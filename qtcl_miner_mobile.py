@@ -93,9 +93,23 @@ TARGET_BLOCK_TIME=600
 # W-STATE CONFIGURATION
 W_STATE_STREAM_INTERVAL_MS=10
 NUM_QUBITS_WSTATE=3
-W_STATE_FIDELITY_THRESHOLD=0.85
+
+FIDELITY_THRESHOLD_STRICT = 0.90
+FIDELITY_THRESHOLD_NORMAL = 0.80
+FIDELITY_THRESHOLD_RELAXED = 0.70
+
+COHERENCE_THRESHOLD_STRICT = 0.92
+COHERENCE_THRESHOLD_NORMAL = 0.85
+COHERENCE_THRESHOLD_RELAXED = 0.75
+
+DEFAULT_FIDELITY_MODE = "normal"
+FIDELITY_THRESHOLD = FIDELITY_THRESHOLD_NORMAL
+W_STATE_FIDELITY_THRESHOLD = FIDELITY_THRESHOLD_NORMAL
+
+FIDELITY_WEIGHT = 0.7
+COHERENCE_WEIGHT = 0.3
+
 RECOVERY_BUFFER_SIZE=100
-FIDELITY_THRESHOLD=0.85
 SYNC_INTERVAL_MS=10
 MAX_SYNC_LAG_MS=100
 HERMITICITY_TOLERANCE=1e-10
@@ -133,6 +147,63 @@ class EntanglementState:
     pq0_fidelity: float = 0.0
     pq_curr_fidelity: float = 0.0
     pq_last_fidelity: float = 0.0
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# W-STATE QUALITY EVALUATION
+# ═════════════════════════════════════════════════════════════════════════════════
+
+class WStateRecoveryManager:
+    """Museum-grade W-state recovery with adaptive threshold evaluation."""
+    
+    @staticmethod
+    def get_threshold_for_mode(mode: str = "normal") -> tuple:
+        """Get fidelity and coherence thresholds for given mode."""
+        thresholds = {
+            "strict": (FIDELITY_THRESHOLD_STRICT, COHERENCE_THRESHOLD_STRICT),
+            "normal": (FIDELITY_THRESHOLD_NORMAL, COHERENCE_THRESHOLD_NORMAL),
+            "relaxed": (FIDELITY_THRESHOLD_RELAXED, COHERENCE_THRESHOLD_RELAXED),
+        }
+        return thresholds.get(mode.lower(), thresholds["normal"])
+    
+    @staticmethod
+    def compute_quality_score(fidelity: float, coherence: float) -> float:
+        """Compute composite quality score: 0.7*F + 0.3*C"""
+        clipped_f = max(0.0, min(1.0, fidelity))
+        clipped_c = max(0.0, min(1.0, coherence))
+        return FIDELITY_WEIGHT * clipped_f + COHERENCE_WEIGHT * clipped_c
+    
+    @staticmethod
+    def evaluate_w_state_quality(fidelity: float, coherence: float, mode: str = "normal", verbose: bool = True) -> tuple:
+        """Evaluate W-state quality with diagnostics."""
+        fid_threshold, coh_threshold = WStateRecoveryManager.get_threshold_for_mode(mode)
+        quality_score = WStateRecoveryManager.compute_quality_score(fidelity, coherence)
+        
+        fidelity_ok = fidelity >= fid_threshold
+        coherence_ok = coherence >= coh_threshold
+        is_valid = fidelity_ok and coherence_ok
+        
+        if is_valid:
+            status = "✅ VALID"
+        elif fidelity >= FIDELITY_THRESHOLD_RELAXED:
+            status = "⚠️  MARGINAL"
+        else:
+            status = "❌ INVALID"
+        
+        diagnostic = (
+            f"{status} W-state | F={fidelity:.4f} (threshold {fid_threshold:.4f}) | "
+            f"C={coherence:.4f} (threshold {coh_threshold:.4f}) | "
+            f"quality={quality_score:.4f} | mode={mode}"
+        )
+        
+        if verbose:
+            if is_valid:
+                logger.info(f"[W-STATE] {diagnostic}")
+            elif fidelity >= FIDELITY_THRESHOLD_RELAXED:
+                logger.warning(f"[W-STATE] {diagnostic}")
+            else:
+                logger.error(f"[W-STATE] {diagnostic}")
+        
+        return is_valid, quality_score, diagnostic
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # BLOCKCHAIN STRUCTURES
@@ -434,24 +505,34 @@ class P2PClientWStateRecovery:
         except:
             return None
     
-    def recover_w_state(self,snapshot: Dict[str,Any])->Optional[RecoveredWState]:
-        """Recover W-state from oracle snapshot - simplified version"""
+    def recover_w_state(self, snapshot: Dict[str, Any]) -> Optional[RecoveredWState]:
+        """Recover W-state from oracle snapshot with adaptive quality evaluation."""
         try:
-            # For the new simplified oracle, we get:
-            # { timestamp_ns, pq_current, pq_last, fidelity, coherence, block_height }
+            fidelity = snapshot.get('fidelity', 0.9)
+            coherence = snapshot.get('coherence', 0.85)
+            timestamp_ns = snapshot.get('timestamp_ns', int(time.time() * 1e9))
             
-            fidelity=snapshot.get('fidelity',0.9)
-            coherence=snapshot.get('coherence',0.85)
-            timestamp_ns=snapshot.get('timestamp_ns',int(time.time()*1e9))
+            dm_array = np.eye(8)
+            purity = 0.95
             
-            # Create identity matrix as placeholder (full DM not transmitted)
-            dm_array=np.eye(8)
-            purity=0.95
+            mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
             
-            is_valid=fidelity>=FIDELITY_THRESHOLD
-            validation_notes=f"F={fidelity:.4f} | C={coherence:.4f}"
+            is_valid, quality_score, diagnostic = WStateRecoveryManager.evaluate_w_state_quality(
+                fidelity=fidelity,
+                coherence=coherence,
+                mode=mode,
+                verbose=True
+            )
             
-            recovered=RecoveredWState(
+            fidelity_minimal = FIDELITY_THRESHOLD_RELAXED
+            coherence_minimal = COHERENCE_THRESHOLD_RELAXED
+            
+            is_acceptable = (
+                fidelity >= fidelity_minimal and
+                coherence >= coherence_minimal
+            )
+            
+            recovered = RecoveredWState(
                 timestamp_ns=timestamp_ns,
                 density_matrix=dm_array,
                 purity=purity,
@@ -459,25 +540,33 @@ class P2PClientWStateRecovery:
                 coherence_l1=coherence,
                 quantum_discord=0.0,
                 is_valid=is_valid,
-                validation_notes=validation_notes,
+                validation_notes=diagnostic,
                 local_statevector=None,
                 signature_verified=True,
                 oracle_address=snapshot.get('pq_current')
             )
             
             with self._state_lock:
-                self.recovered_w_state=recovered
-                self.pq0_matrix=dm_array.copy()
+                self.recovered_w_state = recovered
+                self.pq0_matrix = dm_array.copy()
+                if hasattr(self, 'last_quality_score'):
+                    self.last_quality_score = quality_score
             
-            if not is_valid and self.strict_verification:
-                logger.error(f"[W-STATE] ❌ Invalid W-state: {validation_notes}")
+            if is_valid:
+                logger.info(f"[W-STATE] ✅ Excellent W-state recovered | {diagnostic}")
+                return recovered
+            
+            elif is_acceptable and not self.strict_verification:
+                logger.warning(f"[W-STATE] ⚠️  Marginal W-state accepted | {diagnostic}")
+                return recovered
+            
+            else:
+                logger.error(f"[W-STATE] ❌ Invalid W-state | {diagnostic}")
                 return None
-            
-            logger.info(f"[W-STATE] ✅ W-state recovered | {validation_notes}")
-            return recovered
         
         except Exception as e:
             logger.error(f"[W-STATE] ❌ Recovery failed: {e}")
+            logger.error(traceback.format_exc())
             return None
     
     def _establish_entanglement(self)->bool:
@@ -1225,6 +1314,8 @@ def parse_args():
     parser.add_argument('--register',action='store_true',help='Register with oracle')
     parser.add_argument('--miner-id',help='Miner ID for registration')
     parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
+    parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',help='W-state fidelity threshold mode: strict (F>=0.90), normal (F>=0.80, recommended), relaxed (F>=0.70)')
+    parser.add_argument('--strict-w-verification',action='store_true',default=False,help='Enable strict W-state verification (rejects marginal states)')
     return parser.parse_args()
 
 def main():
@@ -1285,6 +1376,13 @@ def main():
             oracle_url=args.oracle_url,
             difficulty=args.difficulty
         )
+        
+        node.fidelity_mode = args.fidelity_mode
+        node.strict_verification = args.strict_w_verification
+        
+        logger.info(f"[INIT] W-state fidelity mode: {args.fidelity_mode}")
+        if args.strict_w_verification:
+            logger.warning("[INIT] Strict W-state verification enabled")
         
         if not node.start():
             logger.error("[MAIN] ❌ Failed to start node")
