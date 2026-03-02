@@ -211,10 +211,11 @@ class P2PClientWStateRecovery:
     Integrated into miner for continuous quantum entropy source.
     """
     
-    def __init__(self, oracle_url: str, peer_id: str, strict_signature_verification: bool=True):
+    def __init__(self, oracle_url: str, peer_id: str, miner_address: str, strict_signature_verification: bool=True):
         """Initialize W-state recovery client."""
         self.oracle_url=oracle_url.rstrip('/')
         self.peer_id=peer_id
+        self.miner_address=miner_address  # FIXED: Add this
         self.running=False
         self.strict_verification=strict_signature_verification
         
@@ -937,6 +938,7 @@ class QTCLFullNode:
         self.w_state_recovery=P2PClientWStateRecovery(
             oracle_url=oracle_url,
             peer_id=peer_id,
+            miner_address=miner_address,  # FIXED: Pass this
             strict_signature_verification=True
         )
         
