@@ -1119,7 +1119,10 @@ class QTCLFullNode:
 class QuickWallet:
     """Minimal wallet for miner address management"""
     def __init__(self,wallet_file=None):
-        self.wallet_file=wallet_file or Path.home()/'.qtcl_miner_wallet'
+        # Use local ./data/ directory for wallet file (better for Termux/mobile)
+        data_dir=Path('data')
+        data_dir.mkdir(exist_ok=True)
+        self.wallet_file=wallet_file or (data_dir/'wallet.json')
         self.address=None
         self.private_key=None
         self.public_key=None
@@ -1158,7 +1161,8 @@ class QuickWallet:
             from cryptography.fernet import Fernet
             from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
             from cryptography.hazmat.primitives import hashes
-            Path.home().mkdir(exist_ok=True)
+            # Ensure data directory exists
+            self.wallet_file.parent.mkdir(exist_ok=True)
             salt=secrets.token_bytes(16)
             kdf=PBKDF2(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=100000)
             key=base64.urlsafe_b64encode(kdf.derive(password.encode()))
@@ -1176,7 +1180,10 @@ class MinerRegistry:
     """Register miner with oracle using HLWE signature"""
     def __init__(self,oracle_url):
         self.oracle_url=oracle_url
-        self.registration_file=Path.home()/'.qtcl_miner_registered'
+        # Use local ./data/ directory for registration file (better for Termux/mobile)
+        data_dir=Path('data')
+        data_dir.mkdir(exist_ok=True)
+        self.registration_file=data_dir/'.qtcl_miner_registered'
         self.token=None
     
     def register(self,miner_id,address,public_key,private_key,miner_name='qtcl-miner'):
