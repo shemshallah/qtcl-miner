@@ -1102,7 +1102,10 @@ class QTCLFullNode:
 class QuickWallet:
     """Minimal wallet for miner address management"""
     def __init__(self,wallet_file=None):
-        self.wallet_file=wallet_file or Path.home()/'.qtcl_miner_wallet'
+        # FIXED: Use ./data/wallet.json, not home directory
+        data_dir = Path('data')
+        data_dir.mkdir(exist_ok=True, mode=0o700)
+        self.wallet_file = wallet_file or (data_dir / 'wallet.json')
         self.address=None
         self.private_key=None
         self.public_key=None
@@ -1120,14 +1123,14 @@ class QuickWallet:
         if not self.wallet_file.exists():
             return False
         try:
-            from cryptography.fernet import Fernet
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-            from cryptography.hazmat.primitives import hashes
+            import base64
             data=json.loads(open(self.wallet_file).read())
-            kdf=PBKDF2(algorithm=hashes.SHA256(),length=32,salt=bytes.fromhex(data['salt']),iterations=100000)
-            key=base64.urlsafe_b64encode(kdf.derive(password.encode()))
-            decrypted=Fernet(key).decrypt(bytes.fromhex(data['encrypted']))
-            wallet_data=json.loads(decrypted.decode())
+            # Verify password hash (no cryptography needed)
+            password_hash=hashlib.sha256(password.encode()).hexdigest()
+            if data.get('password_hash')!=password_hash:
+                return False
+            # Decode wallet data (simple base64, not encrypted)
+            wallet_data=json.loads(base64.b64decode(data['wallet_b64']).decode())
             self.address=wallet_data['address']
             self.private_key=wallet_data['private_key']
             self.public_key=wallet_data['public_key']
@@ -1136,30 +1139,34 @@ class QuickWallet:
             return False
     
     def _save(self,password):
-        """Save wallet encrypted"""
+        """Save wallet (base64 encoding, no cryptography)"""
         try:
-            from cryptography.fernet import Fernet
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-            from cryptography.hazmat.primitives import hashes
-            Path.home().mkdir(exist_ok=True)
-            salt=secrets.token_bytes(16)
-            kdf=PBKDF2(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=100000)
-            key=base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            import base64
+            # Ensure data directory exists
+            self.wallet_file.parent.mkdir(exist_ok=True, mode=0o700)
+            # Hash password for verification
+            password_hash=hashlib.sha256(password.encode()).hexdigest()
+            # Prepare wallet data
             wallet_data={'address':self.address,'private_key':self.private_key,'public_key':self.public_key}
-            encrypted=Fernet(key).encrypt(json.dumps(wallet_data).encode())
-            data={'salt':salt.hex(),'encrypted':encrypted.hex()}
+            # Encode with base64 (not encrypted, just encoded)
+            wallet_b64=base64.b64encode(json.dumps(wallet_data).encode()).decode()
+            # Save to disk
+            data={'password_hash':password_hash,'wallet_b64':wallet_b64}
             with open(self.wallet_file,'w') as f:
                 f.write(json.dumps(data))
             os.chmod(self.wallet_file,0o600)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"[WALLET] Save failed: {e}")
 
 
 class MinerRegistry:
     """Register miner with oracle using HLWE signature"""
     def __init__(self,oracle_url):
         self.oracle_url=oracle_url
-        self.registration_file=Path.home()/'.qtcl_miner_registered'
+        # FIXED: Use ./data/ not home directory
+        data_dir=Path('data')
+        data_dir.mkdir(exist_ok=True, mode=0o700)
+        self.registration_file=data_dir/'.qtcl_miner_registered'
         self.token=None
     
     def register(self,miner_id,address,public_key,private_key,miner_name='qtcl-miner'):
