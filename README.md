@@ -1,0 +1,2 @@
+# qtcl-miner
+QTCL Miner
