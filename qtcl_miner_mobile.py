@@ -3366,16 +3366,21 @@ def main():
                     sys.exit(1)
         
         # Start mining
-        # ─── DATABASE INITIALIZATION WITH COMPLETE SCHEMA ─────────────────────────────
+        # ─── DATABASE INITIALIZATION WITH PERSISTENT FILE-BASED STORAGE ──────────────
         global db
-        logger.info("[DB] 🔧 Initializing database with complete schema...")
+        db_path = Path('qtcl-miner/data/qtcl_blockchain.db')
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"[DB] 🔧 Initializing persistent database at {db_path}...")
         try:
-            db = sqlite3.connect(':memory:', check_same_thread=False)
+            # 🎯 PERSISTENT FILE-BASED DATABASE (survives restarts)
+            db = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
             db.execute("PRAGMA synchronous=NORMAL")
             db.execute("PRAGMA journal_mode=WAL")
             
-            # 🎯 CREATE ESSENTIAL TABLES - MUST EXIST BEFORE ANY OPERATIONS
-            db.executescript("""
+            # 🎯 VALIDATE AND CREATE SCHEMA - Check tables exist, create if missing
+            # This ensures compatibility across restarts and versions
+            schema_validation_sql = """
                 CREATE TABLE IF NOT EXISTS blocks (
                     height INTEGER PRIMARY KEY,
                     block_hash TEXT UNIQUE NOT NULL,
@@ -3407,13 +3412,51 @@ def main():
                     total_blocks_retargeted INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
-            """)
+            """
+            
+            logger.info("[DB] 🔍 Validating schema...")
+            
+            # Verify blocks table has all required columns
+            try:
+                cursor = db.execute("PRAGMA table_info(blocks)")
+                existing_cols = {row[1] for row in cursor.fetchall()}
+                required_cols = {'height', 'block_hash', 'parent_hash', 'merkle_root', 'timestamp_s', 
+                                'difficulty_bits', 'nonce', 'miner_address', 'w_state_fidelity', 'w_entropy_hash'}
+                if required_cols <= existing_cols:
+                    logger.info("[DB] ✅ Schema validation: blocks table OK")
+                else:
+                    missing = required_cols - existing_cols
+                    logger.warning(f"[DB] ⚠️  Schema validation: blocks table missing columns {missing}, recreating...")
+                    db.execute("DROP TABLE IF EXISTS blocks")
+            except:
+                logger.info("[DB] 📋 Schema validation: blocks table missing, creating...")
+            
+            # Verify difficulty_state table exists
+            try:
+                cursor = db.execute("PRAGMA table_info(difficulty_state)")
+                if cursor.fetchone():
+                    logger.info("[DB] ✅ Schema validation: difficulty_state table OK")
+                else:
+                    raise Exception("Empty table")
+            except:
+                logger.info("[DB] 📋 Schema validation: difficulty_state table missing, creating...")
+            
+            # Execute complete schema creation (creates only if not exists)
+            db.executescript(schema_validation_sql)
             
             # Initialize difficulty_state singleton row
             db.execute("INSERT OR IGNORE INTO difficulty_state (id) VALUES(1)")
             db.commit()
             
-            logger.info("[DB] ✅ Database initialized | blocks table ready | difficulty_state ready")
+            # Final verification
+            cursor = db.execute("SELECT COUNT(*) FROM blocks")
+            block_count = cursor.fetchone()[0]
+            cursor = db.execute("SELECT COUNT(*) FROM difficulty_state")
+            difficulty_count = cursor.fetchone()[0]
+            
+            logger.info(f"[DB] ✅ Persistent database ready | path={db_path}")
+            logger.info(f"[DB] ✅ Schema validated: blocks table ({block_count} records), difficulty_state ({difficulty_count} records)")
+            logger.info(f"[DB] ✅ Persistent storage: ENABLED (survives restarts)")
         except Exception as e:
             logger.error(f"[DB] ❌ Database initialization failed: {e}")
             import traceback
