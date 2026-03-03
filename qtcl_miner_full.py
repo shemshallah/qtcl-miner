@@ -1578,10 +1578,11 @@ class ClayMinerWallet:
         self.current_fingerprint = result['wallet_fingerprint']
         self._address = result['first_address']
         
-        # FIX: Extract public_key from current_master after load
-        self.load(password)
-        if self.current_master and hasattr(self.current_master, 'public_key'):
-            self._public_key = self.current_master.public_key.hex() if self.current_master.public_key else None
+        # FIX: Extract public_key directly from result['master_key'] - NO DUPLICATE LOAD
+        if 'master_key' in result and hasattr(result['master_key'], 'public_key'):
+            self._public_key = result['master_key'].public_key.hex()
+        else:
+            self._public_key = None
         
         # Store fingerprint
         with open(self.wallet_file, 'w') as f:
@@ -3405,7 +3406,9 @@ class QuickWallet:
         result = self.hlwe_wallet.create(password)
         self.address = result
         self.public_key = self.hlwe_wallet.public_key
-        self._save(password)
+        
+        # FIX: Don't save here - ClayMinerWallet already saved to wallet_clay.json
+        # self._save(password)  ← REMOVED: was creating duplicate wallet.json
         
         db.execute("""
             INSERT OR IGNORE INTO wallet_addresses 
