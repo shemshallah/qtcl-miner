@@ -3551,10 +3551,6 @@ def main():
     args = parse_args()
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    # SINGLE WALLET INSTANCE - reuse everywhere
-    wallet = QuickWallet()
-    address = None
-    
     try:
         if args.wallet_init:
             if not args.wallet_password:
