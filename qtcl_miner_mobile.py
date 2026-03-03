@@ -1193,20 +1193,23 @@ class QTCLFullNode:
                     time.sleep(5)
                     continue
                 
+                # Get pending transactions (empty list is OK - can mine empty blocks)
                 pending_txs = self.mempool.get_pending(limit=100)
-                if not pending_txs:
-                    logger.debug(f"[MINING] 💤 No transactions in mempool, next check in {MINING_POLL_INTERVAL}s")
-                    time.sleep(MINING_POLL_INTERVAL)
-                    continue
+                
+                # ✅ MUSEUM-GRADE FIX: Allow mining with empty mempool
+                # Blockchains can mine empty blocks (common during low activity)
+                # This was the bug preventing mining when mempool = 0
                 
                 # Get current W-state metrics
                 current_fidelity = entanglement.get('pq_curr_fidelity', 0.0)
                 fidelity_measurements.append(current_fidelity)
                 
-                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} | txs={len(pending_txs)} | F={current_fidelity:.4f}")
+                tx_count = len(pending_txs) if pending_txs else 0
+                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} | txs={tx_count} | F={current_fidelity:.4f}")
                 
                 block_start = time.time()
-                block = self.miner.mine_block(pending_txs, self.miner_address, tip.block_hash, tip.height+1)
+                # Pass empty list if no pending transactions (mine empty block)
+                block = self.miner.mine_block(pending_txs or [], self.miner_address, tip.block_hash, tip.height+1)
                 block_time = time.time() - block_start
                 
                 if block:
