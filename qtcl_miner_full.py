@@ -1420,7 +1420,7 @@ class HLWEClayWallet:
         """
         # 1. Generate quantum entropy
         quantum_entropy = self.quantum.get_hyperbolic_entropy(64)
-        seed = bytes(quantum_entropy)[:64]
+        seed = bytes([int(x) & 0xFF for x in quantum_entropy])[:64]
         
         # 2. Create master key
         master_key = self.bip32.create_master_key(seed)
