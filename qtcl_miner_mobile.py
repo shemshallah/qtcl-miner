@@ -1228,53 +1228,49 @@ class QTCLFullNode:
                     
                     # Validate block
                     if self.validator.validate_block(block):
-                        # Submit to network with comprehensive error handling
+                        # ✅ BULLETPROOF: Submit to network - NEVER use asdict()
                         submit_start = time.time()
                         
                         try:
-                            # ✅ MUSEUM-GRADE: Proper block serialization
-                            # Convert block to submittable format with error diagnostics
+                            # ✅ MUSEUM-GRADE: Manual dict serialization - NO asdict() anywhere
                             
-                            # Serialize header safely
-                            if hasattr(block.header, '__dataclass_fields__'):
-                                # It's a dataclass - use asdict
-                                header_dict = asdict(block.header)
-                            elif hasattr(block.header, '__dict__'):
-                                # Manual serialization
-                                header_dict = {
-                                    'height': block.header.height,
-                                    'block_hash': block.header.block_hash,
-                                    'parent_hash': block.header.parent_hash,
-                                    'merkle_root': block.header.merkle_root,
-                                    'timestamp_s': block.header.timestamp_s,
-                                    'difficulty_bits': block.header.difficulty_bits,
-                                    'nonce': block.header.nonce,
-                                    'miner_address': block.header.miner_address,
-                                    'w_state_fidelity': block.header.w_state_fidelity,
-                                    'w_entropy_hash': block.header.w_entropy_hash,
-                                }
-                            else:
-                                raise ValueError(f"Cannot serialize block header of type {type(block.header)}")
+                            # Serialize header - direct attribute access
+                            header_dict = {
+                                'height': int(block.header.height),
+                                'block_hash': str(block.header.block_hash),
+                                'parent_hash': str(block.header.parent_hash),
+                                'merkle_root': str(block.header.merkle_root),
+                                'timestamp_s': int(block.header.timestamp_s),
+                                'difficulty_bits': int(block.header.difficulty_bits),
+                                'nonce': int(block.header.nonce),
+                                'miner_address': str(block.header.miner_address),
+                                'w_state_fidelity': float(block.header.w_state_fidelity),
+                                'w_entropy_hash': str(block.header.w_entropy_hash),
+                            }
                             
-                            # Serialize transactions
+                            # Serialize transactions - manual dict per transaction
                             tx_list = []
                             for tx in block.transactions:
-                                if hasattr(tx, '__dataclass_fields__'):
-                                    tx_list.append(asdict(tx))
-                                elif hasattr(tx, '__dict__'):
-                                    tx_list.append(tx.__dict__)
-                                else:
-                                    tx_list.append(dict(tx))
+                                tx_dict = {
+                                    'tx_id': str(tx.tx_id),
+                                    'from_addr': str(tx.from_addr),
+                                    'to_addr': str(tx.to_addr),
+                                    'amount': float(tx.amount),
+                                    'fee': float(tx.fee),
+                                    'timestamp': int(tx.timestamp),
+                                    'signature': str(tx.signature) if hasattr(tx, 'signature') else '',
+                                }
+                                tx_list.append(tx_dict)
                             
                             # Build submission payload
                             block_payload = {
                                 'header': header_dict,
                                 'transactions': tx_list,
-                                'miner_address': self.miner_address,
+                                'miner_address': str(self.miner_address),
                                 'timestamp': int(time.time()),
                             }
                             
-                            logger.debug(f"[MINING] 📤 Submitting block #{block.header.height} | hash={block.header.block_hash[:16]}… | txs={len(tx_list)}")
+                            logger.info(f"[MINING] 📤 Submitting block #{block.header.height} | hash={block.header.block_hash[:16]}… | txs={len(tx_list)}")
                             
                             # Submit block to server
                             success, msg = self.client.submit_block(block_payload)
@@ -1308,32 +1304,27 @@ class QTCLFullNode:
                                 
                                 if fidelity_measurements:
                                     avg_fidelity = sum(fidelity_measurements) / len(fidelity_measurements)
-                                    logger.info(f"[MINING] 🎯 Quantum: Avg F={avg_fidelity:.4f} | Quality={sum(fidelity_measurements)/len(fidelity_measurements):.4f}")
+                                    logger.info(f"[MINING] 🎯 Quantum: Avg F={avg_fidelity:.4f}")
                             
                             else:
                                 # ❌ SUBMISSION FAILED - Diagnostic info
                                 logger.error(f"[MINING] ❌ Block submission REJECTED: {msg}")
                                 logger.error(f"[MINING] 🔍 Diagnostics:")
                                 logger.error(f"[MINING]   • Block height: {block.header.height}")
-                                logger.error(f"[MINING]   • Block hash: {block.header.block_hash}")
-                                logger.error(f"[MINING]   • Parent hash: {block.header.parent_hash}")
+                                logger.error(f"[MINING]   • Block hash: {block.header.block_hash[:32]}…")
+                                logger.error(f"[MINING]   • Parent hash: {block.header.parent_hash[:32]}…")
                                 logger.error(f"[MINING]   • Miner: {block.header.miner_address}")
                                 logger.error(f"[MINING]   • Transactions: {len(block.transactions)}")
                                 logger.error(f"[MINING]   • Submission time: {submit_time*1000:.1f}ms")
                         
                         except Exception as submit_error:
-                            logger.error(f"[MINING] ❌ Block serialization/submission failed: {submit_error}")
+                            logger.error(f"[MINING] ❌ Block submission failed: {submit_error}")
                             logger.error(f"[MINING] 🔍 Error type: {type(submit_error).__name__}")
-                            logger.error(f"[MINING] 📋 Block details:")
-                            logger.error(f"[MINING]   • Height: {block.header.height}")
-                            logger.error(f"[MINING]   • Hash: {block.header.block_hash}")
-                            logger.error(f"[MINING]   • Header type: {type(block.header)}")
-                            logger.error(f"[MINING]   • Has __dict__: {hasattr(block.header, '__dict__')}")
-                            logger.error(f"[MINING]   • Has __dataclass_fields__: {hasattr(block.header, '__dataclass_fields__')}")
-                            logger.debug(f"[MINING] Traceback: {traceback.format_exc()}")
+                            logger.error(f"[MINING] 📋 Block: height={block.header.height} hash={block.header.block_hash[:32]}…")
+                            logger.error(f"[MINING] Traceback: {traceback.format_exc()}")
                     
                     else:
-                        logger.error(f"[MINING] ❌ Block validation failed - block not submitted to network")
+                        logger.error(f"[MINING] ❌ Block validation failed")
                 else:
                     logger.warning(f"[MINING] ⚠️  Mining timeout or failed for block #{tip.height+1}")
                 
