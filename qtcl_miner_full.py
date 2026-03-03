@@ -1578,6 +1578,11 @@ class ClayMinerWallet:
         self.current_fingerprint = result['wallet_fingerprint']
         self._address = result['first_address']
         
+        # FIX: Extract public_key from current_master after load
+        self.load(password)
+        if self.current_master and hasattr(self.current_master, 'public_key'):
+            self._public_key = self.current_master.public_key.hex() if self.current_master.public_key else None
+        
         # Store fingerprint
         with open(self.wallet_file, 'w') as f:
             json.dump({
@@ -3546,21 +3551,24 @@ def main():
     args = parse_args()
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
+    # SINGLE WALLET INSTANCE - reuse everywhere
+    wallet = QuickWallet()
+    address = None
+    
     try:
         if args.wallet_init:
             if not args.wallet_password:
                 args.wallet_password = input("Enter wallet password: ")
-            wallet = QuickWallet()
             address = wallet.create(args.wallet_password)
             logger.info(f"[WALLET] Created: {address}")
             logger.info(f"[WALLET] Public Key: {wallet.public_key}")
             logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
             return
         
+        # Load or use provided address
         if args.address:
             address = args.address
         else:
-            wallet = QuickWallet()
             if not args.wallet_password:
                 args.wallet_password = input("Enter wallet password: ")
             if wallet.load(args.wallet_password):
@@ -3572,28 +3580,27 @@ def main():
                 print(f"ERROR: {error_msg}", file=sys.stderr)
                 sys.exit(1)
         
+        # Register if requested
         if args.register:
             if not all([args.miner_id, args.wallet_password]):
                 logger.error("[REGISTER] --miner-id and --wallet-password required")
                 sys.exit(1)
             
-            wallet = QuickWallet()
-            if wallet.load(args.wallet_password):
-                registry = MinerRegistry(args.oracle_url)
-                if registry.register(
-                    miner_id=args.miner_id,
-                    address=wallet.address,
-                    public_key=wallet.public_key or '',
-                    private_key=wallet.private_key or '',
-                    miner_name=args.miner_name
-                ):
-                    logger.info("[REGISTER] ✅ Successfully registered")
-                    return
-                else:
-                    error_msg = "[REGISTER] ❌ Registration failed"
-                    logger.error(error_msg)
-                    print(f"ERROR: {error_msg}", file=sys.stderr)
-                    sys.exit(1)
+            registry = MinerRegistry(args.oracle_url)
+            if registry.register(
+                miner_id=args.miner_id,
+                address=wallet.address,
+                public_key=wallet.public_key or '',
+                private_key=wallet.private_key or '',
+                miner_name=args.miner_name
+            ):
+                logger.info("[REGISTER] ✅ Successfully registered")
+                return
+            else:
+                error_msg = "[REGISTER] ❌ Registration failed"
+                logger.error(error_msg)
+                print(f"ERROR: {error_msg}", file=sys.stderr)
+                sys.exit(1)
         
         node = QTCLFullNode(
             miner_address=address,
