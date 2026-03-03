@@ -3546,146 +3546,43 @@ class MinerRegistry:
             pass
         return None
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
-
-def parse_args():
-    import argparse
-    parser = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with HLWE')
-    parser.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url', '-o', default='https://qtcl-blockchain.koyeb.app', help='Oracle URL')
-    parser.add_argument('--difficulty', '-d', type=int, default=DEFAULT_DIFFICULTY, help='Mining difficulty bits')
-    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
-    parser.add_argument('--wallet-init', action='store_true', help='Initialize new wallet')
-    parser.add_argument('--wallet-password', help='Wallet password')
-    parser.add_argument('--register', action='store_true', help='Register with oracle')
-    parser.add_argument('--miner-id', help='Miner ID for registration')
-    parser.add_argument('--miner-name', default='qtcl-miner', help='Friendly miner name')
-    parser.add_argument('--fidelity-mode', choices=['strict', 'normal', 'relaxed'], default='normal', help='W-state fidelity threshold mode')
-    parser.add_argument('--strict-w-verification', action='store_true', default=False, help='Enable strict W-state verification')
-    return parser.parse_args()
-
-def main():
-    args = parse_args()
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
+def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
+    r"""
+    Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ* \ {0}) ≤ ε}
+    where ρ_{1/s}(x) = exp(-π s^2 ‖x‖^2)
     
-    try:
-        if args.wallet_init:
-            if not args.wallet_password:
-                args.wallet_password = input("Enter wallet password: ")
-            wallet = QuickWallet()
-            address = wallet.create(args.wallet_password)
-            logger.info(f"[WALLET] Created: {address}")
-            logger.info(f"[WALLET] Public Key: {wallet.public_key}")
-            logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
-            return
-        
-        if args.address:
-            address = args.address
-        else:
-            wallet = QuickWallet()
-            if not args.wallet_password:
-                args.wallet_password = input("Enter wallet password: ")
-            if wallet.load(args.wallet_password):
-                address = wallet.address
-                logger.info(f"[WALLET] Loaded: {address}")
-            else:
-                logger.error("[WALLET] Failed to load wallet")
-                sys.exit(1)
-        
-        if args.register:
-            if not all([args.miner_id, args.wallet_password]):
-                logger.error("[REGISTER] --miner-id and --wallet-password required")
-                sys.exit(1)
-            
-            wallet = QuickWallet()
-            if wallet.load(args.wallet_password):
-                registry = MinerRegistry(args.oracle_url)
-                if registry.register(
-                    miner_id=args.miner_id,
-                    address=wallet.address,
-                    public_key=wallet.public_key or '',
-                    private_key=wallet.private_key or '',
-                    miner_name=args.miner_name
-                ):
-                    logger.info("[REGISTER] ✅ Successfully registered")
-                    return
-                else:
-                    logger.error("[REGISTER] ❌ Registration failed")
-                    sys.exit(1)
-        
-        node = QTCLFullNode(
-            miner_address=address,
-            oracle_url=args.oracle_url,
-            difficulty=args.difficulty
-        )
-        
-        node.fidelity_mode = args.fidelity_mode
-        node.strict_verification = args.strict_w_verification
-        
-        logger.info(f"[INIT] W-state fidelity mode: {args.fidelity_mode}")
-        if args.strict_w_verification:
-            logger.warning("[INIT] Strict W-state verification enabled")
-        
-        if not node.start():
-            logger.error("[MAIN] ❌ Failed to start node")
-            sys.exit(1)
-        
-        while True:
-            time.sleep(30)
-            status = node.get_status()
-            print("\n" + ("=" * 140))
-            print("⛏️  QTCL QUANTUM MINER STATUS (W-STATE ENTANGLED + HLWE)")
-            print("=" * 140)
-            print(f"Miner:                    {status['miner_full']}")
-            print(f"Status:                   {status['status'].upper()}")
-            print(f"")
-            print(f"BLOCKCHAIN:")
-            print(f"  Chain Height:           {status['chain']['height']}")
-            print(f"  Tip Hash:               {status['chain']['tip_hash']}")
-            print(f"")
-            print(f"WALLET & REWARDS:")
-            print(f"  Address:                {status['wallet']['address']}")
-            print(f"  Balance:                {status['wallet']['balance_formatted']}")
-            print(f"  Estimated Rewards:      {status['wallet']['estimated_rewards']:.2f} QTCL")
-            print(f"")
-            print(f"MEMPOOL:")
-            print(f"  Pending Transactions:   {status['mempool']['size']}")
-            print(f"")
-            print(f"MINING METRICS:")
-            print(f"  Blocks Mined:           {status['mining']['blocks_mined']}")
-            print(f"  Block Rewards Earned:   {status['mining']['block_rewards']}")
-            print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
-            print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
-            print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
-            print(f"")
-            print(f"QUANTUM W-STATE ENTANGLEMENT:")
-            print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
-            print(f"  pq0 Oracle Fidelity:    {status['quantum']['w_state']['pq0_fidelity']:.4f}")
-            print(f"  W-State Fidelity:       {status['quantum']['w_state']['w_state_fidelity']:.4f}")
-            print(f"  pq_curr (field ID):     {status['quantum']['w_state']['pq_curr'][:32]}…")
-            print(f"  pq_last (field ID):     {status['quantum']['w_state']['pq_last'][:32]}…")
-            print(f"  Sync Lag:               {status['quantum']['w_state']['sync_lag_ms']:.1f}ms")
-            print(f"")
-            print(f"ORACLE RECOVERY:")
-            print(f"  Connected:              {status['quantum']['recovery']['connected']}")
-            print(f"  Peer ID:                {status['quantum']['recovery']['peer_id']}")
-            print(f"  Oracle URL:             {status['network']['oracle_url']}")
-            print("=" * 140 + "\n")
+    The smoothing parameter η_ε(Λ) is the smallest s such that the Gaussian
+    measure of the dual lattice minus the origin is at most ε. This is a
+    critical quantity in lattice-based cryptography that determines the
+    hardness of the Learning With Errors problem.
     
-    except KeyboardInterrupt:
-        print("\n[MAIN] 🛑 Shutdown signal received...")
-    except Exception as e:
-        print(f"\n❌ FATAL: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        if 'node' in locals():
-            node.stop()
-        print("\n✅ Shutdown complete\n")
-
-if __name__ == '__main__':
-    import argparse
-    import numpy as np
-    main()
+    For a lattice Λ of dimension n with volume det(Λ), the Gaussian heuristic
+    gives an approximation:
+        η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
+    
+    where λ_1(Λ*) is the length of the shortest non-zero vector in the dual
+    lattice. Using the Gaussian heuristic for the shortest vector:
+        λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
+    
+    Args:
+        epsilon: Error tolerance (default 1e-9)
+        
+    Returns:
+        Estimated smoothing parameter η_ε(Λ)
+    """
+    # Approximate using Gaussian heuristic
+    n = self.n
+    vol = float(self.volume)
+    if vol <= 0:
+        vol = 1.0
+    
+    # Gaussian heuristic for shortest vector in dual lattice
+    # λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
+    gh = math.sqrt(n / (2 * math.pi * math.e)) * (vol ** (1.0 / n))
+    
+    # Smoothing parameter approximation
+    # η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
+    log_term = math.log(2 * n * (1 + 1.0 / epsilon))
+    eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
+    
+    return eta
