@@ -851,6 +851,16 @@ class LiveNodeClient:
             return False,r.json().get('error','Submission failed')
         except Exception as e:
             return False,str(e)
+    
+    def query_balance(self, address: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Query wallet balance from server for a given address"""
+        try:
+            r = self.session.get(f"{self.base_url}{API_PREFIX}/wallet?address={address}", timeout=10)
+            if r.status_code == 200:
+                return r.json(), None
+            return None, f"Status {r.status_code}: {r.text}"
+        except Exception as e:
+            return None, str(e)
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # VALIDATION ENGINE
@@ -1218,38 +1228,112 @@ class QTCLFullNode:
                     
                     # Validate block
                     if self.validator.validate_block(block):
-                        # Submit to network
+                        # Submit to network with comprehensive error handling
                         submit_start = time.time()
-                        success, msg = self.client.submit_block({
-                            'header': asdict(block.header) if hasattr(block.header, '__dict__') else block.header.__dict__,
-                            'transactions': [asdict(tx) for tx in block.transactions]
-                        })
-                        submit_time = time.time() - submit_start
                         
-                        if success:
-                            # Block accepted
-                            self.state.add_block(block.header)
-                            for tx in pending_txs:
-                                self.state.apply_transaction(tx)
-                            self.mempool.remove_transactions([tx.tx_id for tx in pending_txs])
+                        try:
+                            # ✅ MUSEUM-GRADE: Proper block serialization
+                            # Convert block to submittable format with error diagnostics
                             
-                            # Calculate metrics
-                            hash_rate = self.miner.metrics['hash_attempts'] / block_time if block_time > 0 else 0
-                            elapsed = time.time() - mining_start_time
-                            blocks_per_hour = (blocks_mined_this_session / elapsed * 3600) if elapsed > 0 else 0
+                            # Serialize header safely
+                            if hasattr(block.header, '__dataclass_fields__'):
+                                # It's a dataclass - use asdict
+                                header_dict = asdict(block.header)
+                            elif hasattr(block.header, '__dict__'):
+                                # Manual serialization
+                                header_dict = {
+                                    'height': block.header.height,
+                                    'block_hash': block.header.block_hash,
+                                    'parent_hash': block.header.parent_hash,
+                                    'merkle_root': block.header.merkle_root,
+                                    'timestamp_s': block.header.timestamp_s,
+                                    'difficulty_bits': block.header.difficulty_bits,
+                                    'nonce': block.header.nonce,
+                                    'miner_address': block.header.miner_address,
+                                    'w_state_fidelity': block.header.w_state_fidelity,
+                                    'w_entropy_hash': block.header.w_entropy_hash,
+                                }
+                            else:
+                                raise ValueError(f"Cannot serialize block header of type {type(block.header)}")
                             
-                            logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED")
-                            logger.info(f"[MINING] 📊 Mining Time: {block_time:.2f}s | Hash Rate: {hash_rate:.0f} hashes/sec | Submit Time: {submit_time:.2f}s")
-                            logger.info(f"[MINING] 📈 Session: {blocks_mined_this_session} blocks mined | {blocks_per_hour:.2f} blocks/hour")
+                            # Serialize transactions
+                            tx_list = []
+                            for tx in block.transactions:
+                                if hasattr(tx, '__dataclass_fields__'):
+                                    tx_list.append(asdict(tx))
+                                elif hasattr(tx, '__dict__'):
+                                    tx_list.append(tx.__dict__)
+                                else:
+                                    tx_list.append(dict(tx))
                             
-                            if fidelity_measurements:
-                                avg_fidelity = sum(fidelity_measurements) / len(fidelity_measurements)
-                                logger.info(f"[MINING] 🎯 Quantum Metrics: Avg Fidelity={avg_fidelity:.4f} | Current={current_fidelity:.4f}")
-                        else:
-                            logger.error(f"[MINING] ❌ Block submission rejected: {msg}")
-                            logger.debug(f"[MINING] Block state: height={block.header.height}, hash={block.header.block_hash[:16]}…")
+                            # Build submission payload
+                            block_payload = {
+                                'header': header_dict,
+                                'transactions': tx_list,
+                                'miner_address': self.miner_address,
+                                'timestamp': int(time.time()),
+                            }
+                            
+                            logger.debug(f"[MINING] 📤 Submitting block #{block.header.height} | hash={block.header.block_hash[:16]}… | txs={len(tx_list)}")
+                            
+                            # Submit block to server
+                            success, msg = self.client.submit_block(block_payload)
+                            submit_time = time.time() - submit_start
+                            
+                            if success:
+                                # ✅ BLOCK ACCEPTED - Update all systems
+                                logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED by network | Response: {msg}")
+                                
+                                # Update local state
+                                self.state.add_block(block.header)
+                                for tx in block.transactions:
+                                    self.state.apply_transaction(tx)
+                                self.mempool.remove_transactions([tx.tx_id for tx in block.transactions] if block.transactions else [])
+                                
+                                # Calculate metrics
+                                hash_rate = self.miner.metrics['hash_attempts'] / block_time if block_time > 0 else 0
+                                elapsed = time.time() - mining_start_time
+                                blocks_per_hour = (blocks_mined_this_session / elapsed * 3600) if elapsed > 0 else 0
+                                
+                                # ✅ Block Reward: 10 QTCL per block (standard)
+                                block_reward = 10.0
+                                logger.info(f"[MINING] 💰 Block Reward: +{block_reward} QTCL")
+                                
+                                logger.info(f"[MINING] ✅ Block #{block.header.height} CONFIRMED")
+                                logger.info(f"[MINING] 📊 Submission:")
+                                logger.info(f"[MINING]   • Network latency: {submit_time*1000:.1f}ms")
+                                logger.info(f"[MINING]   • Hash rate: {hash_rate:.0f} hashes/sec")
+                                logger.info(f"[MINING]   • Mining time: {block_time:.2f}s")
+                                logger.info(f"[MINING] 📈 Session: {blocks_mined_this_session} blocks | {blocks_per_hour:.2f} blocks/hour | Rewards: +{blocks_mined_this_session * block_reward} QTCL")
+                                
+                                if fidelity_measurements:
+                                    avg_fidelity = sum(fidelity_measurements) / len(fidelity_measurements)
+                                    logger.info(f"[MINING] 🎯 Quantum: Avg F={avg_fidelity:.4f} | Quality={sum(fidelity_measurements)/len(fidelity_measurements):.4f}")
+                            
+                            else:
+                                # ❌ SUBMISSION FAILED - Diagnostic info
+                                logger.error(f"[MINING] ❌ Block submission REJECTED: {msg}")
+                                logger.error(f"[MINING] 🔍 Diagnostics:")
+                                logger.error(f"[MINING]   • Block height: {block.header.height}")
+                                logger.error(f"[MINING]   • Block hash: {block.header.block_hash}")
+                                logger.error(f"[MINING]   • Parent hash: {block.header.parent_hash}")
+                                logger.error(f"[MINING]   • Miner: {block.header.miner_address}")
+                                logger.error(f"[MINING]   • Transactions: {len(block.transactions)}")
+                                logger.error(f"[MINING]   • Submission time: {submit_time*1000:.1f}ms")
+                        
+                        except Exception as submit_error:
+                            logger.error(f"[MINING] ❌ Block serialization/submission failed: {submit_error}")
+                            logger.error(f"[MINING] 🔍 Error type: {type(submit_error).__name__}")
+                            logger.error(f"[MINING] 📋 Block details:")
+                            logger.error(f"[MINING]   • Height: {block.header.height}")
+                            logger.error(f"[MINING]   • Hash: {block.header.block_hash}")
+                            logger.error(f"[MINING]   • Header type: {type(block.header)}")
+                            logger.error(f"[MINING]   • Has __dict__: {hasattr(block.header, '__dict__')}")
+                            logger.error(f"[MINING]   • Has __dataclass_fields__: {hasattr(block.header, '__dataclass_fields__')}")
+                            logger.debug(f"[MINING] Traceback: {traceback.format_exc()}")
+                    
                     else:
-                        logger.error(f"[MINING] ❌ Block validation failed")
+                        logger.error(f"[MINING] ❌ Block validation failed - block not submitted to network")
                 else:
                     logger.warning(f"[MINING] ⚠️  Mining timeout or failed for block #{tip.height+1}")
                 
@@ -1284,6 +1368,20 @@ class QTCLFullNode:
             avg_attempts = mining_stats['hash_attempts'] / mining_stats['blocks_mined']
             hash_rate = avg_attempts / 10  # Assuming ~10s per block
         
+        # ✅ MUSEUM-GRADE: Query wallet balance from server
+        wallet_balance = 0.0
+        try:
+            balance_response, _ = self.client.query_balance(self.miner_address)
+            if balance_response:
+                wallet_balance = float(balance_response.get('balance', 0))
+                logger.debug(f"[NODE] 💰 Wallet balance queried: {wallet_balance} QTCL")
+        except Exception as e:
+            logger.warning(f"[NODE] ⚠️  Could not query wallet balance: {e}")
+            # Calculate estimated from blocks mined
+            estimated_rewards = mining_stats.get('blocks_mined', 0) * 10.0
+            logger.debug(f"[NODE] 📊 Estimated rewards: {estimated_rewards} QTCL (not confirmed)")
+            wallet_balance = estimated_rewards
+        
         return {
             'miner': self.miner_address[:20] + '…',
             'miner_full': self.miner_address,
@@ -1302,6 +1400,13 @@ class QTCLFullNode:
                 'total_hash_attempts': mining_stats.get('hash_attempts', 0),
                 'avg_fidelity': mining_stats.get('avg_fidelity', 0.0),
                 'estimated_hash_rate': f"{hash_rate:.0f}" if hash_rate > 0 else "calculating",
+                'block_rewards': f"{mining_stats.get('blocks_mined', 0) * 10.0} QTCL",
+            },
+            'wallet': {
+                'address': self.miner_address,
+                'balance': wallet_balance,
+                'balance_formatted': f"{wallet_balance:.2f} QTCL",
+                'estimated_rewards': mining_stats.get('blocks_mined', 0) * 10.0,
             },
             'quantum': {
                 'w_state': {
@@ -1320,7 +1425,7 @@ class QTCLFullNode:
                 'oracle_url': self.w_state_recovery.oracle_url,
                 'peer_count': 0,  # Would need P2P impl
             },
-            'metrics_summary': f"Height={self.state.get_height()} | Blocks={mining_stats.get('blocks_mined', 0)} | F={mining_stats.get('avg_fidelity', 0.0):.4f} | Entangled={entanglement.get('established', False)}"
+            'metrics_summary': f"Height={self.state.get_height()} | Blocks={mining_stats.get('blocks_mined', 0)} | Balance={wallet_balance:.2f} QTCL | F={mining_stats.get('avg_fidelity', 0.0):.4f}"
         }
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -1538,11 +1643,17 @@ def main():
             print(f"  Chain Height:           {status['chain']['height']}")
             print(f"  Tip Hash:               {status['chain']['tip_hash']}")
             print(f"")
+            print(f"WALLET & REWARDS:")
+            print(f"  Address:                {status['wallet']['address']}")
+            print(f"  Balance:                {status['wallet']['balance_formatted']}")
+            print(f"  Estimated Rewards:      {status['wallet']['estimated_rewards']:.2f} QTCL")
+            print(f"")
             print(f"MEMPOOL:")
             print(f"  Pending Transactions:   {status['mempool']['size']}")
             print(f"")
             print(f"MINING METRICS:")
             print(f"  Blocks Mined:           {status['mining']['blocks_mined']}")
+            print(f"  Block Rewards Earned:   {status['mining']['block_rewards']}")
             print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
             print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
             print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
