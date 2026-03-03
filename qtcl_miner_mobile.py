@@ -408,8 +408,29 @@ class QuantumLatticeSchemaBuilder:
                     description TEXT,
                     applied_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
+                
+                CREATE TABLE IF NOT EXISTS difficulty_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    current_difficulty INTEGER NOT NULL DEFAULT 12,
+                    target_block_time_s REAL NOT NULL DEFAULT 30.0,
+                    retarget_window INTEGER NOT NULL DEFAULT 10,
+                    last_retarget_height INTEGER NOT NULL DEFAULT 0,
+                    ema_block_time_s REAL NOT NULL DEFAULT 30.0,
+                    ema_alpha REAL NOT NULL DEFAULT 0.2,
+                    min_difficulty INTEGER NOT NULL DEFAULT 8,
+                    max_difficulty INTEGER NOT NULL DEFAULT 32,
+                    total_blocks_retargeted INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
             """)
             self.conn.commit()
+            # Ensure difficulty_state row exists
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("INSERT OR IGNORE INTO difficulty_state (id) VALUES(1)")
+                self.conn.commit()
+            except:
+                pass
     
     def populate_lattice(self):
         tessellator = PoincareHyperbolicTessellator(max_depth=self.tessellation_depth)
@@ -1208,6 +1229,7 @@ _TX_SIGNER: Optional[HLWETransactionSigner] = None
 _ORACLE_BROADCASTER: Optional[OracleBroadcaster] = None
 _CONSENSUS_MGR: Optional[ConsensusManager] = None
 _PEER_SYNC: Optional[PeriodicPeerSync] = None
+db: Optional[sqlite3.Connection] = None  # Global database connection for schema and state
 
 LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
 API_PREFIX='/api'
@@ -2179,6 +2201,158 @@ class P2PClientWStateRecovery:
         logger.info("[W-STATE] ✅ Stopped")
 
 # ═════════════════════════════════════════════════════════════════════════════════
+# DIFFICULTY RETARGETING ENGINE - EXPONENTIAL MOVING AVERAGE (EMA) BASED
+# ═════════════════════════════════════════════════════════════════════════════════
+
+class DifficultyRetargeting:
+    """
+    Museum-grade difficulty retargeting using exponential moving average (EMA).
+    Targets consistent block time (default 30 seconds) through dynamic difficulty adjustment.
+    
+    Algorithm:
+    • Tracks actual block mining times
+    • Maintains EMA of block time with configurable smoothing factor
+    • Adjusts difficulty every N blocks (retarget window)
+    • Prevents extreme swings (min/max difficulty bounds)
+    • Persists state to database
+    
+    This ensures the network adjusts smoothly to changing hash rates while preventing
+    trivial or impossible difficulties.
+    """
+    
+    def __init__(self, db: sqlite3.Connection, target_block_time_s: float=30.0, 
+                 retarget_window: int=10, ema_alpha: float=0.2):
+        self.db=db
+        self.target_block_time_s=target_block_time_s
+        self.retarget_window=retarget_window
+        self.ema_alpha=ema_alpha
+        self.min_difficulty=8
+        self.max_difficulty=32
+        self._lock=threading.RLock()
+        
+        # Load state from database
+        self._load_state()
+        
+        logger.info(f"[DIFFICULTY] 🎯 Retargeting engine initialized | target={target_block_time_s}s | window={retarget_window} blocks | ema_α={ema_alpha}")
+    
+    def _load_state(self):
+        """Load difficulty state from database."""
+        try:
+            with self._lock:
+                cursor=self.db.cursor()
+                cursor.execute("SELECT current_difficulty, ema_block_time_s, last_retarget_height FROM difficulty_state WHERE id=1")
+                row=cursor.fetchone()
+                if row:
+                    self.current_difficulty=row[0]
+                    self.ema_block_time_s=row[1]
+                    self.last_retarget_height=row[2]
+                    logger.info(f"[DIFFICULTY] 📂 Loaded state | current_diff={self.current_difficulty} | ema_time={self.ema_block_time_s:.2f}s | last_retarget={self.last_retarget_height}")
+                else:
+                    self.current_difficulty=12
+                    self.ema_block_time_s=self.target_block_time_s
+                    self.last_retarget_height=0
+        except Exception as e:
+            logger.error(f"[DIFFICULTY] ❌ Failed to load state: {e}")
+            self.current_difficulty=12
+            self.ema_block_time_s=self.target_block_time_s
+            self.last_retarget_height=0
+    
+    def _save_state(self):
+        """Persist difficulty state to database."""
+        try:
+            with self._lock:
+                cursor=self.db.cursor()
+                cursor.execute("""
+                    UPDATE difficulty_state SET 
+                        current_difficulty=?, 
+                        ema_block_time_s=?, 
+                        last_retarget_height=?, 
+                        updated_at=?
+                    WHERE id=1
+                """, (self.current_difficulty, self.ema_block_time_s, self.last_retarget_height, int(time.time())))
+                self.db.commit()
+        except Exception as e:
+            logger.error(f"[DIFFICULTY] ❌ Failed to save state: {e}")
+    
+    def record_block_mining_time(self, height: int, mining_time_s: float):
+        """
+        Record actual mining time for a block and potentially trigger retargeting.
+        
+        Uses exponential moving average to smooth out variance:
+        ema_new = ema_old * (1 - α) + actual_time * α
+        
+        Then adjusts difficulty every retarget_window blocks.
+        """
+        with self._lock:
+            try:
+                # Update EMA with new mining time
+                old_ema=self.ema_block_time_s
+                self.ema_block_time_s=(old_ema * (1.0 - self.ema_alpha)) + (mining_time_s * self.ema_alpha)
+                
+                logger.debug(f"[DIFFICULTY] 📊 Block #{height} mining_time={mining_time_s:.2f}s | ema={self.ema_block_time_s:.2f}s")
+                
+                # Check if it's time to retarget
+                blocks_since_retarget=height - self.last_retarget_height
+                if blocks_since_retarget >= self.retarget_window:
+                    self._perform_retarget(height)
+                
+                # Save state periodically
+                if height % 5 == 0:
+                    self._save_state()
+            except Exception as e:
+                logger.error(f"[DIFFICULTY] ❌ Error recording block time: {e}")
+    
+    def _perform_retarget(self, height: int):
+        """
+        Adjust difficulty based on EMA block time vs target.
+        
+        Simple proportional adjustment:
+        • If actual_time > target: decrease difficulty (easier)
+        • If actual_time < target: increase difficulty (harder)
+        
+        Adjustment factor = target / actual (capped for stability)
+        new_diff = current_diff * adjustment_factor (clamped to min/max)
+        """
+        try:
+            time_ratio=self.target_block_time_s / max(self.ema_block_time_s, 0.1)
+            
+            # Clamp adjustment factor to prevent extreme swings
+            # Allow at most 2x increase or 0.5x decrease per retarget
+            adjustment_factor=max(0.5, min(2.0, time_ratio))
+            
+            old_difficulty=self.current_difficulty
+            new_difficulty=int(self.current_difficulty * adjustment_factor)
+            new_difficulty=max(self.min_difficulty, min(self.max_difficulty, new_difficulty))
+            
+            self.current_difficulty=new_difficulty
+            self.last_retarget_height=height
+            
+            direction="↑" if new_difficulty > old_difficulty else ("↓" if new_difficulty < old_difficulty else "=")
+            logger.info(f"[DIFFICULTY] 🎯 RETARGET at block #{height} | {direction} {old_difficulty} → {new_difficulty} | ema_time={self.ema_block_time_s:.2f}s (target {self.target_block_time_s}s)")
+            
+            # Save immediately after retarget
+            self._save_state()
+        except Exception as e:
+            logger.error(f"[DIFFICULTY] ❌ Retargeting failed: {e}")
+    
+    def get_current_difficulty(self)->int:
+        """Get current difficulty bits."""
+        with self._lock:
+            return self.current_difficulty
+    
+    def get_status(self)->Dict[str,Any]:
+        """Get difficulty status for logging/monitoring."""
+        with self._lock:
+            return {
+                'current_difficulty': self.current_difficulty,
+                'target_block_time_s': self.target_block_time_s,
+                'ema_block_time_s': self.ema_block_time_s,
+                'last_retarget_height': self.last_retarget_height,
+                'min_difficulty': self.min_difficulty,
+                'max_difficulty': self.max_difficulty,
+            }
+
+# ═════════════════════════════════════════════════════════════════════════════════
 # LIVE NODE CLIENT
 # ═════════════════════════════════════════════════════════════════════════════════
 
@@ -2327,9 +2501,10 @@ class Mempool:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QuantumMiner:
-    def __init__(self,w_state_recovery: P2PClientWStateRecovery,difficulty: int=12):
+    def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12):
         self.w_state_recovery=w_state_recovery
-        self.difficulty=difficulty
+        self.difficulty_engine=difficulty_engine
+        self.difficulty=difficulty  # fallback if engine not provided
         self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0}
         self._lock=threading.RLock()
     
@@ -2339,6 +2514,11 @@ class QuantumMiner:
             mining_start = time.time()
             
             logger.info(f"[MINING] ⛏️  Mining block #{height} with {len(transactions)} transactions")
+            
+            # Get current difficulty from engine (or use fallback)
+            current_difficulty=self.difficulty_engine.get_current_difficulty() if self.difficulty_engine else self.difficulty
+            
+            logger.info(f"[MINING] ⚙️  Using difficulty {current_difficulty} bits")
             
             # Measure W-state for entropy
             entropy_start = time.time()
@@ -2380,7 +2560,7 @@ class QuantumMiner:
                 parent_hash=parent_hash,
                 merkle_root='',
                 timestamp_s=int(time.time()),
-                difficulty_bits=self.difficulty,
+                difficulty_bits=current_difficulty,
                 nonce=0,
                 miner_address=miner_address,
                 w_state_fidelity=current_fidelity,
@@ -2450,6 +2630,10 @@ class QuantumMiner:
                     logger.info(f"[MINING]   • Lattice field: pq_curr={pq_curr_id[:16]}… → pq_last={pq_last_id[:16]}…")
                     logger.info(f"[MINING] ⏱️  Total mining time: {total_time:.2f}s")
                     
+                    # 🎯 RECORD MINING TIME FOR DIFFICULTY RETARGETING
+                    if self.difficulty_engine:
+                        self.difficulty_engine.record_block_mining_time(height, total_time)
+                    
                     # Rotate W-state for next iteration
                     self.w_state_recovery.rotate_entanglement_state()
                     
@@ -2476,14 +2660,24 @@ class QuantumMiner:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QTCLFullNode:
-    def __init__(self,miner_address: str,oracle_url: str='http://localhost:5000',difficulty: int=12):
+    def __init__(self, miner_address: str, oracle_url: str='http://localhost:5000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
+        self.db=db_connection  # Database connection for difficulty state
         
         self.client=LiveNodeClient()
         self.state=ChainState()
         self.mempool=Mempool()
         self.validator=ValidationEngine()
+        
+        # DIFFICULTY RETARGETING ENGINE
+        self.difficulty_engine=None
+        if self.db:
+            try:
+                self.difficulty_engine=DifficultyRetargeting(self.db, target_block_time_s=30.0, retarget_window=10, ema_alpha=0.2)
+                logger.info("[NODE] ✅ Difficulty retargeting engine initialized")
+            except Exception as e:
+                logger.warning(f"[NODE] ⚠️  Failed to initialize difficulty engine: {e}")
         
         # W-STATE RECOVERY
         peer_id=f"miner_{uuid.uuid4().hex[:12]}"
@@ -2494,8 +2688,8 @@ class QTCLFullNode:
             strict_signature_verification=True
         )
         
-        # MINING with W-state
-        self.miner=QuantumMiner(self.w_state_recovery,difficulty=difficulty)
+        # MINING with W-state and DYNAMIC DIFFICULTY
+        self.miner=QuantumMiner(self.w_state_recovery, difficulty_engine=self.difficulty_engine, difficulty=difficulty)
         
         self.sync_thread: Optional[threading.Thread]=None
         self.mining_thread: Optional[threading.Thread]=None
@@ -2785,6 +2979,30 @@ class QTCLFullNode:
                                 # ✅ BLOCK ACCEPTED - Update all systems atomically
                                 logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED by network | Response: {msg}")
                                 
+                                # ── Persist block to database immediately ──
+                                try:
+                                    db.execute("""
+                                        INSERT OR IGNORE INTO blocks 
+                                        (height, block_hash, parent_hash, merkle_root, timestamp_s, 
+                                         difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        block.header.height,
+                                        block.header.block_hash,
+                                        block.header.parent_hash,
+                                        block.header.merkle_root,
+                                        block.header.timestamp_s,
+                                        block.header.difficulty_bits,
+                                        block.header.nonce,
+                                        block.header.miner_address,
+                                        block.header.w_state_fidelity,
+                                        block.header.w_entropy_hash
+                                    ))
+                                    db.commit()
+                                    logger.debug(f"[MINING] 💾 Block #{block.header.height} persisted to database")
+                                except Exception as pe:
+                                    logger.warning(f"[MINING] ⚠️  Failed to persist block: {pe}")
+                                
                                 # ── Advance local chain state immediately ──
                                 # Do NOT wait for sync loop — update now so next iteration
                                 # mines block N+1, not N again.
@@ -2915,6 +3133,8 @@ class QTCLFullNode:
                 'avg_fidelity': mining_stats.get('avg_fidelity', 0.0),
                 'estimated_hash_rate': f"{hash_rate:.0f}" if hash_rate > 0 else "calculating",
                 'block_rewards': f"{mining_stats.get('blocks_mined', 0) * 10.0} QTCL",
+                'current_difficulty': self.difficulty_engine.get_current_difficulty() if self.difficulty_engine else self.miner.difficulty,
+                'ema_block_time_s': self.difficulty_engine.ema_block_time_s if self.difficulty_engine else 0.0,
             },
             'wallet': {
                 'address': self.miner_address,
@@ -3129,10 +3349,24 @@ def main():
                     sys.exit(1)
         
         # Start mining
+        # ─── DATABASE INITIALIZATION ────────────────────────────────────────────────────
+        global db
+        logger.info("[DB] 🔧 Initializing database...")
+        try:
+            db = sqlite3.connect(':memory:', check_same_thread=False)
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.commit()
+            logger.info("[DB] ✅ SQLite initialized with in-memory database")
+        except Exception as e:
+            logger.error(f"[DB] ❌ Database initialization failed: {e}")
+            sys.exit(1)
+        
         node=QTCLFullNode(
             miner_address=address,
             oracle_url=args.oracle_url,
-            difficulty=args.difficulty
+            difficulty=args.difficulty,
+            db_connection=db
         )
         
         node.fidelity_mode = args.fidelity_mode
@@ -3289,6 +3523,8 @@ def main():
             print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
             print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
             print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
+            print(f"  Current Difficulty:     {status['mining']['current_difficulty']} bits")
+            print(f"  EMA Block Time:         {status['mining']['ema_block_time_s']:.2f}s (target 30s)")
             print(f"")
             print(f"QUANTUM W-STATE ENTANGLEMENT:")
             print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
