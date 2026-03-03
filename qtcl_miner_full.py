@@ -472,7 +472,7 @@ class HyperbolicLattice:
             for i in range(self.n):
                 for j in range(self.n):
                     M[i, j] = self.G[i][j]
-            return abs(M.det())
+            return abs(mp.det(M))
         else:
             # Approximate determinant
             try:
@@ -534,7 +534,7 @@ class HyperbolicLattice:
         return 0.0
     
     def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
-        """
+        r"""
         Compute smoothing parameter eta_epsilon(Lambda) = min{s > 0 : rho_{1/s}(Lambda*\{0}) <= epsilon}
         where rho_{1/s}(x) = exp(-pi s^2 ||x||^2)
         """
@@ -3567,7 +3567,9 @@ def main():
                 address = wallet.address
                 logger.info(f"[WALLET] Loaded: {address}")
             else:
-                logger.error("[WALLET] Failed to load wallet")
+                error_msg = "[WALLET] Failed to load wallet"
+                logger.error(error_msg)
+                print(f"ERROR: {error_msg}", file=sys.stderr)
                 sys.exit(1)
         
         if args.register:
@@ -3588,7 +3590,9 @@ def main():
                     logger.info("[REGISTER] ✅ Successfully registered")
                     return
                 else:
-                    logger.error("[REGISTER] ❌ Registration failed")
+                    error_msg = "[REGISTER] ❌ Registration failed"
+                    logger.error(error_msg)
+                    print(f"ERROR: {error_msg}", file=sys.stderr)
                     sys.exit(1)
         
         node = QTCLFullNode(
@@ -3605,7 +3609,9 @@ def main():
             logger.warning("[INIT] Strict W-state verification enabled")
         
         if not node.start():
-            logger.error("[MAIN] ❌ Failed to start node")
+            error_msg = "[MAIN] ❌ Failed to start node"
+            logger.error(error_msg)
+            print(f"ERROR: {error_msg}", file=sys.stderr)
             sys.exit(1)
         
         while True:
