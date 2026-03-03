@@ -465,114 +465,154 @@ class HyperbolicLattice:
         
         return G
     
-    def _compute_volume(self) -> mpf:
-        """Compute determinant of Gram matrix = squared volume"""
-        if MPMATH_AVAILABLE:
-            M = matrix(self.n, self.n)
-            for i in range(self.n):
-                for j in range(self.n):
-                    M[i, j] = self.G[i][j]
-            return abs(M.det())
-        else:
-            # Approximate determinant
-            try:
-                import numpy as np
-                M = np.array([[float(self.G[i][j]) for j in range(self.n)] for i in range(self.n)])
-                return abs(np.linalg.det(M))
-            except:
-                return mpf(1.0)
-    
-    def _dual_basis(self) -> List[List[mpf]]:
-        """Compute dual basis v_i* such that ⟨v_i*, v_j⟩ = δ_ij"""
-        if MPMATH_AVAILABLE and self.n <= 50:
-            # Solve G * [coeffs] = e_i
-            M = matrix(self.n, self.n)
-            for i in range(self.n):
-                for j in range(self.n):
-                    M[i, j] = self.G[i][j]
-            
-            dual = []
-            for i in range(self.n):
-                # Create unit vector
-                e = matrix(self.n, 1)
-                e[i, 0] = mpf(1)
-                
-                # Solve for coefficients
-                try:
-                    coeffs = M.solve(e)
-                except:
-                    coeffs = [mpf(0) for _ in range(self.n)]
-                
-                # Build dual vector
-                v_star = [mpf(0) for _ in range(self.n)]
-                for j in range(self.n):
-                    c = coeffs[j, 0] if j < len(coeffs) else mpf(0)
-                    for k in range(self.n):
-                        if k < len(self.basis[j]) and k < len(v_star):
-                            v_star[k] += c * self.basis[j][k]
-                
-                dual.append(v_star)
-            
-            return dual
-        else:
-            # Fallback
-            return self.basis
-    
-    def norm(self, v: List[mpf]) -> float:
-        """Compute hyperbolic norm of vector"""
-        if len(v) >= 2:
-            p = HyperbolicPoint(float(v[0]), float(v[1]))
-            return p.norm
-        return 0.0
-    
-    def inner_product(self, v: List[mpf], w: List[mpf]) -> float:
-        """Hyperbolic inner product"""
-        if len(v) >= 2 and len(w) >= 2:
-            p1 = HyperbolicPoint(float(v[0]), float(v[1]))
-            p2 = HyperbolicPoint(float(w[0]), float(w[1]))
-            return -cosh(p1.distance_to(p2)) if MPMATH_AVAILABLE else -math.cosh(p1.distance_to(p2))
-        return 0.0
-    
-def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
-    r"""
-    Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ* \ {0}) ≤ ε}
-    where ρ_{1/s}(x) = exp(-π s^2 ‖x‖^2)
-    
-    The smoothing parameter η_ε(Λ) is the smallest s such that the Gaussian
-    measure of the dual lattice minus the origin is at most ε. This is a
-    critical quantity in lattice-based cryptography that determines the
-    hardness of the Learning With Errors problem.
-    
-    For a lattice Λ of dimension n with volume det(Λ), the Gaussian heuristic
-    gives an approximation:
-        η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
-    
-    where λ_1(Λ*) is the length of the shortest non-zero vector in the dual
-    lattice. Using the Gaussian heuristic for the shortest vector:
-        λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
-    
-    Args:
-        epsilon: Error tolerance (default 1e-9)
+def _compute_volume(self) -> mpf:
+    """Compute determinant of Gram matrix = squared volume"""
+    if MPMATH_AVAILABLE:
+        from mpmath import det
+        M = matrix(self.n, self.n)
+        for i in range(self.n):
+            for j in range(self.n):
+                M[i, j] = self.G[i][j]
+        try:
+            # mpmath uses det() function, not .det() method
+            return abs(det(M))
+        except:
+            return mpf(1.0)
+    else:
+        # Approximate determinant
+        try:
+            import numpy as np
+            M = np.array([[float(self.G[i][j]) for j in range(self.n)] for i in range(self.n)])
+            return abs(np.linalg.det(M))
+        except:
+            return mpf(1.0)
+
+def _dual_basis(self) -> List[List[mpf]]:
+    """Compute dual basis v_i* such that ⟨v_i*, v_j⟩ = δ_ij"""
+    if MPMATH_AVAILABLE and self.n <= 50:
+        from mpmath import lu_solve
+        # Solve G * [coeffs] = e_i
+        M = matrix(self.n, self.n)
+        for i in range(self.n):
+            for j in range(self.n):
+                M[i, j] = self.G[i][j]
         
-    Returns:
-        Estimated smoothing parameter η_ε(Λ)
+        dual = []
+        for i in range(self.n):
+            # Create unit vector
+            e = [mpf(0) for _ in range(self.n)]
+            e[i] = mpf(1)
+            
+            # Solve for coefficients using LU decomposition
+            try:
+                coeffs = lu_solve(M, e)
+            except:
+                coeffs = [mpf(0) for _ in range(self.n)]
+            
+            # Build dual vector
+            v_star = [mpf(0) for _ in range(self.n)]
+            for j in range(self.n):
+                c = coeffs[j] if j < len(coeffs) else mpf(0)
+                for k in range(self.n):
+                    if k < len(self.basis[j]) and k < len(v_star):
+                        v_star[k] += c * self.basis[j][k]
+            
+            dual.append(v_star)
+        
+        return dual
+    else:
+        # Fallback
+        return self.basis
+
+def lll_reduce(self, delta: float = 0.99) -> List[List[mpf]]:
     """
-    # Approximate using Gaussian heuristic
+    LLL lattice basis reduction.
+    Used for parameter validation and security estimation.
+    """
+    if not MPMATH_AVAILABLE or self.n > 20:
+        return self.basis
+    
+    from mpmath import sqrt
+    
+    # Convert to mpmath matrix
     n = self.n
-    vol = float(self.volume)
-    if vol <= 0:
-        vol = 1.0
+    B = matrix(n, n)
+    for i in range(n):
+        for j in range(min(n, len(self.basis[i]))):
+            B[i, j] = self.basis[i][j]
     
-    # Gaussian heuristic for shortest vector in dual lattice
-    # λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
-    gh = math.sqrt(n / (2 * math.pi * math.e)) * (vol ** (1.0 / n))
+    # Gram-Schmidt
+    mu = [[mpf(0) for _ in range(n)] for _ in range(n)]
+    B_norm = [mpf(0) for _ in range(n)]
     
-    # Smoothing parameter approximation
-    # η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
-    log_term = math.log(2 * n * (1 + 1.0 / epsilon))
-    eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
+    for i in range(n):
+        # Compute B_norm[i] = ||b_i*||
+        v = [mpf(0) for _ in range(n)]
+        for k in range(n):
+            v[k] = B[i, k]
+        
+        for j in range(i):
+            # Compute dot product
+            dot = mpf(0)
+            for k in range(n):
+                dot += B[i, k] * B[j, k]
+            mu[i][j] = dot / B_norm[j]
+            
+            for k in range(n):
+                v[k] -= mu[i][j] * B[j, k]
+        
+        # Compute norm
+        norm_sq = mpf(0)
+        for k in range(n):
+            norm_sq += v[k] * v[k]
+        B_norm[i] = sqrt(max(norm_sq, mpf(1e-300)))
     
-    return eta
+    # LLL reduction (simplified)
+    k = 1
+    while k < n:
+        # Size reduction
+        for j in range(k-1, -1, -1):
+            if abs(mu[k][j]) > 0.5:
+                # b_k = b_k - round(mu[k][j]) * b_j
+                r = round(mu[k][j])
+                for col in range(n):
+                    B[k, col] -= r * B[j, col]
+                
+                # Update mu
+                for l in range(j+1):
+                    mu[k][l] -= r * mu[j][l]
+        
+        # Lovász condition
+        if B_norm[k] >= (delta - mu[k][k-1]**2) * B_norm[k-1]:
+            k += 1
+        else:
+            # Swap b_k and b_{k-1}
+            for col in range(n):
+                B[k, col], B[k-1, col] = B[k-1, col], B[k, col]
+            
+            # Update mu and B_norm
+            mu_k = mu[k][k-1]
+            delta_norm = B_norm[k] + mu_k**2 * B_norm[k-1]
+            if delta_norm > 0:
+                mu[k][k-1] = mu_k * B_norm[k-1] / delta_norm
+                B_norm[k] *= B_norm[k-1] / delta_norm
+                B_norm[k-1] = delta_norm
+            
+            # Update remaining mu
+            for i in range(k+1, n):
+                t = mu[i][k]
+                mu[i][k] = mu[i][k-1] - mu_k * t
+                mu[i][k-1] = t + mu[k][k-1] * mu[i][k]
+            
+            k = max(k-1, 1)
+    
+    # Convert back
+    reduced = []
+    for i in range(n):
+        vec = [float(B[i, j]) for j in range(n)]
+        reduced.append([mpf(x) for x in vec])
+    
+    return reduced
     
     def sample_gaussian(self, sigma: float = 3.2) -> List[int]:
         """
