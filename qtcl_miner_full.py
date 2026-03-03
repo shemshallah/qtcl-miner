@@ -3555,6 +3555,7 @@ def main():
         if args.wallet_init:
             if not args.wallet_password:
                 args.wallet_password = input("Enter wallet password: ")
+            wallet = QuickWallet()
             address = wallet.create(args.wallet_password)
             logger.info(f"[WALLET] Created: {address}")
             logger.info(f"[WALLET] Public Key: {wallet.public_key}")
@@ -3565,6 +3566,7 @@ def main():
         if args.address:
             address = args.address
         else:
+            wallet = QuickWallet()
             if not args.wallet_password:
                 args.wallet_password = input("Enter wallet password: ")
             if wallet.load(args.wallet_password):
@@ -3581,6 +3583,9 @@ def main():
             if not all([args.miner_id, args.wallet_password]):
                 logger.error("[REGISTER] --miner-id and --wallet-password required")
                 sys.exit(1)
+            
+            wallet = QuickWallet()
+            wallet.load(args.wallet_password)
             
             registry = MinerRegistry(args.oracle_url)
             if registry.register(
