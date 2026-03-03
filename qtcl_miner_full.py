@@ -1577,12 +1577,6 @@ class ClayMinerWallet:
         result = self.clay.create_wallet(password)
         self.current_fingerprint = result['wallet_fingerprint']
         self._address = result['first_address']
-         
-        # FIX: Extract public_key from result
-        if 'public_key' in result and result['public_key']:
-            self._public_key = result['public_key']
-        elif 'master_key' in result and hasattr(result['master_key'], 'public_key'):
-            self._public_key = result['master_key'].public_key.hex() if result['master_key'].public_key else None
         
         # Store fingerprint
         with open(self.wallet_file, 'w') as f:
@@ -3406,11 +3400,6 @@ class QuickWallet:
         result = self.hlwe_wallet.create(password)
         self.address = result
         self.public_key = self.hlwe_wallet.public_key
-        # FIX: Ensure public_key is not None
-        if not self.public_key:
-            logger.warning("[WALLET] Public key extraction failed, attempting fallback")
-            if hasattr(self.hlwe_wallet, 'current_master') and self.hlwe_wallet.current_master:
-                self.public_key = self.hlwe_wallet.current_master.public_key.hex() if hasattr(self.hlwe_wallet.current_master, 'public_key') else None
         self._save(password)
         
         db.execute("""
@@ -3557,9 +3546,6 @@ def main():
     args = parse_args()
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    # DEDUPLICATION FIX: Create wallet ONCE, reuse everywhere
-    wallet = None
-    
     try:
         if args.wallet_init:
             if not args.wallet_password:
@@ -3571,7 +3557,6 @@ def main():
             logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
             return
         
-        # DEDUPLICATION: Single wallet creation
         if args.address:
             address = args.address
         else:
@@ -3592,30 +3577,23 @@ def main():
                 logger.error("[REGISTER] --miner-id and --wallet-password required")
                 sys.exit(1)
             
-            # DEDUPLICATION: Reuse wallet instance (already loaded above)
-            if not wallet:
-                wallet = QuickWallet()
-                if not wallet.load(args.wallet_password):
-                    error_msg = "[REGISTER] Failed to load wallet"
+            wallet = QuickWallet()
+            if wallet.load(args.wallet_password):
+                registry = MinerRegistry(args.oracle_url)
+                if registry.register(
+                    miner_id=args.miner_id,
+                    address=wallet.address,
+                    public_key=wallet.public_key or '',
+                    private_key=wallet.private_key or '',
+                    miner_name=args.miner_name
+                ):
+                    logger.info("[REGISTER] ✅ Successfully registered")
+                    return
+                else:
+                    error_msg = "[REGISTER] ❌ Registration failed"
                     logger.error(error_msg)
                     print(f"ERROR: {error_msg}", file=sys.stderr)
                     sys.exit(1)
-            
-            registry = MinerRegistry(args.oracle_url)
-            if registry.register(
-                miner_id=args.miner_id,
-                address=wallet.address,
-                public_key=wallet.public_key or '',
-                private_key=wallet.private_key or '',
-                miner_name=args.miner_name
-            ):
-                logger.info("[REGISTER] ✅ Successfully registered")
-                return
-            else:
-                error_msg = "[REGISTER] ❌ Registration failed"
-                logger.error(error_msg)
-                print(f"ERROR: {error_msg}", file=sys.stderr)
-                sys.exit(1)
         
         node = QTCLFullNode(
             miner_address=address,
