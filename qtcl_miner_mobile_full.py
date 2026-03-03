@@ -2939,7 +2939,7 @@ class QuantumMiner:
 # =============================================================================
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str = 'http://qtcl-blockchain.koyeb.app:8000', difficulty: int = 12):
+    def __init__(self, miner_address: str, oracle_url: str = 'https://qtcl-blockchain.koyeb.app', difficulty: int = 12):
         self.miner_address = miner_address
         self.running = False
         
@@ -3661,7 +3661,7 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with HLWE')
     parser.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url', '-o', default='http://qtcl-blockchain.koyeb.app:8000', help='Oracle URL (default: http://qtcl-blockchain.koyeb.app:8000)')
+    parser.add_argument('--oracle-url', '-o', default='https://qtcl-blockchain.koyeb.app', help='Oracle URL (default: https://qtcl-blockchain.koyeb.app)')
     parser.add_argument('--difficulty', '-d', type=int, default=DEFAULT_DIFFICULTY, help='Mining difficulty bits')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     parser.add_argument('--wallet-init', action='store_true', help='Initialize new wallet')
@@ -3680,7 +3680,11 @@ def main():
     try:
         if args.wallet_init:
             if not args.wallet_password:
-                args.wallet_password = getpass.getpass("Enter wallet password: ", stream=sys.stderr)
+                try:
+                    args.wallet_password = getpass.getpass("Enter wallet password: ")
+                except (EOFError, OSError):
+                    # Fallback for mobile/embedded environments without proper TTY
+                    args.wallet_password = input("Enter wallet password: ")
             wallet = QuickWallet()
             address = wallet.create(args.wallet_password)
             logger.info(f"[WALLET] Created: {address}")
@@ -3694,7 +3698,11 @@ def main():
         else:
             wallet = QuickWallet()
             if not args.wallet_password:
-                args.wallet_password = getpass.getpass("Enter wallet password: ", stream=sys.stderr)
+                try:
+                    args.wallet_password = getpass.getpass("Enter wallet password: ")
+                except (EOFError, OSError):
+                    # Fallback for mobile/embedded environments without proper TTY
+                    args.wallet_password = input("Enter wallet password: ")
             if wallet.load(args.wallet_password):
                 address = wallet.address
                 logger.info(f"[WALLET] Loaded: {address}")
