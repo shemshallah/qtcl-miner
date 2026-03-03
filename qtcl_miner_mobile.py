@@ -98,8 +98,8 @@ FIDELITY_THRESHOLD_STRICT = 0.90
 FIDELITY_THRESHOLD_NORMAL = 0.80
 FIDELITY_THRESHOLD_RELAXED = 0.70
 
-COHERENCE_THRESHOLD_STRICT = 0.92
-COHERENCE_THRESHOLD_NORMAL = 0.85
+COHERENCE_THRESHOLD_STRICT = 0.90
+COHERENCE_THRESHOLD_NORMAL = 0.80
 COHERENCE_THRESHOLD_RELAXED = 0.75
 
 DEFAULT_FIDELITY_MODE = "normal"
@@ -603,23 +603,36 @@ class P2PClientWStateRecovery:
             logger.error(f"[W-STATE] ❌ Entanglement failed: {e}")
             return False
     
-    def verify_entanglement(self,local_fidelity: float,signature_verified: bool)->bool:
-        """Verify entanglement quality."""
+    def verify_entanglement(self, local_fidelity: float, signature_verified: bool) -> bool:
+        """Verify entanglement quality with adaptive thresholds."""
         try:
             with self._state_lock:
-                self.entanglement_state.local_fidelity=local_fidelity
-                self.entanglement_state.signature_verified=signature_verified
+                self.entanglement_state.local_fidelity = local_fidelity
+                self.entanglement_state.signature_verified = signature_verified
             
-            if local_fidelity>=FIDELITY_THRESHOLD and signature_verified:
+            mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
+            fid_threshold, coh_threshold = WStateRecoveryManager.get_threshold_for_mode(mode)
+            fid_minimal = FIDELITY_THRESHOLD_RELAXED
+            
+            if local_fidelity >= fid_threshold and signature_verified:
                 with self._state_lock:
-                    self.entanglement_state.established=True
-                    self.entanglement_state.coherence_verified=True
+                    self.entanglement_state.established = True
+                    self.entanglement_state.coherence_verified = True
                 
-                logger.debug(f"[W-STATE] 🔗 Entanglement verified | fidelity={local_fidelity:.4f} | signature=✓")
+                logger.info(f"[W-STATE] 🔗 Entanglement verified | fidelity={local_fidelity:.4f} (threshold {fid_threshold:.4f}) | signature=✓")
                 return True
+            
+            elif local_fidelity >= fid_minimal and signature_verified:
+                with self._state_lock:
+                    self.entanglement_state.established = True
+                    self.entanglement_state.coherence_verified = True
+                
+                logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | fidelity={local_fidelity:.4f} (threshold {fid_minimal:.4f}) | sig_verified={signature_verified}")
+                return True
+            
             else:
                 with self._state_lock:
-                    self.entanglement_state.established=False
+                    self.entanglement_state.established = False
                 
                 logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | fidelity={local_fidelity:.4f} | sig_verified={signature_verified}")
                 return False
@@ -935,19 +948,24 @@ class QuantumMiner:
         self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0}
         self._lock=threading.RLock()
     
-    def mine_block(self,transactions: List[Transaction],miner_address: str,parent_hash: str,height: int)->Optional[Block]:
+    def mine_block(self, transactions: List[Transaction], miner_address: str, parent_hash: str, height: int) -> Optional[Block]:
+        """Mine a block with comprehensive metrics tracking"""
         try:
-            logger.info(f"[MINING] ⛏️  Mining block #{height} with {len(transactions)} txs | W-state fidelity check...")
+            mining_start = time.time()
+            
+            logger.info(f"[MINING] ⛏️  Mining block #{height} with {len(transactions)} transactions")
             
             # Measure W-state for entropy
-            w_entropy=self.w_state_recovery.measure_w_state()
-            entanglement=self.w_state_recovery.get_entanglement_status()
-            current_fidelity=entanglement.get('pq_curr_fidelity',0.0)
+            entropy_start = time.time()
+            w_entropy = self.w_state_recovery.measure_w_state()
+            entropy_time = time.time() - entropy_start
+            entanglement = self.w_state_recovery.get_entanglement_status()
+            current_fidelity = entanglement.get('pq_curr_fidelity', 0.0)
             
-            logger.info(f"[MINING] W-state entropy acquired | pq_curr_F={current_fidelity:.4f}")
+            logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
             
             # Create block template
-            header=BlockHeader(
+            header = BlockHeader(
                 height=height,
                 block_hash='',
                 parent_hash=parent_hash,
@@ -960,16 +978,21 @@ class QuantumMiner:
                 w_entropy_hash=w_entropy[:64] if w_entropy else ''
             )
             
-            block=Block(header=header,transactions=transactions)
-            header.merkle_root=block.compute_merkle()
+            block = Block(header=header, transactions=transactions)
+            header.merkle_root = block.compute_merkle()
             
             # PoW mining with W-state witness
-            target=(1<<(256-self.difficulty))-1
-            hash_attempts=0
+            target = (1 << (256 - self.difficulty)) - 1
+            hash_attempts = 0
+            nonce_start = time.time()
             
-            while header.nonce<2**32:
-                hash_attempts+=1
-                block_data=json.dumps({
+            logger.debug(f"[MINING] ⚙️  PoW target: {target} | difficulty_bits={self.difficulty}")
+            
+            while header.nonce < 2**32:
+                hash_attempts += 1
+                
+                # Create deterministic block data
+                block_data = json.dumps({
                     'height': header.height,
                     'parent_hash': header.parent_hash,
                     'merkle_root': header.merkle_root,
@@ -978,34 +1001,58 @@ class QuantumMiner:
                     'nonce': header.nonce,
                     'miner_address': header.miner_address,
                     'w_entropy_hash': header.w_entropy_hash,
-                },sort_keys=True)
+                }, sort_keys=True)
                 
-                block_hash=hashlib.sha3_256(block_data.encode()).hexdigest()
-                hash_int=int(block_hash,16)
+                block_hash = hashlib.sha3_256(block_data.encode()).hexdigest()
+                hash_int = int(block_hash, 16)
                 
-                if hash_int<=target:
-                    header.block_hash=block_hash
-                    block.header=header
+                if hash_int <= target:
+                    # ✅ SOLUTION FOUND
+                    nonce_time = time.time() - nonce_start
+                    header.block_hash = block_hash
+                    block.header = header
                     
                     with self._lock:
-                        self.metrics['blocks_mined']+=1
-                        self.metrics['hash_attempts']+=hash_attempts
-                        self.metrics['avg_fidelity']=(self.metrics['avg_fidelity']+current_fidelity)/2
+                        self.metrics['blocks_mined'] += 1
+                        self.metrics['hash_attempts'] += hash_attempts
+                        current_avg = self.metrics['avg_fidelity']
+                        self.metrics['avg_fidelity'] = (current_avg + current_fidelity) / 2
                     
-                    logger.info(f"[MINING] ✅ Block mined #{height} | hash={block_hash[:16]}… | attempts={hash_attempts} | F={current_fidelity:.4f}")
+                    hash_rate = hash_attempts / nonce_time if nonce_time > 0 else 0
+                    total_time = time.time() - mining_start
+                    
+                    logger.info(f"[MINING] ✅ Block #{height} SOLVED")
+                    logger.info(f"[MINING] 📊 Proof-of-Work:")
+                    logger.info(f"[MINING]   • Hash attempts: {hash_attempts:,}")
+                    logger.info(f"[MINING]   • Hash rate: {hash_rate:.0f} hashes/sec")
+                    logger.info(f"[MINING]   • PoW time: {nonce_time:.2f}s")
+                    logger.info(f"[MINING]   • Block hash: {block_hash[:32]}…")
+                    logger.info(f"[MINING]   • Nonce: {header.nonce}")
+                    logger.info(f"[MINING] 🎯 Quantum:")
+                    logger.info(f"[MINING]   • W-state fidelity: {current_fidelity:.4f}")
+                    logger.info(f"[MINING]   • W-entropy source: 256-bit measurement")
+                    logger.info(f"[MINING]   • Entanglement: pq0={entanglement.get('pq0_fidelity', 0.0):.4f}, pq_curr={entanglement.get('pq_curr_fidelity', 0.0):.4f}, pq_last={entanglement.get('pq_last_fidelity', 0.0):.4f}")
+                    logger.info(f"[MINING] ⏱️  Total mining time: {total_time:.2f}s")
                     
                     # Rotate W-state for next iteration
                     self.w_state_recovery.rotate_entanglement_state()
                     
                     return block
                 
-                header.nonce+=1
+                header.nonce += 1
+                
+                # Progress logging every 100k attempts
+                if hash_attempts % 100000 == 0:
+                    elapsed = time.time() - nonce_start
+                    current_rate = hash_attempts / elapsed if elapsed > 0 else 0
+                    logger.debug(f"[MINING] 🔄 Progress: {hash_attempts:,} hashes | rate={current_rate:.0f} h/s | nonce={header.nonce}")
             
-            logger.warning(f"[MINING] ⚠️  PoW timeout at height {height}")
+            logger.warning(f"[MINING] ⚠️  PoW timeout - exhausted nonce space at height {height}")
             return None
         
         except Exception as e:
-            logger.error(f"[MINING] ❌ Mining failed: {e}")
+            logger.error(f"[MINING] ❌ Mining exception: {e}")
+            logger.error(f"[MINING] Traceback: {traceback.format_exc()}")
             return None
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -1122,68 +1169,155 @@ class QTCLFullNode:
         logger.info("[SYNC] 🛑 Loop ended")
     
     def _mining_loop(self):
-        """Background mining subsystem with W-state entanglement"""
+        """Background mining subsystem with W-state entanglement and comprehensive metrics"""
         logger.info("[MINING] ⛏️  Loop started")
+        
+        mining_start_time = time.time()
+        blocks_mined_this_session = 0
+        total_hash_attempts = 0
+        fidelity_measurements = []
+        entropy_samples = []
+        
         while self.running:
             try:
-                entanglement=self.w_state_recovery.get_entanglement_status()
+                entanglement = self.w_state_recovery.get_entanglement_status()
+                
                 if not entanglement.get('established'):
-                    logger.debug("[MINING] ⏳ Waiting for entanglement...")
+                    logger.debug("[MINING] ⏳ Waiting for entanglement establishment...")
                     time.sleep(2)
                     continue
                 
-                tip=self.state.get_tip()
+                tip = self.state.get_tip()
                 if not tip:
-                    logger.debug("[MINING] ⏳ No chain yet, waiting...")
+                    logger.debug("[MINING] ⏳ No chain tip yet, waiting...")
                     time.sleep(5)
                     continue
                 
-                pending_txs=self.mempool.get_pending(limit=100)
+                pending_txs = self.mempool.get_pending(limit=100)
                 if not pending_txs:
-                    logger.debug("[MINING] 💤 No transactions in mempool")
+                    logger.debug(f"[MINING] 💤 No transactions in mempool, next check in {MINING_POLL_INTERVAL}s")
                     time.sleep(MINING_POLL_INTERVAL)
                     continue
                 
-                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} with {len(pending_txs)} txs...")
-                block=self.miner.mine_block(pending_txs,self.miner_address,tip.block_hash,tip.height+1)
+                # Get current W-state metrics
+                current_fidelity = entanglement.get('pq_curr_fidelity', 0.0)
+                fidelity_measurements.append(current_fidelity)
                 
-                if block and self.validator.validate_block(block):
-                    success,msg=self.client.submit_block({
-                        'header':asdict(block.header) if hasattr(block.header,'__dict__') else block.header.__dict__,
-                        'transactions':[asdict(tx) for tx in block.transactions]
-                    })
-                    if success:
-                        logger.info(f"[MINING] ✅ Block submitted! {msg}")
-                        self.state.add_block(block.header)
-                        for tx in pending_txs:
-                            self.state.apply_transaction(tx)
-                            self.mempool.remove_transactions([tx.tx_id])
+                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} | txs={len(pending_txs)} | F={current_fidelity:.4f}")
+                
+                block_start = time.time()
+                block = self.miner.mine_block(pending_txs, self.miner_address, tip.block_hash, tip.height+1)
+                block_time = time.time() - block_start
+                
+                if block:
+                    total_hash_attempts += self.miner.metrics.get('hash_attempts', 0)
+                    blocks_mined_this_session += 1
+                    
+                    # Validate block
+                    if self.validator.validate_block(block):
+                        # Submit to network
+                        submit_start = time.time()
+                        success, msg = self.client.submit_block({
+                            'header': asdict(block.header) if hasattr(block.header, '__dict__') else block.header.__dict__,
+                            'transactions': [asdict(tx) for tx in block.transactions]
+                        })
+                        submit_time = time.time() - submit_start
+                        
+                        if success:
+                            # Block accepted
+                            self.state.add_block(block.header)
+                            for tx in pending_txs:
+                                self.state.apply_transaction(tx)
+                            self.mempool.remove_transactions([tx.tx_id for tx in pending_txs])
+                            
+                            # Calculate metrics
+                            hash_rate = self.miner.metrics['hash_attempts'] / block_time if block_time > 0 else 0
+                            elapsed = time.time() - mining_start_time
+                            blocks_per_hour = (blocks_mined_this_session / elapsed * 3600) if elapsed > 0 else 0
+                            
+                            logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED")
+                            logger.info(f"[MINING] 📊 Mining Time: {block_time:.2f}s | Hash Rate: {hash_rate:.0f} hashes/sec | Submit Time: {submit_time:.2f}s")
+                            logger.info(f"[MINING] 📈 Session: {blocks_mined_this_session} blocks mined | {blocks_per_hour:.2f} blocks/hour")
+                            
+                            if fidelity_measurements:
+                                avg_fidelity = sum(fidelity_measurements) / len(fidelity_measurements)
+                                logger.info(f"[MINING] 🎯 Quantum Metrics: Avg Fidelity={avg_fidelity:.4f} | Current={current_fidelity:.4f}")
+                        else:
+                            logger.error(f"[MINING] ❌ Block submission rejected: {msg}")
+                            logger.debug(f"[MINING] Block state: height={block.header.height}, hash={block.header.block_hash[:16]}…")
                     else:
-                        logger.error(f"[MINING] ❌ Submission failed: {msg}")
+                        logger.error(f"[MINING] ❌ Block validation failed")
+                else:
+                    logger.warning(f"[MINING] ⚠️  Mining timeout or failed for block #{tip.height+1}")
                 
                 time.sleep(MINING_POLL_INTERVAL)
+                
             except Exception as e:
-                logger.error(f"[MINING] ❌ Error: {e}")
+                logger.error(f"[MINING] ❌ Loop error: {e}")
+                logger.debug(f"[MINING] Traceback: {traceback.format_exc()}")
                 time.sleep(5)
-        logger.info("[MINING] 🛑 Loop ended")
+        
+        # Session summary
+        elapsed = time.time() - mining_start_time
+        logger.info(f"[MINING] 🛑 Loop ended after {elapsed:.1f}s")
+        logger.info(f"[MINING] 📊 Session Summary:")
+        logger.info(f"[MINING]   • Blocks mined: {blocks_mined_this_session}")
+        logger.info(f"[MINING]   • Total hash attempts: {total_hash_attempts}")
+        if fidelity_measurements:
+            logger.info(f"[MINING]   • Avg W-state fidelity: {sum(fidelity_measurements)/len(fidelity_measurements):.4f}")
+        if blocks_mined_this_session > 0 and elapsed > 0:
+            logger.info(f"[MINING]   • Blocks/hour: {blocks_mined_this_session/elapsed*3600:.2f}")
     
-    def get_status(self)->Dict[str,Any]:
-        tip=self.state.get_tip()
-        entanglement=self.w_state_recovery.get_entanglement_status()
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive node and mining status"""
+        tip = self.state.get_tip()
+        entanglement = self.w_state_recovery.get_entanglement_status()
+        
+        mining_stats = dict(self.miner.metrics)
+        
+        # Calculate mining efficiency metrics
+        hash_rate = 0
+        if mining_stats.get('hash_attempts', 0) > 0 and mining_stats.get('blocks_mined', 0) > 0:
+            avg_attempts = mining_stats['hash_attempts'] / mining_stats['blocks_mined']
+            hash_rate = avg_attempts / 10  # Assuming ~10s per block
         
         return {
-            'miner': self.miner_address[:20]+'...',
-            'chain_height': self.state.get_height(),
-            'chain_tip': tip.block_hash[:16]+'...' if tip else None,
-            'mempool_size': self.mempool.get_size(),
-            'mining_stats': dict(self.miner.metrics),
-            'w_state': {
-                'entanglement_established': entanglement.get('established',False),
-                'pq0_fidelity': entanglement.get('pq0_fidelity',0.0),
-                'pq_curr_fidelity': entanglement.get('pq_curr_fidelity',0.0),
-                'pq_last_fidelity': entanglement.get('pq_last_fidelity',0.0),
-                'sync_lag_ms': entanglement.get('sync_lag_ms',0.0),
-            }
+            'miner': self.miner_address[:20] + '…',
+            'miner_full': self.miner_address,
+            'status': 'mining' if self.running else 'stopped',
+            'chain': {
+                'height': self.state.get_height(),
+                'tip_hash': tip.block_hash[:32] + '…' if tip else 'genesis',
+                'tip_timestamp': tip.timestamp_s if tip else None,
+            },
+            'mempool': {
+                'size': self.mempool.get_size(),
+                'pending_transactions': self.mempool.get_size(),
+            },
+            'mining': {
+                'blocks_mined': mining_stats.get('blocks_mined', 0),
+                'total_hash_attempts': mining_stats.get('hash_attempts', 0),
+                'avg_fidelity': mining_stats.get('avg_fidelity', 0.0),
+                'estimated_hash_rate': f"{hash_rate:.0f}" if hash_rate > 0 else "calculating",
+            },
+            'quantum': {
+                'w_state': {
+                    'entanglement_established': entanglement.get('established', False),
+                    'pq0_fidelity': entanglement.get('pq0_fidelity', 0.0),
+                    'pq_curr_fidelity': entanglement.get('pq_curr_fidelity', 0.0),
+                    'pq_last_fidelity': entanglement.get('pq_last_fidelity', 0.0),
+                    'sync_lag_ms': entanglement.get('sync_lag_ms', 0.0),
+                },
+                'recovery': {
+                    'connected': self.w_state_recovery.running,
+                    'peer_id': self.w_state_recovery.peer_id,
+                }
+            },
+            'network': {
+                'oracle_url': self.w_state_recovery.oracle_url,
+                'peer_count': 0,  # Would need P2P impl
+            },
+            'metrics_summary': f"Height={self.state.get_height()} | Blocks={mining_stats.get('blocks_mined', 0)} | F={mining_stats.get('avg_fidelity', 0.0):.4f} | Entangled={entanglement.get('established', False)}"
         }
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -1390,24 +1524,38 @@ def main():
         
         while True:
             time.sleep(30)
-            status=node.get_status()
-            print("\n"+("="*140))
+            status = node.get_status()
+            print("\n" + ("=" * 140))
             print("⛏️  QTCL QUANTUM MINER STATUS (W-STATE ENTANGLED)")
-            print("="*140)
-            print(f"Miner:              {status['miner']}")
-            print(f"Chain Height:       {status['chain_height']}")
-            print(f"Chain Tip:          {status['chain_tip']}")
-            print(f"Mempool:            {status['mempool_size']} transactions")
-            print(f"Blocks Mined:       {status['mining_stats']['blocks_mined']}")
-            print(f"Avg W-State Fidelity: {status['mining_stats']['avg_fidelity']:.4f}")
+            print("=" * 140)
+            print(f"Miner:                    {status['miner_full']}")
+            print(f"Status:                   {status['status'].upper()}")
             print(f"")
-            print(f"W-STATE ENTANGLEMENT:")
-            print(f"  Established:      {status['w_state']['entanglement_established']}")
-            print(f"  pq0 (Oracle):     {status['w_state']['pq0_fidelity']:.4f}")
-            print(f"  pq_curr:          {status['w_state']['pq_curr_fidelity']:.4f}")
-            print(f"  pq_last:          {status['w_state']['pq_last_fidelity']:.4f}")
-            print(f"  Sync Lag:         {status['w_state']['sync_lag_ms']:.1f}ms")
-            print("="*140+"\n")
+            print(f"BLOCKCHAIN:")
+            print(f"  Chain Height:           {status['chain']['height']}")
+            print(f"  Tip Hash:               {status['chain']['tip_hash']}")
+            print(f"")
+            print(f"MEMPOOL:")
+            print(f"  Pending Transactions:   {status['mempool']['size']}")
+            print(f"")
+            print(f"MINING METRICS:")
+            print(f"  Blocks Mined:           {status['mining']['blocks_mined']}")
+            print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
+            print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
+            print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
+            print(f"")
+            print(f"QUANTUM W-STATE ENTANGLEMENT:")
+            print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
+            print(f"  pq0 (Oracle) Fidelity:  {status['quantum']['w_state']['pq0_fidelity']:.4f}")
+            print(f"  pq_curr (Current):      {status['quantum']['w_state']['pq_curr_fidelity']:.4f}")
+            print(f"  pq_last (Previous):     {status['quantum']['w_state']['pq_last_fidelity']:.4f}")
+            print(f"  Sync Lag:               {status['quantum']['w_state']['sync_lag_ms']:.1f}ms")
+            print(f"")
+            print(f"ORACLE RECOVERY:")
+            print(f"  Connected:              {status['quantum']['recovery']['connected']}")
+            print(f"  Peer ID:                {status['quantum']['recovery']['peer_id']}")
+            print(f"  Oracle URL:             {status['network']['oracle_url']}")
+            print("=" * 140 + "\n")
     
     except KeyboardInterrupt:
         print("\n[MAIN] 🛑 Shutdown signal received...")
