@@ -465,154 +465,90 @@ class HyperbolicLattice:
         
         return G
     
-def _compute_volume(self) -> mpf:
-    """Compute determinant of Gram matrix = squared volume"""
-    if MPMATH_AVAILABLE:
-        from mpmath import det
-        M = matrix(self.n, self.n)
-        for i in range(self.n):
-            for j in range(self.n):
-                M[i, j] = self.G[i][j]
-        try:
-            # mpmath uses det() function, not .det() method
-            return abs(det(M))
-        except:
-            return mpf(1.0)
-    else:
-        # Approximate determinant
-        try:
-            import numpy as np
-            M = np.array([[float(self.G[i][j]) for j in range(self.n)] for i in range(self.n)])
-            return abs(np.linalg.det(M))
-        except:
-            return mpf(1.0)
-
-def _dual_basis(self) -> List[List[mpf]]:
-    """Compute dual basis v_i* such that ⟨v_i*, v_j⟩ = δ_ij"""
-    if MPMATH_AVAILABLE and self.n <= 50:
-        from mpmath import lu_solve
-        # Solve G * [coeffs] = e_i
-        M = matrix(self.n, self.n)
-        for i in range(self.n):
-            for j in range(self.n):
-                M[i, j] = self.G[i][j]
-        
-        dual = []
-        for i in range(self.n):
-            # Create unit vector
-            e = [mpf(0) for _ in range(self.n)]
-            e[i] = mpf(1)
-            
-            # Solve for coefficients using LU decomposition
-            try:
-                coeffs = lu_solve(M, e)
-            except:
-                coeffs = [mpf(0) for _ in range(self.n)]
-            
-            # Build dual vector
-            v_star = [mpf(0) for _ in range(self.n)]
-            for j in range(self.n):
-                c = coeffs[j] if j < len(coeffs) else mpf(0)
-                for k in range(self.n):
-                    if k < len(self.basis[j]) and k < len(v_star):
-                        v_star[k] += c * self.basis[j][k]
-            
-            dual.append(v_star)
-        
-        return dual
-    else:
-        # Fallback
-        return self.basis
-
-def lll_reduce(self, delta: float = 0.99) -> List[List[mpf]]:
-    """
-    LLL lattice basis reduction.
-    Used for parameter validation and security estimation.
-    """
-    if not MPMATH_AVAILABLE or self.n > 20:
-        return self.basis
-    
-    from mpmath import sqrt
-    
-    # Convert to mpmath matrix
-    n = self.n
-    B = matrix(n, n)
-    for i in range(n):
-        for j in range(min(n, len(self.basis[i]))):
-            B[i, j] = self.basis[i][j]
-    
-    # Gram-Schmidt
-    mu = [[mpf(0) for _ in range(n)] for _ in range(n)]
-    B_norm = [mpf(0) for _ in range(n)]
-    
-    for i in range(n):
-        # Compute B_norm[i] = ||b_i*||
-        v = [mpf(0) for _ in range(n)]
-        for k in range(n):
-            v[k] = B[i, k]
-        
-        for j in range(i):
-            # Compute dot product
-            dot = mpf(0)
-            for k in range(n):
-                dot += B[i, k] * B[j, k]
-            mu[i][j] = dot / B_norm[j]
-            
-            for k in range(n):
-                v[k] -= mu[i][j] * B[j, k]
-        
-        # Compute norm
-        norm_sq = mpf(0)
-        for k in range(n):
-            norm_sq += v[k] * v[k]
-        B_norm[i] = sqrt(max(norm_sq, mpf(1e-300)))
-    
-    # LLL reduction (simplified)
-    k = 1
-    while k < n:
-        # Size reduction
-        for j in range(k-1, -1, -1):
-            if abs(mu[k][j]) > 0.5:
-                # b_k = b_k - round(mu[k][j]) * b_j
-                r = round(mu[k][j])
-                for col in range(n):
-                    B[k, col] -= r * B[j, col]
-                
-                # Update mu
-                for l in range(j+1):
-                    mu[k][l] -= r * mu[j][l]
-        
-        # Lovász condition
-        if B_norm[k] >= (delta - mu[k][k-1]**2) * B_norm[k-1]:
-            k += 1
+    def _compute_volume(self) -> mpf:
+        """Compute determinant of Gram matrix = squared volume"""
+        if MPMATH_AVAILABLE:
+            M = matrix(self.n, self.n)
+            for i in range(self.n):
+                for j in range(self.n):
+                    M[i, j] = self.G[i][j]
+            return abs(M.det())
         else:
-            # Swap b_k and b_{k-1}
-            for col in range(n):
-                B[k, col], B[k-1, col] = B[k-1, col], B[k, col]
-            
-            # Update mu and B_norm
-            mu_k = mu[k][k-1]
-            delta_norm = B_norm[k] + mu_k**2 * B_norm[k-1]
-            if delta_norm > 0:
-                mu[k][k-1] = mu_k * B_norm[k-1] / delta_norm
-                B_norm[k] *= B_norm[k-1] / delta_norm
-                B_norm[k-1] = delta_norm
-            
-            # Update remaining mu
-            for i in range(k+1, n):
-                t = mu[i][k]
-                mu[i][k] = mu[i][k-1] - mu_k * t
-                mu[i][k-1] = t + mu[k][k-1] * mu[i][k]
-            
-            k = max(k-1, 1)
+            # Approximate determinant
+            try:
+                import numpy as np
+                M = np.array([[float(self.G[i][j]) for j in range(self.n)] for i in range(self.n)])
+                return abs(np.linalg.det(M))
+            except:
+                return mpf(1.0)
     
-    # Convert back
-    reduced = []
-    for i in range(n):
-        vec = [float(B[i, j]) for j in range(n)]
-        reduced.append([mpf(x) for x in vec])
+    def _dual_basis(self) -> List[List[mpf]]:
+        """Compute dual basis v_i* such that ⟨v_i*, v_j⟩ = δ_ij"""
+        if MPMATH_AVAILABLE and self.n <= 50:
+            # Solve G * [coeffs] = e_i
+            M = matrix(self.n, self.n)
+            for i in range(self.n):
+                for j in range(self.n):
+                    M[i, j] = self.G[i][j]
+            
+            dual = []
+            for i in range(self.n):
+                # Create unit vector
+                e = matrix(self.n, 1)
+                e[i, 0] = mpf(1)
+                
+                # Solve for coefficients
+                try:
+                    coeffs = M.solve(e)
+                except:
+                    coeffs = [mpf(0) for _ in range(self.n)]
+                
+                # Build dual vector
+                v_star = [mpf(0) for _ in range(self.n)]
+                for j in range(self.n):
+                    c = coeffs[j, 0] if j < len(coeffs) else mpf(0)
+                    for k in range(self.n):
+                        if k < len(self.basis[j]) and k < len(v_star):
+                            v_star[k] += c * self.basis[j][k]
+                
+                dual.append(v_star)
+            
+            return dual
+        else:
+            # Fallback
+            return self.basis
     
-    return reduced
+    def norm(self, v: List[mpf]) -> float:
+        """Compute hyperbolic norm of vector"""
+        if len(v) >= 2:
+            p = HyperbolicPoint(float(v[0]), float(v[1]))
+            return p.norm
+        return 0.0
+    
+    def inner_product(self, v: List[mpf], w: List[mpf]) -> float:
+        """Hyperbolic inner product"""
+        if len(v) >= 2 and len(w) >= 2:
+            p1 = HyperbolicPoint(float(v[0]), float(v[1]))
+            p2 = HyperbolicPoint(float(w[0]), float(w[1]))
+            return -cosh(p1.distance_to(p2)) if MPMATH_AVAILABLE else -math.cosh(p1.distance_to(p2))
+        return 0.0
+    
+    def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
+        """
+        Compute smoothing parameter eta_epsilon(Lambda) = min{s > 0 : rho_{1/s}(Lambda*\{0}) <= epsilon}
+        where rho_{1/s}(x) = exp(-pi s^2 ||x||^2)
+        """
+        # Approximate using Gaussian heuristic
+        n = self.n
+        vol = float(self.volume)
+        
+        # Gaussian heuristic for shortest vector
+        gh = math.sqrt(n / (2 * math.pi * math.e)) * vol ** (1/n)
+        
+        # Smoothing parameter approximately sqrt(log n)/sigma
+        eta = math.sqrt(math.log(n)) / max(gh, 1e-10)
+        
+        return eta
     
     def sample_gaussian(self, sigma: float = 3.2) -> List[int]:
         """
@@ -3586,43 +3522,146 @@ class MinerRegistry:
             pass
         return None
 
-def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
-    r"""
-    Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ* \ {0}) ≤ ε}
-    where ρ_{1/s}(x) = exp(-π s^2 ‖x‖^2)
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with HLWE')
+    parser.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
+    parser.add_argument('--oracle-url', '-o', default='https://qtcl-blockchain.koyeb.app', help='Oracle URL')
+    parser.add_argument('--difficulty', '-d', type=int, default=DEFAULT_DIFFICULTY, help='Mining difficulty bits')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    parser.add_argument('--wallet-init', action='store_true', help='Initialize new wallet')
+    parser.add_argument('--wallet-password', help='Wallet password')
+    parser.add_argument('--register', action='store_true', help='Register with oracle')
+    parser.add_argument('--miner-id', help='Miner ID for registration')
+    parser.add_argument('--miner-name', default='qtcl-miner', help='Friendly miner name')
+    parser.add_argument('--fidelity-mode', choices=['strict', 'normal', 'relaxed'], default='normal', help='W-state fidelity threshold mode')
+    parser.add_argument('--strict-w-verification', action='store_true', default=False, help='Enable strict W-state verification')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    The smoothing parameter η_ε(Λ) is the smallest s such that the Gaussian
-    measure of the dual lattice minus the origin is at most ε. This is a
-    critical quantity in lattice-based cryptography that determines the
-    hardness of the Learning With Errors problem.
-    
-    For a lattice Λ of dimension n with volume det(Λ), the Gaussian heuristic
-    gives an approximation:
-        η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
-    
-    where λ_1(Λ*) is the length of the shortest non-zero vector in the dual
-    lattice. Using the Gaussian heuristic for the shortest vector:
-        λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
-    
-    Args:
-        epsilon: Error tolerance (default 1e-9)
+    try:
+        if args.wallet_init:
+            if not args.wallet_password:
+                args.wallet_password = input("Enter wallet password: ")
+            wallet = QuickWallet()
+            address = wallet.create(args.wallet_password)
+            logger.info(f"[WALLET] Created: {address}")
+            logger.info(f"[WALLET] Public Key: {wallet.public_key}")
+            logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
+            return
         
-    Returns:
-        Estimated smoothing parameter η_ε(Λ)
-    """
-    # Approximate using Gaussian heuristic
-    n = self.n
-    vol = float(self.volume)
-    if vol <= 0:
-        vol = 1.0
+        if args.address:
+            address = args.address
+        else:
+            wallet = QuickWallet()
+            if not args.wallet_password:
+                args.wallet_password = input("Enter wallet password: ")
+            if wallet.load(args.wallet_password):
+                address = wallet.address
+                logger.info(f"[WALLET] Loaded: {address}")
+            else:
+                logger.error("[WALLET] Failed to load wallet")
+                sys.exit(1)
+        
+        if args.register:
+            if not all([args.miner_id, args.wallet_password]):
+                logger.error("[REGISTER] --miner-id and --wallet-password required")
+                sys.exit(1)
+            
+            wallet = QuickWallet()
+            if wallet.load(args.wallet_password):
+                registry = MinerRegistry(args.oracle_url)
+                if registry.register(
+                    miner_id=args.miner_id,
+                    address=wallet.address,
+                    public_key=wallet.public_key or '',
+                    private_key=wallet.private_key or '',
+                    miner_name=args.miner_name
+                ):
+                    logger.info("[REGISTER] ✅ Successfully registered")
+                    return
+                else:
+                    logger.error("[REGISTER] ❌ Registration failed")
+                    sys.exit(1)
+        
+        node = QTCLFullNode(
+            miner_address=address,
+            oracle_url=args.oracle_url,
+            difficulty=args.difficulty
+        )
+        
+        node.fidelity_mode = args.fidelity_mode
+        node.strict_verification = args.strict_w_verification
+        
+        logger.info(f"[INIT] W-state fidelity mode: {args.fidelity_mode}")
+        if args.strict_w_verification:
+            logger.warning("[INIT] Strict W-state verification enabled")
+        
+        if not node.start():
+            logger.error("[MAIN] ❌ Failed to start node")
+            sys.exit(1)
+        
+        while True:
+            time.sleep(30)
+            status = node.get_status()
+            print("\n" + ("=" * 140))
+            print("⛏️  QTCL QUANTUM MINER STATUS (W-STATE ENTANGLED + HLWE)")
+            print("=" * 140)
+            print(f"Miner:                    {status['miner_full']}")
+            print(f"Status:                   {status['status'].upper()}")
+            print(f"")
+            print(f"BLOCKCHAIN:")
+            print(f"  Chain Height:           {status['chain']['height']}")
+            print(f"  Tip Hash:               {status['chain']['tip_hash']}")
+            print(f"")
+            print(f"WALLET & REWARDS:")
+            print(f"  Address:                {status['wallet']['address']}")
+            print(f"  Balance:                {status['wallet']['balance_formatted']}")
+            print(f"  Estimated Rewards:      {status['wallet']['estimated_rewards']:.2f} QTCL")
+            print(f"")
+            print(f"MEMPOOL:")
+            print(f"  Pending Transactions:   {status['mempool']['size']}")
+            print(f"")
+            print(f"MINING METRICS:")
+            print(f"  Blocks Mined:           {status['mining']['blocks_mined']}")
+            print(f"  Block Rewards Earned:   {status['mining']['block_rewards']}")
+            print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
+            print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
+            print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
+            print(f"")
+            print(f"QUANTUM W-STATE ENTANGLEMENT:")
+            print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
+            print(f"  pq0 Oracle Fidelity:    {status['quantum']['w_state']['pq0_fidelity']:.4f}")
+            print(f"  W-State Fidelity:       {status['quantum']['w_state']['w_state_fidelity']:.4f}")
+            print(f"  pq_curr (field ID):     {status['quantum']['w_state']['pq_curr'][:32]}…")
+            print(f"  pq_last (field ID):     {status['quantum']['w_state']['pq_last'][:32]}…")
+            print(f"  Sync Lag:               {status['quantum']['w_state']['sync_lag_ms']:.1f}ms")
+            print(f"")
+            print(f"ORACLE RECOVERY:")
+            print(f"  Connected:              {status['quantum']['recovery']['connected']}")
+            print(f"  Peer ID:                {status['quantum']['recovery']['peer_id']}")
+            print(f"  Oracle URL:             {status['network']['oracle_url']}")
+            print("=" * 140 + "\n")
     
-    # Gaussian heuristic for shortest vector in dual lattice
-    # λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
-    gh = math.sqrt(n / (2 * math.pi * math.e)) * (vol ** (1.0 / n))
-    
-    # Smoothing parameter approximation
-    # η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
-    log_term = math.log(2 * n * (1 + 1.0 / epsilon))
-    eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
-    
-    return eta
+    except KeyboardInterrupt:
+        print("\n[MAIN] 🛑 Shutdown signal received...")
+    except Exception as e:
+        print(f"\n❌ FATAL: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if 'node' in locals():
+            node.stop()
+        print("\n✅ Shutdown complete\n")
+
+if __name__ == '__main__':
+    import argparse
+    import numpy as np
+    main()
