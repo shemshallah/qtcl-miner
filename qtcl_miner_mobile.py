@@ -546,6 +546,13 @@ class P2PClientWStateRecovery:
             pq_curr_id = str(snapshot.get('pq_current', ''))
             pq_last_id = str(snapshot.get('pq_last',    ''))
             
+            # If pq_last is absent or '0' (oracle genesis state), derive it deterministically
+            # from the current snapshot so the field-space range [pq_last→pq_curr] is always
+            # well-defined and non-empty for the lattice controller.
+            if not pq_last_id or pq_last_id == '0' or pq_last_id == 'None':
+                seed = f"genesis:{timestamp_ns}:{pq_curr_id}"
+                pq_last_id = hashlib.sha256(seed.encode()).hexdigest()
+            
             # Build a proper 8x8 W-state density matrix from oracle fidelity.
             # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
             # We scale by oracle fidelity so the DM reflects the real quantum state quality.
@@ -1400,13 +1407,14 @@ class QTCLFullNode:
                             tx_list = []
                             for tx in block.transactions:
                                 tx_dict = {
-                                    'tx_id': str(tx.tx_id),
-                                    'from_addr': str(tx.from_addr),
-                                    'to_addr': str(tx.to_addr),
-                                    'amount': float(tx.amount),
-                                    'fee': float(tx.fee),
-                                    'timestamp': int(tx.timestamp),
-                                    'signature': str(tx.signature) if hasattr(tx, 'signature') else '',
+                                    'tx_id':      str(tx.tx_id),
+                                    'from_addr':  str(tx.from_addr),
+                                    'to_addr':    str(tx.to_addr),
+                                    'amount':     float(tx.amount),
+                                    'fee':        float(tx.fee),
+                                    # Transaction uses timestamp_ns (nanoseconds)
+                                    'timestamp':  int(getattr(tx, 'timestamp_ns', 0) // 1_000_000_000),
+                                    'signature':  str(tx.signature) if hasattr(tx, 'signature') else '',
                                 }
                                 tx_list.append(tx_dict)
                             
@@ -1425,24 +1433,43 @@ class QTCLFullNode:
                             submit_time = time.time() - submit_start
                             
                             if success:
-                                # ✅ BLOCK ACCEPTED - Update all systems
+                                # ✅ BLOCK ACCEPTED - Update all systems atomically
                                 logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED by network | Response: {msg}")
                                 
-                                # Update local state
+                                # ── Advance local chain state immediately ──
+                                # Do NOT wait for sync loop — update now so next iteration
+                                # mines block N+1, not N again.
                                 self.state.add_block(block.header)
                                 for tx in block.transactions:
                                     self.state.apply_transaction(tx)
-                                self.mempool.remove_transactions([tx.tx_id for tx in block.transactions] if block.transactions else [])
+                                self.mempool.remove_transactions(
+                                    [tx.tx_id for tx in block.transactions] if block.transactions else []
+                                )
+                                
+                                # Confirm by querying network tip (non-blocking, best-effort)
+                                try:
+                                    network_tip = self.client.get_tip_block()
+                                    if network_tip and network_tip.height >= block.header.height:
+                                        self.state.add_block(network_tip)
+                                        logger.info(
+                                            f"[MINING] ⛓️  Chain advanced to height={network_tip.height} "
+                                            f"| hash={network_tip.block_hash[:16]}…"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[MINING] ⛓️  Local chain at height={self.state.get_height()} "
+                                            f"(network tip confirming…)"
+                                        )
+                                except Exception:
+                                    pass  # Network tip confirm is best-effort; local state is already updated
                                 
                                 # Calculate metrics
                                 hash_rate = self.miner.metrics['hash_attempts'] / block_time if block_time > 0 else 0
                                 elapsed = time.time() - mining_start_time
                                 blocks_per_hour = (blocks_mined_this_session / elapsed * 3600) if elapsed > 0 else 0
                                 
-                                # ✅ Block Reward: 10 QTCL per block (standard)
-                                block_reward = 10.0
+                                block_reward = 12.5  # matches server reward
                                 logger.info(f"[MINING] 💰 Block Reward: +{block_reward} QTCL")
-                                
                                 logger.info(f"[MINING] ✅ Block #{block.header.height} CONFIRMED")
                                 logger.info(f"[MINING] 📊 Submission:")
                                 logger.info(f"[MINING]   • Network latency: {submit_time*1000:.1f}ms")
@@ -1466,10 +1493,9 @@ class QTCLFullNode:
                                 logger.error(f"[MINING]   • Submission time: {submit_time*1000:.1f}ms")
                         
                         except Exception as submit_error:
-                            logger.error(f"[MINING] ❌ Block submission failed: {submit_error}")
-                            logger.error(f"[MINING] 🔍 Error type: {type(submit_error).__name__}")
-                            logger.error(f"[MINING] 📋 Block: height={block.header.height} hash={block.header.block_hash[:32]}…")
-                            logger.error(f"[MINING] Traceback: {traceback.format_exc()}")
+                            logger.error(f"[MINING] ❌ Block submission EXCEPTION: {type(submit_error).__name__}: {submit_error}")
+                            logger.error(f"[MINING]   • Block: height={block.header.height} hash={block.header.block_hash[:32]}…")
+                            logger.error(f"[MINING]   • Traceback:\n{traceback.format_exc()}")
                     
                     else:
                         logger.error(f"[MINING] ❌ Block validation failed")
