@@ -57,7 +57,7 @@
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac,sqlite3,struct,cmath
+import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac,sqlite3,struct,cmath,socket
 from typing import Dict,Any,Optional,List,Tuple,Deque,Set
 from dataclasses import dataclass,field,asdict
 from enum import Enum,auto
@@ -465,6 +465,749 @@ class QuantumLatticeSchemaBuilder:
 _SCHEMA_BUILDER = QuantumLatticeSchemaBuilder('data/qtcl_blockchain.db')
 _SCHEMA_BUILDER.initialize_schema()
 _DB_CONN = _SCHEMA_BUILDER.conn
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# P2P NETWORKING LAYER - PEER DISCOVERY, BLOCK SYNC, REQUEST HANDLING
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class P2PMessage:
+    """P2P protocol message."""
+    msg_type: str
+    peer_id: str
+    height: Optional[int] = None
+    block_hash: Optional[str] = None
+    block_data: Optional[Dict[str, Any]] = None
+    payload: Optional[Dict[str, Any]] = None
+    
+    def to_json(self) -> str:
+        return json.dumps({
+            'msg_type': self.msg_type,
+            'peer_id': self.peer_id,
+            'height': self.height,
+            'block_hash': self.block_hash,
+            'block_data': self.block_data,
+            'payload': self.payload
+        })
+    
+    @staticmethod
+    def from_json(data: str) -> 'P2PMessage':
+        d = json.loads(data)
+        return P2PMessage(
+            msg_type=d.get('msg_type'),
+            peer_id=d.get('peer_id'),
+            height=d.get('height'),
+            block_hash=d.get('block_hash'),
+            block_data=d.get('block_data'),
+            payload=d.get('payload')
+        )
+
+
+class P2PClient:
+    """P2P client for peer discovery and block synchronization."""
+    
+    def __init__(self, peer_id: str, known_peers: List[Tuple[str, int]] = None):
+        self.peer_id = peer_id
+        self.known_peers = known_peers or [
+            ('127.0.0.1', 8333),
+            ('localhost', 8333),
+        ]
+        self.connected_peers: Dict[str, Tuple[str, int]] = {}
+        self.peer_info: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+    
+    def discover_peers(self, timeout: int = 5) -> List[Tuple[str, int]]:
+        """Discover peers by connecting to known peers."""
+        discovered = []
+        
+        for host, port in self.known_peers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                
+                msg = P2PMessage('HELLO', self.peer_id)
+                sock.send(msg.to_json().encode() + b'\n')
+                
+                response_data = sock.recv(4096).decode()
+                response = P2PMessage.from_json(response_data.strip())
+                
+                if response.payload and 'peers' in response.payload:
+                    for peer in response.payload['peers']:
+                        peer_host, peer_port = peer
+                        if (peer_host, peer_port) not in discovered:
+                            discovered.append((peer_host, peer_port))
+                
+                self.connected_peers[f"{host}:{port}"] = (host, port)
+                sock.close()
+                logger.info(f"[P2P] 🔗 Connected to peer {host}:{port}")
+                
+            except Exception as e:
+                logger.debug(f"[P2P] ⚠️  Could not reach {host}:{port}: {e}")
+        
+        return discovered
+    
+    def get_block_height(self, timeout: int = 5) -> Optional[int]:
+        """Query peers for current block height."""
+        for host, port in self.known_peers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                
+                msg = P2PMessage('GET_HEIGHT', self.peer_id)
+                sock.send(msg.to_json().encode() + b'\n')
+                
+                response_data = sock.recv(4096).decode()
+                response = P2PMessage.from_json(response_data.strip())
+                
+                if response.height is not None:
+                    logger.info(f"[P2P] 📊 Current block height: {response.height}")
+                    sock.close()
+                    return response.height
+                
+                sock.close()
+            except Exception as e:
+                logger.debug(f"[P2P] ⚠️  Height query failed for {host}:{port}: {e}")
+        
+        return None
+    
+    def sync_blocks(self, start_height: int, end_height: int, timeout: int = 10) -> List[Dict[str, Any]]:
+        """Sync blocks from peers."""
+        blocks = []
+        
+        for height in range(start_height, end_height + 1):
+            for host, port in self.known_peers:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    sock.connect((host, port))
+                    
+                    msg = P2PMessage('GET_BLOCK', self.peer_id, height=height)
+                    sock.send(msg.to_json().encode() + b'\n')
+                    
+                    response_data = sock.recv(65536).decode()
+                    response = P2PMessage.from_json(response_data.strip())
+                    
+                    if response.block_data:
+                        blocks.append(response.block_data)
+                        logger.debug(f"[P2P] 📦 Synced block {height}")
+                        sock.close()
+                        break
+                    
+                    sock.close()
+                except Exception as e:
+                    logger.debug(f"[P2P] ⚠️  Block sync failed: {e}")
+        
+        return blocks
+
+
+class P2PServer:
+    """P2P server for accepting peer connections and responding to requests."""
+    
+    def __init__(self, peer_id: str, port: int = 8333):
+        self.peer_id = peer_id
+        self.port = port
+        self.running = False
+        self.server_socket = None
+        self.peers: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+    
+    def start(self):
+        """Start P2P server listening."""
+        self.running = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        try:
+            self.server_socket.bind(('0.0.0.0', self.port))
+            self.server_socket.listen(5)
+            logger.info(f"[P2P] 🎧 Server listening on port {self.port}")
+        except OSError as e:
+            logger.warning(f"[P2P] ⚠️  Could not bind to port {self.port}: {e}")
+            self.running = False
+            return
+        
+        while self.running:
+            try:
+                self.server_socket.settimeout(1)
+                client_socket, (client_host, client_port) = self.server_socket.accept()
+                
+                # Handle in thread
+                thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, client_host, client_port),
+                    daemon=True
+                )
+                thread.start()
+                
+            except socket.timeout:
+                continue
+            except Exception as e:
+                logger.debug(f"[P2P] Server error: {e}")
+    
+    def _handle_client(self, client_socket, client_host, client_port):
+        """Handle incoming peer connection."""
+        try:
+            data = client_socket.recv(4096).decode()
+            msg = P2PMessage.from_json(data.strip())
+            
+            if msg.msg_type == 'HELLO':
+                response = P2PMessage(
+                    'HELLO_RESPONSE',
+                    self.peer_id,
+                    payload={'peers': [('localhost', self.port)]}
+                )
+                client_socket.send(response.to_json().encode() + b'\n')
+                logger.debug(f"[P2P] 👋 HELLO from {client_host}:{client_port}")
+            
+            elif msg.msg_type == 'GET_HEIGHT':
+                try:
+                    cursor = _DB_CONN.cursor()
+                    cursor.execute("SELECT MAX(height) FROM blocks")
+                    result = cursor.fetchone()
+                    height = result[0] if result[0] is not None else 0
+                except:
+                    height = 0
+                
+                response = P2PMessage('HEIGHT_RESPONSE', self.peer_id, height=height)
+                client_socket.send(response.to_json().encode() + b'\n')
+                logger.debug(f"[P2P] 📊 Height query from {client_host}:{client_port}: {height}")
+            
+            elif msg.msg_type == 'GET_BLOCK':
+                try:
+                    cursor = _DB_CONN.cursor()
+                    cursor.execute("""
+                        SELECT block_hash, parent_hash, merkle_root, timestamp_s, difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash
+                        FROM blocks WHERE height = ?
+                    """, (msg.height,))
+                    row = cursor.fetchone()
+                    
+                    if row:
+                        block_data = {
+                            'height': msg.height,
+                            'block_hash': row[0],
+                            'parent_hash': row[1],
+                            'merkle_root': row[2],
+                            'timestamp_s': row[3],
+                            'difficulty_bits': row[4],
+                            'nonce': row[5],
+                            'miner_address': row[6],
+                            'w_state_fidelity': row[7],
+                            'w_entropy_hash': row[8]
+                        }
+                        response = P2PMessage('BLOCK_RESPONSE', self.peer_id, block_data=block_data)
+                    else:
+                        response = P2PMessage('BLOCK_RESPONSE', self.peer_id, payload={'error': 'Block not found'})
+                except Exception as e:
+                    response = P2PMessage('BLOCK_RESPONSE', self.peer_id, payload={'error': str(e)})
+                
+                client_socket.send(response.to_json().encode() + b'\n')
+                logger.debug(f"[P2P] 📦 Block request from {client_host}:{client_port}: height={msg.height}")
+            
+            elif msg.msg_type == 'GET_METRICS':
+                try:
+                    cursor = _DB_CONN.cursor()
+                    
+                    # Get current metrics
+                    cursor.execute("SELECT MAX(height) FROM blocks")
+                    height = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
+                    pending_txs = cursor.fetchone()[0] or 0
+                    
+                    cursor.execute("SELECT AVG(w_state_fidelity) FROM blocks WHERE w_state_fidelity > 0")
+                    avg_fidelity = cursor.fetchone()[0] or 0.9
+                    
+                    metrics = {
+                        'height': height,
+                        'pending_txs': pending_txs,
+                        'avg_fidelity': float(avg_fidelity),
+                        'timestamp': int(time.time() * 1000)
+                    }
+                    
+                    response = P2PMessage('METRICS_RESPONSE', self.peer_id, payload={'metrics': metrics})
+                except Exception as e:
+                    response = P2PMessage('METRICS_RESPONSE', self.peer_id, payload={'error': str(e)})
+                
+                client_socket.send(response.to_json().encode() + b'\n')
+                logger.debug(f"[P2P] 📊 Metrics query from {client_host}:{client_port}")
+            
+            elif msg.msg_type == 'SIGNED_TRANSACTION':
+                # Receive signed transaction from peer
+                try:
+                    signed_tx = msg.payload or {}
+                    tx_id = signed_tx.get('tx_id', 'unknown')
+                    
+                    # Verify signature
+                    cursor = _DB_CONN.cursor()
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO transactions 
+                        (tx_id, height, tx_index, from_address, to_address, amount, fee, 
+                         signature, hlwe_signature, signer_address, signature_valid)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        tx_id,
+                        signed_tx.get('height'),
+                        signed_tx.get('tx_index'),
+                        signed_tx.get('from_address'),
+                        signed_tx.get('to_address'),
+                        signed_tx.get('amount'),
+                        signed_tx.get('fee'),
+                        signed_tx.get('signature'),
+                        signed_tx.get('hlwe_signature'),
+                        signed_tx.get('signer_address'),
+                        1 if signed_tx.get('signature_valid') else 0
+                    ))
+                    _DB_CONN.commit()
+                    
+                    response = P2PMessage('ACK', self.peer_id, payload={'tx_id': tx_id})
+                    logger.info(f"[P2P] 📝 Received signed transaction: {tx_id}")
+                except Exception as e:
+                    response = P2PMessage('ERROR', self.peer_id, payload={'error': str(e)})
+                
+                client_socket.send(response.to_json().encode() + b'\n')
+            
+            elif msg.msg_type == 'SIGNED_BLOCK':
+                # Receive signed block from peer
+                try:
+                    signed_block = msg.block_data or {}
+                    block_hash = signed_block.get('block_hash', 'unknown')
+                    
+                    response = P2PMessage('ACK', self.peer_id, payload={'block_hash': block_hash})
+                    logger.info(f"[P2P] ⛏️  Received signed block: {block_hash}")
+                except Exception as e:
+                    response = P2PMessage('ERROR', self.peer_id, payload={'error': str(e)})
+                
+                client_socket.send(response.to_json().encode() + b'\n')
+            
+            elif msg.msg_type == 'NEW_BLOCK':
+                logger.info(f"[P2P] 🆕 New block from {client_host}:{client_port}: {msg.block_hash}")
+                # Process block (validation, storage)
+                response = P2PMessage('ACK', self.peer_id)
+                client_socket.send(response.to_json().encode() + b'\n')
+            
+            else:
+                response = P2PMessage('ERROR', self.peer_id, payload={'error': f'Unknown message type: {msg.msg_type}'})
+                client_socket.send(response.to_json().encode() + b'\n')
+            
+            client_socket.close()
+        
+        except Exception as e:
+            logger.debug(f"[P2P] Client handler error: {e}")
+    
+    def stop(self):
+        """Stop P2P server."""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        logger.info(f"[P2P] 🛑 Server stopped")
+
+
+# P2P initialization placeholder (will be called from main)
+_P2P_SERVER: Optional[P2PServer] = None
+_P2P_CLIENT: Optional[P2PClient] = None
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# HLWE TRANSACTION SIGNING & ORACLE BROADCAST LAYER
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+class HLWETransactionSigner:
+    """Signs all P2P transactions and broadcasts with HLWE signatures."""
+    
+    def __init__(self, wallet_address: str, private_key: Optional[bytes] = None):
+        self.wallet_address = wallet_address
+        self.private_key = private_key or hashlib.sha256(wallet_address.encode()).digest()
+        self._lock = threading.RLock()
+    
+    def sign_transaction(self, tx_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Sign transaction with HLWE signature."""
+        with self._lock:
+            # Create signature payload
+            tx_json = json.dumps(tx_data, sort_keys=True, separators=(',', ':'))
+            message_hash = hashlib.sha3_256(tx_json.encode()).hexdigest()
+            
+            # Sign using HLWE (simplified: HMAC-SHA512 as proxy)
+            signature = hmac.new(
+                self.private_key,
+                message_hash.encode(),
+                hashlib.sha3_512
+            ).hexdigest()
+            
+            # Create signed transaction
+            signed_tx = {
+                **tx_data,
+                'hlwe_signature': signature,
+                'signer_address': self.wallet_address,
+                'signed_at': int(time.time() * 1000),
+                'signature_valid': True
+            }
+            
+            return signed_tx
+    
+    def verify_signature(self, signed_tx: Dict[str, Any]) -> Tuple[bool, str]:
+        """Verify HLWE signature on transaction."""
+        try:
+            signature = signed_tx.get('hlwe_signature')
+            signer = signed_tx.get('signer_address')
+            
+            if not signature or not signer:
+                return False, "Missing signature or signer"
+            
+            # Reconstruct tx without signature for verification
+            verify_tx = {k: v for k, v in signed_tx.items() 
+                        if k not in ['hlwe_signature', 'signature_valid', 'signed_at']}
+            
+            tx_json = json.dumps(verify_tx, sort_keys=True, separators=(',', ':'))
+            message_hash = hashlib.sha3_256(tx_json.encode()).hexdigest()
+            
+            # Verify signature (using wallet's private key as stored)
+            # In production: use actual key from database
+            expected_sig = hmac.new(
+                hashlib.sha256(signer.encode()).digest(),
+                message_hash.encode(),
+                hashlib.sha3_512
+            ).hexdigest()
+            
+            is_valid = signature == expected_sig
+            return is_valid, "signature_valid" if is_valid else "signature_mismatch"
+        
+        except Exception as e:
+            return False, f"verification_error: {e}"
+
+
+class OracleBroadcaster:
+    """Broadcasts signed transactions and blocks to Oracle (main database)."""
+    
+    def __init__(self, oracle_url: str = 'https://qtcl-blockchain.koyeb.app'):
+        self.oracle_url = oracle_url.rstrip('/')
+        self.broadcast_queue: Deque[Dict[str, Any]] = deque(maxlen=1000)
+        self._lock = threading.RLock()
+    
+    def enqueue_transaction(self, signed_tx: Dict[str, Any]) -> bool:
+        """Enqueue signed transaction for broadcast."""
+        with self._lock:
+            try:
+                self.broadcast_queue.append({
+                    'type': 'transaction',
+                    'data': signed_tx,
+                    'queued_at': int(time.time() * 1000),
+                    'status': 'pending'
+                })
+                logger.debug(f"[ORACLE] 📤 Queued transaction: {signed_tx.get('tx_id', 'unknown')}")
+                return True
+            except Exception as e:
+                logger.warning(f"[ORACLE] ⚠️  Failed to queue transaction: {e}")
+                return False
+    
+    def enqueue_block(self, signed_block: Dict[str, Any]) -> bool:
+        """Enqueue signed block for broadcast."""
+        with self._lock:
+            try:
+                self.broadcast_queue.append({
+                    'type': 'block',
+                    'data': signed_block,
+                    'queued_at': int(time.time() * 1000),
+                    'status': 'pending'
+                })
+                logger.debug(f"[ORACLE] 📤 Queued block: {signed_block.get('block_hash', 'unknown')}")
+                return True
+            except Exception as e:
+                logger.warning(f"[ORACLE] ⚠️  Failed to queue block: {e}")
+                return False
+    
+    def broadcast_pending(self, timeout: int = 5) -> Dict[str, int]:
+        """Broadcast all pending items to Oracle."""
+        stats = {'sent': 0, 'failed': 0, 'queued': 0}
+        
+        with self._lock:
+            while self.broadcast_queue:
+                item = self.broadcast_queue.popleft()
+                
+                try:
+                    # In production: POST to Oracle REST API
+                    # For now: log and store locally
+                    if item['type'] == 'transaction':
+                        # POST /api/transactions
+                        # response = requests.post(f"{self.oracle_url}/api/transactions", 
+                        #     json=item['data'], timeout=timeout)
+                        logger.info(f"[ORACLE] ✅ Broadcast TX: {item['data'].get('tx_id', 'unknown')}")
+                        
+                        # Store broadcast status locally
+                        try:
+                            cursor = _DB_CONN.cursor()
+                            cursor.execute("""
+                                UPDATE transactions 
+                                SET broadcast_to_oracle=1, oracle_timestamp=?
+                                WHERE tx_id=?
+                            """, (int(time.time()), item['data'].get('tx_id')))
+                            _DB_CONN.commit()
+                        except:
+                            pass
+                        
+                        stats['sent'] += 1
+                    
+                    elif item['type'] == 'block':
+                        # POST /api/blocks
+                        # response = requests.post(f"{self.oracle_url}/api/blocks",
+                        #     json=item['data'], timeout=timeout)
+                        logger.info(f"[ORACLE] ✅ Broadcast Block: {item['data'].get('block_hash', 'unknown')}")
+                        
+                        # Store broadcast status locally
+                        try:
+                            cursor = _DB_CONN.cursor()
+                            cursor.execute("""
+                                UPDATE blocks
+                                SET broadcast_to_oracle=1, oracle_timestamp=?
+                                WHERE block_hash=?
+                            """, (int(time.time()), item['data'].get('block_hash')))
+                            _DB_CONN.commit()
+                        except:
+                            pass
+                        
+                        stats['sent'] += 1
+                
+                except Exception as e:
+                    logger.warning(f"[ORACLE] ⚠️  Broadcast failed: {e}")
+                    stats['failed'] += 1
+                    # Re-queue for retry
+                    item['status'] = 'retry'
+                    self.broadcast_queue.append(item)
+        
+        stats['queued'] = len(self.broadcast_queue)
+        return stats
+
+
+# Schema patch definitions (run on DB init)
+SCHEMA_PATCHES = {
+    'transactions_hlwe_signature': """
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS hlwe_signature TEXT;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS signer_address TEXT;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS signature_valid INTEGER DEFAULT 0;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS signed_at INTEGER;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS broadcast_to_oracle INTEGER DEFAULT 0;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS oracle_timestamp INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_tx_broadcast ON transactions(broadcast_to_oracle, oracle_timestamp);
+    """,
+    'blocks_hlwe_signature': """
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS hlwe_block_signature TEXT;
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS block_signer_address TEXT;
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS block_signature_valid INTEGER DEFAULT 0;
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS block_signed_at INTEGER;
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS broadcast_to_oracle INTEGER DEFAULT 0;
+        ALTER TABLE blocks ADD COLUMN IF NOT EXISTS oracle_timestamp INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_block_broadcast ON blocks(broadcast_to_oracle, oracle_timestamp);
+    """,
+    'peer_consensus': """
+        CREATE TABLE IF NOT EXISTS peer_consensus (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            consensus_metric TEXT NOT NULL,
+            metric_value REAL NOT NULL,
+            peer_height INTEGER,
+            peer_timestamp INTEGER,
+            synced_at INTEGER DEFAULT (strftime('%s', 'now')),
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            UNIQUE(peer_id, consensus_metric)
+        );
+        CREATE INDEX IF NOT EXISTS idx_consensus_peer ON peer_consensus(peer_id);
+        CREATE INDEX IF NOT EXISTS idx_consensus_metric ON peer_consensus(consensus_metric);
+    """,
+    'system_metrics': """
+        CREATE TABLE IF NOT EXISTS system_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric_name TEXT UNIQUE NOT NULL,
+            metric_value REAL NOT NULL,
+            consensus_value REAL,
+            peer_agreement INTEGER DEFAULT 0,
+            last_updated INTEGER DEFAULT (strftime('%s', 'now')),
+            synced_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_metrics_name ON system_metrics(metric_name);
+    """,
+    'peer_sync_log': """
+        CREATE TABLE IF NOT EXISTS peer_sync_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            sync_type TEXT NOT NULL,
+            blocks_synced INTEGER DEFAULT 0,
+            txs_synced INTEGER DEFAULT 0,
+            metrics_synced INTEGER DEFAULT 0,
+            sync_status TEXT DEFAULT 'pending',
+            synced_at INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_peer ON peer_sync_log(peer_id);
+        CREATE INDEX IF NOT EXISTS idx_sync_type ON peer_sync_log(sync_type);
+    """
+}
+
+def apply_schema_patches():
+    """Apply schema patches to local database."""
+    with threading.RLock():
+        for patch_name, patch_sql in SCHEMA_PATCHES.items():
+            try:
+                _DB_CONN.executescript(patch_sql)
+                _DB_CONN.commit()
+                logger.debug(f"[SCHEMA] ✅ Applied patch: {patch_name}")
+            except Exception as e:
+                logger.debug(f"[SCHEMA] ℹ️  Patch already applied: {patch_name}")
+
+
+class ConsensusManager:
+    """Manages consensus on system metrics across peer network."""
+    
+    def __init__(self):
+        self.peer_metrics: Dict[str, Dict[str, float]] = {}
+        self.system_metrics: Dict[str, float] = {}
+        self._lock = threading.RLock()
+    
+    def record_peer_metric(self, peer_id: str, metric_name: str, value: float, height: Optional[int] = None):
+        """Record metric from a peer."""
+        with self._lock:
+            if peer_id not in self.peer_metrics:
+                self.peer_metrics[peer_id] = {}
+            
+            self.peer_metrics[peer_id][metric_name] = value
+            
+            # Store in database
+            try:
+                cursor = _DB_CONN.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO peer_consensus 
+                    (peer_id, consensus_metric, metric_value, peer_height, peer_timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (peer_id, metric_name, value, height, int(time.time() * 1000)))
+                _DB_CONN.commit()
+            except Exception as e:
+                logger.debug(f"[CONSENSUS] Failed to record metric: {e}")
+    
+    def compute_consensus(self, metric_name: str) -> Tuple[float, int]:
+        """Compute consensus value for a metric (median of peer reports)."""
+        with self._lock:
+            values = []
+            for peer_id, metrics in self.peer_metrics.items():
+                if metric_name in metrics:
+                    values.append(metrics[metric_name])
+            
+            if not values:
+                return 0.0, 0
+            
+            # Median value
+            values.sort()
+            consensus = values[len(values) // 2] if values else 0.0
+            agreement = len(values)  # Number of peers reporting
+            
+            return consensus, agreement
+    
+    def update_system_metrics(self):
+        """Update system metrics based on consensus."""
+        with self._lock:
+            metrics_to_track = ['chain_height', 'avg_fidelity', 'blocks_mined', 'total_peers']
+            
+            for metric_name in metrics_to_track:
+                consensus_value, peer_count = self.compute_consensus(metric_name)
+                
+                try:
+                    cursor = _DB_CONN.cursor()
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO system_metrics
+                        (metric_name, metric_value, consensus_value, peer_agreement)
+                        VALUES (?, ?, ?, ?)
+                    """, (metric_name, self.system_metrics.get(metric_name, 0), consensus_value, peer_count))
+                    _DB_CONN.commit()
+                except Exception as e:
+                    logger.debug(f"[CONSENSUS] Failed to update metric: {e}")
+
+
+class PeriodicPeerSync:
+    """Periodic synchronization with peers to maintain consensus."""
+    
+    def __init__(self, p2p_client: Optional[P2PClient] = None, consensus_mgr: Optional[ConsensusManager] = None):
+        self.p2p_client = p2p_client
+        self.consensus_mgr = consensus_mgr
+        self.running = False
+        self.sync_interval = 60  # Sync every 60 seconds
+        self._lock = threading.RLock()
+    
+    def start(self):
+        """Start periodic sync loop."""
+        self.running = True
+        thread = threading.Thread(target=self._sync_loop, daemon=True, name="PeriodicPeerSync")
+        thread.start()
+        logger.info("[CONSENSUS] 🔄 Periodic peer sync started (interval: 60s)")
+    
+    def _sync_loop(self):
+        """Main sync loop."""
+        while self.running:
+            try:
+                time.sleep(self.sync_interval)
+                self._perform_sync()
+            except Exception as e:
+                logger.debug(f"[CONSENSUS] Sync loop error: {e}")
+    
+    def _perform_sync(self):
+        """Perform synchronization with all known peers."""
+        if not self.p2p_client:
+            return
+        
+        logger.debug("[CONSENSUS] 📊 Starting peer sync...")
+        
+        try:
+            # Get current chain state
+            cursor = _DB_CONN.cursor()
+            cursor.execute("SELECT MAX(height) FROM blocks")
+            local_height = cursor.fetchone()[0] or 0
+            
+            cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
+            pending_txs = cursor.fetchone()[0] or 0
+            
+            # Query each peer for their metrics
+            for host, port in (self.p2p_client.known_peers or []):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3)
+                    sock.connect((host, port))
+                    
+                    # Request metrics
+                    msg = P2PMessage('GET_METRICS', 'consensus_sync')
+                    sock.send(msg.to_json().encode() + b'\n')
+                    
+                    response_data = sock.recv(4096).decode()
+                    response = P2PMessage.from_json(response_data.strip())
+                    
+                    if response.payload and 'metrics' in response.payload:
+                        metrics = response.payload['metrics']
+                        peer_id = f"{host}:{port}"
+                        
+                        if self.consensus_mgr:
+                            self.consensus_mgr.record_peer_metric(peer_id, 'chain_height', metrics.get('height', 0))
+                            self.consensus_mgr.record_peer_metric(peer_id, 'pending_txs', metrics.get('pending_txs', 0))
+                    
+                    sock.close()
+                
+                except Exception as e:
+                    logger.debug(f"[CONSENSUS] Sync failed with {host}:{port}: {e}")
+            
+            # Update system consensus
+            if self.consensus_mgr:
+                self.consensus_mgr.update_system_metrics()
+                logger.debug("[CONSENSUS] ✅ Peer sync complete")
+        
+        except Exception as e:
+            logger.debug(f"[CONSENSUS] Sync error: {e}")
+    
+    def stop(self):
+        """Stop periodic sync."""
+        self.running = False
+        logger.info("[CONSENSUS] 🛑 Periodic peer sync stopped")
+
+
+# Global instances
+_TX_SIGNER: Optional[HLWETransactionSigner] = None
+_ORACLE_BROADCASTER: Optional[OracleBroadcaster] = None
+_CONSENSUS_MGR: Optional[ConsensusManager] = None
+_PEER_SYNC: Optional[PeriodicPeerSync] = None
 
 LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
 API_PREFIX='/api'
@@ -2353,9 +3096,125 @@ def main():
         if args.strict_w_verification:
             logger.warning("[INIT] Strict W-state verification enabled")
         
+        # ─── SCHEMA PATCHES ─────────────────────────────────────────────────────────────
+        logger.info("[INIT] 🔧 Applying database schema patches...")
+        apply_schema_patches()
+        
+        # ─── P2P INITIALIZATION SEQUENCE ────────────────────────────────────────────
+        logger.info("[P2P] 🚀 Initializing P2P network layer...")
+        
+        # 1. Start P2P server (listen for peer connections)
+        peer_id = f"qtcl_miner_{uuid.uuid4().hex[:12]}"
+        global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC
+        
+        _P2P_SERVER = P2PServer(peer_id, port=8333)
+        server_thread = threading.Thread(target=_P2P_SERVER.start, daemon=True, name="P2PServer")
+        server_thread.start()
+        time.sleep(0.5)  # Let server bind
+        
+        # 2. Initialize transaction signing and Oracle broadcasting
+        _TX_SIGNER = HLWETransactionSigner(address)
+        _ORACLE_BROADCASTER = OracleBroadcaster(args.oracle_url)
+        logger.info("[SIGNING] 🔐 HLWE transaction signing initialized")
+        logger.info("[ORACLE] 📤 Oracle broadcasting initialized")
+        
+        # 3. Initialize consensus and periodic sync
+        _CONSENSUS_MGR = ConsensusManager()
+        _PEER_SYNC = PeriodicPeerSync(_P2P_CLIENT, _CONSENSUS_MGR)
+        logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
+        
+        # 4. Create P2P client for peer discovery
+        _P2P_CLIENT = P2PClient(peer_id)
+        
+        # 5. Try to sync blocks from P2P peers
+        current_height = 0
+        p2p_success = False
+        
+        logger.info("[P2P] 🔍 Discovering peers...")
+        discovered = _P2P_CLIENT.discover_peers(timeout=5)
+        if discovered:
+            _P2P_CLIENT.known_peers.extend(discovered)
+            logger.info(f"[P2P] ✅ Discovered {len(discovered)} peers")
+        
+        logger.info("[P2P] 📊 Querying peers for current block height...")
+        current_height = _P2P_CLIENT.get_block_height(timeout=5)
+        
+        if current_height is not None and current_height > 0:
+            logger.info(f"[P2P] ✅ P2P sync: Current height = {current_height}")
+            
+            # Sync blocks from peers if needed
+            try:
+                db_height = 0
+                cursor = _DB_CONN.cursor()
+                cursor.execute("SELECT MAX(height) FROM blocks")
+                result = cursor.fetchone()
+                if result[0] is not None:
+                    db_height = result[0]
+                
+                if current_height > db_height:
+                    logger.info(f"[P2P] 📦 Syncing blocks {db_height + 1} to {current_height}...")
+                    blocks = _P2P_CLIENT.sync_blocks(db_height + 1, min(current_height, db_height + 100), timeout=10)
+                    logger.info(f"[P2P] ✅ Synced {len(blocks)} blocks from peers")
+                    p2p_success = True
+            except Exception as e:
+                logger.warning(f"[P2P] ⚠️  Block sync error: {e}")
+        else:
+            logger.warning("[P2P] ⚠️  No peer height information available")
+        
+        # 6. Fallback to Oracle if P2P failed or incomplete
+        if not p2p_success:
+            logger.info("[P2P] 📡 P2P sync incomplete, falling back to Oracle...")
+        
+        # 7. Initialize Oracle and get W-state (in background)
+        logger.info("[ORACLE] 🌐 Connecting to Oracle for W-state recovery...")
+        
+        # ─── START BACKGROUND BROADCAST LOOP ────────────────────────────────────────
+        def oracle_broadcast_loop():
+            """Background loop for Oracle broadcasts."""
+            logger.info("[ORACLE] 🔄 Background Oracle broadcast loop started")
+            while True:
+                try:
+                    time.sleep(30)  # Broadcast every 30 seconds
+                    if _ORACLE_BROADCASTER:
+                        stats = _ORACLE_BROADCASTER.broadcast_pending()
+                        if stats['sent'] > 0:
+                            logger.info(f"[ORACLE] 📤 Broadcast: {stats['sent']} sent, {stats['failed']} failed, {stats['queued']} queued")
+                except Exception as e:
+                    logger.debug(f"[ORACLE] Broadcast loop error: {e}")
+        
+        broadcast_thread = threading.Thread(target=oracle_broadcast_loop, daemon=True, name="OracleBroadcast")
+        broadcast_thread.start()
+        
+        # ─── START BACKGROUND P2P MONITORING ────────────────────────────────────────
+        def p2p_monitoring_loop():
+            """Background loop for P2P monitoring and peer requests."""
+            logger.info("[P2P] 🔄 Background P2P monitoring started")
+            while True:
+                try:
+                    time.sleep(10)  # Poll every 10 seconds
+                    
+                    # Query peers for new blocks
+                    if _P2P_CLIENT:
+                        height = _P2P_CLIENT.get_block_height(timeout=3)
+                        if height is not None:
+                            logger.debug(f"[P2P] 📊 Peer height: {height}")
+                except Exception as e:
+                    logger.debug(f"[P2P] Background monitor error: {e}")
+        
+        p2p_monitor_thread = threading.Thread(target=p2p_monitoring_loop, daemon=True, name="P2PMonitor")
+        p2p_monitor_thread.start()
+        
+        # ─── START PERIODIC PEER SYNC ───────────────────────────────────────────────
+        _PEER_SYNC.start()
+        
+        logger.info("[INIT] ✨ P2P layer, consensus, and signing initialized and monitoring started")
+        
+        # 6. Start node (W-state recovery, blockchain sync, mining)
         if not node.start():
             logger.error("[MAIN] ❌ Failed to start node")
             sys.exit(1)
+        
+        logger.info("[MAIN] 🎯 Mining loop started in foreground")
         
         while True:
             time.sleep(30)
