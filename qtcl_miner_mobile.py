@@ -88,7 +88,19 @@ SYNC_BATCH=50
 MEMPOOL_POLL_INTERVAL=5
 MINING_POLL_INTERVAL=2
 DIFFICULTY_WINDOW=2016
-TARGET_BLOCK_TIME=600
+TARGET_BLOCK_TIME=10          # target seconds per block
+
+# ── Block capacity ────────────────────────────────────────────────────────────
+# Max USER transactions per block (coinbase does NOT count toward this limit).
+# 3 user txs + 1 coinbase = 4 txs total per block.
+# Prevents coinbase-tx loop: coinbase from block N is type='coinbase' and is
+# never added to the mempool, so it can't trigger an immediate block N+1.
+MAX_BLOCK_TX = 3
+
+# ── Mining difficulty ─────────────────────────────────────────────────────────
+# At ~50,000 SHA3-256 h/s (mobile/Termux): difficulty 20 = ~20s average block time.
+# Tune with --difficulty flag at runtime. Default 20 targets ~10-20s.
+DEFAULT_DIFFICULTY = 20
 
 # W-STATE CONFIGURATION
 W_STATE_STREAM_INTERVAL_MS=10
@@ -114,6 +126,18 @@ SYNC_INTERVAL_MS=10
 MAX_SYNC_LAG_MS=100
 HERMITICITY_TOLERANCE=1e-10
 EIGENVALUE_TOLERANCE=-1e-10
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COINBASE CONSTANTS
+# Like Bitcoin: every block's first transaction is a coinbase with no sender.
+# The null address is provably unspendable — no private key can sign from it.
+# Reward is fixed at BLOCK_REWARD_QTCL, halving schedule TBD.
+# ─────────────────────────────────────────────────────────────────────────────
+COINBASE_ADDRESS    = '0000000000000000000000000000000000000000000000000000000000000000'
+BLOCK_REWARD_QTCL   = 12.5          # QTCL per block (human-readable)
+BLOCK_REWARD_BASE   = 1250          # base units (NUMERIC(30,0), 1 QTCL = 100 base units)
+COINBASE_TX_VERSION = 1             # coinbase version field
+COINBASE_MATURITY   = 100           # blocks before coinbase output is spendable (future enforcement)
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE DATA STRUCTURES
@@ -268,18 +292,121 @@ class Transaction:
         return hashlib.sha3_256(data.encode()).hexdigest()
 
 @dataclass
+class CoinbaseTx:
+    """
+    Bitcoin-correct coinbase transaction — always tx[0] in every block.
+
+    CONTRACT:
+      • from_addr  = COINBASE_ADDRESS (64 zero hex chars) — provably unspendable null input
+      • to_addr    = miner_address — where the reward lands
+      • amount     = BLOCK_REWARD_BASE (integer base units, NUMERIC(30,0) compatible)
+      • tx_type    = 'coinbase'
+      • tx_id      = deterministic SHA3-256 of (height + miner + w_entropy_hash)
+                     so the same miner mining the same height always produces the
+                     same coinbase hash — fully verifiable from block header fields
+      • w_proof    = W-state entropy witness — QTCL-specific quantum proof field
+                     binds the block reward to the quantum measurement that solved PoW
+      • signature  = 'COINBASE' sentinel — no cryptographic signature needed;
+                     validity is proven by inclusion in a valid PoW block
+    """
+    tx_id:          str         # SHA3-256(height:miner:w_entropy)
+    from_addr:      str         # COINBASE_ADDRESS — null/unspendable input
+    to_addr:        str         # miner address
+    amount:         int         # BLOCK_REWARD_BASE in base units
+    block_height:   int         # height of the block this coinbase belongs to
+    timestamp_ns:   int         # nanosecond timestamp
+    w_proof:        str         # W-state entropy hash (quantum witness)
+    tx_type:        str = 'coinbase'
+    version:        int = COINBASE_TX_VERSION
+    fee:            float = 0.0
+    signature:      str = 'COINBASE'
+    nonce:          int = 0
+
+    def compute_hash(self) -> str:
+        """Deterministic coinbase hash — same inputs always produce same hash."""
+        canonical = json.dumps({
+            'tx_id':        self.tx_id,
+            'from_addr':    self.from_addr,
+            'to_addr':      self.to_addr,
+            'amount':       self.amount,
+            'block_height': self.block_height,
+            'w_proof':      self.w_proof,
+            'tx_type':      self.tx_type,
+            'version':      self.version,
+        }, sort_keys=True)
+        return hashlib.sha3_256(canonical.encode()).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for block payload — matches server expected fields."""
+        return {
+            'tx_id':        self.tx_id,
+            'from_addr':    self.from_addr,
+            'to_addr':      self.to_addr,
+            'amount':       self.amount,
+            'fee':          self.fee,
+            'timestamp':    self.timestamp_ns // 1_000_000_000,
+            'timestamp_ns': self.timestamp_ns,
+            'block_height': self.block_height,
+            'w_proof':      self.w_proof,
+            'tx_type':      self.tx_type,
+            'version':      self.version,
+            'nonce':        self.nonce,
+            'signature':    self.signature,
+        }
+
+
+def build_coinbase_tx(height: int, miner_address: str, w_entropy_hash: str,
+                      fee_total_base: int = 0) -> CoinbaseTx:
+    """
+    Build the coinbase transaction for a block.
+
+    The tx_id is deterministic: SHA3-256(height:miner_address:w_entropy_hash)
+    This allows any node to recompute and verify the coinbase independently.
+
+    Total reward = block subsidy + transaction fees (in base units).
+    """
+    # Deterministic coinbase ID — no randomness, fully reproducible
+    coinbase_seed = f"coinbase:{height}:{miner_address}:{w_entropy_hash}"
+    tx_id = hashlib.sha3_256(coinbase_seed.encode()).hexdigest()
+
+    total_reward = BLOCK_REWARD_BASE + fee_total_base
+
+    return CoinbaseTx(
+        tx_id        = tx_id,
+        from_addr    = COINBASE_ADDRESS,
+        to_addr      = miner_address,
+        amount       = total_reward,
+        block_height = height,
+        timestamp_ns = time.time_ns(),
+        w_proof      = w_entropy_hash,
+        fee          = 0.0,
+        nonce        = height,   # coinbase nonce = block height (Bitcoin convention)
+    )
+
+@dataclass
 class Block:
     header: BlockHeader
-    transactions: List[Transaction]
-    
-    def compute_merkle(self)->str:
+    transactions: List[Any]   # List[CoinbaseTx | Transaction] — coinbase always at index 0
+
+    def compute_merkle(self) -> str:
+        """
+        Bitcoin-style SHA3-256 merkle tree.
+
+        tx[0] MUST be the coinbase transaction.
+        Both CoinbaseTx and Transaction expose .compute_hash() — duck-typed.
+        Empty transaction list (should never happen after coinbase was added)
+        returns SHA3-256 of empty bytes as a safe sentinel.
+        """
         if not self.transactions:
             return hashlib.sha3_256(b'').hexdigest()
-        hashes=[tx.compute_hash() for tx in self.transactions]
-        while len(hashes)>1:
-            if len(hashes)%2:
-                hashes.append(hashes[-1])
-            hashes=[hashlib.sha3_256((hashes[i]+hashes[i+1]).encode()).hexdigest() for i in range(0,len(hashes),2)]
+        hashes = [tx.compute_hash() for tx in self.transactions]
+        while len(hashes) > 1:
+            if len(hashes) % 2:
+                hashes.append(hashes[-1])   # duplicate last leaf (Bitcoin convention)
+            hashes = [
+                hashlib.sha3_256((hashes[i] + hashes[i+1]).encode()).hexdigest()
+                for i in range(0, len(hashes), 2)
+            ]
         return hashes[0]
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -527,7 +654,7 @@ class P2PClientWStateRecovery:
         except:
             return None
     
-    def recover_w_state(self, snapshot: Dict[str, Any]) -> Optional[RecoveredWState]:
+    def recover_w_state(self, snapshot: Dict[str, Any], verbose: bool = True) -> Optional[RecoveredWState]:
         """Recover W-state from oracle snapshot with adaptive quality evaluation.
         
         CONTRACT:
@@ -578,7 +705,7 @@ class P2PClientWStateRecovery:
                 fidelity=fidelity,
                 coherence=coherence,
                 mode=mode,
-                verbose=True
+                verbose=verbose   # only emit quality log lines on throttled cycles
             )
             
             fidelity_minimal = FIDELITY_THRESHOLD_RELAXED
@@ -614,17 +741,19 @@ class P2PClientWStateRecovery:
                 self._w_state_coherence = coherence
             
             if is_valid:
-                logger.info(
-                    f"[W-STATE] ✅ W-state recovered | {diagnostic} | "
-                    f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
-                )
+                if verbose:
+                    logger.info(
+                        f"[W-STATE] ✅ W-state recovered | {diagnostic} | "
+                        f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
+                    )
                 return recovered
             
             elif is_acceptable and not self.strict_verification:
-                logger.warning(
-                    f"[W-STATE] ⚠️  Marginal W-state accepted | {diagnostic} | "
-                    f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
-                )
+                if verbose:
+                    logger.warning(
+                        f"[W-STATE] ⚠️  Marginal W-state accepted | {diagnostic} | "
+                        f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
+                    )
                 return recovered
             
             else:
@@ -687,7 +816,7 @@ class P2PClientWStateRecovery:
             logger.error(f"[W-STATE] ❌ Entanglement failed: {e}")
             return False
     
-    def verify_entanglement(self, local_fidelity: float, signature_verified: bool) -> bool:
+    def verify_entanglement(self, local_fidelity: float, signature_verified: bool, verbose: bool = True) -> bool:
         """Verify entanglement quality with adaptive thresholds.
         
         local_fidelity is the oracle-reported W-state fidelity (degraded by sync lag).
@@ -710,7 +839,8 @@ class P2PClientWStateRecovery:
                     self.entanglement_state.established = True
                     self.entanglement_state.coherence_verified = True
                 
-                logger.info(f"[W-STATE] 🔗 Entanglement verified | F={local_fidelity:.4f} (≥{fid_threshold:.2f}) | sig=✓")
+                if verbose:
+                    logger.info(f"[W-STATE] 🔗 Entanglement verified | F={local_fidelity:.4f} (≥{fid_threshold:.2f}) | sig=✓")
                 return True
             
             elif local_fidelity >= fid_minimal and signature_verified:
@@ -718,13 +848,15 @@ class P2PClientWStateRecovery:
                     self.entanglement_state.established = True
                     self.entanglement_state.coherence_verified = True
                 
-                logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | F={local_fidelity:.4f} (≥{fid_minimal:.2f}) | sig={signature_verified}")
+                if verbose:
+                    logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | F={local_fidelity:.4f} (≥{fid_minimal:.2f}) | sig={signature_verified}")
                 return True
             
             else:
                 with self._state_lock:
                     self.entanglement_state.established = False
                 
+                # Always log failures — these are actionable
                 logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | F={local_fidelity:.4f} | sig={signature_verified}")
                 return False
         
@@ -787,14 +919,20 @@ class P2PClientWStateRecovery:
         """Continuous sync worker with signature verification."""
         logger.info("[W-STATE] 🔄 Sync worker started")
         
+        _cycle = 0
+        _LOG_EVERY = 50   # log W-state status every 50 cycles (~5s at 10ms interval)
+        
         while self.running:
             try:
+                _cycle += 1
+                _verbose = (_cycle % _LOG_EVERY == 0)
+                
                 snapshot=self.download_latest_snapshot()
                 if snapshot is None:
                     time.sleep(0.5)
                     continue
                 
-                recovered=self.recover_w_state(snapshot)
+                recovered=self.recover_w_state(snapshot, verbose=_verbose)
                 if recovered is None:
                     with self._state_lock:
                         self.entanglement_state.sync_error_count+=1
@@ -809,7 +947,7 @@ class P2PClientWStateRecovery:
                     self.entanglement_state.sync_lag_ms=sync_lag_ms
                 
                 local_fidelity=recovered.w_state_fidelity*(1.0-min(sync_lag_ms/1000,0.1))
-                self.verify_entanglement(local_fidelity,recovered.signature_verified)
+                self.verify_entanglement(local_fidelity, recovered.signature_verified, verbose=_verbose)
                 
                 time.sleep(SYNC_INTERVAL_MS/1000.0)
             
@@ -1068,7 +1206,7 @@ class QuantumMiner:
         self._lock=threading.RLock()
     
     def mine_block(self, transactions: List[Transaction], miner_address: str, parent_hash: str, height: int) -> Optional[Block]:
-        """Mine a block with comprehensive metrics tracking"""
+        """Mine a block with coinbase tx[0] and W-state quantum entropy witness."""
         try:
             mining_start = time.time()
             
@@ -1081,13 +1219,31 @@ class QuantumMiner:
             entanglement = self.w_state_recovery.get_entanglement_status()
             
             # ── CRITICAL: Use oracle-reported fidelity, NOT matrix-computed fidelity ──
-            # pq_curr and pq_last are string lattice field-space identifiers.
-            # The real W-state quality for block submission comes from w_state_fidelity.
             current_fidelity = entanglement.get('w_state_fidelity', 0.0)
             pq_curr_id = entanglement.get('pq_curr', '')
             pq_last_id = entanglement.get('pq_last', '')
             
             logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
+            
+            w_entropy_hash = w_entropy[:64] if w_entropy else secrets.token_hex(32)
+            
+            # ── BUILD COINBASE TX (always tx[0], Bitcoin-correct) ──
+            # Compute fee total from mempool txs in base units
+            fee_total_base = sum(int(round(getattr(tx, 'fee', 0.0) * 100)) for tx in transactions)
+            coinbase = build_coinbase_tx(
+                height         = height,
+                miner_address  = miner_address,
+                w_entropy_hash = w_entropy_hash,
+                fee_total_base = fee_total_base,
+            )
+            logger.info(
+                f"[MINING] 🪙 Coinbase built | tx_id={coinbase.tx_id[:16]}… | "
+                f"reward={coinbase.amount} base units ({coinbase.amount/100:.2f} QTCL) | "
+                f"w_proof={coinbase.w_proof[:16]}…"
+            )
+            
+            # Prepend coinbase — it is ALWAYS transactions[0]
+            all_transactions: List[Any] = [coinbase] + list(transactions)
             
             # Create block template
             header = BlockHeader(
@@ -1100,11 +1256,17 @@ class QuantumMiner:
                 nonce=0,
                 miner_address=miner_address,
                 w_state_fidelity=current_fidelity,
-                w_entropy_hash=w_entropy[:64] if w_entropy else ''
+                w_entropy_hash=w_entropy_hash,
             )
             
-            block = Block(header=header, transactions=transactions)
+            block = Block(header=header, transactions=all_transactions)
+            # Merkle root commits to coinbase + all txs — reward is now ON-CHAIN
             header.merkle_root = block.compute_merkle()
+            
+            logger.info(
+                f"[MINING] 🌿 Merkle root computed | root={header.merkle_root[:16]}… | "
+                f"tx_count={len(all_transactions)} (1 coinbase + {len(transactions)} mempool)"
+            )
             
             # PoW mining with W-state witness
             target = (1 << (256 - self.difficulty)) - 1
@@ -1363,8 +1525,13 @@ class QTCLFullNode:
                     time.sleep(5)
                     continue
                 
-                # Get pending transactions (empty list is OK - can mine empty blocks)
-                pending_txs = self.mempool.get_pending(limit=100)
+                # Pull at most MAX_BLOCK_TX user transactions from mempool.
+                # Coinbase is NOT counted — it's prepended separately in mine_block().
+                # This cap prevents the block size from growing unboundedly and
+                # ensures the coinbase loop can never form:
+                #   • Coinbase tx_type='coinbase' is never added to the mempool
+                #   • /api/mempool only returns type='transfer' pending txs
+                pending_txs = self.mempool.get_pending(limit=MAX_BLOCK_TX)
                 
                 # ✅ MUSEUM-GRADE FIX: Allow mining with empty mempool
                 # Blockchains can mine empty blocks (common during low activity)
@@ -1408,20 +1575,23 @@ class QTCLFullNode:
                                 'w_entropy_hash': str(block.header.w_entropy_hash),
                             }
                             
-                            # Serialize transactions - manual dict per transaction
+                            # Serialize transactions — coinbase (tx[0]) uses its own
+                            # to_dict() serializer; regular transfers use manual extraction.
                             tx_list = []
-                            for tx in block.transactions:
-                                tx_dict = {
-                                    'tx_id':      str(tx.tx_id),
-                                    'from_addr':  str(tx.from_addr),
-                                    'to_addr':    str(tx.to_addr),
-                                    'amount':     float(tx.amount),
-                                    'fee':        float(tx.fee),
-                                    # Transaction uses timestamp_ns (nanoseconds)
-                                    'timestamp':  int(getattr(tx, 'timestamp_ns', 0) // 1_000_000_000),
-                                    'signature':  str(tx.signature) if hasattr(tx, 'signature') else '',
-                                }
-                                tx_list.append(tx_dict)
+                            for idx, tx in enumerate(block.transactions):
+                                if isinstance(tx, CoinbaseTx):
+                                    tx_list.append(tx.to_dict())
+                                else:
+                                    tx_list.append({
+                                        'tx_id':      str(tx.tx_id),
+                                        'from_addr':  str(tx.from_addr),
+                                        'to_addr':    str(tx.to_addr),
+                                        'amount':     float(tx.amount),
+                                        'fee':        float(tx.fee),
+                                        'timestamp':  int(getattr(tx, 'timestamp_ns', 0) // 1_000_000_000),
+                                        'signature':  str(tx.signature) if hasattr(tx, 'signature') else '',
+                                        'tx_type':    'transfer',
+                                    })
                             
                             # Build submission payload
                             block_payload = {
@@ -1721,7 +1891,7 @@ def parse_args():
     parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
     parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
-    parser.add_argument('--difficulty','-d',type=int,default=12,help='Mining difficulty bits')
+    parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Initialize new wallet')
     parser.add_argument('--wallet-password',help='Wallet password')
