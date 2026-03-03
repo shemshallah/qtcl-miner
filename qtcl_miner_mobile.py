@@ -529,10 +529,9 @@ class P2PClient:
     
     def __init__(self, peer_id: str, known_peers: List[Tuple[str, int]] = None):
         self.peer_id = peer_id
-        self.known_peers = known_peers or [
-            ('127.0.0.1', 8333),
-            ('localhost', 8333),
-        ]
+        # 🎯 FIXED: Don't discover ourselves! Start with empty peers list
+        # Oracle will be discovered separately on port 8000
+        self.known_peers = known_peers or []
         self.connected_peers: Dict[str, Tuple[str, int]] = {}
         self.peer_info: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -568,8 +567,32 @@ class P2PClient:
         
         return discovered
     
-    def get_block_height(self, timeout: int = 5) -> Optional[int]:
-        """Query peers for current block height."""
+    def get_block_height(self, timeout: int = 5, oracle_url: str = None) -> Optional[int]:
+        """
+        Get current block height from authoritative sources.
+        
+        Priority:
+        1. LOCAL DATABASE (source of truth)
+        2. Oracle on port 8000 (network consensus)
+        3. Peers on port 8333 (fallback)
+        """
+        # 🎯 PRIORITY 1: Local database is authoritative
+        # This is handled by caller, not here
+        
+        # 🎯 PRIORITY 2: Try Oracle on port 8000 (real network state)
+        if oracle_url:
+            try:
+                import requests
+                r = requests.get(f"{oracle_url.rstrip('/')}/api/blocks/tip", timeout=timeout)
+                if r.status_code == 200:
+                    data = r.json()
+                    oracle_height = data.get('height')
+                    if oracle_height is not None:
+                        return int(oracle_height)
+            except Exception as e:
+                pass  # Fall through to peers
+        
+        # 🎯 PRIORITY 3: Peer network (8333) - only if we have peers
         for host, port in self.known_peers:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -583,13 +606,12 @@ class P2PClient:
                 response = P2PMessage.from_json(response_data.strip())
                 
                 if response.height is not None:
-                    logger.info(f"[P2P] 📊 Current block height: {response.height}")
                     sock.close()
                     return response.height
                 
                 sock.close()
             except Exception as e:
-                logger.debug(f"[P2P] ⚠️  Height query failed for {host}:{port}: {e}")
+                pass  # Try next peer
         
         return None
     
@@ -3568,22 +3590,89 @@ def main():
         
         # ─── START BACKGROUND P2P MONITORING ────────────────────────────────────────
         def p2p_monitoring_loop():
-            """Background loop for P2P monitoring and peer requests."""
+            """Background loop for P2P monitoring - reports LOCAL blockchain height only."""
             logger.info("[P2P] 🔄 Background P2P monitoring started")
             while True:
                 try:
-                    time.sleep(10)  # Poll every 10 seconds
+                    time.sleep(30)  # Check every 30 seconds
                     
-                    # Query peers for new blocks
-                    if _P2P_CLIENT:
-                        height = _P2P_CLIENT.get_block_height(timeout=3)
-                        if height is not None:
-                            logger.debug(f"[P2P] 📊 Peer height: {height}")
+                    # 🎯 FIXED: Report LOCAL database height, not peer height
+                    # Local database is the source of truth
+                    try:
+                        if node.db:
+                            cursor = node.db.execute("SELECT MAX(height) FROM blocks")
+                            result = cursor.fetchone()
+                            local_height = result[0] if result and result[0] is not None else 0
+                            
+                            # Only log if height changed
+                            if not hasattr(p2p_monitoring_loop, 'last_height'):
+                                p2p_monitoring_loop.last_height = local_height
+                            
+                            if local_height != p2p_monitoring_loop.last_height:
+                                logger.info(f"[P2P] 📊 Local blockchain height: {local_height} (from database)")
+                                p2p_monitoring_loop.last_height = local_height
+                    except Exception as e:
+                        logger.debug(f"[P2P] Height check error: {e}")
+                
                 except Exception as e:
                     logger.debug(f"[P2P] Background monitor error: {e}")
         
         p2p_monitor_thread = threading.Thread(target=p2p_monitoring_loop, daemon=True, name="P2PMonitor")
         p2p_monitor_thread.start()
+        
+        # ─── START REAL-TIME ORACLE SYNC ────────────────────────────────────────────
+        def oracle_realtime_sync_loop():
+            """
+            Background loop: continuously sync latest blocks from Oracle.
+            This ensures local database stays in sync with network state.
+            """
+            logger.info("[ORACLE] 🔄 Real-time block sync loop started (interval: 15s)")
+            while True:
+                try:
+                    time.sleep(15)  # Sync every 15 seconds
+                    
+                    # Get current local height
+                    if node.db:
+                        cursor = node.db.execute("SELECT MAX(height) FROM blocks")
+                        result = cursor.fetchone()
+                        local_height = result[0] if result and result[0] is not None else 0
+                        
+                        # Fetch latest blocks from Oracle
+                        try:
+                            tip = node.client.get_tip_block()
+                            if tip and tip.height > local_height:
+                                logger.info(f"[ORACLE] 📥 Syncing blocks {local_height + 1}…{tip.height} from Oracle...")
+                                
+                                for block_height in range(local_height + 1, min(local_height + 11, tip.height + 1)):
+                                    try:
+                                        block_data = node.client.get_block_by_height(block_height)
+                                        if block_data:
+                                            header = BlockHeader.from_dict(block_data.get('header', block_data))
+                                            
+                                            # Persist to database immediately
+                                            node.db.execute("""
+                                                INSERT OR IGNORE INTO blocks 
+                                                (height, block_hash, parent_hash, merkle_root, timestamp_s,
+                                                 difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            """, (
+                                                header.height, header.block_hash, header.parent_hash,
+                                                header.merkle_root, header.timestamp_s, header.difficulty_bits,
+                                                header.nonce, header.miner_address,
+                                                getattr(header, 'w_state_fidelity', 0.0),
+                                                getattr(header, 'w_entropy_hash', '')
+                                            ))
+                                            node.db.commit()
+                                            logger.debug(f"[ORACLE] 📦 Synced block #{block_height} from Oracle")
+                                    except Exception as e:
+                                        logger.debug(f"[ORACLE] ⚠️  Failed to sync block {block_height}: {e}")
+                        except Exception as e:
+                            logger.debug(f"[ORACLE] Sync error: {e}")
+                except Exception as e:
+                    logger.debug(f"[ORACLE] Background sync error: {e}")
+        
+        oracle_sync_thread = threading.Thread(target=oracle_realtime_sync_loop, daemon=True, name="OracleSync")
+        oracle_sync_thread.start()
         
         # ─── START PERIODIC PEER SYNC ───────────────────────────────────────────────
         _PEER_SYNC.start()
@@ -3631,8 +3720,8 @@ def main():
             print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
             print(f"  pq0 Oracle Fidelity:    {status['quantum']['w_state']['pq0_fidelity']:.4f}")
             print(f"  W-State Fidelity:       {status['quantum']['w_state']['w_state_fidelity']:.4f}")
-            print(f"  pq_curr (field ID):     {status['quantum']['w_state']['pq_curr'][:32]}…")
-            print(f"  pq_last (field ID):     {status['quantum']['w_state']['pq_last'][:32]}…")
+            print(f"  pq_curr (field ID):     {status['quantum']['w_state']['pq_curr']}")
+            print(f"  pq_last (field ID):     {status['quantum']['w_state']['pq_last']}")
             print(f"  Sync Lag:               {status['quantum']['w_state']['sync_lag_ms']:.1f}ms")
             print(f"")
             print(f"ORACLE RECOVERY:")
