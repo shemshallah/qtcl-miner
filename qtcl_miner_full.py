@@ -534,21 +534,43 @@ class HyperbolicLattice:
         return 0.0
     
     def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
-        """
-        Compute smoothing parameter eta_epsilon(Lambda) = min{s > 0 : rho_{1/s}(Lambda*\{0}) <= epsilon}
-        where rho_{1/s}(x) = exp(-pi s^2 ||x||^2)
-        """
-        # Approximate using Gaussian heuristic
-        n = self.n
-        vol = float(self.volume)
+    """
+    Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ* \ {0}) ≤ ε}
+    where ρ_{1/s}(x) = exp(-π s^2 ‖x‖^2)
+    
+    The smoothing parameter η_ε(Λ) is the smallest s such that the Gaussian
+    measure of the dual lattice minus the origin is at most ε. This is a
+    critical quantity in lattice-based cryptography that determines the
+    hardness of the Learning With Errors problem.
+    
+    For a lattice Λ of dimension n with volume det(Λ), the Gaussian heuristic
+    gives an approximation:
+        η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
+    
+    where λ_1(Λ*) is the length of the shortest non-zero vector in the dual
+    lattice. Using the Gaussian heuristic for the shortest vector:
+        λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
+    
+    Args:
+        epsilon: Error tolerance (default 1e-9)
         
-        # Gaussian heuristic for shortest vector
-        gh = math.sqrt(n / (2 * math.pi * math.e)) * vol ** (1/n)
-        
-        # Smoothing parameter approximately sqrt(log n)/sigma
-        eta = math.sqrt(math.log(n)) / max(gh, 1e-10)
-        
-        return eta
+    Returns:
+        Estimated smoothing parameter η_ε(Λ)
+    """
+    # Approximate using Gaussian heuristic
+    n = self.n
+    vol = float(self.volume)
+    
+    # Gaussian heuristic for shortest vector in dual lattice
+    # λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
+    gh = math.sqrt(n / (2 * math.pi * math.e)) * vol ** (1/n)
+    
+    # Smoothing parameter approximation
+    # η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
+    log_term = math.log(2 * n * (1 + 1/epsilon))
+    eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
+    
+    return eta
     
     def sample_gaussian(self, sigma: float = 3.2) -> List[int]:
         """
