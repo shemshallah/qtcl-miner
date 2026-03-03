@@ -412,7 +412,7 @@ class HyperbolicLattice:
                 v = [0.1, 0.1]
             
             # Apply Cayley transform to map to hyperbolic space
-            # x_ℍ = (1 + |x_𝔼|²)⁻¹ · (2x_𝔼, 1 - |x_𝔼|²)
+            # x_H = (1 + |x_E|^2)^-1 * (2x_E, 1 - |x_E|^2)
             v_sq = sum(x*x for x in v)
             denom = 1 + v_sq
             
@@ -535,8 +535,8 @@ class HyperbolicLattice:
     
     def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
         """
-        Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ*\{0}) ≤ ε}
-        where ρ_{1/s}(x) = exp(-πs²‖x‖²)
+        Compute smoothing parameter eta_epsilon(Lambda) = min{s > 0 : rho_{1/s}(Lambda*\{0}) <= epsilon}
+        where rho_{1/s}(x) = exp(-pi s^2 ||x||^2)
         """
         # Approximate using Gaussian heuristic
         n = self.n
@@ -545,7 +545,7 @@ class HyperbolicLattice:
         # Gaussian heuristic for shortest vector
         gh = math.sqrt(n / (2 * math.pi * math.e)) * vol ** (1/n)
         
-        # Smoothing parameter ≈ √(log n)/σ
+        # Smoothing parameter approximately sqrt(log n)/sigma
         eta = math.sqrt(math.log(n)) / max(gh, 1e-10)
         
         return eta
@@ -671,7 +671,7 @@ class HyperbolicLattice:
 class HyperbolicGaussian:
     """
     Gaussian distribution on hyperbolic space.
-    PDF ∝ exp(-d(0,x)²/2σ²) where d is hyperbolic distance.
+    PDF proportional to exp(-d(0,x)^2/2sigma^2) where d is hyperbolic distance.
     """
     
     def __init__(self, sigma: float = 3.2, dimension: int = 2):
@@ -680,8 +680,8 @@ class HyperbolicGaussian:
         self.normalization = self._compute_normalization()
     
     def _compute_normalization(self) -> mpf:
-        """Compute normalization constant Z = ∫_ℍ exp(-d(0,x)²/2σ²) dV"""
-        # Volume element in Poincaré disk: dV = 4 dx dy / (1 - r²)²
+        """Compute normalization constant Z = integral_H exp(-d(0,x)^2/2sigma^2) dV"""
+        # Volume element in Poincaré disk: dV = 4 dx dy / (1 - r^2)^2
         # Integrate in polar coordinates
         if MPMATH_AVAILABLE:
             Z = mpf(0)
@@ -749,11 +749,11 @@ class HLWEClayEngine:
     
     Mathematical Definition:
         Given:
-            - Hyperbolic lattice Λ ⊂ ℍ_qⁿ
-            - Secret s ← χ_ℍ (hyperbolic Gaussian)
-            - Error e ← χ_ℍ
-            - Random a ← ℍ_qⁿ (uniform)
-            - b = ⟨a, s⟩_ℍ + e (mod q)
+            - Hyperbolic lattice Lambda subset H_q^n
+            - Secret s sampled from chi_H (hyperbolic Gaussian)
+            - Error e sampled from chi_H
+            - Random a sampled from H_q^n (uniform)
+            - b = <a, s>_H + e (mod q)
         
         Problem: Find s given (a_i, b_i)
     """
@@ -1272,7 +1272,7 @@ class QuantumWStateEntropy:
     """
     Quantum W-state entropy source for hyperbolic key generation.
     
-    W-state: |W⟩ = (|100⟩ + |010⟩ + |001⟩)/√3
+    W-state: |W> = (|100> + |010> + |001>)/sqrt(3)
     Measurement produces 3-bit outcomes with quantum randomness.
     """
     
@@ -2379,9 +2379,9 @@ class P2PClientWStateRecovery:
                 return secrets.token_hex(32)
             
             qc = QuantumCircuit(NUM_QUBITS_WSTATE, NUM_QUBITS_WSTATE)
-            qc.ry(np.arccos(np.sqrt(2/3)), 0)
+            qc.ry(2 * math.acos(1/math.sqrt(3)), 0)
             qc.cx(0, 1)
-            qc.ry(np.arccos(np.sqrt(1/2)), 1)
+            qc.ry(math.acos(1/math.sqrt(2)), 1)
             qc.cx(1, 2)
             qc.measure([0, 1, 2], [0, 1, 2])
             
@@ -3527,6 +3527,7 @@ class MinerRegistry:
 # =============================================================================
 
 def parse_args():
+    import argparse
     parser = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with HLWE')
     parser.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
     parser.add_argument('--oracle-url', '-o', default='https://qtcl-blockchain.koyeb.app', help='Oracle URL')
