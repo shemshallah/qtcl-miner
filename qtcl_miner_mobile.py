@@ -1819,21 +1819,30 @@ class P2PClientWStateRecovery:
             coherence = float(snapshot.get('coherence', 0.85))
             timestamp_ns = snapshot.get('timestamp_ns', int(time.time() * 1e9))
             
-            # ── Lattice field-space identifiers (hex strings, NOT floats) ──
-            pq_curr_id = str(snapshot.get('pq_current', ''))
-            pq_last_id = str(snapshot.get('pq_last',    ''))
+            # ── Lattice field-space identifiers (integers 1-106495 from oracle) ──
+            pq_curr_id = snapshot.get('pq_current')
+            pq_last_id = snapshot.get('pq_last')
             
-            # Oracle may send integer 0 at genesis (block_state not yet populated).
-            # Derive deterministic hex identifiers so the field-space range is always
-            # well-defined and non-degenerate for the lattice controller.
-            if not pq_curr_id or pq_curr_id in ('0', 'None', 'genesis'):
-                pq_curr_id = hashlib.sha256(
-                    f"pq_curr:{timestamp_ns}:{fidelity}".encode()
-                ).hexdigest()
-            if not pq_last_id or pq_last_id in ('0', 'None', 'genesis'):
-                pq_last_id = hashlib.sha256(
-                    f"pq_last:{timestamp_ns}:{pq_curr_id}".encode()
-                ).hexdigest()
+            # Ensure these are actual lattice field IDs from oracle
+            # Oracle sends integers in range [1, 106495]
+            if pq_curr_id is None or not isinstance(pq_curr_id, (int, float)):
+                pq_curr_id = snapshot.get('pq_curr')
+            if pq_last_id is None or not isinstance(pq_last_id, (int, float)):
+                pq_last_id = snapshot.get('pq_last')
+            
+            # Validate lattice field IDs are in valid range
+            if isinstance(pq_curr_id, (int, float)) and 1 <= int(pq_curr_id) <= 106495:
+                pq_curr_id = str(int(pq_curr_id))
+            else:
+                # Fallback: use entropy + timestamp to derive deterministic field ID
+                entropy_val = int(snapshot.get('entropy', timestamp_ns)) % 106495
+                pq_curr_id = str(max(1, entropy_val))
+            
+            if isinstance(pq_last_id, (int, float)) and 1 <= int(pq_last_id) <= 106495:
+                pq_last_id = str(int(pq_last_id))
+            else:
+                # Fallback: derive from current
+                pq_last_id = str(max(1, (int(pq_curr_id) - 1) % 106495 or 106495))
             
             # Build a proper 8x8 W-state density matrix from oracle fidelity.
             # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
@@ -2744,15 +2753,18 @@ class QTCLFullNode:
                 # ─── FETCH MISSING BLOCKS FROM ORACLE ─────────────────────────────
                 # If tip height > 0, we need to fetch blocks 1..tip.height from Oracle
                 try:
-                    # Get current local height
-                    cursor = db.execute("SELECT MAX(height) FROM blocks")
-                    result = cursor.fetchone()
-                    local_height = result[0] if result and result[0] is not None else 0
+                    # Get current local height from database
+                    if self.db:
+                        cursor = self.db.execute("SELECT MAX(height) FROM blocks")
+                        result = cursor.fetchone()
+                        local_height = result[0] if result and result[0] is not None else 0
+                    else:
+                        local_height = 0
                     
                     if tip.height > local_height:
-                        logger.info(f"[NODE] 📥 Syncing {tip.height - local_height} blocks from Oracle...")
+                        logger.info(f"[NODE] 📥 Syncing {tip.height - local_height} blocks from network (heights {local_height + 1}…{tip.height})...")
                         
-                        # Fetch blocks from Oracle one by one
+                        # Fetch blocks from network one by one
                         for block_height in range(local_height + 1, tip.height + 1):
                             try:
                                 block_data = self.client.get_block_by_height(block_height)
@@ -2761,31 +2773,35 @@ class QTCLFullNode:
                                     self.state.add_block(header)
                                     
                                     # Store in database
-                                    db.execute("""
-                                        INSERT OR IGNORE INTO blocks 
-                                        (height, block_hash, parent_hash, merkle_root, timestamp_s, 
-                                         difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        header.height,
-                                        header.block_hash,
-                                        header.parent_hash,
-                                        header.merkle_root,
-                                        header.timestamp_s,
-                                        header.difficulty_bits,
-                                        header.nonce,
-                                        header.miner_address,
-                                        header.w_state_fidelity,
-                                        header.w_entropy_hash
-                                    ))
+                                    if self.db:
+                                        self.db.execute("""
+                                            INSERT OR IGNORE INTO blocks 
+                                            (height, block_hash, parent_hash, merkle_root, timestamp_s, 
+                                             difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            header.height,
+                                            header.block_hash,
+                                            header.parent_hash,
+                                            header.merkle_root,
+                                            header.timestamp_s,
+                                            header.difficulty_bits,
+                                            header.nonce,
+                                            header.miner_address,
+                                            header.w_state_fidelity if hasattr(header, 'w_state_fidelity') else 0.0,
+                                            header.w_entropy_hash if hasattr(header, 'w_entropy_hash') else ''
+                                        ))
+                                        self.db.commit()
                                     
-                                    logger.debug(f"[NODE] 📦 Synced block {block_height}")
+                                    logger.info(f"[NODE] 📦 Synced block #{block_height} | hash={header.block_hash[:16]}…")
                             except Exception as e:
                                 logger.warning(f"[NODE] ⚠️  Failed to sync block {block_height}: {e}")
                         
-                        logger.info(f"[NODE] ✅ Oracle sync complete | local height now: {tip.height}")
+                        logger.info(f"[NODE] ✅ Blocks synced | local height now: {tip.height}")
                 except Exception as e:
-                    logger.warning(f"[NODE] ⚠️  Oracle block sync error: {e}")
+                    logger.warning(f"[NODE] ⚠️  Block sync error: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             self.running = True
             
@@ -2981,25 +2997,26 @@ class QTCLFullNode:
                                 
                                 # ── Persist block to database immediately ──
                                 try:
-                                    db.execute("""
-                                        INSERT OR IGNORE INTO blocks 
-                                        (height, block_hash, parent_hash, merkle_root, timestamp_s, 
-                                         difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        block.header.height,
-                                        block.header.block_hash,
-                                        block.header.parent_hash,
-                                        block.header.merkle_root,
-                                        block.header.timestamp_s,
-                                        block.header.difficulty_bits,
-                                        block.header.nonce,
-                                        block.header.miner_address,
-                                        block.header.w_state_fidelity,
-                                        block.header.w_entropy_hash
-                                    ))
-                                    db.commit()
-                                    logger.debug(f"[MINING] 💾 Block #{block.header.height} persisted to database")
+                                    if self.db:
+                                        self.db.execute("""
+                                            INSERT OR IGNORE INTO blocks 
+                                            (height, block_hash, parent_hash, merkle_root, timestamp_s, 
+                                             difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            block.header.height,
+                                            block.header.block_hash,
+                                            block.header.parent_hash,
+                                            block.header.merkle_root,
+                                            block.header.timestamp_s,
+                                            block.header.difficulty_bits,
+                                            block.header.nonce,
+                                            block.header.miner_address,
+                                            block.header.w_state_fidelity if hasattr(block.header, 'w_state_fidelity') else 0.0,
+                                            block.header.w_entropy_hash if hasattr(block.header, 'w_entropy_hash') else ''
+                                        ))
+                                        self.db.commit()
+                                        logger.info(f"[MINING] 💾 Block #{block.header.height} persisted to database")
                                 except Exception as pe:
                                     logger.warning(f"[MINING] ⚠️  Failed to persist block: {pe}")
                                 
@@ -3349,17 +3366,58 @@ def main():
                     sys.exit(1)
         
         # Start mining
-        # ─── DATABASE INITIALIZATION ────────────────────────────────────────────────────
+        # ─── DATABASE INITIALIZATION WITH COMPLETE SCHEMA ─────────────────────────────
         global db
-        logger.info("[DB] 🔧 Initializing database...")
+        logger.info("[DB] 🔧 Initializing database with complete schema...")
         try:
             db = sqlite3.connect(':memory:', check_same_thread=False)
             db.execute("PRAGMA synchronous=NORMAL")
             db.execute("PRAGMA journal_mode=WAL")
+            
+            # 🎯 CREATE ESSENTIAL TABLES - MUST EXIST BEFORE ANY OPERATIONS
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS blocks (
+                    height INTEGER PRIMARY KEY,
+                    block_hash TEXT UNIQUE NOT NULL,
+                    parent_hash TEXT NOT NULL,
+                    merkle_root TEXT NOT NULL,
+                    timestamp_s INTEGER NOT NULL,
+                    difficulty_bits INTEGER NOT NULL,
+                    nonce INTEGER NOT NULL,
+                    miner_address TEXT NOT NULL,
+                    w_state_fidelity REAL NOT NULL,
+                    w_entropy_hash TEXT NOT NULL,
+                    mining_time_s REAL NOT NULL DEFAULT 0.0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
+                CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+                
+                CREATE TABLE IF NOT EXISTS difficulty_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    current_difficulty INTEGER NOT NULL DEFAULT 12,
+                    target_block_time_s REAL NOT NULL DEFAULT 30.0,
+                    retarget_window INTEGER NOT NULL DEFAULT 10,
+                    last_retarget_height INTEGER NOT NULL DEFAULT 0,
+                    ema_block_time_s REAL NOT NULL DEFAULT 30.0,
+                    ema_alpha REAL NOT NULL DEFAULT 0.2,
+                    min_difficulty INTEGER NOT NULL DEFAULT 8,
+                    max_difficulty INTEGER NOT NULL DEFAULT 32,
+                    total_blocks_retargeted INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+            """)
+            
+            # Initialize difficulty_state singleton row
+            db.execute("INSERT OR IGNORE INTO difficulty_state (id) VALUES(1)")
             db.commit()
-            logger.info("[DB] ✅ SQLite initialized with in-memory database")
+            
+            logger.info("[DB] ✅ Database initialized | blocks table ready | difficulty_state ready")
         except Exception as e:
             logger.error(f"[DB] ❌ Database initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
         
         node=QTCLFullNode(
