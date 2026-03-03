@@ -534,7 +534,7 @@ class HyperbolicLattice:
         return 0.0
     
     def smoothing_parameter(self, epsilon: float = 1e-9) -> float:
-    """
+        """
     Compute smoothing parameter η_ε(Λ) = min{s > 0 : ρ_{1/s}(Λ* \ {0}) ≤ ε}
     where ρ_{1/s}(x) = exp(-π s^2 ‖x‖^2)
     
