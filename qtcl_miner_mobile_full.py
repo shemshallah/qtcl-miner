@@ -2960,6 +2960,7 @@ class QTCLFullNode:
         
         self.sync_thread: Optional[threading.Thread] = None
         self.mining_thread: Optional[threading.Thread] = None
+        self.recovery_thread: Optional[threading.Thread] = None
         
         db.execute("""
             INSERT OR IGNORE INTO quantum_lattice_metadata 
@@ -2976,65 +2977,66 @@ class QTCLFullNode:
         try:
             logger.info("[NODE] 🚀 Starting node...")
             
-            # ─── ATTEMPT ORACLE RECOVERY (with graceful fallback) ───────────────
+            # ─── START W-STATE RECOVERY IN BACKGROUND (NON-BLOCKING) ────────────
+            # This is the critical fix - don't block on Oracle sync
+            logger.info("[NODE] 🔄 W-state recovery starting in background...")
+            self.recovery_thread = threading.Thread(
+                target=self.w_state_recovery.start,
+                daemon=True,
+                name="WStateRecovery"
+            )
+            self.recovery_thread.start()
+            
+            # Node starts immediately in DEGRADED mode
+            # Recovery thread will upgrade to ONLINE mode when Oracle responds
             oracle_online = False
-            logger.info("[NODE] 🔄 Attempting W-state oracle recovery...")
             
-            try:
-                if self.w_state_recovery.start():
-                    oracle_online = True
-                    logger.info("[NODE] ✅ W-state oracle recovery online")
-                else:
-                    logger.warning("[NODE] ⚠️  W-state oracle recovery failed — starting in DEGRADED mode")
-                    logger.info("[NODE] 📡 Will sync block height & W-state from peers instead")
-            except Exception as e:
-                logger.warning(f"[NODE] ⚠️  Oracle connection error: {e}")
-                logger.info("[NODE] 📡 Will sync from peers — continuing startup in DEGRADED mode")
-            
-            # ─── BLOCK HEIGHT SYNC (from oracle OR peers) ──────────────────────
+            # ─── BLOCK HEIGHT SYNC (from local DB as fallback) ──────────────────
             tip = None
-            if oracle_online:
-                tip = self.client.get_tip_block()
-            
-            if not tip:
-                logger.info("[NODE] 📡 Syncing block height from peer network...")
-                # Try to get tip from peers in peer_registry
-                try:
-                    db_cursor = db.execute("SELECT block_height FROM peer_registry ORDER BY block_height DESC LIMIT 1")
-                    result = db_cursor.fetchone()
-                    if result and result[0] > 0:
-                        logger.info(f"[NODE] 📊 Peer consensus height: {result[0]}")
-                except:
-                    pass
-            
-            genesis_data = self.client.get_block_by_height(0)
-            if genesis_data:
-                genesis_header_data = genesis_data.get('header', genesis_data)
-                genesis_header = BlockHeader.from_dict(genesis_header_data)
-                self.state.add_block(genesis_header)
-                
-                db.execute("""
-                    INSERT OR IGNORE INTO blocks 
-                    (height, block_hash, parent_hash, merkle_root, timestamp_s, difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    genesis_header.height,
-                    genesis_header.block_hash,
-                    genesis_header.parent_hash,
-                    genesis_header.merkle_root,
-                    genesis_header.timestamp_s,
-                    genesis_header.difficulty_bits,
-                    genesis_header.nonce,
-                    genesis_header.miner_address,
-                    genesis_header.w_state_fidelity,
-                    genesis_header.w_entropy_hash
-                ))
-                
-                logger.info(
-                    f"[NODE] ⛓️  Genesis block anchored | height=0 | "
-                    f"hash={genesis_header.block_hash[:16]}…"
-                )
-            else:
+            try:
+                genesis_data = self.client.get_block_by_height(0)
+                if genesis_data:
+                    genesis_header_data = genesis_data.get('header', genesis_data)
+                    genesis_header = BlockHeader.from_dict(genesis_header_data)
+                    self.state.add_block(genesis_header)
+                    
+                    db.execute("""
+                        INSERT OR IGNORE INTO blocks 
+                        (height, block_hash, parent_hash, merkle_root, timestamp_s, difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        genesis_header.height,
+                        genesis_header.block_hash,
+                        genesis_header.parent_hash,
+                        genesis_header.merkle_root,
+                        genesis_header.timestamp_s,
+                        genesis_header.difficulty_bits,
+                        genesis_header.nonce,
+                        genesis_header.miner_address,
+                        genesis_header.w_state_fidelity,
+                        genesis_header.w_entropy_hash
+                    ))
+                    
+                    logger.info(
+                        f"[NODE] ⛓️  Genesis block anchored | height=0 | "
+                        f"hash={genesis_header.block_hash[:16]}…"
+                    )
+                else:
+                    genesis_hash = '0' * 64
+                    genesis_header = BlockHeader(
+                        height=0,
+                        block_hash=genesis_hash,
+                        parent_hash='0' * 64,
+                        merkle_root='0' * 64,
+                        timestamp_s=int(time.time()),
+                        difficulty_bits=self.miner.difficulty,
+                        nonce=0,
+                        miner_address='genesis',
+                    )
+                    self.state.add_block(genesis_header)
+                    logger.warning("[NODE] ⚠️  Genesis not on network — using local genesis anchor")
+            except Exception as e:
+                logger.debug(f"[NODE] Could not fetch genesis from network: {e}")
                 genesis_hash = '0' * 64
                 genesis_header = BlockHeader(
                     height=0,
@@ -3047,14 +3049,6 @@ class QTCLFullNode:
                     miner_address='genesis',
                 )
                 self.state.add_block(genesis_header)
-                logger.warning("[NODE] ⚠️  Genesis not on network — using local genesis anchor")
-            
-            if not tip and oracle_online:
-                tip = self.client.get_tip_block()
-            
-            if tip and tip.height > 0:
-                self.state.add_block(tip)
-                logger.info(f"[NODE] ✅ Network tip | height={tip.height} | hash={tip.block_hash[:16]}…")
             
             self.running = True
             
@@ -3064,16 +3058,19 @@ class QTCLFullNode:
             self.mining_thread = threading.Thread(target=self._mining_loop, daemon=True, name="MiningWorker")
             self.mining_thread.start()
             
-            logger.info("[NODE] ✨ Full node with quantum mining started")
+            logger.info("[NODE] ✨ Full node with quantum mining started (DEGRADED mode - syncing W-state in background)")
             return True
         
         except Exception as e:
             logger.error(f"[NODE] ❌ Startup failed: {e}")
+            traceback.print_exc()
             return False
     
     def stop(self):
         self.running = False
         self.w_state_recovery.stop()
+        if self.recovery_thread:
+            self.recovery_thread.join(timeout=5)
         if self.sync_thread:
             self.sync_thread.join(timeout=5)
         if self.mining_thread:
