@@ -3618,7 +3618,6 @@ def main():
                     logger.debug(f"[P2P] Background monitor error: {e}")
         
         p2p_monitor_thread = threading.Thread(target=p2p_monitoring_loop, daemon=True, name="P2PMonitor")
-        p2p_monitor_thread.start()
         
         # ─── START REAL-TIME ORACLE SYNC ────────────────────────────────────────────
         def oracle_realtime_sync_loop():
@@ -3672,7 +3671,6 @@ def main():
                     logger.debug(f"[ORACLE] Background sync error: {e}")
         
         oracle_sync_thread = threading.Thread(target=oracle_realtime_sync_loop, daemon=True, name="OracleSync")
-        oracle_sync_thread.start()
         
         # ─── START PERIODIC PEER SYNC ───────────────────────────────────────────────
         _PEER_SYNC.start()
@@ -3683,6 +3681,11 @@ def main():
         if not node.start():
             logger.error("[MAIN] ❌ Failed to start node")
             sys.exit(1)
+        
+        # 🎯 START BACKGROUND LOOPS AFTER node.start() so they can access node.db
+        p2p_monitor_thread.start()
+        oracle_sync_thread.start()
+        logger.info("[MONITORING] 🔄 Started: P2P monitor, Oracle real-time sync")
         
         logger.info("[MAIN] 🎯 Mining loop started in foreground")
         
