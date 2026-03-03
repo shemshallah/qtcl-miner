@@ -556,18 +556,20 @@ class HyperbolicLattice:
         
     Returns:
         Estimated smoothing parameter η_ε(Λ)
-    """
+        """
     # Approximate using Gaussian heuristic
     n = self.n
     vol = float(self.volume)
+    if vol <= 0:
+        vol = 1.0
     
     # Gaussian heuristic for shortest vector in dual lattice
     # λ_1(Λ*) ≈ √(n/(2πe)) · det(Λ)^(1/n)
-    gh = math.sqrt(n / (2 * math.pi * math.e)) * vol ** (1/n)
+    gh = math.sqrt(n / (2 * math.pi * math.e)) * (vol ** (1.0 / n))
     
     # Smoothing parameter approximation
     # η_ε(Λ) ≈ √(log(2n(1 + 1/ε)) / π) / λ_1(Λ*)
-    log_term = math.log(2 * n * (1 + 1/epsilon))
+    log_term = math.log(2 * n * (1 + 1.0 / epsilon))
     eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
     
     return eta
