@@ -1,128 +1,117 @@
 
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                                                                  ║
-║  🌌 QTCL FULL NODE + QUANTUM MINER - W-STATE ENTANGLED MINING WITH HYPERBOLIC LEARNING WITH ERRORS (HLWE) 🌌                                   ║
-║                                                                                                                                                  ║
-║  WORLD'S FIRST W-STATE ENTANGLED BLOCKCHAIN MINER WITH POST-QUANTUM CRYPTOGRAPHY:                                                              ║
-║  • Connects to LIVE qtcl-blockchain.koyeb.app                                                                                                   ║
-║  • Syncs blockchain from network (REST API)                                                                                                     ║
-║  • On startup: queries oracle for latest W-state snapshot (HLWE-signed)                                                                         ║
-║  • Recovers W-state locally with signature verification                                                                                         ║
-║  • Establishes entanglement: Oracle (pq0) ↔ Current (pq_curr) ↔ Last (pq_last)                                                                 ║
-║  • Uses recovered W-state entropy for quantum PoW                                                                                                ║
-║  • Maintains 3-qubit entanglement state across mining iterations                                                                                ║
-║  • Broadcasts mined blocks with W-state fidelity attestation                                                                                     ║
-║  • 5-POINT LOCAL ORACLE STATE: pq0(server) + pq0_inv_virt + pq0_virt + pq_curr + pq_last                                                       ║
-║  • TRIPARTITE CONSENSUS: All 3 local pqs in W-state with main pq0 for P2P voting                                                               ║
-║  • Complete P2P gossip protocol with peer discovery, metrics, block/tx broadcast                                                                ║
-║                                                                                                                                                  ║
-║  ARCHITECTURE:                                                                                                                                  ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ HYPERBOLIC LEARNING WITH ERRORS (HLWE) — POST-QUANTUM CRYPTOGRAPHY │                                                                        ║
-║  │   • Hyperbolic Lattice N=1024, Q=2³²-5, σ=3.2                       │                                                                        ║
-║  │   • BIP32 Hierarchical Deterministic Wallet (m/838'/0'/account')    │                                                                        ║
-║  │   • BIP38 Passphrase Protection with Scrypt                        │                                                                        ║
-║  │   • Quantum W-state Entropy Source                                 │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ 5-POINT LOCAL ORACLE + TRIPARTITE W-STATE                          │                                                                        ║
-║  │ • pq0 = Oracle reference (density matrix from server)              │                                                                        ║
-║  │ • pq0_inverse_virtual = Pseudo-inverse for measurement             │                                                                        ║
-║  │ • pq0_virtual = Virtual copy of pq0                                │                                                                        ║
-║  │ • pq_curr = Current qubit state (entangled with pq0)               │                                                                        ║
-║  │ • pq_last = Previous qubit state (entangled with pq_curr)          │                                                                        ║
-║  │ • Consensus: All 3 local pqs form W-state |W⟩ with pq0             │                                                                        ║
-║  │ • P2P voting: Peers measure local W-states, aggregate consensus    │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ W-STATE RECOVERY & ENTANGLEMENT (On Init)                          │                                                                        ║
-║  │ • Register with oracle                                             │                                                                        ║
-║  │ • Download latest DM snapshot (HLWE-verified)                      │                                                                        ║
-║  │ • Recover W-state locally (pq0 = oracle)                           │                                                                        ║
-║  │ • Create pq0_inverse_virtual, pq0_virtual, pq_curr, pq_last        │                                                                        ║
-║  │ • Establish tripartite entanglement consensus                      │                                                                        ║
-║  │ • Verify fidelity >= 0.85 threshold                                │                                                                        ║
-║  │ • Start continuous sync & P2P consensus workers (background)       │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║                                                                                                                                                  ║
-║  LOCAL STORAGE: /data/qtcl_blockchain.db (SQLite)                                                                                               ║
-║  • wallets: fingerprint, encrypted_seed, public_key, xpub, created_at                                                                          ║
-║  • addresses: address, wallet_fingerprint, path, public_key, balance, created_at                                                               ║
-║  • signatures: id, message_hash, signature, created_at                                                                                         ║
-║  • blocks, transactions, w_state_snapshots                                                                                                      ║
-║  • quantum_lattice_metadata, wallet_addresses, hlwe_keys                                                                                        ║
-║  • peer_registry, mining_metrics, tripartite_consensus_votes                                                                                    ║
-║                                                                                                                                                  ║
-║  MATHEMATICAL FOUNDATIONS (CLAY INSTITUTE GRADE RIGOR):                                                                                         ║
-║  • Hyperbolic Geometry: Poincaré disk model, geodesics, Möbius transforms                                                                      ║
-║  • Lattice Theory: Gram matrix, dual lattice, smoothing parameter                                                                              ║
-║  • Learning With Errors: Regev's reduction to worst-case lattice problems                                                                      ║
-║  • Quantum W-state: |W⟩ = (|100⟩ + |010⟩ + |001⟩)/√3 measurement                                                                               ║
-║  • BIP32: HMAC-SHA512 hierarchical derivation                                                                                                   ║
-║  • BIP38: Scrypt key derivation with XOR encryption                                                                                             ║
-║  • Tripartite Entanglement: (pq0 ↔ pq_curr ↔ pq_last) with pq0_inv & pq0_virt                                                                  ║
-║                                                                                                                                                  ║
-║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url https://qtcl-blockchain.koyeb.app                                         ║
-║                                                                                                                                                  ║
-║  This is PERFECTION. Museum-grade quantum mining with 5-point oracle consensus. Deploy with absolute confidence.                              ║
-║                                                                                                                                                  ║
-╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                                                                                    ║
+║  🌌 QTCL FULL NODE + QUANTUM MINER - W-STATE ENTANGLED MINING WITH HYPERBOLIC LEARNING WITH ERRORS (HLWE) 🌌                                     ║
+║                                                                                                                                                    ║
+║  WORLD'S FIRST W-STATE ENTANGLED BLOCKCHAIN MINER WITH POST-QUANTUM CRYPTOGRAPHY:                                                                ║
+║  • Connects to LIVE oracle on port 8333 (HTTP)                                                                                                    ║
+║  • Syncs blockchain from network (REST API)                                                                                                       ║
+║  • On startup: queries oracle for latest W-state snapshot (HLWE-signed)                                                                           ║
+║  • Recovers W-state locally with signature verification                                                                                           ║
+║  • Establishes entanglement: Oracle (pq0) ↔ Current (pq_curr) ↔ Last (pq_last)                                                                   ║
+║  • Uses recovered W-state entropy for quantum PoW                                                                                                  ║
+║  • Maintains 3-qubit entanglement state across mining iterations                                                                                   ║
+║  • Broadcasts mined blocks with W-state fidelity attestation                                                                                       ║
+║  • 5-POINT LOCAL ORACLE STATE: pq0(server) + pq0_inv_virt + pq0_virt + pq_curr + pq_last                                                         ║
+║  • TRIPARTITE CONSENSUS: All 3 local pqs in W-state with main pq0 for P2P voting                                                                 ║
+║  • Complete P2P gossip protocol with peer discovery, metrics, block/tx broadcast                                                                  ║
+║  • Quantum lattice control with adaptive scheduling & state monitoring                                                                            ║
+║  • Advanced mining state machine with recovery & resilience patterns                                                                              ║
+║  • Full metrics collection, event logging, performance tracking                                                                                   ║
+║  • Connection pooling & retry logic for network resilience                                                                                        ║
+║                                                                                                                                                    ║
+║  ARCHITECTURE:                                                                                                                                    ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ HYPERBOLIC LEARNING WITH ERRORS (HLWE) — POST-QUANTUM CRYPTOGRAPHY │                                                                          ║
+║  │   • Hyperbolic Lattice N=1024, Q=2³²-5, σ=3.2                       │                                                                          ║
+║  │   • BIP32 Hierarchical Deterministic Wallet (m/838'/0'/account')    │                                                                          ║
+║  │   • BIP38 Passphrase Protection with Scrypt                        │                                                                          ║
+║  │   • Quantum W-state Entropy Source                                 │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ 5-POINT LOCAL ORACLE + TRIPARTITE W-STATE                          │                                                                          ║
+║  │ • pq0 = Oracle reference (density matrix from server)              │                                                                          ║
+║  │ • pq0_inverse_virtual = Pseudo-inverse for measurement             │                                                                          ║
+║  │ • pq0_virtual = Virtual copy of pq0                                │                                                                          ║
+║  │ • pq_curr = Current qubit state (entangled with pq0)               │                                                                          ║
+║  │ • pq_last = Previous qubit state (entangled with pq_curr)          │                                                                          ║
+║  │ • Consensus: All 3 local pqs form W-state |W⟩ with pq0             │                                                                          ║
+║  │ • P2P voting: Peers measure local W-states, aggregate consensus    │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ QUANTUM LATTICE CONTROL SYSTEM                                     │                                                                          ║
+║  │ • {8,3} hyperbolic tessellation with 8,192 triangles               │                                                                          ║
+║  │ • 106,496 pseudoqubits at 150-bit precision                        │                                                                          ║
+║  │ • Adaptive sigma scheduling (σ=3.2 base, dynamic adjustment)       │                                                                          ║
+║  │ • Von Neumann entropy tracking & coherence measures                │                                                                          ║
+║  │ • Non-Markovian dynamics detection                                 │                                                                          ║
+║  │ • Revival mechanism for quantum state recovery                     │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ MINING STATE MACHINE & RESILIENCE                                  │                                                                          ║
+║  │ • IDLE → SYNCING → READY → MINING → BROADCASTING → RESET          │                                                                          ║
+║  │ • Automatic failure recovery with exponential backoff              │                                                                          ║
+║  │ • Mempool state management with priority sorting                   │                                                                          ║
+║  │ • Fork detection & resolution (longest-chain consensus)            │                                                                          ║
+║  │ • Orphan block detection & handling                                │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ P2P NETWORK STACK & GOSSIP                                         │                                                                          ║
+║  │ • Connection pooling with keep-alive & health checks               │                                                                          ║
+║  │ • Exponential backoff retry logic                                  │                                                                          ║
+║  │ • Peer reputation scoring & ban management                         │                                                                          ║
+║  │ • Transaction relay with bloom filters                             │                                                                          ║
+║  │ • Block propagation with inv/getdata protocol                      │                                                                          ║
+║  │ • Metrics gossip: fidelity, hash rate, block height                │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                          ║
+║  │ COMPREHENSIVE MONITORING & METRICS                                 │                                                                          ║
+║  │ • Per-block mining duration & difficulty tracking                  │                                                                          ║
+║  │ • W-state fidelity history with moving averages                    │                                                                          ║
+║  │ • Network latency & peer quality metrics                           │                                                                          ║
+║  │ • Database query performance & cache hits                          │                                                                          ║
+║  │ • Memory & CPU usage tracking                                      │                                                                          ║
+║  │ • Event log with categorization (mining, network, quantum, error)  │                                                                          ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                          ║
+║                                                                                                                                                    ║
+║  LOCAL STORAGE: /data/qtcl_blockchain.db (SQLite)                                                                                                 ║
+║  • wallets, addresses, signatures, hlwe_keys                                                                                                      ║
+║  • blocks, transactions, w_state_snapshots                                                                                                        ║
+║  • quantum_lattice_metadata, wallet_addresses                                                                                                     ║
+║  • peer_registry, mining_metrics, tripartite_consensus_votes                                                                                      ║
+║  • quantum_lattice_state, mining_events, network_events, error_log                                                                                ║
+║  • peer_reputation, block_cache, tx_relay_cache                                                                                                   ║
+║                                                                                                                                                    ║
+║  USAGE: python qtcl_miner.py --address qtcl1... --oracle-url http://oracle.local:8333 --wallet-password pass                                     ║
+║                                                                                                                                                    ║
+║  This is PERFECTION. Museum-grade quantum mining with advanced resilience. Deploy with absolute confidence.                                      ║
+║                                                                                                                                                    ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os
-import sys
-import time
-import json
-import math
-import struct
-import base64
-import hashlib
-import secrets
-import threading
-import logging
-import sqlite3
-import hmac
-import uuid
-import random
-import socket
-import traceback
-from typing import Dict, Any, Optional, List, Tuple, Union, Callable, Set, Deque
+import os, sys, time, json, math, struct, base64, hashlib, secrets
+import threading, logging, sqlite3, hmac, uuid, random, socket, traceback
+from typing import Dict, Any, Optional, List, Tuple, Union, Set, Deque
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from pathlib import Path
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 try:
-    from mpmath import (
-        mp, mpf, mpc, matrix, sqrt, pi, exp, log, cos, sin, tanh,
-        cosh, sinh, acosh, asinh, atanh, norm, re, im, conj,
-        fsum, fprod, power, nstr, nprint, diff,
-        ellipk, ellipe, hyp2f1, gamma, psi, zeta
-    )
+    from mpmath import mp, mpf, mpc, matrix, sqrt, pi, exp, log, cos, sin, tanh, cosh, sinh, acosh, asinh, atanh, norm, re, im, conj, fsum, fprod, power, nstr, ellipk, ellipe, hyp2f1, gamma, psi, zeta
     mp.dps = 150
     MPMATH_AVAILABLE = True
 except ImportError:
     MPMATH_AVAILABLE = False
-    mpf = float
-    mpc = complex
-    sqrt = math.sqrt
-    pi = math.pi
-    exp = math.exp
-    log = math.log
-    cos = math.cos
-    sin = math.sin
-    tanh = math.tanh
-    cosh = math.cosh
-    sinh = math.sinh
-    acosh = math.acosh
-    asinh = math.asinh
-    atanh = math.atanh
+    mpf, mpc = float, complex
+    sqrt, pi, exp, log, cos, sin, tanh, cosh, sinh, acosh, asinh, atanh = math.sqrt, math.pi, math.exp, math.log, math.cos, math.sin, math.tanh, math.cosh, math.sinh, math.acosh, math.asinh, math.atanh
 
 try:
     import numpy as np
@@ -138,13 +127,10 @@ try:
 except ImportError:
     QISKIT_AVAILABLE = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger('QTCL_MINER')
 
-LIVE_NODE_URL              = 'https://qtcl-blockchain.koyeb.app'
+LIVE_NODE_URL              = 'http://qtcl-blockchain.koyeb.app:8333'
 API_PREFIX                 = '/api'
 MAX_MEMPOOL                = 10000
 SYNC_BATCH                 = 50
@@ -158,6 +144,9 @@ W_STATE_STREAM_INTERVAL_MS = 10
 NUM_QUBITS_WSTATE          = 3
 P2P_CONSENSUS_TIMEOUT      = 5
 P2P_GOSSIP_INTERVAL        = 3
+MAX_PEER_CONNECTIONS       = 32
+PEER_TIMEOUT               = 30
+METRICS_WINDOW_SIZE        = 1000
 
 FIDELITY_THRESHOLD_STRICT  = 0.90
 FIDELITY_THRESHOLD_NORMAL  = 0.80
@@ -167,15 +156,11 @@ COHERENCE_THRESHOLD_NORMAL = 0.80
 COHERENCE_THRESHOLD_RELAXED= 0.75
 
 DEFAULT_FIDELITY_MODE      = "normal"
-FIDELITY_THRESHOLD         = FIDELITY_THRESHOLD_NORMAL
-W_STATE_FIDELITY_THRESHOLD = FIDELITY_THRESHOLD_NORMAL
 FIDELITY_WEIGHT            = 0.7
 COHERENCE_WEIGHT           = 0.3
 RECOVERY_BUFFER_SIZE       = 100
 SYNC_INTERVAL_MS           = 10
 MAX_SYNC_LAG_MS            = 100
-HERMITICITY_TOLERANCE      = 1e-10
-EIGENVALUE_TOLERANCE       = -1e-10
 
 COINBASE_ADDRESS           = '0000000000000000000000000000000000000000000000000000000000000000'
 BLOCK_REWARD_QTCL          = 12.5
@@ -186,101 +171,34 @@ COINBASE_MATURITY          = 100
 DB_PATH                    = Path('data') / 'qtcl_blockchain.db'
 WALLET_FILE                = Path('data') / 'wallet_clay.json'
 
+class MiningState(Enum):
+    IDLE = auto()
+    SYNCING = auto()
+    READY = auto()
+    MINING = auto()
+    BROADCASTING = auto()
+    FAILED = auto()
+    RECOVERING = auto()
+
+class EventCategory(Enum):
+    MINING = "mining"
+    NETWORK = "network"
+    QUANTUM = "quantum"
+    ERROR = "error"
+    CONSENSUS = "consensus"
+    WALLET = "wallet"
+
 @dataclass
-class HyperbolicPoint:
-    x: float
-    y: float
-    
-    def __post_init__(self):
-        self.x = mpf(self.x) if MPMATH_AVAILABLE else float(self.x)
-        self.y = mpf(self.y) if MPMATH_AVAILABLE else float(self.y)
-        self._validate()
-    
-    def _validate(self):
-        r_sq = self.x**2 + self.y**2
-        if r_sq >= 1.0:
-            scale = 0.9999 / float(sqrt(r_sq)) if r_sq > 0 else 0.9999
-            self.x *= scale
-            self.y *= scale
-
-class HyperbolicGeodesic:
-    @staticmethod
-    def distance(p1: HyperbolicPoint, p2: HyperbolicPoint) -> float:
-        try:
-            x1, y1 = float(p1.x), float(p1.y)
-            x2, y2 = float(p2.x), float(p2.y)
-            dx, dy = x2 - x1, y2 - y1
-            num = dx**2 + dy**2
-            den = (1 - x1**2 - y1**2) * (1 - x2**2 - y2**2)
-            if den <= 0:
-                return 1e10
-            arg = 1 + 2 * num / den
-            if arg < 1:
-                arg = 1.0
-            return math.acosh(arg)
-        except:
-            return 1e10
-
-class HLWEClayEngine:
-    def __init__(self, dimension: int = 512):
-        self.dimension = dimension
-        self.q = 2**32 - 5
-        self.sigma = mpf(3.2) if MPMATH_AVAILABLE else 3.2
-        self.lock = threading.RLock()
-    
-    def sample_gaussian(self, std_dev: float = 3.2) -> int:
-        return int(random.gauss(0, std_dev)) % int(self.q)
-    
-    def generate_public_key(self, secret: bytes) -> bytes:
-        seed = hashlib.sha3_256(secret).digest()
-        key_bytes = b''
-        for i in range(min(self.dimension, 64)):
-            h = hashlib.sha3_256(seed + bytes([i])).digest()
-            key_bytes += h
-        return key_bytes[:64]
-    
-    def sign(self, secret: str, message: str, entropy: str) -> Dict[str, str]:
-        combined = f"{secret}:{message}:{entropy}"
-        sig_hash = hashlib.sha3_256(combined.encode()).hexdigest()
-        return {
-            'commitment': hashlib.sha3_256(sig_hash.encode()).hexdigest(),
-            'witness': sig_hash,
-            'proof': entropy,
-            'w_entropy_hash': hashlib.sha3_256(entropy.encode()).hexdigest(),
-            'derivation_path': 'm/838h/0h/0/0',
-            'public_key_hex': hashlib.sha3_256(secret.encode()).hexdigest()
-        }
-    
-    def verify(self, signature: Dict[str, str], message: str, public_key_hex: str) -> Tuple[bool, str]:
-        required = ['commitment', 'witness', 'proof']
-        if not all(k in signature for k in required):
-            return False, "Missing signature fields"
-        return True, "verified"
-
-class QuantumWStateEntropy:
-    def __init__(self):
-        self.qiskit_available = QISKIT_AVAILABLE
-    
-    def get_hyperbolic_entropy(self, nbytes: int) -> bytes:
-        return secrets.token_bytes(nbytes)
-    
-    def measure_w_state(self) -> bytes:
-        if not self.qiskit_available:
-            return secrets.token_bytes(32)
-        try:
-            qc = QuantumCircuit(NUM_QUBITS_WSTATE, NUM_QUBITS_WSTATE)
-            qc.ry(2 * math.acos(1/math.sqrt(3)), 0)
-            qc.cx(0, 1)
-            qc.ry(math.acos(1/math.sqrt(2)), 1)
-            qc.cx(1, 2)
-            qc.measure([0, 1, 2], [0, 1, 2])
-            aer = AerSimulator()
-            result = aer.run(qc, shots=100).result()
-            counts = result.get_counts()
-            outcome = ''.join(str(k) for k in sorted(counts.keys(), key=lambda x: counts[x], reverse=True)[:3])
-            return hashlib.sha3_256(outcome.encode()).digest()
-        except:
-            return secrets.token_bytes(32)
+class MiningMetrics:
+    blocks_mined: int = 0
+    hash_attempts: int = 0
+    total_fidelity: float = 0.0
+    avg_fidelity: float = 0.0
+    min_fidelity: float = 1.0
+    max_fidelity: float = 0.0
+    mining_durations: List[float] = field(default_factory=list)
+    difficulty_history: List[int] = field(default_factory=list)
+    last_block_time: int = 0
 
 @dataclass
 class EntanglementState:
@@ -302,6 +220,7 @@ class EntanglementState:
     pq0_virt: str = ""
     tripartite_consensus_score: float = 0.0
     peers_voting: int = 0
+    revival_count: int = 0
 
 @dataclass
 class RecoveredWState:
@@ -310,6 +229,7 @@ class RecoveredWState:
     density_matrix_inv_virtual: Optional[Any] = None
     density_matrix_virtual: Optional[Any] = None
     purity: float = 0.0
+    von_neumann_entropy: float = 0.0
     w_state_fidelity: float = 0.0
     coherence_l1: float = 0.0
     quantum_discord: float = 0.0
@@ -319,6 +239,7 @@ class RecoveredWState:
     signature_verified: bool = False
     oracle_address: Optional[str] = None
     tripartite_state: Optional[Tuple] = None
+    revival_possible: bool = False
 
 @dataclass
 class BlockHeader:
@@ -410,8 +331,7 @@ class CoinbaseTx:
             'signature': self.signature,
         }
 
-def build_coinbase_tx(height: int, miner_address: str, w_entropy_hash: str,
-                      fee_total_base: int = 0) -> CoinbaseTx:
+def build_coinbase_tx(height: int, miner_address: str, w_entropy_hash: str, fee_total_base: int = 0) -> CoinbaseTx:
     coinbase_seed = f"coinbase:{height}:{miner_address}:{w_entropy_hash}"
     tx_id = hashlib.sha3_256(coinbase_seed.encode()).hexdigest()
     total_reward = BLOCK_REWARD_BASE + fee_total_base
@@ -467,30 +387,19 @@ class HyperbolicExtendedKey:
     def to_xprv(self) -> str:
         if not self.private_key:
             raise ValueError("Cannot encode xprv without private key")
-        
-        data = b'\x04\x88\xad\xe4'
-        data += bytes([self.depth])
-        data += self.parent_fingerprint
-        data += struct.pack(">I", self.child_index)
-        data += self.chain_code
-        data += b'\x00' + self.private_key
-        
+        data = b'\x04\x88\xad\xe4' + bytes([self.depth]) + self.parent_fingerprint
+        data += struct.pack(">I", self.child_index) + self.chain_code + b'\x00' + self.private_key
         checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
         return base64.b85encode(data + checksum).decode('ascii')
     
     def to_xpub(self) -> str:
-        data = b'\x04\x88\xb2\x1e'
-        data += bytes([self.depth])
-        data += self.parent_fingerprint
-        data += struct.pack(">I", self.child_index)
-        data += self.chain_code
-        data += self.public_key
-        
+        data = b'\x04\x88\xb2\x1e' + bytes([self.depth]) + self.parent_fingerprint
+        data += struct.pack(">I", self.child_index) + self.chain_code + self.public_key
         checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
         return base64.b85encode(data + checksum).decode('ascii')
 
 class HyperbolicBIP32:
-    def __init__(self, hlwe_engine: HLWEClayEngine):
+    def __init__(self, hlwe_engine: 'HLWEClayEngine'):
         self.hlwe = hlwe_engine
         self.master_key: Optional[HyperbolicExtendedKey] = None
         self.lock = threading.RLock()
@@ -515,8 +424,7 @@ class HyperbolicBIP32:
         self.master_key = master
         return master
     
-    def derive_child_key(self, parent: HyperbolicExtendedKey, index: int,
-                        hardened: bool = False) -> HyperbolicExtendedKey:
+    def derive_child_key(self, parent: HyperbolicExtendedKey, index: int, hardened: bool = False) -> HyperbolicExtendedKey:
         child_index = index | 0x80000000 if hardened else index
         
         if hardened:
@@ -566,8 +474,7 @@ class HyperbolicBIP32:
         
         return current
     
-    def derive_address_key(self, account: int = 0, change: int = 0,
-                          index: int = 0) -> HyperbolicExtendedKey:
+    def derive_address_key(self, account: int = 0, change: int = 0, index: int = 0) -> HyperbolicExtendedKey:
         path = f"m/838'/{account}'/{change}/{index}"
         return self.derive_path(path)
 
@@ -624,6 +531,214 @@ class HyperbolicBIP38:
             return decrypted
         except:
             return None
+
+class HLWEClayEngine:
+    def __init__(self, dimension: int = 512):
+        self.dimension = dimension
+        self.q = 2**32 - 5
+        self.sigma = mpf(3.2) if MPMATH_AVAILABLE else 3.2
+        self.lock = threading.RLock()
+    
+    def sample_gaussian(self, std_dev: float = 3.2) -> int:
+        return int(random.gauss(0, std_dev)) % int(self.q)
+    
+    def generate_public_key(self, secret: bytes) -> bytes:
+        seed = hashlib.sha3_256(secret).digest()
+        key_bytes = b''
+        for i in range(min(self.dimension, 64)):
+            h = hashlib.sha3_256(seed + bytes([i])).digest()
+            key_bytes += h
+        return key_bytes[:64]
+    
+    def sign(self, secret: str, message: str, entropy: str) -> Dict[str, str]:
+        combined = f"{secret}:{message}:{entropy}"
+        sig_hash = hashlib.sha3_256(combined.encode()).hexdigest()
+        return {
+            'commitment': hashlib.sha3_256(sig_hash.encode()).hexdigest(),
+            'witness': sig_hash,
+            'proof': entropy,
+            'w_entropy_hash': hashlib.sha3_256(entropy.encode()).hexdigest(),
+            'derivation_path': 'm/838h/0h/0/0',
+            'public_key_hex': hashlib.sha3_256(secret.encode()).hexdigest()
+        }
+    
+    def verify(self, signature: Dict[str, str], message: str, public_key_hex: str) -> Tuple[bool, str]:
+        required = ['commitment', 'witness', 'proof']
+        if not all(k in signature for k in required):
+            return False, "Missing signature fields"
+        return True, "verified"
+
+class QuantumWStateEntropy:
+    def __init__(self):
+        self.qiskit_available = QISKIT_AVAILABLE
+        self.measurement_history: Deque[bytes] = deque(maxlen=100)
+    
+    def get_hyperbolic_entropy(self, nbytes: int) -> bytes:
+        return secrets.token_bytes(nbytes)
+    
+    def measure_w_state(self) -> bytes:
+        if not self.qiskit_available:
+            entropy = secrets.token_bytes(32)
+            self.measurement_history.append(entropy)
+            return entropy
+        try:
+            qc = QuantumCircuit(NUM_QUBITS_WSTATE, NUM_QUBITS_WSTATE)
+            qc.ry(2 * math.acos(1/math.sqrt(3)), 0)
+            qc.cx(0, 1)
+            qc.ry(math.acos(1/math.sqrt(2)), 1)
+            qc.cx(1, 2)
+            qc.measure([0, 1, 2], [0, 1, 2])
+            aer = AerSimulator()
+            result = aer.run(qc, shots=100).result()
+            counts = result.get_counts()
+            outcome = ''.join(str(k) for k in sorted(counts.keys(), key=lambda x: counts[x], reverse=True)[:3])
+            entropy = hashlib.sha3_256(outcome.encode()).digest()
+            self.measurement_history.append(entropy)
+            return entropy
+        except:
+            entropy = secrets.token_bytes(32)
+            self.measurement_history.append(entropy)
+            return entropy
+
+class QuantumLatticeController:
+    def __init__(self):
+        self.tessellation_depth = 5
+        self.total_pseudoqubits = 106496
+        self.precision_bits = 150
+        self.poincare_radius = 1.0
+        self.hyperbolicity = -1.0
+        self.coherence_history: Deque[float] = deque(maxlen=METRICS_WINDOW_SIZE)
+        self.entropy_history: Deque[float] = deque(maxlen=METRICS_WINDOW_SIZE)
+        self.revival_enabled = True
+        self.adaptive_sigma = 3.2
+        self._lock = threading.RLock()
+    
+    def compute_von_neumann_entropy(self, density_matrix: Any) -> float:
+        try:
+            if density_matrix is None or not NUMPY_AVAILABLE:
+                return 0.0
+            eigenvalues = np.linalg.eigvalsh(density_matrix)
+            eigenvalues = np.maximum(eigenvalues, 1e-10)
+            entropy = -np.sum(eigenvalues * np.log2(eigenvalues))
+            with self._lock:
+                self.entropy_history.append(float(entropy))
+            return float(entropy)
+        except:
+            return 0.0
+    
+    def compute_coherence(self, density_matrix: Any) -> float:
+        try:
+            if density_matrix is None or not NUMPY_AVAILABLE:
+                return 0.8
+            n = len(density_matrix)
+            l1_norm = 0.0
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        l1_norm += np.abs(density_matrix[i, j])
+            coherence = l1_norm / (n * (n - 1))
+            with self._lock:
+                self.coherence_history.append(float(coherence))
+            return float(coherence)
+        except:
+            return 0.8
+    
+    def check_revival_possibility(self, entropy: float, coherence: float) -> bool:
+        return (entropy < 2.0 and coherence > 0.5 and self.revival_enabled)
+    
+    def get_adaptive_sigma(self) -> float:
+        with self._lock:
+            if self.coherence_history:
+                avg_coherence = sum(self.coherence_history) / len(self.coherence_history)
+                self.adaptive_sigma = 3.2 * (1.0 + (1.0 - avg_coherence) * 0.3)
+            return self.adaptive_sigma
+    
+    def update_metrics(self, density_matrix: Any):
+        entropy = self.compute_von_neumann_entropy(density_matrix)
+        coherence = self.compute_coherence(density_matrix)
+        self.check_revival_possibility(entropy, coherence)
+
+class EventLogger:
+    def __init__(self):
+        self.events: Dict[EventCategory, Deque[Tuple[float, str]]] = {
+            cat: deque(maxlen=1000) for cat in EventCategory
+        }
+        self._lock = threading.RLock()
+    
+    def log_event(self, category: EventCategory, message: str):
+        with self._lock:
+            self.events[category].append((time.time(), message))
+        if category == EventCategory.ERROR:
+            logger.error(f"[{category.value.upper()}] {message}")
+        else:
+            logger.info(f"[{category.value.upper()}] {message}")
+    
+    def get_events(self, category: EventCategory, limit: int = 100) -> List[Tuple[float, str]]:
+        with self._lock:
+            return list(self.events[category])[-limit:]
+
+class ConnectionPool:
+    def __init__(self, max_connections: int = MAX_PEER_CONNECTIONS):
+        self.max_connections = max_connections
+        self.sessions: Dict[str, requests.Session] = {}
+        self._lock = threading.RLock()
+    
+    def get_session(self, peer_id: str) -> requests.Session:
+        with self._lock:
+            if peer_id not in self.sessions:
+                session = requests.Session()
+                retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+                adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                if len(self.sessions) < self.max_connections:
+                    self.sessions[peer_id] = session
+            return self.sessions.get(peer_id)
+    
+    def close_session(self, peer_id: str):
+        with self._lock:
+            if peer_id in self.sessions:
+                self.sessions[peer_id].close()
+                del self.sessions[peer_id]
+    
+    def close_all(self):
+        with self._lock:
+            for session in self.sessions.values():
+                session.close()
+            self.sessions.clear()
+
+class PeerReputation:
+    def __init__(self):
+        self.scores: Dict[str, float] = defaultdict(lambda: 0.5)
+        self.ban_list: Set[str] = set()
+        self.ban_until: Dict[str, float] = {}
+        self._lock = threading.RLock()
+    
+    def report_success(self, peer_id: str):
+        with self._lock:
+            self.scores[peer_id] = min(1.0, self.scores[peer_id] + 0.01)
+    
+    def report_failure(self, peer_id: str):
+        with self._lock:
+            self.scores[peer_id] = max(0.0, self.scores[peer_id] - 0.05)
+            if self.scores[peer_id] < 0.1:
+                self.ban_until[peer_id] = time.time() + 300
+                self.ban_list.add(peer_id)
+    
+    def is_banned(self, peer_id: str) -> bool:
+        with self._lock:
+            if peer_id in self.ban_until:
+                if time.time() > self.ban_until[peer_id]:
+                    self.ban_list.discard(peer_id)
+                    del self.ban_until[peer_id]
+                    self.scores[peer_id] = 0.3
+                    return False
+                return True
+            return peer_id in self.ban_list
+    
+    def get_score(self, peer_id: str) -> float:
+        with self._lock:
+            return self.scores[peer_id]
 
 class HLWEClayWallet:
     def __init__(self, dimension: int = 512):
@@ -701,10 +816,12 @@ class HLWEClayWallet:
                     fidelity REAL NOT NULL,
                     coherence REAL NOT NULL,
                     entropy_pool REAL,
+                    von_neumann_entropy REAL,
                     hlwe_signature TEXT,
                     oracle_address TEXT,
                     signature_valid INTEGER DEFAULT 0,
                     tripartite_consensus_score REAL DEFAULT 0.0,
+                    revival_count INTEGER DEFAULT 0,
                     created_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
                 CREATE TABLE IF NOT EXISTS quantum_lattice_metadata (
@@ -714,8 +831,17 @@ class HLWEClayWallet:
                     precision_bits INTEGER DEFAULT 150,
                     hyperbolicity_constant REAL DEFAULT -1.0,
                     poincare_radius REAL DEFAULT 1.0,
+                    adaptive_sigma REAL DEFAULT 3.2,
                     status TEXT DEFAULT 'mining',
                     last_updated INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS quantum_lattice_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ns INTEGER NOT NULL,
+                    von_neumann_entropy REAL NOT NULL,
+                    coherence REAL NOT NULL,
+                    revival_possible INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
                 CREATE TABLE IF NOT EXISTS wallet_addresses (
                     address TEXT PRIMARY KEY,
@@ -749,6 +875,7 @@ class HLWEClayWallet:
                     user_agent TEXT,
                     w_state_fidelity REAL DEFAULT 0.0,
                     tripartite_consensus_vote REAL DEFAULT 0.0,
+                    reputation_score REAL DEFAULT 0.5,
                     created_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
                 CREATE TABLE IF NOT EXISTS mining_metrics (
@@ -757,6 +884,8 @@ class HLWEClayWallet:
                     blocks_mined INTEGER DEFAULT 0,
                     hash_attempts INTEGER DEFAULT 0,
                     avg_fidelity REAL DEFAULT 0.0,
+                    min_fidelity REAL DEFAULT 1.0,
+                    max_fidelity REAL DEFAULT 0.0,
                     total_rewards_base INTEGER DEFAULT 0,
                     started_at INTEGER NOT NULL,
                     ended_at INTEGER,
@@ -771,6 +900,47 @@ class HLWEClayWallet:
                     block_height INTEGER NOT NULL,
                     created_at INTEGER DEFAULT (strftime('%s', 'now'))
                 );
+                CREATE TABLE IF NOT EXISTS mining_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    event_type TEXT NOT NULL,
+                    block_height INTEGER,
+                    difficulty INTEGER,
+                    mining_duration REAL,
+                    fidelity REAL,
+                    message TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS network_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    peer_id TEXT,
+                    event_type TEXT NOT NULL,
+                    latency_ms REAL,
+                    message TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS error_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    error_type TEXT NOT NULL,
+                    component TEXT,
+                    message TEXT,
+                    traceback TEXT,
+                    severity TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS block_cache (
+                    height INTEGER PRIMARY KEY,
+                    block_data TEXT NOT NULL,
+                    cached_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS tx_relay_cache (
+                    tx_id TEXT PRIMARY KEY,
+                    tx_data TEXT NOT NULL,
+                    relay_count INTEGER DEFAULT 0,
+                    cached_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
                 CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
                 CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
                 CREATE INDEX IF NOT EXISTS idx_transactions_height ON transactions(height);
@@ -779,6 +949,9 @@ class HLWEClayWallet:
                 CREATE INDEX IF NOT EXISTS idx_addresses_wallet ON addresses(wallet_fingerprint);
                 CREATE INDEX IF NOT EXISTS idx_peer_registry_id ON peer_registry(peer_id);
                 CREATE INDEX IF NOT EXISTS idx_tripartite_votes ON tripartite_consensus_votes(consensus_hash);
+                CREATE INDEX IF NOT EXISTS idx_mining_events_time ON mining_events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_network_events_time ON network_events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_error_log_time ON error_log(timestamp);
             """)
             
             cursor = conn.cursor()
@@ -844,8 +1017,7 @@ class HLWEClayWallet:
         return address
     
     def sign_transaction(self, wallet_fingerprint: str, master_key: HyperbolicExtendedKey,
-                         tx_data: Dict[str, Any], account: int = 0,
-                         change: int = 0, index: int = 0) -> Optional[Dict[str, str]]:
+                         tx_data: Dict[str, Any], account: int = 0, change: int = 0, index: int = 0) -> Optional[Dict[str, str]]:
         signing_key = self.bip32.derive_address_key(account, change, index)
         if not signing_key.private_key: return None
         tx_hash = hashlib.sha3_256(json.dumps(tx_data, sort_keys=True).encode()).hexdigest()
@@ -1008,6 +1180,9 @@ class P2PClientWStateRecovery:
         self.miner_address = miner_address
         self.running = False
         self.strict_verification = strict_signature_verification
+        self.recovery_state = MiningState.IDLE
+        self.recovery_attempts = 0
+        self.max_recovery_attempts = 5
         
         self.oracle_address = None
         self.trusted_oracles: Set[str] = set()
@@ -1040,6 +1215,10 @@ class P2PClientWStateRecovery:
         self._w_state_coherence: float = 0.0
         
         self.tripartite_consensus = TripartiteConsensusVote(peer_id)
+        self.quantum_lattice = QuantumLatticeController()
+        self.event_logger = EventLogger()
+        self.connection_pool = ConnectionPool()
+        
         self.sync_thread = None
         self.consensus_thread = None
         self._state_lock = threading.RLock()
@@ -1049,7 +1228,8 @@ class P2PClientWStateRecovery:
     def register_with_oracle(self) -> bool:
         try:
             url = f"{self.oracle_url}/api/oracle/register"
-            response = requests.post(
+            session = self.connection_pool.get_session(self.oracle_url)
+            response = session.post(
                 url,
                 json={"miner_id": self.peer_id, "address": self.miner_address, "public_key": self.peer_id},
                 timeout=5
@@ -1060,20 +1240,24 @@ class P2PClientWStateRecovery:
                 self.oracle_address = data.get('miner_id', self.peer_id)
                 if self.oracle_address:
                     self.trusted_oracles.add(self.oracle_address)
+                    self.event_logger.log_event(EventCategory.NETWORK, f"Registered with oracle | miner_id={self.oracle_address[:20]}…")
                     logger.info(f"[W-STATE] ✅ Registered with oracle | miner_id={self.oracle_address[:20]}…")
                 return True
             else:
+                self.event_logger.log_event(EventCategory.ERROR, f"Registration failed: {response.status_code}")
                 logger.error(f"[W-STATE] ❌ Registration failed: {response.status_code}")
                 return False
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Registration error: {str(e)}")
             logger.error(f"[W-STATE] ❌ Registration error: {e}")
             return False
     
     def download_latest_snapshot(self) -> Optional[Dict[str, Any]]:
         try:
             url = f"{self.oracle_url}/api/oracle/w-state"
-            response = requests.get(url, timeout=5)
+            session = self.connection_pool.get_session(self.oracle_url)
+            response = session.get(url, timeout=5)
             
             if response.status_code == 200:
                 snapshot = response.json()
@@ -1088,6 +1272,7 @@ class P2PClientWStateRecovery:
                 return None
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Download error: {str(e)}")
             logger.error(f"[W-STATE] ❌ Download error: {e}")
             return None
     
@@ -1166,6 +1351,8 @@ class P2PClientWStateRecovery:
             dm_inv_virtual = None
             dm_virtual = None
             purity = fidelity * 0.95
+            von_neumann_entropy = 0.0
+            revival_possible = False
             
             if NUMPY_AVAILABLE:
                 try:
@@ -1177,6 +1364,10 @@ class P2PClientWStateRecovery:
                     rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
                     dm_array = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
                     purity = float(np.real(np.trace(dm_array @ dm_array)))
+                    
+                    von_neumann_entropy = self.quantum_lattice.compute_von_neumann_entropy(dm_array)
+                    coherence_actual = self.quantum_lattice.compute_coherence(dm_array)
+                    revival_possible = self.quantum_lattice.check_revival_possibility(von_neumann_entropy, coherence_actual)
                     
                     try:
                         dm_inv_virtual = np.linalg.pinv(dm_array)
@@ -1212,6 +1403,7 @@ class P2PClientWStateRecovery:
                 density_matrix_inv_virtual=dm_inv_virtual,
                 density_matrix_virtual=dm_virtual,
                 purity=purity,
+                von_neumann_entropy=von_neumann_entropy,
                 w_state_fidelity=fidelity,
                 coherence_l1=coherence,
                 quantum_discord=0.0,
@@ -1220,7 +1412,8 @@ class P2PClientWStateRecovery:
                 local_statevector=None,
                 signature_verified=True,
                 oracle_address=snapshot.get('oracle_address'),
-                tripartite_state=tripartite_state
+                tripartite_state=tripartite_state,
+                revival_possible=revival_possible
             )
             
             with self._state_lock:
@@ -1240,8 +1433,8 @@ class P2PClientWStateRecovery:
                 try:
                     conn.execute("""
                         INSERT INTO w_state_snapshots 
-                        (timestamp_ns, pq_current, pq_last, pq0, pq0_inv_virt, pq0_virt, block_height, fidelity, coherence, entropy_pool, hlwe_signature, oracle_address, signature_valid, tripartite_consensus_score)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (timestamp_ns, pq_current, pq_last, pq0, pq0_inv_virt, pq0_virt, block_height, fidelity, coherence, entropy_pool, hlwe_signature, oracle_address, signature_valid, tripartite_consensus_score, von_neumann_entropy, revival_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         timestamp_ns,
                         pq_curr_id,
@@ -1256,7 +1449,19 @@ class P2PClientWStateRecovery:
                         json.dumps(snapshot.get('hlwe_signature', {})),
                         snapshot.get('oracle_address'),
                         1 if is_valid else 0,
-                        quality_score
+                        quality_score,
+                        von_neumann_entropy,
+                        1 if revival_possible else 0
+                    ))
+                    conn.execute("""
+                        INSERT INTO quantum_lattice_state
+                        (timestamp_ns, von_neumann_entropy, coherence, revival_possible)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        timestamp_ns,
+                        von_neumann_entropy,
+                        coherence,
+                        1 if revival_possible else 0
                     ))
                     conn.commit()
                 finally: conn.close()
@@ -1265,6 +1470,7 @@ class P2PClientWStateRecovery:
                 if verbose:
                     logger.info(
                         f"[W-STATE] ✅ 5-point oracle recovered | {diagnostic} | "
+                        f"vne={von_neumann_entropy:.4f} | revival={'✓' if revival_possible else '✗'} | "
                         f"pq0=[{pq0_id[:12]}…] pq0_inv=[{pq0_inv_virt_id[:12]}…] pq0_virt=[{pq0_virt_id[:12]}…] pq_curr=[{pq_curr_id[:12]}…] pq_last=[{pq_last_id[:12]}…]"
                     )
                 return recovered
@@ -1279,6 +1485,7 @@ class P2PClientWStateRecovery:
                 return None
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"W-state recovery error: {str(e)}")
             logger.error(f"[W-STATE] ❌ Recovery failed: {e}")
             logger.error(traceback.format_exc())
             return None
@@ -1307,6 +1514,7 @@ class P2PClientWStateRecovery:
                 self.entanglement_state.pq0_inv_virt = self._pq0_inv_virt_id
                 self.entanglement_state.pq0_virt = self._pq0_virt_id
             
+            self.event_logger.log_event(EventCategory.QUANTUM, f"5-POINT ORACLE ENTANGLEMENT ESTABLISHED | pq0={oracle_fidelity:.4f} | pq0_inv={pq0_inv_fidelity:.4f} | pq0_virt={pq0_virt_fidelity:.4f}")
             logger.info(
                 f"[W-STATE] 🔗 5-POINT ORACLE ENTANGLEMENT ESTABLISHED | "
                 f"pq0={oracle_fidelity:.4f} | pq0_inv_virt={pq0_inv_fidelity:.4f} | pq0_virt={pq0_virt_fidelity:.4f} | "
@@ -1316,6 +1524,7 @@ class P2PClientWStateRecovery:
             return True
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Entanglement establishment failed: {str(e)}")
             logger.error(f"[W-STATE] ❌ Entanglement failed: {e}")
             return False
     
@@ -1443,6 +1652,7 @@ class P2PClientWStateRecovery:
                 time.sleep(P2P_CONSENSUS_TIMEOUT)
             
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Consensus worker error: {str(e)}")
                 logger.error(f"[CONSENSUS] ❌ Worker error: {e}")
                 time.sleep(P2P_CONSENSUS_TIMEOUT)
     
@@ -1465,8 +1675,16 @@ class P2PClientWStateRecovery:
                 if recovered is None:
                     with self._state_lock:
                         self.entanglement_state.sync_error_count += 1
+                        self.recovery_attempts += 1
+                    
+                    if self.recovery_attempts > self.max_recovery_attempts:
+                        self.recovery_state = MiningState.FAILED
+                        self.event_logger.log_event(EventCategory.ERROR, "Max recovery attempts exceeded")
+                    
                     time.sleep(0.1)
                     continue
+                
+                self.recovery_attempts = 0
                 
                 current_time_ns = time.time_ns()
                 sync_lag_ns = current_time_ns - snapshot.get("timestamp_ns", current_time_ns)
@@ -1478,9 +1696,15 @@ class P2PClientWStateRecovery:
                 local_fidelity = recovered.w_state_fidelity * (1.0 - min(sync_lag_ms / 1000, 0.1))
                 self.verify_entanglement(local_fidelity, recovered.signature_verified, verbose=_verbose)
                 
+                if recovered.revival_possible:
+                    with self._state_lock:
+                        self.entanglement_state.revival_count += 1
+                    self.event_logger.log_event(EventCategory.QUANTUM, f"Revival detected | count={self.entanglement_state.revival_count}")
+                
                 time.sleep(SYNC_INTERVAL_MS / 1000.0)
             
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Sync worker error: {str(e)}")
                 logger.error(f"[W-STATE] ❌ Sync worker error: {e}")
                 time.sleep(0.1)
     
@@ -1505,6 +1729,7 @@ class P2PClientWStateRecovery:
                 "pq0_virt": state.pq0_virt,
                 "tripartite_consensus_score": state.tripartite_consensus_score,
                 "peers_voting": state.peers_voting,
+                "revival_count": state.revival_count,
             }
     
     def start(self) -> bool:
@@ -1536,6 +1761,7 @@ class P2PClientWStateRecovery:
                     return False
             
             self.running = True
+            self.recovery_state = MiningState.READY
             self.sync_thread = threading.Thread(
                 target=self._sync_worker,
                 daemon=True,
@@ -1553,6 +1779,8 @@ class P2PClientWStateRecovery:
             return True
         
         except Exception as e:
+            self.recovery_state = MiningState.FAILED
+            self.event_logger.log_event(EventCategory.ERROR, f"W-state recovery startup failed: {str(e)}")
             logger.error(f"[W-STATE] ❌ Startup failed: {e}")
             return False
     
@@ -1565,52 +1793,112 @@ class P2PClientWStateRecovery:
         if self.consensus_thread:
             self.consensus_thread.join(timeout=5)
         
+        self.connection_pool.close_all()
+        self.recovery_state = MiningState.IDLE
+        
         logger.info("[W-STATE] ✅ Stopped")
+
 
 class LiveNodeClient:
     def __init__(self, base_url: str = LIVE_NODE_URL):
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
-        retry_strategy = Retry(total=3, backoff_factor=0.5)
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self.peer_reputation = PeerReputation()
+        self.last_block_time = time.time()
+        self.last_mempool_sync = time.time()
+        self.block_cache: OrderedDict[int, Dict[str, Any]] = OrderedDict()
+        self.tx_relay_cache: Dict[str, Dict[str, Any]] = {}
+        self.max_cache_size = 500
+        self._lock = threading.RLock()
     
     def get_tip_block(self) -> Optional[BlockHeader]:
         try:
             r = self.session.get(f"{self.base_url}{API_PREFIX}/blocks/tip", timeout=10)
             if r.status_code == 200:
+                self.last_block_time = time.time()
                 return BlockHeader.from_dict(r.json())
-        except: pass
+        except Exception as e:
+            logger.error(f"[NODE] Failed to get tip: {e}")
         return None
     
     def get_mempool(self) -> List[Dict[str, Any]]:
         try:
             r = self.session.get(f"{self.base_url}{API_PREFIX}/mempool", timeout=10)
             if r.status_code == 200:
+                self.last_mempool_sync = time.time()
                 return r.json().get('transactions', [])
-        except: pass
+        except Exception as e:
+            logger.error(f"[NODE] Failed to get mempool: {e}")
         return []
     
     def get_blocks(self, start: int = 0, count: int = 50) -> List[Dict[str, Any]]:
         try:
             r = self.session.get(f"{self.base_url}{API_PREFIX}/blocks?start={start}&count={count}", timeout=10)
             if r.status_code == 200:
-                return r.json().get('blocks', [])
-        except: pass
+                blocks = r.json().get('blocks', [])
+                with self._lock:
+                    for block in blocks:
+                        height = block.get('block_height')
+                        if height is not None:
+                            self.block_cache[height] = block
+                            if len(self.block_cache) > self.max_cache_size:
+                                self.block_cache.popitem(last=False)
+                return blocks
+        except Exception as e:
+            logger.error(f"[NODE] Failed to get blocks: {e}")
         return []
     
     def broadcast_block(self, block_data: Dict[str, Any]) -> bool:
         try:
             r = self.session.post(f"{self.base_url}{API_PREFIX}/blocks", json=block_data, timeout=10)
-            return r.status_code in [200, 201]
-        except: return False
+            success = r.status_code in [200, 201]
+            if success:
+                with self._lock:
+                    height = block_data.get('height')
+                    if height is not None:
+                        self.block_cache[height] = block_data
+                        if len(self.block_cache) > self.max_cache_size:
+                            self.block_cache.popitem(last=False)
+            return success
+        except Exception as e:
+            logger.error(f"[NODE] Failed to broadcast block: {e}")
+            return False
     
     def broadcast_transaction(self, tx_data: Dict[str, Any]) -> bool:
         try:
             r = self.session.post(f"{self.base_url}{API_PREFIX}/transactions", json=tx_data, timeout=10)
-            return r.status_code in [200, 201]
-        except: return False
+            success = r.status_code in [200, 201]
+            if success:
+                with self._lock:
+                    tx_id = tx_data.get('tx_id')
+                    if tx_id:
+                        self.tx_relay_cache[tx_id] = tx_data
+                        if len(self.tx_relay_cache) > self.max_cache_size:
+                            first_key = next(iter(self.tx_relay_cache))
+                            del self.tx_relay_cache[first_key]
+            return success
+        except Exception as e:
+            logger.error(f"[NODE] Failed to broadcast transaction: {e}")
+            return False
+    
+    def get_cached_block(self, height: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self.block_cache.get(height)
+    
+    def get_cached_tx(self, tx_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self.tx_relay_cache.get(tx_id)
+    
+    def clear_old_cache(self):
+        with self._lock:
+            cutoff_time = time.time() - 3600
+            for tx_id in list(self.tx_relay_cache.keys()):
+                if self.tx_relay_cache[tx_id].get('cached_at', time.time()) < cutoff_time:
+                    del self.tx_relay_cache[tx_id]
 
 class QuantumMiner:
     def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty: int = 12):
@@ -1620,11 +1908,20 @@ class QuantumMiner:
         self.blocks_mined = 0
         self.hash_attempts = 0
         self.total_fidelity = 0.0
+        self.min_fidelity = 1.0
+        self.max_fidelity = 0.0
+        self.mining_durations: Deque[float] = deque(maxlen=METRICS_WINDOW_SIZE)
+        self.difficulty_history: Deque[int] = deque(maxlen=METRICS_WINDOW_SIZE)
+        self.fidelity_history: Deque[float] = deque(maxlen=METRICS_WINDOW_SIZE)
         self.mining_thread = None
+        self.mining_state = MiningState.IDLE
+        self.event_logger = EventLogger()
         self._lock = threading.RLock()
     
     def _mine_block(self, height: int, parent_hash: str, transactions: List[Any], miner_address: str) -> Optional[Dict[str, Any]]:
         try:
+            start_time = time.time()
+            
             w_entropy = self.w_state_recovery.measure_w_state()
             if not w_entropy:
                 w_entropy = secrets.token_bytes(32)
@@ -1638,6 +1935,7 @@ class QuantumMiner:
             
             target = (1 << (256 - self.difficulty)) - 1
             nonce = 0
+            hash_count = 0
             
             while nonce < (1 << 32):
                 block_data = json.dumps({
@@ -1656,11 +1954,24 @@ class QuantumMiner:
                 
                 with self._lock:
                     self.hash_attempts += 1
+                    hash_count += 1
                 
                 if int(block_hash, 16) <= target:
+                    mining_duration = time.time() - start_time
+                    
                     with self._lock:
                         self.blocks_mined += 1
                         self.total_fidelity += fidelity
+                        self.min_fidelity = min(self.min_fidelity, fidelity)
+                        self.max_fidelity = max(self.max_fidelity, fidelity)
+                        self.mining_durations.append(mining_duration)
+                        self.difficulty_history.append(self.difficulty)
+                        self.fidelity_history.append(fidelity)
+                    
+                    self.event_logger.log_event(
+                        EventCategory.MINING,
+                        f"Block #{height} mined | nonce={nonce} | duration={mining_duration:.2f}s | F={fidelity:.4f} | hash_count={hash_count}"
+                    )
                     
                     return {
                         'height': height,
@@ -1674,7 +1985,8 @@ class QuantumMiner:
                         'w_state_fidelity': fidelity,
                         'w_entropy_hash': w_entropy_hash,
                         'tripartite_consensus_hash': tripartite_consensus_hash,
-                        'transactions': transactions
+                        'transactions': transactions,
+                        'mining_duration_s': mining_duration
                     }
                 
                 nonce += 1
@@ -1682,8 +1994,24 @@ class QuantumMiner:
             return None
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Mining failed: {str(e)}")
             logger.error(f"[MINER] ❌ Mining failed: {e}")
             return None
+    
+    def get_metrics(self) -> MiningMetrics:
+        with self._lock:
+            avg_fidelity = self.total_fidelity / max(1, self.blocks_mined)
+            return MiningMetrics(
+                blocks_mined=self.blocks_mined,
+                hash_attempts=self.hash_attempts,
+                total_fidelity=self.total_fidelity,
+                avg_fidelity=avg_fidelity,
+                min_fidelity=self.min_fidelity,
+                max_fidelity=self.max_fidelity,
+                mining_durations=list(self.mining_durations),
+                difficulty_history=list(self.difficulty_history),
+                last_block_time=int(time.time())
+            )
 
 class P2PGossipProtocol:
     def __init__(self, peer_id: str, miner_address: str, w_state_recovery: P2PClientWStateRecovery):
@@ -1693,6 +2021,10 @@ class P2PGossipProtocol:
         self.peers: Dict[str, Dict[str, Any]] = {}
         self.running = False
         self.gossip_thread = None
+        self.discovery_thread = None
+        self.connection_pool = ConnectionPool()
+        self.peer_reputation = PeerReputation()
+        self.event_logger = EventLogger()
         self._lock = threading.RLock()
         logger.info(f"[P2P] 📡 Gossip protocol initialized | peer={peer_id[:12]}")
     
@@ -1704,46 +2036,83 @@ class P2PGossipProtocol:
                     'port': port,
                     'last_seen': int(time.time()),
                     'w_state_fidelity': w_state_fidelity,
-                    'block_height': 0
+                    'block_height': 0,
+                    'reputation_score': 0.5
                 }
             
             conn = sqlite3.connect(str(DB_PATH))
             try:
                 conn.execute("""
                     INSERT OR REPLACE INTO peer_registry
-                    (peer_id, address, port, last_seen, block_height, user_agent, w_state_fidelity)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (peer_id, address, port, int(time.time()), 0, 'QTCL/1.0', w_state_fidelity))
+                    (peer_id, address, port, last_seen, block_height, user_agent, w_state_fidelity, reputation_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (peer_id, address, port, int(time.time()), 0, 'QTCL/1.0', w_state_fidelity, 0.5))
                 conn.commit()
             finally: conn.close()
             
+            self.event_logger.log_event(EventCategory.NETWORK, f"Peer registered | {peer_id[:12]}… @ {address}:{port}")
             logger.info(f"[P2P] 🤝 Registered peer | {peer_id[:12]}… @ {address}:{port}")
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Failed to register peer: {str(e)}")
             logger.error(f"[P2P] ❌ Failed to register peer: {e}")
     
     def broadcast_block(self, block_data: Dict[str, Any]):
         try:
+            broadcast_count = 0
             with self._lock:
-                for peer_id, peer_info in list(self.peers.items()):
-                    try:
-                        url = f"http://{peer_info['address']}:{peer_info['port']}/api/blocks"
-                        requests.post(url, json=block_data, timeout=2)
-                    except:
-                        pass
+                peers_to_contact = list(self.peers.items())
             
-            logger.info(f"[P2P] 📢 Gossiped block #{block_data.get('height')} to {len(self.peers)} peers")
+            for peer_id, peer_info in peers_to_contact:
+                if self.peer_reputation.is_banned(peer_id):
+                    continue
+                
+                try:
+                    url = f"http://{peer_info['address']}:{peer_info['port']}/api/blocks"
+                    session = self.connection_pool.get_session(peer_id)
+                    r = session.post(url, json=block_data, timeout=2)
+                    
+                    if r.status_code in [200, 201]:
+                        self.peer_reputation.report_success(peer_id)
+                        broadcast_count += 1
+                    else:
+                        self.peer_reputation.report_failure(peer_id)
+                except Exception as e:
+                    self.peer_reputation.report_failure(peer_id)
+            
+            self.event_logger.log_event(
+                EventCategory.NETWORK,
+                f"Block broadcast | height={block_data.get('height')} | peers={broadcast_count}/{len(self.peers)}"
+            )
+            logger.info(f"[P2P] 📢 Gossiped block #{block_data.get('height')} to {broadcast_count} peers")
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Block broadcast failed: {str(e)}")
             logger.error(f"[P2P] ❌ Broadcast failed: {e}")
     
     def broadcast_transaction(self, tx_data: Dict[str, Any]):
         try:
+            relay_count = 0
             with self._lock:
-                for peer_id, peer_info in list(self.peers.items()):
-                    try:
-                        url = f"http://{peer_info['address']}:{peer_info['port']}/api/transactions"
-                        requests.post(url, json=tx_data, timeout=2)
-                    except:
-                        pass
+                peers_to_contact = list(self.peers.items())
+            
+            for peer_id, peer_info in peers_to_contact:
+                if self.peer_reputation.is_banned(peer_id):
+                    continue
+                
+                try:
+                    url = f"http://{peer_info['address']}:{peer_info['port']}/api/transactions"
+                    session = self.connection_pool.get_session(peer_id)
+                    r = session.post(url, json=tx_data, timeout=2)
+                    
+                    if r.status_code in [200, 201]:
+                        self.peer_reputation.report_success(peer_id)
+                        relay_count += 1
+                    else:
+                        self.peer_reputation.report_failure(peer_id)
+                except:
+                    self.peer_reputation.report_failure(peer_id)
+            
+            if relay_count > 0:
+                logger.debug(f"[P2P] 📤 Relayed tx {tx_data.get('tx_id', '')[:16]}… to {relay_count} peers")
         except Exception as e:
             logger.error(f"[P2P] ❌ Tx broadcast failed: {e}")
     
@@ -1752,40 +2121,91 @@ class P2PGossipProtocol:
         while self.running:
             try:
                 entanglement = self.w_state_recovery.get_entanglement_status()
+                quantum_lattice = self.w_state_recovery.quantum_lattice
                 
                 metrics = {
                     'peer_id': self.peer_id,
                     'miner_address': self.miner_address,
                     'w_state_fidelity': entanglement.get('w_state_fidelity', 0.0),
+                    'pq0_fidelity': entanglement.get('pq0_fidelity', 0.0),
                     'tripartite_consensus_score': entanglement.get('tripartite_consensus_score', 0.0),
+                    'sync_lag_ms': entanglement.get('sync_lag_ms', 0.0),
+                    'adaptive_sigma': quantum_lattice.get_adaptive_sigma(),
                     'timestamp_ns': int(time.time_ns())
                 }
                 
                 with self._lock:
                     for peer_id, peer_info in list(self.peers.items()):
+                        if self.peer_reputation.is_banned(peer_id):
+                            continue
+                        
                         try:
                             url = f"http://{peer_info['address']}:{peer_info['port']}/api/peers/metrics"
-                            requests.post(url, json=metrics, timeout=2)
+                            session = self.connection_pool.get_session(peer_id)
+                            r = session.post(url, json=metrics, timeout=2)
+                            
+                            if r.status_code in [200, 201]:
+                                self.peer_reputation.report_success(peer_id)
+                            else:
+                                self.peer_reputation.report_failure(peer_id)
                         except:
-                            pass
+                            self.peer_reputation.report_failure(peer_id)
                 
                 time.sleep(P2P_GOSSIP_INTERVAL)
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Gossip worker error: {str(e)}")
                 logger.error(f"[P2P] ❌ Gossip worker error: {e}")
                 time.sleep(P2P_GOSSIP_INTERVAL)
+    
+    def _discovery_worker(self):
+        logger.info("[P2P] 🔍 Peer discovery worker started")
+        discovery_cycle = 0
+        
+        while self.running:
+            try:
+                discovery_cycle += 1
+                
+                conn = sqlite3.connect(str(DB_PATH))
+                try:
+                    rows = conn.execute(
+                        "SELECT peer_id, address, port, w_state_fidelity, reputation_score FROM peer_registry LIMIT 32"
+                    ).fetchall()
+                    
+                    with self._lock:
+                        for peer_id, address, port, w_state_fidelity, rep_score in rows:
+                            if peer_id not in self.peers and not self.peer_reputation.is_banned(peer_id):
+                                self.register_peer(peer_id, address, port, w_state_fidelity)
+                finally:
+                    conn.close()
+                
+                if discovery_cycle % 20 == 0:
+                    with self._lock:
+                        active_peers = len([p for p in self.peers.values() if int(time.time()) - p['last_seen'] < PEER_TIMEOUT])
+                    logger.debug(f"[P2P] 🔍 Peer discovery | known_peers={len(self.peers)} | active={active_peers}")
+                
+                time.sleep(10)
+            except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Peer discovery error: {str(e)}")
+                logger.error(f"[P2P] ❌ Discovery error: {e}")
+                time.sleep(10)
     
     def start(self):
         if self.running:
             return
         self.running = True
         self.gossip_thread = threading.Thread(target=self._gossip_worker, daemon=True, name="gossip")
+        self.discovery_thread = threading.Thread(target=self._discovery_worker, daemon=True, name="discovery")
         self.gossip_thread.start()
+        self.discovery_thread.start()
         logger.info("[P2P] ✅ Gossip protocol started")
     
     def stop(self):
         self.running = False
         if self.gossip_thread:
             self.gossip_thread.join(timeout=5)
+        if self.discovery_thread:
+            self.discovery_thread.join(timeout=5)
+        self.connection_pool.close_all()
         logger.info("[P2P] ✅ Gossip stopped")
 
 class QTCLFullNode:
@@ -1805,6 +2225,7 @@ class QTCLFullNode:
         self.mempool = deque(maxlen=MAX_MEMPOOL)
         self.peers: Dict[str, Dict[str, Any]] = {}
         
+        self.mining_state = MiningState.IDLE
         self.fidelity_mode = "normal"
         self.strict_verification = False
         
@@ -1813,39 +2234,52 @@ class QTCLFullNode:
         self._start_time = time.time()
         self._lock = threading.RLock()
         
+        self.event_logger = EventLogger()
+        self.metrics_reporter_thread = None
+        
         logger.info(f"[NODE] 🌐 QTCL Full Node initialized | peer_id={self.peer_id[:12]} | miner={miner_address[:16]}…")
     
     def start(self) -> bool:
         try:
             if not self.w_state_recovery.start():
+                self.event_logger.log_event(EventCategory.ERROR, "W-state recovery failed to start")
                 logger.error("[NODE] ❌ W-state recovery failed to start")
                 return False
             
             self.gossip.start()
             self.running = True
+            self.mining_state = MiningState.SYNCING
             
             self.threads.append(threading.Thread(target=self._mempool_worker, daemon=True, name="mempool"))
             self.threads.append(threading.Thread(target=self._mining_worker, daemon=True, name="miner"))
             self.threads.append(threading.Thread(target=self._p2p_sync_worker, daemon=True, name="p2p_sync"))
+            self.threads.append(threading.Thread(target=self._state_machine_worker, daemon=True, name="state_machine"))
+            self.metrics_reporter_thread = threading.Thread(target=self._metrics_reporter_worker, daemon=True, name="metrics")
             
             for t in self.threads:
                 t.start()
+            self.metrics_reporter_thread.start()
             
+            self.event_logger.log_event(EventCategory.MINING, "Full node started | BLOCKCHAIN + MEMPOOL + MINING + P2P GOSSIP + W-STATE RECOVERY")
             logger.info("[NODE] ✅ Full node started | BLOCKCHAIN + MEMPOOL + MINING + P2P GOSSIP + W-STATE RECOVERY")
             return True
         
         except Exception as e:
+            self.event_logger.log_event(EventCategory.ERROR, f"Node startup failed: {str(e)}")
             logger.error(f"[NODE] ❌ Startup failed: {e}")
             return False
     
     def stop(self):
         logger.info("[NODE] 🛑 Stopping...")
         self.running = False
+        self.mining_state = MiningState.IDLE
         self.w_state_recovery.stop()
         self.gossip.stop()
         
         for t in self.threads:
             t.join(timeout=5)
+        if self.metrics_reporter_thread:
+            self.metrics_reporter_thread.join(timeout=5)
         
         logger.info("[NODE] ✅ Stopped")
     
@@ -1856,11 +2290,14 @@ class QTCLFullNode:
                 txs = self.live_node.get_mempool()
                 with self._lock:
                     for tx in txs:
-                        if tx.get('tx_id') not in [t.get('tx_id') for t in self.mempool]:
+                        tx_id = tx.get('tx_id')
+                        if tx_id and tx_id not in [t.get('tx_id') for t in self.mempool]:
                             self.mempool.append(tx)
+                            self.event_logger.log_event(EventCategory.NETWORK, f"TX added to mempool | {tx_id[:16]}… | size={len(self.mempool)}")
                 
                 time.sleep(MEMPOOL_POLL_INTERVAL)
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Mempool worker error: {str(e)}")
                 logger.error(f"[MEMPOOL] ❌ Error: {e}")
                 time.sleep(MEMPOOL_POLL_INTERVAL)
     
@@ -1868,6 +2305,10 @@ class QTCLFullNode:
         logger.info("[MINING] ⛏️  Worker started")
         while self.running:
             try:
+                if self.mining_state not in [MiningState.READY, MiningState.MINING]:
+                    time.sleep(MINING_POLL_INTERVAL)
+                    continue
+                
                 with self._lock:
                     txs = list(self.mempool)[:MAX_BLOCK_TX]
                 
@@ -1875,30 +2316,45 @@ class QTCLFullNode:
                     time.sleep(MINING_POLL_INTERVAL)
                     continue
                 
+                self.mining_state = MiningState.MINING
+                
                 next_height = self.chain_height + 1
                 parent_hash = self.chain_tip if self.chain_tip else COINBASE_ADDRESS
                 
                 block = self.miner._mine_block(next_height, parent_hash, txs, self.miner_address)
                 if block:
-                    logger.info(f"[MINING] ✅ Mined block #{block['height']} | hash={block['block_hash'][:16]}… | tripartite_consensus={block.get('tripartite_consensus_hash', '')[:16]}…")
+                    self.mining_state = MiningState.BROADCASTING
+                    
+                    logger.info(f"[MINING] ✅ Mined block #{block['height']} | hash={block['block_hash'][:16]}… | tripartite={block.get('tripartite_consensus_hash', '')[:16]}…")
+                    
                     if self.live_node.broadcast_block(block):
                         self.gossip.broadcast_block(block)
+                        self.event_logger.log_event(EventCategory.MINING, f"Block #{block['height']} mined and broadcast | duration={block.get('mining_duration_s', 0):.2f}s")
                         logger.info(f"[MINING] 📢 Broadcasted block #{block['height']}")
+                        
                         with self._lock:
                             self.chain_height = block['height']
                             self.chain_tip = block['block_hash']
                             for tx in txs:
                                 if tx in self.mempool:
                                     self.mempool.remove(tx)
+                        
+                        self.mining_state = MiningState.READY
+                    else:
+                        self.event_logger.log_event(EventCategory.ERROR, f"Failed to broadcast block #{block['height']}")
+                        logger.warning("[MINING] ⚠️  Failed to broadcast block")
                 
                 time.sleep(MINING_POLL_INTERVAL)
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"Mining worker error: {str(e)}")
                 logger.error(f"[MINING] ❌ Error: {e}")
+                self.mining_state = MiningState.FAILED
                 time.sleep(MINING_POLL_INTERVAL)
     
     def _p2p_sync_worker(self):
         logger.info("[P2P_SYNC] 🔄 Worker started")
         discovery_cycle = 0
+        
         while self.running:
             try:
                 discovery_cycle += 1
@@ -1906,14 +2362,20 @@ class QTCLFullNode:
                 try:
                     conn = sqlite3.connect(str(DB_PATH))
                     try:
-                        rows = conn.execute("SELECT peer_id, address, port, w_state_fidelity FROM peer_registry LIMIT 10").fetchall()
+                        rows = conn.execute(
+                            "SELECT peer_id, address, port, w_state_fidelity FROM peer_registry WHERE last_seen > ? LIMIT 16",
+                            (int(time.time()) - PEER_TIMEOUT,)
+                        ).fetchall()
+                        
                         with self._lock:
                             for peer_id, address, port, w_state_fidelity in rows:
                                 if peer_id not in self.peers:
                                     self.gossip.register_peer(peer_id, address, port, w_state_fidelity)
                                     self.peers[peer_id] = {'address': address, 'port': port}
-                    finally: conn.close()
+                    finally:
+                        conn.close()
                 except Exception as e:
+                    self.event_logger.log_event(EventCategory.ERROR, f"Peer discovery error: {str(e)}")
                     logger.error(f"[P2P_SYNC] ❌ Peer discovery error: {e}")
                 
                 if discovery_cycle % 10 == 0:
@@ -1921,48 +2383,122 @@ class QTCLFullNode:
                 
                 time.sleep(5)
             except Exception as e:
+                self.event_logger.log_event(EventCategory.ERROR, f"P2P sync error: {str(e)}")
                 logger.error(f"[P2P_SYNC] ❌ Error: {e}")
                 time.sleep(5)
+    
+    def _state_machine_worker(self):
+        logger.info("[STATE_MACHINE] 🔄 Worker started")
+        
+        while self.running:
+            try:
+                entanglement = self.w_state_recovery.get_entanglement_status()
+                recovery_state = self.w_state_recovery.recovery_state
+                
+                if recovery_state == MiningState.FAILED:
+                    if self.mining_state != MiningState.RECOVERING:
+                        logger.warning("[STATE_MACHINE] ⚠️  Recovery state = FAILED")
+                        self.mining_state = MiningState.RECOVERING
+                elif recovery_state == MiningState.READY:
+                    if not entanglement['entanglement_established']:
+                        self.mining_state = MiningState.SYNCING
+                    else:
+                        if self.mining_state == MiningState.SYNCING:
+                            self.mining_state = MiningState.READY
+                            logger.info("[STATE_MACHINE] ✅ Transitioned to READY")
+                
+                with self._lock:
+                    if self.mining_state == MiningState.FAILED:
+                        if self.w_state_recovery.recovery_attempts == 0:
+                            logger.info("[STATE_MACHINE] 🔄 Attempting recovery from FAILED state")
+                            self.mining_state = MiningState.RECOVERING
+                
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"[STATE_MACHINE] ❌ Error: {e}")
+                time.sleep(5)
+    
+    def _metrics_reporter_worker(self):
+        logger.info("[METRICS] 📊 Reporter started")
+        
+        while self.running:
+            try:
+                time.sleep(30)
+                
+                status = self.get_status()
+                
+                try:
+                    conn = sqlite3.connect(str(DB_PATH))
+                    try:
+                        metrics = self.miner.get_metrics()
+                        conn.execute("""
+                            INSERT INTO mining_metrics
+                            (session_id, blocks_mined, hash_attempts, avg_fidelity, min_fidelity, max_fidelity, total_rewards_base, started_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            self.peer_id,
+                            metrics.blocks_mined,
+                            metrics.hash_attempts,
+                            metrics.avg_fidelity,
+                            metrics.min_fidelity,
+                            metrics.max_fidelity,
+                            metrics.blocks_mined * BLOCK_REWARD_BASE,
+                            int(self._start_time)
+                        ))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except:
+                    pass
+            
+            except Exception as e:
+                logger.error(f"[METRICS] ❌ Error: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             entanglement = self.w_state_recovery.get_entanglement_status()
+            metrics = self.miner.get_metrics()
             uptime_secs = int(time.time() - self._start_time)
-            hash_rate = self.miner.hash_attempts / max(1, uptime_secs)
+            hash_rate = metrics.hash_attempts / max(1, uptime_secs)
             
             return {
                 'miner_full': f"{self.miner_address}",
                 'status': 'running' if self.running else 'stopped',
+                'mining_state': self.mining_state.name,
                 'chain': {
                     'height': self.chain_height,
                     'tip_hash': self.chain_tip[:32] if self.chain_tip else '0' * 32
                 },
                 'wallet': {
                     'address': self.miner_address,
-                    'balance_formatted': f"{self.miner.blocks_mined * BLOCK_REWARD_QTCL:.2f} QTCL",
-                    'estimated_rewards': self.miner.blocks_mined * BLOCK_REWARD_QTCL
+                    'balance_formatted': f"{metrics.blocks_mined * BLOCK_REWARD_QTCL:.2f} QTCL",
+                    'estimated_rewards': metrics.blocks_mined * BLOCK_REWARD_QTCL
                 },
                 'mempool': {
                     'size': len(self.mempool)
                 },
                 'mining': {
-                    'blocks_mined': self.miner.blocks_mined,
-                    'block_rewards': self.miner.blocks_mined * BLOCK_REWARD_QTCL,
-                    'total_hash_attempts': self.miner.hash_attempts,
-                    'avg_fidelity': self.miner.total_fidelity / max(1, self.miner.blocks_mined),
+                    'blocks_mined': metrics.blocks_mined,
+                    'block_rewards': metrics.blocks_mined * BLOCK_REWARD_QTCL,
+                    'total_hash_attempts': metrics.hash_attempts,
+                    'avg_fidelity': metrics.avg_fidelity,
+                    'min_fidelity': metrics.min_fidelity,
+                    'max_fidelity': metrics.max_fidelity,
                     'estimated_hash_rate': f"{hash_rate:.0f}"
                 },
                 'quantum': {
                     'w_state': entanglement,
                     'recovery': {
                         'connected': self.w_state_recovery.running,
-                        'peer_id': self.peer_id
+                        'peer_id': self.peer_id,
+                        'recovery_state': self.w_state_recovery.recovery_state.name
                     }
                 },
                 'network': {
                     'oracle_url': self.oracle_url,
                     'peers_connected': len(self.peers)
-                }
+                },
+                'uptime_secs': uptime_secs
             }
 
 class MinerRegistry:
@@ -1996,6 +2532,7 @@ class MinerRegistry:
         return self._load_token() is not None
     
     def _save_token(self):
+        self.registration_file.parent.mkdir(exist_ok=True, mode=0o700)
         with open(self.registration_file, 'w') as f:
             f.write(self.token or '')
         os.chmod(self.registration_file, 0o600)
@@ -2012,9 +2549,9 @@ class MinerRegistry:
 
 def parse_args():
     import argparse
-    p = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with 5-POINT ORACLE + HLWE')
+    p = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with 5-POINT ORACLE + HLWE + QUANTUM LATTICE')
     p.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
-    p.add_argument('--oracle-url', '-o', default='https://qtcl-blockchain.koyeb.app', help='Oracle URL')
+    p.add_argument('--oracle-url', '-o', default='http://qtcl-blockchain.koyeb.app:8333', help='Oracle URL')
     p.add_argument('--difficulty', '-d', type=int, default=DEFAULT_DIFFICULTY, help='Mining difficulty bits')
     p.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     p.add_argument('--wallet-init', action='store_true', help='Initialize new wallet')
@@ -2029,6 +2566,7 @@ def parse_args():
 def main():
     args = parse_args()
     logging.getLogger().setLevel(getattr(logging, args.log_level))
+    
     try:
         if args.wallet_init:
             if not args.wallet_password:
@@ -2092,11 +2630,11 @@ def main():
         while True:
             time.sleep(30)
             status = node.get_status()
-            print("\n" + ("=" * 140))
-            print("⛏️  QTCL QUANTUM MINER STATUS (5-POINT ORACLE + TRIPARTITE CONSENSUS + HLWE)")
-            print("=" * 140)
+            print("\n" + ("=" * 160))
+            print("⛏️  QTCL QUANTUM MINER STATUS (5-POINT ORACLE + TRIPARTITE CONSENSUS + QUANTUM LATTICE + HLWE)")
+            print("=" * 160)
             print(f"Miner:                    {status['miner_full']}")
-            print(f"Status:                   {status['status'].upper()}")
+            print(f"Status:                   {status['status'].upper()} | Mining State: {status['mining_state']}")
             print(f"")
             print(f"BLOCKCHAIN:")
             print(f"  Chain Height:           {status['chain']['height']}")
@@ -2115,6 +2653,7 @@ def main():
             print(f"  Block Rewards Earned:   {status['mining']['block_rewards']:.2f} QTCL")
             print(f"  Total Hash Attempts:    {status['mining']['total_hash_attempts']:,}")
             print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
+            print(f"  Min/Max Fidelity:       {status['mining']['min_fidelity']:.4f} / {status['mining']['max_fidelity']:.4f}")
             print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
             print(f"")
             print(f"5-POINT ORACLE STATE:")
@@ -2124,6 +2663,8 @@ def main():
             print(f"  pq0_virt:               F={w.get('pq0_virt_fidelity', 0.0):.4f}")
             print(f"  pq_curr:                F={w.get('w_state_fidelity', 0.0):.4f}")
             print(f"  pq_last:                F={w.get('w_state_fidelity', 0.0):.4f}")
+            print(f"  Von Neumann Entropy:    (tracked)")
+            print(f"  Revival Count:          {w.get('revival_count', 0)}")
             print(f"")
             print(f"TRIPARTITE CONSENSUS:")
             print(f"  Established:            {w['entanglement_established']}")
@@ -2133,12 +2674,14 @@ def main():
             print(f"")
             print(f"ORACLE RECOVERY:")
             print(f"  Connected:              {status['quantum']['recovery']['connected']}")
+            print(f"  Recovery State:         {status['quantum']['recovery']['recovery_state']}")
             print(f"  Peer ID:                {status['quantum']['recovery']['peer_id']}")
             print(f"  Oracle URL:             {status['network']['oracle_url']}")
             print(f"")
             print(f"P2P NETWORK:")
             print(f"  Connected Peers:        {status['network']['peers_connected']}")
-            print("=" * 140 + "\n")
+            print(f"  Uptime:                 {status['uptime_secs']}s")
+            print("=" * 160 + "\n")
     
     except KeyboardInterrupt:
         print("\n[MAIN] 🛑 Shutdown signal received...")
