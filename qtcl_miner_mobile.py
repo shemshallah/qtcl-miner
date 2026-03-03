@@ -57,7 +57,7 @@
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac
+import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac,sqlite3,struct,cmath
 from typing import Dict,Any,Optional,List,Tuple,Deque,Set
 from dataclasses import dataclass,field,asdict
 from enum import Enum,auto
@@ -80,6 +80,391 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO,format='[%(asctime)s] %(levelname)s: %(message)s')
 logger=logging.getLogger('QTCL_MINER')
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# QUANTUM LATTICE SCHEMA BUILDER - MUSEUM GRADE {8,3} POINCARÉ TESSELLATION
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HyperbolicPoint:
+    """Point in Poincaré disk (complex number with |z| < 1)."""
+    x: float
+    y: float
+    
+    @property
+    def complex(self) -> complex:
+        return complex(self.x, self.y)
+    
+    @property
+    def radius(self) -> float:
+        return math.sqrt(self.x**2 + self.y**2)
+    
+    def distance_to(self, other: 'HyperbolicPoint') -> float:
+        z1 = self.complex
+        z2 = other.complex
+        if abs(z1 - z2) < 1e-15:
+            return 0.0
+        numerator = abs(z1 - z2)
+        denominator = abs(1 - z1.conjugate() * z2)
+        if denominator < 1e-15:
+            return float('inf')
+        return 2 * math.atanh(numerator / denominator)
+    
+    @staticmethod
+    def from_polar(r: float, theta: float) -> 'HyperbolicPoint':
+        return HyperbolicPoint(r * math.cos(theta), r * math.sin(theta))
+
+
+@dataclass
+class HyperbolicTriangle:
+    """Triangle in {8,3} tessellation."""
+    vertices: List[HyperbolicPoint]
+    depth: int
+    pseudoqubits: int = 13
+    
+    def center(self) -> HyperbolicPoint:
+        x = sum(v.x for v in self.vertices) / 3
+        y = sum(v.y for v in self.vertices) / 3
+        return HyperbolicPoint(x, y)
+    
+    def area(self) -> float:
+        return (math.pi / 4) / (2 ** self.depth)
+
+
+class PoincareHyperbolicTessellator:
+    """Builds {8,3} regular tessellation of Poincaré disk."""
+    
+    def __init__(self, max_depth: int = 5):
+        self.max_depth = max_depth
+        self.triangles: List[HyperbolicTriangle] = []
+    
+    def _geodesic_midpoint(self, p1: HyperbolicPoint, p2: HyperbolicPoint) -> HyperbolicPoint:
+        z1 = p1.complex
+        z2 = p2.complex
+        numerator = z1 + z2
+        denominator = 1 + z1 * z2.conjugate()
+        if abs(denominator) < 1e-15:
+            mid = complex(0, 0)
+        else:
+            mid = numerator / denominator
+        mag = abs(mid)
+        if mag >= 0.99:
+            mid = 0.99 * mid / mag
+        return HyperbolicPoint(mid.real, mid.imag)
+    
+    def _initial_triangle(self) -> HyperbolicTriangle:
+        angle1, angle2, angle3 = 0.0, math.pi / 4, math.pi / 2
+        r = 0.3
+        v1 = HyperbolicPoint.from_polar(r, angle1)
+        v2 = HyperbolicPoint.from_polar(r, angle2)
+        v3 = HyperbolicPoint.from_polar(r, angle3)
+        return HyperbolicTriangle([v1, v2, v3], depth=0)
+    
+    def _subdivide_triangle(self, triangle: HyperbolicTriangle) -> List[HyperbolicTriangle]:
+        if triangle.depth >= self.max_depth:
+            return [triangle]
+        vertices = triangle.vertices
+        mid01 = self._geodesic_midpoint(vertices[0], vertices[1])
+        mid12 = self._geodesic_midpoint(vertices[1], vertices[2])
+        mid20 = self._geodesic_midpoint(vertices[2], vertices[0])
+        return [
+            HyperbolicTriangle([vertices[0], mid01, mid20], depth=triangle.depth + 1),
+            HyperbolicTriangle([vertices[1], mid12, mid01], depth=triangle.depth + 1),
+            HyperbolicTriangle([vertices[2], mid20, mid12], depth=triangle.depth + 1),
+            HyperbolicTriangle([mid01, mid12, mid20], depth=triangle.depth + 1),
+        ]
+    
+    def tessellate(self) -> List[HyperbolicTriangle]:
+        triangles = []
+        for i in range(8):
+            angle = 2 * math.pi * i / 8
+            base_tri = self._initial_triangle()
+            rotated_vertices = [HyperbolicPoint.from_polar(v.radius, math.atan2(v.y, v.x) + angle) for v in base_tri.vertices]
+            rotated_tri = HyperbolicTriangle(rotated_vertices, depth=0)
+            def subdivide_recursive(tri):
+                subs = self._subdivide_triangle(tri)
+                result = []
+                for sub in subs:
+                    if sub.depth < self.max_depth:
+                        result.extend(subdivide_recursive(sub))
+                    else:
+                        result.append(sub)
+                return result
+            triangles.extend(subdivide_recursive(rotated_tri))
+        self.triangles = triangles
+        return triangles
+
+
+class QuantumLatticeSchemaBuilder:
+    """Builds museum-grade quantum lattice database with hyperbolic tessellation."""
+    
+    def __init__(self, db_path: str = 'data/qtcl_blockchain.db'):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(exist_ok=True, parents=True)
+        self.tessellation_depth = 5
+        self.conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
+    
+    def exists(self) -> bool:
+        return self.db_path.exists()
+    
+    def connect(self):
+        self.db_path.parent.mkdir(exist_ok=True, parents=True)
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-10000")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+    
+    def build_schema(self):
+        with self._lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS quantum_lattice_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tessellation_type TEXT NOT NULL DEFAULT '{8,3}',
+                    tessellation_depth INTEGER NOT NULL DEFAULT 5,
+                    total_pseudoqubits INTEGER NOT NULL DEFAULT 106496,
+                    qubits_per_triangle INTEGER DEFAULT 13,
+                    precision_bits INTEGER DEFAULT 150,
+                    poincare_radius REAL DEFAULT 1.0,
+                    hyperbolicity_constant REAL DEFAULT -1.0,
+                    status TEXT DEFAULT 'initialized',
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE TABLE IF NOT EXISTS lattice_triangles (
+                    triangle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    depth INTEGER NOT NULL,
+                    parent_id INTEGER,
+                    v1_x REAL NOT NULL,
+                    v1_y REAL NOT NULL,
+                    v2_x REAL NOT NULL,
+                    v2_y REAL NOT NULL,
+                    v3_x REAL NOT NULL,
+                    v3_y REAL NOT NULL,
+                    center_x REAL,
+                    center_y REAL,
+                    area REAL,
+                    pseudoqubit_count INTEGER DEFAULT 13,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY(parent_id) REFERENCES lattice_triangles(triangle_id)
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_lattice_depth ON lattice_triangles(depth);
+                CREATE INDEX IF NOT EXISTS idx_lattice_parent ON lattice_triangles(parent_id);
+                
+                CREATE TABLE IF NOT EXISTS pseudoqubits (
+                    qubit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    triangle_id INTEGER NOT NULL,
+                    qubit_index INTEGER NOT NULL,
+                    state_vector TEXT NOT NULL,
+                    coherence_time_us REAL,
+                    decoherence_rate REAL,
+                    last_measured_at INTEGER,
+                    FOREIGN KEY(triangle_id) REFERENCES lattice_triangles(triangle_id),
+                    UNIQUE(triangle_id, qubit_index)
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_qubits_triangle ON pseudoqubits(triangle_id);
+                
+                CREATE TABLE IF NOT EXISTS blocks (
+                    height INTEGER PRIMARY KEY,
+                    block_hash TEXT UNIQUE NOT NULL,
+                    parent_hash TEXT NOT NULL,
+                    merkle_root TEXT NOT NULL,
+                    timestamp_s INTEGER NOT NULL,
+                    difficulty_bits INTEGER NOT NULL,
+                    nonce INTEGER NOT NULL,
+                    miner_address TEXT NOT NULL,
+                    w_state_fidelity REAL NOT NULL,
+                    w_entropy_hash TEXT NOT NULL,
+                    tx_count INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
+                CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+                
+                CREATE TABLE IF NOT EXISTS transactions (
+                    tx_id TEXT PRIMARY KEY,
+                    height INTEGER NOT NULL,
+                    tx_index INTEGER NOT NULL,
+                    from_address TEXT NOT NULL,
+                    to_address TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    fee INTEGER DEFAULT 0,
+                    tx_type TEXT DEFAULT 'transfer',
+                    signature TEXT,
+                    w_proof TEXT,
+                    timestamp_ns INTEGER,
+                    FOREIGN KEY(height) REFERENCES blocks(height),
+                    UNIQUE(height, tx_index)
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_txs_height ON transactions(height);
+                CREATE INDEX IF NOT EXISTS idx_txs_from ON transactions(from_address);
+                CREATE INDEX IF NOT EXISTS idx_txs_to ON transactions(to_address);
+                
+                CREATE TABLE IF NOT EXISTS w_state_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ns INTEGER UNIQUE NOT NULL,
+                    pq_current TEXT NOT NULL,
+                    pq_last TEXT NOT NULL,
+                    block_height INTEGER NOT NULL,
+                    fidelity REAL NOT NULL,
+                    coherence REAL NOT NULL,
+                    entropy_pool REAL,
+                    hlwe_signature TEXT,
+                    oracle_address TEXT,
+                    signature_valid INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_wstate_timestamp ON w_state_snapshots(timestamp_ns);
+                
+                CREATE TABLE IF NOT EXISTS hlwe_keys (
+                    address TEXT PRIMARY KEY,
+                    private_key_encrypted TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    nonce_hex TEXT NOT NULL,
+                    salt_hex TEXT NOT NULL,
+                    algorithm TEXT DEFAULT 'HLWE-256',
+                    derivation_path TEXT,
+                    key_fingerprint TEXT,
+                    is_locked INTEGER DEFAULT 0,
+                    security_level_bits INTEGER DEFAULT 256,
+                    quantum_security_bits INTEGER DEFAULT 128,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_hlwe_address ON hlwe_keys(address);
+                CREATE INDEX IF NOT EXISTS idx_hlwe_fingerprint ON hlwe_keys(key_fingerprint);
+                
+                CREATE TABLE IF NOT EXISTS wallet_addresses (
+                    address TEXT PRIMARY KEY,
+                    wallet_fingerprint TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    derivation_path TEXT,
+                    balance INTEGER DEFAULT 0,
+                    transaction_count INTEGER DEFAULT 0,
+                    last_used_at INTEGER,
+                    label TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_wallet_fingerprint ON wallet_addresses(wallet_fingerprint);
+                
+                CREATE TABLE IF NOT EXISTS bip32_master_keys (
+                    id INTEGER PRIMARY KEY,
+                    fingerprint TEXT UNIQUE NOT NULL,
+                    encrypted_seed TEXT NOT NULL,
+                    salt_hex TEXT NOT NULL,
+                    nonce_hex TEXT NOT NULL,
+                    chain_code TEXT NOT NULL,
+                    depth INTEGER DEFAULT 0,
+                    parent_fingerprint TEXT,
+                    child_index INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE TABLE IF NOT EXISTS bip38_passphrases (
+                    id INTEGER PRIMARY KEY,
+                    wallet_fingerprint TEXT UNIQUE NOT NULL,
+                    encrypted_hash TEXT NOT NULL,
+                    scrypt_params TEXT NOT NULL,
+                    salt_hex TEXT NOT NULL,
+                    iterations INTEGER DEFAULT 16384,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY(wallet_fingerprint) REFERENCES wallet_addresses(wallet_fingerprint)
+                );
+                
+                CREATE TABLE IF NOT EXISTS peer_registry (
+                    peer_id TEXT PRIMARY KEY,
+                    address TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    block_height INTEGER DEFAULT 0,
+                    user_agent TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE TABLE IF NOT EXISTS mining_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    blocks_mined INTEGER DEFAULT 0,
+                    hash_attempts INTEGER DEFAULT 0,
+                    avg_fidelity REAL DEFAULT 0.0,
+                    total_rewards_base INTEGER DEFAULT 0,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    description TEXT,
+                    applied_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+            """)
+            self.conn.commit()
+    
+    def populate_lattice(self):
+        tessellator = PoincareHyperbolicTessellator(max_depth=self.tessellation_depth)
+        triangles = tessellator.tessellate()
+        with self._lock:
+            cursor = self.conn.cursor()
+            for i, triangle in enumerate(triangles):
+                center = triangle.center()
+                area = triangle.area()
+                vertices = triangle.vertices
+                cursor.execute("""
+                    INSERT INTO lattice_triangles (depth, v1_x, v1_y, v2_x, v2_y, v3_x, v3_y, center_x, center_y, area, pseudoqubit_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 13)
+                """, (triangle.depth, vertices[0].x, vertices[0].y, vertices[1].x, vertices[1].y, vertices[2].x, vertices[2].y, center.x, center.y, area))
+            self.conn.commit()
+    
+    def populate_metadata(self):
+        tessellator = PoincareHyperbolicTessellator(max_depth=self.tessellation_depth)
+        triangles = tessellator.tessellate()
+        total_qubits = len(triangles) * 13
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""INSERT INTO quantum_lattice_metadata (tessellation_type, tessellation_depth, total_pseudoqubits, qubits_per_triangle, precision_bits, status)
+            VALUES (?, ?, ?, ?, ?, 'initialized')""", ('{8,3}', self.tessellation_depth, total_qubits, 13, 150))
+            self.conn.commit()
+    
+    def initialize_schema(self):
+        if self.exists():
+            logger.info(f"[SCHEMA] 📀 Database exists — skipping creation")
+            self.connect()
+            return False
+        logger.info(f"[SCHEMA] 🏗️  Building quantum lattice database...")
+        logger.info(f"[SCHEMA] ├─ Tessellation: {{8,3}} Poincaré sphere")
+        logger.info(f"[SCHEMA] ├─ Depth: 5")
+        logger.info(f"[SCHEMA] ├─ Qubits/triangle: 13")
+        logger.info(f"[SCHEMA] └─ Total pseudoqubits: 106,496")
+        self.connect()
+        logger.info(f"[SCHEMA] 📋 Creating schema...")
+        self.build_schema()
+        logger.info(f"[SCHEMA] 🧮 Tessellating lattice...")
+        self.populate_lattice()
+        logger.info(f"[SCHEMA] 📊 Recording metadata...")
+        self.populate_metadata()
+        logger.info(f"[SCHEMA] ✅ Database initialized successfully")
+        return True
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+# Initialize quantum lattice database BEFORE anything else
+_SCHEMA_BUILDER = QuantumLatticeSchemaBuilder('data/qtcl_blockchain.db')
+_SCHEMA_BUILDER.initialize_schema()
+_DB_CONN = _SCHEMA_BUILDER.conn
 
 LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
 API_PREFIX='/api'
