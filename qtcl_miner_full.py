@@ -46,47 +46,14 @@
 ║  │ • Verify fidelity >= 0.85 threshold                                │                                                                        ║
 ║  │ • Start continuous sync & P2P consensus workers (background)       │                                                                        ║
 ║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ LIVE BLOCKCHAIN SYNC                                               │                                                                        ║
-║  │ • Fetch blocks from qtcl-blockchain.koyeb.app REST API            │                                                                        ║
-║  │ • Validate block headers, PoW, transactions                       │                                                                        ║
-║  │ • Maintain chain state (in-memory)                                │                                                                        ║
-║  │ • Fork detection & resolution (longest-chain)                     │                                                                        ║
-║  │ • Sync progress tracking                                          │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ MEMPOOL MANAGEMENT                                                 │                                                                        ║
-║  │ • Fetch pending transactions from /api/mempool                    │                                                                        ║
-║  │ • Validate signatures (HLWE), nonces, balances                    │                                                                        ║
-║  │ • Fee-based prioritization                                        │                                                                        ║
-║  │ • Remove included transactions after block                        │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ QUANTUM-ENTANGLED MINING SUBSYSTEM                                 │                                                                        ║
-║  │ • Poll mempool for transactions                                   │                                                                        ║
-║  │ • Build block template from highest-fee transactions              │                                                                        ║
-║  │ • Measure W-state (pq_curr) for quantum PoW entropy               │                                                                        ║
-║  │ • Rotate pq_curr → pq_last, recover new pq_curr from oracle      │                                                                        ║
-║  │ • Sequential nonce iteration (SHA3-256 PoW + W-state witness)     │                                                                        ║
-║  │ • Broadcast mined block with fidelity attestation                 │                                                                        ║
-║  │ • Track mining rewards & entanglement metrics                     │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                        ║
-║  │ P2P GOSSIP & CONSENSUS PROTOCOL                                    │                                                                        ║
-║  │ • Peer discovery via DHT / peer_registry table                    │                                                                        ║
-║  │ • Gossip blocks, transactions, mining metrics                     │                                                                        ║
-║  │ • W-state measurement consensus voting                            │                                                                        ║
-║  │ • Tripartite entanglement verification across peers               │                                                                        ║
-║  │ • Broadcast oracle recovery status & metrics                      │                                                                        ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                        ║
 ║                                                                                                                                                  ║
 ║  LOCAL STORAGE: /data/qtcl_blockchain.db (SQLite)                                                                                               ║
-║  • Complete HLWE key storage with BIP38 encryption                                                                                              ║
-║  • Blocks, transactions, w_state_snapshots                                                                                                      ║
-║  • Quantum lattice metadata (5-point oracle state)                                                                                              ║
-║  • Wallet addresses with BIP32 derivation paths                                                                                                 ║
-║  • Peer registry with W-state consensus votes                                                                                                   ║
-║  • Mining metrics and tripartite entanglement records                                                                                           ║
+║  • wallets: fingerprint, encrypted_seed, public_key, xpub, created_at                                                                          ║
+║  • addresses: address, wallet_fingerprint, path, public_key, balance, created_at                                                               ║
+║  • signatures: id, message_hash, signature, created_at                                                                                         ║
+║  • blocks, transactions, w_state_snapshots                                                                                                      ║
+║  • quantum_lattice_metadata, wallet_addresses, hlwe_keys                                                                                        ║
+║  • peer_registry, mining_metrics, tripartite_consensus_votes                                                                                    ║
 ║                                                                                                                                                  ║
 ║  MATHEMATICAL FOUNDATIONS (CLAY INSTITUTE GRADE RIGOR):                                                                                         ║
 ║  • Hyperbolic Geometry: Poincaré disk model, geodesics, Möbius transforms                                                                      ║
@@ -670,161 +637,161 @@ class HLWEClayWallet:
     def _init_db(self):
         self.db_path.parent.mkdir(exist_ok=True, mode=0o700)
         conn = sqlite3.connect(str(self.db_path))
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                fingerprint       TEXT PRIMARY KEY,
-                encrypted_seed    TEXT NOT NULL,
-                public_key        TEXT NOT NULL,
-                xpub              TEXT NOT NULL,
-                created_at        INTEGER DEFAULT (strftime('%s','now'))
-            );
-            CREATE TABLE IF NOT EXISTS addresses (
-                address            TEXT PRIMARY KEY,
-                wallet_fingerprint TEXT NOT NULL,
-                path               TEXT NOT NULL,
-                public_key         TEXT NOT NULL,
-                balance            INTEGER DEFAULT 0,
-                created_at         INTEGER DEFAULT (strftime('%s','now'))
-            );
-            CREATE TABLE IF NOT EXISTS signatures (
-                id           TEXT PRIMARY KEY,
-                message_hash TEXT NOT NULL,
-                signature    TEXT NOT NULL,
-                created_at   INTEGER DEFAULT (strftime('%s','now'))
-            );
-            CREATE TABLE IF NOT EXISTS blocks (
-                height INTEGER PRIMARY KEY,
-                block_hash TEXT UNIQUE NOT NULL,
-                parent_hash TEXT NOT NULL,
-                merkle_root TEXT NOT NULL,
-                timestamp_s INTEGER NOT NULL,
-                difficulty_bits INTEGER NOT NULL,
-                nonce INTEGER NOT NULL,
-                miner_address TEXT NOT NULL,
-                w_state_fidelity REAL NOT NULL,
-                w_entropy_hash TEXT NOT NULL,
-                tripartite_consensus_hash TEXT,
-                tx_count INTEGER DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS transactions (
-                tx_id TEXT PRIMARY KEY,
-                height INTEGER NOT NULL,
-                tx_index INTEGER NOT NULL,
-                from_address TEXT NOT NULL,
-                to_address TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                fee INTEGER DEFAULT 0,
-                tx_type TEXT DEFAULT 'transfer',
-                signature TEXT,
-                w_proof TEXT,
-                timestamp_ns INTEGER,
-                FOREIGN KEY(height) REFERENCES blocks(height),
-                UNIQUE(height, tx_index)
-            );
-            CREATE TABLE IF NOT EXISTS w_state_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ns INTEGER UNIQUE NOT NULL,
-                pq_current TEXT NOT NULL,
-                pq_last TEXT NOT NULL,
-                pq0 TEXT NOT NULL,
-                pq0_inv_virt TEXT,
-                pq0_virt TEXT,
-                block_height INTEGER NOT NULL,
-                fidelity REAL NOT NULL,
-                coherence REAL NOT NULL,
-                entropy_pool REAL,
-                hlwe_signature TEXT,
-                oracle_address TEXT,
-                signature_valid INTEGER DEFAULT 0,
-                tripartite_consensus_score REAL DEFAULT 0.0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS quantum_lattice_metadata (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tessellation_depth INTEGER DEFAULT 5,
-                total_pseudoqubits INTEGER DEFAULT 106496,
-                precision_bits INTEGER DEFAULT 150,
-                hyperbolicity_constant REAL DEFAULT -1.0,
-                poincare_radius REAL DEFAULT 1.0,
-                status TEXT DEFAULT 'mining',
-                last_updated INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS wallet_addresses (
-                address TEXT PRIMARY KEY,
-                wallet_fingerprint TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                balance INTEGER DEFAULT 0,
-                transaction_count INTEGER DEFAULT 0,
-                last_used_at INTEGER,
-                label TEXT,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS hlwe_keys (
-                address TEXT PRIMARY KEY,
-                private_key_encrypted TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                nonce_hex TEXT NOT NULL,
-                salt_hex TEXT NOT NULL,
-                algorithm TEXT DEFAULT 'HLWE-256',
-                derivation_path TEXT,
-                key_fingerprint TEXT,
-                is_locked INTEGER DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now')),
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS peer_registry (
-                peer_id TEXT PRIMARY KEY,
-                address TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL,
-                block_height INTEGER DEFAULT 0,
-                user_agent TEXT,
-                w_state_fidelity REAL DEFAULT 0.0,
-                tripartite_consensus_vote REAL DEFAULT 0.0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS mining_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                blocks_mined INTEGER DEFAULT 0,
-                hash_attempts INTEGER DEFAULT 0,
-                avg_fidelity REAL DEFAULT 0.0,
-                total_rewards_base INTEGER DEFAULT 0,
-                started_at INTEGER NOT NULL,
-                ended_at INTEGER,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE TABLE IF NOT EXISTS tripartite_consensus_votes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                peer_id TEXT NOT NULL,
-                consensus_hash TEXT NOT NULL,
-                fidelity_vote REAL NOT NULL,
-                timestamp_ns INTEGER NOT NULL,
-                block_height INTEGER NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
-            CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
-            CREATE INDEX IF NOT EXISTS idx_transactions_height ON transactions(height);
-            CREATE INDEX IF NOT EXISTS idx_w_state_timestamp ON w_state_snapshots(timestamp_ns);
-            CREATE INDEX IF NOT EXISTS idx_hlwe_address ON hlwe_keys(address);
-            CREATE INDEX IF NOT EXISTS idx_addresses_wallet ON addresses(wallet_fingerprint);
-            CREATE INDEX IF NOT EXISTS idx_peer_registry_id ON peer_registry(peer_id);
-            CREATE INDEX IF NOT EXISTS idx_tripartite_votes ON tripartite_consensus_votes(consensus_hash);
-        """)
-        
         try:
-            conn.execute("PRAGMA table_info(wallets)")
-            cols = [row[1] for row in conn.fetchall()]
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    fingerprint       TEXT PRIMARY KEY,
+                    encrypted_seed    TEXT NOT NULL,
+                    public_key        TEXT NOT NULL,
+                    created_at        INTEGER DEFAULT (strftime('%s','now'))
+                );
+                CREATE TABLE IF NOT EXISTS addresses (
+                    address            TEXT PRIMARY KEY,
+                    wallet_fingerprint TEXT NOT NULL,
+                    path               TEXT NOT NULL,
+                    public_key         TEXT NOT NULL,
+                    balance            INTEGER DEFAULT 0,
+                    created_at         INTEGER DEFAULT (strftime('%s','now'))
+                );
+                CREATE TABLE IF NOT EXISTS signatures (
+                    id           TEXT PRIMARY KEY,
+                    message_hash TEXT NOT NULL,
+                    signature    TEXT NOT NULL,
+                    created_at   INTEGER DEFAULT (strftime('%s','now'))
+                );
+                CREATE TABLE IF NOT EXISTS blocks (
+                    height INTEGER PRIMARY KEY,
+                    block_hash TEXT UNIQUE NOT NULL,
+                    parent_hash TEXT NOT NULL,
+                    merkle_root TEXT NOT NULL,
+                    timestamp_s INTEGER NOT NULL,
+                    difficulty_bits INTEGER NOT NULL,
+                    nonce INTEGER NOT NULL,
+                    miner_address TEXT NOT NULL,
+                    w_state_fidelity REAL NOT NULL,
+                    w_entropy_hash TEXT NOT NULL,
+                    tripartite_consensus_hash TEXT,
+                    tx_count INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS transactions (
+                    tx_id TEXT PRIMARY KEY,
+                    height INTEGER NOT NULL,
+                    tx_index INTEGER NOT NULL,
+                    from_address TEXT NOT NULL,
+                    to_address TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    fee INTEGER DEFAULT 0,
+                    tx_type TEXT DEFAULT 'transfer',
+                    signature TEXT,
+                    w_proof TEXT,
+                    timestamp_ns INTEGER,
+                    FOREIGN KEY(height) REFERENCES blocks(height),
+                    UNIQUE(height, tx_index)
+                );
+                CREATE TABLE IF NOT EXISTS w_state_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ns INTEGER UNIQUE NOT NULL,
+                    pq_current TEXT NOT NULL,
+                    pq_last TEXT NOT NULL,
+                    pq0 TEXT NOT NULL,
+                    pq0_inv_virt TEXT,
+                    pq0_virt TEXT,
+                    block_height INTEGER NOT NULL,
+                    fidelity REAL NOT NULL,
+                    coherence REAL NOT NULL,
+                    entropy_pool REAL,
+                    hlwe_signature TEXT,
+                    oracle_address TEXT,
+                    signature_valid INTEGER DEFAULT 0,
+                    tripartite_consensus_score REAL DEFAULT 0.0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS quantum_lattice_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tessellation_depth INTEGER DEFAULT 5,
+                    total_pseudoqubits INTEGER DEFAULT 106496,
+                    precision_bits INTEGER DEFAULT 150,
+                    hyperbolicity_constant REAL DEFAULT -1.0,
+                    poincare_radius REAL DEFAULT 1.0,
+                    status TEXT DEFAULT 'mining',
+                    last_updated INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS wallet_addresses (
+                    address TEXT PRIMARY KEY,
+                    wallet_fingerprint TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    balance INTEGER DEFAULT 0,
+                    transaction_count INTEGER DEFAULT 0,
+                    last_used_at INTEGER,
+                    label TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS hlwe_keys (
+                    address TEXT PRIMARY KEY,
+                    private_key_encrypted TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    nonce_hex TEXT NOT NULL,
+                    salt_hex TEXT NOT NULL,
+                    algorithm TEXT DEFAULT 'HLWE-256',
+                    derivation_path TEXT,
+                    key_fingerprint TEXT,
+                    is_locked INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS peer_registry (
+                    peer_id TEXT PRIMARY KEY,
+                    address TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    block_height INTEGER DEFAULT 0,
+                    user_agent TEXT,
+                    w_state_fidelity REAL DEFAULT 0.0,
+                    tripartite_consensus_vote REAL DEFAULT 0.0,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS mining_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    blocks_mined INTEGER DEFAULT 0,
+                    hash_attempts INTEGER DEFAULT 0,
+                    avg_fidelity REAL DEFAULT 0.0,
+                    total_rewards_base INTEGER DEFAULT 0,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS tripartite_consensus_votes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    peer_id TEXT NOT NULL,
+                    consensus_hash TEXT NOT NULL,
+                    fidelity_vote REAL NOT NULL,
+                    timestamp_ns INTEGER NOT NULL,
+                    block_height INTEGER NOT NULL,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);
+                CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(block_hash);
+                CREATE INDEX IF NOT EXISTS idx_transactions_height ON transactions(height);
+                CREATE INDEX IF NOT EXISTS idx_w_state_timestamp ON w_state_snapshots(timestamp_ns);
+                CREATE INDEX IF NOT EXISTS idx_hlwe_address ON hlwe_keys(address);
+                CREATE INDEX IF NOT EXISTS idx_addresses_wallet ON addresses(wallet_fingerprint);
+                CREATE INDEX IF NOT EXISTS idx_peer_registry_id ON peer_registry(peer_id);
+                CREATE INDEX IF NOT EXISTS idx_tripartite_votes ON tripartite_consensus_votes(consensus_hash);
+            """)
+            
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(wallets)")
+            cols = [row[1] for row in cursor.fetchall()]
+            
             if 'xpub' not in cols:
                 conn.execute("ALTER TABLE wallets ADD COLUMN xpub TEXT")
                 logger.info("[DB] Migrated wallets table: added xpub column")
-        except Exception as e:
-            logger.warning(f"[DB] Migration check failed: {e}")
-        
-        conn.commit()
-        conn.close()
+            
+            conn.commit()
+        finally:
+            conn.close()
     
     @staticmethod
     def _public_key_to_address(public_key: bytes) -> str:
