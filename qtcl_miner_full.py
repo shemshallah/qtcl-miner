@@ -572,7 +572,7 @@ class HyperbolicLattice:
     log_term = math.log(2 * n * (1 + 1.0 / epsilon))
     eta = math.sqrt(log_term / math.pi) / max(gh, 1e-10)
     
-    return eta
+        return eta
     
     def sample_gaussian(self, sigma: float = 3.2) -> List[int]:
         """
