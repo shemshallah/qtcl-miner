@@ -2546,6 +2546,52 @@ class QTCLFullNode:
             if tip and tip.height > 0:
                 self.state.add_block(tip)
                 logger.info(f"[NODE] ✅ Network tip | height={tip.height} | hash={tip.block_hash[:16]}…")
+                
+                # ─── FETCH MISSING BLOCKS FROM ORACLE ─────────────────────────────
+                # If tip height > 0, we need to fetch blocks 1..tip.height from Oracle
+                try:
+                    # Get current local height
+                    cursor = db.execute("SELECT MAX(height) FROM blocks")
+                    result = cursor.fetchone()
+                    local_height = result[0] if result and result[0] is not None else 0
+                    
+                    if tip.height > local_height:
+                        logger.info(f"[NODE] 📥 Syncing {tip.height - local_height} blocks from Oracle...")
+                        
+                        # Fetch blocks from Oracle one by one
+                        for block_height in range(local_height + 1, tip.height + 1):
+                            try:
+                                block_data = self.client.get_block_by_height(block_height)
+                                if block_data:
+                                    header = BlockHeader.from_dict(block_data.get('header', block_data))
+                                    self.state.add_block(header)
+                                    
+                                    # Store in database
+                                    db.execute("""
+                                        INSERT OR IGNORE INTO blocks 
+                                        (height, block_hash, parent_hash, merkle_root, timestamp_s, 
+                                         difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        header.height,
+                                        header.block_hash,
+                                        header.parent_hash,
+                                        header.merkle_root,
+                                        header.timestamp_s,
+                                        header.difficulty_bits,
+                                        header.nonce,
+                                        header.miner_address,
+                                        header.w_state_fidelity,
+                                        header.w_entropy_hash
+                                    ))
+                                    
+                                    logger.debug(f"[NODE] 📦 Synced block {block_height}")
+                            except Exception as e:
+                                logger.warning(f"[NODE] ⚠️  Failed to sync block {block_height}: {e}")
+                        
+                        logger.info(f"[NODE] ✅ Oracle sync complete | local height now: {tip.height}")
+                except Exception as e:
+                    logger.warning(f"[NODE] ⚠️  Oracle block sync error: {e}")
             
             self.running = True
             
