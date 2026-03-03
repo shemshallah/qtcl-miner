@@ -1578,11 +1578,11 @@ class ClayMinerWallet:
         self.current_fingerprint = result['wallet_fingerprint']
         self._address = result['first_address']
          
-         # FIX: Extract public_key from result
-         if 'public_key' in result and result['public_key']:
-             self._public_key = result['public_key']
-         elif 'master_key' in result and hasattr(result['master_key'], 'public_key'):
-             self._public_key = result['master_key'].public_key.hex() if result['master_key'].public_key else None
+        # FIX: Extract public_key from result
+        if 'public_key' in result and result['public_key']:
+            self._public_key = result['public_key']
+        elif 'master_key' in result and hasattr(result['master_key'], 'public_key'):
+            self._public_key = result['master_key'].public_key.hex() if result['master_key'].public_key else None
         
         # Store fingerprint
         with open(self.wallet_file, 'w') as f:
@@ -3406,11 +3406,11 @@ class QuickWallet:
         result = self.hlwe_wallet.create(password)
         self.address = result
         self.public_key = self.hlwe_wallet.public_key
-         # FIX: Ensure public_key is not None
-         if not self.public_key:
-             logger.warning("[WALLET] Public key extraction failed, attempting fallback")
-             if hasattr(self.hlwe_wallet, 'current_master') and self.hlwe_wallet.current_master:
-                 self.public_key = self.hlwe_wallet.current_master.public_key.hex() if hasattr(self.hlwe_wallet.current_master, 'public_key') else None
+        # FIX: Ensure public_key is not None
+        if not self.public_key:
+            logger.warning("[WALLET] Public key extraction failed, attempting fallback")
+            if hasattr(self.hlwe_wallet, 'current_master') and self.hlwe_wallet.current_master:
+                self.public_key = self.hlwe_wallet.current_master.public_key.hex() if hasattr(self.hlwe_wallet.current_master, 'public_key') else None
         self._save(password)
         
         db.execute("""
