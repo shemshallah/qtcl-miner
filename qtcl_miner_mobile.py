@@ -546,12 +546,17 @@ class P2PClientWStateRecovery:
             pq_curr_id = str(snapshot.get('pq_current', ''))
             pq_last_id = str(snapshot.get('pq_last',    ''))
             
-            # If pq_last is absent or '0' (oracle genesis state), derive it deterministically
-            # from the current snapshot so the field-space range [pq_last→pq_curr] is always
-            # well-defined and non-empty for the lattice controller.
-            if not pq_last_id or pq_last_id == '0' or pq_last_id == 'None':
-                seed = f"genesis:{timestamp_ns}:{pq_curr_id}"
-                pq_last_id = hashlib.sha256(seed.encode()).hexdigest()
+            # Oracle may send integer 0 at genesis (block_state not yet populated).
+            # Derive deterministic hex identifiers so the field-space range is always
+            # well-defined and non-degenerate for the lattice controller.
+            if not pq_curr_id or pq_curr_id in ('0', 'None', 'genesis'):
+                pq_curr_id = hashlib.sha256(
+                    f"pq_curr:{timestamp_ns}:{fidelity}".encode()
+                ).hexdigest()
+            if not pq_last_id or pq_last_id in ('0', 'None', 'genesis'):
+                pq_last_id = hashlib.sha256(
+                    f"pq_last:{timestamp_ns}:{pq_curr_id}".encode()
+                ).hexdigest()
             
             # Build a proper 8x8 W-state density matrix from oracle fidelity.
             # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
@@ -1468,7 +1473,7 @@ class QTCLFullNode:
                                 elapsed = time.time() - mining_start_time
                                 blocks_per_hour = (blocks_mined_this_session / elapsed * 3600) if elapsed > 0 else 0
                                 
-                                block_reward = 12.5  # matches server reward
+                                block_reward = 12.5  # QTCL (server awards 1250 base units)
                                 logger.info(f"[MINING] 💰 Block Reward: +{block_reward} QTCL")
                                 logger.info(f"[MINING] ✅ Block #{block.header.height} CONFIRMED")
                                 logger.info(f"[MINING] 📊 Submission:")
