@@ -136,7 +136,18 @@ class RecoveredWState:
 
 @dataclass
 class EntanglementState:
-    """Track local entanglement with remote pq0 (oracle) and pq_curr/pq_last."""
+    """Track local entanglement with remote pq0 (oracle) and pq_curr/pq_last.
+    
+    DESIGN CONTRACT:
+      pq_curr  — STRING hex identifier of the CURRENT lattice field-space position
+      pq_last  — STRING hex identifier of the PREVIOUS lattice field-space position
+      The lattice field space is defined by the range [pq_last … pq_curr].
+      These are NOT fidelity metrics — they are cryptographic coordinates in the
+      quantum lattice that mark which field region the miner is operating in.
+      
+      w_state_fidelity — FLOAT 0..1, the actual W-state quality from oracle.
+                         This is what block submission uses for threshold validation.
+    """
     established: bool
     local_fidelity: float
     sync_lag_ms: float
@@ -144,9 +155,11 @@ class EntanglementState:
     sync_error_count: int = 0
     coherence_verified: bool = False
     signature_verified: bool = False
-    pq0_fidelity: float = 0.0
-    pq_curr_fidelity: float = 0.0
-    pq_last_fidelity: float = 0.0
+    pq0_fidelity: float = 0.0           # Oracle W-state fidelity (from oracle snapshot)
+    w_state_fidelity: float = 0.0       # Current active W-state fidelity (what block uses)
+    # Lattice field-space identifiers (hex strings, NOT fidelity values)
+    pq_curr: str = ''                   # Current lattice field position identifier
+    pq_last: str = ''                   # Previous lattice field position identifier
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE QUALITY EVALUATION
@@ -309,6 +322,15 @@ class P2PClientWStateRecovery:
         self.pq_curr_matrix: Optional[np.ndarray]=None
         self.pq_last_matrix: Optional[np.ndarray]=None
         self.pq_curr_measurement_counts: Dict[str,int]={}
+        
+        # Lattice field-space identifiers (hex strings from oracle)
+        # These mark the range [pq_last … pq_curr] in the quantum lattice
+        self._pq_curr_id: str = ''
+        self._pq_last_id: str = ''
+        
+        # Actual W-state fidelity (float, from oracle snapshot — used for block submission)
+        self._w_state_fidelity: float = 0.0
+        self._w_state_coherence: float = 0.0
         
         self.sync_thread=None
         self._state_lock=threading.RLock()
@@ -506,14 +528,37 @@ class P2PClientWStateRecovery:
             return None
     
     def recover_w_state(self, snapshot: Dict[str, Any]) -> Optional[RecoveredWState]:
-        """Recover W-state from oracle snapshot with adaptive quality evaluation."""
+        """Recover W-state from oracle snapshot with adaptive quality evaluation.
+        
+        CONTRACT:
+          snapshot['pq_current'] — hex string: current lattice field-space identifier
+          snapshot['pq_last']    — hex string: previous lattice field-space identifier
+          snapshot['fidelity']   — float: actual W-state quality (used for block submission)
+          snapshot['coherence']  — float: L1 coherence metric
+        """
         try:
-            fidelity = snapshot.get('fidelity', 0.9)
-            coherence = snapshot.get('coherence', 0.85)
+            # ── Real oracle fidelity (the ONLY value that goes into block header) ──
+            fidelity  = float(snapshot.get('fidelity',  0.90))
+            coherence = float(snapshot.get('coherence', 0.85))
             timestamp_ns = snapshot.get('timestamp_ns', int(time.time() * 1e9))
             
-            dm_array = np.eye(8)
-            purity = 0.95
+            # ── Lattice field-space identifiers (hex strings, NOT floats) ──
+            pq_curr_id = str(snapshot.get('pq_current', ''))
+            pq_last_id = str(snapshot.get('pq_last',    ''))
+            
+            # Build a proper 8x8 W-state density matrix from oracle fidelity.
+            # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
+            # We scale by oracle fidelity so the DM reflects the real quantum state quality.
+            w_amp = 1.0 / np.sqrt(3.0)
+            w_vec = np.zeros(8, dtype=np.complex128)
+            w_vec[4] = w_amp   # |100⟩
+            w_vec[2] = w_amp   # |010⟩
+            w_vec[1] = w_amp   # |001⟩
+            rho_pure = np.outer(w_vec, w_vec.conj())
+            # Mix pure W-state with maximally mixed state according to oracle fidelity
+            rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
+            dm_array = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+            purity = float(np.real(np.trace(dm_array @ dm_array)))
             
             mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
             
@@ -543,21 +588,31 @@ class P2PClientWStateRecovery:
                 validation_notes=diagnostic,
                 local_statevector=None,
                 signature_verified=True,
-                oracle_address=snapshot.get('pq_current')
+                oracle_address=snapshot.get('oracle_address')
             )
             
             with self._state_lock:
                 self.recovered_w_state = recovered
                 self.pq0_matrix = dm_array.copy()
-                if hasattr(self, 'last_quality_score'):
-                    self.last_quality_score = quality_score
+                # Store lattice field-space identifiers
+                self._pq_curr_id  = pq_curr_id
+                self._pq_last_id  = pq_last_id
+                # Store real oracle fidelity for block submission
+                self._w_state_fidelity  = fidelity
+                self._w_state_coherence = coherence
             
             if is_valid:
-                logger.info(f"[W-STATE] ✅ Excellent W-state recovered | {diagnostic}")
+                logger.info(
+                    f"[W-STATE] ✅ W-state recovered | {diagnostic} | "
+                    f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
+                )
                 return recovered
             
             elif is_acceptable and not self.strict_verification:
-                logger.warning(f"[W-STATE] ⚠️  Marginal W-state accepted | {diagnostic}")
+                logger.warning(
+                    f"[W-STATE] ⚠️  Marginal W-state accepted | {diagnostic} | "
+                    f"lattice_field=[{pq_last_id[:12]}…→{pq_curr_id[:12]}…]"
+                )
                 return recovered
             
             else:
@@ -570,33 +625,50 @@ class P2PClientWStateRecovery:
             return None
     
     def _establish_entanglement(self)->bool:
-        """Establish entanglement between pq0 (oracle), pq_curr, and pq_last."""
+        """Establish entanglement between pq0 (oracle), pq_curr, and pq_last.
+        
+        pq_curr and pq_last are lattice field-space IDENTIFIERS (hex strings).
+        The density matrices pq_curr_matrix / pq_last_matrix are entangled copies
+        of the oracle DM for use in entropy measurement.
+        The real W-state fidelity comes from the oracle snapshot, NOT from
+        re-computing fidelity against the ideal W-state on these matrices.
+        """
         try:
             with self._state_lock:
                 if self.pq0_matrix is None:
                     return False
                 
-                # Create entangled copies
-                self.pq_curr_matrix=self.pq0_matrix.copy()
-                self.pq_last_matrix=self.pq0_matrix.copy()
+                # Create entangled copies of the oracle density matrix
+                self.pq_curr_matrix = self.pq0_matrix.copy()
+                self.pq_last_matrix = self.pq0_matrix.copy()
                 
-                # Simulate entanglement via small perturbations
-                noise=np.random.normal(0,0.01,(8,8))
-                noise=(noise+noise.conj().T)/2
-                self.pq_curr_matrix=0.99*self.pq_curr_matrix+0.01*noise
-                self.pq_curr_matrix/=np.trace(self.pq_curr_matrix)
+                # Apply small decoherence perturbations to simulate entanglement spread
+                noise = np.random.normal(0, 0.005, (8, 8))
+                noise = (noise + noise.conj().T) / 2
+                self.pq_curr_matrix = 0.995 * self.pq_curr_matrix + 0.005 * noise
+                self.pq_curr_matrix /= np.trace(self.pq_curr_matrix)
                 
-                noise=np.random.normal(0,0.01,(8,8))
-                noise=(noise+noise.conj().T)/2
-                self.pq_last_matrix=0.99*self.pq_last_matrix+0.01*noise
-                self.pq_last_matrix/=np.trace(self.pq_last_matrix)
+                noise = np.random.normal(0, 0.005, (8, 8))
+                noise = (noise + noise.conj().T) / 2
+                self.pq_last_matrix = 0.995 * self.pq_last_matrix + 0.005 * noise
+                self.pq_last_matrix /= np.trace(self.pq_last_matrix)
                 
-                self.entanglement_state.established=True
-                self.entanglement_state.pq0_fidelity=self._compute_w_state_fidelity(self.pq0_matrix)
-                self.entanglement_state.pq_curr_fidelity=self._compute_w_state_fidelity(self.pq_curr_matrix)
-                self.entanglement_state.pq_last_fidelity=self._compute_w_state_fidelity(self.pq_last_matrix)
+                # The fidelity that matters is the ORACLE's reported fidelity,
+                # not a re-computation on the perturbed matrices.
+                oracle_fidelity = self._w_state_fidelity
+                
+                self.entanglement_state.established    = True
+                self.entanglement_state.pq0_fidelity   = oracle_fidelity
+                self.entanglement_state.w_state_fidelity = oracle_fidelity
+                # pq_curr and pq_last are string identifiers in the lattice field
+                self.entanglement_state.pq_curr = self._pq_curr_id
+                self.entanglement_state.pq_last = self._pq_last_id
             
-            logger.info(f"[W-STATE] 🔗 Entanglement established | pq0={self.entanglement_state.pq0_fidelity:.4f} | pq_curr={self.entanglement_state.pq_curr_fidelity:.4f} | pq_last={self.entanglement_state.pq_last_fidelity:.4f}")
+            logger.info(
+                f"[W-STATE] 🔗 Entanglement established | "
+                f"oracle_F={oracle_fidelity:.4f} | "
+                f"lattice_field=[{self._pq_last_id[:12]}…→{self._pq_curr_id[:12]}…]"
+            )
             return True
         
         except Exception as e:
@@ -604,10 +676,17 @@ class P2PClientWStateRecovery:
             return False
     
     def verify_entanglement(self, local_fidelity: float, signature_verified: bool) -> bool:
-        """Verify entanglement quality with adaptive thresholds."""
+        """Verify entanglement quality with adaptive thresholds.
+        
+        local_fidelity is the oracle-reported W-state fidelity (degraded by sync lag).
+        This is the REAL field quality — stored directly as w_state_fidelity for
+        block submission. We do NOT re-compute fidelity from the density matrix
+        (that would give the meaningless 0.0417 identity-matrix trace value).
+        """
         try:
             with self._state_lock:
-                self.entanglement_state.local_fidelity = local_fidelity
+                self.entanglement_state.local_fidelity     = local_fidelity
+                self.entanglement_state.w_state_fidelity   = local_fidelity  # ← real value for blocks
                 self.entanglement_state.signature_verified = signature_verified
             
             mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
@@ -619,7 +698,7 @@ class P2PClientWStateRecovery:
                     self.entanglement_state.established = True
                     self.entanglement_state.coherence_verified = True
                 
-                logger.info(f"[W-STATE] 🔗 Entanglement verified | fidelity={local_fidelity:.4f} (threshold {fid_threshold:.4f}) | signature=✓")
+                logger.info(f"[W-STATE] 🔗 Entanglement verified | F={local_fidelity:.4f} (≥{fid_threshold:.2f}) | sig=✓")
                 return True
             
             elif local_fidelity >= fid_minimal and signature_verified:
@@ -627,14 +706,14 @@ class P2PClientWStateRecovery:
                     self.entanglement_state.established = True
                     self.entanglement_state.coherence_verified = True
                 
-                logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | fidelity={local_fidelity:.4f} (threshold {fid_minimal:.4f}) | sig_verified={signature_verified}")
+                logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | F={local_fidelity:.4f} (≥{fid_minimal:.2f}) | sig={signature_verified}")
                 return True
             
             else:
                 with self._state_lock:
                     self.entanglement_state.established = False
                 
-                logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | fidelity={local_fidelity:.4f} | sig_verified={signature_verified}")
+                logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | F={local_fidelity:.4f} | sig={signature_verified}")
                 return False
         
         except Exception as e:
@@ -642,12 +721,24 @@ class P2PClientWStateRecovery:
             return False
     
     def rotate_entanglement_state(self)->None:
-        """Rotate W-state measurements: pq_curr → pq_last, recover new pq_curr from pq0."""
+        """Rotate W-state measurements: pq_curr → pq_last, recover new pq_curr from pq0.
+        
+        Rotates BOTH the density matrices (for entropy measurement) AND the
+        lattice field-space identifiers (pq_curr_id → pq_last_id).
+        """
         try:
             with self._state_lock:
-                self.pq_last_matrix=self.pq_curr_matrix.copy() if self.pq_curr_matrix is not None else None
-                self.pq_curr_matrix=self.pq0_matrix.copy() if self.pq0_matrix is not None else None
-            logger.debug("[W-STATE] 🔄 Entanglement rotated: pq_curr → pq_last")
+                # Rotate density matrices
+                self.pq_last_matrix  = self.pq_curr_matrix.copy() if self.pq_curr_matrix is not None else None
+                self.pq_curr_matrix  = self.pq0_matrix.copy()     if self.pq0_matrix     is not None else None
+                # Rotate lattice field-space identifiers
+                self.entanglement_state.pq_last = self.entanglement_state.pq_curr
+                self.entanglement_state.pq_curr = self._pq_curr_id
+                self._pq_last_id = self._pq_curr_id
+            logger.debug(
+                f"[W-STATE] 🔄 Entanglement rotated | "
+                f"lattice_field=[{self.entanglement_state.pq_last[:12]}…→{self.entanglement_state.pq_curr[:12]}…]"
+            )
         except Exception as e:
             logger.error(f"[W-STATE] ❌ Rotation failed: {e}")
     
@@ -734,19 +825,25 @@ class P2PClientWStateRecovery:
             }
     
     def get_entanglement_status(self)->Dict[str,Any]:
-        """Get entanglement status."""
+        """Get entanglement status.
+        
+        NOTE: pq_curr and pq_last are hex STRING identifiers (lattice field-space
+        coordinates), NOT fidelity floats. w_state_fidelity is the real quality metric.
+        """
         with self._state_lock:
             state=self.entanglement_state
             return {
-                "established": state.established,
-                "local_fidelity": state.local_fidelity,
-                "sync_lag_ms": state.sync_lag_ms,
-                "coherence_verified": state.coherence_verified,
-                "signature_verified": state.signature_verified,
-                "sync_error_count": state.sync_error_count,
-                "pq0_fidelity": state.pq0_fidelity,
-                "pq_curr_fidelity": state.pq_curr_fidelity,
-                "pq_last_fidelity": state.pq_last_fidelity,
+                "established":          state.established,
+                "local_fidelity":       state.local_fidelity,
+                "w_state_fidelity":     state.w_state_fidelity,   # ← real oracle fidelity
+                "sync_lag_ms":          state.sync_lag_ms,
+                "coherence_verified":   state.coherence_verified,
+                "signature_verified":   state.signature_verified,
+                "sync_error_count":     state.sync_error_count,
+                "pq0_fidelity":         state.pq0_fidelity,
+                # Lattice field-space identifiers (strings, not floats)
+                "pq_curr":              state.pq_curr,
+                "pq_last":              state.pq_last,
             }
     
     def start(self)->bool:
@@ -970,7 +1067,13 @@ class QuantumMiner:
             w_entropy = self.w_state_recovery.measure_w_state()
             entropy_time = time.time() - entropy_start
             entanglement = self.w_state_recovery.get_entanglement_status()
-            current_fidelity = entanglement.get('pq_curr_fidelity', 0.0)
+            
+            # ── CRITICAL: Use oracle-reported fidelity, NOT matrix-computed fidelity ──
+            # pq_curr and pq_last are string lattice field-space identifiers.
+            # The real W-state quality for block submission comes from w_state_fidelity.
+            current_fidelity = entanglement.get('w_state_fidelity', 0.0)
+            pq_curr_id = entanglement.get('pq_curr', '')
+            pq_last_id = entanglement.get('pq_last', '')
             
             logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
             
@@ -1041,7 +1144,8 @@ class QuantumMiner:
                     logger.info(f"[MINING] 🎯 Quantum:")
                     logger.info(f"[MINING]   • W-state fidelity: {current_fidelity:.4f}")
                     logger.info(f"[MINING]   • W-entropy source: 256-bit measurement")
-                    logger.info(f"[MINING]   • Entanglement: pq0={entanglement.get('pq0_fidelity', 0.0):.4f}, pq_curr={entanglement.get('pq_curr_fidelity', 0.0):.4f}, pq_last={entanglement.get('pq_last_fidelity', 0.0):.4f}")
+                    logger.info(f"[MINING]   • Oracle F: pq0={entanglement.get('pq0_fidelity', 0.0):.4f}")
+                    logger.info(f"[MINING]   • Lattice field: pq_curr={pq_curr_id[:16]}… → pq_last={pq_last_id[:16]}…")
                     logger.info(f"[MINING] ⏱️  Total mining time: {total_time:.2f}s")
                     
                     # Rotate W-state for next iteration
@@ -1107,19 +1211,47 @@ class QTCLFullNode:
             
             logger.info("[NODE] ✅ W-state recovery online")
             
-            # Sync blockchain
-            tip=self.client.get_tip_block()
-            if tip:
-                self.state.add_block(tip)
-                logger.info(f"[NODE] ✅ Got tip block | height={tip.height}")
+            # ── Bootstrap from genesis (Bitcoin-style: always start from block 0) ──
+            # Fetch genesis block first to anchor the chain.
+            genesis_data = self.client.get_block_by_height(0)
+            if genesis_data:
+                genesis_header_data = genesis_data.get('header', genesis_data)
+                genesis_header = BlockHeader.from_dict(genesis_header_data)
+                self.state.add_block(genesis_header)
+                logger.info(
+                    f"[NODE] ⛓️  Genesis block anchored | height=0 | "
+                    f"hash={genesis_header.block_hash[:16]}…"
+                )
+            else:
+                # Genesis not yet on chain — create a local genesis anchor
+                # so the miner can mine block #1 referencing the correct genesis hash
+                genesis_hash = '0' * 64
+                genesis_header = BlockHeader(
+                    height=0,
+                    block_hash=genesis_hash,
+                    parent_hash='0' * 64,
+                    merkle_root='0' * 64,
+                    timestamp_s=int(time.time()),
+                    difficulty_bits=self.miner.difficulty,
+                    nonce=0,
+                    miner_address='genesis',
+                )
+                self.state.add_block(genesis_header)
+                logger.warning("[NODE] ⚠️  Genesis not on network — using local genesis anchor")
             
-            self.running=True
+            # Fetch current tip so we know how far to sync
+            tip = self.client.get_tip_block()
+            if tip and tip.height > 0:
+                self.state.add_block(tip)
+                logger.info(f"[NODE] ✅ Network tip | height={tip.height} | hash={tip.block_hash[:16]}…")
+            
+            self.running = True
             
             # Start background threads
-            self.sync_thread=threading.Thread(target=self._sync_loop,daemon=True,name="SyncWorker")
+            self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True, name="SyncWorker")
             self.sync_thread.start()
             
-            self.mining_thread=threading.Thread(target=self._mining_loop,daemon=True,name="MiningWorker")
+            self.mining_thread = threading.Thread(target=self._mining_loop, daemon=True, name="MiningWorker")
             self.mining_thread.start()
             
             logger.info("[NODE] ✨ Full node with quantum mining started")
@@ -1139,35 +1271,51 @@ class QTCLFullNode:
         logger.info("[NODE] ✅ Stopped")
     
     def _sync_loop(self):
-        """Continuously sync blockchain from network"""
+        """Continuously sync blockchain from network — Bitcoin-style from genesis to tip."""
         logger.info("[SYNC] 🔄 Loop started")
         while self.running:
             try:
-                tip=self.client.get_tip_block()
+                tip = self.client.get_tip_block()
                 if not tip:
                     logger.warning("[SYNC] ⚠️  Failed to get tip, retrying...")
                     time.sleep(10)
                     continue
                 
-                current_height=self.state.get_height()
-                if current_height<tip.height:
-                    logger.info(f"[SYNC] 📥 Syncing: {current_height+1} → {tip.height}")
-                    for h in range(current_height+1,min(current_height+SYNC_BATCH+1,tip.height+1)):
-                        block_data=self.client.get_block_by_height(h)
+                current_height = self.state.get_height()
+                
+                if current_height < tip.height:
+                    sync_start = current_height + 1
+                    sync_end   = min(current_height + SYNC_BATCH + 1, tip.height + 1)
+                    logger.info(f"[SYNC] 📥 Syncing blocks {sync_start} → {sync_end - 1} (network tip={tip.height})")
+                    
+                    for h in range(sync_start, sync_end):
+                        block_data = self.client.get_block_by_height(h)
                         if block_data:
-                            header=BlockHeader.from_dict(block_data.get('header',{}))
-                            txs=[Transaction(**tx) for tx in block_data.get('transactions',[])]
-                            block=Block(header=header,transactions=txs)
+                            # Handle both flat ({height:…}) and nested ({header:{…}}) responses
+                            header_data = block_data.get('header', block_data)
+                            # Normalise: server may return 'height' not 'block_height'
+                            if 'height' in header_data and 'block_height' not in header_data:
+                                header_data = dict(header_data)
+                                header_data['block_height'] = header_data['height']
+                            header = BlockHeader.from_dict(header_data)
+                            txs    = [Transaction(**tx) for tx in block_data.get('transactions', [])]
+                            block  = Block(header=header, transactions=txs)
                             if self.validator.validate_block(block):
                                 self.state.add_block(header)
+                                tx_ids_to_remove = []
                                 for tx in txs:
                                     self.state.apply_transaction(tx)
-                                    self.mempool.remove_transactions([tx.tx_id])
-                        time.sleep(0.1)
+                                    tx_ids_to_remove.append(tx.tx_id)
+                                if tx_ids_to_remove:
+                                    self.mempool.remove_transactions(tx_ids_to_remove)
+                                logger.debug(f"[SYNC] ✅ Synced block #{h}")
+                            else:
+                                logger.warning(f"[SYNC] ⚠️  Block #{h} failed validation, skipping")
+                        time.sleep(0.05)
                 else:
                     logger.debug(f"[SYNC] ✅ In sync at height {current_height}")
                 
-                mempool_txs=self.client.get_mempool()
+                mempool_txs = self.client.get_mempool()
                 for tx in mempool_txs:
                     self.mempool.add_transaction(tx)
                 logger.debug(f"[SYNC] 💾 Mempool: {self.mempool.get_size()} txs")
@@ -1210,8 +1358,8 @@ class QTCLFullNode:
                 # Blockchains can mine empty blocks (common during low activity)
                 # This was the bug preventing mining when mempool = 0
                 
-                # Get current W-state metrics
-                current_fidelity = entanglement.get('pq_curr_fidelity', 0.0)
+                # Get current W-state metrics — use real oracle fidelity
+                current_fidelity = entanglement.get('w_state_fidelity', 0.0)
                 fidelity_measurements.append(current_fidelity)
                 
                 tx_count = len(pending_txs) if pending_txs else 0
@@ -1402,10 +1550,12 @@ class QTCLFullNode:
             'quantum': {
                 'w_state': {
                     'entanglement_established': entanglement.get('established', False),
-                    'pq0_fidelity': entanglement.get('pq0_fidelity', 0.0),
-                    'pq_curr_fidelity': entanglement.get('pq_curr_fidelity', 0.0),
-                    'pq_last_fidelity': entanglement.get('pq_last_fidelity', 0.0),
-                    'sync_lag_ms': entanglement.get('sync_lag_ms', 0.0),
+                    'pq0_fidelity':             entanglement.get('pq0_fidelity', 0.0),
+                    'w_state_fidelity':         entanglement.get('w_state_fidelity', 0.0),
+                    # Lattice field-space identifiers (hex strings)
+                    'pq_curr':                  entanglement.get('pq_curr', ''),
+                    'pq_last':                  entanglement.get('pq_last', ''),
+                    'sync_lag_ms':              entanglement.get('sync_lag_ms', 0.0),
                 },
                 'recovery': {
                     'connected': self.w_state_recovery.running,
@@ -1651,9 +1801,10 @@ def main():
             print(f"")
             print(f"QUANTUM W-STATE ENTANGLEMENT:")
             print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
-            print(f"  pq0 (Oracle) Fidelity:  {status['quantum']['w_state']['pq0_fidelity']:.4f}")
-            print(f"  pq_curr (Current):      {status['quantum']['w_state']['pq_curr_fidelity']:.4f}")
-            print(f"  pq_last (Previous):     {status['quantum']['w_state']['pq_last_fidelity']:.4f}")
+            print(f"  pq0 Oracle Fidelity:    {status['quantum']['w_state']['pq0_fidelity']:.4f}")
+            print(f"  W-State Fidelity:       {status['quantum']['w_state']['w_state_fidelity']:.4f}")
+            print(f"  pq_curr (field ID):     {status['quantum']['w_state']['pq_curr'][:32]}…")
+            print(f"  pq_last (field ID):     {status['quantum']['w_state']['pq_last'][:32]}…")
             print(f"  Sync Lag:               {status['quantum']['w_state']['sync_lag_ms']:.1f}ms")
             print(f"")
             print(f"ORACLE RECOVERY:")
