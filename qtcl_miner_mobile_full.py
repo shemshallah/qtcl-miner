@@ -94,6 +94,7 @@ import hmac
 import uuid
 import random
 import socket
+import getpass
 import traceback
 from typing import Dict, Any, Optional, List, Tuple, Union, Callable, Set, Deque
 from dataclasses import dataclass, field, asdict
@@ -165,7 +166,7 @@ except ImportError:
 # CONSTANTS
 # =============================================================================
 
-LIVE_NODE_URL = 'http://qtcl-blockchain.koyeb.app:8333'
+LIVE_NODE_URL = 'http://qtcl-blockchain.koyeb.app:8000'
 API_PREFIX = '/api'
 MAX_MEMPOOL = 10000
 SYNC_BATCH = 50
@@ -2565,25 +2566,41 @@ class P2PClientWStateRecovery:
         try:
             logger.info(f"[W-STATE] 🚀 Starting recovery client...")
             
-            if not self.register_with_oracle():
-                logger.error("[W-STATE] ❌ Failed to register with oracle")
-                return False
+            oracle_available = False
             
-            snapshot = self.download_latest_snapshot()
-            if snapshot is None:
-                logger.error("[W-STATE] ❌ Failed to download initial snapshot")
-                return False
+            # ─── ATTEMPT ORACLE REGISTRATION (with graceful fallback) ──────────
+            if self.register_with_oracle():
+                oracle_available = True
+                logger.info("[W-STATE] ✅ Registered with oracle")
+            else:
+                logger.warning("[W-STATE] ⚠️  Oracle registration failed — running in DEGRADED mode")
+                logger.info("[W-STATE] 📡 Will await W-state from peers or retry oracle periodically")
             
-            recovered = self.recover_w_state(snapshot)
-            if recovered is None:
-                logger.error("[W-STATE] ❌ Initial recovery failed")
+            # ─── ATTEMPT SNAPSHOT DOWNLOAD ────────────────────────────────────
+            snapshot = None
+            if oracle_available:
+                snapshot = self.download_latest_snapshot()
+            
+            if snapshot is None and oracle_available:
+                logger.warning("[W-STATE] ⚠️  Failed to download initial snapshot")
                 if self.strict_verification:
+                    logger.error("[W-STATE] ❌ Strict verification required but snapshot unavailable")
                     return False
             
-            if not self._establish_entanglement():
-                logger.error("[W-STATE] ❌ Failed to establish entanglement")
-                if self.strict_verification:
-                    return False
+            # ─── RECOVER W-STATE IF SNAPSHOT AVAILABLE ────────────────────────
+            if snapshot:
+                recovered = self.recover_w_state(snapshot)
+                if recovered is None:
+                    logger.warning("[W-STATE] ⚠️  Initial recovery failed")
+                    if self.strict_verification:
+                        return False
+                
+                if not self._establish_entanglement():
+                    logger.warning("[W-STATE] ⚠️  Failed to establish entanglement")
+                    if self.strict_verification:
+                        return False
+            else:
+                logger.info("[W-STATE] ⏳ Waiting for W-state snapshot from oracle or peers...")
             
             self.running = True
             self.sync_thread = threading.Thread(
@@ -2593,7 +2610,8 @@ class P2PClientWStateRecovery:
             )
             self.sync_thread.start()
             
-            logger.info(f"[W-STATE] ✨ Recovery client running with W-state entanglement")
+            mode_str = "ONLINE" if oracle_available else "DEGRADED"
+            logger.info(f"[W-STATE] ✨ Recovery client running ({mode_str}) with W-state entanglement")
             return True
         
         except Exception as e:
@@ -2921,7 +2939,7 @@ class QuantumMiner:
 # =============================================================================
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str = 'http://qtcl-blockchain.koyeb.app:8333', difficulty: int = 12):
+    def __init__(self, miner_address: str, oracle_url: str = 'http://qtcl-blockchain.koyeb.app:8000', difficulty: int = 12):
         self.miner_address = miner_address
         self.running = False
         
@@ -2958,11 +2976,36 @@ class QTCLFullNode:
         try:
             logger.info("[NODE] 🚀 Starting node...")
             
-            if not self.w_state_recovery.start():
-                logger.error("[NODE] ❌ W-state recovery failed to start")
-                return False
+            # ─── ATTEMPT ORACLE RECOVERY (with graceful fallback) ───────────────
+            oracle_online = False
+            logger.info("[NODE] 🔄 Attempting W-state oracle recovery...")
             
-            logger.info("[NODE] ✅ W-state recovery online")
+            try:
+                if self.w_state_recovery.start():
+                    oracle_online = True
+                    logger.info("[NODE] ✅ W-state oracle recovery online")
+                else:
+                    logger.warning("[NODE] ⚠️  W-state oracle recovery failed — starting in DEGRADED mode")
+                    logger.info("[NODE] 📡 Will sync block height & W-state from peers instead")
+            except Exception as e:
+                logger.warning(f"[NODE] ⚠️  Oracle connection error: {e}")
+                logger.info("[NODE] 📡 Will sync from peers — continuing startup in DEGRADED mode")
+            
+            # ─── BLOCK HEIGHT SYNC (from oracle OR peers) ──────────────────────
+            tip = None
+            if oracle_online:
+                tip = self.client.get_tip_block()
+            
+            if not tip:
+                logger.info("[NODE] 📡 Syncing block height from peer network...")
+                # Try to get tip from peers in peer_registry
+                try:
+                    db_cursor = db.execute("SELECT block_height FROM peer_registry ORDER BY block_height DESC LIMIT 1")
+                    result = db_cursor.fetchone()
+                    if result and result[0] > 0:
+                        logger.info(f"[NODE] 📊 Peer consensus height: {result[0]}")
+                except:
+                    pass
             
             genesis_data = self.client.get_block_by_height(0)
             if genesis_data:
@@ -3006,7 +3049,9 @@ class QTCLFullNode:
                 self.state.add_block(genesis_header)
                 logger.warning("[NODE] ⚠️  Genesis not on network — using local genesis anchor")
             
-            tip = self.client.get_tip_block()
+            if not tip and oracle_online:
+                tip = self.client.get_tip_block()
+            
             if tip and tip.height > 0:
                 self.state.add_block(tip)
                 logger.info(f"[NODE] ✅ Network tip | height={tip.height} | hash={tip.block_hash[:16]}…")
@@ -3616,7 +3661,7 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner with HLWE')
     parser.add_argument('--address', '-a', help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url', '-o', default='http://qtcl-blockchain.koyeb.app:8333', help='Oracle URL (default: http://qtcl-blockchain.koyeb.app:8333)')
+    parser.add_argument('--oracle-url', '-o', default='http://qtcl-blockchain.koyeb.app:8000', help='Oracle URL (default: http://qtcl-blockchain.koyeb.app:8000)')
     parser.add_argument('--difficulty', '-d', type=int, default=DEFAULT_DIFFICULTY, help='Mining difficulty bits')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     parser.add_argument('--wallet-init', action='store_true', help='Initialize new wallet')
@@ -3635,7 +3680,7 @@ def main():
     try:
         if args.wallet_init:
             if not args.wallet_password:
-                args.wallet_password = input("Enter wallet password: ")
+                args.wallet_password = getpass.getpass("Enter wallet password: ", stream=sys.stderr)
             wallet = QuickWallet()
             address = wallet.create(args.wallet_password)
             logger.info(f"[WALLET] Created: {address}")
@@ -3649,7 +3694,7 @@ def main():
         else:
             wallet = QuickWallet()
             if not args.wallet_password:
-                args.wallet_password = input("Enter wallet password: ")
+                args.wallet_password = getpass.getpass("Enter wallet password: ", stream=sys.stderr)
             if wallet.load(args.wallet_password):
                 address = wallet.address
                 logger.info(f"[WALLET] Loaded: {address}")
