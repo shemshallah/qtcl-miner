@@ -1594,7 +1594,16 @@ class Block:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class MinerWebSocketP2PClient:
-    """WebSocket P2P client for miner registration, heartbeats, and snapshot requests."""
+    """WebSocket P2P client for miner registration, heartbeats, snapshot requests, and gossip.
+    
+    ENHANCED: Supports gossip protocol for peer discovery, snapshot sharing, and resilience.
+    Features:
+      • Adaptive timeout tuning based on request latencies
+      • Gossip protocol for peer discovery
+      • Snapshot caching for resilience
+      • Background peer discovery loop
+      • Health tracking for known peers
+    """
     
     def __init__(self, oracle_url: str, miner_id: str, miner_address: str, public_key: str=''):
         self.oracle_url=oracle_url.rstrip('/')
@@ -1606,13 +1615,26 @@ class MinerWebSocketP2PClient:
         self._lock=threading.RLock()
         self._running=False
         
+        # Gossip protocol: track known peers and their snapshots
+        self.known_peers: Dict[str, Dict[str, Any]] = {}  # peer_id -> {url, ws_url, last_seen, snapshot_ts}
+        self.peer_discovery_thread = None
+        
+        # Snapshot cache: timestamp -> snapshot (for relay)
+        self.snapshot_cache: Dict[int, Dict[str, Any]] = {}
+        self.latest_snapshot_ts = 0
+        
+        # Adaptive timeout tracking
+        self.request_times: deque = deque(maxlen=10)
+        self.current_timeout = 5
+        
         if SOCKETIO_AVAILABLE:
             try:
                 self.sio=socketio.Client(
                     reconnection=True,
                     reconnection_delay=1,
                     reconnection_delay_max=5,
-                    reconnection_attempts=10
+                    reconnection_attempts=10,
+                    request_timeout=self.current_timeout
                 )
                 
                 @self.sio.event
@@ -1632,12 +1654,37 @@ class MinerWebSocketP2PClient:
                 def on_register_ack(data):
                     if data.get('status')=='registered':
                         logger.info(f"[WEBSOCKET] ✅ Registration acknowledged")
+                        # Extract peer info from ACK for gossip discovery
+                        if 'known_peers' in data:
+                            self._process_peer_list(data['known_peers'])
                     else:
                         logger.warning(f"[WEBSOCKET] Registration error: {data.get('message')}")
                 
                 @self.sio.on('miner_snapshot')
                 def on_snapshot(data):
-                    logger.debug("[WEBSOCKET] Received snapshot from oracle via WebSocket")
+                    ts = data.get('timestamp_ns', 0)
+                    logger.debug(f"[WEBSOCKET] 📥 Received snapshot from oracle | ts={ts}")
+                    # Cache snapshot for local gossip relay
+                    with self._lock:
+                        self.snapshot_cache[ts] = data
+                        self.latest_snapshot_ts = max(self.latest_snapshot_ts, ts)
+                
+                @self.sio.on('gossip_peer_list')
+                def on_gossip_peer_list(data):
+                    """Receive peer list from oracle for gossip discovery"""
+                    peers = data.get('peers', [])
+                    logger.debug(f"[GOSSIP] Received {len(peers)} peers from oracle")
+                    self._process_peer_list(peers)
+                
+                @self.sio.on('gossip_snapshot')
+                def on_gossip_snapshot(data):
+                    """Receive snapshot from peer via gossip"""
+                    from_peer = data.get('from_peer', '?')
+                    ts = data.get('timestamp_ns', 0)
+                    logger.debug(f"[GOSSIP] 📥 Snapshot from {from_peer[:12]} | ts={ts}")
+                    with self._lock:
+                        self.snapshot_cache[ts] = data
+                        self.latest_snapshot_ts = max(self.latest_snapshot_ts, ts)
                 
                 @self.sio.on('error')
                 def on_error(data):
@@ -1647,10 +1694,41 @@ class MinerWebSocketP2PClient:
                 logger.warning(f"[WEBSOCKET] SocketIO initialization failed: {e}")
                 self.sio=None
     
+    def _process_peer_list(self, peers: List[Dict[str, Any]]) -> None:
+        """Process peer list from oracle/gossip for discovery."""
+        with self._lock:
+            for peer in peers:
+                peer_id = peer.get('miner_id')
+                if peer_id and peer_id != self.miner_id:  # Don't add ourselves
+                    self.known_peers[peer_id] = {
+                        'url': peer.get('url', ''),
+                        'ws_url': peer.get('ws_url', ''),
+                        'last_seen': time.time(),
+                        'snapshot_ts': peer.get('snapshot_ts', 0)
+                    }
+            logger.debug(f"[GOSSIP] 🔄 Updated peer list: {len(self.known_peers)} peers")
+    
+    def _update_adaptive_timeout(self) -> None:
+        """Update timeout based on recent request latencies."""
+        if len(self.request_times) > 3:
+            avg_time = sum(self.request_times) / len(self.request_times)
+            # Set timeout to 2x average + 1 second, capped at 15s, minimum 5s
+            new_timeout = min(max(avg_time * 2 + 1, 5), 15)
+            if abs(new_timeout - self.current_timeout) > 0.5:
+                old_timeout = self.current_timeout
+                self.current_timeout = new_timeout
+                logger.info(f"[WEBSOCKET] ⏱️  Adaptive timeout: {old_timeout:.1f}s → {self.current_timeout:.1f}s (avg latency: {avg_time:.2f}s)")
+                if self.sio:
+                    try:
+                        self.sio.request_timeout = self.current_timeout
+                    except:
+                        pass
+    
     def connect(self)->bool:
-        """Connect to oracle P2P via WebSocket (port 8333).
+        """Connect to oracle P2P via WebSocket with adaptive timeout.
         
-        FIXED: Uses HTTPS for external connections, supports P2P_WEBSOCKET_URL env var
+        ENHANCED: Uses HTTPS/WSS, supports P2P_WEBSOCKET_URL env var,
+        enables gossip protocol discovery.
         """
         if not self.sio:
             return False
@@ -1660,46 +1738,62 @@ class MinerWebSocketP2PClient:
             p2p_ws_url = os.getenv('P2P_WEBSOCKET_URL')
             
             if p2p_ws_url:
-                # Use explicit configuration (e.g., wss://qtcl-blockchain.koyeb.app or http://localhost:8333)
+                # Use explicit configuration
                 ws_url = p2p_ws_url.rstrip('/')
                 logger.info(f"[WEBSOCKET] Using configured P2P WebSocket URL: {ws_url}")
             else:
                 # Extract host from oracle_url, connect to port 8333 for P2P
                 url_parts=self.oracle_url.replace('http://', '').replace('https://', '')
-                host_only=url_parts.split(':')[0]  # Get just hostname
+                host_only=url_parts.split(':')[0]
                 
                 # Determine protocol: use wss:// for external URLs, ws:// for localhost
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
                     ws_url=f"http://{host_only}:8333"
                 else:
-                    # Use wss:// (WebSocket Secure) for cloud/external deployments
                     ws_url=f"wss://{host_only}"
             
-            logger.debug(f"[WEBSOCKET] Attempting connection to {ws_url}")
-            self.sio.connect(ws_url, wait_timeout=5, transports=['websocket', 'polling'])
+            logger.debug(f"[WEBSOCKET] 🔌 Attempting connection to {ws_url} (timeout: {self.current_timeout}s)")
+            
+            start_time = time.time()
+            self.sio.connect(ws_url, wait_timeout=self.current_timeout, transports=['websocket', 'polling'])
+            elapsed = time.time() - start_time
+            self.request_times.append(elapsed)
+            self._update_adaptive_timeout()
+            logger.info(f"[WEBSOCKET] ✅ Connected in {elapsed:.2f}s")
+            
             return True
         except Exception as e:
             logger.warning(f"[WEBSOCKET] P2P WebSocket connection failed ({ws_url if 'ws_url' in locals() else 'unknown'}): {e}")
             return False
     
     def _send_register(self)->None:
-        """Send registration message to oracle."""
+        """Send registration message to oracle with gossip info."""
         try:
             if self.sio and self.connected:
                 self.sio.emit('miner_register', {
                     'miner_id': self.miner_id,
                     'address': self.miner_address,
-                    'public_key': self.public_key
+                    'public_key': self.public_key,
+                    'supports_gossip': True,  # Signal that we support gossip protocol
+                    'snapshot_ts': self.latest_snapshot_ts
                 })
-                logger.debug("[WEBSOCKET] Registration event sent")
+                logger.debug("[WEBSOCKET] Registration event sent with gossip support")
         except Exception as e:
             logger.debug(f"[WEBSOCKET] Registration emit failed: {e}")
     
     def send_heartbeat(self)->bool:
-        """Send heartbeat to keep registration alive."""
+        """Send heartbeat with peer/snapshot info for gossip."""
         try:
             if self.sio and self.connected:
-                self.sio.emit('miner_heartbeat', {'miner_id': self.miner_id})
+                start_time = time.time()
+                self.sio.emit('miner_heartbeat', {
+                    'miner_id': self.miner_id,
+                    'known_peers': len(self.known_peers),
+                    'snapshot_ts': self.latest_snapshot_ts
+                })
+                elapsed = time.time() - start_time
+                self.request_times.append(elapsed)
+                self._update_adaptive_timeout()
                 return True
             return False
         except Exception as e:
@@ -1710,12 +1804,41 @@ class MinerWebSocketP2PClient:
         """Request W-state snapshot from oracle."""
         try:
             if self.sio and self.connected:
-                self.sio.emit('miner_snapshot_request', {'miner_id': self.miner_id})
+                start_time = time.time()
+                self.sio.emit('miner_snapshot_request', {
+                    'miner_id': self.miner_id,
+                    'known_snapshot_ts': self.latest_snapshot_ts
+                })
+                elapsed = time.time() - start_time
+                self.request_times.append(elapsed)
+                self._update_adaptive_timeout()
                 return True
             return False
         except Exception as e:
             logger.debug(f"[WEBSOCKET] Snapshot request failed: {e}")
             return False
+    
+    def request_peer_list(self)->bool:
+        """Request peer list from oracle for gossip discovery."""
+        try:
+            if self.sio and self.connected:
+                self.sio.emit('gossip_peer_list_request', {'miner_id': self.miner_id})
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"[WEBSOCKET] Peer list request failed: {e}")
+            return False
+    
+    def get_cached_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Get latest cached snapshot from gossip network."""
+        with self._lock:
+            if self.latest_snapshot_ts in self.snapshot_cache:
+                return self.snapshot_cache[self.latest_snapshot_ts]
+            # Return most recent if exact timestamp not found
+            if self.snapshot_cache:
+                latest_ts = max(self.snapshot_cache.keys())
+                return self.snapshot_cache[latest_ts]
+        return None
     
     def disconnect(self)->None:
         """Disconnect from oracle."""
@@ -1748,6 +1871,55 @@ class MinerWebSocketP2PClient:
         """Start background snapshot request thread."""
         def snapshot_loop():
             while self._running:
+                try:
+                    time.sleep(interval_sec)
+                    self.request_snapshot()
+                except Exception as e:
+                    logger.debug(f"[WEBSOCKET] Snapshot loop error: {e}")
+        
+        with self._lock:
+            self._running=True
+        
+        thread=threading.Thread(target=snapshot_loop, daemon=True, name="MinerSnapshot")
+        thread.start()
+    
+    def start_peer_discovery_loop(self, interval_sec: int=30)->None:
+        """Start background peer discovery thread for gossip protocol."""
+        def discovery_loop():
+            while self._running:
+                try:
+                    time.sleep(interval_sec)
+                    # Request updated peer list
+                    self.request_peer_list()
+                    
+                    # Log peer health
+                    with self._lock:
+                        now = time.time()
+                        active_peers = sum(1 for p in self.known_peers.values() 
+                                         if now - p['last_seen'] < 120)
+                        stale_peers = [pid for pid, p in self.known_peers.items() 
+                                      if now - p['last_seen'] > 300]
+                    
+                    # Remove stale peers
+                    for pid in stale_peers:
+                        with self._lock:
+                            del self.known_peers[pid]
+                    
+                    logger.info(f"[GOSSIP] 👥 {len(self.known_peers)} known peers ({active_peers} active) | removed {len(stale_peers)} stale")
+                except Exception as e:
+                    logger.debug(f"[GOSSIP] Discovery loop error: {e}")
+        
+        with self._lock:
+            self._running=True
+        
+        self.peer_discovery_thread = threading.Thread(target=discovery_loop, daemon=True, name="PeerDiscovery")
+        self.peer_discovery_thread.start()
+    
+    def stop(self)->None:
+        """Stop all background operations."""
+        with self._lock:
+            self._running=False
+        self.disconnect()
                 try:
                     time.sleep(interval_sec)
                     self.request_snapshot()
@@ -1839,16 +2011,19 @@ class P2PClientWStateRecovery:
     def register_with_oracle(self)->bool:
         """Register with oracle via WebSocket (preferred) or HTTP fallback.
         
-        ENHANCED: WebSocket P2P first, then HTTP with exponential backoff (1s,2s,4s,5s,5s).
+        ENHANCED: WebSocket P2P with gossip protocol, then HTTP fallback.
+        Starts peer discovery loop for gossip-based snapshot resilience.
         """
         # Try WebSocket first (non-blocking, persistent connection)
         if self.ws_client:
             try:
-                logger.info("[W-STATE] 🌐 Attempting WebSocket P2P registration...")
+                logger.info("[W-STATE] 🌐 Attempting WebSocket P2P registration with gossip protocol...")
                 if self.ws_client.connect():
+                    # Start background services
                     self.ws_client.start_background_heartbeat(interval_sec=5)
                     self.ws_client.start_background_snapshot_sync(interval_sec=10)
-                    logger.info("[W-STATE] ✅ WebSocket P2P registration successful - heartbeat & snapshot sync started")
+                    self.ws_client.start_peer_discovery_loop(interval_sec=30)  # Discover peers every 30s
+                    logger.info("[W-STATE] ✅ WebSocket P2P registration successful - heartbeat, snapshot sync, and peer discovery started")
                     return True
                 else:
                     logger.warning("[W-STATE] ⚠️  WebSocket connection failed - falling back to HTTP")
@@ -1863,7 +2038,7 @@ class P2PClientWStateRecovery:
                 response=requests.post(
                     url,
                     json={"miner_id": self.peer_id, "address": self.miner_address, "public_key": self.peer_id},
-                    timeout=5
+                    timeout=10  # Increased from 5s
                 )
                 
                 if response.status_code in [200,201]:
@@ -1877,13 +2052,13 @@ class P2PClientWStateRecovery:
                     logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} failed: {response.status_code}")
             
             except requests.Timeout:
-                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} timeout")
+                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} timeout after 10s")
             except Exception as e:
                 logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} error: {e}")
             
-            # Exponential backoff: 1s, 2s, 4s, 5s, 5s
+            # Exponential backoff: 1s, 2s, 4s, 8s, 8s
             if attempt < max_attempts - 1:
-                delay_sec = min(2 ** attempt, 5)
+                delay_sec = min(2 ** attempt, 8)
                 logger.info(f"[W-STATE] 🔄 Retrying registration in {delay_sec}s…")
                 time.sleep(delay_sec)
         
@@ -1892,15 +2067,40 @@ class P2PClientWStateRecovery:
         return True
     
     def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
-        """Download latest W-state snapshot from oracle.
+        """Download latest W-state snapshot from oracle with gossip fallback.
         
-        FIXED: Now retries with backoff on timeout (max 3 attempts).
+        ENHANCED: 
+        - Adaptive timeouts based on oracle latency
+        - Fallback to gossip network cache if oracle slow
+        - Increased retry attempts with exponential backoff (max 5)
+        - Logs detailed latency metrics
         """
-        max_attempts=3
+        # First try: Quick check for gossip-cached snapshot (no network call)
+        if self.ws_client:
+            cached = self.ws_client.get_cached_snapshot()
+            if cached:
+                ts = cached.get('timestamp_ns', 0)
+                logger.info(f"[W-STATE] 💾 Using gossip-cached snapshot | ts={ts}")
+                with self._state_lock:
+                    self.current_snapshot=cached
+                    self.snapshot_buffer.append(cached)
+                return cached
+        
+        # Second try: Direct HTTP fetch from oracle with adaptive timeout
+        base_timeout = 5
+        max_attempts = 5
+        
         for attempt in range(max_attempts):
             try:
+                # Adaptive timeout: increase with each attempt
+                timeout = min(base_timeout + (attempt * 2), 15)
                 url=f"{self.oracle_url}/api/oracle/w-state"
-                response=requests.get(url,timeout=5)
+                
+                logger.debug(f"[W-STATE] Download attempt {attempt+1}/{max_attempts} | timeout={timeout}s")
+                
+                start_time = time.time()
+                response=requests.get(url, timeout=timeout)
+                elapsed = time.time() - start_time
                 
                 if response.status_code==200:
                     snapshot=response.json()
@@ -1908,19 +2108,23 @@ class P2PClientWStateRecovery:
                         self.current_snapshot=snapshot
                         self.snapshot_buffer.append(snapshot)
                     
-                    logger.debug(f"[W-STATE] 📥 Downloaded snapshot | timestamp={snapshot['timestamp_ns']}")
+                    ts = snapshot.get('timestamp_ns', 0)
+                    logger.info(f"[W-STATE] 📥 Downloaded snapshot | ts={ts} | latency={elapsed:.2f}s")
                     return snapshot
                 else:
-                    logger.warning(f"[W-STATE] ⚠️  Download attempt {attempt+1}/{max_attempts} failed: {response.status_code}")
+                    logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: HTTP {response.status_code}")
             
             except requests.Timeout:
-                logger.warning(f"[W-STATE] ⚠️  Download attempt {attempt+1}/{max_attempts} timeout")
+                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: Timeout after {timeout}s")
+            except requests.ConnectionError as e:
+                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: Connection error: {str(e)[:50]}")
             except Exception as e:
-                logger.warning(f"[W-STATE] ⚠️  Download attempt {attempt+1}/{max_attempts} error: {e}")
+                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: {type(e).__name__}: {str(e)[:50]}")
             
-            # Retry with backoff (1s, 2s)
+            # Exponential backoff: 1s, 2s, 4s, 8s, 8s
             if attempt < max_attempts - 1:
-                delay_sec = min(2 ** attempt, 2)
+                delay_sec = min(2 ** attempt, 8)
+                logger.info(f"[W-STATE] 🔄 Retrying in {delay_sec}s…")
                 time.sleep(delay_sec)
         
         logger.error(f"[W-STATE] ❌ Download failed after {max_attempts} attempts - recovery will use cached/synthetic snapshot")
