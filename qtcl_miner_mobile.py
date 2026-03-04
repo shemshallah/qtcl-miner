@@ -2105,9 +2105,13 @@ class P2PClientWStateRecovery:
                     with self._state_lock:
                         self.current_snapshot=snapshot
                         self.snapshot_buffer.append(snapshot)
-                    
+
                     ts = snapshot.get('timestamp_ns', 0)
-                    logger.info(f"[W-STATE] 📥 Downloaded snapshot | ts={ts} | latency={elapsed:.2f}s")
+                    # Only surface latency spikes at INFO; routine downloads go to DEBUG
+                    if elapsed > 2.0:
+                        logger.warning(f"[W-STATE] ⚠️  Slow snapshot | latency={elapsed:.2f}s (>{2.0}s threshold)")
+                    else:
+                        logger.debug(f"[W-STATE] 📥 Snapshot | ts={ts} | latency={elapsed:.2f}s")
                     return snapshot
                 else:
                     logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: HTTP {response.status_code}")
@@ -2580,7 +2584,7 @@ class P2PClientWStateRecovery:
         logger.info("[W-STATE] 🔄 Sync worker started")
         
         _cycle = 0
-        _LOG_EVERY = 50   # log W-state status every 50 cycles (~5s at 10ms interval)
+        _LOG_EVERY = 600  # log W-state fidelity status every 600 cycles (~60s at 10ms interval)
         
         while self.running:
             try:
@@ -2821,27 +2825,35 @@ class DifficultyRetargeting:
     
     def record_block_mining_time(self, height: int, mining_time_s: float):
         """
-        Record actual mining time for a block and potentially trigger retargeting.
-        
-        Uses exponential moving average to smooth out variance:
-        ema_new = ema_old * (1 - α) + actual_time * α
-        
-        Then adjusts difficulty every retarget_window blocks.
+        Record actual block mining time and trigger retargeting when appropriate.
+
+        EMA update:  ema_new = ema_old*(1-α) + actual*α
+        Retarget trigger:
+          • Always after every retarget_window accepted blocks (baseline)
+          • Also immediately when EMA deviates >2× from target in either direction
+            (fast-correction mode) — prevents multi-window lag when far off-target
         """
         with self._lock:
             try:
-                # Update EMA with new mining time
-                old_ema=self.ema_block_time_s
-                self.ema_block_time_s=(old_ema * (1.0 - self.ema_alpha)) + (mining_time_s * self.ema_alpha)
-                
-                logger.debug(f"[DIFFICULTY] 📊 Block #{height} mining_time={mining_time_s:.2f}s | ema={self.ema_block_time_s:.2f}s")
-                
-                # Check if it's time to retarget
-                blocks_since_retarget=height - self.last_retarget_height
-                if blocks_since_retarget >= self.retarget_window:
+                old_ema = self.ema_block_time_s
+                self.ema_block_time_s = (old_ema * (1.0 - self.ema_alpha)) + (mining_time_s * self.ema_alpha)
+
+                ratio = self.target_block_time_s / max(self.ema_block_time_s, 0.1)
+                blocks_since_retarget = height - self.last_retarget_height
+
+                # Fast-correction: retarget immediately when EMA is >2× from target
+                far_off = ratio > 2.0 or ratio < 0.5
+                window_due = blocks_since_retarget >= self.retarget_window
+
+                logger.debug(
+                    f"[DIFFICULTY] Block #{height} | time={mining_time_s:.1f}s | "
+                    f"ema={self.ema_block_time_s:.1f}s | ratio={ratio:.2f} | "
+                    f"since_retarget={blocks_since_retarget} | far_off={far_off}"
+                )
+
+                if window_due or far_off:
                     self._perform_retarget(height)
-                
-                # Save state periodically
+
                 if height % 5 == 0:
                     self._save_state()
             except Exception as e:
@@ -2849,37 +2861,32 @@ class DifficultyRetargeting:
     
     def _perform_retarget(self, height: int):
         """
-        Adjust difficulty using additive log2 adjustment — the mathematically correct
-        algorithm for PoW difficulty because expected solve time scales as 2^d / h/s.
+        Additive log₂ difficulty adjustment — mathematically correct for PoW bit-space.
 
-        WRONG (old): new_d = old_d * (target/actual)
-          At 18 bits, 7s actual, 60s target → 18 * 8.05 = 145 → clamped to 32 → next
-          retarget would see 32 bits = 2^32/12k h/s = 97 HOURS per block. Oscillation.
+        Expected solve time scales as 2^d / h/s, so difficulty lives in log₂-space.
+        Additive delta = log₂(target/ema) is the exact correction needed.
 
-        CORRECT: new_d = old_d + log2(target/actual), capped ±3 bits per retarget.
-          At 18 bits, 7s actual, 60s target → 18 + log2(8.05) = 18 + 3.0 = 21.
-          At 21 bits, 172s actual → 21 + log2(60/172) = 21 - 1.52 ≈ 20 → converges.
-
-        Max step ±3 bits prevents overshooting during transient conditions.
+        Step cap: ±4 bits per retarget to prevent overshoot while still converging
+        within 1-2 windows when far off-target (ratio 4× → delta +2 bits; cap only
+        activates beyond 16× deviation which would be pathological).
         """
         try:
             ratio = self.target_block_time_s / max(self.ema_block_time_s, 0.1)
-            # Additive bit-space adjustment (capped ±3 bits per window)
             delta = math.log2(ratio)
-            delta = max(-3.0, min(3.0, delta))
-            
+            # Cap at ±4 bits — allows 16× range per retarget (handles ratio up to 16x)
+            delta = max(-4.0, min(4.0, delta))
+
             old_difficulty = self.current_difficulty
             new_difficulty  = int(round(self.current_difficulty + delta))
             new_difficulty  = max(self.min_difficulty, min(self.max_difficulty, new_difficulty))
-            
-            self.current_difficulty    = new_difficulty
-            self.last_retarget_height  = height
-            
+
+            self.current_difficulty   = new_difficulty
+            self.last_retarget_height = height
+
             direction = "↑" if new_difficulty > old_difficulty else ("↓" if new_difficulty < old_difficulty else "=")
             logger.info(
                 f"[DIFFICULTY] 🎯 RETARGET #{height} | {direction} {old_difficulty}→{new_difficulty} bits | "
-                f"delta={delta:+.2f} | ema={self.ema_block_time_s:.1f}s (target {self.target_block_time_s}s) | "
-                f"ratio={ratio:.2f}"
+                f"Δ={delta:+.2f} | ema={self.ema_block_time_s:.1f}s → target={self.target_block_time_s:.0f}s"
             )
             self._save_state()
         except Exception as e:
