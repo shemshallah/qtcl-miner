@@ -2516,16 +2516,29 @@ class P2PClientWStateRecovery:
         
         Rotates BOTH the density matrices (for entropy measurement) AND the
         lattice field-space identifiers (pq_curr_id → pq_last_id).
+        CRITICAL FIX: Increment pq_curr for next block height (don't use old value)
         """
         try:
             with self._state_lock:
                 # Rotate density matrices
                 self.pq_last_matrix  = self.pq_curr_matrix.copy() if self.pq_curr_matrix is not None else None
                 self.pq_curr_matrix  = self.pq0_matrix.copy()     if self.pq0_matrix     is not None else None
-                # Rotate lattice field-space identifiers
+                
+                # 🔐 CRITICAL FIX: Advance pq values for NEXT block height
+                # pq_last stays as current pq_curr value
                 self.entanglement_state.pq_last = self.entanglement_state.pq_curr
-                self.entanglement_state.pq_curr = self._pq_curr_id
                 self._pq_last_id = self._pq_curr_id
+                
+                # Increment pq_curr for next block (try numeric increment, fallback to hash)
+                try:
+                    curr_height = int(self._pq_curr_id)
+                    next_height = curr_height + 1
+                    self.entanglement_state.pq_curr = str(next_height)
+                    self._pq_curr_id = str(next_height)
+                except (ValueError, TypeError):
+                    # If pq_curr_id is hex string, keep it as-is (recovery will update)
+                    pass
+                
             logger.debug(
                 f"[W-STATE] 🔄 Entanglement rotated | "
                 f"lattice_field=[{self.entanglement_state.pq_last[:12]}…→{self.entanglement_state.pq_curr[:12]}…]"
@@ -2764,23 +2777,23 @@ class DifficultyRetargeting:
                 row=cursor.fetchone()
                 if row:
                     # 🔐 CRITICAL: Sync with server difficulty, not cached value
-                    # If cached value is way off (e.g., 24 when server says 18), reset to testing default
+                    # If cached value is way off (e.g., 24 when server says 21), reset to testing default
                     cached_difficulty = row[0]
-                    if cached_difficulty > 18:  # ← If cached is too high, reset to testing difficulty (18 = ~30s/block)
-                        self.current_difficulty=18
-                        logger.warning(f"[DIFFICULTY] ⚠️  Cached difficulty was {cached_difficulty} (too high for testing), resetting to 18 (~30s/block)")
+                    if cached_difficulty > 21:  # ← If cached is too high, reset to testing difficulty (21 = ~30-50s/block)
+                        self.current_difficulty=21
+                        logger.warning(f"[DIFFICULTY] ⚠️  Cached difficulty was {cached_difficulty} (too high for testing), resetting to 21 (~30-50s/block)")
                     else:
                         self.current_difficulty=cached_difficulty
                     self.ema_block_time_s=row[1]
                     self.last_retarget_height=row[2]
                     logger.info(f"[DIFFICULTY] 📂 Loaded state | current_diff={self.current_difficulty} | ema_time={self.ema_block_time_s:.2f}s | last_retarget={self.last_retarget_height}")
                 else:
-                    self.current_difficulty=18  # ← Testing difficulty: 18 bits ≈ 30 seconds per block
+                    self.current_difficulty=21  # ← Testing difficulty: 21 bits ≈ 30-50 seconds per block
                     self.ema_block_time_s=self.target_block_time_s
                     self.last_retarget_height=0
         except Exception as e:
             logger.error(f"[DIFFICULTY] ❌ Failed to load state: {e}")
-            self.current_difficulty=18  # ← Testing difficulty: 18 bits ≈ 30 seconds per block
+            self.current_difficulty=21  # ← Testing difficulty: 21 bits ≈ 30-50 seconds per block
             self.ema_block_time_s=self.target_block_time_s
             self.last_retarget_height=0
     
@@ -2922,10 +2935,24 @@ class LiveNodeClient:
     def submit_block(self,block_data: Dict[str,Any])->Tuple[bool,str]:
         try:
             r=self.session.post(f"{self.base_url}{API_PREFIX}/submit_block",json=block_data,timeout=10)
+            
+            # 🔐 LOG FULL RESPONSE FOR DEBUGGING
+            logger.debug(f"[SUBMIT] Status: {r.status_code} | Headers: {dict(r.headers)}")
+            
             if r.status_code in [200,201]:
                 return True,r.json().get('message','Block accepted')
-            return False,r.json().get('error','Submission failed')
+            
+            # ❌ SUBMISSION FAILED - LOG FULL DETAILS
+            try:
+                error_data = r.json()
+                error_msg = error_data.get('error', f'HTTP {r.status_code}')
+            except:
+                error_msg = f'HTTP {r.status_code}: {r.text[:200]}'
+            
+            logger.error(f"[SUBMIT] ❌ Server rejected (HTTP {r.status_code}): {error_msg}")
+            return False, error_msg
         except Exception as e:
+            logger.error(f"[SUBMIT] ❌ Exception: {type(e).__name__}: {e}")
             return False,str(e)
     
     def query_balance(self, address: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -3125,7 +3152,19 @@ class QuantumMiner:
             # Get current difficulty from engine (or use fallback)
             current_difficulty=self.difficulty_engine.get_current_difficulty() if self.difficulty_engine else self.difficulty
             
-            logger.info(f"[MINING] ⚙️  Using difficulty {current_difficulty} bits")
+            # 🔐 SAFETY: If engine exists, ALWAYS use it. If not, use fallback=21 (testing)
+            if self.difficulty_engine is None:
+                current_difficulty = 21
+                logger.warning(f"[MINING] ⚠️  No difficulty_engine! Using hardcoded 21")
+            
+            # Sanity check: difficulty should be 16-24, not 1-10
+            if current_difficulty < 16:
+                logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} is TOO LOW (< 16)!")
+                logger.error(f"[MINING]    Engine: {self.difficulty_engine}")
+                logger.error(f"[MINING]    This will solve instantly!")
+                current_difficulty = 21  # Reset to safe value
+            
+            logger.warning(f"[MINING] ⚙️  DIFFICULTY CHECK: engine={self.difficulty_engine is not None} | value={current_difficulty}")
             
             # Measure W-state for entropy
             entropy_start = time.time()
@@ -4106,18 +4145,44 @@ def main():
         # 4. Create P2P client for peer discovery
         _P2P_CLIENT = P2PClient(peer_id)
         
+        # 🔐 FIX #4: Register oracle as a known peer IMMEDIATELY
+        # Parse oracle URL to extract host and port
+        oracle_host = 'qtcl-blockchain.koyeb.app'  # or localhost:8000 for testing
+        oracle_port = 8000
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(oracle_url)
+            if parsed.hostname:
+                oracle_host = parsed.hostname
+            if parsed.port:
+                oracle_port = parsed.port
+        except:
+            pass
+        
+        _P2P_CLIENT.known_peers.append((oracle_host, oracle_port))
+        logger.info(f"[P2P] 🏛️  Registered oracle as peer: {oracle_host}:{oracle_port}")
+        
         # 5. Try to sync blocks from P2P peers
         current_height = 0
         p2p_success = False
         
-        logger.info("[P2P] 🔍 Discovering peers...")
-        discovered = _P2P_CLIENT.discover_peers(timeout=5)
-        if discovered:
-            _P2P_CLIENT.known_peers.extend(discovered)
-            logger.info(f"[P2P] ✅ Discovered {len(discovered)} peers")
-        
-        logger.info("[P2P] 📊 Querying peers for current block height...")
+        # 🔐 FIX #5: Query height immediately from oracle (don't wait for peer discovery)
+        logger.info("[P2P] 📊 Querying oracle for current block height...")
         current_height = _P2P_CLIENT.get_block_height(timeout=5)
+        
+        if current_height is not None and current_height > 0:
+            logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
+        else:
+            logger.warning("[P2P] ⚠️  Could not get height from oracle, attempting peer discovery...")
+            
+            # Try peer discovery as fallback
+            logger.info("[P2P] 🔍 Discovering other peers...")
+            discovered = _P2P_CLIENT.discover_peers(timeout=5)
+            if discovered:
+                _P2P_CLIENT.known_peers.extend(discovered)
+                logger.info(f"[P2P] ✅ Discovered {len(discovered)} additional peers")
+                # Try height query again
+                current_height = _P2P_CLIENT.get_block_height(timeout=5)
         
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ P2P sync: Current height = {current_height}")
