@@ -1763,7 +1763,7 @@ class MinerWebSocketP2PClient:
             
             return True
         except Exception as e:
-            logger.warning(f"[WEBSOCKET] P2P WebSocket connection failed ({ws_url if 'ws_url' in locals() else 'unknown'}): {e}")
+            logger.debug(f"[WEBSOCKET] P2P WebSocket unavailable ({ws_url if 'ws_url' in locals() else 'unknown'}): {e} (falling back to HTTP polling)")
             return False
     
     def _send_register(self)->None:
@@ -2763,17 +2763,24 @@ class DifficultyRetargeting:
                 cursor.execute("SELECT current_difficulty, ema_block_time_s, last_retarget_height FROM difficulty_state WHERE id=1")
                 row=cursor.fetchone()
                 if row:
-                    self.current_difficulty=row[0]
+                    # 🔐 CRITICAL: Sync with server difficulty, not cached value
+                    # If cached value is way off (e.g., 24 when server says 18), reset to testing default
+                    cached_difficulty = row[0]
+                    if cached_difficulty > 18:  # ← If cached is too high, reset to testing difficulty (18 = ~30s/block)
+                        self.current_difficulty=18
+                        logger.warning(f"[DIFFICULTY] ⚠️  Cached difficulty was {cached_difficulty} (too high for testing), resetting to 18 (~30s/block)")
+                    else:
+                        self.current_difficulty=cached_difficulty
                     self.ema_block_time_s=row[1]
                     self.last_retarget_height=row[2]
                     logger.info(f"[DIFFICULTY] 📂 Loaded state | current_diff={self.current_difficulty} | ema_time={self.ema_block_time_s:.2f}s | last_retarget={self.last_retarget_height}")
                 else:
-                    self.current_difficulty=13  # ← Adjusted for ~1 min phone blocks
+                    self.current_difficulty=18  # ← Testing difficulty: 18 bits ≈ 30 seconds per block
                     self.ema_block_time_s=self.target_block_time_s
                     self.last_retarget_height=0
         except Exception as e:
             logger.error(f"[DIFFICULTY] ❌ Failed to load state: {e}")
-            self.current_difficulty=13  # ← Adjusted for ~1 min phone blocks
+            self.current_difficulty=18  # ← Testing difficulty: 18 bits ≈ 30 seconds per block
             self.ema_block_time_s=self.target_block_time_s
             self.last_retarget_height=0
     
