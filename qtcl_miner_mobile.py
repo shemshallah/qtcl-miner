@@ -1920,23 +1920,6 @@ class MinerWebSocketP2PClient:
         with self._lock:
             self._running=False
         self.disconnect()
-                try:
-                    time.sleep(interval_sec)
-                    self.request_snapshot()
-                except Exception as e:
-                    logger.debug(f"[WEBSOCKET] Snapshot loop error: {e}")
-        
-        with self._lock:
-            self._running=True
-        
-        thread=threading.Thread(target=snapshot_loop, daemon=True, name="MinerSnapshot")
-        thread.start()
-    
-    def stop(self)->None:
-        """Stop all background operations."""
-        with self._lock:
-            self._running=False
-        self.disconnect()
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE RECOVERY ENGINE (VERBATIM FROM v14 FINAL + ENHANCED)
