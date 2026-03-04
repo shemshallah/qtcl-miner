@@ -533,123 +533,112 @@ class P2PMessage:
 
 
 class P2PClient:
-    """P2P client for peer discovery and block synchronization."""
-    
-    def __init__(self, peer_id: str, known_peers: List[Tuple[str, int]] = None):
-        self.peer_id = peer_id
-        # 🎯 FIXED: Don't discover ourselves! Start with empty peers list
-        # Oracle will be discovered separately on port 8000 (unified REST + P2P)
-        self.known_peers = known_peers or []
+    """
+    P2P client for peer discovery and block synchronisation.
+
+    All transport uses HTTPS REST — the oracle runs on Koyeb behind TLS 443.
+    Raw TCP sockets / custom framing never worked against an HTTPS host.
+    WebSocket P2P (socket.io) is handled separately by MinerWebSocketP2PClient.
+    """
+
+    def __init__(self, peer_id: str, known_peers: List[Tuple[str, int]] = None,
+                 oracle_base_url: str = ''):
+        self.peer_id        = peer_id
+        self.known_peers    = known_peers or []
+        self._oracle_base   = oracle_base_url.rstrip('/')  # e.g. https://qtcl-blockchain.koyeb.app
         self.connected_peers: Dict[str, Tuple[str, int]] = {}
-        self.peer_info: Dict[str, Dict[str, Any]] = {}
+        self.peer_info: Dict[str, Dict[str, Any]]        = {}
         self._lock = threading.RLock()
-    
-    def discover_peers(self, timeout: int = 5) -> List[Tuple[str, int]]:
-        """Discover peers by connecting to known peers."""
-        discovered = []
-        
-        for host, port in self.known_peers:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                sock.connect((host, port))
-                
-                msg = P2PMessage('HELLO', self.peer_id)
-                sock.send(msg.to_json().encode() + b'\n')
-                
-                response_data = sock.recv(4096).decode()
-                response = P2PMessage.from_json(response_data.strip())
-                
-                if response.payload and 'peers' in response.payload:
-                    for peer in response.payload['peers']:
-                        peer_host, peer_port = peer
-                        if (peer_host, peer_port) not in discovered:
-                            discovered.append((peer_host, peer_port))
-                
-                self.connected_peers[f"{host}:{port}"] = (host, port)
-                sock.close()
-                logger.info(f"[P2P] 🔗 Connected to peer {host}:{port}")
-                
-            except Exception as e:
-                logger.debug(f"[P2P] ⚠️  Could not reach {host}:{port}: {e}")
-        
-        return discovered
-    
-    def get_block_height(self, timeout: int = 5, oracle_url: str = None) -> Optional[int]:
-        """
-        Get current block height from authoritative sources.
-        
-        Priority:
-        1. LOCAL DATABASE (source of truth)
-        2. Oracle on port 8000 (unified REST + P2P WebSocket)
-        3. Peer network on port 8000 (fallback)
-        """
-        # 🎯 PRIORITY 1: Local database is authoritative
-        # This is handled by caller, not here
-        
-        # 🎯 PRIORITY 2: Try Oracle on port 8000 (unified REST + P2P network state)
+        self._session = requests.Session()
+        _a = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.3))
+        self._session.mount('https://', _a)
+        self._session.mount('http://',  _a)
+
+    def _base_urls(self, oracle_url: str = None) -> List[str]:
+        """Build ordered list of base REST URLs to try."""
+        urls = []
         if oracle_url:
+            urls.append(oracle_url.rstrip('/'))
+        if self._oracle_base:
+            urls.append(self._oracle_base)
+        for host, _port in self.known_peers:
+            scheme = 'https' if host not in ('localhost', '127.0.0.1') else 'http'
+            port_s = '' if host not in ('localhost', '127.0.0.1') else ':8000'
+            urls.append(f"{scheme}://{host}{port_s}")
+        return list(dict.fromkeys(urls))  # deduplicate, preserve order
+
+    def discover_peers(self, timeout: int = 8) -> List[Tuple[str, int]]:
+        """
+        Discover active peers via oracle REST gossip endpoint.
+        Returns list of (host, port) tuples for any miners that expose a URL.
+        """
+        discovered = []
+        for base in self._base_urls():
             try:
-                import requests
-                r = requests.get(f"{oracle_url.rstrip('/')}/api/blocks/tip", timeout=timeout)
+                r = self._session.get(f"{base}/api/oracle/miners", timeout=timeout)
                 if r.status_code == 200:
                     data = r.json()
-                    oracle_height = data.get('height')
-                    if oracle_height is not None:
-                        return int(oracle_height)
+                    miners = data if isinstance(data, list) else data.get('miners', [])
+                    for m in miners:
+                        url = m.get('url') or m.get('oracle_url', '')
+                        if url:
+                            try:
+                                from urllib.parse import urlparse
+                                p = urlparse(url)
+                                host = p.hostname
+                                port = p.port or (443 if p.scheme == 'https' else 80)
+                                if host and (host, port) not in discovered:
+                                    discovered.append((host, port))
+                            except Exception:
+                                pass
+                    if discovered:
+                        logger.info(f"[P2P] 🔍 Discovered {len(discovered)} peers via {base}")
+                        return discovered
             except Exception as e:
-                pass  # Fall through to peers
-        
-        # 🎯 PRIORITY 3: Peer network (8333) - only if we have peers
-        for host, port in self.known_peers:
+                logger.debug(f"[P2P] discover_peers {base}: {e}")
+        return discovered
+
+    def get_block_height(self, timeout: int = 8, oracle_url: str = None) -> Optional[int]:
+        """
+        Get current chain tip height from oracle REST /api/blocks/tip.
+        Accepts both 'block_height' and 'height' keys for compatibility.
+        """
+        for base in self._base_urls(oracle_url):
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                sock.connect((host, port))
-                
-                msg = P2PMessage('GET_HEIGHT', self.peer_id)
-                sock.send(msg.to_json().encode() + b'\n')
-                
-                response_data = sock.recv(4096).decode()
-                response = P2PMessage.from_json(response_data.strip())
-                
-                if response.height is not None:
-                    sock.close()
-                    return response.height
-                
-                sock.close()
+                r = self._session.get(f"{base}/api/blocks/tip", timeout=timeout)
+                if r.status_code == 200:
+                    data = r.json()
+                    h = data.get('block_height') or data.get('height')
+                    if h is not None:
+                        logger.info(f"[P2P] ✅ Chain tip height={h} from {base}")
+                        return int(h)
             except Exception as e:
-                pass  # Try next peer
-        
+                logger.debug(f"[P2P] get_block_height {base}: {e}")
+        logger.warning("[P2P] ⚠️  All REST height queries failed")
         return None
-    
-    def sync_blocks(self, start_height: int, end_height: int, timeout: int = 10) -> List[Dict[str, Any]]:
-        """Sync blocks from peers."""
+
+    def sync_blocks(self, start_height: int, end_height: int,
+                    timeout: int = 10) -> List[Dict[str, Any]]:
+        """
+        Fetch blocks start_height..end_height via REST /api/blocks/height/{h}.
+        Used for initial startup sync only — steady-state sync is in QTCLFullNode._sync_loop.
+        """
         blocks = []
-        
         for height in range(start_height, end_height + 1):
-            for host, port in self.known_peers:
+            for base in self._base_urls():
                 try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(timeout)
-                    sock.connect((host, port))
-                    
-                    msg = P2PMessage('GET_BLOCK', self.peer_id, height=height)
-                    sock.send(msg.to_json().encode() + b'\n')
-                    
-                    response_data = sock.recv(65536).decode()
-                    response = P2PMessage.from_json(response_data.strip())
-                    
-                    if response.block_data:
-                        blocks.append(response.block_data)
-                        logger.debug(f"[P2P] 📦 Synced block {height}")
-                        sock.close()
+                    r = self._session.get(
+                        f"{base}/api/blocks/height/{height}", timeout=timeout
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        # Unwrap nested header if present
+                        block = data.get('header', data)
+                        blocks.append(block)
+                        logger.debug(f"[P2P] 📦 Fetched block #{height}")
                         break
-                    
-                    sock.close()
                 except Exception as e:
-                    logger.debug(f"[P2P] ⚠️  Block sync failed: {e}")
-        
+                    logger.debug(f"[P2P] sync_blocks #{height} from {base}: {e}")
         return blocks
 
 
@@ -1198,53 +1187,36 @@ class PeriodicPeerSync:
                 logger.debug(f"[CONSENSUS] Sync loop error: {e}")
     
     def _perform_sync(self):
-        """Perform synchronization with all known peers."""
+        """
+        Synchronise with oracle via REST — raw TCP sockets removed.
+        Fetches chain height and pending tx count from /api/blocks/tip.
+        """
         if not self.p2p_client:
             return
-        
-        logger.debug("[CONSENSUS] 📊 Starting peer sync...")
-        
         try:
-            # Get current chain state
             cursor = _DB_CONN.cursor()
             cursor.execute("SELECT MAX(height) FROM blocks")
             local_height = cursor.fetchone()[0] or 0
-            
-            cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
-            pending_txs = cursor.fetchone()[0] or 0
-            
-            # Query each peer for their metrics
-            for host, port in (self.p2p_client.known_peers or []):
+
+            # Use P2PClient's session to query oracle REST
+            for base in self.p2p_client._base_urls():
                 try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(3)
-                    sock.connect((host, port))
-                    
-                    # Request metrics
-                    msg = P2PMessage('GET_METRICS', 'consensus_sync')
-                    sock.send(msg.to_json().encode() + b'\n')
-                    
-                    response_data = sock.recv(4096).decode()
-                    response = P2PMessage.from_json(response_data.strip())
-                    
-                    if response.payload and 'metrics' in response.payload:
-                        metrics = response.payload['metrics']
-                        peer_id = f"{host}:{port}"
-                        
+                    r = self.p2p_client._session.get(
+                        f"{base}/api/blocks/tip", timeout=5
+                    )
+                    if r.status_code == 200:
+                        data   = r.json()
+                        height = data.get('block_height') or data.get('height') or 0
+                        peer_id = base
                         if self.consensus_mgr:
-                            self.consensus_mgr.record_peer_metric(peer_id, 'chain_height', metrics.get('height', 0))
-                            self.consensus_mgr.record_peer_metric(peer_id, 'pending_txs', metrics.get('pending_txs', 0))
-                    
-                    sock.close()
-                
+                            self.consensus_mgr.record_peer_metric(peer_id, 'chain_height', height)
+                        logger.debug(f"[CONSENSUS] 📊 Oracle height={height} | local={local_height}")
+                        break
                 except Exception as e:
-                    logger.debug(f"[CONSENSUS] Sync failed with {host}:{port}: {e}")
-            
-            # Update system consensus
+                    logger.debug(f"[CONSENSUS] Sync REST failed {base}: {e}")
+
             if self.consensus_mgr:
                 self.consensus_mgr.update_system_metrics()
-                logger.debug("[CONSENSUS] ✅ Peer sync complete")
-        
         except Exception as e:
             logger.debug(f"[CONSENSUS] Sync error: {e}")
     
@@ -1724,46 +1696,49 @@ class MinerWebSocketP2PClient:
                     except:
                         pass
     
-    def connect(self)->bool:
-        """Connect to oracle P2P via WebSocket with adaptive timeout.
-        
-        ENHANCED: Uses HTTPS/WSS, supports P2P_WEBSOCKET_URL env var,
-        enables gossip protocol discovery.
+    def connect(self) -> bool:
+        """
+        Connect to oracle via Socket.IO over WSS/443.
+
+        socket.io client convention: pass the BASE URL (https://host), NOT
+        a ws:// URL with /socket.io appended. The client library appends
+        /socket.io internally. Passing wss://host/socket.io was causing
+        double-path (/socket.io/socket.io) and silent connection failure.
         """
         if not self.sio:
             return False
-        
         try:
-            # Check for explicit P2P WebSocket URL override (for Koyeb/cloud deployments)
             p2p_ws_url = os.getenv('P2P_WEBSOCKET_URL')
-            
             if p2p_ws_url:
-                # Use explicit configuration
-                ws_url = p2p_ws_url.rstrip('/')
-                logger.info(f"[WEBSOCKET] Using configured P2P WebSocket URL: {ws_url}")
+                connect_url = p2p_ws_url.rstrip('/')
+                logger.info(f"[WEBSOCKET] Using env P2P_WEBSOCKET_URL: {connect_url}")
             else:
-                # Extract host from oracle_url, connect to port 8000 for unified REST + P2P
-                url_parts=self.oracle_url.replace('http://', '').replace('https://', '').replace('ws://', '').replace('wss://', '')
-                host_only=url_parts.split(':')[0].split('/')[0]
-                
-                # Determine protocol: use wss:// (443 implicit) for external URLs, ws:// (8000) for localhost
+                # Strip to bare host, then build https:// base URL for socket.io
+                raw = (self.oracle_url
+                       .replace('wss://', '').replace('ws://', '')
+                       .replace('https://', '').replace('http://', ''))
+                host_only = raw.split('/')[0].split(':')[0]
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
-                    ws_url=f"ws://{host_only}:8000/socket.io"
+                    connect_url = f"http://{host_only}:8000"
                 else:
-                    ws_url=f"wss://{host_only}/socket.io"  # Port 443 implicit (HTTPS default, Koyeb standard)
-            
-            logger.debug(f"[WEBSOCKET] 🔌 Attempting connection to {ws_url} (timeout: {self.current_timeout}s)")
-            
-            start_time = time.time()
-            self.sio.connect(ws_url, wait_timeout=self.current_timeout, transports=['websocket', 'polling'])
-            elapsed = time.time() - start_time
+                    connect_url = f"https://{host_only}"  # TLS 443, socket.io appends path
+
+            logger.debug(f"[WEBSOCKET] 🔌 Connecting to {connect_url} (timeout={self.current_timeout}s)")
+            t0 = time.time()
+            self.sio.connect(
+                connect_url,
+                wait_timeout=self.current_timeout,
+                transports=['websocket', 'polling'],
+                socketio_path='/socket.io',
+            )
+            elapsed = time.time() - t0
             self.request_times.append(elapsed)
             self._update_adaptive_timeout()
-            logger.info(f"[WEBSOCKET] ✅ Connected in {elapsed:.2f}s")
-            
+            logger.info(f"[WEBSOCKET] ✅ Connected to {connect_url} in {elapsed:.2f}s")
             return True
         except Exception as e:
-            logger.debug(f"[WEBSOCKET] P2P WebSocket unavailable ({ws_url if 'ws_url' in locals() else 'unknown'}): {e} (falling back to HTTP polling)")
+            logger.debug(f"[WEBSOCKET] Connection failed ({connect_url if 'connect_url' in locals() else '?'}): {e}"
+                         " — falling back to HTTP polling")
             return False
     
     def _send_register(self)->None:
@@ -2796,13 +2771,13 @@ class DifficultyRetargeting:
                         f"ema={self.ema_block_time_s:.2f}s | last_retarget=#{self.last_retarget_height}"
                     )
                 else:
-                    # Fresh DB — seed at 19 bits (≈43s at ~12k h/s; EMA tunes from here)
-                    self.current_difficulty   = 19
+                    # Fresh DB — seed at 21 bits (≈86s at ~61k h/s; EMA will tune from here)
+                    self.current_difficulty   = 21
                     self.ema_block_time_s     = self.target_block_time_s
                     self.last_retarget_height = 0
         except Exception as e:
             logger.error(f"[DIFFICULTY] ❌ Failed to load state: {e}")
-            self.current_difficulty   = 19
+            self.current_difficulty   = 21
             self.ema_block_time_s     = self.target_block_time_s
             self.last_retarget_height = 0
     
@@ -3185,8 +3160,8 @@ class QuantumMiner:
     def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12):
         self.w_state_recovery=w_state_recovery
         self.difficulty_engine=difficulty_engine
-        self.difficulty=difficulty  # fallback if engine not provided
-        self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0}
+        self.difficulty=difficulty
+        self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0,'live_hash_attempts':0}
         self._lock=threading.RLock()
     
     def mine_block(self, transactions: List[Transaction], miner_address: str, parent_hash: str, height: int) -> Optional[Block]:
@@ -3206,9 +3181,9 @@ class QuantumMiner:
             
             # Sanity check: difficulty must be within engine bounds [12, 24]
             if current_difficulty < 12:
-                logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} < 12 (floor). Resetting to 19.")
+                logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} < 12 (floor). Resetting to 21.")
                 logger.error(f"[MINING]    This would solve in milliseconds — engine state corrupt.")
-                current_difficulty = 19
+                current_difficulty = 21
             
             logger.warning(f"[MINING] ⚙️  DIFFICULTY CHECK: engine={self.difficulty_engine is not None} | value={current_difficulty}")
             
@@ -3335,12 +3310,17 @@ class QuantumMiner:
                     return block
                 
                 header.nonce += 1
-                
-                # Progress logging every 100k attempts
-                if hash_attempts % 100000 == 0:
+                # Update live counter (lock-free increment — slight race is acceptable for display)
+                self.metrics['live_hash_attempts'] = hash_attempts
+
+                # Progress at INFO every 500k so operator can confirm mining is alive
+                if hash_attempts % 500000 == 0 and hash_attempts > 0:
                     elapsed = time.time() - nonce_start
                     current_rate = hash_attempts / elapsed if elapsed > 0 else 0
-                    logger.debug(f"[MINING] 🔄 Progress: {hash_attempts:,} hashes | rate={current_rate:.0f} h/s | nonce={header.nonce}")
+                    logger.info(
+                        f"[MINING] ⛏️  PoW #{height} | {hash_attempts:,} hashes | "
+                        f"{current_rate:.0f} h/s | diff={current_difficulty} bits"
+                    )
             
             logger.warning(f"[MINING] ⚠️  PoW timeout - exhausted nonce space at height {height}")
             return None
@@ -3833,6 +3813,11 @@ class QTCLFullNode:
         entanglement = self.w_state_recovery.get_entanglement_status()
         
         mining_stats = dict(self.miner.metrics)
+        # During active PoW, show live progress (resets to 0 on each new block attempt)
+        live = mining_stats.get('live_hash_attempts', 0)
+        total_committed = mining_stats.get('hash_attempts', 0)
+        # Show whichever is larger: committed (solved blocks) or live in-progress
+        display_attempts = max(total_committed, total_committed + live)
         
         # Calculate mining efficiency metrics
         hash_rate = 0
@@ -3869,7 +3854,7 @@ class QTCLFullNode:
             },
             'mining': {
                 'blocks_mined': mining_stats.get('blocks_mined', 0),
-                'total_hash_attempts': mining_stats.get('hash_attempts', 0),
+                'total_hash_attempts': display_attempts,
                 'avg_fidelity': mining_stats.get('avg_fidelity', 0.0),
                 'estimated_hash_rate': f"{hash_rate:.0f}" if hash_rate > 0 else "calculating",
                 'block_rewards': f"{mining_stats.get('blocks_mined', 0) * 10.0} QTCL",
@@ -4228,33 +4213,16 @@ def main():
         _PEER_SYNC = PeriodicPeerSync(_P2P_CLIENT, _CONSENSUS_MGR)
         logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
         
-        # 4. Create P2P client for peer discovery
-        _P2P_CLIENT = P2PClient(peer_id)
-        
-        # 🔐 FIX #4: Register oracle as a known peer IMMEDIATELY
-        # Parse oracle URL to extract host and port
-        oracle_host = 'qtcl-blockchain.koyeb.app'  # or localhost:8000 for testing
-        oracle_port = 8000
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(oracle_url)
-            if parsed.hostname:
-                oracle_host = parsed.hostname
-            if parsed.port:
-                oracle_port = parsed.port
-        except:
-            pass
-        
-        _P2P_CLIENT.known_peers.append((oracle_host, oracle_port))
-        logger.info(f"[P2P] 🏛️  Registered oracle as peer: {oracle_host}:{oracle_port}")
+        # 4. Create P2P client — pass oracle base URL so REST queries always resolve
+        _P2P_CLIENT = P2PClient(peer_id, oracle_base_url=oracle_url)
         
         # 5. Try to sync blocks from P2P peers
         current_height = 0
         p2p_success = False
         
-        # 🔐 FIX #5: Query height immediately from oracle (don't wait for peer discovery)
+        # 🔐 FIX: Pass oracle_url explicitly so REST branch always fires
         logger.info("[P2P] 📊 Querying oracle for current block height...")
-        current_height = _P2P_CLIENT.get_block_height(timeout=5)
+        current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
         
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
@@ -4267,8 +4235,8 @@ def main():
             if discovered:
                 _P2P_CLIENT.known_peers.extend(discovered)
                 logger.info(f"[P2P] ✅ Discovered {len(discovered)} additional peers")
-                # Try height query again
-                current_height = _P2P_CLIENT.get_block_height(timeout=5)
+                # Try height query again with oracle_url
+                current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
         
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ P2P sync: Current height = {current_height}")
