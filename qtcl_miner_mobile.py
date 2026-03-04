@@ -2753,20 +2753,24 @@ class DifficultyRetargeting:
     trivial or impossible difficulties.
     """
     
-    def __init__(self, db: sqlite3.Connection, target_block_time_s: float=60.0, 
-                 retarget_window: int=10, ema_alpha: float=0.2):
+    def __init__(self, db: sqlite3.Connection, target_block_time_s: float=60.0,
+                 retarget_window: int=5, ema_alpha: float=0.3):
         self.db=db
         self.target_block_time_s=target_block_time_s
         self.retarget_window=retarget_window
         self.ema_alpha=ema_alpha
-        self.min_difficulty=8
-        self.max_difficulty=32
+        self.min_difficulty=12   # 2^12/12k h/s ≈ 0.34s — absolute floor
+        self.max_difficulty=24   # 2^24/12k h/s ≈ 1374s (~23 min) — hard ceiling
         self._lock=threading.RLock()
-        
+
         # Load state from database
         self._load_state()
-        
-        logger.info(f"[DIFFICULTY] 🎯 Retargeting engine initialized | target={target_block_time_s}s | window={retarget_window} blocks | ema_α={ema_alpha}")
+
+        logger.info(
+            f"[DIFFICULTY] 🎯 Engine init | target={target_block_time_s}s | "
+            f"window={retarget_window} blocks | ema_α={ema_alpha} | "
+            f"range=[{self.min_difficulty},{self.max_difficulty}] bits"
+        )
     
     def _load_state(self):
         """Load difficulty state from database."""
@@ -2776,26 +2780,27 @@ class DifficultyRetargeting:
                 cursor.execute("SELECT current_difficulty, ema_block_time_s, last_retarget_height FROM difficulty_state WHERE id=1")
                 row=cursor.fetchone()
                 if row:
-                    # 🔐 CRITICAL: Sync with server difficulty, not cached value
-                    # If cached value is way off (e.g., 24 when server says 21), reset to testing default
-                    cached_difficulty = row[0]
-                    if cached_difficulty > 21:  # ← If cached is too high, reset to testing difficulty (21 = ~30-50s/block)
-                        self.current_difficulty=21
-                        logger.warning(f"[DIFFICULTY] ⚠️  Cached difficulty was {cached_difficulty} (too high for testing), resetting to 21 (~30-50s/block)")
-                    else:
-                        self.current_difficulty=cached_difficulty
-                    self.ema_block_time_s=row[1]
-                    self.last_retarget_height=row[2]
-                    logger.info(f"[DIFFICULTY] 📂 Loaded state | current_diff={self.current_difficulty} | ema_time={self.ema_block_time_s:.2f}s | last_retarget={self.last_retarget_height}")
+                    # Trust the persisted difficulty unconditionally — the EMA will correct it.
+                    # The old >21 cap was catastrophically wrong: it reset difficulty to 21 on
+                    # every restart, destroying all retarget progress and keeping blocks fast
+                    # regardless of hash rate. Trust the engine, not a hard-coded ceiling.
+                    self.current_difficulty   = max(self.min_difficulty, min(self.max_difficulty, int(row[0])))
+                    self.ema_block_time_s     = float(row[1]) if row[1] else self.target_block_time_s
+                    self.last_retarget_height = int(row[2]) if row[2] else 0
+                    logger.info(
+                        f"[DIFFICULTY] 📂 Loaded state | diff={self.current_difficulty} | "
+                        f"ema={self.ema_block_time_s:.2f}s | last_retarget=#{self.last_retarget_height}"
+                    )
                 else:
-                    self.current_difficulty=21  # ← Testing difficulty: 21 bits ≈ 30-50 seconds per block
-                    self.ema_block_time_s=self.target_block_time_s
-                    self.last_retarget_height=0
+                    # Fresh DB — seed at 19 bits (≈43s at ~12k h/s; EMA tunes from here)
+                    self.current_difficulty   = 19
+                    self.ema_block_time_s     = self.target_block_time_s
+                    self.last_retarget_height = 0
         except Exception as e:
             logger.error(f"[DIFFICULTY] ❌ Failed to load state: {e}")
-            self.current_difficulty=21  # ← Testing difficulty: 21 bits ≈ 30-50 seconds per block
-            self.ema_block_time_s=self.target_block_time_s
-            self.last_retarget_height=0
+            self.current_difficulty   = 19
+            self.ema_block_time_s     = self.target_block_time_s
+            self.last_retarget_height = 0
     
     def _save_state(self):
         """Persist difficulty state to database."""
@@ -2844,33 +2849,38 @@ class DifficultyRetargeting:
     
     def _perform_retarget(self, height: int):
         """
-        Adjust difficulty based on EMA block time vs target.
-        
-        Simple proportional adjustment:
-        • If actual_time > target: decrease difficulty (easier)
-        • If actual_time < target: increase difficulty (harder)
-        
-        Adjustment factor = target / actual (capped for stability)
-        new_diff = current_diff * adjustment_factor (clamped to min/max)
+        Adjust difficulty using additive log2 adjustment — the mathematically correct
+        algorithm for PoW difficulty because expected solve time scales as 2^d / h/s.
+
+        WRONG (old): new_d = old_d * (target/actual)
+          At 18 bits, 7s actual, 60s target → 18 * 8.05 = 145 → clamped to 32 → next
+          retarget would see 32 bits = 2^32/12k h/s = 97 HOURS per block. Oscillation.
+
+        CORRECT: new_d = old_d + log2(target/actual), capped ±3 bits per retarget.
+          At 18 bits, 7s actual, 60s target → 18 + log2(8.05) = 18 + 3.0 = 21.
+          At 21 bits, 172s actual → 21 + log2(60/172) = 21 - 1.52 ≈ 20 → converges.
+
+        Max step ±3 bits prevents overshooting during transient conditions.
         """
         try:
-            time_ratio=self.target_block_time_s / max(self.ema_block_time_s, 0.1)
+            ratio = self.target_block_time_s / max(self.ema_block_time_s, 0.1)
+            # Additive bit-space adjustment (capped ±3 bits per window)
+            delta = math.log2(ratio)
+            delta = max(-3.0, min(3.0, delta))
             
-            # Clamp adjustment factor to prevent extreme swings
-            # Allow at most 2x increase or 0.5x decrease per retarget
-            adjustment_factor=max(0.5, min(2.0, time_ratio))
+            old_difficulty = self.current_difficulty
+            new_difficulty  = int(round(self.current_difficulty + delta))
+            new_difficulty  = max(self.min_difficulty, min(self.max_difficulty, new_difficulty))
             
-            old_difficulty=self.current_difficulty
-            new_difficulty=int(self.current_difficulty * adjustment_factor)
-            new_difficulty=max(self.min_difficulty, min(self.max_difficulty, new_difficulty))
+            self.current_difficulty    = new_difficulty
+            self.last_retarget_height  = height
             
-            self.current_difficulty=new_difficulty
-            self.last_retarget_height=height
-            
-            direction="↑" if new_difficulty > old_difficulty else ("↓" if new_difficulty < old_difficulty else "=")
-            logger.info(f"[DIFFICULTY] 🎯 RETARGET at block #{height} | {direction} {old_difficulty} → {new_difficulty} | ema_time={self.ema_block_time_s:.2f}s (target {self.target_block_time_s}s)")
-            
-            # Save immediately after retarget
+            direction = "↑" if new_difficulty > old_difficulty else ("↓" if new_difficulty < old_difficulty else "=")
+            logger.info(
+                f"[DIFFICULTY] 🎯 RETARGET #{height} | {direction} {old_difficulty}→{new_difficulty} bits | "
+                f"delta={delta:+.2f} | ema={self.ema_block_time_s:.1f}s (target {self.target_block_time_s}s) | "
+                f"ratio={ratio:.2f}"
+            )
             self._save_state()
         except Exception as e:
             logger.error(f"[DIFFICULTY] ❌ Retargeting failed: {e}")
@@ -3187,12 +3197,11 @@ class QuantumMiner:
                 current_difficulty = 21
                 logger.warning(f"[MINING] ⚠️  No difficulty_engine! Using hardcoded 21")
             
-            # Sanity check: difficulty should be 16-24, not 1-10
-            if current_difficulty < 16:
-                logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} is TOO LOW (< 16)!")
-                logger.error(f"[MINING]    Engine: {self.difficulty_engine}")
-                logger.error(f"[MINING]    This will solve instantly!")
-                current_difficulty = 21  # Reset to safe value
+            # Sanity check: difficulty must be within engine bounds [12, 24]
+            if current_difficulty < 12:
+                logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} < 12 (floor). Resetting to 19.")
+                logger.error(f"[MINING]    This would solve in milliseconds — engine state corrupt.")
+                current_difficulty = 19
             
             logger.warning(f"[MINING] ⚙️  DIFFICULTY CHECK: engine={self.difficulty_engine is not None} | value={current_difficulty}")
             
@@ -3355,7 +3364,12 @@ class QTCLFullNode:
         self.difficulty_engine=None
         if self.db:
             try:
-                self.difficulty_engine=DifficultyRetargeting(self.db, target_block_time_s=60.0, retarget_window=10, ema_alpha=0.2)
+                self.difficulty_engine=DifficultyRetargeting(
+                    self.db,
+                    target_block_time_s=60.0,
+                    retarget_window=5,    # retarget every 5 accepted blocks — fast enough to chase hash rate
+                    ema_alpha=0.3,        # 0.3 smoothing: responsive without over-reacting to single lucky blocks
+                )
                 logger.info("[NODE] ✅ Difficulty retargeting engine initialized")
             except Exception as e:
                 logger.warning(f"[NODE] ⚠️  Failed to initialize difficulty engine: {e}")
@@ -3854,6 +3868,7 @@ class QTCLFullNode:
                 'block_rewards': f"{mining_stats.get('blocks_mined', 0) * 10.0} QTCL",
                 'current_difficulty': self.difficulty_engine.get_current_difficulty() if self.difficulty_engine else self.miner.difficulty,
                 'ema_block_time_s': self.difficulty_engine.ema_block_time_s if self.difficulty_engine else 0.0,
+                'target_block_time_s': self.difficulty_engine.target_block_time_s if self.difficulty_engine else 60.0,
             },
             'wallet': {
                 'address': self.miner_address,
@@ -4423,7 +4438,7 @@ def main():
             print(f"  Avg W-State Fidelity:   {status['mining']['avg_fidelity']:.4f}")
             print(f"  Hash Rate:              {status['mining']['estimated_hash_rate']} hashes/sec")
             print(f"  Current Difficulty:     {status['mining']['current_difficulty']} bits")
-            print(f"  EMA Block Time:         {status['mining']['ema_block_time_s']:.2f}s (target 30s)")
+            print(f"  EMA Block Time:         {status['mining']['ema_block_time_s']:.2f}s (target {status['mining']['target_block_time_s']:.0f}s)")
             print(f"")
             print(f"QUANTUM W-STATE ENTANGLEMENT:")
             print(f"  Established:            {status['quantum']['w_state']['entanglement_established']}")
