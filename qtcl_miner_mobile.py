@@ -1782,14 +1782,29 @@ class MinerWebSocketP2PClient:
             logger.debug(f"[WEBSOCKET] Registration emit failed: {e}")
     
     def send_heartbeat(self)->bool:
-        """Send heartbeat with peer/snapshot info for gossip."""
+        """Send heartbeat with peer/snapshot/block height info for gossip."""
         try:
             if self.sio and self.connected:
                 start_time = time.time()
+                
+                # 🔐 CRITICAL FIX: Include current block height in heartbeat for P2P sync awareness
+                current_height = 0
+                try:
+                    # Try to get from chain state if available
+                    if hasattr(self, 'chain_state') and self.chain_state:
+                        current_height = self.chain_state.get_height()
+                    else:
+                        # Fallback: try parent context
+                        current_height = getattr(self, '_current_block_height', 0)
+                except:
+                    current_height = 0
+                
                 self.sio.emit('miner_heartbeat', {
                     'miner_id': self.miner_id,
                     'known_peers': len(self.known_peers),
-                    'snapshot_ts': self.latest_snapshot_ts
+                    'snapshot_ts': self.latest_snapshot_ts,
+                    'block_height': current_height,  # ← NEW: Server now knows our block height
+                    'timestamp': int(time.time() * 1000),
                 })
                 elapsed = time.time() - start_time
                 self.request_times.append(elapsed)
@@ -2260,8 +2275,9 @@ class P2PClientWStateRecovery:
         """Recover W-state from oracle snapshot with adaptive quality evaluation.
         
         CONTRACT:
-          snapshot['pq_current'] — hex string: current lattice field-space identifier
-          snapshot['pq_last']    — hex string: previous lattice field-space identifier
+          snapshot['pq_current'] — hex string OR block height: current lattice field identifier
+          snapshot['pq_last']    — hex string OR block height: previous lattice field identifier
+          NOTE: These should ideally come from server as block heights, not arbitrary hex strings
           snapshot['fidelity']   — float: actual W-state quality (used for block submission)
           snapshot['coherence']  — float: L1 coherence metric
         """
@@ -2271,30 +2287,50 @@ class P2PClientWStateRecovery:
             coherence = float(snapshot.get('coherence', 0.85))
             timestamp_ns = snapshot.get('timestamp_ns', int(time.time() * 1e9))
             
-            # ── Lattice field-space identifiers (integers 1-106495 from oracle) ──
+            # ── 🔐 CRITICAL FIX: Lattice field-space should be indexed by block HEIGHT, not oracle hex ──
+            # The "lattice field" is conceptually the range [block_height-1, block_height]
+            # Extract block height from snapshot (if available) or use chain state
+            current_block_height = snapshot.get('block_height', 0)
+            if current_block_height == 0:
+                # Fallback: try to get from chain state if available
+                try:
+                    current_block_height = getattr(self, 'current_chain_height', 0) or 0
+                except:
+                    current_block_height = 0
+            
+            # Lattice field identifiers should be block heights
+            # pq_curr = current block height
+            # pq_last = previous block height (height - 1)
             pq_curr_id = snapshot.get('pq_current')
             pq_last_id = snapshot.get('pq_last')
             
-            # Ensure these are actual lattice field IDs from oracle
-            # Oracle sends integers in range [1, 106495]
-            if pq_curr_id is None or not isinstance(pq_curr_id, (int, float)):
-                pq_curr_id = snapshot.get('pq_curr')
-            if pq_last_id is None or not isinstance(pq_last_id, (int, float)):
-                pq_last_id = snapshot.get('pq_last')
-            
-            # Validate lattice field IDs are in valid range
-            if isinstance(pq_curr_id, (int, float)) and 1 <= int(pq_curr_id) <= 106495:
-                pq_curr_id = str(int(pq_curr_id))
+            # If pq_* are not block heights, compute them from block height
+            # Block height is definitive; oracle hex is secondary context only
+            if current_block_height > 0:
+                pq_curr_id = str(current_block_height)
+                pq_last_id = str(max(0, current_block_height - 1))
             else:
-                # Fallback: use entropy + timestamp to derive deterministic field ID
-                entropy_val = int(snapshot.get('entropy', timestamp_ns)) % 106495
-                pq_curr_id = str(max(1, entropy_val))
-            
-            if isinstance(pq_last_id, (int, float)) and 1 <= int(pq_last_id) <= 106495:
-                pq_last_id = str(int(pq_last_id))
-            else:
-                # Fallback: derive from current
-                pq_last_id = str(max(1, (int(pq_curr_id) - 1) % 106495 or 106495))
+                # Fallback: oracle-provided values (less precise but available)
+                # Ensure these are actual lattice field IDs from oracle
+                # Oracle sends integers in range [1, 106495]
+                if pq_curr_id is None or not isinstance(pq_curr_id, (int, float)):
+                    pq_curr_id = snapshot.get('pq_curr')
+                if pq_last_id is None or not isinstance(pq_last_id, (int, float)):
+                    pq_last_id = snapshot.get('pq_last')
+                
+                # Validate lattice field IDs are in valid range
+                if isinstance(pq_curr_id, (int, float)) and 1 <= int(pq_curr_id) <= 106495:
+                    pq_curr_id = str(int(pq_curr_id))
+                else:
+                    # Fallback: use entropy + timestamp to derive deterministic field ID
+                    entropy_val = int(snapshot.get('entropy', timestamp_ns)) % 106495
+                    pq_curr_id = str(max(1, entropy_val))
+                
+                if isinstance(pq_last_id, (int, float)) and 1 <= int(pq_last_id) <= 106495:
+                    pq_last_id = str(int(pq_last_id))
+                else:
+                    # Fallback: derive from current
+                    pq_last_id = str(max(1, (int(pq_curr_id) - 1) % 106495 or 106495))
             
             # Build a proper 8x8 W-state density matrix from oracle fidelity.
             # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
@@ -3141,11 +3177,12 @@ class QuantumMiner:
             )
             
             # PoW mining with W-state witness
-            target = (1 << (256 - self.difficulty)) - 1
+            # 🔐 CRITICAL FIX: Use current_difficulty (from consensus), NOT self.difficulty (stale fallback)
+            target = (1 << (256 - current_difficulty)) - 1
             hash_attempts = 0
             nonce_start = time.time()
             
-            logger.debug(f"[MINING] ⚙️  PoW target: {target} | difficulty_bits={self.difficulty}")
+            logger.debug(f"[MINING] ⚙️  PoW target: {target} | difficulty_bits={current_difficulty} (consensus-driven)")
             
             while header.nonce < 2**32:
                 hash_attempts += 1
