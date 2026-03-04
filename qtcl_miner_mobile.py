@@ -1648,20 +1648,38 @@ class MinerWebSocketP2PClient:
                 self.sio=None
     
     def connect(self)->bool:
-        """Connect to oracle P2P via WebSocket (port 8333)."""
+        """Connect to oracle P2P via WebSocket (port 8333).
+        
+        FIXED: Uses HTTPS for external connections, supports P2P_WEBSOCKET_URL env var
+        """
         if not self.sio:
             return False
         
         try:
-            # Extract host from oracle_url, connect to port 8333 for P2P
-            url_parts=self.oracle_url.replace('http://', '').replace('https://', '')
-            host_only=url_parts.split(':')[0]  # Get just hostname
-            ws_url=f"http://{host_only}:8333"
+            # Check for explicit P2P WebSocket URL override (for Koyeb/cloud deployments)
+            p2p_ws_url = os.getenv('P2P_WEBSOCKET_URL')
             
-            self.sio.connect(ws_url, wait_timeout=5)
+            if p2p_ws_url:
+                # Use explicit configuration (e.g., wss://qtcl-blockchain.koyeb.app or http://localhost:8333)
+                ws_url = p2p_ws_url.rstrip('/')
+                logger.info(f"[WEBSOCKET] Using configured P2P WebSocket URL: {ws_url}")
+            else:
+                # Extract host from oracle_url, connect to port 8333 for P2P
+                url_parts=self.oracle_url.replace('http://', '').replace('https://', '')
+                host_only=url_parts.split(':')[0]  # Get just hostname
+                
+                # Determine protocol: use wss:// for external URLs, ws:// for localhost
+                if 'localhost' in host_only or '127.0.0.1' in host_only:
+                    ws_url=f"http://{host_only}:8333"
+                else:
+                    # Use wss:// (WebSocket Secure) for cloud/external deployments
+                    ws_url=f"wss://{host_only}"
+            
+            logger.debug(f"[WEBSOCKET] Attempting connection to {ws_url}")
+            self.sio.connect(ws_url, wait_timeout=5, transports=['websocket', 'polling'])
             return True
         except Exception as e:
-            logger.warning(f"[WEBSOCKET] P2P WebSocket connection failed ({ws_url}): {e}")
+            logger.warning(f"[WEBSOCKET] P2P WebSocket connection failed ({ws_url if 'ws_url' in locals() else 'unknown'}): {e}")
             return False
     
     def _send_register(self)->None:
