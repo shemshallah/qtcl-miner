@@ -50,7 +50,7 @@
 ║  │ • Track mining rewards & entanglement metrics                     │                                                                ║
 ║  └────────────────────────────────────────────────────────────────────┘                                                                ║
 ║                                                                                                                                            ║
-║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url http://oracle.local:5000                                         ║
+║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url wss://oracle.example.com:8000                                  ║
 ║                                                                                                                                            ║
 ║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
 ║                                                                                                                                            ║
@@ -538,7 +538,7 @@ class P2PClient:
     def __init__(self, peer_id: str, known_peers: List[Tuple[str, int]] = None):
         self.peer_id = peer_id
         # 🎯 FIXED: Don't discover ourselves! Start with empty peers list
-        # Oracle will be discovered separately on port 8000
+        # Oracle will be discovered separately on port 8000 (unified REST + P2P)
         self.known_peers = known_peers or []
         self.connected_peers: Dict[str, Tuple[str, int]] = {}
         self.peer_info: Dict[str, Dict[str, Any]] = {}
@@ -581,13 +581,13 @@ class P2PClient:
         
         Priority:
         1. LOCAL DATABASE (source of truth)
-        2. Oracle on port 8000 (network consensus)
-        3. Peers on port 8333 (fallback)
+        2. Oracle on port 8000 (unified REST + P2P WebSocket)
+        3. Peer network on port 8000 (fallback)
         """
         # 🎯 PRIORITY 1: Local database is authoritative
         # This is handled by caller, not here
         
-        # 🎯 PRIORITY 2: Try Oracle on port 8000 (real network state)
+        # 🎯 PRIORITY 2: Try Oracle on port 8000 (unified REST + P2P network state)
         if oracle_url:
             try:
                 import requests
@@ -656,7 +656,7 @@ class P2PClient:
 class P2PServer:
     """P2P server for accepting peer connections and responding to requests."""
     
-    def __init__(self, peer_id: str, port: int = 8333):
+    def __init__(self, peer_id: str, port: int = 8000):
         self.peer_id = peer_id
         self.port = port
         self.running = False
@@ -1742,15 +1742,15 @@ class MinerWebSocketP2PClient:
                 ws_url = p2p_ws_url.rstrip('/')
                 logger.info(f"[WEBSOCKET] Using configured P2P WebSocket URL: {ws_url}")
             else:
-                # Extract host from oracle_url, connect to port 8333 for P2P
-                url_parts=self.oracle_url.replace('http://', '').replace('https://', '')
+                # Extract host from oracle_url, connect to port 8000 for unified REST + P2P
+                url_parts=self.oracle_url.replace('http://', '').replace('https://', '').replace('ws://', '').replace('wss://', '')
                 host_only=url_parts.split(':')[0]
                 
                 # Determine protocol: use wss:// for external URLs, ws:// for localhost
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
-                    ws_url=f"http://{host_only}:8333"
+                    ws_url=f"ws://{host_only}:8000"
                 else:
-                    ws_url=f"wss://{host_only}"
+                    ws_url=f"wss://{host_only}:8000"
             
             logger.debug(f"[WEBSOCKET] 🔌 Attempting connection to {ws_url} (timeout: {self.current_timeout}s)")
             
@@ -3224,7 +3224,7 @@ class QuantumMiner:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str='http://localhost:5000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
+    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:8000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
         self.db=db_connection  # Database connection for difficulty state
@@ -4043,7 +4043,7 @@ def main():
         peer_id = f"qtcl_miner_{uuid.uuid4().hex[:12]}"
         global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC
         
-        _P2P_SERVER = P2PServer(peer_id, port=8333)
+        _P2P_SERVER = P2PServer(peer_id, port=8000)
         server_thread = threading.Thread(target=_P2P_SERVER.start, daemon=True, name="P2PServer")
         server_thread.start()
         time.sleep(0.5)  # Let server bind
