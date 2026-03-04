@@ -2970,8 +2970,17 @@ class LiveNodeClient:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class ValidationEngine:
-    def __init__(self):
-        self.difficulty_cache={}
+    """
+    Block and transaction validation engine.
+    Requires chain_state and db to be supplied at construction so that
+    _parent_block_exists can perform real lookups instead of crashing on
+    missing self.blocks (the root cause of the 'Block validation failed' loop).
+    """
+    def __init__(self, chain_state: Optional['ChainState'] = None,
+                 db: Optional[sqlite3.Connection] = None):
+        self.difficulty_cache: Dict[int, int] = {}
+        self._chain_state = chain_state   # ChainState — in-memory block index
+        self._db          = db            # SQLite — persistent block store
     
     def validate_block(self,block: Block)->bool:
         """
@@ -3048,22 +3057,43 @@ class ValidationEngine:
             traceback.print_exc()
             return False
     
-    def _parent_block_exists(self, parent_hash: str)->bool:
-        """Check if parent block exists in chain."""
-        try:
-            # First check: is it in our local state?
-            for height, header in self.blocks.items():
-                if header.block_hash==parent_hash:
+    def _parent_block_exists(self, parent_hash: str) -> bool:
+        """
+        Two-tier parent block lookup: in-memory ChainState first, SQLite fallback.
+        Genesis sentinel ('0'*64) is always accepted.
+
+        The original implementation referenced self.blocks which does NOT exist on
+        ValidationEngine — that AttributeError was swallowed by the bare except and
+        caused every block to fail validation, keeping the miner in an infinite
+        solve-fail-restart loop without ever submitting to the network.
+        """
+        # ── 0. Genesis sentinel — all-zeros parent is unconditionally valid ──────
+        if parent_hash == '0' * 64:
+            return True
+
+        # ── 1. In-memory ChainState (O(n) but always current) ────────────────────
+        if self._chain_state is not None:
+            try:
+                with self._chain_state._lock:
+                    for _height, header in self._chain_state.blocks.items():
+                        if header.block_hash == parent_hash:
+                            return True
+            except Exception as cse:
+                logger.debug(f"[VALIDATION] ChainState parent lookup error: {cse}")
+
+        # ── 2. SQLite database (covers all startup-synced and accepted blocks) ────
+        if self._db is not None:
+            try:
+                cursor = self._db.execute(
+                    "SELECT height FROM blocks WHERE block_hash=? LIMIT 1", (parent_hash,)
+                )
+                if cursor.fetchone() is not None:
                     return True
-            
-            # Fallback: check database
-            if hasattr(self, '_db'):
-                cursor=self._db.execute("SELECT height FROM blocks WHERE block_hash=?", (parent_hash,))
-                return cursor.fetchone() is not None
-            
-            return False
-        except:
-            return False
+            except Exception as dbe:
+                logger.debug(f"[VALIDATION] DB parent lookup error: {dbe}")
+
+        logger.debug(f"[VALIDATION] Parent not found in state or DB: {parent_hash[:16]}…")
+        return False
     
     def verify_pow(self,block_hash: str,difficulty_bits: int)->bool:
         try:
@@ -3277,9 +3307,11 @@ class QuantumMiner:
                     logger.info(f"[MINING]   • Lattice field: pq_curr={pq_curr_id[:16]}… → pq_last={pq_last_id[:16]}…")
                     logger.info(f"[MINING] ⏱️  Total mining time: {total_time:.2f}s")
                     
-                    # 🎯 RECORD MINING TIME FOR DIFFICULTY RETARGETING
-                    if self.difficulty_engine:
-                        self.difficulty_engine.record_block_mining_time(height, total_time)
+                    # ── EMA difficulty retargeting NOTE ────────────────────────────────────
+                    # record_block_mining_time is intentionally NOT called here.
+                    # It is called by _mining_loop only after the server accepts the block.
+                    # Calling it here would corrupt the EMA with failed-validation retries,
+                    # driving difficulty to min and creating an instant-solve loop.
                     
                     # Rotate W-state for next iteration
                     self.w_state_recovery.rotate_entanglement_state()
@@ -3315,7 +3347,9 @@ class QTCLFullNode:
         self.client=LiveNodeClient()
         self.state=ChainState()
         self.mempool=Mempool()
-        self.validator=ValidationEngine()
+        # CRITICAL FIX: pass chain_state + db so _parent_block_exists works correctly.
+        # Without these, ValidationEngine.blocks AttributeError silently kills every block.
+        self.validator=ValidationEngine(chain_state=self.state, db=self.db)
         
         # DIFFICULTY RETARGETING ENGINE
         self.difficulty_engine=None
@@ -3504,6 +3538,24 @@ class QTCLFullNode:
                                     tx_ids_to_remove.append(tx.tx_id)
                                 if tx_ids_to_remove:
                                     self.mempool.remove_transactions(tx_ids_to_remove)
+                                # ── Persist to SQLite so parent lookups survive long-running sessions ──
+                                if self.db:
+                                    try:
+                                        self.db.execute("""
+                                            INSERT OR IGNORE INTO blocks
+                                            (height, block_hash, parent_hash, merkle_root, timestamp_s,
+                                             difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            header.height, header.block_hash, header.parent_hash,
+                                            header.merkle_root, header.timestamp_s, header.difficulty_bits,
+                                            header.nonce, header.miner_address,
+                                            getattr(header, 'w_state_fidelity', 0.0),
+                                            getattr(header, 'w_entropy_hash', ''),
+                                        ))
+                                        self.db.commit()
+                                    except Exception as dbe:
+                                        logger.debug(f"[SYNC] DB persist error for #{h}: {dbe}")
                                 logger.debug(f"[SYNC] ✅ Synced block #{h}")
                             else:
                                 logger.warning(f"[SYNC] ⚠️  Block #{h} failed validation, skipping")
@@ -3632,6 +3684,18 @@ class QTCLFullNode:
                             if success:
                                 # ✅ BLOCK ACCEPTED - Update all systems atomically
                                 logger.info(f"[MINING] ✅ Block #{block.header.height} ACCEPTED by network | Response: {msg}")
+                                
+                                # ── EMA difficulty retargeting — fire ONLY on server-accepted blocks ──
+                                # block_time measured from mine_block() call to here, so it is
+                                # the true wall-clock cost of producing an accepted block.
+                                if self.difficulty_engine:
+                                    self.difficulty_engine.record_block_mining_time(
+                                        block.header.height, block_time
+                                    )
+                                    logger.debug(
+                                        f"[DIFFICULTY] 📊 EMA updated | height={block.header.height} "
+                                        f"time={block_time:.2f}s | new_ema={self.difficulty_engine.ema_block_time_s:.2f}s"
+                                    )
                                 
                                 # ── Persist block to database immediately ──
                                 try:
