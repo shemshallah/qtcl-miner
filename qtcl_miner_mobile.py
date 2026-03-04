@@ -644,14 +644,17 @@ class P2PClient:
 
 class P2PServer:
     """P2P server for accepting peer connections and responding to requests."""
-    
-    def __init__(self, peer_id: str, port: int = 8000):
+
+    def __init__(self, peer_id: str, port: int = 8000, db_connection: Optional[sqlite3.Connection] = None):
         self.peer_id = peer_id
         self.port = port
         self.running = False
         self.server_socket = None
         self.peers: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        # Use supplied connection; fall back to schema-builder conn only if nothing else provided.
+        # This eliminates the split-brain: main() passes db= after initialising its own SQLite conn.
+        self._db: Optional[sqlite3.Connection] = db_connection
     
     def start(self):
         """Start P2P server listening."""
@@ -687,11 +690,13 @@ class P2PServer:
                 logger.debug(f"[P2P] Server error: {e}")
     
     def _handle_client(self, client_socket, client_host, client_port):
-        """Handle incoming peer connection."""
+        """Handle incoming peer connection — always uses self._db (main node db) if set."""
+        # Resolve the correct db: prefer injected main db, fall back to schema-builder conn
+        _conn = self._db if self._db is not None else _DB_CONN
         try:
             data = client_socket.recv(4096).decode()
             msg = P2PMessage.from_json(data.strip())
-            
+
             if msg.msg_type == 'HELLO':
                 response = P2PMessage(
                     'HELLO_RESPONSE',
@@ -703,7 +708,7 @@ class P2PServer:
             
             elif msg.msg_type == 'GET_HEIGHT':
                 try:
-                    cursor = _DB_CONN.cursor()
+                    cursor = _conn.cursor()
                     cursor.execute("SELECT MAX(height) FROM blocks")
                     result = cursor.fetchone()
                     height = result[0] if result[0] is not None else 0
@@ -716,7 +721,7 @@ class P2PServer:
             
             elif msg.msg_type == 'GET_BLOCK':
                 try:
-                    cursor = _DB_CONN.cursor()
+                    cursor = _conn.cursor()
                     cursor.execute("""
                         SELECT block_hash, parent_hash, merkle_root, timestamp_s, difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash
                         FROM blocks WHERE height = ?
@@ -747,14 +752,18 @@ class P2PServer:
             
             elif msg.msg_type == 'GET_METRICS':
                 try:
-                    cursor = _DB_CONN.cursor()
-                    
+                    cursor = _conn.cursor()
+
                     # Get current metrics
                     cursor.execute("SELECT MAX(height) FROM blocks")
                     height = cursor.fetchone()[0] or 0
-                    
-                    cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
-                    pending_txs = cursor.fetchone()[0] or 0
+
+                    # broadcast_to_oracle column only exists after schema patches — guard it
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
+                        pending_txs = cursor.fetchone()[0] or 0
+                    except Exception:
+                        pending_txs = 0
                     
                     cursor.execute("SELECT AVG(w_state_fidelity) FROM blocks WHERE w_state_fidelity > 0")
                     avg_fidelity = cursor.fetchone()[0] or 0.9
@@ -780,7 +789,7 @@ class P2PServer:
                     tx_id = signed_tx.get('tx_id', 'unknown')
                     
                     # Verify signature
-                    cursor = _DB_CONN.cursor()
+                    cursor = _conn.cursor()
                     cursor.execute("""
                         INSERT OR IGNORE INTO transactions 
                         (tx_id, height, tx_index, from_address, to_address, amount, fee, 
@@ -799,7 +808,7 @@ class P2PServer:
                         signed_tx.get('signer_address'),
                         1 if signed_tx.get('signature_valid') else 0
                     ))
-                    _DB_CONN.commit()
+                    _conn.commit()
                     
                     response = P2PMessage('ACK', self.peer_id, payload={'tx_id': tx_id})
                     logger.info(f"[P2P] 📝 Received signed transaction: {tx_id}")
@@ -1762,16 +1771,11 @@ class MinerWebSocketP2PClient:
             if self.sio and self.connected:
                 start_time = time.time()
                 
-                # 🔐 CRITICAL FIX: Include current block height in heartbeat for P2P sync awareness
+                # Block height for P2P sync awareness — set externally via ws_client._current_block_height
                 current_height = 0
                 try:
-                    # Try to get from chain state if available
-                    if hasattr(self, 'chain_state') and self.chain_state:
-                        current_height = self.chain_state.get_height()
-                    else:
-                        # Fallback: try parent context
-                        current_height = getattr(self, '_current_block_height', 0)
-                except:
+                    current_height = int(getattr(self, '_current_block_height', 0) or 0)
+                except Exception:
                     current_height = 0
                 
                 self.sio.emit('miner_heartbeat', {
@@ -3732,6 +3736,14 @@ class QTCLFullNode:
                                 self.mempool.remove_transactions(
                                     [tx.tx_id for tx in block.transactions] if block.transactions else []
                                 )
+
+                                # Propagate new height to WebSocket heartbeat so peers know our tip
+                                try:
+                                    ws = getattr(self.w_state_recovery, 'ws_client', None)
+                                    if ws is not None:
+                                        ws._current_block_height = block.header.height
+                                except Exception:
+                                    pass
                                 
                                 # Confirm by querying network tip (non-blocking, best-effort)
                                 try:
@@ -4168,8 +4180,7 @@ def main():
             logger.info(f"[DB] ✅ Persistent storage: ENABLED (survives restarts)")
         except Exception as e:
             logger.error(f"[DB] ❌ Database initialization failed: {e}")
-            import traceback
-            traceback.print_exc()
+            traceback.print_exc()   # module already imported at top-level — NO local re-import
             sys.exit(1)
         
         node=QTCLFullNode(
@@ -4197,59 +4208,62 @@ def main():
         peer_id = f"qtcl_miner_{uuid.uuid4().hex[:12]}"
         global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC
         
-        _P2P_SERVER = P2PServer(peer_id, port=8000)
+        _P2P_SERVER = P2PServer(peer_id, port=8000, db_connection=db)
         server_thread = threading.Thread(target=_P2P_SERVER.start, daemon=True, name="P2PServer")
         server_thread.start()
         time.sleep(0.5)  # Let server bind
         
+        # ── Canonical oracle URL — single source of truth for all P2P/REST calls ──
+        oracle_url = args.oracle_url
+
         # 2. Initialize transaction signing and Oracle broadcasting
         _TX_SIGNER = HLWETransactionSigner(address)
-        _ORACLE_BROADCASTER = OracleBroadcaster(args.oracle_url)
+        _ORACLE_BROADCASTER = OracleBroadcaster(oracle_url)
         logger.info("[SIGNING] 🔐 HLWE transaction signing initialized")
         logger.info("[ORACLE] 📤 Oracle broadcasting initialized")
-        
-        # 3. Initialize consensus and periodic sync
+
+        # 3. Create P2P client FIRST — must exist before PeriodicPeerSync references it
+        _P2P_CLIENT = P2PClient(peer_id, oracle_base_url=oracle_url)
+        logger.info(f"[P2P] ✅ P2P client created | oracle={oracle_url}")
+
+        # 4. Initialize consensus and periodic sync — now _P2P_CLIENT is valid
         _CONSENSUS_MGR = ConsensusManager()
         _PEER_SYNC = PeriodicPeerSync(_P2P_CLIENT, _CONSENSUS_MGR)
         logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
-        
-        # 4. Create P2P client — pass oracle base URL so REST queries always resolve
-        _P2P_CLIENT = P2PClient(peer_id, oracle_base_url=oracle_url)
-        
-        # 5. Try to sync blocks from P2P peers
+
+        # 5. Sync chain height from oracle / peers
         current_height = 0
         p2p_success = False
-        
-        # 🔐 FIX: Pass oracle_url explicitly so REST branch always fires
+
         logger.info("[P2P] 📊 Querying oracle for current block height...")
         current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
-        
+
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
         else:
             logger.warning("[P2P] ⚠️  Could not get height from oracle, attempting peer discovery...")
-            
+
             # Try peer discovery as fallback
             logger.info("[P2P] 🔍 Discovering other peers...")
             discovered = _P2P_CLIENT.discover_peers(timeout=5)
             if discovered:
                 _P2P_CLIENT.known_peers.extend(discovered)
                 logger.info(f"[P2P] ✅ Discovered {len(discovered)} additional peers")
-                # Try height query again with oracle_url
+                # Retry height query with freshly discovered peers
                 current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
         
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ P2P sync: Current height = {current_height}")
-            
-            # Sync blocks from peers if needed
+
+            # Sync blocks from peers if needed — use main `db`, NOT schema-builder _DB_CONN
             try:
                 db_height = 0
-                cursor = _DB_CONN.cursor()
+                cursor = db.cursor()
                 cursor.execute("SELECT MAX(height) FROM blocks")
                 result = cursor.fetchone()
                 if result[0] is not None:
                     db_height = result[0]
-                
+
                 if current_height > db_height:
                     logger.info(f"[P2P] 📦 Syncing blocks {db_height + 1} to {current_height}...")
                     blocks = _P2P_CLIENT.sync_blocks(db_height + 1, min(current_height, db_height + 100), timeout=10)
