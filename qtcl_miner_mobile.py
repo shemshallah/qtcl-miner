@@ -50,7 +50,7 @@
 ║  │ • Track mining rewards & entanglement metrics                     │                                                                ║
 ║  └────────────────────────────────────────────────────────────────────┘                                                                ║
 ║                                                                                                                                            ║
-║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url wss://oracle.example.com:8000                                  ║
+║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url wss://oracle.example.com/socket.io                            ║
 ║                                                                                                                                            ║
 ║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
 ║                                                                                                                                            ║
@@ -1744,13 +1744,13 @@ class MinerWebSocketP2PClient:
             else:
                 # Extract host from oracle_url, connect to port 8000 for unified REST + P2P
                 url_parts=self.oracle_url.replace('http://', '').replace('https://', '').replace('ws://', '').replace('wss://', '')
-                host_only=url_parts.split(':')[0]
+                host_only=url_parts.split(':')[0].split('/')[0]
                 
-                # Determine protocol: use wss:// for external URLs, ws:// for localhost
+                # Determine protocol: use wss:// (443 implicit) for external URLs, ws:// (8000) for localhost
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
-                    ws_url=f"ws://{host_only}:8000"
+                    ws_url=f"ws://{host_only}:8000/socket.io"
                 else:
-                    ws_url=f"wss://{host_only}:8000"
+                    ws_url=f"wss://{host_only}/socket.io"  # Port 443 implicit (HTTPS default, Koyeb standard)
             
             logger.debug(f"[WEBSOCKET] 🔌 Attempting connection to {ws_url} (timeout: {self.current_timeout}s)")
             
@@ -3224,7 +3224,7 @@ class QuantumMiner:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:8000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
+    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:8000/socket.io', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
         self.db=db_connection  # Database connection for difficulty state
