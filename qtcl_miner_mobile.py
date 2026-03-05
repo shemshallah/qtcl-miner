@@ -563,7 +563,7 @@ class P2PClient:
             urls.append(self._oracle_base)
         for host, _port in self.known_peers:
             scheme = 'https' if host not in ('localhost', '127.0.0.1') else 'http'
-            port_s = '' if host not in ('localhost', '127.0.0.1') else ':8000'
+            port_s = '' if host not in ('localhost', '127.0.0.1') else ':443'
             urls.append(f"{scheme}://{host}{port_s}")
         return list(dict.fromkeys(urls))  # deduplicate, preserve order
 
@@ -645,7 +645,7 @@ class P2PClient:
 class P2PServer:
     """P2P server for accepting peer connections and responding to requests."""
 
-    def __init__(self, peer_id: str, port: int = 8000, db_connection: Optional[sqlite3.Connection] = None):
+    def __init__(self, peer_id: str, port: int = 443, db_connection: Optional[sqlite3.Connection] = None):
         self.peer_id = peer_id
         self.port = port
         self.running = False
@@ -1728,7 +1728,7 @@ class MinerWebSocketP2PClient:
                        .replace('https://', '').replace('http://', ''))
                 host_only = raw.split('/')[0].split(':')[0]
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
-                    connect_url = f"http://{host_only}:8000"
+                    connect_url = f"http://{host_only}:443"
                 else:
                     connect_url = f"https://{host_only}"  # TLS 443, socket.io appends path
 
@@ -3339,7 +3339,7 @@ class QuantumMiner:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:8000/socket.io', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
+    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:443/socket.io', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
         self.db=db_connection  # Database connection for difficulty state
@@ -4208,7 +4208,7 @@ def main():
         peer_id = f"qtcl_miner_{uuid.uuid4().hex[:12]}"
         global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC
         
-        _P2P_SERVER = P2PServer(peer_id, port=8000, db_connection=db)
+        _P2P_SERVER = P2PServer(peer_id, port=443, db_connection=db)
         server_thread = threading.Thread(target=_P2P_SERVER.start, daemon=True, name="P2PServer")
         server_thread.start()
         time.sleep(0.5)  # Let server bind
