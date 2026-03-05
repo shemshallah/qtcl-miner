@@ -3518,27 +3518,31 @@ class QTCLFullNode:
                     time.sleep(5)
                     continue
                 
+                # Pull fresh mempool from server RIGHT NOW before building this block.
+                # The background sync loop runs every MEMPOOL_POLL_INTERVAL seconds — if
+                # a TX was submitted after the last poll, it would miss this block entirely.
+                # Fetching here guarantees the current block includes every known pending TX.
+                try:
+                    fresh_txs = self.client.get_mempool()
+                    for tx in fresh_txs:
+                        self.mempool.add_transaction(tx)
+                    if fresh_txs:
+                        logger.info(f"[MINING] Fetched {len(fresh_txs)} pending TXs from server mempool")
+                except Exception as mp_err:
+                    logger.debug(f"[MINING] Pre-block mempool fetch failed (using cached): {mp_err}")
+
                 # Pull at most MAX_BLOCK_TX user transactions from mempool.
-                # Coinbase is NOT counted — it's prepended separately in mine_block().
-                # This cap prevents the block size from growing unboundedly and
-                # ensures the coinbase loop can never form:
-                #   • Coinbase tx_type='coinbase' is never added to the mempool
-                #   • /api/mempool only returns type='transfer' pending txs
+                # Coinbase is NOT counted — prepended separately in mine_block().
                 pending_txs = self.mempool.get_pending(limit=MAX_BLOCK_TX)
-                
-                # ✅ MUSEUM-GRADE FIX: Allow mining with empty mempool
-                # Blockchains can mine empty blocks (common during low activity)
-                # This was the bug preventing mining when mempool = 0
                 
                 # Get current W-state metrics — use real oracle fidelity
                 current_fidelity = entanglement.get('w_state_fidelity', 0.0)
                 fidelity_measurements.append(current_fidelity)
                 
                 tx_count = len(pending_txs) if pending_txs else 0
-                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} | txs={tx_count} | F={current_fidelity:.4f}")
+                logger.info(f"[MINING] Mining block #{tip.height+1} | txs={tx_count} | F={current_fidelity:.4f}")
                 
                 block_start = time.time()
-                # Pass empty list if no pending transactions (mine empty block)
                 block = self.miner.mine_block(pending_txs or [], self.miner_address, tip.block_hash, tip.height+1)
                 block_time = time.time() - block_start
                 
