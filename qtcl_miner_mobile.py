@@ -2172,71 +2172,86 @@ class P2PClientWStateRecovery:
         return True
     
     def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
-        """Download latest W-state snapshot from oracle with gossip fallback.
-        
-        ENHANCED: 
-        - Adaptive timeouts based on oracle latency
-        - Fallback to gossip network cache if oracle slow
-        - Increased retry attempts with exponential backoff (max 5)
-        - Logs detailed latency metrics
+        """Download latest W-state snapshot.
+
+        Priority order:
+          1. Already-cached snapshot from WS gossip channel (instant)
+          2. Request snapshot via connected WebSocket and wait up to 8s for delivery
+          3. HTTP GET /api/oracle/w-state with adaptive timeouts + exponential backoff
         """
-        # First try: Quick check for gossip-cached snapshot (no network call)
-        if self.ws_client:
-            cached = self.ws_client.get_cached_snapshot()
+        ws = self.ws_client
+
+        # ── 1. Instant cache hit ──────────────────────────────────────────────
+        if ws:
+            cached = ws.get_cached_snapshot()
             if cached:
                 ts = cached.get('timestamp_ns', 0)
-                logger.info(f"[W-STATE] 💾 Using gossip-cached snapshot | ts={ts}")
+                logger.debug(f"[W-STATE] 💾 WS cache hit | ts={ts}")
                 with self._state_lock:
-                    self.current_snapshot=cached
+                    self.current_snapshot = cached
                     self.snapshot_buffer.append(cached)
                 return cached
-        
-        # Second try: Direct HTTP fetch from oracle with adaptive timeout
-        base_timeout = 5
-        max_attempts = 5
-        
-        for attempt in range(max_attempts):
-            try:
-                # Adaptive timeout: increase with each attempt
-                timeout = min(base_timeout + (attempt * 2), 15)
-                url=f"{self.oracle_url}/api/oracle/w-state"
-                
-                logger.debug(f"[W-STATE] Download attempt {attempt+1}/{max_attempts} | timeout={timeout}s")
-                
-                start_time = time.time()
-                response=requests.get(url, timeout=timeout)
-                elapsed = time.time() - start_time
-                
-                if response.status_code==200:
-                    snapshot=response.json()
-                    with self._state_lock:
-                        self.current_snapshot=snapshot
-                        self.snapshot_buffer.append(snapshot)
 
+        # ── 2. Request via WebSocket and poll for delivery ────────────────────
+        # If WS is connected but no snapshot cached yet (first call after connect),
+        # emit a snapshot request and wait up to 8s for the oracle to push it back.
+        # This avoids the HTTP path entirely when WS is working.
+        if ws and getattr(ws, 'connected', False):
+            logger.info("[W-STATE] 📡 Requesting snapshot via WebSocket…")
+            ws.request_snapshot()
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                time.sleep(0.25)
+                cached = ws.get_cached_snapshot()
+                if cached:
+                    ts = cached.get('timestamp_ns', 0)
+                    logger.info(f"[W-STATE] ✅ WS snapshot received | ts={ts}")
+                    with self._state_lock:
+                        self.current_snapshot = cached
+                        self.snapshot_buffer.append(cached)
+                    return cached
+            logger.warning("[W-STATE] ⚠️  WS snapshot not delivered within 8s — falling back to HTTP")
+
+        # ── 3. HTTP fallback with adaptive timeouts ───────────────────────────
+        base_timeout = 8   # server is already warm at this point
+        max_attempts = 5
+
+        for attempt in range(max_attempts):
+            timeout = min(base_timeout + attempt * 2, 20)
+            url = f"{self.oracle_url}/api/oracle/w-state"
+            logger.debug(f"[W-STATE] HTTP attempt {attempt+1}/{max_attempts} | timeout={timeout}s")
+            try:
+                t0 = time.time()
+                response = requests.get(url, timeout=timeout)
+                elapsed = time.time() - t0
+
+                if response.status_code == 200:
+                    snapshot = response.json()
+                    with self._state_lock:
+                        self.current_snapshot = snapshot
+                        self.snapshot_buffer.append(snapshot)
                     ts = snapshot.get('timestamp_ns', 0)
-                    # Only surface latency spikes at INFO; routine downloads go to DEBUG
                     if elapsed > 2.0:
-                        logger.warning(f"[W-STATE] ⚠️  Slow snapshot | latency={elapsed:.2f}s (>{2.0}s threshold)")
+                        logger.warning(f"[W-STATE] ⚠️  Slow HTTP snapshot | latency={elapsed:.2f}s")
                     else:
-                        logger.debug(f"[W-STATE] 📥 Snapshot | ts={ts} | latency={elapsed:.2f}s")
+                        logger.debug(f"[W-STATE] 📥 HTTP snapshot | ts={ts} | latency={elapsed:.2f}s")
                     return snapshot
                 else:
-                    logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: HTTP {response.status_code}")
-            
+                    logger.warning(f"[W-STATE] ⚠️  HTTP attempt {attempt+1}/{max_attempts}: status {response.status_code}")
+
             except requests.Timeout:
-                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: Timeout after {timeout}s")
+                logger.warning(f"[W-STATE] ⚠️  HTTP attempt {attempt+1}/{max_attempts}: timeout after {timeout}s")
             except requests.ConnectionError as e:
-                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: Connection error: {str(e)[:50]}")
+                logger.warning(f"[W-STATE] ⚠️  HTTP attempt {attempt+1}/{max_attempts}: connection error: {str(e)[:60]}")
             except Exception as e:
-                logger.warning(f"[W-STATE] ⚠️  Attempt {attempt+1}/{max_attempts}: {type(e).__name__}: {str(e)[:50]}")
-            
-            # Exponential backoff: 1s, 2s, 4s, 8s, 8s
+                logger.warning(f"[W-STATE] ⚠️  HTTP attempt {attempt+1}/{max_attempts}: {type(e).__name__}: {str(e)[:60]}")
+
             if attempt < max_attempts - 1:
-                delay_sec = min(2 ** attempt, 8)
-                logger.info(f"[W-STATE] 🔄 Retrying in {delay_sec}s…")
-                time.sleep(delay_sec)
-        
-        logger.error(f"[W-STATE] ❌ Download failed after {max_attempts} attempts - recovery will use cached/synthetic snapshot")
+                delay = min(2 ** attempt, 8)
+                logger.info(f"[W-STATE] 🔄 Retrying in {delay}s…")
+                time.sleep(delay)
+
+        logger.error("[W-STATE] ❌ All snapshot download methods failed — using synthetic snapshot")
         return None
     
     def _verify_snapshot_signature(self,snapshot: Dict[str,Any])->Tuple[bool,str]:
