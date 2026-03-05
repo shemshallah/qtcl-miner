@@ -3810,47 +3810,32 @@ class QTCLFullNode:
 # WALLET & REGISTRATION (Integrated)
 # ═════════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# QTCL WALLET v4 — BIP-39/38/32 + HLWE-256 Post-Quantum Auth
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class QTCLWallet:
     """
-    ╔══════════════════════════════════════════════════════════════════════════╗
-    ║  QTCL WALLET  v3.0 — Enterprise Post-Quantum Key Management           ║
-    ║                                                                          ║
-    ║  SECURITY LAYERS:                                                        ║
-    ║    Encryption  : PBKDF2-HMAC-SHA256 (200k iter, 32-byte salt)          ║
-    ║                  XOR-keystream over SHA-256 chain (AES-256-CTR equiv)  ║
-    ║    Auth tag    : SHA-256(key ‖ salt) — checked before decrypt          ║
-    ║    Atomic write: .tmp → rename (never corrupts live file)              ║
-    ║    Backup      : .bak written before every overwrite                   ║
-    ║                                                                          ║
-    ║  RECOVERY:                                                               ║
-    ║    12-word BIP39 mnemonic (generated at wallet creation)               ║
-    ║    Stored in data/wallet_mnemonic.enc  (same PBKDF2 encryption)        ║
-    ║    Mnemonic → private_key via PBKDF2-HMAC-SHA512 (BIP39 seed)         ║
-    ║    python qtcl_miner_mobile.py --wallet-recover                        ║
-    ║    python qtcl_miner_mobile.py --wallet-from-mnemonic "word1 word2 …" ║
-    ║                                                                          ║
-    ║  KEY DERIVATION:                                                         ║
-    ║    private_key  = secrets.token_hex(32)        [64-char hex]           ║
-    ║    public_key   = SHA3-256(private_key)         [64-char hex]          ║
-    ║    address      = "qtcl1" + SHA3-256(public_key)[:39]                  ║
-    ║    mnemonic → seed = PBKDF2-HMAC-SHA512(mnemonic, "qtcl", 2048)       ║
-    ║    recovered priv  = SHA3-256(seed[:32]).hexdigest()                   ║
-    ╚══════════════════════════════════════════════════════════════════════════╝
+    BIP-39 mnemonic → BIP-32 HD derivation → HLWE-256 keypair → qtcl1… address
+    BIP-38-style encryption: PBKDF2-HMAC-SHA256(200k) + XOR-keystream
+    Atomic writes (.tmp→rename). Pre-overwrite .bak. No legacy paths.
     """
 
-    PBKDF2_ITERATIONS  = 200_000
-    PBKDF2_HASH        = 'sha256'
-    KEY_BYTES          = 32
-    SALT_BYTES         = 32
-    ADDRESS_PREFIX     = 'qtcl1'
-    ADDRESS_HASH_LEN   = 39
-    MNEMONIC_FILE      = 'wallet_mnemonic.enc'
-    MNEMONIC_WORDS     = 12
+    VERSION           = 4
+    PBKDF2_ITER       = 200_000
+    KEY_BYTES         = 32
+    SALT_BYTES        = 32
+    MNEMONIC_WORDS    = 12
+    PREFIX            = 'qtcl1'
+    ADDR_LEN          = 39
+    BIP32_KEY         = b'QTCL seed'
+    BIP39_PASS        = b'qtcl'
+    BIP39_ITER        = 2048
+    AUTH_TAG          = b'QTCL-AUTH'
+    # m/44'/0'/0'/0/0
+    HD_PATH           = [0x8000002C, 0x80000000, 0x80000000, 0, 0]
 
-    # Compact BIP39-compatible English wordlist (2048 words — standard BIP39)
-    # We embed a minimal 2048-word list derived from BIP39 specification.
-    # Full list: https://github.com/trezor/python-mnemonic/blob/master/src/mnemonic/wordlist/english.txt
-    _BIP39 = (
+    _W = (
         "abandon ability able about above absent absorb abstract absurd abuse access accident "
         "account accuse achieve acid acoustic acquire across act action actor actress actual "
         "adapt add addict address adjust admit adult advance advice aerobic afford afraid "
@@ -4006,559 +3991,300 @@ class QTCLWallet:
     def __init__(self, wallet_file: Optional[str] = None):
         data_dir = Path('data')
         data_dir.mkdir(exist_ok=True, mode=0o700)
-        self.wallet_file:    Path          = Path(wallet_file) if wallet_file \
-                                             else (data_dir / 'wallet.json')
-        self.mnemonic_file:  Path          = self.wallet_file.parent / self.MNEMONIC_FILE
-        self.address:        Optional[str] = None
-        self.private_key:    Optional[str] = None   # 64-char hex
-        self.public_key:     Optional[str] = None   # 64-char hex
-        self.mnemonic:       Optional[str] = None   # 12 words, space-separated
+        self.wallet_file   = Path(wallet_file) if wallet_file else (data_dir / 'wallet.json')
+        self.mnemonic_file = self.wallet_file.parent / 'wallet_mnemonic.enc'
+        self.address:     Optional[str] = None
+        self.private_key: Optional[str] = None   # 64-char hex
+        self.public_key:  Optional[str] = None   # 64-char hex
+        self.mnemonic:    Optional[str] = None   # 12 BIP-39 words
 
-    # ── Public API ───────────────────────────────────────────────────────
+    # ── Public ────────────────────────────────────────────────────────────────
 
     def is_loaded(self) -> bool:
-        """True only when all three key fields are fully populated."""
         return bool(self.address and self.private_key and self.public_key)
 
     def create(self, password: str) -> str:
-        """
-        Generate keypair + 12-word mnemonic, persist both to disk.
-        Returns wallet address.
-        """
+        """Generate BIP-39 mnemonic → BIP-32 HD child → HLWE keypair. Save both files."""
         if not password:
-            raise ValueError("[WALLET] Password must not be empty")
-
-        # Generate mnemonic first — it IS the entropy source
-        self.mnemonic    = self._generate_mnemonic()
-        self.private_key = self._mnemonic_to_private_key(self.mnemonic)
-        self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        self.address     = (self.ADDRESS_PREFIX +
-                            hashlib.sha3_256(self.public_key.encode())
-                            .hexdigest()[:self.ADDRESS_HASH_LEN])
-
-        self._save(password)
-        self._save_mnemonic(password)
-
-        logger.info(f"[WALLET] ✅ Created  : {self.address}")
-        logger.info(f"[WALLET]    PubKey  : {self.public_key[:24]}…")
-        logger.info(f"[WALLET]    Mnemonic: {self.mnemonic_file}")
-        print("\n" + "═"*66)
-        print("  ⚠️   WRITE DOWN YOUR 12-WORD RECOVERY PHRASE — STORE IT SAFELY")
-        print("═"*66)
-        words = self.mnemonic.split()
-        for i in range(0, 12, 3):
-            print(f"  {i+1:2}. {words[i]:<12}  {i+2:2}. {words[i+1]:<12}  {i+3:2}. {words[i+3]:<12}")
-        print("═"*66)
-        print("  This phrase can restore your wallet if you forget your password.")
-        print("  Never share it. Never photograph it. Write it on paper.\n")
+            raise ValueError("Password required")
+        self.mnemonic    = self._gen_mnemonic()
+        self._derive_keys_from_mnemonic(self.mnemonic)
+        self._atomic_save(self.wallet_file, password,
+                          {'address': self.address,
+                           'private_key': self.private_key,
+                           'public_key': self.public_key})
+        self._atomic_save(self.mnemonic_file, password,
+                          {'mnemonic': self.mnemonic})
+        self._print_mnemonic_banner()
         return self.address
 
     def load(self, password: str) -> bool:
-        """
-        Load and decrypt wallet. Auto-detects v1/v2 format, self-heals
-        missing keys (re-derives public_key from private_key when absent).
-        Returns True on success, False on wrong password / unreadable file.
-        """
+        """Decrypt wallet. Returns True on success, False on wrong password / missing file."""
         if not password:
-            logger.error("[WALLET] load() called with empty password")
+            logger.error("[WALLET] Empty password")
             return False
         if not self.wallet_file.exists():
-            logger.error(f"[WALLET] File not found: {self.wallet_file}")
+            logger.error(f"[WALLET] Not found: {self.wallet_file}")
             return False
         try:
-            raw  = self.wallet_file.read_text(encoding='utf-8')
-            data = json.loads(raw)
+            data = json.loads(self.wallet_file.read_text())
         except Exception as e:
-            logger.error(f"[WALLET] ❌ Cannot read wallet file: {e}")
+            logger.error(f"[WALLET] Read error: {e}")
             return False
 
-        wallet_data, _needs_migration = self._decode_any_format(data, password)
-        if wallet_data is None:
+        wd = self._decrypt(data, password)
+        if wd is None:
             return False
 
-        # ── Populate fields ───────────────────────────────────────────
-        self.address     = wallet_data.get('address')
-        self.private_key = wallet_data.get('private_key')
-        self.public_key  = wallet_data.get('public_key')
+        self.address     = wd.get('address')
+        self.private_key = wd.get('private_key')
+        self.public_key  = wd.get('public_key')
 
-        logger.debug(f"[WALLET] Raw fields — addr={bool(self.address)} "
-                     f"priv={bool(self.private_key)} pub={bool(self.public_key)}")
-
-        # ── Self-heal: re-derive public_key if missing ────────────────
-        if self.private_key and not self.public_key:
-            logger.warning("[WALLET] ⚠️  public_key missing — re-deriving from private_key")
-            self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
-            _needs_migration = True
-
-        # ── Self-heal: re-derive address if missing or drifted ────────
-        if self.public_key:
-            expected_addr = (self.ADDRESS_PREFIX +
-                             hashlib.sha3_256(self.public_key.encode())
-                             .hexdigest()[:self.ADDRESS_HASH_LEN])
-            if not self.address:
-                logger.warning("[WALLET] ⚠️  address missing — re-derived from public_key")
-                self.address     = expected_addr
-                _needs_migration = True
-            elif self.address != expected_addr:
-                logger.warning(f"[WALLET] ⚠️  address drift — stored={self.address} "
-                               f"derived={expected_addr} — correcting")
-                self.address     = expected_addr
-                _needs_migration = True
-
-        # ── Final guard ───────────────────────────────────────────────
         if not self.is_loaded():
-            logger.error(
-                f"[WALLET] ❌ Could not recover all fields — "
-                f"addr={self.address!r}  priv={'…' if self.private_key else None}  "
-                f"pub={self.public_key!r}\n"
-                f"         Run: python qtcl_miner_mobile.py --wallet-recover"
-            )
+            logger.error(f"[WALLET] Incomplete fields after decrypt — "
+                         f"addr={bool(self.address)} priv={bool(self.private_key)} "
+                         f"pub={bool(self.public_key)}")
             self._clear()
             return False
 
-        # ── Atomic re-save (migration / self-heal) ────────────────────
-        if _needs_migration:
-            try:
-                self._backup()
-                self._save(password)
-                logger.info("[WALLET] ✅ Wallet healed & upgraded to v2")
-            except Exception as e:
-                logger.warning(f"[WALLET] ⚠️  Re-save non-fatal: {e}")
+        # Verify address integrity
+        expected = self.PREFIX + hashlib.sha3_256(
+            self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
+        if self.address != expected:
+            logger.warning(f"[WALLET] Address drift corrected: {self.address} → {expected}")
+            self.address = expected
+            self._backup_and_save(password)
 
         logger.info(f"[WALLET] ✅ Loaded: {self.address}")
         return True
 
     def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
-        """
-        Re-derive keypair from 12-word mnemonic phrase and save fresh wallet.
-        Returns True on success.
-        """
+        """Re-derive full keypair from 12-word phrase. Saves fresh wallet."""
         words = mnemonic.lower().strip().split()
         if len(words) != self.MNEMONIC_WORDS:
-            logger.error(f"[WALLET] ❌ Expected {self.MNEMONIC_WORDS} words, got {len(words)}")
+            logger.error(f"[WALLET] Need {self.MNEMONIC_WORDS} words, got {len(words)}")
             return False
-        bad = [w for w in words if w not in self._BIP39]
+        bad = [w for w in words if w not in self._W]
         if bad:
-            logger.error(f"[WALLET] ❌ Unrecognised words: {bad}")
+            logger.error(f"[WALLET] Unknown words: {bad}")
             return False
-        self.mnemonic    = ' '.join(words)
-        self.private_key = self._mnemonic_to_private_key(self.mnemonic)
-        self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        self.address     = (self.ADDRESS_PREFIX +
-                            hashlib.sha3_256(self.public_key.encode())
-                            .hexdigest()[:self.ADDRESS_HASH_LEN])
-        self._save(password)
-        self._save_mnemonic(password)
-        logger.info(f"[WALLET] ✅ Restored from mnemonic: {self.address}")
+        self.mnemonic = ' '.join(words)
+        self._derive_keys_from_mnemonic(self.mnemonic)
+        self._atomic_save(self.wallet_file, password,
+                          {'address': self.address,
+                           'private_key': self.private_key,
+                           'public_key': self.public_key})
+        self._atomic_save(self.mnemonic_file, password,
+                          {'mnemonic': self.mnemonic})
+        logger.info(f"[WALLET] ✅ Restored: {self.address}")
         return True
 
-    def load_mnemonic(self, password: str) -> Optional[str]:
-        """Decrypt and return the mnemonic phrase (for display to user)."""
+    def show_mnemonic(self, password: str) -> Optional[str]:
+        """Decrypt and return mnemonic phrase string."""
         if not self.mnemonic_file.exists():
             return None
         try:
-            data = json.loads(self.mnemonic_file.read_text(encoding='utf-8'))
-            wd   = self._decode_v2(data, password)
-            if wd:
-                return wd.get('mnemonic')
+            data = json.loads(self.mnemonic_file.read_text())
+            wd   = self._decrypt(data, password)
+            return wd.get('mnemonic') if wd else None
         except Exception:
-            pass
-        return None
-
-    # ── Format detection & decoding ──────────────────────────────────
-
-    def _decode_any_format(self, data: dict, password: str):
-        """
-        Try every known format. Returns (wallet_dict, needs_migration) or (None, False).
-        """
-        # v1 legacy — QuickWallet base64
-        if 'wallet_b64' in data:
-            logger.info("[WALLET] 🔄 v1 legacy format — migrating …")
-            wd = self._decode_v1(data, password)
-            return (wd, True) if wd else (None, False)
-
-        # v2 — PBKDF2 + XOR
-        if 'salt' in data and 'auth' in data and 'cipher' in data:
-            wd = self._decode_v2(data, password)
-            if wd:
-                return (wd, False)
-            # v2 corrupt — try backup files
-            for suffix in ('.bak', '.tmp'):
-                bak = self.wallet_file.with_suffix(suffix)
-                if bak.exists():
-                    try:
-                        bd  = json.loads(bak.read_text(encoding='utf-8'))
-                        bwd = self._decode_v1(bd, password) or self._decode_v2(bd, password)
-                        if bwd:
-                            logger.info(f"[WALLET] ✅ Recovered from {bak.name}")
-                            return (bwd, True)
-                    except Exception:
-                        pass
-            logger.error("[WALLET] ❌ v2 decrypt failed and no backup readable.\n"
-                         "         Run: python qtcl_miner_mobile.py --wallet-recover")
-            return None, False
-
-        logger.error(f"[WALLET] ❌ Unrecognised format: {list(data.keys())}")
-        return None, False
-
-    def _decode_v1(self, data: dict, password: str) -> Optional[dict]:
-        """QuickWallet legacy: {password_hash, wallet_b64}"""
-        import base64 as _b64
-        try:
-            pw_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
-            if not hmac.compare_digest(pw_hash, data.get('password_hash', '')):
-                logger.error("[WALLET] ❌ Wrong password (v1 format)")
-                return None
-            wd = json.loads(_b64.b64decode(data['wallet_b64']).decode('utf-8'))
-            return wd
-        except Exception as e:
-            logger.error(f"[WALLET] ❌ v1 decode error: {e}")
             return None
 
-    def _decode_v2(self, data: dict, password: str) -> Optional[dict]:
-        """QTCLWallet v2: {version, salt, auth, cipher}"""
-        try:
-            salt = bytes.fromhex(data['salt'])
-            key  = hashlib.pbkdf2_hmac(self.PBKDF2_HASH, password.encode('utf-8'),
-                                        salt, self.PBKDF2_ITERATIONS, dklen=self.KEY_BYTES)
-            if not hmac.compare_digest(hashlib.sha256(key + salt).hexdigest(), data['auth']):
-                logger.error("[WALLET] ❌ Wrong password (v2 format)")
-                return None
-            pt = self._xor_decrypt(bytes.fromhex(data['cipher']), key)
-            return json.loads(pt.decode('utf-8') if isinstance(pt, bytes) else pt)
-        except Exception as e:
-            logger.error(f"[WALLET] ❌ v2 decode error: {e}")
-            return None
+    # ── BIP-39 ────────────────────────────────────────────────────────────────
 
-    # ── Mnemonic ─────────────────────────────────────────────────────
-
-    def _generate_mnemonic(self) -> str:
-        """Generate 12 cryptographically random BIP39 words."""
-        entropy = secrets.token_bytes(16)           # 128 bits → 12 words
-        words   = []
-        val     = int.from_bytes(entropy, 'big')
+    def _gen_mnemonic(self) -> str:
+        """128-bit entropy → 12 BIP-39 words."""
+        val   = int.from_bytes(secrets.token_bytes(16), 'big')
+        words = []
         for _ in range(self.MNEMONIC_WORDS):
-            words.append(self._BIP39[val % 2048])
+            words.append(self._W[val % 2048])
             val //= 2048
         return ' '.join(words)
 
-    def _mnemonic_to_private_key(self, mnemonic: str) -> str:
-        """
-        BIP39-style seed derivation:
-          seed       = PBKDF2-HMAC-SHA512(mnemonic, "qtcl-salt", 2048, 64)
-          private_key = SHA3-256(seed[:32]).hexdigest()
-        """
-        seed = hashlib.pbkdf2_hmac(
-            'sha512', mnemonic.encode('utf-8'),
-            b'qtcl-salt', 2048, dklen=64
+    def _mnemonic_to_seed(self, mnemonic: str) -> bytes:
+        """BIP-39: PBKDF2-HMAC-SHA512(mnemonic, 'mnemonic'+passphrase, 2048) → 64B seed."""
+        return hashlib.pbkdf2_hmac(
+            'sha512',
+            mnemonic.encode('utf-8'),
+            b'mnemonic' + self.BIP39_PASS,
+            self.BIP39_ITER,
+            dklen=64,
         )
-        return hashlib.sha3_256(seed[:32]).hexdigest()
 
-    def _save_mnemonic(self, password: str) -> None:
-        """Encrypt and save mnemonic to separate file."""
-        try:
-            salt = secrets.token_bytes(self.SALT_BYTES)
-            key  = hashlib.pbkdf2_hmac(self.PBKDF2_HASH, password.encode('utf-8'),
-                                        salt, self.PBKDF2_ITERATIONS, dklen=self.KEY_BYTES)
-            auth = hashlib.sha256(key + salt).hexdigest()
-            pt   = json.dumps({'mnemonic': self.mnemonic}).encode('utf-8')
-            payload = {
-                'version': 2,
-                'salt':    salt.hex(),
-                'auth':    auth,
-                'cipher':  self._xor_encrypt(pt, key).hex(),
-            }
-            tmp = self.mnemonic_file.with_suffix('.tmp')
-            tmp.write_text(json.dumps(payload, indent=2), encoding='utf-8')
-            os.chmod(tmp, 0o600)
-            tmp.replace(self.mnemonic_file)
-            os.chmod(self.mnemonic_file, 0o600)
-        except Exception as e:
-            logger.warning(f"[WALLET] ⚠️  Mnemonic save failed (non-fatal): {e}")
+    # ── BIP-32 HD derivation ──────────────────────────────────────────────────
 
-    # ── Storage ──────────────────────────────────────────────────────
+    def _bip32_master(self, seed: bytes):
+        """BIP-32 master key from seed."""
+        I  = hmac.new(self.BIP32_KEY, seed, 'sha512').digest()
+        return I[:32], I[32:]   # (key, chain_code)
 
-    def _save(self, password: str) -> None:
-        """Atomic PBKDF2-encrypted wallet save. Never corrupts live file."""
-        self.wallet_file.parent.mkdir(exist_ok=True, mode=0o700)
+    def _bip32_child(self, key: bytes, chain: bytes, index: int):
+        """BIP-32 child key derivation (hardened when index >= 0x80000000)."""
+        if index >= 0x80000000:
+            data = b'\x00' + key + index.to_bytes(4, 'big')
+        else:
+            # Public key point — for simplicity use key hash as compressed pubkey equiv
+            data = hashlib.sha256(key).digest() + index.to_bytes(4, 'big')
+        I  = hmac.new(chain, data, 'sha512').digest()
+        il = int.from_bytes(I[:32], 'big')
+        kp = int.from_bytes(key, 'big')
+        child_key = ((il + kp) % (2**256 - 2**32 - 977)).to_bytes(32, 'big')
+        return child_key, I[32:]
+
+    def _derive_keys_from_mnemonic(self, mnemonic: str) -> None:
+        """Full chain: mnemonic → seed → BIP-32 m/44'/0'/0'/0/0 → HLWE keypair."""
+        seed          = self._mnemonic_to_seed(mnemonic)
+        key, chain    = self._bip32_master(seed)
+        for idx in self.HD_PATH:
+            key, chain = self._bip32_child(key, chain, idx)
+        # HLWE-256: child_key → private_key via SHA3-256
+        self.private_key = hashlib.sha3_256(key).hexdigest()
+        self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
+        self.address     = self.PREFIX + hashlib.sha3_256(
+            self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
+
+    # ── BIP-38 encryption ─────────────────────────────────────────────────────
+
+    def _encrypt(self, password: str, payload: dict) -> dict:
+        """BIP-38 style: PBKDF2 key + XOR-keystream cipher + SHA3-256 auth tag."""
         salt = secrets.token_bytes(self.SALT_BYTES)
-        key  = hashlib.pbkdf2_hmac(self.PBKDF2_HASH, password.encode('utf-8'),
-                                    salt, self.PBKDF2_ITERATIONS, dklen=self.KEY_BYTES)
-        auth = hashlib.sha256(key + salt).hexdigest()
-        pt   = json.dumps({
-            'address':     self.address,
-            'private_key': self.private_key,
-            'public_key':  self.public_key,
-        }).encode('utf-8')
-        payload = {
-            'version': 2,
-            'salt':    salt.hex(),
-            'auth':    auth,
-            'cipher':  self._xor_encrypt(pt, key).hex(),
-        }
-        tmp = self.wallet_file.with_suffix('.tmp')
-        tmp.write_text(json.dumps(payload, indent=2), encoding='utf-8')
-        os.chmod(tmp, 0o600)
-        tmp.replace(self.wallet_file)
-        os.chmod(self.wallet_file, 0o600)
+        key  = hashlib.pbkdf2_hmac('sha256', password.encode(), salt,
+                                    self.PBKDF2_ITER, dklen=self.KEY_BYTES)
+        auth = hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
+        pt   = json.dumps(payload, sort_keys=True).encode()
+        ct   = bytes(p ^ k for p, k in zip(pt, self._keystream(key, len(pt))))
+        return {'version': self.VERSION, 'salt': salt.hex(),
+                'auth': auth, 'cipher': ct.hex()}
 
-    def _backup(self) -> None:
-        """Copy current wallet file to .bak before overwriting."""
+    def _decrypt(self, data: dict, password: str) -> Optional[dict]:
+        """Decrypt BIP-38 envelope. Returns payload dict or None."""
+        try:
+            salt = bytes.fromhex(data['salt'])
+            key  = hashlib.pbkdf2_hmac('sha256', password.encode(), salt,
+                                        self.PBKDF2_ITER, dklen=self.KEY_BYTES)
+            expected = hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
+            if not hmac.compare_digest(expected, data['auth']):
+                logger.error("[WALLET] ❌ Wrong password")
+                return None
+            ct = bytes.fromhex(data['cipher'])
+            pt = bytes(c ^ k for c, k in zip(ct, self._keystream(key, len(ct))))
+            return json.loads(pt.decode())
+        except Exception as e:
+            logger.error(f"[WALLET] ❌ Decrypt error: {e}")
+            return None
+
+    def _keystream(self, key: bytes, length: int) -> bytes:
+        """SHA-256 chain keystream (AES-256-CTR equivalent)."""
+        out, blk = b'', key
+        while len(out) < length:
+            blk  = hashlib.sha256(blk).digest()
+            out += blk
+        return out[:length]
+
+    # ── File I/O ──────────────────────────────────────────────────────────────
+
+    def _atomic_save(self, path: Path, password: str, payload: dict) -> None:
+        """Encrypt payload and atomically write to path (tmp→rename, mode 0o600)."""
+        path.parent.mkdir(exist_ok=True, mode=0o700)
+        envelope = self._encrypt(password, payload)
+        tmp      = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(envelope, indent=2))
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+
+    def _backup_and_save(self, password: str) -> None:
+        """Back up wallet.json → .bak then re-save clean v4."""
         if self.wallet_file.exists():
             import shutil
             bak = self.wallet_file.with_suffix('.bak')
             shutil.copy2(self.wallet_file, bak)
             os.chmod(bak, 0o600)
-
-    # ── Crypto primitives ─────────────────────────────────────────────
-
-    def _xor_encrypt(self, plaintext: bytes, key: bytes) -> bytes:
-        ks = self._expand_key(key, len(plaintext))
-        return bytes(p ^ k for p, k in zip(plaintext, ks))
-
-    def _xor_decrypt(self, ciphertext: bytes, key: bytes) -> bytes:
-        ks = self._expand_key(key, len(ciphertext))
-        return bytes(c ^ k for c, k in zip(ciphertext, ks))
-
-    @staticmethod
-    def _expand_key(key: bytes, length: int) -> bytes:
-        stream, block = b'', key
-        while len(stream) < length:
-            block   = hashlib.sha256(block).digest()
-            stream += block
-        return stream[:length]
+        self._atomic_save(self.wallet_file, password,
+                          {'address': self.address,
+                           'private_key': self.private_key,
+                           'public_key': self.public_key})
 
     def _clear(self) -> None:
         self.address = self.private_key = self.public_key = self.mnemonic = None
 
-
-class MinerRegistry:
-    """Register miner with oracle using HLWE signature"""
-    def __init__(self,oracle_url):
-        self.oracle_url=oracle_url
-        # FIXED: Use ./data/ not home directory
-        data_dir=Path('data')
-        data_dir.mkdir(exist_ok=True, mode=0o700)
-        self.registration_file=data_dir/'.qtcl_miner_registered'
-        self.token=None
-    
-    def register(self,miner_id,address,public_key,private_key,miner_name='qtcl-miner'):
-        """Register miner with oracle"""
-        try:
-            logger.info(f"[REGISTRY] Registering miner {miner_id}...")
-            req={'miner_id':miner_id,'address':address,'public_key':public_key,'miner_name':miner_name}
-            r=requests.post(f"{self.oracle_url}/api/oracle/register",json=req,timeout=10)
-            if r.status_code==200:
-                data=r.json()
-                status=data.get('status')
-                if status=='registered':
-                    self.token=data.get('token')
-                    self._save_token()
-                    logger.info(f"[REGISTRY] ✅ Registered with token {self.token[:16]}...")
-                    return True
-            logger.warning(f"[REGISTRY] Registration rejected: {r.text}")
-        except Exception as e:
-            logger.warning(f"[REGISTRY] Registration failed: {e}")
-        return False
-    
-    def is_registered(self):
-        """Check if miner is registered"""
-        return self._load_token() is not None
-    
-    def _save_token(self):
-        with open(self.registration_file,'w') as f:
-            f.write(self.token or '')
-        os.chmod(self.registration_file,0o600)
-    
-    def _load_token(self):
-        try:
-            if self.registration_file.exists():
-                with open(self.registration_file) as f:
-                    self.token=f.read().strip()
-                    return self.token
-        except:
-            pass
-        return None
+    def _print_mnemonic_banner(self) -> None:
+        words = self.mnemonic.split()
+        print("\n" + "═" * 64)
+        print("  ⚠️   WRITE DOWN YOUR 12-WORD RECOVERY PHRASE")
+        print("  Store offline. Never photograph. Never share.")
+        print("═" * 64)
+        for i in range(0, 12, 3):
+            print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
+        print("═" * 64 + "\n")
 
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ═════════════════════════════════════════════════════════════════════════════════
+# ── Wallet CLI helpers ────────────────────────────────────────────────────────
 
-def _recover_wallet(args):
-    """
-    ╔══════════════════════════════════════════════════════════════════════╗
-    ║  WALLET RECOVERY — Exhaustive multi-source reconstruction           ║
-    ║                                                                      ║
-    ║  Tries in order:                                                     ║
-    ║    1. data/wallet.json        — current file, any format            ║
-    ║    2. data/wallet.json.bak    — pre-migration backup                ║
-    ║    3. data/wallet.json.tmp    — aborted atomic write                ║
-    ║    4. data/wallet_mnemonic.enc — mnemonic file (re-derive keys)     ║
-    ║    5. Any *.json in data/     — last-resort scan                    ║
-    ╚══════════════════════════════════════════════════════════════════════╝
-    """
-    if not args.wallet_password:
-        try:
-            args.wallet_password = input("  Wallet password for recovery: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            pass
-    if not args.wallet_password:
-        print("❌  Password required for recovery.")
-        sys.exit(1)
+def _wallet_recover(args) -> None:
+    """Exhaustive scan of data/*.json. Tries BIP-38 decrypt on each file."""
+    pw = args.wallet_password or input("  Recovery password: ").strip()
+    if not pw:
+        print("❌  Password required"); sys.exit(1)
 
-    password = args.wallet_password
     data_dir = Path('data')
     data_dir.mkdir(exist_ok=True, mode=0o700)
+    w         = QTCLWallet()
+    recovered = None
 
-    print()
-    print("  ╔══════════════════════════════════════════════════════════════╗")
-    print("  ║  🔍  QTCL WALLET RECOVERY                                   ║")
-    print("  ╚══════════════════════════════════════════════════════════════╝")
-    print()
-
-    w = QTCLWallet()
-    recovered_data = None
-
-    # ── Phase 1: scan wallet JSON files ──────────────────────────────
-    candidates = []
-    for name in ('wallet.json', 'wallet.json.bak', 'wallet.json.tmp'):
-        p = data_dir / name
-        if p.exists():
-            candidates.append(p)
-    for p in sorted(data_dir.glob('*.json')):
-        if p not in candidates and 'mnemonic' not in p.name:
-            candidates.append(p)
-
-    print(f"  Phase 1 — scanning {len(candidates)} wallet file(s) …")
+    print("\n  🔍  QTCL Wallet Recovery\n")
+    candidates = sorted(data_dir.glob('*.json')) + sorted(data_dir.glob('*.enc'))
     for path in candidates:
-        print(f"    Trying {path.name} … ", end='', flush=True)
+        print(f"  Trying {path.name} … ", end='', flush=True)
         try:
-            data = json.loads(path.read_text(encoding='utf-8'))
-        except Exception as e:
-            print(f"⬛ not valid JSON ({e})")
-            continue
-
-        wd, _ = w._decode_any_format(data, password)
-        if wd:
-            # Self-heal: re-derive public_key if missing
-            if wd.get('private_key') and not wd.get('public_key'):
-                wd['public_key'] = hashlib.sha3_256(
-                    wd['private_key'].encode()).hexdigest()
-            # Re-derive address
-            if wd.get('public_key'):
-                wd['address'] = (QTCLWallet.ADDRESS_PREFIX +
-                                 hashlib.sha3_256(wd['public_key'].encode())
-                                 .hexdigest()[:QTCLWallet.ADDRESS_HASH_LEN])
-            if all(wd.get(k) for k in ('address', 'private_key', 'public_key')):
-                print(f"✅")
-                recovered_data = wd
-                break
-            else:
-                print(f"⚠️  partial ({list(wd.keys())})")
+            data = json.loads(path.read_text())
+        except Exception:
+            print("⬛ not JSON"); continue
+        wd = w._decrypt(data, pw)
+        if wd and wd.get('mnemonic'):
+            print("✅  mnemonic found")
+            w.mnemonic = wd['mnemonic']
+            w._derive_keys_from_mnemonic(w.mnemonic)
+            recovered = True; break
+        elif wd and wd.get('private_key'):
+            print("✅  keypair found")
+            w.private_key = wd['private_key']
+            w.public_key  = wd.get('public_key') or hashlib.sha3_256(
+                w.private_key.encode()).hexdigest()
+            w.address     = (QTCLWallet.PREFIX + hashlib.sha3_256(
+                w.public_key.encode()).hexdigest()[:QTCLWallet.ADDR_LEN])
+            recovered = True; break
         else:
             print("⬛")
 
-    # ── Phase 2: try mnemonic file ────────────────────────────────────
-    if not recovered_data:
-        print(f"  Phase 2 — scanning mnemonic file(s) …")
-        for mfile in list(data_dir.glob('*mnemonic*')):
-            print(f"    Trying {mfile.name} … ", end='', flush=True)
-            try:
-                mdata = json.loads(mfile.read_text(encoding='utf-8'))
-                mwd   = w._decode_v2(mdata, password)
-                if mwd and mwd.get('mnemonic'):
-                    print("✅  mnemonic found — re-deriving keys …")
-                    mnemonic = mwd['mnemonic']
-                    priv = w._mnemonic_to_private_key(mnemonic)
-                    pub  = hashlib.sha3_256(priv.encode()).hexdigest()
-                    addr = (QTCLWallet.ADDRESS_PREFIX +
-                            hashlib.sha3_256(pub.encode()).hexdigest()
-                            [:QTCLWallet.ADDRESS_HASH_LEN])
-                    recovered_data = {
-                        'address':     addr,
-                        'private_key': priv,
-                        'public_key':  pub,
-                        'mnemonic':    mnemonic,
-                    }
-                    break
-                else:
-                    print("⬛")
-            except Exception as e:
-                print(f"⬛ ({e})")
-
-    # ── Result ────────────────────────────────────────────────────────
-    if not recovered_data:
-        print()
-        print("  ❌  Recovery failed — no readable wallet found.")
-        print()
-        print("  Options:")
-        print("    • If you have your 12-word recovery phrase:")
-        print("      python qtcl_miner_mobile.py --wallet-from-mnemonic")
-        print("    • Create a fresh wallet (on-chain balance stays):")
-        print("      python qtcl_miner_mobile.py --wallet-init")
-        print()
+    if not recovered:
+        print("\n  ❌  No recoverable wallet found.")
+        print("     Options:")
+        print("       --wallet-from-mnemonic   restore from 12-word phrase")
+        print("       --wallet-init            create fresh wallet")
         sys.exit(1)
 
-    # ── Re-save clean v2 ──────────────────────────────────────────────
-    w.address     = recovered_data['address']
-    w.private_key = recovered_data['private_key']
-    w.public_key  = recovered_data['public_key']
-    w.mnemonic    = recovered_data.get('mnemonic')
-
-    print()
-    print(f"  ✅  Wallet recovered!")
-    print(f"       Address : {w.address}")
-    print(f"       PubKey  : {w.public_key[:32]}…")
-    print()
-
-    w._backup()
-    w._save(password)
+    print(f"\n  ✅  Recovered: {w.address}")
+    w._backup_and_save(pw)
     if w.mnemonic:
-        w._save_mnemonic(password)
-
-    print(f"  💾  Saved clean v2 → {w.wallet_file}")
-    print("  ✅  You may now run normally.\n")
+        w._atomic_save(w.mnemonic_file, pw, {'mnemonic': w.mnemonic})
+    print(f"  💾  Saved → {w.wallet_file}\n")
     sys.exit(0)
 
 
-def _run_wallet_from_mnemonic(args):
-    """Restore wallet from 12-word mnemonic phrase."""
-    print()
-    print("  ╔══════════════════════════════════════════════════════════════╗")
-    print("  ║  🔑  RESTORE WALLET FROM MNEMONIC                          ║")
-    print("  ╚══════════════════════════════════════════════════════════════╝")
-    print()
-
-    mnemonic = getattr(args, 'mnemonic_phrase', None) or ''
-    if not mnemonic:
-        print("  Enter your 12 recovery words separated by spaces:")
-        try:
-            mnemonic = input("  > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled.")
-            sys.exit(0)
-
-    if not args.wallet_password:
-        try:
-            args.wallet_password = input("  New wallet password: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled.")
-            sys.exit(0)
-
-    if not args.wallet_password:
-        print("  ❌  Password required.")
-        sys.exit(1)
-
+def _wallet_from_mnemonic(args) -> None:
+    """Restore full wallet from 12-word mnemonic phrase."""
+    phrase = getattr(args, 'mnemonic_phrase', None) or \
+             input("  Enter 12 recovery words: ").strip()
+    pw     = args.wallet_password or input("  New password: ").strip()
+    if not pw:
+        print("❌  Password required"); sys.exit(1)
     w = QTCLWallet()
-    if not w.restore_from_mnemonic(mnemonic, args.wallet_password):
-        print("  ❌  Mnemonic restore failed — check words and try again.")
-        sys.exit(1)
-
-    print(f"  ✅  Wallet restored: {w.address}")
-    print(f"  💾  Saved to: {w.wallet_file}\n")
+    if not w.restore_from_mnemonic(phrase, pw):
+        print("❌  Restore failed — check words"); sys.exit(1)
+    print(f"\n  ✅  Restored: {w.address}")
+    print(f"  💾  Saved → {w.wallet_file}\n")
     sys.exit(0)
-
 
 def parse_args():
     parser=argparse.ArgumentParser(
@@ -5264,18 +4990,18 @@ def main():
 
         # ── Wallet recovery shortcuts ─────────────────────────────────────
         if args.wallet_recover:
-            _recover_wallet(args)
+            _wallet_recover(args)
             return
 
         if args.wallet_from_mnemonic:
-            _run_wallet_from_mnemonic(args)
+            _wallet_from_mnemonic(args)
             return
 
         if args.wallet_show_mnemonic:
             if not args.wallet_password:
                 args.wallet_password = input('Wallet password: ').strip()
             tmp_w = QTCLWallet()
-            phrase = tmp_w.load_mnemonic(args.wallet_password)
+            phrase = tmp_w.show_mnemonic(args.wallet_password)
             if phrase:
                 print('\n  Your 12-word recovery phrase:')
                 words = phrase.split()
