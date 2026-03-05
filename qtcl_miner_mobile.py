@@ -3867,7 +3867,9 @@ class QTCLWallet:
     def load(self, password: str) -> bool:
         """
         Load and decrypt wallet from disk.
-        Returns True on success, False on wrong password or missing file.
+        Auto-detects legacy v1 (QuickWallet base64) and v2 (QTCLWallet PBKDF2) formats.
+        Migrates v1 → v2 on successful load so subsequent loads use the secure path.
+        Returns True on success, False on wrong password / missing file / corrupt data.
         Never raises — all errors are caught and logged.
         """
         if not password:
@@ -3877,40 +3879,48 @@ class QTCLWallet:
             logger.error(f"[WALLET] File not found: {self.wallet_file}")
             return False
         try:
-            raw = self.wallet_file.read_text(encoding='utf-8')
+            raw  = self.wallet_file.read_text(encoding='utf-8')
             data = json.loads(raw)
 
-            salt_hex  = data['salt']
-            auth_hex  = data['auth']
-            cipher_hex = data['cipher']
+            # ── Format detection ──────────────────────────────────────
+            #   v1 legacy  →  keys: password_hash, wallet_b64
+            #   v2 current →  keys: version=2, salt, auth, cipher
+            if 'wallet_b64' in data:
+                wallet_data = self._load_legacy_v1(data, password)
+                if wallet_data is None:
+                    return False
+                self.address     = wallet_data['address']
+                self.private_key = wallet_data['private_key']
+                self.public_key  = wallet_data['public_key']
+                # Migrate to v2 in-place so next load uses the secure path
+                logger.info("[WALLET] 🔄 Legacy v1 format detected — migrating to v2 …")
+                self._save(password)
+                logger.info("[WALLET] ✅ Migration to v2 complete")
+            else:
+                # v2 path
+                salt       = bytes.fromhex(data['salt'])
+                auth_hex   = data['auth']
+                cipher_hex = data['cipher']
 
-            salt = bytes.fromhex(salt_hex)
+                key = hashlib.pbkdf2_hmac(
+                    self.PBKDF2_HASH,
+                    password.encode('utf-8'),
+                    salt,
+                    self.PBKDF2_ITERATIONS,
+                    dklen=self.KEY_BYTES,
+                )
+                expected_auth = hashlib.sha256(key + salt).hexdigest()
+                if not hmac.compare_digest(expected_auth, auth_hex):
+                    logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
+                    return False
 
-            # Derive key
-            key = hashlib.pbkdf2_hmac(
-                self.PBKDF2_HASH,
-                password.encode('utf-8'),
-                salt,
-                self.PBKDF2_ITERATIONS,
-                dklen=self.KEY_BYTES,
-            )
+                plaintext    = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
+                wallet_data  = json.loads(plaintext)
+                self.address     = wallet_data['address']
+                self.private_key = wallet_data['private_key']
+                self.public_key  = wallet_data['public_key']
 
-            # Verify auth tag before decrypting — reject wrong password fast
-            expected_auth = hashlib.sha256(key + salt).hexdigest()
-            if not hmac.compare_digest(expected_auth, auth_hex):
-                logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
-                return False
-
-            # Decrypt (XOR keystream)
-            plaintext = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
-            wallet_data = json.loads(plaintext)
-
-            # Populate fields
-            self.address     = wallet_data['address']
-            self.private_key = wallet_data['private_key']
-            self.public_key  = wallet_data['public_key']
-
-            # Integrity: re-derive address from stored public key
+            # ── Integrity check (both paths) ──────────────────────────
             expected_addr = (
                 self.ADDRESS_PREFIX +
                 hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDRESS_HASH_LEN]
@@ -3936,6 +3946,28 @@ class QTCLWallet:
             logger.error(f"[WALLET] ❌ Unexpected load error: {e}")
             self._clear()
             return False
+
+    def _load_legacy_v1(self, data: dict, password: str) -> Optional[dict]:
+        """
+        Decode a legacy QuickWallet v1 file.
+        Format: { password_hash: sha256(password).hex(), wallet_b64: base64(json) }
+        Returns decoded wallet dict on success, None on wrong password or corrupt data.
+        """
+        import base64 as _b64
+        try:
+            pw_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
+            if not hmac.compare_digest(pw_hash, data.get('password_hash', '')):
+                logger.error("[WALLET] ❌ Wrong password (legacy v1 format)")
+                return None
+            wallet_data = json.loads(_b64.b64decode(data['wallet_b64']).decode('utf-8'))
+            required = ('address', 'private_key', 'public_key')
+            if not all(k in wallet_data for k in required):
+                logger.error("[WALLET] ❌ Legacy v1 wallet missing required fields")
+                return None
+            return wallet_data
+        except Exception as e:
+            logger.error(f"[WALLET] ❌ Legacy v1 decode error: {e}")
+            return None
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
