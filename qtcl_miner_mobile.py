@@ -4230,13 +4230,13 @@ def _run_transaction_wizard(args, wallet):
         f"{wallet.address}{to_addr}{amount}{time.time()}".encode()).hexdigest()
     payload = {
         'tx_id':       tx_id,
-        'from_address': wallet.address,
-        'to_address':   to_addr,
-        'amount':       amount,
-        'fee':          fee,
-        'memo':         memo,
-        'timestamp':    int(time.time()),
-        'public_key':   wallet.public_key,
+        'from':        wallet.address,
+        'to':          to_addr,
+        'amount':      amount,
+        'fee':         fee,
+        'memo':        memo,
+        'timestamp':   int(time.time()),
+        'public_key':  wallet.public_key,
     }
 
     # HLWE-256 signature: commitment = SHA3-256(payload), witness = SHA3-256(priv+commit)
@@ -4436,6 +4436,13 @@ def main():
                 logger.error(f"[WALLET-KEYS] ❌ Display failed: {e}")
                 sys.exit(1)
             return
+        
+        # ── Check for --wallet-show-private without --wallet-show-keys ─────────
+        if getattr(args, "wallet_show_private", False):
+            print("\n❌ ERROR: --wallet-show-private requires --wallet-show-keys flag")
+            print("\nCorrect usage:")
+            print("  python qtcl_miner_enhanced.py --wallet-show-keys --wallet-show-private --wallet-password <PASSWORD>\n")
+            sys.exit(1)
 
         # ── Load wallet ───────────────────────────────────────────────────────
         wallet = QTCLWallet()
