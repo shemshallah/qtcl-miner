@@ -104,9 +104,7 @@ message WStateSnapshot { uint64 timestamp_ns = 1; string oracle_address = 2; str
 """
 
 def _compile_grpc_client_proto():
-    global _GRPC_CLIENT_AVAILABLE, _grpc_client_mod, _wstate_pb2_client, _wstate_pb2_grpc_client
-    try:
-        # gRPC client removed
+    pass  # gRPC client removed - using SSE
 # ── end gRPC client init ──────────────────────────────────────────────────────
 
 try:
@@ -1761,7 +1759,8 @@ class GRPCSnapshotStream:
             return self.latest_snapshot
 
 
-# MinerWebSocketP2PClient removed
+# MinerWebSocketP2PClient removed - using SSE
+
 class P2PClientWStateRecovery:
     """
     P2P client-side W-state recovery with HLWE signature verification.
@@ -1780,7 +1779,10 @@ class P2PClientWStateRecovery:
         self.strict_verification=strict_signature_verification
         
         # ✅ Initialize WebSocket P2P client (NEW)
-        # WebSocket removed: 
+        self.ws_client=None
+        if SOCKETIO_AVAILABLE:
+            try:
+                # WebSocket client removed
                 logger.info("[W-STATE] 🌐 WebSocket P2P client initialized")
             except Exception as e:
                 logger.warning(f"[W-STATE] WebSocket initialization failed: {e}")
@@ -1861,8 +1863,66 @@ class P2PClientWStateRecovery:
             except Exception as e:
                 logger.warning(f"[W-STATE] ⚠️  WebSocket registration error: {e} - falling back to HTTP")
         
-        # HTTP fallback removed - SSE only
-def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
+        # ── HTTP fallback: warm up server first, then register ───────────────
+        # Koyeb cold starts can add 10-20s of latency on first request.
+        # Ping /api/blocks/tip (cheap GET) until the server responds before
+        # hitting the register endpoint — prevents burning all retry attempts
+        # on cold-start timeouts.
+        logger.info("[W-STATE] 🌡️  Pre-warming server before HTTP registration…")
+        deadline = time.time() + 25
+        warmup_attempt = 0
+        while time.time() < deadline:
+            warmup_attempt += 1
+            try:
+                r = requests.get(f"{self.oracle_url}/api/blocks/tip", timeout=5)
+                if r.status_code < 500:
+                    logger.info(f"[W-STATE] ✅ Server warm (HTTP {r.status_code}) after {warmup_attempt} ping(s)")
+                    break
+            except Exception:
+                pass
+            wait = min(2 ** (warmup_attempt - 1), 8)
+            logger.info(f"[W-STATE] ⏳ Server not ready — waiting {wait}s…")
+            time.sleep(wait)
+
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                url = f"{self.oracle_url}/api/oracle/register"
+                # Timeout: 8s on first attempt (server should now be warm),
+                # increase to 15s on retries to absorb any residual lag.
+                timeout = 8 if attempt == 0 else 15
+                response = requests.post(
+                    url,
+                    json={"miner_id": self.peer_id, "address": self.miner_address, "public_key": self.peer_id},
+                    timeout=timeout,
+                )
+
+                if response.status_code in [200, 201]:
+                    data = response.json()
+                    self.oracle_address = data.get('miner_id', self.peer_id)
+                    if self.oracle_address:
+                        self.trusted_oracles.add(self.oracle_address)
+                        logger.info(f"[W-STATE] ✅ Registered with oracle (HTTP) | miner_id={self.oracle_address[:20]}…")
+                    return True
+                else:
+                    logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} failed: {response.status_code}")
+
+            except requests.Timeout:
+                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} timeout after {timeout}s")
+            except Exception as e:
+                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} error: {e}")
+
+            # Backoff: 2s, 4s, 8s, 8s (skip 1s — server is already warm)
+            if attempt < max_attempts - 1:
+                delay_sec = min(2 ** (attempt + 1), 8)
+                logger.info(f"[W-STATE] 🔄 Retrying registration in {delay_sec}s…")
+                time.sleep(delay_sec)
+
+        logger.error(f"[W-STATE] ❌ Registration failed after {max_attempts} attempts - continuing with graceful degradation")
+        # Return True to allow recovery to proceed with cached/synthetic snapshots
+        return True
+    
+    def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
         """Download latest W-state snapshot.
 
         Priority:
