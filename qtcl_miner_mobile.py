@@ -3889,76 +3889,120 @@ class QTCLWallet:
 
             if 'wallet_b64' in data:
                 # ── v1 legacy path ────────────────────────────────────
-                logger.info("[WALLET] 🔄 Legacy v1 format detected — migrating to v2 …")
+                logger.info("[WALLET] 🔄 Legacy v1 format detected — will migrate to v2")
                 wallet_data = self._load_legacy_v1(data, password)
                 if wallet_data is None:
                     return False
                 _needs_migration = True
-            else:
+
+            elif data.get('version') == 2 or ('salt' in data and 'auth' in data and 'cipher' in data):
                 # ── v2 current path ───────────────────────────────────
-                salt       = bytes.fromhex(data['salt'])
-                auth_hex   = data['auth']
-                cipher_hex = data['cipher']
+                try:
+                    salt       = bytes.fromhex(data['salt'])
+                    auth_hex   = data['auth']
+                    cipher_hex = data['cipher']
 
-                key = hashlib.pbkdf2_hmac(
-                    self.PBKDF2_HASH,
-                    password.encode('utf-8'),
-                    salt,
-                    self.PBKDF2_ITERATIONS,
-                    dklen=self.KEY_BYTES,
-                )
-                expected_auth = hashlib.sha256(key + salt).hexdigest()
-                if not hmac.compare_digest(expected_auth, auth_hex):
-                    logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
-                    return False
+                    key = hashlib.pbkdf2_hmac(
+                        self.PBKDF2_HASH,
+                        password.encode('utf-8'),
+                        salt,
+                        self.PBKDF2_ITERATIONS,
+                        dklen=self.KEY_BYTES,
+                    )
+                    expected_auth = hashlib.sha256(key + salt).hexdigest()
+                    if not hmac.compare_digest(expected_auth, auth_hex):
+                        logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
+                        return False
 
-                plaintext   = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
-                wallet_data = json.loads(plaintext)
+                    plaintext   = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
+                    wallet_data = json.loads(plaintext.decode('utf-8')
+                                             if isinstance(plaintext, bytes) else plaintext)
+                except Exception as v2_err:
+                    logger.error(f"[WALLET] ❌ v2 decrypt failed: {v2_err}")
+                    # v2 file may be corrupt from a previous interrupted write —
+                    # check if a v1 backup exists (wallet.json.bak)
+                    bak = self.wallet_file.with_suffix('.bak')
+                    if bak.exists():
+                        logger.warning("[WALLET] ⚠️  Trying backup wallet file …")
+                        try:
+                            bak_data = json.loads(bak.read_text(encoding='utf-8'))
+                            if 'wallet_b64' in bak_data:
+                                wallet_data = self._load_legacy_v1(bak_data, password)
+                                if wallet_data:
+                                    _needs_migration = True
+                                    logger.info("[WALLET] ✅ Recovered from backup")
+                                else:
+                                    logger.error("[WALLET] ❌ Backup load failed — wrong password")
+                                    return False
+                            else:
+                                logger.error("[WALLET] ❌ Backup format unrecognised")
+                                return False
+                        except Exception as bak_err:
+                            logger.error(f"[WALLET] ❌ Backup read failed: {bak_err}")
+                            return False
+                    else:
+                        logger.error(
+                            "[WALLET] ❌ Wallet file corrupt (incomplete v2 migration).\n"
+                            "  Recovery options:\n"
+                            "    1. python qtcl_miner_mobile.py --wallet-recover  "
+                            "(attempts reconstruction from recoverable data)\n"
+                            "    2. Restore the original data/wallet.json from backup\n"
+                            "    3. Run --wallet-init for a fresh wallet "
+                            "(balance is preserved on-chain)"
+                        )
+                        return False
+            else:
+                logger.error(f"[WALLET] ❌ Unrecognised wallet format (keys: {list(data.keys())})")
+                return False
 
-            # ── Populate fields (both paths) ──────────────────────────
+            # ── Populate fields ───────────────────────────────────────
             self.address     = wallet_data.get('address')
             self.private_key = wallet_data.get('private_key')
             self.public_key  = wallet_data.get('public_key')
 
+            logger.debug(f"[WALLET] Fields: address={bool(self.address)} "
+                         f"private_key={bool(self.private_key)} "
+                         f"public_key={bool(self.public_key)}")
+
             # ── Integrity check ───────────────────────────────────────
             if not self.is_loaded():
-                logger.error("[WALLET] ❌ Wallet fields incomplete — file may be corrupt")
+                logger.error(
+                    f"[WALLET] ❌ Wallet fields incomplete after decode — "
+                    f"address={self.address!r} pub={self.public_key!r}"
+                )
                 self._clear()
                 return False
 
-            # Re-derive expected address from public_key and verify
             expected_addr = (
                 self.ADDRESS_PREFIX +
                 hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDRESS_HASH_LEN]
             )
             if self.address != expected_addr:
-                # Legacy wallets may have used a different derivation path —
-                # re-derive and correct the address rather than failing
                 logger.warning(
-                    f"[WALLET] ⚠️  Address mismatch — re-deriving from public key "
-                    f"(was: {self.address}  now: {expected_addr})"
+                    f"[WALLET] ⚠️  Stored address differs from derived — correcting. "
+                    f"stored={self.address}  derived={expected_addr}"
                 )
                 self.address = expected_addr
-                _needs_migration = True   # force re-save with corrected address
+                _needs_migration = True
 
-            # ── Migrate v1 → v2 AFTER all fields are verified ─────────
+            # ── Atomic migrate/re-save AFTER all fields verified ──────
             if _needs_migration:
                 try:
+                    # Back up original before overwriting
+                    bak = self.wallet_file.with_suffix('.bak')
+                    import shutil
+                    shutil.copy2(self.wallet_file, bak)
                     self._save(password)
-                    logger.info("[WALLET] ✅ Migration to v2 complete — wallet upgraded")
+                    logger.info(f"[WALLET] ✅ Upgraded to v2  (backup → {bak.name})")
                 except Exception as mig_err:
-                    # Migration failure is non-fatal: wallet is loaded in memory
-                    logger.warning(f"[WALLET] ⚠️  Migration save failed (non-fatal): {mig_err}")
+                    logger.warning(f"[WALLET] ⚠️  Migration save non-fatal: {mig_err}")
 
             logger.info(f"[WALLET] ✅ Loaded: {self.address}")
             return True
 
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            logger.error(f"[WALLET] ❌ Parse error: {e}")
-            self._clear()
-            return False
         except Exception as e:
             logger.error(f"[WALLET] ❌ Unexpected load error: {e}")
+            import traceback as _tb; logger.debug(_tb.format_exc())
             self._clear()
             return False
 
@@ -3987,7 +4031,11 @@ class QTCLWallet:
     # ── Internal helpers ─────────────────────────────────────────────────
 
     def _save(self, password: str) -> None:
-        """Encrypt and persist wallet to disk (mode 0o600)."""
+        """
+        Encrypt and atomically persist wallet to disk (mode 0o600).
+        Writes to a .tmp file first then renames — guarantees the wallet
+        file is never left in a partial/corrupt state even if interrupted.
+        """
         try:
             self.wallet_file.parent.mkdir(exist_ok=True, mode=0o700)
 
@@ -4000,9 +4048,7 @@ class QTCLWallet:
                 dklen=self.KEY_BYTES,
             )
 
-            # Auth tag = SHA-256(key || salt)  — verified on load before decrypt
-            auth_hex = hashlib.sha256(key + salt).hexdigest()
-
+            auth_hex   = hashlib.sha256(key + salt).hexdigest()
             plaintext  = json.dumps({
                 'address':     self.address,
                 'private_key': self.private_key,
@@ -4016,11 +4062,14 @@ class QTCLWallet:
                 'auth':     auth_hex,
                 'cipher':   cipher_hex,
             }
-            self.wallet_file.write_text(
-                json.dumps(payload, indent=2), encoding='utf-8'
-            )
-            os.chmod(self.wallet_file, 0o600)
-            logger.debug(f"[WALLET] 💾 Saved to {self.wallet_file}")
+            serialised = json.dumps(payload, indent=2)
+
+            # Atomic write: tmp → rename
+            tmp_path = self.wallet_file.with_suffix('.tmp')
+            tmp_path.write_text(serialised, encoding='utf-8')
+            os.chmod(tmp_path, 0o600)
+            tmp_path.replace(self.wallet_file)   # atomic on POSIX
+            logger.debug(f"[WALLET] 💾 Saved (atomic) → {self.wallet_file}")
         except Exception as e:
             logger.error(f"[WALLET] ❌ Save failed: {e}")
             raise
@@ -4105,6 +4154,124 @@ class MinerRegistry:
 # MAIN ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════════
 
+def _recover_wallet(args):
+    """
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  WALLET RECOVERY — Tries every known format to resurrect a wallet  ║
+    ║                                                                      ║
+    ║  Attempts in order:                                                  ║
+    ║    1. data/wallet.json       (current file, any format)             ║
+    ║    2. data/wallet.json.bak   (backup written before migration)      ║
+    ║    3. data/wallet.json.tmp   (atomic-write temp, if rename failed)  ║
+    ║    4. Any *.json in data/    (last resort scan)                     ║
+    ║                                                                      ║
+    ║  On success: re-saves as clean v2 and exits 0.                     ║
+    ║  On failure: prints actionable guidance and exits 1.                ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+    """
+    import glob
+
+    if not args.wallet_password:
+        args.wallet_password = input("Wallet password for recovery: ").strip()
+    if not args.wallet_password:
+        print("❌  Password required for recovery.")
+        sys.exit(1)
+
+    password  = args.wallet_password
+    data_dir  = Path('data')
+    candidates = []
+
+    # Ordered candidate list
+    for name in ('wallet.json', 'wallet.json.bak', 'wallet.json.tmp'):
+        p = data_dir / name
+        if p.exists():
+            candidates.append(p)
+
+    # Last-resort: any .json in data/
+    for p in sorted(data_dir.glob('*.json')):
+        if p not in candidates:
+            candidates.append(p)
+
+    print(f"\n  🔍  Wallet recovery — scanning {len(candidates)} candidate file(s) …\n")
+
+    recovered = None
+    for path in candidates:
+        print(f"  Trying: {path}")
+        try:
+            raw  = path.read_text(encoding='utf-8')
+            data = json.loads(raw)
+        except Exception as e:
+            print(f"    ⬛ Not valid JSON: {e}")
+            continue
+
+        wallet_data = None
+
+        # Try v1
+        if 'wallet_b64' in data:
+            pw_hash = hashlib.sha256(password.encode()).hexdigest()
+            if hmac.compare_digest(pw_hash, data.get('password_hash', '')):
+                try:
+                    import base64 as _b64
+                    wallet_data = json.loads(_b64.b64decode(data['wallet_b64']).decode())
+                    print(f"    ✅ Decoded as v1 legacy format")
+                except Exception as e:
+                    print(f"    ⚠️  v1 decode error: {e}")
+            else:
+                print(f"    ⬛ v1 — wrong password")
+
+        # Try v2
+        elif 'salt' in data and 'auth' in data and 'cipher' in data:
+            try:
+                salt = bytes.fromhex(data['salt'])
+                key  = hashlib.pbkdf2_hmac('sha256', password.encode(), salt,
+                                            QTCLWallet.PBKDF2_ITERATIONS,
+                                            dklen=QTCLWallet.KEY_BYTES)
+                if hmac.compare_digest(hashlib.sha256(key + salt).hexdigest(), data['auth']):
+                    w = QTCLWallet()
+                    pt = w._xor_decrypt(bytes.fromhex(data['cipher']), key)
+                    wallet_data = json.loads(pt.decode() if isinstance(pt, bytes) else pt)
+                    print(f"    ✅ Decoded as v2 format")
+                else:
+                    print(f"    ⬛ v2 — wrong password")
+            except Exception as e:
+                print(f"    ⚠️  v2 decode error: {e}")
+
+        else:
+            print(f"    ⬛ Unrecognised format: {list(data.keys())}")
+            continue
+
+        if wallet_data and all(wallet_data.get(k) for k in ('address','private_key','public_key')):
+            recovered = wallet_data
+            print(f"\n  ✅  Recovered wallet from {path}!")
+            print(f"       address     : {recovered['address']}")
+            print(f"       public_key  : {recovered['public_key'][:24]}…")
+            break
+
+    if not recovered:
+        print("\n  ❌  Recovery failed — no readable wallet found.")
+        print("     Your keys may still exist on-chain. Options:")
+        print("     • Run --wallet-init to create a new wallet")
+        print("       (your existing QTCL balance stays at your old address on-chain)")
+        print("     • If you wrote down your private key, contact support for manual restore")
+        sys.exit(1)
+
+    # Re-save recovered wallet as clean v2
+    w = QTCLWallet()
+    w.address     = recovered['address']
+    w.private_key = recovered['private_key']
+    w.public_key  = recovered['public_key']
+    # Re-derive address from public key to correct any drift
+    expected = QTCLWallet.ADDRESS_PREFIX + hashlib.sha3_256(
+        w.public_key.encode()).hexdigest()[:QTCLWallet.ADDRESS_HASH_LEN]
+    if w.address != expected:
+        print(f"  ⚠️   Address corrected: {w.address} → {expected}")
+        w.address = expected
+    w._save(password)
+    print(f"\n  💾  Wallet re-saved as clean v2 → {w.wallet_file}")
+    print(f"  ✅  Recovery complete. You may now run normally.\n")
+    sys.exit(0)
+
+
 def parse_args():
     parser=argparse.ArgumentParser(
         description='⚛️  QTCL Full Node — W-State Entangled Mining & HLWE-Secured Transactions',
@@ -4139,6 +4306,7 @@ def parse_args():
                         help='Reject marginal W-states during mining')
     # ── Wallet ────────────────────────────────────────────────────────────
     parser.add_argument('--wallet-init',action='store_true',help='Generate and persist a new wallet')
+    parser.add_argument('--wallet-recover',action='store_true',help='Attempt to recover a corrupt wallet file')
     parser.add_argument('--wallet-password',help='Wallet encryption password')
     # ── Registration ──────────────────────────────────────────────────────
     parser.add_argument('--register',action='store_true',help='Register miner with oracle')
@@ -4801,6 +4969,10 @@ def main():
             logger.info(f"[WALLET]    PubKey  : {w.public_key}")
             logger.info(f"[WALLET]    File    : {w.wallet_file}")
             return
+
+        # ── Wallet recovery shortcut ──────────────────────────────────────────
+        if args.wallet_recover:
+            _recover_wallet(args)
 
         # ── Oracle registration shortcut ──────────────────────────────────────
         if args.register:
