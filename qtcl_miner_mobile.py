@@ -50,20 +50,9 @@
 ║  │ • Track mining rewards & entanglement metrics                     │                                                                ║
 ║  └────────────────────────────────────────────────────────────────────┘                                                                ║
 ║                                                                                                                                            ║
-║  USAGE:                                                                                                                                 ║
-║    python qtcl_miner_mobile.py                          → interactive prompt: choose [1] Mine  [2] Transact                           ║
-║    python qtcl_miner_mobile.py --mode mine              → start W-state entangled mining immediately                                  ║
-║    python qtcl_miner_mobile.py --mode transact          → open HLWE-secured transaction wizard                                        ║
-║    python qtcl_miner_mobile.py --address qtcl1…         → supply address directly (skips wallet load prompt)                          ║
-║    python qtcl_miner_mobile.py --wallet-init            → generate & persist a new QTCL wallet                                        ║
+║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url https://oracle.example.com/socket.io                            ║
 ║                                                                                                                                            ║
-║  TRANSACTION SECURITY:                                                                                                                  ║
-║    • HLWE-256 post-quantum signature (commitment / witness / proof triple)                                                             ║
-║    • W-state entropy sourced from live oracle snapshot                                                                                 ║
-║    • SHA3-256 canonical tx hash  •  PBKDF2-HMAC-SHA256 key derivation                                                                 ║
-║    • Local signature verification before broadcast                                                                                     ║
-║                                                                                                                                            ║
-║  This is PERFECTION. Museum-grade quantum node. Deploy with absolute confidence.                                                       ║
+║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
 ║                                                                                                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
@@ -3810,31 +3799,26 @@ class QTCLFullNode:
 # WALLET & REGISTRATION (Integrated)
 # ═════════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# QTCL WALLET v4 — BIP-39/38/32 + HLWE-256 Post-Quantum Auth
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class QTCLWallet:
     """
-    BIP-39 mnemonic → BIP-32 HD derivation → HLWE-256 keypair → qtcl1… address
-    BIP-38-style encryption: PBKDF2-HMAC-SHA256(200k) + XOR-keystream
+    BIP-39 mnemonic → BIP-32 HD derivation → HLWE-256 keypair.
+    BIP-38 encryption: PBKDF2-HMAC-SHA256(200k) + XOR-keystream.
     Atomic writes (.tmp→rename). Pre-overwrite .bak. No legacy paths.
     """
+    VERSION        = 4
+    PBKDF2_ITER    = 200_000
+    KEY_BYTES      = 32
+    SALT_BYTES     = 32
+    MNEMONIC_WORDS = 12
+    PREFIX         = 'qtcl1'
+    ADDR_LEN       = 39
+    BIP32_KEY      = b'QTCL seed'
+    BIP39_PASS     = b'qtcl'
+    BIP39_ITER     = 2048
+    AUTH_TAG       = b'QTCL-AUTH'
+    HD_PATH        = [0x8000002C, 0x80000000, 0x80000000, 0, 0]
 
-    VERSION           = 4
-    PBKDF2_ITER       = 200_000
-    KEY_BYTES         = 32
-    SALT_BYTES        = 32
-    MNEMONIC_WORDS    = 12
-    PREFIX            = 'qtcl1'
-    ADDR_LEN          = 39
-    BIP32_KEY         = b'QTCL seed'
-    BIP39_PASS        = b'qtcl'
-    BIP39_ITER        = 2048
-    AUTH_TAG          = b'QTCL-AUTH'
-    # m/44'/0'/0'/0/0
-    HD_PATH           = [0x8000002C, 0x80000000, 0x80000000, 0, 0]
-
+    # QTCL mnemonic wordlist — 1893 BIP-39 compatible words (130-bit entropy per 12-word phrase)
     _W = (
         "abandon ability able about above absent absorb abstract absurd abuse access accident "
         "account accuse achieve acid acoustic acquire across act action actor actress actual "
@@ -3988,1173 +3972,427 @@ class QTCLWallet:
         "young youth zebra zero zone zoo"
     ).split()
 
-    def __init__(self, wallet_file: Optional[str] = None):
+    def __init__(self, wallet_file=None):
         data_dir = Path('data')
         data_dir.mkdir(exist_ok=True, mode=0o700)
         self.wallet_file   = Path(wallet_file) if wallet_file else (data_dir / 'wallet.json')
         self.mnemonic_file = self.wallet_file.parent / 'wallet_mnemonic.enc'
         self.address:     Optional[str] = None
-        self.private_key: Optional[str] = None   # 64-char hex
-        self.public_key:  Optional[str] = None   # 64-char hex
-        self.mnemonic:    Optional[str] = None   # 12 BIP-39 words
+        self.private_key: Optional[str] = None
+        self.public_key:  Optional[str] = None
+        self.mnemonic:    Optional[str] = None
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    def is_loaded(self): return bool(self.address and self.private_key and self.public_key)
 
-    def is_loaded(self) -> bool:
-        return bool(self.address and self.private_key and self.public_key)
-
-    def create(self, password: str) -> str:
-        """Generate BIP-39 mnemonic → BIP-32 HD child → HLWE keypair. Save both files."""
-        if not password:
-            raise ValueError("Password required")
+    def create(self, password):
+        if not password: raise ValueError("Password required")
         self.mnemonic    = self._gen_mnemonic()
-        self._derive_keys_from_mnemonic(self.mnemonic)
+        self._derive_keys(self.mnemonic)
         self._atomic_save(self.wallet_file, password,
-                          {'address': self.address,
-                           'private_key': self.private_key,
-                           'public_key': self.public_key})
-        self._atomic_save(self.mnemonic_file, password,
-                          {'mnemonic': self.mnemonic})
-        self._print_mnemonic_banner()
+                          {'address':self.address,'private_key':self.private_key,'public_key':self.public_key})
+        self._atomic_save(self.mnemonic_file, password, {'mnemonic':self.mnemonic})
+        self._print_mnemonic()
         return self.address
 
-    def load(self, password: str) -> bool:
-        """Decrypt wallet. Returns True on success, False on wrong password / missing file."""
-        if not password:
-            logger.error("[WALLET] Empty password")
-            return False
-        if not self.wallet_file.exists():
-            logger.error(f"[WALLET] Not found: {self.wallet_file}")
-            return False
+    def load(self, password):
+        if not password or not self.wallet_file.exists(): return False
         try:
             data = json.loads(self.wallet_file.read_text())
         except Exception as e:
-            logger.error(f"[WALLET] Read error: {e}")
-            return False
-
+            logger.error(f"[WALLET] Read error: {e}"); return False
         wd = self._decrypt(data, password)
-        if wd is None:
-            return False
-
+        if wd is None: return False
         self.address     = wd.get('address')
         self.private_key = wd.get('private_key')
         self.public_key  = wd.get('public_key')
-
+        # self-heal: re-derive public_key if missing
+        if self.private_key and not self.public_key:
+            self.public_key = hashlib.sha3_256(self.private_key.encode()).hexdigest()
+            self._backup(); self._atomic_save(self.wallet_file, password,
+                {'address':self.address,'private_key':self.private_key,'public_key':self.public_key})
         if not self.is_loaded():
-            logger.error(f"[WALLET] Incomplete fields after decrypt — "
-                         f"addr={bool(self.address)} priv={bool(self.private_key)} "
-                         f"pub={bool(self.public_key)}")
-            self._clear()
-            return False
-
-        # Verify address integrity
-        expected = self.PREFIX + hashlib.sha3_256(
-            self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
-        if self.address != expected:
-            logger.warning(f"[WALLET] Address drift corrected: {self.address} → {expected}")
-            self.address = expected
-            self._backup_and_save(password)
-
+            logger.error(f"[WALLET] Incomplete fields after decrypt"); self._clear(); return False
+        # verify address integrity
+        exp = self.PREFIX + hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
+        if self.address != exp:
+            self.address = exp; self._backup()
+            self._atomic_save(self.wallet_file, password,
+                {'address':self.address,'private_key':self.private_key,'public_key':self.public_key})
         logger.info(f"[WALLET] ✅ Loaded: {self.address}")
         return True
 
-    def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
-        """Re-derive full keypair from 12-word phrase. Saves fresh wallet."""
+    def restore_from_mnemonic(self, mnemonic, password):
         words = mnemonic.lower().strip().split()
-        if len(words) != self.MNEMONIC_WORDS:
-            logger.error(f"[WALLET] Need {self.MNEMONIC_WORDS} words, got {len(words)}")
-            return False
-        bad = [w for w in words if w not in self._W]
-        if bad:
-            logger.error(f"[WALLET] Unknown words: {bad}")
-            return False
+        if len(words) != self.MNEMONIC_WORDS: return False
+        if any(w not in self._W for w in words): return False
         self.mnemonic = ' '.join(words)
-        self._derive_keys_from_mnemonic(self.mnemonic)
+        self._derive_keys(self.mnemonic)
         self._atomic_save(self.wallet_file, password,
-                          {'address': self.address,
-                           'private_key': self.private_key,
-                           'public_key': self.public_key})
-        self._atomic_save(self.mnemonic_file, password,
-                          {'mnemonic': self.mnemonic})
-        logger.info(f"[WALLET] ✅ Restored: {self.address}")
+                          {'address':self.address,'private_key':self.private_key,'public_key':self.public_key})
+        self._atomic_save(self.mnemonic_file, password, {'mnemonic':self.mnemonic})
         return True
 
-    def show_mnemonic(self, password: str) -> Optional[str]:
-        """Decrypt and return mnemonic phrase string."""
-        if not self.mnemonic_file.exists():
-            return None
+    def show_mnemonic(self, password):
+        if not self.mnemonic_file.exists(): return None
         try:
-            data = json.loads(self.mnemonic_file.read_text())
-            wd   = self._decrypt(data, password)
+            wd = self._decrypt(json.loads(self.mnemonic_file.read_text()), password)
             return wd.get('mnemonic') if wd else None
-        except Exception:
-            return None
+        except Exception: return None
 
-    # ── BIP-39 ────────────────────────────────────────────────────────────────
+    # BIP-39
+    def _gen_mnemonic(self):
+        return ' '.join(self._W[secrets.randbelow(len(self._W))] for _ in range(self.MNEMONIC_WORDS))
 
-    def _gen_mnemonic(self) -> str:
-        """Generate 12 cryptographically random words (130-bit entropy, 1893-word QTCL wordlist)."""
-        return ' '.join(self._W[secrets.randbelow(len(self._W))]
-                        for _ in range(self.MNEMONIC_WORDS))
+    def _mnemonic_to_seed(self, mnemonic):
+        return hashlib.pbkdf2_hmac('sha512', mnemonic.encode(),
+                                    b'mnemonic' + self.BIP39_PASS, self.BIP39_ITER, dklen=64)
 
-    def _mnemonic_to_seed(self, mnemonic: str) -> bytes:
-        """BIP-39: PBKDF2-HMAC-SHA512(mnemonic, 'mnemonic'+passphrase, 2048) → 64B seed."""
-        return hashlib.pbkdf2_hmac(
-            'sha512',
-            mnemonic.encode('utf-8'),
-            b'mnemonic' + self.BIP39_PASS,
-            self.BIP39_ITER,
-            dklen=64,
-        )
+    # BIP-32
+    def _bip32_master(self, seed):
+        I = hmac.new(self.BIP32_KEY, seed, 'sha512').digest()
+        return I[:32], I[32:]
 
-    # ── BIP-32 HD derivation ──────────────────────────────────────────────────
-
-    def _bip32_master(self, seed: bytes):
-        """BIP-32 master key from seed."""
-        I  = hmac.new(self.BIP32_KEY, seed, 'sha512').digest()
-        return I[:32], I[32:]   # (key, chain_code)
-
-    def _bip32_child(self, key: bytes, chain: bytes, index: int):
-        """BIP-32 child key derivation (hardened when index >= 0x80000000)."""
-        if index >= 0x80000000:
-            data = b'\x00' + key + index.to_bytes(4, 'big')
-        else:
-            # Public key point — for simplicity use key hash as compressed pubkey equiv
-            data = hashlib.sha256(key).digest() + index.to_bytes(4, 'big')
+    def _bip32_child(self, key, chain, index):
+        data = (b'\x00' + key + index.to_bytes(4,'big')) if index >= 0x80000000 \
+               else (hashlib.sha256(key).digest() + index.to_bytes(4,'big'))
         I  = hmac.new(chain, data, 'sha512').digest()
-        il = int.from_bytes(I[:32], 'big')
-        kp = int.from_bytes(key, 'big')
-        child_key = ((il + kp) % (2**256 - 2**32 - 977)).to_bytes(32, 'big')
-        return child_key, I[32:]
+        ck = ((int.from_bytes(I[:32],'big') + int.from_bytes(key,'big'))
+               % (2**256 - 2**32 - 977)).to_bytes(32,'big')
+        return ck, I[32:]
 
-    def _derive_keys_from_mnemonic(self, mnemonic: str) -> None:
-        """Full chain: mnemonic → seed → BIP-32 m/44'/0'/0'/0/0 → HLWE keypair."""
-        seed          = self._mnemonic_to_seed(mnemonic)
-        key, chain    = self._bip32_master(seed)
+    def _derive_keys(self, mnemonic):
+        seed       = self._mnemonic_to_seed(mnemonic)
+        key, chain = self._bip32_master(seed)
         for idx in self.HD_PATH:
             key, chain = self._bip32_child(key, chain, idx)
-        # HLWE-256: child_key → private_key via SHA3-256
         self.private_key = hashlib.sha3_256(key).hexdigest()
         self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
         self.address     = self.PREFIX + hashlib.sha3_256(
             self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
 
-    # ── BIP-38 encryption ─────────────────────────────────────────────────────
-
-    def _encrypt(self, password: str, payload: dict) -> dict:
-        """BIP-38 style: PBKDF2 key + XOR-keystream cipher + SHA3-256 auth tag."""
+    # BIP-38 encryption
+    def _encrypt(self, password, payload):
         salt = secrets.token_bytes(self.SALT_BYTES)
         key  = hashlib.pbkdf2_hmac('sha256', password.encode(), salt,
                                     self.PBKDF2_ITER, dklen=self.KEY_BYTES)
         auth = hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
         pt   = json.dumps(payload, sort_keys=True).encode()
-        ct   = bytes(p ^ k for p, k in zip(pt, self._keystream(key, len(pt))))
-        return {'version': self.VERSION, 'salt': salt.hex(),
-                'auth': auth, 'cipher': ct.hex()}
+        ct   = bytes(p ^ k for p, k in zip(pt, self._ks(key, len(pt))))
+        return {'version':self.VERSION,'salt':salt.hex(),'auth':auth,'cipher':ct.hex()}
 
-    def _decrypt(self, data: dict, password: str) -> Optional[dict]:
-        """Decrypt BIP-38 envelope. Returns payload dict or None."""
+    def _decrypt(self, data, password):
         try:
             salt = bytes.fromhex(data['salt'])
             key  = hashlib.pbkdf2_hmac('sha256', password.encode(), salt,
                                         self.PBKDF2_ITER, dklen=self.KEY_BYTES)
-            expected = hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
-            if not hmac.compare_digest(expected, data['auth']):
-                logger.error("[WALLET] ❌ Wrong password")
-                return None
+            if not hmac.compare_digest(
+                    hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest(), data['auth']):
+                logger.error("[WALLET] ❌ Wrong password"); return None
             ct = bytes.fromhex(data['cipher'])
-            pt = bytes(c ^ k for c, k in zip(ct, self._keystream(key, len(ct))))
-            return json.loads(pt.decode())
+            return json.loads(bytes(c^k for c,k in zip(ct, self._ks(key,len(ct)))).decode())
         except Exception as e:
-            logger.error(f"[WALLET] ❌ Decrypt error: {e}")
-            return None
+            logger.error(f"[WALLET] ❌ Decrypt: {e}"); return None
 
-    def _keystream(self, key: bytes, length: int) -> bytes:
-        """SHA-256 chain keystream (AES-256-CTR equivalent)."""
+    def _ks(self, key, length):
         out, blk = b'', key
-        while len(out) < length:
-            blk  = hashlib.sha256(blk).digest()
-            out += blk
+        while len(out) < length: blk = hashlib.sha256(blk).digest(); out += blk
         return out[:length]
 
-    # ── File I/O ──────────────────────────────────────────────────────────────
-
-    def _atomic_save(self, path: Path, password: str, payload: dict) -> None:
-        """Encrypt payload and atomically write to path (tmp→rename, mode 0o600)."""
+    # I/O
+    def _atomic_save(self, path, password, payload):
         path.parent.mkdir(exist_ok=True, mode=0o700)
-        envelope = self._encrypt(password, payload)
-        tmp      = path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(envelope, indent=2))
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        os.chmod(path, 0o600)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self._encrypt(password, payload), indent=2))
+        os.chmod(tmp, 0o600); tmp.replace(path); os.chmod(path, 0o600)
 
-    def _backup_and_save(self, password: str) -> None:
-        """Back up wallet.json → .bak then re-save clean v4."""
+    def _backup(self):
         if self.wallet_file.exists():
             import shutil
             bak = self.wallet_file.with_suffix('.bak')
-            shutil.copy2(self.wallet_file, bak)
-            os.chmod(bak, 0o600)
-        self._atomic_save(self.wallet_file, password,
-                          {'address': self.address,
-                           'private_key': self.private_key,
-                           'public_key': self.public_key})
+            shutil.copy2(self.wallet_file, bak); os.chmod(bak, 0o600)
 
-    def _clear(self) -> None:
-        self.address = self.private_key = self.public_key = self.mnemonic = None
+    def _clear(self): self.address = self.private_key = self.public_key = self.mnemonic = None
 
-    def _print_mnemonic_banner(self) -> None:
+    def _print_mnemonic(self):
         words = self.mnemonic.split()
-        print("\n" + "═" * 64)
+        print("\n" + "═"*60)
         print("  ⚠️   WRITE DOWN YOUR 12-WORD RECOVERY PHRASE")
         print("  Store offline. Never photograph. Never share.")
-        print("═" * 64)
+        print("═"*60)
         for i in range(0, 12, 3):
             print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
-        print("═" * 64 + "\n")
+        print("═"*60 + "\n")
 
-
-# ── Wallet CLI helpers ────────────────────────────────────────────────────────
-
-def _wallet_recover(args) -> None:
-    """Exhaustive scan of data/*.json. Tries BIP-38 decrypt on each file."""
-    pw = args.wallet_password or input("  Recovery password: ").strip()
-    if not pw:
-        print("❌  Password required"); sys.exit(1)
-
-    data_dir = Path('data')
-    data_dir.mkdir(exist_ok=True, mode=0o700)
-    w         = QTCLWallet()
-    recovered = None
-
-    print("\n  🔍  QTCL Wallet Recovery\n")
-    candidates = sorted(data_dir.glob('*.json')) + sorted(data_dir.glob('*.enc'))
-    for path in candidates:
-        print(f"  Trying {path.name} … ", end='', flush=True)
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            print("⬛ not JSON"); continue
-        wd = w._decrypt(data, pw)
-        if wd and wd.get('mnemonic'):
-            print("✅  mnemonic found")
-            w.mnemonic = wd['mnemonic']
-            w._derive_keys_from_mnemonic(w.mnemonic)
-            recovered = True; break
-        elif wd and wd.get('private_key'):
-            print("✅  keypair found")
-            w.private_key = wd['private_key']
-            w.public_key  = wd.get('public_key') or hashlib.sha3_256(
-                w.private_key.encode()).hexdigest()
-            w.address     = (QTCLWallet.PREFIX + hashlib.sha3_256(
-                w.public_key.encode()).hexdigest()[:QTCLWallet.ADDR_LEN])
-            recovered = True; break
-        else:
-            print("⬛")
-
-    if not recovered:
-        print("\n  ❌  No recoverable wallet found.")
-        print("     Options:")
-        print("       --wallet-from-mnemonic   restore from 12-word phrase")
-        print("       --wallet-init            create fresh wallet")
-        sys.exit(1)
-
-    print(f"\n  ✅  Recovered: {w.address}")
-    w._backup_and_save(pw)
-    if w.mnemonic:
-        w._atomic_save(w.mnemonic_file, pw, {'mnemonic': w.mnemonic})
-    print(f"  💾  Saved → {w.wallet_file}\n")
-    sys.exit(0)
-
-
-def _wallet_from_mnemonic(args) -> None:
-    """Restore full wallet from 12-word mnemonic phrase."""
-    phrase = getattr(args, 'mnemonic_phrase', None) or \
-             input("  Enter 12 recovery words: ").strip()
-    pw     = args.wallet_password or input("  New password: ").strip()
-    if not pw:
-        print("❌  Password required"); sys.exit(1)
-    w = QTCLWallet()
-    if not w.restore_from_mnemonic(phrase, pw):
-        print("❌  Restore failed — check words"); sys.exit(1)
-    print(f"\n  ✅  Restored: {w.address}")
-    print(f"  💾  Saved → {w.wallet_file}\n")
-    sys.exit(0)
 
 class MinerRegistry:
     """Register miner with oracle. Token stored in data/.qtcl_registered."""
+    def __init__(self, oracle_url):
+        self.oracle_url  = oracle_url
+        self._tok_file   = Path('data') / '.qtcl_registered'
+        self._tok_file.parent.mkdir(exist_ok=True, mode=0o700)
+        self.token       = self._load_token()
 
-    def __init__(self, oracle_url: str):
-        self.oracle_url       = oracle_url
-        self._token_file      = Path('data') / '.qtcl_registered'
-        self._token_file.parent.mkdir(exist_ok=True, mode=0o700)
-        self.token: Optional[str] = self._load_token()
-
-    def register(self, miner_id: str, address: str, public_key: str,
-                 private_key: str, miner_name: str = 'qtcl-miner') -> bool:
+    def register(self, miner_id, address, public_key, private_key, miner_name='qtcl-miner'):
         try:
-            r = requests.post(
-                f"{self.oracle_url}/api/oracle/register",
-                json={'miner_id': miner_id, 'address': address,
-                      'public_key': public_key, 'miner_name': miner_name},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if data.get('status') == 'registered':
-                    self.token = data.get('token', '')
-                    self._save_token()
-                    logger.info(f"[REGISTRY] ✅ Registered — token {self.token[:16]}…")
-                    return True
-            logger.warning(f"[REGISTRY] Rejected: {r.text[:120]}")
+            r = requests.post(f"{self.oracle_url}/api/oracle/register",
+                json={'miner_id':miner_id,'address':address,
+                      'public_key':public_key,'miner_name':miner_name}, timeout=10)
+            if r.status_code == 200 and r.json().get('status') == 'registered':
+                self.token = r.json().get('token','')
+                self._tok_file.write_text(self.token); os.chmod(self._tok_file, 0o600)
+                logger.info(f"[REGISTRY] ✅ Registered token={self.token[:16]}…")
+                return True
+            logger.warning(f"[REGISTRY] Rejected: {r.text[:80]}")
         except Exception as e:
             logger.warning(f"[REGISTRY] Failed: {e}")
         return False
 
-    def is_registered(self) -> bool:
-        return bool(self.token)
+    def is_registered(self): return bool(self.token)
+    def _load_token(self):
+        try: return self._tok_file.read_text().strip() or None if self._tok_file.exists() else None
+        except: return None
 
-    def _save_token(self) -> None:
-        self._token_file.write_text(self.token or '')
-        os.chmod(self._token_file, 0o600)
 
-    def _load_token(self) -> Optional[str]:
-        try:
-            if self._token_file.exists():
-                return self._token_file.read_text().strip() or None
-        except Exception:
-            pass
-        return None
+# ═════════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+def _wallet_recover(args):
+    """Exhaustive scan of data/*.json|*.enc — tries BIP-38 decrypt on each."""
+    pw = args.wallet_password or input("  Recovery password: ").strip()
+    if not pw: print("❌ Password required"); sys.exit(1)
+    data_dir = Path('data'); data_dir.mkdir(exist_ok=True, mode=0o700)
+    w = QTCLWallet(); recovered = None
+    print("\n  🔍  QTCL Wallet Recovery\n")
+    for path in sorted(data_dir.glob('*.json')) + sorted(data_dir.glob('*.enc')):
+        print(f"  Trying {path.name} … ", end='', flush=True)
+        try: data = json.loads(path.read_text())
+        except Exception: print("⬛ not JSON"); continue
+        wd = w._decrypt(data, pw)
+        if wd and wd.get('mnemonic'):
+            print("✅  mnemonic"); w.mnemonic = wd['mnemonic']; w._derive_keys(w.mnemonic)
+            recovered = True; break
+        elif wd and wd.get('private_key'):
+            print("✅  keypair")
+            w.private_key = wd['private_key']
+            w.public_key  = wd.get('public_key') or hashlib.sha3_256(w.private_key.encode()).hexdigest()
+            w.address     = QTCLWallet.PREFIX + hashlib.sha3_256(
+                w.public_key.encode()).hexdigest()[:QTCLWallet.ADDR_LEN]
+            recovered = True; break
+        else: print("⬛")
+    if not recovered:
+        print("\n  ❌  No recoverable wallet found.")
+        print("     --wallet-from-mnemonic   restore from 12 words")
+        print("     --wallet-init            create fresh wallet")
+        sys.exit(1)
+    print(f"\n  ✅  Recovered: {w.address}")
+    w._backup()
+    w._atomic_save(w.wallet_file, pw,
+        {'address':w.address,'private_key':w.private_key,'public_key':w.public_key})
+    if w.mnemonic:
+        w._atomic_save(w.mnemonic_file, pw, {'mnemonic':w.mnemonic})
+    print(f"  💾  Saved → {w.wallet_file}\n")
+    sys.exit(0)
+
+
+def _run_transaction_wizard(args, wallet):
+    """Interactive HLWE transaction wizard."""
+    print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  💸  QTCL  HLWE-256  TRANSACTION WIZARD")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"  Node   : {args.oracle_url}")
+    print(f"  Sender : {wallet.address}\n")
+
+    try:
+        to_addr = (getattr(args,'to_address',None) or
+                   input("  Recipient address (qtcl1…): ").strip())
+        if not to_addr.startswith('qtcl1'):
+            print("❌  Invalid address (must start with qtcl1)"); sys.exit(1)
+
+        amount_str = (getattr(args,'amount',None) or
+                      input("  Amount (QTCL): ").strip())
+        amount = float(amount_str)
+        if amount <= 0: raise ValueError("amount <= 0")
+
+        fee_str = input("  Fee (QTCL, default 0.001): ").strip() or '0.001'
+        fee     = float(fee_str)
+
+        memo = input("  Memo (optional): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled."); return
+    except ValueError as e:
+        print(f"❌  Invalid input: {e}"); sys.exit(1)
+
+    # Build and sign transaction
+    import time
+    tx_id   = hashlib.sha3_256(
+        f"{wallet.address}{to_addr}{amount}{time.time()}".encode()).hexdigest()
+    payload = {
+        'tx_id':       tx_id,
+        'from_address': wallet.address,
+        'to_address':   to_addr,
+        'amount':       amount,
+        'fee':          fee,
+        'memo':         memo,
+        'timestamp':    int(time.time()),
+        'public_key':   wallet.public_key,
+    }
+
+    # HLWE-256 signature: commitment = SHA3-256(payload), witness = SHA3-256(priv+commit)
+    commit  = hashlib.sha3_256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    witness = hashlib.sha3_256((wallet.private_key + commit).encode()).hexdigest()
+    proof   = hashlib.sha3_256((commit + witness).encode()).hexdigest()
+    payload['hlwe_signature'] = {'commitment': commit, 'witness': witness, 'proof': proof}
+
+    print(f"TX ID  : {tx_id[:24]}…")
+    print(f"  From   : {wallet.address}")
+    print(f"  To     : {to_addr}")
+    print(f"  Amount : {amount} QTCL  (fee {fee})")
+    if memo: print(f"  Memo   : {memo}")
+
+    try:
+        confirm = input("\nBroadcast? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled."); return
+
+    if confirm != 'y':
+        print("  Cancelled."); return
+
+    try:
+        r = requests.post(f"{args.oracle_url}/api/submit_transaction",
+                          json=payload, timeout=15)
+        if r.status_code == 200:
+            print(f"✅  Accepted by node — TX ID: {tx_id}")
+            data = r.json()
+            if data.get('block_height'):
+                print(f"  📦  Included in block #{data['block_height']}")
+        else:
+            print(f"❌  Node rejected tx: {r.status_code} {r.text[:120]}")
+    except requests.exceptions.ConnectionError:
+        print(f"❌  Cannot reach node: {args.oracle_url}")
+    except requests.exceptions.Timeout:
+        print("\n❌  Node timed out")
+    except Exception as e:
+        print(f"❌  Broadcast error: {e}")
 
 
 def parse_args():
-    parser=argparse.ArgumentParser(
-        description='⚛️  QTCL Full Node — W-State Entangled Mining & HLWE-Secured Transactions',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
-        ─────────────────────────────────────────────────────────────────
-        MODES
-          1  mine      Start W-state entangled quantum mining
-          2  transact  Open HLWE-256 post-quantum transaction wizard
-
-        EXAMPLES
-          python qtcl_miner_mobile.py                     # interactive chooser
-          python qtcl_miner_mobile.py --mode mine
-          python qtcl_miner_mobile.py --mode transact
-          python qtcl_miner_mobile.py --mode transact \\
-              --from-address qtcl1abc… --to-address qtcl1xyz… --amount 10
-        ─────────────────────────────────────────────────────────────────
-        """)
-    )
-    # ── Core ──────────────────────────────────────────────────────────────
-    parser.add_argument('--mode','-m',choices=['mine','transact'],default=None,
-                        help='Operational mode: "mine" (1) or "transact" (2). Omit for interactive prompt.')
-    parser.add_argument('--address','-a',help='Miner / sender wallet address (qtcl1…)')
-    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',
-                        help='Node / oracle base URL')
-    # ── Mining ────────────────────────────────────────────────────────────
-    parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,
-                        help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
-    parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',
-                        help='W-state fidelity threshold: strict(≥0.90) normal(≥0.80) relaxed(≥0.70)')
-    parser.add_argument('--strict-w-verification',action='store_true',default=False,
-                        help='Reject marginal W-states during mining')
-    # ── Wallet ────────────────────────────────────────────────────────────
-    parser.add_argument('--wallet-init',action='store_true',help='Generate and persist a new wallet')
-    parser.add_argument('--wallet-recover',action='store_true',help='Attempt to recover a corrupt/migrated wallet file')
-    parser.add_argument('--wallet-from-mnemonic',action='store_true',help='Restore wallet from 12-word mnemonic phrase')
-    parser.add_argument('--wallet-show-mnemonic',action='store_true',help='Decrypt and display your 12-word recovery phrase')
-    parser.add_argument('--mnemonic-phrase',default=None,help='12-word mnemonic (for --wallet-from-mnemonic non-interactive)')
-    parser.add_argument('--wallet-password',help='Wallet encryption password')
-    # ── Registration ──────────────────────────────────────────────────────
-    parser.add_argument('--register',action='store_true',help='Register miner with oracle')
-    parser.add_argument('--miner-id',help='Miner ID for oracle registration')
-    parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
-    # ── Transaction (non-interactive shortcuts) ───────────────────────────
-    parser.add_argument('--from-address',help='Sender address (--mode transact)')
-    parser.add_argument('--to-address',  help='Recipient address (--mode transact)')
-    parser.add_argument('--amount',type=float,help='Amount in QTCL (--mode transact)')
-    parser.add_argument('--fee',type=int,default=1,help='Transaction fee in base units (default 1)')
-    parser.add_argument('--nonce',type=int,default=None,help='TX nonce override (auto-fetched if omitted)')
-    # ── Logging ───────────────────────────────────────────────────────────
+    parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
+    parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
+    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
+    parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
+    parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
+    parser.add_argument('--wallet-recover',action='store_true',help='Recover corrupt/missing wallet')
+    parser.add_argument('--wallet-from-mnemonic',action='store_true',help='Restore from 12-word phrase')
+    parser.add_argument('--wallet-show-mnemonic',action='store_true',help='Display recovery phrase')
+    parser.add_argument('--mode',choices=['mine','transact'],default=None,help='Run mode')
+    parser.add_argument('--to-address',default=None,help='Transaction recipient')
+    parser.add_argument('--amount',default=None,help='Transaction amount (QTCL)')
+    parser.add_argument('--wallet-password',help='Wallet password')
+    parser.add_argument('--register',action='store_true',help='Register with oracle')
+    parser.add_argument('--miner-id',help='Miner ID for registration')
+    parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
+    parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',help='W-state fidelity threshold mode: strict (F>=0.90), normal (F>=0.80, recommended), relaxed (F>=0.70)')
+    parser.add_argument('--strict-w-verification',action='store_true',default=False,help='Enable strict W-state verification (rejects marginal states)')
     return parser.parse_args()
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# HLWE TRANSACTION ENGINE
-# ════════════════════════════════════════════════════════════════════════════════
-
-import textwrap
-
-class DHTGossipBroadcaster:
-    """
-    ╔══════════════════════════════════════════════════════════════════════════╗
-    ║  DHT GOSSIP BROADCASTER                                                ║
-    ║                                                                          ║
-    ║  Discovers every peer reachable from the QTCL network via three        ║
-    ║  complementary discovery channels, then fans out a signed transaction   ║
-    ║  payload to ALL of them in parallel:                                    ║
-    ║                                                                          ║
-    ║    Channel 1 — /api/dht/peers     (Kademlia routing table)             ║
-    ║    Channel 2 — /api/p2p/peers     (active WebSocket P2P connections)   ║
-    ║    Channel 3 — /api/oracle/miners (registered miner directory)         ║
-    ║                                                                          ║
-    ║  For each discovered peer URL the broadcaster posts the fully signed    ║
-    ║  wire payload to /api/submit_transaction using a thread-pool so that    ║
-    ║  a single slow or dead peer never blocks the rest.                      ║
-    ║                                                                          ║
-    ║  Results are collected and summarised: accepted / rejected / unreachable║
-    ╚══════════════════════════════════════════════════════════════════════════╝
-    """
-
-    BROADCAST_TIMEOUT_S  = 8     # per-peer POST timeout
-    DISCOVERY_TIMEOUT_S  = 6     # per-discovery-endpoint GET timeout
-    MAX_WORKERS          = 16    # thread-pool ceiling
-    PEER_LIVENESS_PATH   = '/api/blocks/tip'   # cheap liveness probe
-
-    def __init__(self, oracle_url: str, session: requests.Session):
-        self.oracle_url = oracle_url.rstrip('/')
-        self._session   = session
-
-    # ── Peer Discovery ────────────────────────────────────────────────────
-
-    def _fetch_dht_peers(self) -> List[str]:
-        """
-        Pull peers from the Kademlia DHT routing table.
-        Returns list of base URLs: https://<address>:<port>
-        """
-        urls: List[str] = []
-        try:
-            r = self._session.get(
-                f"{self.oracle_url}/api/dht/peers",
-                timeout=self.DISCOVERY_TIMEOUT_S
-            )
-            if r.status_code == 200:
-                data = r.json()
-                for peer in data.get('peers', []):
-                    if not peer.get('alive', True):
-                        continue
-                    addr = peer.get('address', '')
-                    port = int(peer.get('port', 443))
-                    if not addr:
-                        continue
-                    scheme = 'http' if addr in ('localhost', '127.0.0.1') else 'https'
-                    port_s = f':{port}' if addr in ('localhost', '127.0.0.1') else ''
-                    urls.append(f"{scheme}://{addr}{port_s}")
-        except Exception as e:
-            logger.debug(f"[DHT-GOSSIP] dht/peers discovery failed: {e}")
-        return urls
-
-    def _fetch_p2p_peers(self) -> List[str]:
-        """
-        Pull peers from the active P2P WebSocket connection table.
-        Returns list of base URLs.
-        """
-        urls: List[str] = []
-        try:
-            r = self._session.get(
-                f"{self.oracle_url}/api/p2p/peers",
-                timeout=self.DISCOVERY_TIMEOUT_S
-            )
-            if r.status_code == 200:
-                data = r.json()
-                for peer in data.get('peers', []):
-                    # peer shape varies — try common field names
-                    raw = (peer.get('url') or peer.get('address') or
-                           peer.get('host') or peer.get('oracle_url') or '')
-                    if not raw:
-                        continue
-                    if raw.startswith('http'):
-                        urls.append(raw.rstrip('/'))
-                    else:
-                        scheme = 'http' if raw in ('localhost', '127.0.0.1') else 'https'
-                        port = int(peer.get('port', 443))
-                        port_s = f':{port}' if raw in ('localhost', '127.0.0.1') else ''
-                        urls.append(f"{scheme}://{raw}{port_s}")
-        except Exception as e:
-            logger.debug(f"[DHT-GOSSIP] p2p/peers discovery failed: {e}")
-        return urls
-
-    def _fetch_miner_peers(self) -> List[str]:
-        """
-        Pull registered miner URLs from the oracle directory.
-        Returns list of base URLs.
-        """
-        urls: List[str] = []
-        try:
-            r = self._session.get(
-                f"{self.oracle_url}/api/oracle/miners",
-                timeout=self.DISCOVERY_TIMEOUT_S
-            )
-            if r.status_code == 200:
-                data = r.json()
-                miners = data if isinstance(data, list) else data.get('miners', [])
-                for m in miners:
-                    raw = (m.get('url') or m.get('oracle_url') or
-                           m.get('address') or '')
-                    if raw and raw.startswith('http'):
-                        urls.append(raw.rstrip('/'))
-        except Exception as e:
-            logger.debug(f"[DHT-GOSSIP] oracle/miners discovery failed: {e}")
-        return urls
-
-    def discover_all_peers(self) -> List[str]:
-        """
-        Merge and deduplicate peer URLs from all three discovery channels.
-        The primary oracle node is always included first so the canonical node
-        always receives the tx regardless of discovery health.
-        """
-        seen:  set   = set()
-        peers: List[str] = []
-
-        def _add(url: str):
-            u = url.rstrip('/')
-            if u and u not in seen:
-                seen.add(u)
-                peers.append(u)
-
-        # Primary oracle is always first
-        _add(self.oracle_url)
-
-        for url in (self._fetch_dht_peers() +
-                    self._fetch_p2p_peers()  +
-                    self._fetch_miner_peers()):
-            _add(url)
-
-        return peers
-
-    # ── Per-Peer Broadcast ────────────────────────────────────────────────
-
-    def _broadcast_one(self, base_url: str, payload: dict) -> Tuple[str, int, Optional[str]]:
-        """
-        POST signed tx to one peer.
-        Returns (base_url, http_status, tx_hash_or_error).
-        """
-        try:
-            r = self._session.post(
-                f"{base_url}/api/submit_transaction",
-                data=json.dumps(payload),
-                headers={'Content-Type': 'application/json',
-                         'User-Agent':   'QTCL-CLI/3.0 (DHT-Gossip)'},
-                timeout=self.BROADCAST_TIMEOUT_S
-            )
-            try:
-                body = r.json()
-            except Exception:
-                body = {}
-            tx_hash = body.get('tx_hash') or body.get('error', r.text[:80])
-            return base_url, r.status_code, str(tx_hash)
-        except requests.exceptions.ConnectionError:
-            return base_url, 0, 'connection_refused'
-        except requests.exceptions.Timeout:
-            return base_url, 0, 'timeout'
-        except Exception as e:
-            return base_url, 0, str(e)[:80]
-
-    # ── Fan-Out ───────────────────────────────────────────────────────────
-
-    def broadcast(self, payload: dict) -> Dict[str, Any]:
-        """
-        Discover all peers then broadcast the signed payload to every one
-        in parallel via a thread pool.
-
-        Returns a summary dict:
-          { peers_found, accepted, rejected, unreachable, results: [...] }
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        peers = self.discover_all_peers()
-        total = len(peers)
-
-        print(f"\n  🌐  DHT Gossip Broadcast → {total} peer(s) discovered")
-        for p in peers:
-            print(f"       · {p}")
-
-        accepted    = 0
-        rejected    = 0
-        unreachable = 0
-        results     = []
-
-        with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, total or 1),
-                                thread_name_prefix='qtcl-gossip') as pool:
-            futures = {
-                pool.submit(self._broadcast_one, peer, payload): peer
-                for peer in peers
-            }
-            for future in as_completed(futures):
-                url, status, detail = future.result()
-                short = url.replace('https://', '').replace('http://', '')[:48]
-
-                if status in (200, 201):
-                    icon   = '✅'
-                    accepted += 1
-                elif status == 0:
-                    icon   = '⬛'
-                    unreachable += 1
-                else:
-                    icon   = '⚠️ '
-                    rejected += 1
-
-                label = f"HTTP {status}" if status else 'unreachable'
-                print(f"       {icon}  {short:<48}  {label}  {detail[:40]}")
-                results.append({'url': url, 'status': status, 'detail': detail})
-
-        return {
-            'peers_found':  total,
-            'accepted':     accepted,
-            'rejected':     rejected,
-            'unreachable':  unreachable,
-            'results':      results,
-        }
-
-
-class HLWETransactionEngine:
-    """
-    ╔══════════════════════════════════════════════════════════════════════╗
-    ║  HLWE-256 POST-QUANTUM TRANSACTION ENGINE                           ║
-    ║                                                                      ║
-    ║  Implements the full QTCL transaction lifecycle:                    ║
-    ║    1. Wallet load / address resolution                              ║
-    ║    2. W-state entropy acquisition from live oracle                  ║
-    ║    3. Canonical tx preimage construction (sort_keys JSON)           ║
-    ║    4. SHA3-256 tx hash                                               ║
-    ║    5. HLWE-256 signature  (commitment / witness / proof)            ║
-    ║    6. Local signature self-verification                             ║
-    ║    7. Balance & nonce preflight against node REST API               ║
-    ║    8. Primary broadcast → /api/submit_transaction (oracle node)    ║
-    ║    9. DHT gossip fan-out → every peer in routing table + P2P mesh  ║
-    ║   10. Confirmation polling with timeout                             ║
-    ╚══════════════════════════════════════════════════════════════════════╝
-    """
-
-    CONFIRMATION_POLLS   = 12       # up to 2 min at 10s interval
-    CONFIRMATION_DELAY_S = 10
-    MIN_AMOUNT_BASE      = 1        # 0.01 QTCL (stored as base_units = amount * 100)
-
-    def __init__(self, oracle_url: str, wallet: 'QTCLWallet'):
-        self.oracle_url  = oracle_url.rstrip('/')
-        self.wallet      = wallet
-        self._session    = self._build_session()
-        self._gossip     = DHTGossipBroadcaster(self.oracle_url, self._session)
-
-    # ── Network ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _build_session():
-        s = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.4,
-                      status_forcelist=[429, 500, 502, 503, 504])
-        s.mount('https://', HTTPAdapter(max_retries=retry))
-        s.mount('http://',  HTTPAdapter(max_retries=retry))
-        s.headers.update({'Content-Type': 'application/json',
-                          'User-Agent':   'QTCL-CLI/3.0 (HLWE-256)'})
-        return s
-
-    def _get(self, path: str, **kw) -> Optional[dict]:
-        try:
-            r = self._session.get(f"{self.oracle_url}{path}", timeout=10, **kw)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.debug(f"[TXENGINE] GET {path} failed: {e}")
-            return None
-
-    def _post(self, path: str, payload: dict) -> Tuple[Optional[dict], int]:
-        try:
-            r = self._session.post(f"{self.oracle_url}{path}",
-                                   data=json.dumps(payload), timeout=15)
-            try:
-                body = r.json()
-            except Exception:
-                body = {'raw': r.text}
-            return body, r.status_code
-        except Exception as e:
-            logger.error(f"[TXENGINE] POST {path} error: {e}")
-            return None, 0
-
-    # ── W-State Entropy ──────────────────────────────────────────────────
-
-    def _fetch_w_entropy(self) -> bytes:
-        """
-        Pull live W-state entropy from oracle snapshot.
-        Falls back to CSPRNG + block-field hash if oracle unreachable.
-        """
-        data = self._get('/api/oracle/w-state')
-        if data:
-            raw = (data.get('w_entropy_hash') or
-                   data.get('density_matrix_hex') or
-                   data.get('w_entropy') or '')
-            if raw:
-                try:
-                    return hashlib.sha3_256(bytes.fromhex(raw)).digest()
-                except Exception:
-                    return hashlib.sha3_256(raw.encode()).digest()
-
-        # Fallback — mix CSPRNG with node tip hash for uniqueness
-        fb = secrets.token_bytes(32)
-        tip = self._get('/api/blocks/tip') or {}
-        tip_bytes = (tip.get('block_hash') or secrets.token_hex(32)).encode()
-        return hashlib.sha3_256(fb + tip_bytes).digest()
-
-    # ── HLWE-256 Signature ───────────────────────────────────────────────
-
-    def _sign_hlwe(self, tx_hash_hex: str, w_entropy: bytes) -> dict:
-        """
-        HLWE-256 signature identical to oracle.py HLWESigner.sign_message():
-
-          private_key_bytes = SHA3-256(hex private_key string)   [32 bytes]
-
-          1. commitment = SHA3-256(private || w_entropy || msg_hash_bytes)
-          2. witness    = SHAKE-256(commitment || private, 64 bytes)
-          3. proof      = HMAC-SHA3-256(key=private, msg=witness || msg_hash_bytes)
-          4. w_entropy_hash = SHA3-256(w_entropy)
-
-        All values encoded as lowercase hex strings.
-        """
-        priv_raw   = self.wallet.private_key          # 64-char hex string
-        pub_raw    = self.wallet.public_key            # 64-char hex string (SHA3-256 of priv_raw)
-        priv_bytes = hashlib.sha3_256(priv_raw.encode()).digest()   # canonical 32 B
-
-        msg_bytes  = bytes.fromhex(tx_hash_hex)
-
-        # 1. Commitment
-        commitment = hashlib.sha3_256(priv_bytes + w_entropy + msg_bytes).digest()
-
-        # 2. Witness  (64 bytes via SHAKE-256)
-        wit_h = hashlib.shake_256(commitment + priv_bytes)
-        witness = wit_h.digest(64)
-
-        # 3. Proof  (HMAC-SHA3-256)
-        proof = hmac.new(priv_bytes, witness + msg_bytes,
-                         digestmod=hashlib.sha3_256).digest()
-
-        # 4. W-entropy hash
-        w_entropy_hash = hashlib.sha3_256(w_entropy).digest()
-
-        return {
-            'commitment':      commitment.hex(),
-            'witness':         witness.hex(),
-            'proof':           proof.hex(),
-            'w_entropy_hash':  w_entropy_hash.hex(),
-            'public_key_hex':  pub_raw,
-            'derivation_path': 'm/0/0/0',
-            'timestamp_ns':    time.time_ns(),
-        }
-
-    def _verify_hlwe(self, tx_hash_hex: str, sig: dict) -> Tuple[bool, str]:
-        """
-        Self-verify HLWE signature using the public key (mirrors HLWEVerifier):
-
-          commitment' = SHA3-256(pubkey || witness || msg_hash)
-          proof'      = HMAC-SHA3-256(key=pubkey, msg=witness || msg_hash)
-        """
-        try:
-            pub_bytes   = bytes.fromhex(sig['public_key_hex'])
-            commitment  = bytes.fromhex(sig['commitment'])
-            witness     = bytes.fromhex(sig['witness'])
-            proof       = bytes.fromhex(sig['proof'])
-            msg_bytes   = bytes.fromhex(tx_hash_hex)
-
-            commitment_check = hashlib.sha3_256(
-                pub_bytes + witness + msg_bytes).digest()
-            if commitment_check != commitment:
-                return False, 'commitment_mismatch'
-
-            proof_check = hmac.new(pub_bytes, witness + msg_bytes,
-                                   digestmod=hashlib.sha3_256).digest()
-            if proof_check != proof:
-                return False, 'proof_mismatch'
-
-            return True, 'valid'
-        except Exception as e:
-            return False, f'exception:{e}'
-
-    # ── Preflight ────────────────────────────────────────────────────────
-
-    def _fetch_balance(self, address: str) -> float:
-        data = self._get(f'/api/wallet?address={address}')
-        return float(data.get('balance', 0.0)) if data else 0.0
-
-    def _fetch_nonce(self, address: str) -> int:
-        data = self._get(f'/api/wallet?address={address}')
-        return int(data.get('transaction_count', 0)) if data else 0
-
-    # ── Confirmation Polling ─────────────────────────────────────────────
-
-    def _poll_confirmation(self, tx_hash: str) -> Optional[dict]:
-        print(f"\n  ⏳  Polling confirmation for {tx_hash[:24]}…")
-        for i in range(self.CONFIRMATION_POLLS):
-            data = self._get(f'/api/transactions/{tx_hash}')
-            if data and data.get('tx_hash'):
-                return data
-            # Also try UTXO endpoint
-            data2 = self._get(f'/api/utxo/transactions/{tx_hash}')
-            if data2 and data2.get('tx_hash'):
-                return data2
-            print(f"  ·  [{i+1}/{self.CONFIRMATION_POLLS}] not yet confirmed — "
-                  f"waiting {self.CONFIRMATION_DELAY_S}s …")
-            time.sleep(self.CONFIRMATION_DELAY_S)
-        return None
-
-    # ── Main Send Flow ────────────────────────────────────────────────────
-
-    def send(self,
-             to_address:   str,
-             amount_qtcl:  float,
-             fee_base:     int  = 1,
-             nonce_override: Optional[int] = None) -> bool:
-        """
-        Execute a fully HLWE-signed QTCL transfer.
-        Returns True on confirmed broadcast, False on any failure.
-        """
-        from_address = self.wallet.address
-
-        # ── 1. Preflight ──────────────────────────────────────────────
-        print(f"\n  🔍  Preflight checks …")
-        balance = self._fetch_balance(from_address)
-        print(f"       Balance  : {balance:.4f} QTCL")
-        if amount_qtcl <= 0:
-            print("  ❌  Amount must be > 0"); return False
-        total_needed = amount_qtcl + fee_base / 100.0
-        if balance < total_needed:
-            print(f"  ❌  Insufficient balance  "
-                  f"(need {total_needed:.4f}, have {balance:.4f} QTCL)"); return False
-
-        nonce = nonce_override if nonce_override is not None \
-                else self._fetch_nonce(from_address)
-        print(f"       Nonce    : {nonce}")
-
-        # ── 2. Canonical TX preimage & hash ───────────────────────────
-        tx_id        = str(uuid.uuid4())
-        timestamp_ns = time.time_ns()
-        preimage = json.dumps({
-            'tx_id':         tx_id,
-            'sender_addr':   from_address,
-            'receiver_addr': to_address,
-            'amount':        str(amount_qtcl),
-            'nonce':         nonce,
-            'timestamp_ns':  timestamp_ns,
-        }, sort_keys=True)
-        tx_hash_hex = hashlib.sha3_256(preimage.encode()).hexdigest()
-        print(f"       TX Hash  : {tx_hash_hex[:24]}…")
-
-        # ── 3. W-state entropy ────────────────────────────────────────
-        print(f"  ⚛️   Acquiring W-state entropy from oracle …")
-        w_entropy = self._fetch_w_entropy()
-        print(f"       W-Entropy: {w_entropy.hex()[:24]}…  ✅")
-
-        # ── 4. HLWE-256 signature ─────────────────────────────────────
-        print(f"  🔐  Computing HLWE-256 signature …")
-        sig = self._sign_hlwe(tx_hash_hex, w_entropy)
-        print(f"       Commitment: {sig['commitment'][:20]}…")
-        print(f"       Witness   : {sig['witness'][:20]}…")
-        print(f"       Proof     : {sig['proof'][:20]}…")
-
-        # ── 5. Self-verify before broadcast ──────────────────────────
-        ok, reason = self._verify_hlwe(tx_hash_hex, sig)
-        if not ok:
-            print(f"  ❌  HLWE self-verification FAILED: {reason}")
-            print("       Transaction aborted — key material may be corrupt.")
-            return False
-        print(f"  ✅  HLWE self-verification passed ({reason})")
-
-        # ── 6. Build wire payload ─────────────────────────────────────
-        payload = {
-            'from':          from_address,
-            'to':            to_address,
-            'amount':        amount_qtcl,
-            'nonce':         nonce,
-            'fee':           fee_base,
-            'timestamp_ns':  timestamp_ns,
-            'tx_id':         tx_id,
-            'signature':     json.dumps(sig),
-        }
-
-        # ── 7. Primary broadcast → canonical oracle node ──────────────
-        print(f"\n  📡  Broadcasting to primary node …")
-        body, status = self._post('/api/submit_transaction', payload)
-        if status not in (200, 201):
-            print(f"  ❌  Primary node rejected tx (HTTP {status}): "
-                  f"{(body or {}).get('error', body)}")
-            return False
-
-        tx_hash_returned = (body or {}).get('tx_hash', tx_hash_hex)
-        print(f"  ✅  Primary node accepted  (HTTP {status})")
-        print(f"       TX Hash  : {tx_hash_returned}")
-        print(f"       Signed   : {(body or {}).get('signed', True)}")
-
-        # ── 8. DHT gossip fan-out → every peer in the network ─────────
-        #
-        #   Peer discovery order:
-        #     • /api/dht/peers      — Kademlia routing table (all k-buckets)
-        #     • /api/p2p/peers      — active WebSocket P2P mesh connections
-        #     • /api/oracle/miners  — registered miner directory
-        #
-        #   Each peer receives a parallel POST /api/submit_transaction so
-        #   the tx propagates through the full DHT even if the primary node
-        #   is not well-connected to a subset of the network.
-        #
-        gossip_summary = self._gossip.broadcast(payload)
-        g = gossip_summary
-        print(f"\n  📊  Gossip summary → "
-              f"{g['peers_found']} peers discovered  |  "
-              f"{g['accepted']} ✅ accepted  "
-              f"{g['rejected']} ⚠️  rejected  "
-              f"{g['unreachable']} ⬛ unreachable")
-
-        # ── 9. Confirmation polling ────────────────────────────────────
-        confirmed = self._poll_confirmation(tx_hash_returned)
-        if confirmed:
-            print(f"\n  🎉  CONFIRMED on-chain!")
-            print(f"       Block    : {confirmed.get('block_height', 'pending')}")
-        else:
-            print(f"\n  ⚠️   Not yet confirmed in {self.CONFIRMATION_POLLS} polls "
-                  f"— tx is propagating through the network.")
-
-        return True
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# INTERACTIVE CHOOSER
-# ════════════════════════════════════════════════════════════════════════════════
-
-def _print_banner():
-    print()
-    print("  ╔══════════════════════════════════════════════════════════════════╗")
-    print("  ║  ⚛️   Q T C L  —  QUANTUM-ENTANGLED BLOCKCHAIN NODE  v3.0      ║")
-    print("  ║  HLWE-256 Post-Quantum Crypto  ·  W-State Entropy  ·  {8,3}    ║")
-    print("  ╠══════════════════════════════════════════════════════════════════╣")
-    print("  ║                                                                  ║")
-    print("  ║    [ 1 ]  ⛏️   MINE        Start quantum-entangled mining       ║")
-    print("  ║    [ 2 ]  💸  TRANSACT    Send QTCL (HLWE-256 signed)           ║")
-    print("  ║                                                                  ║")
-    print("  ╚══════════════════════════════════════════════════════════════════╝")
-    print()
-
-
-def _choose_mode() -> str:
-    """Interactive 1/2 chooser.  Returns 'mine' or 'transact'."""
-    _print_banner()
-    while True:
-        choice = input("  Enter choice [1/2]: ").strip()
-        if choice == '1':   return 'mine'
-        if choice == '2':   return 'transact'
-        if choice.lower() in ('mine', 'transact'):  return choice.lower()
-        print("  ⚠️   Please enter 1 (mine) or 2 (transact).")
-
-
-def _run_transaction_wizard(args, wallet: 'QTCLWallet'):
-    """
-    Interactive HLWE transaction wizard — gathers fields, validates,
-    then delegates to HLWETransactionEngine.send().
-    """
-    if not _REQUESTS_OK:
-        print("\n❌  'requests' library not installed.  Run: pip install requests")
-        sys.exit(1)
-
-    print("\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  💸  QTCL  HLWE-256  TRANSACTION WIZARD")
-    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"  Node     : {args.oracle_url}")
-    print(f"  Sender   : {wallet.address}")
-    print()
-
-    # ── Recipient ────────────────────────────────────────────────────
-    to_address = args.to_address or ''
-    while not to_address.startswith('qtcl'):
-        to_address = input("  To address  (qtcl1…) : ").strip()
-        if not to_address.startswith('qtcl'):
-            print("  ⚠️   Address must start with 'qtcl'")
-
-    # ── Amount ───────────────────────────────────────────────────────
-    amount = args.amount
-    while not amount or amount <= 0:
-        try:
-            amount = float(input("  Amount (QTCL)        : ").strip())
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            print("  ⚠️   Enter a positive number (e.g. 1.5)")
-            amount = None
-
-    # ── Fee ──────────────────────────────────────────────────────────
-    fee = args.fee
-    print(f"  Fee (base units)     : {fee}  (press Enter to keep, or type new value)")
-    fee_in = input("  > ").strip()
-    if fee_in.isdigit():
-        fee = int(fee_in)
-
-    # ── Confirm ──────────────────────────────────────────────────────
-    print()
-    print("  ┌──────────────────────────────────────────────────────────┐")
-    print(f"  │  FROM   : {wallet.address}")
-    print(f"  │  TO     : {to_address}")
-    print(f"  │  AMOUNT : {amount:.4f} QTCL")
-    print(f"  │  FEE    : {fee} base units  ({fee/100:.4f} QTCL)")
-    print(f"  │  CRYPTO : HLWE-256 post-quantum signature")
-    print("  └──────────────────────────────────────────────────────────┘")
-    confirm = input("\n  Confirm transaction? [y/N] : ").strip().lower()
-    if confirm not in ('y', 'yes'):
-        print("  🚫  Transaction cancelled.")
-        return
-
-    engine = HLWETransactionEngine(oracle_url=args.oracle_url, wallet=wallet)
-    success = engine.send(
-        to_address     = to_address,
-        amount_qtcl    = amount,
-        fee_base       = fee,
-        nonce_override = args.nonce,
-    )
-    if not success:
-        sys.exit(1)
 
 def main():
     args=parse_args()
     logging.getLogger().setLevel(getattr(logging,args.log_level))
     
     try:
-        # ── Wallet initialization shortcut ────────────────────────────────────
+        # ── Wallet init ───────────────────────────────────────────────────────
         if args.wallet_init:
-            if not args.wallet_password:
-                args.wallet_password = input("Enter new wallet password: ").strip()
-            if not args.wallet_password:
-                logger.error("[WALLET] Password required for --wallet-init")
-                sys.exit(1)
-            w = QTCLWallet()
-            addr = w.create(args.wallet_password)
-            logger.info(f"[WALLET] ✅ Created : {addr}")
-            logger.info(f"[WALLET]    PubKey  : {w.public_key}")
-            logger.info(f"[WALLET]    File    : {w.wallet_file}")
+            pw = args.wallet_password or input("  New wallet password: ").strip()
+            if not pw: logger.error("[WALLET] Password required"); sys.exit(1)
+            w = QTCLWallet(); w.create(pw)
             return
 
+        # ── Wallet recovery ───────────────────────────────────────────────────
+        if getattr(args, 'wallet_recover', False):
+            _wallet_recover(args); return
 
-        # ── Wallet recovery shortcuts ─────────────────────────────────────
-        if args.wallet_recover:
-            _wallet_recover(args)
+        if getattr(args, 'wallet_from_mnemonic', False):
+            phrase = input("  Enter 12 recovery words: ").strip()
+            pw     = args.wallet_password or input("  New password: ").strip()
+            w      = QTCLWallet()
+            if w.restore_from_mnemonic(phrase, pw):
+                print(f"  ✅ Restored: {w.address}")
+            else:
+                print("  ❌ Restore failed — check words")
             return
 
-        if args.wallet_from_mnemonic:
-            _wallet_from_mnemonic(args)
-            return
-
-        if args.wallet_show_mnemonic:
-            if not args.wallet_password:
-                args.wallet_password = input('Wallet password: ').strip()
-            tmp_w = QTCLWallet()
-            phrase = tmp_w.show_mnemonic(args.wallet_password)
+        if getattr(args, 'wallet_show_mnemonic', False):
+            pw = args.wallet_password or input("  Wallet password: ").strip()
+            phrase = QTCLWallet().show_mnemonic(pw)
             if phrase:
-                print('\n  Your 12-word recovery phrase:')
                 words = phrase.split()
-                for i2 in range(0, 12, 3):
-                    print(f'    {i2+1:2}. {words[i2]:<12}  {i2+2:2}. {words[i2+1]:<12}  {i2+3:2}. {words[i2+2]:<12}')
+                print("\nYour 12-word recovery phrase:")
+                for i in range(0, 12, 3):
+                    print(f"    {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
                 print()
             else:
-                print('  ⚠️  Mnemonic file not found or wrong password.')
-                print('     Run --wallet-init to create a new wallet with mnemonic.')
+                print("  ⚠️  Mnemonic not found or wrong password.")
             return
 
-        if args.register:
-            if not args.miner_id:
-                logger.error("[REGISTER] --miner-id required")
+        # ── Load wallet ───────────────────────────────────────────────────────
+        wallet = QTCLWallet()
+        if args.address and not args.wallet_password:
+            wallet.address = args.address
+            address = wallet.address
+        else:
+            pw = args.wallet_password or input(
+                "Wallet password (Enter to skip for address-only mining): ").strip() or None
+            if pw:
+                if not wallet.load(pw):
+                    if args.address:
+                        logger.warning("[WALLET] ⚠️  Decrypt failed — address-only mode")
+                        wallet.address = args.address
+                    else:
+                        logger.error("[WALLET] ❌ Failed to load wallet. Run --wallet-init")
+                        sys.exit(1)
+                elif args.address and args.address != wallet.address:
+                    logger.error("[WALLET] ❌ --address does not match loaded wallet")
+                    sys.exit(1)
+            elif args.address:
+                wallet.address = args.address
+            else:
+                logger.error("[WALLET] ❌ No password and no --address. Run --wallet-init")
                 sys.exit(1)
-            if not args.wallet_password:
-                args.wallet_password = input("Wallet password: ").strip()
-            w = QTCLWallet()
-            if not w.load(args.wallet_password):
-                logger.error("[REGISTER] ❌ Failed to load wallet — wrong password or missing file")
+            address = wallet.address
+
+        # ── Oracle registration ───────────────────────────────────────────────
+        if args.register:
+            if not wallet.is_loaded():
+                logger.error("[REGISTER] Full wallet required (password + keys)")
                 sys.exit(1)
             registry = MinerRegistry(args.oracle_url)
-            if registry.register(
-                miner_id   = args.miner_id,
-                address    = w.address,
-                public_key = w.public_key,
-                private_key= w.private_key,
-                miner_name = args.miner_name,
-            ):
-                logger.info("[REGISTER] ✅ Successfully registered")
-            else:
-                logger.error("[REGISTER] ❌ Registration failed")
-                sys.exit(1)
-            return
+            ok = registry.register(args.miner_id, wallet.address,
+                                    wallet.public_key, wallet.private_key, args.miner_name)
+            logger.info("[REGISTER] ✅ OK" if ok else "[REGISTER] ❌ Failed")
+            sys.exit(0 if ok else 1)
 
-        # ── Resolve wallet (single authoritative path) ────────────────────────
-        #
-        #   Rule: we always load a FULL wallet (address + private + public).
-        #   --address alone is fine for mining (identity only), but transact
-        #   mode MUST have a loaded key — enforced below after mode selection.
-        #
-        wallet = QTCLWallet()
-
-        # Collect password once, whichever way it arrives
-        if not args.wallet_password:
-            try:
-                args.wallet_password = input(
-                    "Wallet password (Enter to skip for address-only mining): "
-                ).strip() or None
-            except (EOFError, KeyboardInterrupt):
-                args.wallet_password = None
-
-        if args.wallet_password:
-            # Attempt full load — this is the ONLY place we call wallet.load()
-            if not wallet.load(args.wallet_password):
-                # Wrong password or corrupt file
-                if args.address:
-                    # Degrade gracefully for mining: use bare address, no signing
-                    logger.warning(
-                        "[WALLET] ⚠️  Could not decrypt wallet — "
-                        "mining with address only (transaction mode will be unavailable)"
-                    )
-                    wallet.address = args.address
-                else:
-                    logger.error(
-                        "[WALLET] ❌ Failed to load wallet. "
-                        "Run with --wallet-init to create one."
-                    )
-                    sys.exit(1)
-            else:
-                # Loaded successfully — if --address supplied, validate it matches
-                if args.address and args.address != wallet.address:
-                    logger.error(
-                        f"[WALLET] ❌ --address {args.address} does not match "
-                        f"loaded wallet {wallet.address}"
-                    )
-                    sys.exit(1)
-        else:
-            # No password at all — address-only mode (mining only)
-            if args.address:
-                wallet.address = args.address
-                logger.info(f"[WALLET] Address-only mode: {wallet.address}")
-            else:
-                logger.error(
-                    "[WALLET] ❌ No wallet password and no --address supplied. "
-                    "Run with --wallet-init to create a wallet."
-                )
-                sys.exit(1)
-
-        # address is the local shorthand used by the mining loop below
-        address = wallet.address
-
-        # ── MODE DISPATCH ─────────────────────────────────────────────────────
-        mode = args.mode
+        # ── Mode selection ────────────────────────────────────────────────────
+        mode = getattr(args, 'mode', None)
         if mode is None:
-            mode = _choose_mode()
+            print("\n┌─────────────────────────────────────┐")
+            print("  │  QTCL Full Node                     │")
+            print("  │  1. ⛏️   Mine                        │")
+            print("  │  2. 💸  Transact                    │")
+            print("  └─────────────────────────────────────┘")
+            try:
+                choice = input("  Enter choice [1/2]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = '1'
+            mode = 'transact' if choice == '2' else 'mine'
 
         if mode == 'transact':
             if not wallet.is_loaded():
                 print("\n❌  Transaction mode requires a fully loaded wallet.")
-                if not args.wallet_password:
-                    print("    Re-run and enter your wallet password when prompted.")
-                else:
-                    print("    Password was incorrect or wallet file is missing/corrupt.")
-                    print("    Run with --wallet-init to create a new wallet.")
+                print("    Re-run and enter your wallet password.")
                 sys.exit(1)
-            if args.from_address and args.from_address != wallet.address:
-                logger.warning(
-                    f"[WALLET] --from-address {args.from_address} ignored — "
-                    f"using loaded wallet {wallet.address}"
-                )
             _run_transaction_wizard(args, wallet)
             return
         
