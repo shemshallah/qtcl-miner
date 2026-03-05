@@ -4197,47 +4197,80 @@ def _wallet_recover(args):
 
 
 def _query_transaction_status(tx_hash, node_url="https://qtcl-blockchain.koyeb.app"):
-    """Query and display transaction status from blockchain."""
+    """
+    Query and display transaction status — checks DB (confirmed+pending) and DHT.
+    Bitcoin model: TX is queryable immediately after broadcast (status=pending).
+    """
     print("\n" + "="*70)
     print("  📊 TRANSACTION STATUS VIEWER")
     print("="*70)
-    print(f"  Querying: {tx_hash[:32]}…\n")
-    
+    print(f"  Node     : {node_url}")
+    print(f"  TX Hash  : {tx_hash[:32]}…\n")
+
+    data = None
+    source = None
+
+    # ── 1. Primary: /api/transactions/<hash> (DB — confirmed + pending) ──────
     try:
         r = requests.get(f"{node_url}/api/transactions/{tx_hash}", timeout=10)
-        
         if r.status_code == 200:
             data = r.json()
-            print(f"  ✅ TRANSACTION FOUND\n")
-            print(f"  TX Hash          : {data.get('tx_hash')}")
-            print(f"  Status           : {data.get('status').upper()}")
-            print(f"  Block Height     : #{data.get('block_height', 'N/A')}")
-            print(f"  Block Hash       : {str(data.get('block_hash', 'N/A'))[:40]}…")
-            print(f"  Transaction Idx  : {data.get('transaction_index', 'N/A')}")
-            print(f"  Amount           : {data.get('amount_qtcl', data.get('amount', 'N/A'))} QTCL")
-            print(f"  From             : {data.get('from_address')}")
-            print(f"  To               : {data.get('to_address')}")
-            print(f"  TX Type          : {data.get('tx_type', 'transfer')}")
-            print(f"  Created At       : {data.get('created_at', 'N/A')}")
-            
-            if data.get('status') == 'sealed':
-                print(f"\n  ✅ TRANSACTION SEALED IN BLOCKCHAIN")
-            else:
-                print(f"\n  ⏳ TRANSACTION PENDING (waiting to be sealed)")
+            source = 'db'
         elif r.status_code == 404:
-            print(f"  ❌ TRANSACTION NOT FOUND")
-            print(f"     Hash: {tx_hash}")
-            print(f"     (May still be pending if just broadcast)")
+            pass  # try fallback
         else:
-            print(f"  ❌ ERROR: HTTP {r.status_code}")
-            print(f"     {r.text[:200]}")
+            print(f"  ⚠️  HTTP {r.status_code}: {r.text[:100]}")
     except requests.exceptions.ConnectionError:
-        print(f"  ❌ Cannot reach node: {node_url}")
+        print(f"  ❌ Cannot reach node: {node_url}"); print("="*70 + "\n"); return
     except requests.exceptions.Timeout:
-        print(f"  ❌ Node timeout (taking too long)")
-    except Exception as e:
-        print(f"  ❌ Error: {e}")
-    
+        print(f"  ❌ Node timeout"); print("="*70 + "\n"); return
+
+    # ── 2. Fallback: /api/mempool/tx/<hash> (quick mempool status check) ─────
+    if data is None:
+        try:
+            r2 = requests.get(f"{node_url}/api/mempool/tx/{tx_hash}", timeout=5)
+            if r2.status_code == 200:
+                data = r2.json()
+                source = 'mempool_check'
+        except Exception:
+            pass
+
+    if data:
+        status = (data.get('status') or 'pending').upper()
+        confirmed = data.get('confirmed', False) or status == 'CONFIRMED'
+        block_height = data.get('block_height')
+
+        if confirmed:
+            print(f"  ✅ TRANSACTION CONFIRMED\n")
+        elif status in ('PENDING', 'PENDING'):
+            print(f"  ⏳ TRANSACTION PENDING (in mempool — waiting for next block)\n")
+        else:
+            print(f"  📋 TRANSACTION STATUS: {status}\n")
+
+        print(f"  TX Hash          : {data.get('tx_hash', tx_hash)}")
+        print(f"  Status           : {status}")
+        print(f"  Confirmed        : {'✅ YES' if confirmed else '⏳ NO (pending)'}")
+        print(f"  Block Height     : {'#' + str(block_height) if block_height else 'N/A — pending'}")
+        print(f"  Block Hash       : {str(data.get('block_hash') or 'N/A — pending')[:42]}")
+        print(f"  Amount           : {data.get('amount_qtcl', 0)} QTCL")
+        print(f"  From             : {data.get('from_address', 'N/A')}")
+        print(f"  To               : {data.get('to_address', 'N/A')}")
+        print(f"  TX Type          : {data.get('tx_type', 'transfer')}")
+        print(f"  Oracle Signed    : {data.get('oracle_signed', '?')}")
+        print(f"  Source           : {source}")
+        if data.get('query_note'):
+            print(f"\n  ℹ️   {data['query_note']}")
+    else:
+        print(f"  ❌ TRANSACTION NOT FOUND in DB, mempool, or DHT")
+        print(f"")
+        print(f"  Possible reasons:")
+        print(f"    1. Wrong hash — use the tx_hash RETURNED by the server (not client tx_id)")
+        print(f"    2. TX not yet submitted — check if broadcast succeeded")
+        print(f"    3. Server restart flushed in-memory mempool (but DB should persist)")
+        print(f"")
+        print(f"  Hash queried: {tx_hash}")
+        print(f"  Try also   : {node_url}/api/mempool/tx/{tx_hash}")
+
     print("\n" + "="*70 + "\n")
 
 
@@ -4275,7 +4308,7 @@ def _run_transaction_menu(args, wallet):
 
 
 def _run_transaction_wizard(args, wallet):
-    """Interactive HLWE transaction wizard."""
+    """Interactive HLWE transaction wizard — Bitcoin-model mempool broadcast."""
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("  💸  QTCL  HLWE-256  TRANSACTION WIZARD")
     print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -4302,19 +4335,28 @@ def _run_transaction_wizard(args, wallet):
     except ValueError as e:
         print(f"❌  Invalid input: {e}"); sys.exit(1)
 
-    # Build and sign transaction
-    import time
-    tx_id   = hashlib.sha3_256(
-        f"{wallet.address}{to_addr}{amount}{time.time()}".encode()).hexdigest()
+    # ── Build canonical TX fields — matches server's canonical hash computation ──
+    # Server computes: SHA3-256(JSON({from_addr, to_addr, amount_base, nonce_str, timestamp_ns_str}))
+    # We compute the client-side tx_id for tracking, but USE the server-returned tx_hash for lookups.
+    import time as _time
+    timestamp_ns = int(_time.time() * 1e9)
+    nonce = int(_time.time() * 1000) % (2**31)  # pseudo-nonce from timestamp
+
+    # Client-side pre-broadcast tx_id (for reference only — server computes authoritative hash)
+    tx_id = hashlib.sha3_256(
+        f"{wallet.address}{to_addr}{amount}{timestamp_ns}".encode()
+    ).hexdigest()
+
     payload = {
-        'tx_id':       tx_id,
-        'from':        wallet.address,
-        'to':          to_addr,
-        'amount':      amount,
-        'fee':         fee,
-        'memo':        memo,
-        'timestamp':   int(time.time()),
-        'public_key':  wallet.public_key,
+        'tx_id'     : tx_id,           # client-side id — server stores as alias if differs from canonical
+        'from'      : wallet.address,
+        'to'        : to_addr,
+        'amount'    : amount,
+        'fee'       : fee,
+        'memo'      : memo,
+        'nonce'     : nonce,
+        'timestamp' : int(_time.time()),
+        'public_key': wallet.public_key,
     }
 
     # HLWE-256 signature: commitment = SHA3-256(payload), witness = SHA3-256(priv+commit)
@@ -4323,11 +4365,12 @@ def _run_transaction_wizard(args, wallet):
     proof   = hashlib.sha3_256((commit + witness).encode()).hexdigest()
     payload['hlwe_signature'] = {'commitment': commit, 'witness': witness, 'proof': proof}
 
-    print(f"TX ID  : {tx_id}")
-    print(f"  From   : {wallet.address}")
-    print(f"  To     : {to_addr}")
-    print(f"  Amount : {amount} QTCL  (fee {fee})")
-    if memo: print(f"  Memo   : {memo}")
+    print(f"\n  Client TX ID : {tx_id}")
+    print(f"  From         : {wallet.address}")
+    print(f"  To           : {to_addr}")
+    print(f"  Amount       : {amount} QTCL  (fee {fee})")
+    if memo: print(f"  Memo         : {memo}")
+    print("\n  ⚠️  The SERVER will return the authoritative TX hash to use for status queries.")
 
     try:
         confirm = input("\nBroadcast? [y/N]: ").strip().lower()
@@ -4342,12 +4385,32 @@ def _run_transaction_wizard(args, wallet):
                           json=payload, timeout=15)
         if r.status_code in (200, 201):
             data = r.json()
-            server_tx_hash = data.get('tx_hash', tx_id)
-            print(f"✅  Accepted by node — TX ID: {server_tx_hash}")
+            # ── Use SERVER-RETURNED tx_hash as authoritative hash ───────────────
+            # This is the canonical hash stored in DB — ALWAYS use this for lookups.
+            server_tx_hash  = data.get('tx_hash', tx_id)
+            client_alias    = data.get('client_tx_id', tx_id)
+            status          = data.get('status', 'pending')
+            oracle_signed   = data.get('signed', False)
+
+            print(f"\n✅  TX Accepted by node!")
+            print(f"  ┌──────────────────────────────────────────────────────────────────────┐")
+            print(f"  │  AUTHORITATIVE TX HASH (use this for ALL lookups):                   │")
+            print(f"  │  {server_tx_hash}  │")
+            print(f"  └──────────────────────────────────────────────────────────────────────┘")
+            print(f"  Status       : {status} (pending until miner seals a block — Bitcoin model)")
+            print(f"  Oracle Signed: {'✅ YES' if oracle_signed else '⚠️  NO'}")
+            if client_alias and client_alias != server_tx_hash:
+                print(f"  Client Alias : {client_alias} (also queryable)")
+            print(f"\n  📡 Query status:")
+            print(f"     {args.oracle_url}/api/transactions/{server_tx_hash}")
+            print(f"     {args.oracle_url}/api/mempool/tx/{server_tx_hash}")
             if data.get('block_height'):
-                print(f"  📦  Included in block #{data['block_height']}")
+                print(f"  📦  Confirmed in block #{data['block_height']}")
+            else:
+                print(f"\n  ⏳  TX is in mempool — will confirm when next block is mined.")
+                print(f"     This is NORMAL. Bitcoin works the same way.")
         else:
-            print(f"❌  Node rejected tx: {r.status_code} {r.text[:120]}")
+            print(f"❌  Node rejected tx: {r.status_code} {r.text[:200]}")
     except requests.exceptions.ConnectionError:
         print(f"❌  Cannot reach node: {args.oracle_url}")
     except requests.exceptions.Timeout:
