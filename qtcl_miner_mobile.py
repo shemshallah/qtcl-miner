@@ -3252,6 +3252,704 @@ class QuantumMiner:
 # FULL NODE WITH W-STATE MINING
 # ═════════════════════════════════════════════════════════════════════════════════
 
+
+# ═════════════════════════════════════════════════════════════════════════════════════════
+# QTCL P2P GOSSIP CLIENT — Production Grade
+# ═════════════════════════════════════════════════════════════════════════════════════════
+#
+# Components:
+#   GossipHTTPHandler   — wsgiref micro-server handler: accepts POST /gossip/ingest
+#   GossipListener      — starts GossipHTTPHandler on a background thread (port 9001+)
+#   SSESubscriber       — connects to oracle /api/events SSE stream, routes events
+#   PeerHeartbeat       — registers with oracle, sends periodic heartbeats
+#   P2PGossipOrchestrator — coordinates all above; started by QTCLFullNode.start()
+#
+# SQLite local sync:
+#   Every TX received via gossip or SSE is inserted into local SQLite `transactions`
+#   table so the miner has a local mirror of pending TXs that survives reconnects.
+# ═════════════════════════════════════════════════════════════════════════════════════════
+
+import http.server
+import socketserver
+import urllib.parse as _urlparse
+
+
+# ── Local SQLite schema for gossip mirror ─────────────────────────────────────
+_GOSSIP_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_txs (
+    tx_hash     TEXT PRIMARY KEY,
+    from_addr   TEXT NOT NULL,
+    to_addr     TEXT NOT NULL,
+    amount_base INTEGER NOT NULL,
+    nonce       INTEGER DEFAULT 0,
+    fee_qtcl    REAL    DEFAULT 0.001,
+    timestamp_ns INTEGER DEFAULT 0,
+    signature   TEXT    DEFAULT '',
+    status      TEXT    DEFAULT 'pending',
+    source      TEXT    DEFAULT 'gossip',
+    received_at REAL    DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pending_txs_status ON pending_txs(status);
+CREATE TABLE IF NOT EXISTS gossip_peers (
+    peer_id     TEXT PRIMARY KEY,
+    gossip_url  TEXT NOT NULL,
+    miner_addr  TEXT DEFAULT '',
+    block_height INTEGER DEFAULT 0,
+    last_seen   REAL DEFAULT 0,
+    online      INTEGER DEFAULT 1
+);
+"""
+
+
+def _init_gossip_db(db) -> None:
+    """Add gossip tables to existing local SQLite DB connection."""
+    if db is None:
+        return
+    try:
+        for stmt in _GOSSIP_DB_SCHEMA.strip().split(';'):
+            s = stmt.strip()
+            if s:
+                db.execute(s)
+        db.commit()
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] DB schema init: {e}")
+
+
+def _local_db_upsert_tx(db, tx: dict) -> bool:
+    """Mirror a pending TX into local SQLite. Returns True if row was new."""
+    if db is None:
+        return False
+    try:
+        cur = db.execute("""
+            INSERT OR IGNORE INTO pending_txs
+                (tx_hash, from_addr, to_addr, amount_base,
+                 nonce, fee_qtcl, timestamp_ns, signature, source)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            tx.get('tx_hash') or tx.get('tx_id',''),
+            tx.get('from_address') or tx.get('from_addr',''),
+            tx.get('to_address') or tx.get('to_addr',''),
+            int(tx.get('amount_base', int(float(tx.get('amount',0))*100))),
+            int(tx.get('nonce', 0)),
+            float(tx.get('fee', 0.001)),
+            int(tx.get('timestamp_ns', 0)),
+            str(tx.get('signature','') or tx.get('quantum_state_hash','')),
+            str(tx.get('source','gossip')),
+        ))
+        db.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] upsert_tx: {e}")
+        return False
+
+
+def _local_db_clear_confirmed(db, tx_hashes: list) -> None:
+    """Mark TXs as confirmed in local mirror after block seal."""
+    if db is None or not tx_hashes:
+        return
+    try:
+        db.executemany(
+            "UPDATE pending_txs SET status='confirmed' WHERE tx_hash=?",
+            [(h,) for h in tx_hashes],
+        )
+        db.commit()
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] clear_confirmed: {e}")
+
+
+def _local_db_get_pending(db) -> list:
+    """Read all pending TXs from local SQLite mirror."""
+    if db is None:
+        return []
+    try:
+        cur = db.execute("""
+            SELECT tx_hash, from_addr, to_addr, amount_base,
+                   nonce, fee_qtcl, timestamp_ns, signature
+            FROM   pending_txs
+            WHERE  status = 'pending'
+            ORDER  BY received_at ASC
+        """)
+        rows = cur.fetchall()
+        return [{
+            'tx_id'        : r[0], 'tx_hash'      : r[0],
+            'from_addr'    : r[1], 'from_address' : r[1],
+            'to_addr'      : r[2], 'to_address'   : r[2],
+            'amount_base'  : r[3], 'amount'        : r[3] / 100,
+            'nonce'        : r[4], 'fee'           : r[5],
+            'timestamp_ns' : r[6], 'signature'     : r[7],
+            'tx_type'      : 'transfer', 'status'  : 'pending',
+        } for r in rows]
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] get_pending: {e}")
+        return []
+
+
+# ── GossipHTTPHandler ─────────────────────────────────────────────────────────
+class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """
+    Minimal HTTP request handler for peer-to-peer gossip.
+
+    Accepts:
+        POST /gossip/ingest   — receive TX + block gossip bundle from another peer
+        GET  /gossip/status   — liveness probe (returns JSON with peer info)
+
+    Injected attributes (set by GossipListener):
+        server.local_mempool  — Mempool instance to push received TXs into
+        server.local_db       — sqlite3 connection for local TX mirror
+        server.miner_address  — this node's address
+        server.peer_id        — this node's peer_id
+        server.on_block_event — callable(height, block_hash) for block gossip
+    """
+    _MAX_BODY = 1_048_576  # 1 MB per ingest call
+
+    def log_message(self, fmt, *args):
+        logger.debug(f"[GOSSIP/http] {fmt % args}")
+
+    def _send_json(self, code: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json_body(self) -> Optional[dict]:
+        length = int(self.headers.get('Content-Length', 0))
+        if length <= 0 or length > self._MAX_BODY:
+            return None
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def do_GET(self):
+        path = _urlparse.urlparse(self.path).path
+        if path == '/gossip/status':
+            mp   = getattr(self.server, 'local_mempool', None)
+            size = mp.get_size() if mp else 0
+            self._send_json(200, {
+                'peer_id'       : getattr(self.server, 'peer_id', ''),
+                'miner_address' : getattr(self.server, 'miner_address', ''),
+                'mempool_size'  : size,
+                'ts'            : time.time(),
+            })
+        else:
+            self._send_json(404, {'error': 'not found'})
+
+    def do_POST(self):
+        path = _urlparse.urlparse(self.path).path
+        if path != '/gossip/ingest':
+            self._send_json(404, {'error': 'not found'})
+            return
+
+        data = self._read_json_body()
+        if not data:
+            self._send_json(400, {'error': 'invalid body'})
+            return
+
+        mp     = getattr(self.server, 'local_mempool', None)
+        db     = getattr(self.server, 'local_db',      None)
+        new_tx = 0
+
+        # ── Ingest transactions ───────────────────────────────────────────────
+        for tx in (data.get('txs') or [])[:50]:
+            tx_hash   = str(tx.get('tx_hash') or tx.get('tx_id', ''))
+            from_addr = str(tx.get('from_address') or tx.get('from_addr', ''))
+            to_addr   = str(tx.get('to_address') or tx.get('to_addr', ''))
+            if not tx_hash or not from_addr or len(tx_hash) != 64:
+                continue
+            amount_b  = int(tx.get('amount_base', int(float(tx.get('amount',0))*100)))
+            # Push to in-memory Mempool
+            if mp:
+                try:
+                    mapped = Transaction(
+                        tx_id        = tx_hash,
+                        from_addr    = from_addr,
+                        to_addr      = to_addr,
+                        amount       = amount_b / 100,
+                        nonce        = int(tx.get('nonce', 0)),
+                        timestamp_ns = int(tx.get('timestamp_ns', int(time.time()*1e9))),
+                        signature    = str(tx.get('signature','')),
+                        fee          = float(tx.get('fee', 0.001)),
+                    )
+                    mp.add_transaction(mapped)
+                except Exception as te:
+                    logger.debug(f"[GOSSIP/ingest] TX→Mempool: {te}")
+            # Mirror to local SQLite
+            tx['source'] = f"peer:{data.get('origin','?')[:32]}"
+            if _local_db_upsert_tx(db, tx):
+                new_tx += 1
+
+        # ── Ingest block notification ─────────────────────────────────────────
+        block = data.get('block')
+        if block and isinstance(block, dict):
+            bh = int(block.get('height', 0))
+            bk = str(block.get('block_hash', ''))
+            on_block = getattr(self.server, 'on_block_event', None)
+            if on_block and bh > 0 and callable(on_block):
+                try:
+                    on_block(bh, bk)
+                except Exception as be:
+                    logger.debug(f"[GOSSIP/ingest] on_block_event: {be}")
+            if new_tx or bh:
+                logger.info(
+                    f"[GOSSIP/ingest] {new_tx} new TX(s) | "
+                    f"{'block #' + str(bh) if bh else 'no block'} "
+                    f"from {data.get('origin','?')[:40]}"
+                )
+
+        self._send_json(200, {'ok': True, 'new_txs': new_tx})
+
+
+class GossipListener:
+    """
+    Starts a GossipHTTPHandler on a background daemon thread.
+    Probes ports 9001-9010 for an available one.
+    """
+    def __init__(self, mempool: 'Mempool', db, miner_address: str, peer_id: str,
+                 preferred_port: int = 9001):
+        self.mempool        = mempool
+        self.db             = db
+        self.miner_address  = miner_address
+        self.peer_id        = peer_id
+        self.preferred_port = preferred_port
+        self.bound_port: Optional[int] = None
+        self.gossip_url: str = ''
+        self._server: Optional[socketserver.TCPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.on_block_event = None   # callable(height, block_hash)
+
+    def start(self) -> bool:
+        for port in range(self.preferred_port, self.preferred_port + 10):
+            try:
+                server = socketserver.TCPServer(('0.0.0.0', port), GossipHTTPHandler)
+                server.local_mempool  = self.mempool
+                server.local_db       = self.db
+                server.miner_address  = self.miner_address
+                server.peer_id        = self.peer_id
+                server.on_block_event = self.on_block_event
+                self._server   = server
+                self.bound_port = port
+                # Build public gossip URL — use env override if behind NAT/proxy
+                host = os.getenv('GOSSIP_PUBLIC_HOST', '')
+                if not host:
+                    try:
+                        import socket as _sock
+                        host = _sock.gethostbyname(_sock.gethostname())
+                    except Exception:
+                        host = '127.0.0.1'
+                self.gossip_url = f"http://{host}:{port}"
+                self._thread = threading.Thread(
+                    target=server.serve_forever, daemon=True, name=f"GossipListener:{port}"
+                )
+                self._thread.start()
+                logger.info(f"[GOSSIP] Listener on port {port} | url={self.gossip_url}")
+                return True
+            except OSError:
+                continue
+        logger.warning("[GOSSIP] Could not bind gossip listener on ports 9001-9010")
+        return False
+
+    def stop(self) -> None:
+        if self._server:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+
+
+# ── SSESubscriber ─────────────────────────────────────────────────────────────
+class SSESubscriber(threading.Thread):
+    """
+    Subscribes to oracle /api/events SSE stream.
+    Routes typed events into the local Mempool and SQLite mirror.
+
+    Event handlers:
+        tx    → push to Mempool + local SQLite
+        block → call on_block_event(height, block_hash)
+        peer  → update gossip_peers table
+        hello → log chain tip and mempool size
+    """
+    RECONNECT_DELAY = 5   # seconds between reconnect attempts
+    READ_TIMEOUT    = 90  # seconds; oracle sends keepalive every 30s
+
+    def __init__(self, oracle_url: str, peer_id: str,
+                 mempool: 'Mempool', db,
+                 on_block_event=None):
+        super().__init__(name='SSESubscriber', daemon=True)
+        self.oracle_url     = oracle_url.rstrip('/')
+        self.peer_id        = peer_id
+        self.mempool        = mempool
+        self.db             = db
+        self.on_block_event = on_block_event   # callable(height, hash)
+        self._running       = True
+        self._session       = requests.Session()
+        self._last_event_ts = 0.0
+
+    def _handle_event(self, raw: str) -> None:
+        try:
+            ev = json.loads(raw)
+        except Exception:
+            return
+        etype = ev.get('type', '')
+        edata = ev.get('data', {})
+
+        if etype == 'tx':
+            tx_hash  = edata.get('tx_hash','')
+            from_a   = edata.get('from','')
+            to_a     = edata.get('to','')
+            amount_b = int(float(edata.get('amount', edata.get('amount_base',0))) * 100
+                           if float(edata.get('amount', 0)) < 10000
+                           else edata.get('amount_base', 0))
+            if tx_hash and from_a and len(tx_hash) == 64:
+                try:
+                    tx = Transaction(
+                        tx_id        = tx_hash,
+                        from_addr    = from_a,
+                        to_addr      = to_a,
+                        amount       = amount_b / 100,
+                        nonce        = int(edata.get('nonce', 0)),
+                        timestamp_ns = int(time.time() * 1e9),
+                        signature    = str(edata.get('signature','')),
+                        fee          = float(edata.get('fee', 0.001)),
+                    )
+                    self.mempool.add_transaction(tx)
+                except Exception as te:
+                    logger.debug(f"[SSE] TX→Mempool: {te}")
+                _local_db_upsert_tx(self.db, {
+                    'tx_hash'    : tx_hash, 'from_addr': from_a, 'to_addr': to_a,
+                    'amount_base': amount_b, 'nonce'   : edata.get('nonce', 0),
+                    'source'     : 'sse',
+                })
+                logger.info(f"[SSE] TX received | {tx_hash[:16]}... {from_a[:12]}...→{to_a[:12]}...")
+                self._last_event_ts = time.time()
+
+        elif etype == 'block':
+            height = int(edata.get('height', 0))
+            bhash  = str(edata.get('block_hash', ''))
+            if height > 0 and self.on_block_event:
+                try:
+                    self.on_block_event(height, bhash)
+                except Exception as be:
+                    logger.debug(f"[SSE] on_block_event: {be}")
+            logger.info(f"[SSE] Block #{height} | {bhash[:16]}... from {edata.get('source','?')}")
+            self._last_event_ts = time.time()
+
+        elif etype == 'peer':
+            ev_sub  = edata.get('event','')
+            peer_id = edata.get('peer_id','')
+            gurl    = edata.get('gossip_url','')
+            if peer_id and gurl and self.db:
+                try:
+                    self.db.execute("""
+                        INSERT OR REPLACE INTO gossip_peers
+                            (peer_id, gossip_url, block_height, last_seen, online)
+                        VALUES (?,?,?,?,?)
+                    """, (peer_id, gurl, edata.get('block_height',0), time.time(),
+                           1 if ev_sub == 'joined' else 0))
+                    self.db.commit()
+                except Exception as pe:
+                    logger.debug(f"[SSE] peer upsert: {pe}")
+
+        elif etype == 'hello':
+            logger.info(
+                f"[SSE] Connected to oracle | "
+                f"tip={edata.get('tip_height',0)} | "
+                f"mempool={edata.get('mempool',0)}"
+            )
+
+    def run(self):
+        url = f"{self.oracle_url}/api/events?client_id={self.peer_id}&types=all"
+        logger.info(f"[SSE] Subscribing to {url}")
+        while self._running:
+            try:
+                with self._session.get(url, stream=True,
+                                       timeout=self.READ_TIMEOUT) as resp:
+                    if resp.status_code != 200:
+                        logger.warning(f"[SSE] HTTP {resp.status_code} — retry in {self.RECONNECT_DELAY}s")
+                        time.sleep(self.RECONNECT_DELAY)
+                        continue
+                    buf = ''
+                    for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
+                        if not self._running:
+                            break
+                        buf += chunk
+                        while '\n\n' in buf:
+                            frame, buf = buf.split('\n\n', 1)
+                            for line in frame.splitlines():
+                                if line.startswith('data:'):
+                                    self._handle_event(line[5:].strip())
+            except Exception as e:
+                if self._running:
+                    logger.warning(f"[SSE] Stream error ({type(e).__name__}): {e} — reconnecting in {self.RECONNECT_DELAY}s")
+                    time.sleep(self.RECONNECT_DELAY)
+
+    def stop(self):
+        self._running = False
+
+
+# ── PeerHeartbeat ─────────────────────────────────────────────────────────────
+class PeerHeartbeat(threading.Thread):
+    """
+    Registers with oracle on startup; sends heartbeats every HEARTBEAT_INTERVAL.
+    Also discovers new peers and pushes new local TXs to them.
+    """
+    HEARTBEAT_INTERVAL = 30   # seconds
+    PEER_SYNC_INTERVAL = 60   # seconds between peer list refresh
+
+    def __init__(self, oracle_url: str, peer_id: str, miner_address: str,
+                 gossip_url: str, mempool: 'Mempool', db,
+                 get_tip_fn=None):
+        super().__init__(name='PeerHeartbeat', daemon=True)
+        self.oracle_url     = oracle_url.rstrip('/')
+        self.peer_id        = peer_id
+        self.miner_address  = miner_address
+        self.gossip_url     = gossip_url
+        self.mempool        = mempool
+        self.db             = db
+        self.get_tip_fn     = get_tip_fn   # callable() → int height
+        self._running       = True
+        self._session       = requests.Session()
+        self._known_peers: List[Dict] = []
+        self._last_peer_sync = 0.0
+
+    def _register(self) -> bool:
+        height = self.get_tip_fn() if self.get_tip_fn else 0
+        try:
+            r = self._session.post(
+                f"{self.oracle_url}/api/peers/register",
+                json={
+                    'peer_id'        : self.peer_id,
+                    'gossip_url'     : self.gossip_url,
+                    'miner_address'  : self.miner_address,
+                    'block_height'   : height,
+                    'network_version': '1.0',
+                    'supports_sse'   : True,
+                },
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                data = r.json()
+                self._known_peers = data.get('live_peers', [])
+                logger.info(
+                    f"[P2P] Registered with oracle | "
+                    f"peer_id={self.peer_id[:16]}... | "
+                    f"live_peers={len(self._known_peers)}"
+                )
+                # Persist known peers to local SQLite
+                if self.db:
+                    for p in self._known_peers:
+                        gurl = p.get('gossip_url','')
+                        if gurl:
+                            try:
+                                self.db.execute("""
+                                    INSERT OR REPLACE INTO gossip_peers
+                                        (peer_id, gossip_url, miner_addr, block_height, last_seen, online)
+                                    VALUES (?,?,?,?,?,1)
+                                """, (p['peer_id'], gurl,
+                                      p.get('miner_address',''),
+                                      p.get('block_height', 0), time.time()))
+                            except Exception:
+                                pass
+                    try:
+                        self.db.commit()
+                    except Exception:
+                        pass
+                return True
+        except Exception as e:
+            logger.warning(f"[P2P] Registration failed: {e}")
+        return False
+
+    def _heartbeat(self) -> None:
+        height = self.get_tip_fn() if self.get_tip_fn else 0
+        try:
+            self._session.post(
+                f"{self.oracle_url}/api/peers/heartbeat",
+                json={'peer_id': self.peer_id, 'block_height': height},
+                timeout=6,
+            )
+        except Exception:
+            pass
+
+    def _refresh_peers(self) -> None:
+        try:
+            r = self._session.get(f"{self.oracle_url}/api/peers/list", timeout=8)
+            if r.status_code == 200:
+                self._known_peers = r.json().get('peers', [])
+                if self.db:
+                    for p in self._known_peers:
+                        gurl = p.get('gossip_url','')
+                        if not gurl:
+                            continue
+                        try:
+                            self.db.execute("""
+                                INSERT OR REPLACE INTO gossip_peers
+                                    (peer_id, gossip_url, miner_addr, block_height, last_seen, online)
+                                VALUES (?,?,?,?,?,1)
+                            """, (p['peer_id'], gurl, p.get('miner_address',''),
+                                  p.get('block_height',0), time.time()))
+                        except Exception:
+                            pass
+                    try:
+                        self.db.commit()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[P2P] peer refresh: {e}")
+
+    def _push_to_peers(self) -> None:
+        """Push latest pending TXs directly to all known peers via HTTP POST."""
+        peers = [p for p in self._known_peers if p.get('gossip_url')
+                 and p['peer_id'] != self.peer_id]
+        if not peers:
+            return
+        local_txs = _local_db_get_pending(self.db)
+        if not local_txs:
+            return
+        payload = {'origin': self.gossip_url, 'txs': local_txs[:50], 'sent_at': time.time()}
+        ok = 0
+        for peer in peers:
+            url = peer['gossip_url'].rstrip('/')
+            try:
+                r = self._session.post(f"{url}/gossip/ingest", json=payload, timeout=5)
+                if r.status_code in (200, 201):
+                    ok += 1
+            except Exception:
+                pass
+        if ok:
+            logger.info(f"[P2P] Pushed {len(local_txs)} pending TX(s) to {ok}/{len(peers)} peers")
+
+    def run(self):
+        # Wait for entanglement before first registration
+        time.sleep(3)
+        # Keep retrying until registered
+        while self._running and not self._register():
+            time.sleep(self.HEARTBEAT_INTERVAL)
+
+        last_hb    = time.time()
+        last_psync = time.time()
+        while self._running:
+            now = time.time()
+            if now - last_hb >= self.HEARTBEAT_INTERVAL:
+                self._heartbeat()
+                self._push_to_peers()
+                last_hb = now
+            if now - last_psync >= self.PEER_SYNC_INTERVAL:
+                self._refresh_peers()
+                last_psync = now
+            time.sleep(5)
+
+    def stop(self):
+        self._running = False
+
+    def get_known_peers(self) -> List[Dict]:
+        return list(self._known_peers)
+
+
+# ── P2PGossipOrchestrator ─────────────────────────────────────────────────────
+class P2PGossipOrchestrator:
+    """
+    Top-level coordinator for all P2P gossip functionality in a QTCL miner node.
+
+    Manages:
+        - GossipListener  (inbound peer HTTP gossip)
+        - SSESubscriber   (oracle push events)
+        - PeerHeartbeat   (oracle registration + peer push)
+        - Local SQLite mirror of pending TXs and gossip peers
+
+    Instantiate and call .start() inside QTCLFullNode.start().
+    The orchestrator integrates deeply with the existing Mempool so mining_loop
+    gets TXs from ALL sources: oracle DB, SSE push, and direct peer gossip.
+    """
+    def __init__(self, oracle_url: str, miner_address: str,
+                 mempool: 'Mempool', db,
+                 on_block_event=None,
+                 gossip_port: int = 9001):
+        self.oracle_url      = oracle_url
+        self.miner_address   = miner_address
+        self.mempool         = mempool
+        self.db              = db
+        self.on_block_event  = on_block_event
+        self.gossip_port     = gossip_port
+        self.get_tip_fn      = None    # set by caller
+
+        # Stable peer_id: sha256(miner_address)[:32]
+        self.peer_id = hashlib.sha256(miner_address.encode()).hexdigest()[:32]
+
+        self._listener   : Optional[GossipListener]   = None
+        self._sse        : Optional[SSESubscriber]     = None
+        self._heartbeat  : Optional[PeerHeartbeat]     = None
+        self._started    = False
+
+    def start(self) -> bool:
+        if self._started:
+            return True
+        self._started = True
+
+        # ── Prepare local SQLite gossip tables ───────────────────────────────
+        _init_gossip_db(self.db)
+
+        # ── GossipListener — inbound peer HTTP ───────────────────────────────
+        self._listener = GossipListener(
+            mempool       = self.mempool,
+            db            = self.db,
+            miner_address = self.miner_address,
+            peer_id       = self.peer_id,
+            preferred_port= self.gossip_port,
+        )
+        self._listener.on_block_event = self.on_block_event
+        self._listener.start()
+        gossip_url = self._listener.gossip_url  # may be '' if port binding failed
+
+        # ── SSESubscriber — oracle push ───────────────────────────────────────
+        self._sse = SSESubscriber(
+            oracle_url     = self.oracle_url,
+            peer_id        = self.peer_id,
+            mempool        = self.mempool,
+            db             = self.db,
+            on_block_event = self.on_block_event,
+        )
+        self._sse.start()
+
+        # ── PeerHeartbeat — registration + peer-to-peer push ─────────────────
+        self._heartbeat = PeerHeartbeat(
+            oracle_url    = self.oracle_url,
+            peer_id       = self.peer_id,
+            miner_address = self.miner_address,
+            gossip_url    = gossip_url,
+            mempool       = self.mempool,
+            db            = self.db,
+            get_tip_fn    = self.get_tip_fn,
+        )
+        self._heartbeat.start()
+
+        logger.info(
+            f"[GOSSIP] Orchestrator online | peer_id={self.peer_id} | "
+            f"gossip={gossip_url or 'unbound'} | sse=subscribed | "
+            f"heartbeat=started"
+        )
+        return True
+
+    def stop(self) -> None:
+        if self._sse:
+            self._sse.stop()
+        if self._heartbeat:
+            self._heartbeat.stop()
+        if self._listener:
+            self._listener.stop()
+
+    def get_peer_count(self) -> int:
+        if self._heartbeat:
+            return len(self._heartbeat.get_known_peers())
+        return 0
+
+    def get_gossip_url(self) -> str:
+        if self._listener:
+            return self._listener.gossip_url
+        return ''
+
+
 class QTCLFullNode:
     def __init__(self, miner_address: str, oracle_url: str='https://qtcl-blockchain.koyeb.app', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
@@ -3293,8 +3991,26 @@ class QTCLFullNode:
         
         self.sync_thread: Optional[threading.Thread]=None
         self.mining_thread: Optional[threading.Thread]=None
-        
-        logger.info(f"[NODE] 🚀 QTCL Full Node initialized | miner={miner_address[:20]}… | oracle={oracle_url}")
+
+        # P2P GOSSIP ORCHESTRATOR — SSE + peer registry + listener + heartbeat
+        self._gossip = P2PGossipOrchestrator(
+            oracle_url    = oracle_url,
+            miner_address = miner_address,
+            mempool       = self.mempool,
+            db            = db_connection,
+        )
+        # Wire on_block_event so gossip-received blocks trigger immediate tip refresh
+        def _on_gossip_block(height: int, bhash: str):
+            try:
+                tip = self.state.get_tip()
+                if tip and height > tip.height:
+                    logger.info(f"[GOSSIP] Block #{height} received — triggering sync")
+                    # Re-fetch tip from oracle on next sync cycle (sync_loop reads state.get_tip)
+            except Exception:
+                pass
+        self._gossip.on_block_event = _on_gossip_block
+
+        logger.info(f"[NODE] QTCL Full Node initialized | miner={miner_address[:20]}… | oracle={oracle_url}")
     
     def start(self)->bool:
         try:
@@ -3402,8 +4118,17 @@ class QTCLFullNode:
             
             self.mining_thread = threading.Thread(target=self._mining_loop, daemon=True, name="MiningWorker")
             self.mining_thread.start()
+
+            # Start P2P gossip orchestrator — SSE subscription, peer registration,
+            # gossip listener, heartbeat. Must start after running=True so get_tip_fn works.
+            self._gossip.get_tip_fn = lambda: (self.state.get_tip().height if self.state.get_tip() else 0)
+            self._gossip.start()
             
-            logger.info("[NODE] ✨ Full node with quantum mining started")
+            logger.info(
+                f"[NODE] Full node online | "
+                f"gossip_url={self._gossip.get_gossip_url() or 'unbound'} | "
+                f"peer_id={self._gossip.peer_id}"
+            )
             return True
         
         except Exception as e:
@@ -3413,11 +4138,13 @@ class QTCLFullNode:
     def stop(self):
         self.running=False
         self.w_state_recovery.stop()
+        if hasattr(self, '_gossip'):
+            self._gossip.stop()
         if self.sync_thread:
             self.sync_thread.join(timeout=5)
         if self.mining_thread:
             self.mining_thread.join(timeout=5)
-        logger.info("[NODE] ✅ Stopped")
+        logger.info("[NODE] Stopped")
     
     def _sync_loop(self):
         """Continuously sync blockchain from network — Bitcoin-style from genesis to tip."""
@@ -3480,18 +4207,13 @@ class QTCLFullNode:
                                 logger.warning(f"[SYNC] ⚠️  Block #{h} failed validation, skipping")
                         time.sleep(0.05)
                 else:
-                    logger.debug(f"[SYNC] ✅ In sync at height {current_height}")
-                
-                mempool_txs = self.client.get_mempool()
-                for tx in mempool_txs:
-                    self.mempool.add_transaction(tx)
-                logger.debug(f"[SYNC] 💾 Mempool: {self.mempool.get_size()} txs")
+                    logger.debug(f"[SYNC] In sync at height {current_height}")
                 
                 time.sleep(MEMPOOL_POLL_INTERVAL)
             except Exception as e:
-                logger.error(f"[SYNC] ❌ Error: {e}")
+                logger.error(f"[SYNC] Error: {e}")
                 time.sleep(10)
-        logger.info("[SYNC] 🛑 Loop ended")
+        logger.info("[SYNC] Loop ended")
     
     def _mining_loop(self):
         """Background mining subsystem with W-state entanglement and comprehensive metrics"""
@@ -3508,57 +4230,73 @@ class QTCLFullNode:
                 entanglement = self.w_state_recovery.get_entanglement_status()
                 
                 if not entanglement.get('established'):
-                    logger.debug("[MINING] ⏳ Waiting for entanglement establishment...")
+                    logger.debug("[MINING] Waiting for W-state entanglement...")
                     time.sleep(2)
                     continue
                 
                 tip = self.state.get_tip()
                 if not tip:
-                    logger.debug("[MINING] ⏳ No chain tip yet, waiting...")
+                    logger.debug("[MINING] No chain tip yet, waiting...")
                     time.sleep(5)
                     continue
                 
-                # Pull fresh mempool from server RIGHT NOW before building this block.
-                # The background sync loop runs every MEMPOOL_POLL_INTERVAL seconds — if
-                # a TX was submitted after the last poll, it would miss this block entirely.
-                # Fetching here guarantees the current block includes every known pending TX.
-                try:
-                    fresh_txs = self.client.get_mempool()
-                    for tx in fresh_txs:
-                        self.mempool.add_transaction(tx)
-                    if fresh_txs:
-                        logger.info(f"[MINING] Fetched {len(fresh_txs)} pending TXs from server mempool")
-                except Exception as mp_err:
-                    logger.debug(f"[MINING] Pre-block mempool fetch failed (using cached): {mp_err}")
+                # ── FETCH PENDING TXs FROM SERVER — DB is the single source of truth ──
+                # ── FETCH PENDING TXs — three-tier priority ─────────────────────────
+                # 1. Oracle /api/mempool (DB-backed, authoritative)
+                # 2. In-memory Mempool (populated by SSE + peer gossip in real-time)
+                # 3. Local SQLite mirror (last resort — survives network partition)
+                pending_txs = self.client.get_mempool()
+                # Merge server TXs into local Mempool buffer for dedup tracking
+                for tx in pending_txs:
+                    self.mempool.add_transaction(tx)
 
-                # Pull at most MAX_BLOCK_TX user transactions from mempool.
-                # Coinbase is NOT counted — prepended separately in mine_block().
-                pending_txs = self.mempool.get_pending(limit=MAX_BLOCK_TX)
-                
-                # Get current W-state metrics — use real oracle fidelity
+                # If server returned nothing, check what gossip/SSE has populated locally
+                if not pending_txs:
+                    in_mem = self.mempool.get_pending(limit=MAX_BLOCK_TX)
+                    if in_mem:
+                        pending_txs = in_mem
+                        logger.info(f"[MINING] Using {len(pending_txs)} in-memory gossip TX(s)")
+
+                # Last resort: local SQLite mirror (peer gossip, SSE, pre-server)
+                if not pending_txs and self.db:
+                    sqlite_txs = _local_db_get_pending(self.db)
+                    if sqlite_txs:
+                        for raw in sqlite_txs[:MAX_BLOCK_TX]:
+                            try:
+                                t = Transaction(
+                                    tx_id        = raw['tx_hash'],
+                                    from_addr    = raw['from_addr'],
+                                    to_addr      = raw['to_addr'],
+                                    amount       = raw['amount'],
+                                    nonce        = raw['nonce'],
+                                    timestamp_ns = raw['timestamp_ns'] or int(time.time()*1e9),
+                                    signature    = raw['signature'],
+                                    fee          = raw['fee'],
+                                )
+                                pending_txs.append(t)
+                            except Exception:
+                                pass
+                        if pending_txs:
+                            logger.info(f"[MINING] Using {len(pending_txs)} local SQLite TX(s)")
+
+                tx_count = len(pending_txs)
                 current_fidelity = entanglement.get('w_state_fidelity', 0.0)
                 fidelity_measurements.append(current_fidelity)
                 
-                tx_count = len(pending_txs) if pending_txs else 0
-                logger.info(f"[MINING] Mining block #{tip.height+1} | txs={tx_count} | F={current_fidelity:.4f}")
+                logger.info(f"[MINING] Block #{tip.height+1} | pending_txs={tx_count} | F={current_fidelity:.4f}")
                 
                 block_start = time.time()
-                block = self.miner.mine_block(pending_txs or [], self.miner_address, tip.block_hash, tip.height+1)
+                block = self.miner.mine_block(pending_txs, self.miner_address, tip.block_hash, tip.height+1)
                 block_time = time.time() - block_start
                 
                 if block:
                     total_hash_attempts += self.miner.metrics.get('hash_attempts', 0)
                     blocks_mined_this_session += 1
                     
-                    # Validate block
                     if self.validator.validate_block(block):
-                        # ✅ BULLETPROOF: Submit to network - NEVER use asdict()
                         submit_start = time.time()
                         
                         try:
-                            # ✅ MUSEUM-GRADE: Manual dict serialization - NO asdict() anywhere
-                            
-                            # Serialize header - direct attribute access
                             header_dict = {
                                 'height': int(block.header.height),
                                 'block_hash': str(block.header.block_hash),
@@ -3649,11 +4387,13 @@ class QTCLFullNode:
                                 # Do NOT wait for sync loop — update now so next iteration
                                 # mines block N+1, not N again.
                                 self.state.add_block(block.header)
+                                confirmed_ids = [tx.tx_id for tx in block.transactions] if block.transactions else []
                                 for tx in block.transactions:
                                     self.state.apply_transaction(tx)
-                                self.mempool.remove_transactions(
-                                    [tx.tx_id for tx in block.transactions] if block.transactions else []
-                                )
+                                self.mempool.remove_transactions(confirmed_ids)
+                                # Mirror confirmation to local SQLite gossip store
+                                if confirmed_ids:
+                                    _local_db_clear_confirmed(self.db, confirmed_ids)
 
                                 # Propagate new height to WebSocket heartbeat so peers know our tip
                                 try:
