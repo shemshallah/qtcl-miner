@@ -4093,13 +4093,9 @@ class QTCLWallet:
     # ── BIP-39 ────────────────────────────────────────────────────────────────
 
     def _gen_mnemonic(self) -> str:
-        """128-bit entropy → 12 BIP-39 words."""
-        val   = int.from_bytes(secrets.token_bytes(16), 'big')
-        words = []
-        for _ in range(self.MNEMONIC_WORDS):
-            words.append(self._W[val % 2048])
-            val //= 2048
-        return ' '.join(words)
+        """Generate 12 cryptographically random words (130-bit entropy, 1893-word QTCL wordlist)."""
+        return ' '.join(self._W[secrets.randbelow(len(self._W))]
+                        for _ in range(self.MNEMONIC_WORDS))
 
     def _mnemonic_to_seed(self, mnemonic: str) -> bytes:
         """BIP-39: PBKDF2-HMAC-SHA512(mnemonic, 'mnemonic'+passphrase, 2048) → 64B seed."""
@@ -4285,6 +4281,52 @@ def _wallet_from_mnemonic(args) -> None:
     print(f"\n  ✅  Restored: {w.address}")
     print(f"  💾  Saved → {w.wallet_file}\n")
     sys.exit(0)
+
+class MinerRegistry:
+    """Register miner with oracle. Token stored in data/.qtcl_registered."""
+
+    def __init__(self, oracle_url: str):
+        self.oracle_url       = oracle_url
+        self._token_file      = Path('data') / '.qtcl_registered'
+        self._token_file.parent.mkdir(exist_ok=True, mode=0o700)
+        self.token: Optional[str] = self._load_token()
+
+    def register(self, miner_id: str, address: str, public_key: str,
+                 private_key: str, miner_name: str = 'qtcl-miner') -> bool:
+        try:
+            r = requests.post(
+                f"{self.oracle_url}/api/oracle/register",
+                json={'miner_id': miner_id, 'address': address,
+                      'public_key': public_key, 'miner_name': miner_name},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('status') == 'registered':
+                    self.token = data.get('token', '')
+                    self._save_token()
+                    logger.info(f"[REGISTRY] ✅ Registered — token {self.token[:16]}…")
+                    return True
+            logger.warning(f"[REGISTRY] Rejected: {r.text[:120]}")
+        except Exception as e:
+            logger.warning(f"[REGISTRY] Failed: {e}")
+        return False
+
+    def is_registered(self) -> bool:
+        return bool(self.token)
+
+    def _save_token(self) -> None:
+        self._token_file.write_text(self.token or '')
+        os.chmod(self._token_file, 0o600)
+
+    def _load_token(self) -> Optional[str]:
+        try:
+            if self._token_file.exists():
+                return self._token_file.read_text().strip() or None
+        except Exception:
+            pass
+        return None
+
 
 def parse_args():
     parser=argparse.ArgumentParser(
@@ -5119,7 +5161,7 @@ def main():
         # Start mining
         # ─── DATABASE INITIALIZATION WITH PERSISTENT FILE-BASED STORAGE ──────────────
         global db
-        db_path = Path('qtcl-miner/data/qtcl_blockchain.db')
+        db_path = Path('data/qtcl_blockchain.db')
         db_path.parent.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"[DB] 🔧 Initializing persistent database at {db_path}...")
