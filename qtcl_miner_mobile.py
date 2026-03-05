@@ -1707,12 +1707,15 @@ class MinerWebSocketP2PClient:
     
     def connect(self) -> bool:
         """
-        Connect to oracle via Socket.IO over WSS/443.
+        Connect to oracle via Socket.IO over HTTPS/WSS (port 443 via Koyeb reverse proxy).
 
         socket.io client convention: pass the BASE URL (https://host), NOT
         a ws:// URL with /socket.io appended. The client library appends
         /socket.io internally. Passing wss://host/socket.io was causing
         double-path (/socket.io/socket.io) and silent connection failure.
+        
+        For Koyeb: Prefer polling transport first (more reliable via reverse proxy),
+        fall back to WebSocket if needed.
         """
         if not self.sio:
             return False
@@ -1729,25 +1732,26 @@ class MinerWebSocketP2PClient:
                 host_only = raw.split('/')[0].split(':')[0]
                 if 'localhost' in host_only or '127.0.0.1' in host_only:
                     connect_url = f"http://{host_only}:8000"
+                    transports = ['websocket', 'polling']  # Local: prefer WebSocket
                 else:
-                    connect_url = f"https://{host_only}"  # TLS 443, socket.io appends path
+                    connect_url = f"https://{host_only}"  # Koyeb: HTTPS base URL, reverse proxy on 443
+                    transports = ['polling', 'websocket']  # Koyeb: prefer polling (more reliable through reverse proxy)
 
-            logger.debug(f"[WEBSOCKET] 🔌 Connecting to {connect_url} (timeout={self.current_timeout}s)")
+            logger.debug(f"[WEBSOCKET] 🔌 Connecting to {connect_url} (timeout={self.current_timeout}s, transports={transports})")
             t0 = time.time()
             self.sio.connect(
                 connect_url,
                 wait_timeout=self.current_timeout,
-                transports=['websocket', 'polling'],
+                transports=transports,
                 socketio_path='/socket.io',
             )
             elapsed = time.time() - t0
             self.request_times.append(elapsed)
             self._update_adaptive_timeout()
-            logger.info(f"[WEBSOCKET] ✅ Connected to {connect_url} in {elapsed:.2f}s")
+            logger.info(f"[WEBSOCKET] ✅ Connected to {connect_url} in {elapsed:.2f}s (transports={transports})")
             return True
         except Exception as e:
-            logger.debug(f"[WEBSOCKET] Connection failed ({connect_url if 'connect_url' in locals() else '?'}): {e}"
-                         " — falling back to HTTP polling")
+            logger.warning(f"[WEBSOCKET] ⚠️  Connection attempt failed ({connect_url if 'connect_url' in locals() else '?'}): {type(e).__name__}: {e}")
             return False
     
     def _send_register(self)->None:
@@ -3339,7 +3343,7 @@ class QuantumMiner:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str='wss://localhost:8000/socket.io', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
+    def __init__(self, miner_address: str, oracle_url: str='https://qtcl-blockchain.koyeb.app', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
         self.db=db_connection  # Database connection for difficulty state
