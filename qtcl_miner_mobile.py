@@ -2816,9 +2816,30 @@ class LiveNodeClient:
         try:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/mempool",timeout=10)
             if r.status_code==200:
-                return [Transaction(**tx) for tx in r.json().get('transactions',[])[:MAX_MEMPOOL]]
-        except:
-            pass
+                txs=[]
+                for tx in r.json().get('transactions',[])[:MAX_MEMPOOL]:
+                    try:
+                        # Remap server field names → Transaction dataclass fields
+                        # Server returns from_address/to_address/tx_hash (DB column names)
+                        # Transaction dataclass needs from_addr/to_addr/tx_id
+                        mapped={
+                            'tx_id'       : tx.get('tx_id') or tx.get('tx_hash') or tx.get('hash',''),
+                            'from_addr'   : tx.get('from_addr') or tx.get('from_address') or tx.get('from',''),
+                            'to_addr'     : tx.get('to_addr') or tx.get('to_address') or tx.get('to',''),
+                            'amount'      : float(tx.get('amount') or tx.get('amount_qtcl',0)),
+                            'nonce'       : int(tx.get('nonce',0)),
+                            'timestamp_ns': int(tx.get('timestamp_ns', int(time.time()*1e9))),
+                            'signature'   : str(tx.get('signature') or tx.get('quantum_state_hash','')),
+                            'fee'         : float(tx.get('fee',0.001)),
+                        }
+                        if mapped['tx_id'] and mapped['from_addr'] and mapped['to_addr']:
+                            txs.append(Transaction(**mapped))
+                    except Exception as tx_err:
+                        logger.debug(f"[MEMPOOL] TX remap error: {tx_err} | raw={tx}")
+                logger.info(f"[MEMPOOL] ✅ Fetched {len(txs)} pending TXs from server")
+                return txs
+        except Exception as e:
+            logger.debug(f"[MEMPOOL] Fetch error: {e}")
         return []
     
     def submit_block(self,block_data: Dict[str,Any])->Tuple[bool,str]:
