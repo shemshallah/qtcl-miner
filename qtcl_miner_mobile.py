@@ -4341,8 +4341,9 @@ def _run_transaction_wizard(args, wallet):
         r = requests.post(f"{args.oracle_url}/api/submit_transaction",
                           json=payload, timeout=15)
         if r.status_code in (200, 201):
-            print(f"✅  Accepted by node — TX ID: {tx_id}")
             data = r.json()
+            server_tx_hash = data.get('tx_hash', tx_id)
+            print(f"✅  Accepted by node — TX ID: {server_tx_hash}")
             if data.get('block_height'):
                 print(f"  📦  Included in block #{data['block_height']}")
         else:
