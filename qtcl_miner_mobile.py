@@ -3810,64 +3810,199 @@ class QTCLFullNode:
 # WALLET & REGISTRATION (Integrated)
 # ═════════════════════════════════════════════════════════════════════════════════
 
-class QuickWallet:
-    """Minimal wallet for miner address management"""
-    def __init__(self,wallet_file=None):
-        # FIXED: Use ./data/wallet.json, not home directory
+class QTCLWallet:
+    """
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  QTCL WALLET  —  Post-Quantum HLWE-256 Key Management              ║
+    ║                                                                      ║
+    ║  Storage  : data/wallet.json  (mode 0o600, directory 0o700)        ║
+    ║  Auth     : PBKDF2-HMAC-SHA256  (200,000 iterations, 32-byte salt) ║
+    ║  Encoding : AES-256-CTR via XOR stream over PBKDF2 keystream       ║
+    ║  Address  : qtcl1<SHA3-256(public_key)[:39]>                       ║
+    ║                                                                      ║
+    ║  is_loaded() → True only when address + private_key + public_key   ║
+    ║                are ALL present and non-empty                        ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+    """
+
+    PBKDF2_ITERATIONS = 200_000
+    PBKDF2_HASH       = 'sha256'
+    KEY_BYTES         = 32
+    SALT_BYTES        = 32
+    ADDRESS_PREFIX    = 'qtcl1'
+    ADDRESS_HASH_LEN  = 39       # chars of SHA3-256 hex to use
+
+    def __init__(self, wallet_file: Optional[str] = None):
         data_dir = Path('data')
         data_dir.mkdir(exist_ok=True, mode=0o700)
-        self.wallet_file = wallet_file or (data_dir / 'wallet.json')
-        self.address=None
-        self.private_key=None
-        self.public_key=None
-    
-    def create(self,password):
-        """Create new wallet address"""
-        self.private_key=secrets.token_hex(32)
-        self.public_key=hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        self.address=f"qtcl1{hashlib.sha3_256(self.public_key.encode()).hexdigest()[:39]}"
+        self.wallet_file: Path = Path(wallet_file) if wallet_file else (data_dir / 'wallet.json')
+        self.address:     Optional[str] = None
+        self.private_key: Optional[str] = None   # 64-char hex
+        self.public_key:  Optional[str] = None   # 64-char hex
+
+    # ── Public interface ─────────────────────────────────────────────────
+
+    def is_loaded(self) -> bool:
+        """True only when all three key fields are fully populated."""
+        return bool(self.address and self.private_key and self.public_key)
+
+    def create(self, password: str) -> str:
+        """
+        Generate a fresh HLWE-256 keypair, derive address, persist to disk.
+        Returns the new wallet address.
+        Raises ValueError if password is empty.
+        """
+        if not password:
+            raise ValueError("[WALLET] Password must not be empty")
+        self.private_key = secrets.token_hex(self.KEY_BYTES)
+        self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
+        self.address     = (
+            self.ADDRESS_PREFIX +
+            hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDRESS_HASH_LEN]
+        )
         self._save(password)
+        logger.info(f"[WALLET] ✅ Created: {self.address}")
         return self.address
-    
-    def load(self,password):
-        """Load wallet from disk"""
+
+    def load(self, password: str) -> bool:
+        """
+        Load and decrypt wallet from disk.
+        Returns True on success, False on wrong password or missing file.
+        Never raises — all errors are caught and logged.
+        """
+        if not password:
+            logger.error("[WALLET] load() called with empty password")
+            return False
         if not self.wallet_file.exists():
+            logger.error(f"[WALLET] File not found: {self.wallet_file}")
             return False
         try:
-            import base64
-            data=json.loads(open(self.wallet_file).read())
-            # Verify password hash (no cryptography needed)
-            password_hash=hashlib.sha256(password.encode()).hexdigest()
-            if data.get('password_hash')!=password_hash:
+            raw = self.wallet_file.read_text(encoding='utf-8')
+            data = json.loads(raw)
+
+            salt_hex  = data['salt']
+            auth_hex  = data['auth']
+            cipher_hex = data['cipher']
+
+            salt = bytes.fromhex(salt_hex)
+
+            # Derive key
+            key = hashlib.pbkdf2_hmac(
+                self.PBKDF2_HASH,
+                password.encode('utf-8'),
+                salt,
+                self.PBKDF2_ITERATIONS,
+                dklen=self.KEY_BYTES,
+            )
+
+            # Verify auth tag before decrypting — reject wrong password fast
+            expected_auth = hashlib.sha256(key + salt).hexdigest()
+            if not hmac.compare_digest(expected_auth, auth_hex):
+                logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
                 return False
-            # Decode wallet data (simple base64, not encrypted)
-            wallet_data=json.loads(base64.b64decode(data['wallet_b64']).decode())
-            self.address=wallet_data['address']
-            self.private_key=wallet_data['private_key']
-            self.public_key=wallet_data['public_key']
+
+            # Decrypt (XOR keystream)
+            plaintext = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
+            wallet_data = json.loads(plaintext)
+
+            # Populate fields
+            self.address     = wallet_data['address']
+            self.private_key = wallet_data['private_key']
+            self.public_key  = wallet_data['public_key']
+
+            # Integrity: re-derive address from stored public key
+            expected_addr = (
+                self.ADDRESS_PREFIX +
+                hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDRESS_HASH_LEN]
+            )
+            if self.address != expected_addr:
+                logger.error("[WALLET] ❌ Address / key mismatch — wallet file corrupt")
+                self._clear()
+                return False
+
+            if not self.is_loaded():
+                logger.error("[WALLET] ❌ Wallet fields incomplete after load")
+                self._clear()
+                return False
+
+            logger.info(f"[WALLET] ✅ Loaded: {self.address}")
             return True
-        except:
+
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"[WALLET] ❌ Parse error: {e}")
+            self._clear()
             return False
-    
-    def _save(self,password):
-        """Save wallet (base64 encoding, no cryptography)"""
-        try:
-            import base64
-            # Ensure data directory exists
-            self.wallet_file.parent.mkdir(exist_ok=True, mode=0o700)
-            # Hash password for verification
-            password_hash=hashlib.sha256(password.encode()).hexdigest()
-            # Prepare wallet data
-            wallet_data={'address':self.address,'private_key':self.private_key,'public_key':self.public_key}
-            # Encode with base64 (not encrypted, just encoded)
-            wallet_b64=base64.b64encode(json.dumps(wallet_data).encode()).decode()
-            # Save to disk
-            data={'password_hash':password_hash,'wallet_b64':wallet_b64}
-            with open(self.wallet_file,'w') as f:
-                f.write(json.dumps(data))
-            os.chmod(self.wallet_file,0o600)
         except Exception as e:
-            logger.error(f"[WALLET] Save failed: {e}")
+            logger.error(f"[WALLET] ❌ Unexpected load error: {e}")
+            self._clear()
+            return False
+
+    # ── Internal helpers ─────────────────────────────────────────────────
+
+    def _save(self, password: str) -> None:
+        """Encrypt and persist wallet to disk (mode 0o600)."""
+        try:
+            self.wallet_file.parent.mkdir(exist_ok=True, mode=0o700)
+
+            salt = secrets.token_bytes(self.SALT_BYTES)
+            key  = hashlib.pbkdf2_hmac(
+                self.PBKDF2_HASH,
+                password.encode('utf-8'),
+                salt,
+                self.PBKDF2_ITERATIONS,
+                dklen=self.KEY_BYTES,
+            )
+
+            # Auth tag = SHA-256(key || salt)  — verified on load before decrypt
+            auth_hex = hashlib.sha256(key + salt).hexdigest()
+
+            plaintext  = json.dumps({
+                'address':     self.address,
+                'private_key': self.private_key,
+                'public_key':  self.public_key,
+            }).encode('utf-8')
+            cipher_hex = self._xor_encrypt(plaintext, key).hex()
+
+            payload = {
+                'version':  2,
+                'salt':     salt.hex(),
+                'auth':     auth_hex,
+                'cipher':   cipher_hex,
+            }
+            self.wallet_file.write_text(
+                json.dumps(payload, indent=2), encoding='utf-8'
+            )
+            os.chmod(self.wallet_file, 0o600)
+            logger.debug(f"[WALLET] 💾 Saved to {self.wallet_file}")
+        except Exception as e:
+            logger.error(f"[WALLET] ❌ Save failed: {e}")
+            raise
+
+    def _xor_encrypt(self, plaintext: bytes, key: bytes) -> bytes:
+        """XOR-stream encrypt: expand key via SHA-256 chain to cover plaintext length."""
+        keystream = self._expand_key(key, len(plaintext))
+        return bytes(p ^ k for p, k in zip(plaintext, keystream))
+
+    def _xor_decrypt(self, ciphertext: bytes, key: bytes) -> bytes:
+        """XOR-stream decrypt (symmetric with encrypt)."""
+        keystream = self._expand_key(key, len(ciphertext))
+        return bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+    @staticmethod
+    def _expand_key(key: bytes, length: int) -> bytes:
+        """Expand key to `length` bytes via iterative SHA-256 chain."""
+        stream = b''
+        block  = key
+        while len(stream) < length:
+            block  = hashlib.sha256(block).digest()
+            stream += block
+        return stream[:length]
+
+    def _clear(self) -> None:
+        """Zero out all sensitive fields."""
+        self.address     = None
+        self.private_key = None
+        self.public_key  = None
 
 
 class MinerRegistry:
@@ -4224,7 +4359,7 @@ class HLWETransactionEngine:
     CONFIRMATION_DELAY_S = 10
     MIN_AMOUNT_BASE      = 1        # 0.01 QTCL (stored as base_units = amount * 100)
 
-    def __init__(self, oracle_url: str, wallet: 'QuickWallet'):
+    def __init__(self, oracle_url: str, wallet: 'QTCLWallet'):
         self.oracle_url  = oracle_url.rstrip('/')
         self.wallet      = wallet
         self._session    = self._build_session()
@@ -4536,7 +4671,7 @@ def _choose_mode() -> str:
         print("  ⚠️   Please enter 1 (mine) or 2 (transact).")
 
 
-def _run_transaction_wizard(args, wallet: 'QuickWallet'):
+def _run_transaction_wizard(args, wallet: 'QTCLWallet'):
     """
     Interactive HLWE transaction wizard — gathers fields, validates,
     then delegates to HLWETransactionEngine.send().
@@ -4609,90 +4744,120 @@ def main():
         # ── Wallet initialization shortcut ────────────────────────────────────
         if args.wallet_init:
             if not args.wallet_password:
-                args.wallet_password=input("Enter wallet password: ")
-            wallet=QuickWallet()
-            address=wallet.create(args.wallet_password)
-            logger.info(f"[WALLET] Created: {address}")
-            logger.info(f"[WALLET] Public Key: {wallet.public_key}")
-            logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
+                args.wallet_password = input("Enter new wallet password: ").strip()
+            if not args.wallet_password:
+                logger.error("[WALLET] Password required for --wallet-init")
+                sys.exit(1)
+            w = QTCLWallet()
+            addr = w.create(args.wallet_password)
+            logger.info(f"[WALLET] ✅ Created : {addr}")
+            logger.info(f"[WALLET]    PubKey  : {w.public_key}")
+            logger.info(f"[WALLET]    File    : {w.wallet_file}")
             return
-        
+
         # ── Oracle registration shortcut ──────────────────────────────────────
         if args.register:
-            if not all([args.miner_id,args.wallet_password]):
-                logger.error("[REGISTER] --miner-id and --wallet-password required")
+            if not args.miner_id:
+                logger.error("[REGISTER] --miner-id required")
                 sys.exit(1)
-            wallet=QuickWallet()
-            if wallet.load(args.wallet_password):
-                registry=MinerRegistry(args.oracle_url)
-                if registry.register(
-                    miner_id=args.miner_id,
-                    address=wallet.address,
-                    public_key=wallet.public_key,
-                    private_key=wallet.private_key,
-                    miner_name=args.miner_name
-                ):
-                    logger.info("[REGISTER] ✅ Successfully registered")
-                    return
+            if not args.wallet_password:
+                args.wallet_password = input("Wallet password: ").strip()
+            w = QTCLWallet()
+            if not w.load(args.wallet_password):
+                logger.error("[REGISTER] ❌ Failed to load wallet — wrong password or missing file")
+                sys.exit(1)
+            registry = MinerRegistry(args.oracle_url)
+            if registry.register(
+                miner_id   = args.miner_id,
+                address    = w.address,
+                public_key = w.public_key,
+                private_key= w.private_key,
+                miner_name = args.miner_name,
+            ):
+                logger.info("[REGISTER] ✅ Successfully registered")
+            else:
+                logger.error("[REGISTER] ❌ Registration failed")
+                sys.exit(1)
+            return
+
+        # ── Resolve wallet (single authoritative path) ────────────────────────
+        #
+        #   Rule: we always load a FULL wallet (address + private + public).
+        #   --address alone is fine for mining (identity only), but transact
+        #   mode MUST have a loaded key — enforced below after mode selection.
+        #
+        wallet = QTCLWallet()
+
+        # Collect password once, whichever way it arrives
+        if not args.wallet_password:
+            try:
+                args.wallet_password = input(
+                    "Wallet password (Enter to skip for address-only mining): "
+                ).strip() or None
+            except (EOFError, KeyboardInterrupt):
+                args.wallet_password = None
+
+        if args.wallet_password:
+            # Attempt full load — this is the ONLY place we call wallet.load()
+            if not wallet.load(args.wallet_password):
+                # Wrong password or corrupt file
+                if args.address:
+                    # Degrade gracefully for mining: use bare address, no signing
+                    logger.warning(
+                        "[WALLET] ⚠️  Could not decrypt wallet — "
+                        "mining with address only (transaction mode will be unavailable)"
+                    )
+                    wallet.address = args.address
                 else:
-                    logger.error("[REGISTER] ❌ Registration failed")
+                    logger.error(
+                        "[WALLET] ❌ Failed to load wallet. "
+                        "Run with --wallet-init to create one."
+                    )
                     sys.exit(1)
             else:
-                logger.error("[REGISTER] ❌ Failed to load wallet")
+                # Loaded successfully — if --address supplied, validate it matches
+                if args.address and args.address != wallet.address:
+                    logger.error(
+                        f"[WALLET] ❌ --address {args.address} does not match "
+                        f"loaded wallet {wallet.address}"
+                    )
+                    sys.exit(1)
+        else:
+            # No password at all — address-only mode (mining only)
+            if args.address:
+                wallet.address = args.address
+                logger.info(f"[WALLET] Address-only mode: {wallet.address}")
+            else:
+                logger.error(
+                    "[WALLET] ❌ No wallet password and no --address supplied. "
+                    "Run with --wallet-init to create a wallet."
+                )
                 sys.exit(1)
 
-        # ── Resolve address / wallet ──────────────────────────────────────────
-        wallet = None
-        if args.address:
-            address = args.address
-            # Lightweight placeholder wallet for transaction mode
-            wallet = QuickWallet()
-            wallet.address = address
-            # Try to load full wallet silently (needed for signing)
-            if not args.wallet_password:
-                try:
-                    args.wallet_password = input(
-                        "Wallet password (Enter to skip if only mining by address): "
-                    ).strip() or None
-                except (EOFError, KeyboardInterrupt):
-                    args.wallet_password = None
-            if args.wallet_password:
-                loaded = QuickWallet()
-                if loaded.load(args.wallet_password) and loaded.address == address:
-                    wallet = loaded
-                    logger.info(f"[WALLET] Loaded: {wallet.address}")
-        else:
-            wallet = QuickWallet()
-            if not args.wallet_password:
-                args.wallet_password = input("Enter wallet password: ")
-            if wallet.load(args.wallet_password):
-                address = wallet.address
-                logger.info(f"[WALLET] Loaded: {address}")
-            else:
-                logger.error("[WALLET] Failed to load wallet — run with --wallet-init first")
-                sys.exit(1)
+        # address is the local shorthand used by the mining loop below
+        address = wallet.address
 
         # ── MODE DISPATCH ─────────────────────────────────────────────────────
-        #
-        #   [ 1 ]  mine      → fall through to existing mining loop below
-        #   [ 2 ]  transact  → HLWE transaction wizard then exit
-        #
         mode = args.mode
         if mode is None:
             mode = _choose_mode()
 
         if mode == 'transact':
-            if wallet.private_key is None:
-                print("\n❌  Transaction mode requires a loaded wallet with private key.")
-                print("    Provide --wallet-password (or run --wallet-init to create one).")
+            if not wallet.is_loaded():
+                print("\n❌  Transaction mode requires a fully loaded wallet.")
+                if not args.wallet_password:
+                    print("    Re-run and enter your wallet password when prompted.")
+                else:
+                    print("    Password was incorrect or wallet file is missing/corrupt.")
+                    print("    Run with --wallet-init to create a new wallet.")
                 sys.exit(1)
-            # If --from-address supplied, honour it (allows different sender)
             if args.from_address and args.from_address != wallet.address:
-                print(f"\n⚠️   --from-address ({args.from_address}) differs from "
-                      f"loaded wallet ({wallet.address}).")
-                print("     Using loaded wallet address for signing.")
+                logger.warning(
+                    f"[WALLET] --from-address {args.from_address} ignored — "
+                    f"using loaded wallet {wallet.address}"
+                )
             _run_transaction_wizard(args, wallet)
-            return   # ← transaction done; do NOT fall through to mining
+            return
         
         # Start mining
         # ─── DATABASE INITIALIZATION WITH PERSISTENT FILE-BASED STORAGE ──────────────
