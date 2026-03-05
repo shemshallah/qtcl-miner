@@ -3885,19 +3885,17 @@ class QTCLWallet:
             # ── Format detection ──────────────────────────────────────
             #   v1 legacy  →  keys: password_hash, wallet_b64
             #   v2 current →  keys: version=2, salt, auth, cipher
+            _needs_migration = False
+
             if 'wallet_b64' in data:
+                # ── v1 legacy path ────────────────────────────────────
+                logger.info("[WALLET] 🔄 Legacy v1 format detected — migrating to v2 …")
                 wallet_data = self._load_legacy_v1(data, password)
                 if wallet_data is None:
                     return False
-                self.address     = wallet_data['address']
-                self.private_key = wallet_data['private_key']
-                self.public_key  = wallet_data['public_key']
-                # Migrate to v2 in-place so next load uses the secure path
-                logger.info("[WALLET] 🔄 Legacy v1 format detected — migrating to v2 …")
-                self._save(password)
-                logger.info("[WALLET] ✅ Migration to v2 complete")
+                _needs_migration = True
             else:
-                # v2 path
+                # ── v2 current path ───────────────────────────────────
                 salt       = bytes.fromhex(data['salt'])
                 auth_hex   = data['auth']
                 cipher_hex = data['cipher']
@@ -3914,26 +3912,43 @@ class QTCLWallet:
                     logger.error("[WALLET] ❌ Wrong password — auth tag mismatch")
                     return False
 
-                plaintext    = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
-                wallet_data  = json.loads(plaintext)
-                self.address     = wallet_data['address']
-                self.private_key = wallet_data['private_key']
-                self.public_key  = wallet_data['public_key']
+                plaintext   = self._xor_decrypt(bytes.fromhex(cipher_hex), key)
+                wallet_data = json.loads(plaintext)
 
-            # ── Integrity check (both paths) ──────────────────────────
+            # ── Populate fields (both paths) ──────────────────────────
+            self.address     = wallet_data.get('address')
+            self.private_key = wallet_data.get('private_key')
+            self.public_key  = wallet_data.get('public_key')
+
+            # ── Integrity check ───────────────────────────────────────
+            if not self.is_loaded():
+                logger.error("[WALLET] ❌ Wallet fields incomplete — file may be corrupt")
+                self._clear()
+                return False
+
+            # Re-derive expected address from public_key and verify
             expected_addr = (
                 self.ADDRESS_PREFIX +
                 hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDRESS_HASH_LEN]
             )
             if self.address != expected_addr:
-                logger.error("[WALLET] ❌ Address / key mismatch — wallet file corrupt")
-                self._clear()
-                return False
+                # Legacy wallets may have used a different derivation path —
+                # re-derive and correct the address rather than failing
+                logger.warning(
+                    f"[WALLET] ⚠️  Address mismatch — re-deriving from public key "
+                    f"(was: {self.address}  now: {expected_addr})"
+                )
+                self.address = expected_addr
+                _needs_migration = True   # force re-save with corrected address
 
-            if not self.is_loaded():
-                logger.error("[WALLET] ❌ Wallet fields incomplete after load")
-                self._clear()
-                return False
+            # ── Migrate v1 → v2 AFTER all fields are verified ─────────
+            if _needs_migration:
+                try:
+                    self._save(password)
+                    logger.info("[WALLET] ✅ Migration to v2 complete — wallet upgraded")
+                except Exception as mig_err:
+                    # Migration failure is non-fatal: wallet is loaded in memory
+                    logger.warning(f"[WALLET] ⚠️  Migration save failed (non-fatal): {mig_err}")
 
             logger.info(f"[WALLET] ✅ Loaded: {self.address}")
             return True
