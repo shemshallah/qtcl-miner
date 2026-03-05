@@ -50,9 +50,20 @@
 ║  │ • Track mining rewards & entanglement metrics                     │                                                                ║
 ║  └────────────────────────────────────────────────────────────────────┘                                                                ║
 ║                                                                                                                                            ║
-║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url https://oracle.example.com/socket.io                            ║
+║  USAGE:                                                                                                                                 ║
+║    python qtcl_miner_mobile.py                          → interactive prompt: choose [1] Mine  [2] Transact                           ║
+║    python qtcl_miner_mobile.py --mode mine              → start W-state entangled mining immediately                                  ║
+║    python qtcl_miner_mobile.py --mode transact          → open HLWE-secured transaction wizard                                        ║
+║    python qtcl_miner_mobile.py --address qtcl1…         → supply address directly (skips wallet load prompt)                          ║
+║    python qtcl_miner_mobile.py --wallet-init            → generate & persist a new QTCL wallet                                        ║
 ║                                                                                                                                            ║
-║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
+║  TRANSACTION SECURITY:                                                                                                                  ║
+║    • HLWE-256 post-quantum signature (commitment / witness / proof triple)                                                             ║
+║    • W-state entropy sourced from live oracle snapshot                                                                                 ║
+║    • SHA3-256 canonical tx hash  •  PBKDF2-HMAC-SHA256 key derivation                                                                 ║
+║    • Local signature verification before broadcast                                                                                     ║
+║                                                                                                                                            ║
+║  This is PERFECTION. Museum-grade quantum node. Deploy with absolute confidence.                                                       ║
 ║                                                                                                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
@@ -3913,26 +3924,689 @@ class MinerRegistry:
 # ═════════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
-    parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
-    parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
-    parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
-    parser.add_argument('--wallet-init',action='store_true',help='Initialize new wallet')
-    parser.add_argument('--wallet-password',help='Wallet password')
-    parser.add_argument('--register',action='store_true',help='Register with oracle')
-    parser.add_argument('--miner-id',help='Miner ID for registration')
+    parser=argparse.ArgumentParser(
+        description='⚛️  QTCL Full Node — W-State Entangled Mining & HLWE-Secured Transactions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        ─────────────────────────────────────────────────────────────────
+        MODES
+          1  mine      Start W-state entangled quantum mining
+          2  transact  Open HLWE-256 post-quantum transaction wizard
+
+        EXAMPLES
+          python qtcl_miner_mobile.py                     # interactive chooser
+          python qtcl_miner_mobile.py --mode mine
+          python qtcl_miner_mobile.py --mode transact
+          python qtcl_miner_mobile.py --mode transact \\
+              --from-address qtcl1abc… --to-address qtcl1xyz… --amount 10
+        ─────────────────────────────────────────────────────────────────
+        """)
+    )
+    # ── Core ──────────────────────────────────────────────────────────────
+    parser.add_argument('--mode','-m',choices=['mine','transact'],default=None,
+                        help='Operational mode: "mine" (1) or "transact" (2). Omit for interactive prompt.')
+    parser.add_argument('--address','-a',help='Miner / sender wallet address (qtcl1…)')
+    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',
+                        help='Node / oracle base URL')
+    # ── Mining ────────────────────────────────────────────────────────────
+    parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,
+                        help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
+    parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',
+                        help='W-state fidelity threshold: strict(≥0.90) normal(≥0.80) relaxed(≥0.70)')
+    parser.add_argument('--strict-w-verification',action='store_true',default=False,
+                        help='Reject marginal W-states during mining')
+    # ── Wallet ────────────────────────────────────────────────────────────
+    parser.add_argument('--wallet-init',action='store_true',help='Generate and persist a new wallet')
+    parser.add_argument('--wallet-password',help='Wallet encryption password')
+    # ── Registration ──────────────────────────────────────────────────────
+    parser.add_argument('--register',action='store_true',help='Register miner with oracle')
+    parser.add_argument('--miner-id',help='Miner ID for oracle registration')
     parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
-    parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',help='W-state fidelity threshold mode: strict (F>=0.90), normal (F>=0.80, recommended), relaxed (F>=0.70)')
-    parser.add_argument('--strict-w-verification',action='store_true',default=False,help='Enable strict W-state verification (rejects marginal states)')
+    # ── Transaction (non-interactive shortcuts) ───────────────────────────
+    parser.add_argument('--from-address',help='Sender address (--mode transact)')
+    parser.add_argument('--to-address',  help='Recipient address (--mode transact)')
+    parser.add_argument('--amount',type=float,help='Amount in QTCL (--mode transact)')
+    parser.add_argument('--fee',type=int,default=1,help='Transaction fee in base units (default 1)')
+    parser.add_argument('--nonce',type=int,default=None,help='TX nonce override (auto-fetched if omitted)')
+    # ── Logging ───────────────────────────────────────────────────────────
+    parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     return parser.parse_args()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HLWE TRANSACTION ENGINE
+# ════════════════════════════════════════════════════════════════════════════════
+
+import textwrap
+
+class DHTGossipBroadcaster:
+    """
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  DHT GOSSIP BROADCASTER                                                ║
+    ║                                                                          ║
+    ║  Discovers every peer reachable from the QTCL network via three        ║
+    ║  complementary discovery channels, then fans out a signed transaction   ║
+    ║  payload to ALL of them in parallel:                                    ║
+    ║                                                                          ║
+    ║    Channel 1 — /api/dht/peers     (Kademlia routing table)             ║
+    ║    Channel 2 — /api/p2p/peers     (active WebSocket P2P connections)   ║
+    ║    Channel 3 — /api/oracle/miners (registered miner directory)         ║
+    ║                                                                          ║
+    ║  For each discovered peer URL the broadcaster posts the fully signed    ║
+    ║  wire payload to /api/submit_transaction using a thread-pool so that    ║
+    ║  a single slow or dead peer never blocks the rest.                      ║
+    ║                                                                          ║
+    ║  Results are collected and summarised: accepted / rejected / unreachable║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+    """
+
+    BROADCAST_TIMEOUT_S  = 8     # per-peer POST timeout
+    DISCOVERY_TIMEOUT_S  = 6     # per-discovery-endpoint GET timeout
+    MAX_WORKERS          = 16    # thread-pool ceiling
+    PEER_LIVENESS_PATH   = '/api/blocks/tip'   # cheap liveness probe
+
+    def __init__(self, oracle_url: str, session: requests.Session):
+        self.oracle_url = oracle_url.rstrip('/')
+        self._session   = session
+
+    # ── Peer Discovery ────────────────────────────────────────────────────
+
+    def _fetch_dht_peers(self) -> List[str]:
+        """
+        Pull peers from the Kademlia DHT routing table.
+        Returns list of base URLs: https://<address>:<port>
+        """
+        urls: List[str] = []
+        try:
+            r = self._session.get(
+                f"{self.oracle_url}/api/dht/peers",
+                timeout=self.DISCOVERY_TIMEOUT_S
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for peer in data.get('peers', []):
+                    if not peer.get('alive', True):
+                        continue
+                    addr = peer.get('address', '')
+                    port = int(peer.get('port', 443))
+                    if not addr:
+                        continue
+                    scheme = 'http' if addr in ('localhost', '127.0.0.1') else 'https'
+                    port_s = f':{port}' if addr in ('localhost', '127.0.0.1') else ''
+                    urls.append(f"{scheme}://{addr}{port_s}")
+        except Exception as e:
+            logger.debug(f"[DHT-GOSSIP] dht/peers discovery failed: {e}")
+        return urls
+
+    def _fetch_p2p_peers(self) -> List[str]:
+        """
+        Pull peers from the active P2P WebSocket connection table.
+        Returns list of base URLs.
+        """
+        urls: List[str] = []
+        try:
+            r = self._session.get(
+                f"{self.oracle_url}/api/p2p/peers",
+                timeout=self.DISCOVERY_TIMEOUT_S
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for peer in data.get('peers', []):
+                    # peer shape varies — try common field names
+                    raw = (peer.get('url') or peer.get('address') or
+                           peer.get('host') or peer.get('oracle_url') or '')
+                    if not raw:
+                        continue
+                    if raw.startswith('http'):
+                        urls.append(raw.rstrip('/'))
+                    else:
+                        scheme = 'http' if raw in ('localhost', '127.0.0.1') else 'https'
+                        port = int(peer.get('port', 443))
+                        port_s = f':{port}' if raw in ('localhost', '127.0.0.1') else ''
+                        urls.append(f"{scheme}://{raw}{port_s}")
+        except Exception as e:
+            logger.debug(f"[DHT-GOSSIP] p2p/peers discovery failed: {e}")
+        return urls
+
+    def _fetch_miner_peers(self) -> List[str]:
+        """
+        Pull registered miner URLs from the oracle directory.
+        Returns list of base URLs.
+        """
+        urls: List[str] = []
+        try:
+            r = self._session.get(
+                f"{self.oracle_url}/api/oracle/miners",
+                timeout=self.DISCOVERY_TIMEOUT_S
+            )
+            if r.status_code == 200:
+                data = r.json()
+                miners = data if isinstance(data, list) else data.get('miners', [])
+                for m in miners:
+                    raw = (m.get('url') or m.get('oracle_url') or
+                           m.get('address') or '')
+                    if raw and raw.startswith('http'):
+                        urls.append(raw.rstrip('/'))
+        except Exception as e:
+            logger.debug(f"[DHT-GOSSIP] oracle/miners discovery failed: {e}")
+        return urls
+
+    def discover_all_peers(self) -> List[str]:
+        """
+        Merge and deduplicate peer URLs from all three discovery channels.
+        The primary oracle node is always included first so the canonical node
+        always receives the tx regardless of discovery health.
+        """
+        seen:  set   = set()
+        peers: List[str] = []
+
+        def _add(url: str):
+            u = url.rstrip('/')
+            if u and u not in seen:
+                seen.add(u)
+                peers.append(u)
+
+        # Primary oracle is always first
+        _add(self.oracle_url)
+
+        for url in (self._fetch_dht_peers() +
+                    self._fetch_p2p_peers()  +
+                    self._fetch_miner_peers()):
+            _add(url)
+
+        return peers
+
+    # ── Per-Peer Broadcast ────────────────────────────────────────────────
+
+    def _broadcast_one(self, base_url: str, payload: dict) -> Tuple[str, int, Optional[str]]:
+        """
+        POST signed tx to one peer.
+        Returns (base_url, http_status, tx_hash_or_error).
+        """
+        try:
+            r = self._session.post(
+                f"{base_url}/api/submit_transaction",
+                data=json.dumps(payload),
+                headers={'Content-Type': 'application/json',
+                         'User-Agent':   'QTCL-CLI/3.0 (DHT-Gossip)'},
+                timeout=self.BROADCAST_TIMEOUT_S
+            )
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            tx_hash = body.get('tx_hash') or body.get('error', r.text[:80])
+            return base_url, r.status_code, str(tx_hash)
+        except requests.exceptions.ConnectionError:
+            return base_url, 0, 'connection_refused'
+        except requests.exceptions.Timeout:
+            return base_url, 0, 'timeout'
+        except Exception as e:
+            return base_url, 0, str(e)[:80]
+
+    # ── Fan-Out ───────────────────────────────────────────────────────────
+
+    def broadcast(self, payload: dict) -> Dict[str, Any]:
+        """
+        Discover all peers then broadcast the signed payload to every one
+        in parallel via a thread pool.
+
+        Returns a summary dict:
+          { peers_found, accepted, rejected, unreachable, results: [...] }
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        peers = self.discover_all_peers()
+        total = len(peers)
+
+        print(f"\n  🌐  DHT Gossip Broadcast → {total} peer(s) discovered")
+        for p in peers:
+            print(f"       · {p}")
+
+        accepted    = 0
+        rejected    = 0
+        unreachable = 0
+        results     = []
+
+        with ThreadPoolExecutor(max_workers=min(self.MAX_WORKERS, total or 1),
+                                thread_name_prefix='qtcl-gossip') as pool:
+            futures = {
+                pool.submit(self._broadcast_one, peer, payload): peer
+                for peer in peers
+            }
+            for future in as_completed(futures):
+                url, status, detail = future.result()
+                short = url.replace('https://', '').replace('http://', '')[:48]
+
+                if status in (200, 201):
+                    icon   = '✅'
+                    accepted += 1
+                elif status == 0:
+                    icon   = '⬛'
+                    unreachable += 1
+                else:
+                    icon   = '⚠️ '
+                    rejected += 1
+
+                label = f"HTTP {status}" if status else 'unreachable'
+                print(f"       {icon}  {short:<48}  {label}  {detail[:40]}")
+                results.append({'url': url, 'status': status, 'detail': detail})
+
+        return {
+            'peers_found':  total,
+            'accepted':     accepted,
+            'rejected':     rejected,
+            'unreachable':  unreachable,
+            'results':      results,
+        }
+
+
+class HLWETransactionEngine:
+    """
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  HLWE-256 POST-QUANTUM TRANSACTION ENGINE                           ║
+    ║                                                                      ║
+    ║  Implements the full QTCL transaction lifecycle:                    ║
+    ║    1. Wallet load / address resolution                              ║
+    ║    2. W-state entropy acquisition from live oracle                  ║
+    ║    3. Canonical tx preimage construction (sort_keys JSON)           ║
+    ║    4. SHA3-256 tx hash                                               ║
+    ║    5. HLWE-256 signature  (commitment / witness / proof)            ║
+    ║    6. Local signature self-verification                             ║
+    ║    7. Balance & nonce preflight against node REST API               ║
+    ║    8. Primary broadcast → /api/submit_transaction (oracle node)    ║
+    ║    9. DHT gossip fan-out → every peer in routing table + P2P mesh  ║
+    ║   10. Confirmation polling with timeout                             ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+    """
+
+    CONFIRMATION_POLLS   = 12       # up to 2 min at 10s interval
+    CONFIRMATION_DELAY_S = 10
+    MIN_AMOUNT_BASE      = 1        # 0.01 QTCL (stored as base_units = amount * 100)
+
+    def __init__(self, oracle_url: str, wallet: 'QuickWallet'):
+        self.oracle_url  = oracle_url.rstrip('/')
+        self.wallet      = wallet
+        self._session    = self._build_session()
+        self._gossip     = DHTGossipBroadcaster(self.oracle_url, self._session)
+
+    # ── Network ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_session():
+        s = requests.Session()
+        retry = Retry(total=3, backoff_factor=0.4,
+                      status_forcelist=[429, 500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retry))
+        s.mount('http://',  HTTPAdapter(max_retries=retry))
+        s.headers.update({'Content-Type': 'application/json',
+                          'User-Agent':   'QTCL-CLI/3.0 (HLWE-256)'})
+        return s
+
+    def _get(self, path: str, **kw) -> Optional[dict]:
+        try:
+            r = self._session.get(f"{self.oracle_url}{path}", timeout=10, **kw)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.debug(f"[TXENGINE] GET {path} failed: {e}")
+            return None
+
+    def _post(self, path: str, payload: dict) -> Tuple[Optional[dict], int]:
+        try:
+            r = self._session.post(f"{self.oracle_url}{path}",
+                                   data=json.dumps(payload), timeout=15)
+            try:
+                body = r.json()
+            except Exception:
+                body = {'raw': r.text}
+            return body, r.status_code
+        except Exception as e:
+            logger.error(f"[TXENGINE] POST {path} error: {e}")
+            return None, 0
+
+    # ── W-State Entropy ──────────────────────────────────────────────────
+
+    def _fetch_w_entropy(self) -> bytes:
+        """
+        Pull live W-state entropy from oracle snapshot.
+        Falls back to CSPRNG + block-field hash if oracle unreachable.
+        """
+        data = self._get('/api/oracle/w-state')
+        if data:
+            raw = (data.get('w_entropy_hash') or
+                   data.get('density_matrix_hex') or
+                   data.get('w_entropy') or '')
+            if raw:
+                try:
+                    return hashlib.sha3_256(bytes.fromhex(raw)).digest()
+                except Exception:
+                    return hashlib.sha3_256(raw.encode()).digest()
+
+        # Fallback — mix CSPRNG with node tip hash for uniqueness
+        fb = secrets.token_bytes(32)
+        tip = self._get('/api/blocks/tip') or {}
+        tip_bytes = (tip.get('block_hash') or secrets.token_hex(32)).encode()
+        return hashlib.sha3_256(fb + tip_bytes).digest()
+
+    # ── HLWE-256 Signature ───────────────────────────────────────────────
+
+    def _sign_hlwe(self, tx_hash_hex: str, w_entropy: bytes) -> dict:
+        """
+        HLWE-256 signature identical to oracle.py HLWESigner.sign_message():
+
+          private_key_bytes = SHA3-256(hex private_key string)   [32 bytes]
+
+          1. commitment = SHA3-256(private || w_entropy || msg_hash_bytes)
+          2. witness    = SHAKE-256(commitment || private, 64 bytes)
+          3. proof      = HMAC-SHA3-256(key=private, msg=witness || msg_hash_bytes)
+          4. w_entropy_hash = SHA3-256(w_entropy)
+
+        All values encoded as lowercase hex strings.
+        """
+        priv_raw   = self.wallet.private_key          # 64-char hex string
+        pub_raw    = self.wallet.public_key            # 64-char hex string (SHA3-256 of priv_raw)
+        priv_bytes = hashlib.sha3_256(priv_raw.encode()).digest()   # canonical 32 B
+
+        msg_bytes  = bytes.fromhex(tx_hash_hex)
+
+        # 1. Commitment
+        commitment = hashlib.sha3_256(priv_bytes + w_entropy + msg_bytes).digest()
+
+        # 2. Witness  (64 bytes via SHAKE-256)
+        wit_h = hashlib.shake_256(commitment + priv_bytes)
+        witness = wit_h.digest(64)
+
+        # 3. Proof  (HMAC-SHA3-256)
+        proof = hmac.new(priv_bytes, witness + msg_bytes,
+                         digestmod=hashlib.sha3_256).digest()
+
+        # 4. W-entropy hash
+        w_entropy_hash = hashlib.sha3_256(w_entropy).digest()
+
+        return {
+            'commitment':      commitment.hex(),
+            'witness':         witness.hex(),
+            'proof':           proof.hex(),
+            'w_entropy_hash':  w_entropy_hash.hex(),
+            'public_key_hex':  pub_raw,
+            'derivation_path': 'm/0/0/0',
+            'timestamp_ns':    time.time_ns(),
+        }
+
+    def _verify_hlwe(self, tx_hash_hex: str, sig: dict) -> Tuple[bool, str]:
+        """
+        Self-verify HLWE signature using the public key (mirrors HLWEVerifier):
+
+          commitment' = SHA3-256(pubkey || witness || msg_hash)
+          proof'      = HMAC-SHA3-256(key=pubkey, msg=witness || msg_hash)
+        """
+        try:
+            pub_bytes   = bytes.fromhex(sig['public_key_hex'])
+            commitment  = bytes.fromhex(sig['commitment'])
+            witness     = bytes.fromhex(sig['witness'])
+            proof       = bytes.fromhex(sig['proof'])
+            msg_bytes   = bytes.fromhex(tx_hash_hex)
+
+            commitment_check = hashlib.sha3_256(
+                pub_bytes + witness + msg_bytes).digest()
+            if commitment_check != commitment:
+                return False, 'commitment_mismatch'
+
+            proof_check = hmac.new(pub_bytes, witness + msg_bytes,
+                                   digestmod=hashlib.sha3_256).digest()
+            if proof_check != proof:
+                return False, 'proof_mismatch'
+
+            return True, 'valid'
+        except Exception as e:
+            return False, f'exception:{e}'
+
+    # ── Preflight ────────────────────────────────────────────────────────
+
+    def _fetch_balance(self, address: str) -> float:
+        data = self._get(f'/api/wallet?address={address}')
+        return float(data.get('balance', 0.0)) if data else 0.0
+
+    def _fetch_nonce(self, address: str) -> int:
+        data = self._get(f'/api/wallet?address={address}')
+        return int(data.get('transaction_count', 0)) if data else 0
+
+    # ── Confirmation Polling ─────────────────────────────────────────────
+
+    def _poll_confirmation(self, tx_hash: str) -> Optional[dict]:
+        print(f"\n  ⏳  Polling confirmation for {tx_hash[:24]}…")
+        for i in range(self.CONFIRMATION_POLLS):
+            data = self._get(f'/api/transactions/{tx_hash}')
+            if data and data.get('tx_hash'):
+                return data
+            # Also try UTXO endpoint
+            data2 = self._get(f'/api/utxo/transactions/{tx_hash}')
+            if data2 and data2.get('tx_hash'):
+                return data2
+            print(f"  ·  [{i+1}/{self.CONFIRMATION_POLLS}] not yet confirmed — "
+                  f"waiting {self.CONFIRMATION_DELAY_S}s …")
+            time.sleep(self.CONFIRMATION_DELAY_S)
+        return None
+
+    # ── Main Send Flow ────────────────────────────────────────────────────
+
+    def send(self,
+             to_address:   str,
+             amount_qtcl:  float,
+             fee_base:     int  = 1,
+             nonce_override: Optional[int] = None) -> bool:
+        """
+        Execute a fully HLWE-signed QTCL transfer.
+        Returns True on confirmed broadcast, False on any failure.
+        """
+        from_address = self.wallet.address
+
+        # ── 1. Preflight ──────────────────────────────────────────────
+        print(f"\n  🔍  Preflight checks …")
+        balance = self._fetch_balance(from_address)
+        print(f"       Balance  : {balance:.4f} QTCL")
+        if amount_qtcl <= 0:
+            print("  ❌  Amount must be > 0"); return False
+        total_needed = amount_qtcl + fee_base / 100.0
+        if balance < total_needed:
+            print(f"  ❌  Insufficient balance  "
+                  f"(need {total_needed:.4f}, have {balance:.4f} QTCL)"); return False
+
+        nonce = nonce_override if nonce_override is not None \
+                else self._fetch_nonce(from_address)
+        print(f"       Nonce    : {nonce}")
+
+        # ── 2. Canonical TX preimage & hash ───────────────────────────
+        tx_id        = str(uuid.uuid4())
+        timestamp_ns = time.time_ns()
+        preimage = json.dumps({
+            'tx_id':         tx_id,
+            'sender_addr':   from_address,
+            'receiver_addr': to_address,
+            'amount':        str(amount_qtcl),
+            'nonce':         nonce,
+            'timestamp_ns':  timestamp_ns,
+        }, sort_keys=True)
+        tx_hash_hex = hashlib.sha3_256(preimage.encode()).hexdigest()
+        print(f"       TX Hash  : {tx_hash_hex[:24]}…")
+
+        # ── 3. W-state entropy ────────────────────────────────────────
+        print(f"  ⚛️   Acquiring W-state entropy from oracle …")
+        w_entropy = self._fetch_w_entropy()
+        print(f"       W-Entropy: {w_entropy.hex()[:24]}…  ✅")
+
+        # ── 4. HLWE-256 signature ─────────────────────────────────────
+        print(f"  🔐  Computing HLWE-256 signature …")
+        sig = self._sign_hlwe(tx_hash_hex, w_entropy)
+        print(f"       Commitment: {sig['commitment'][:20]}…")
+        print(f"       Witness   : {sig['witness'][:20]}…")
+        print(f"       Proof     : {sig['proof'][:20]}…")
+
+        # ── 5. Self-verify before broadcast ──────────────────────────
+        ok, reason = self._verify_hlwe(tx_hash_hex, sig)
+        if not ok:
+            print(f"  ❌  HLWE self-verification FAILED: {reason}")
+            print("       Transaction aborted — key material may be corrupt.")
+            return False
+        print(f"  ✅  HLWE self-verification passed ({reason})")
+
+        # ── 6. Build wire payload ─────────────────────────────────────
+        payload = {
+            'from':          from_address,
+            'to':            to_address,
+            'amount':        amount_qtcl,
+            'nonce':         nonce,
+            'fee':           fee_base,
+            'timestamp_ns':  timestamp_ns,
+            'tx_id':         tx_id,
+            'signature':     json.dumps(sig),
+        }
+
+        # ── 7. Primary broadcast → canonical oracle node ──────────────
+        print(f"\n  📡  Broadcasting to primary node …")
+        body, status = self._post('/api/submit_transaction', payload)
+        if status not in (200, 201):
+            print(f"  ❌  Primary node rejected tx (HTTP {status}): "
+                  f"{(body or {}).get('error', body)}")
+            return False
+
+        tx_hash_returned = (body or {}).get('tx_hash', tx_hash_hex)
+        print(f"  ✅  Primary node accepted  (HTTP {status})")
+        print(f"       TX Hash  : {tx_hash_returned}")
+        print(f"       Signed   : {(body or {}).get('signed', True)}")
+
+        # ── 8. DHT gossip fan-out → every peer in the network ─────────
+        #
+        #   Peer discovery order:
+        #     • /api/dht/peers      — Kademlia routing table (all k-buckets)
+        #     • /api/p2p/peers      — active WebSocket P2P mesh connections
+        #     • /api/oracle/miners  — registered miner directory
+        #
+        #   Each peer receives a parallel POST /api/submit_transaction so
+        #   the tx propagates through the full DHT even if the primary node
+        #   is not well-connected to a subset of the network.
+        #
+        gossip_summary = self._gossip.broadcast(payload)
+        g = gossip_summary
+        print(f"\n  📊  Gossip summary → "
+              f"{g['peers_found']} peers discovered  |  "
+              f"{g['accepted']} ✅ accepted  "
+              f"{g['rejected']} ⚠️  rejected  "
+              f"{g['unreachable']} ⬛ unreachable")
+
+        # ── 9. Confirmation polling ────────────────────────────────────
+        confirmed = self._poll_confirmation(tx_hash_returned)
+        if confirmed:
+            print(f"\n  🎉  CONFIRMED on-chain!")
+            print(f"       Block    : {confirmed.get('block_height', 'pending')}")
+        else:
+            print(f"\n  ⚠️   Not yet confirmed in {self.CONFIRMATION_POLLS} polls "
+                  f"— tx is propagating through the network.")
+
+        return True
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE CHOOSER
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _print_banner():
+    print()
+    print("  ╔══════════════════════════════════════════════════════════════════╗")
+    print("  ║  ⚛️   Q T C L  —  QUANTUM-ENTANGLED BLOCKCHAIN NODE  v3.0      ║")
+    print("  ║  HLWE-256 Post-Quantum Crypto  ·  W-State Entropy  ·  {8,3}    ║")
+    print("  ╠══════════════════════════════════════════════════════════════════╣")
+    print("  ║                                                                  ║")
+    print("  ║    [ 1 ]  ⛏️   MINE        Start quantum-entangled mining       ║")
+    print("  ║    [ 2 ]  💸  TRANSACT    Send QTCL (HLWE-256 signed)           ║")
+    print("  ║                                                                  ║")
+    print("  ╚══════════════════════════════════════════════════════════════════╝")
+    print()
+
+
+def _choose_mode() -> str:
+    """Interactive 1/2 chooser.  Returns 'mine' or 'transact'."""
+    _print_banner()
+    while True:
+        choice = input("  Enter choice [1/2]: ").strip()
+        if choice == '1':   return 'mine'
+        if choice == '2':   return 'transact'
+        if choice.lower() in ('mine', 'transact'):  return choice.lower()
+        print("  ⚠️   Please enter 1 (mine) or 2 (transact).")
+
+
+def _run_transaction_wizard(args, wallet: 'QuickWallet'):
+    """
+    Interactive HLWE transaction wizard — gathers fields, validates,
+    then delegates to HLWETransactionEngine.send().
+    """
+    if not _REQUESTS_OK:
+        print("\n❌  'requests' library not installed.  Run: pip install requests")
+        sys.exit(1)
+
+    print("\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  💸  QTCL  HLWE-256  TRANSACTION WIZARD")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"  Node     : {args.oracle_url}")
+    print(f"  Sender   : {wallet.address}")
+    print()
+
+    # ── Recipient ────────────────────────────────────────────────────
+    to_address = args.to_address or ''
+    while not to_address.startswith('qtcl'):
+        to_address = input("  To address  (qtcl1…) : ").strip()
+        if not to_address.startswith('qtcl'):
+            print("  ⚠️   Address must start with 'qtcl'")
+
+    # ── Amount ───────────────────────────────────────────────────────
+    amount = args.amount
+    while not amount or amount <= 0:
+        try:
+            amount = float(input("  Amount (QTCL)        : ").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            print("  ⚠️   Enter a positive number (e.g. 1.5)")
+            amount = None
+
+    # ── Fee ──────────────────────────────────────────────────────────
+    fee = args.fee
+    print(f"  Fee (base units)     : {fee}  (press Enter to keep, or type new value)")
+    fee_in = input("  > ").strip()
+    if fee_in.isdigit():
+        fee = int(fee_in)
+
+    # ── Confirm ──────────────────────────────────────────────────────
+    print()
+    print("  ┌──────────────────────────────────────────────────────────┐")
+    print(f"  │  FROM   : {wallet.address}")
+    print(f"  │  TO     : {to_address}")
+    print(f"  │  AMOUNT : {amount:.4f} QTCL")
+    print(f"  │  FEE    : {fee} base units  ({fee/100:.4f} QTCL)")
+    print(f"  │  CRYPTO : HLWE-256 post-quantum signature")
+    print("  └──────────────────────────────────────────────────────────┘")
+    confirm = input("\n  Confirm transaction? [y/N] : ").strip().lower()
+    if confirm not in ('y', 'yes'):
+        print("  🚫  Transaction cancelled.")
+        return
+
+    engine = HLWETransactionEngine(oracle_url=args.oracle_url, wallet=wallet)
+    success = engine.send(
+        to_address     = to_address,
+        amount_qtcl    = amount,
+        fee_base       = fee,
+        nonce_override = args.nonce,
+    )
+    if not success:
+        sys.exit(1)
 
 def main():
     args=parse_args()
     logging.getLogger().setLevel(getattr(logging,args.log_level))
     
     try:
-        # Handle wallet initialization
+        # ── Wallet initialization shortcut ────────────────────────────────────
         if args.wallet_init:
             if not args.wallet_password:
                 args.wallet_password=input("Enter wallet password: ")
@@ -3943,26 +4617,11 @@ def main():
             logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
             return
         
-        # Get or load address
-        if args.address:
-            address=args.address
-        else:
-            wallet=QuickWallet()
-            if not args.wallet_password:
-                args.wallet_password=input("Enter wallet password: ")
-            if wallet.load(args.wallet_password):
-                address=wallet.address
-                logger.info(f"[WALLET] Loaded: {address}")
-            else:
-                logger.error("[WALLET] Failed to load wallet")
-                sys.exit(1)
-        
-        # Handle oracle registration
+        # ── Oracle registration shortcut ──────────────────────────────────────
         if args.register:
             if not all([args.miner_id,args.wallet_password]):
                 logger.error("[REGISTER] --miner-id and --wallet-password required")
                 sys.exit(1)
-            
             wallet=QuickWallet()
             if wallet.load(args.wallet_password):
                 registry=MinerRegistry(args.oracle_url)
@@ -3978,6 +4637,62 @@ def main():
                 else:
                     logger.error("[REGISTER] ❌ Registration failed")
                     sys.exit(1)
+            else:
+                logger.error("[REGISTER] ❌ Failed to load wallet")
+                sys.exit(1)
+
+        # ── Resolve address / wallet ──────────────────────────────────────────
+        wallet = None
+        if args.address:
+            address = args.address
+            # Lightweight placeholder wallet for transaction mode
+            wallet = QuickWallet()
+            wallet.address = address
+            # Try to load full wallet silently (needed for signing)
+            if not args.wallet_password:
+                try:
+                    args.wallet_password = input(
+                        "Wallet password (Enter to skip if only mining by address): "
+                    ).strip() or None
+                except (EOFError, KeyboardInterrupt):
+                    args.wallet_password = None
+            if args.wallet_password:
+                loaded = QuickWallet()
+                if loaded.load(args.wallet_password) and loaded.address == address:
+                    wallet = loaded
+                    logger.info(f"[WALLET] Loaded: {wallet.address}")
+        else:
+            wallet = QuickWallet()
+            if not args.wallet_password:
+                args.wallet_password = input("Enter wallet password: ")
+            if wallet.load(args.wallet_password):
+                address = wallet.address
+                logger.info(f"[WALLET] Loaded: {address}")
+            else:
+                logger.error("[WALLET] Failed to load wallet — run with --wallet-init first")
+                sys.exit(1)
+
+        # ── MODE DISPATCH ─────────────────────────────────────────────────────
+        #
+        #   [ 1 ]  mine      → fall through to existing mining loop below
+        #   [ 2 ]  transact  → HLWE transaction wizard then exit
+        #
+        mode = args.mode
+        if mode is None:
+            mode = _choose_mode()
+
+        if mode == 'transact':
+            if wallet.private_key is None:
+                print("\n❌  Transaction mode requires a loaded wallet with private key.")
+                print("    Provide --wallet-password (or run --wallet-init to create one).")
+                sys.exit(1)
+            # If --from-address supplied, honour it (allows different sender)
+            if args.from_address and args.from_address != wallet.address:
+                print(f"\n⚠️   --from-address ({args.from_address}) differs from "
+                      f"loaded wallet ({wallet.address}).")
+                print("     Using loaded wallet address for signing.")
+            _run_transaction_wizard(args, wallet)
+            return   # ← transaction done; do NOT fall through to mining
         
         # Start mining
         # ─── DATABASE INITIALIZATION WITH PERSISTENT FILE-BASED STORAGE ──────────────
