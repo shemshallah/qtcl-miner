@@ -4196,6 +4196,84 @@ def _wallet_recover(args):
     sys.exit(0)
 
 
+def _query_transaction_status(tx_hash, node_url="https://qtcl-blockchain.koyeb.app"):
+    """Query and display transaction status from blockchain."""
+    print("\n" + "="*70)
+    print("  📊 TRANSACTION STATUS VIEWER")
+    print("="*70)
+    print(f"  Querying: {tx_hash[:32]}…\n")
+    
+    try:
+        r = requests.get(f"{node_url}/api/transactions/{tx_hash}", timeout=10)
+        
+        if r.status_code == 200:
+            data = r.json()
+            print(f"  ✅ TRANSACTION FOUND\n")
+            print(f"  TX Hash          : {data.get('tx_hash')}")
+            print(f"  Status           : {data.get('status').upper()}")
+            print(f"  Block Height     : #{data.get('block_height', 'N/A')}")
+            print(f"  Block Hash       : {str(data.get('block_hash', 'N/A'))[:40]}…")
+            print(f"  Transaction Idx  : {data.get('transaction_index', 'N/A')}")
+            print(f"  Amount           : {data.get('amount_qtcl', data.get('amount', 'N/A'))} QTCL")
+            print(f"  From             : {data.get('from_address')}")
+            print(f"  To               : {data.get('to_address')}")
+            print(f"  TX Type          : {data.get('tx_type', 'transfer')}")
+            print(f"  Created At       : {data.get('created_at', 'N/A')}")
+            
+            if data.get('status') == 'sealed':
+                print(f"\n  ✅ TRANSACTION SEALED IN BLOCKCHAIN")
+            else:
+                print(f"\n  ⏳ TRANSACTION PENDING (waiting to be sealed)")
+        elif r.status_code == 404:
+            print(f"  ❌ TRANSACTION NOT FOUND")
+            print(f"     Hash: {tx_hash}")
+            print(f"     (May still be pending if just broadcast)")
+        else:
+            print(f"  ❌ ERROR: HTTP {r.status_code}")
+            print(f"     {r.text[:200]}")
+    except requests.exceptions.ConnectionError:
+        print(f"  ❌ Cannot reach node: {node_url}")
+    except requests.exceptions.Timeout:
+        print(f"  ❌ Node timeout (taking too long)")
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+    
+    print("\n" + "="*70 + "\n")
+
+
+def _run_transaction_menu(args, wallet):
+    """Secondary menu: Send transaction or view transaction status."""
+    while True:
+        print("\n" + "━"*70)
+        print("  💸  TRANSACTION MENU")
+        print("━"*70)
+        print("  ┌──────────────────────────────────────┐")
+        print("  │ 1. 📤  Send Transaction              │")
+        print("  │ 2. 📊  Check Transaction Status      │")
+        print("  │ 3. 🔙  Back to Main Menu             │")
+        print("  └──────────────────────────────────────┘")
+        
+        try:
+            choice = input("  Enter choice [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = '3'
+        
+        if choice == '1':
+            _run_transaction_wizard(args, wallet)
+            break
+        elif choice == '2':
+            print()
+            tx_hash = input("  Enter Transaction Hash: ").strip()
+            if tx_hash:
+                _query_transaction_status(tx_hash, args.oracle_url)
+            else:
+                print("  ❌ Transaction hash required")
+        elif choice == '3':
+            break
+        else:
+            print("  ❌ Invalid choice")
+
+
 def _run_transaction_wizard(args, wallet):
     """Interactive HLWE transaction wizard."""
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -4245,7 +4323,7 @@ def _run_transaction_wizard(args, wallet):
     proof   = hashlib.sha3_256((commit + witness).encode()).hexdigest()
     payload['hlwe_signature'] = {'commitment': commit, 'witness': witness, 'proof': proof}
 
-    print(f"TX ID  : {tx_id[:24]}…")
+    print(f"TX ID  : {tx_id}")
     print(f"  From   : {wallet.address}")
     print(f"  To     : {to_addr}")
     print(f"  Amount : {amount} QTCL  (fee {fee})")
@@ -4262,7 +4340,7 @@ def _run_transaction_wizard(args, wallet):
     try:
         r = requests.post(f"{args.oracle_url}/api/submit_transaction",
                           json=payload, timeout=15)
-        if r.status_code == 200:
+        if r.status_code in (200, 201):
             print(f"✅  Accepted by node — TX ID: {tx_id}")
             data = r.json()
             if data.get('block_height'):
@@ -4500,7 +4578,7 @@ def main():
                 print("\n❌  Transaction mode requires a fully loaded wallet.")
                 print("    Re-run and enter your wallet password.")
                 sys.exit(1)
-            _run_transaction_wizard(args, wallet)
+            _run_transaction_menu(args, wallet)
             return
         
         # Start mining
