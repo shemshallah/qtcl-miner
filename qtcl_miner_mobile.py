@@ -1705,54 +1705,155 @@ class MinerWebSocketP2PClient:
                     except:
                         pass
     
+    def _warmup_server(self, base_url: str, max_wait: int = 30) -> bool:
+        """
+        Ping /api/blocks/tip until server responds (handles Koyeb cold starts).
+        Returns True once server is alive, False if it never wakes up in time.
+        """
+        deadline = time.time() + max_wait
+        attempt  = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                r = requests.get(f"{base_url}/api/blocks/tip", timeout=5)
+                if r.status_code < 500:
+                    logger.info(f"[WEBSOCKET] ✅ Server warm ({r.status_code}) after {attempt} ping(s)")
+                    return True
+            except Exception:
+                pass
+            wait = min(2 ** (attempt - 1), 8)   # 1 2 4 8 8 …
+            logger.info(f"[WEBSOCKET] ⏳ Server not ready — retrying in {wait}s (cold-start warmup)")
+            time.sleep(wait)
+        logger.warning(f"[WEBSOCKET] ⚠️  Server did not warm up within {max_wait}s")
+        return False
+
     def connect(self) -> bool:
         """
         Connect to oracle via Socket.IO over HTTPS/WSS (port 443 via Koyeb reverse proxy).
 
-        socket.io client convention: pass the BASE URL (https://host), NOT
-        a ws:// URL with /socket.io appended. The client library appends
-        /socket.io internally. Passing wss://host/socket.io was causing
-        double-path (/socket.io/socket.io) and silent connection failure.
-        
-        For Koyeb: Prefer polling transport first (more reliable via reverse proxy),
-        fall back to WebSocket if needed.
+        Enhancements vs previous version:
+          • Pre-flight server warmup ping (handles Koyeb cold starts)
+          • 3 connection attempts with exponential backoff (1s, 2s)
+          • Polling-only fallback when namespace negotiation fails
         """
         if not self.sio:
             return False
-        try:
-            p2p_ws_url = os.getenv('P2P_WEBSOCKET_URL')
-            if p2p_ws_url:
-                connect_url = p2p_ws_url.rstrip('/')
-                logger.info(f"[WEBSOCKET] Using env P2P_WEBSOCKET_URL: {connect_url}")
-            else:
-                # Strip to bare host, then build https:// base URL for socket.io
-                raw = (self.oracle_url
-                       .replace('wss://', '').replace('ws://', '')
-                       .replace('https://', '').replace('http://', ''))
-                host_only = raw.split('/')[0].split(':')[0]
-                if 'localhost' in host_only or '127.0.0.1' in host_only:
-                    connect_url = f"http://{host_only}:8000"
-                    transports = ['websocket', 'polling']  # Local: prefer WebSocket
-                else:
-                    connect_url = f"https://{host_only}"  # Koyeb: HTTPS base URL, reverse proxy on 443
-                    transports = ['polling', 'websocket']  # Koyeb: prefer polling (more reliable through reverse proxy)
 
-            logger.debug(f"[WEBSOCKET] 🔌 Connecting to {connect_url} (timeout={self.current_timeout}s, transports={transports})")
-            t0 = time.time()
-            self.sio.connect(
-                connect_url,
-                wait_timeout=self.current_timeout,
-                transports=transports,
-                socketio_path='/socket.io',
-            )
-            elapsed = time.time() - t0
-            self.request_times.append(elapsed)
-            self._update_adaptive_timeout()
-            logger.info(f"[WEBSOCKET] ✅ Connected to {connect_url} in {elapsed:.2f}s (transports={transports})")
-            return True
-        except Exception as e:
-            logger.warning(f"[WEBSOCKET] ⚠️  Connection attempt failed ({connect_url if 'connect_url' in locals() else '?'}): {type(e).__name__}: {e}")
-            return False
+        # ── Resolve connect URL once ──────────────────────────────────────────
+        p2p_ws_url = os.getenv('P2P_WEBSOCKET_URL')
+        if p2p_ws_url:
+            connect_url = p2p_ws_url.rstrip('/')
+            logger.info(f"[WEBSOCKET] Using env P2P_WEBSOCKET_URL: {connect_url}")
+        else:
+            raw = (self.oracle_url
+                   .replace('wss://', '').replace('ws://', '')
+                   .replace('https://', '').replace('http://', ''))
+            host_only = raw.split('/')[0].split(':')[0]
+            if 'localhost' in host_only or '127.0.0.1' in host_only:
+                connect_url = f"http://{host_only}:8000"
+            else:
+                connect_url = f"https://{host_only}"
+
+        # ── Server warmup (absorbs Koyeb cold-start lag silently) ────────────
+        self._warmup_server(connect_url, max_wait=30)
+
+        # ── Transport preference lists to try in order ────────────────────────
+        local = 'localhost' in connect_url or '127.0.0.1' in connect_url
+        transport_strategies = (
+            [['websocket', 'polling'], ['polling']]   # local: WS first, polling fallback
+            if local else
+            [['polling', 'websocket'], ['polling']]   # Koyeb: polling first, polling-only fallback
+        )
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            transports = transport_strategies[0] if attempt < max_attempts else transport_strategies[-1]
+            try:
+                # Recreate sio client on retry to clear any stale internal state
+                if attempt > 1 and self.sio:
+                    try:
+                        self.sio.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        self.sio = socketio.Client(
+                            reconnection=True,
+                            reconnection_delay=1,
+                            reconnection_delay_max=5,
+                            reconnection_attempts=10,
+                            request_timeout=self.current_timeout,
+                        )
+                        # Re-attach event handlers
+                        @self.sio.event
+                        def connect():
+                            with self._lock:
+                                self.connected = True
+                            logger.info("[WEBSOCKET] ✅ Connected to oracle via WebSocket")
+                            self._send_register()
+
+                        @self.sio.event
+                        def disconnect():
+                            with self._lock:
+                                self.connected = False
+                            logger.warning("[WEBSOCKET] Disconnected from oracle")
+
+                        @self.sio.on('miner_register_ack')
+                        def on_register_ack(data):
+                            if data.get('status') == 'registered':
+                                logger.info("[WEBSOCKET] ✅ Registration acknowledged")
+                                if 'known_peers' in data:
+                                    self._process_peer_list(data['known_peers'])
+                            else:
+                                logger.warning(f"[WEBSOCKET] Registration error: {data.get('message')}")
+
+                        @self.sio.on('miner_snapshot')
+                        def on_snapshot(data):
+                            ts = data.get('timestamp_ns', 0)
+                            with self._lock:
+                                self.snapshot_cache[ts] = data
+                                self.latest_snapshot_ts = max(self.latest_snapshot_ts, ts)
+
+                        @self.sio.on('gossip_peer_list')
+                        def on_gossip_peer_list(data):
+                            self._process_peer_list(data.get('peers', []))
+
+                        @self.sio.on('gossip_snapshot')
+                        def on_gossip_snapshot(data):
+                            ts = data.get('timestamp_ns', 0)
+                            with self._lock:
+                                self.snapshot_cache[ts] = data
+                                self.latest_snapshot_ts = max(self.latest_snapshot_ts, ts)
+
+                        @self.sio.on('error')
+                        def on_error(data):
+                            logger.error(f"[WEBSOCKET] Oracle error: {data}")
+                    except Exception as reinit_err:
+                        logger.debug(f"[WEBSOCKET] sio reinit error: {reinit_err}")
+
+                logger.info(f"[WEBSOCKET] 🔌 Attempt {attempt}/{max_attempts} → {connect_url} "
+                            f"(transports={transports}, timeout={self.current_timeout}s)")
+                t0 = time.time()
+                self.sio.connect(
+                    connect_url,
+                    wait_timeout=self.current_timeout,
+                    transports=transports,
+                    socketio_path='/socket.io',
+                )
+                elapsed = time.time() - t0
+                self.request_times.append(elapsed)
+                self._update_adaptive_timeout()
+                logger.info(f"[WEBSOCKET] ✅ Connected in {elapsed:.2f}s (transports={transports})")
+                return True
+
+            except Exception as e:
+                logger.warning(f"[WEBSOCKET] ⚠️  Attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}")
+                if attempt < max_attempts:
+                    backoff = 2 ** (attempt - 1)   # 1s, 2s
+                    logger.info(f"[WEBSOCKET] 🔄 Retrying in {backoff}s…")
+                    time.sleep(backoff)
+
+        logger.warning(f"[WEBSOCKET] ⚠️  All {max_attempts} connection attempts failed for {connect_url}")
+        return False
     
     def _send_register(self)->None:
         """Send registration message to oracle with gossip info."""
@@ -2011,38 +2112,61 @@ class P2PClientWStateRecovery:
             except Exception as e:
                 logger.warning(f"[W-STATE] ⚠️  WebSocket registration error: {e} - falling back to HTTP")
         
-        # Fall back to HTTP with exponential backoff
-        max_attempts=5
+        # ── HTTP fallback: warm up server first, then register ───────────────
+        # Koyeb cold starts can add 10-20s of latency on first request.
+        # Ping /api/blocks/tip (cheap GET) until the server responds before
+        # hitting the register endpoint — prevents burning all retry attempts
+        # on cold-start timeouts.
+        logger.info("[W-STATE] 🌡️  Pre-warming server before HTTP registration…")
+        deadline = time.time() + 25
+        warmup_attempt = 0
+        while time.time() < deadline:
+            warmup_attempt += 1
+            try:
+                r = requests.get(f"{self.oracle_url}/api/blocks/tip", timeout=5)
+                if r.status_code < 500:
+                    logger.info(f"[W-STATE] ✅ Server warm (HTTP {r.status_code}) after {warmup_attempt} ping(s)")
+                    break
+            except Exception:
+                pass
+            wait = min(2 ** (warmup_attempt - 1), 8)
+            logger.info(f"[W-STATE] ⏳ Server not ready — waiting {wait}s…")
+            time.sleep(wait)
+
+        max_attempts = 5
         for attempt in range(max_attempts):
             try:
-                url=f"{self.oracle_url}/api/oracle/register"
-                response=requests.post(
+                url = f"{self.oracle_url}/api/oracle/register"
+                # Timeout: 8s on first attempt (server should now be warm),
+                # increase to 15s on retries to absorb any residual lag.
+                timeout = 8 if attempt == 0 else 15
+                response = requests.post(
                     url,
                     json={"miner_id": self.peer_id, "address": self.miner_address, "public_key": self.peer_id},
-                    timeout=10  # Increased from 5s
+                    timeout=timeout,
                 )
-                
-                if response.status_code in [200,201]:
-                    data=response.json()
-                    self.oracle_address=data.get('miner_id',self.peer_id)
+
+                if response.status_code in [200, 201]:
+                    data = response.json()
+                    self.oracle_address = data.get('miner_id', self.peer_id)
                     if self.oracle_address:
                         self.trusted_oracles.add(self.oracle_address)
                         logger.info(f"[W-STATE] ✅ Registered with oracle (HTTP) | miner_id={self.oracle_address[:20]}…")
                     return True
                 else:
                     logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} failed: {response.status_code}")
-            
+
             except requests.Timeout:
-                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} timeout after 10s")
+                logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} timeout after {timeout}s")
             except Exception as e:
                 logger.warning(f"[W-STATE] ⚠️  Registration attempt {attempt+1}/{max_attempts} error: {e}")
-            
-            # Exponential backoff: 1s, 2s, 4s, 8s, 8s
+
+            # Backoff: 2s, 4s, 8s, 8s (skip 1s — server is already warm)
             if attempt < max_attempts - 1:
-                delay_sec = min(2 ** attempt, 8)
+                delay_sec = min(2 ** (attempt + 1), 8)
                 logger.info(f"[W-STATE] 🔄 Retrying registration in {delay_sec}s…")
                 time.sleep(delay_sec)
-        
+
         logger.error(f"[W-STATE] ❌ Registration failed after {max_attempts} attempts - continuing with graceful degradation")
         # Return True to allow recovery to proceed with cached/synthetic snapshots
         return True
