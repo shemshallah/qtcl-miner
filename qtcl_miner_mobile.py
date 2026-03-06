@@ -5366,19 +5366,46 @@ def _run_transaction_wizard(args, wallet):
         'public_key': wallet.public_key,
     }
 
-    # HLWE-256 signature: commitment = SHA3-256(payload), witness = SHA3-256(priv+commit)
-    commit  = hashlib.sha3_256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-    witness = hashlib.sha3_256((wallet.private_key + commit).encode()).hexdigest()
-    proof   = hashlib.sha3_256((commit + witness).encode()).hexdigest()
+    # ── Compute canonical TX hash (matches mempool.canonical_hash) ──
+    tx_hash_payload = json.dumps({
+        'from_address': wallet.address,
+        'to_address'  : to_addr,
+        'amount'      : str(int(amount * 100)),  # base units
+        'nonce'       : str(nonce),
+        'fee'         : str(int(fee * 100)),     # base units
+        'timestamp_ns': str(int(_time.time() * 1e9)),
+    }, sort_keys=True)
+    message_hash = hashlib.sha3_256(tx_hash_payload.encode()).hexdigest()
     
     # W-state entropy: deterministic source from wallet + nonce + timestamp
     timestamp_ns = int(_time.time() * 1e9)
     w_entropy_input = f"{wallet.public_key}:{nonce}:{timestamp_ns}".encode()
     w_entropy_hash = hashlib.sha3_256(w_entropy_input).hexdigest()
+    w_entropy_bytes = hashlib.sha3_256(w_entropy_input).digest()
+    
+    # HLWE signature computation (matching oracle.HLWESigner):
+    # 1. Commitment = SHA3-256(private || w_entropy || message_hash)
+    message_hash_bytes = bytes.fromhex(message_hash)
+    private_key_bytes = bytes.fromhex(wallet.private_key)
+    pubkey_bytes = bytes.fromhex(wallet.public_key)
+    
+    commitment_input = private_key_bytes + w_entropy_bytes + message_hash_bytes
+    commitment = hashlib.sha3_256(commitment_input).hexdigest()
+    commitment_bytes = hashlib.sha3_256(commitment_input).digest()
+    
+    # 2. Witness = SHAKE-256(commitment || private)
+    witness_input = commitment_bytes + private_key_bytes
+    witness = hashlib.shake_256(witness_input).digest(64).hex()
+    witness_bytes = hashlib.shake_256(witness_input).digest(64)
+    
+    # 3. Proof = HMAC-SHA3(pubkey, witness || message_hash)
+    # NOTE: Uses pubkey, not private_key (critical fix!)
+    proof_input = witness_bytes + message_hash_bytes
+    proof = hmac.new(pubkey_bytes, proof_input, digestmod=hashlib.sha3_256).digest().hex()
     
     # Complete signature with all 7 required HLWESignature fields
     payload['signature'] = {
-        'commitment'      : commit,
+        'commitment'      : commitment,
         'witness'         : witness,
         'proof'           : proof,
         'w_entropy_hash'  : w_entropy_hash,
