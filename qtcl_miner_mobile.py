@@ -4173,7 +4173,9 @@ class QTCLFullNode:
                 logger.warning(f"[NODE] ⚠️  Failed to initialize difficulty engine: {e}")
         
         # W-STATE RECOVERY
-        peer_id=f"miner_{uuid.uuid4().hex[:12]}"
+        # Derive deterministic peer_id from miner_address (wallet) — persists across restarts
+        peer_id_hash = hashlib.sha256(miner_address.encode()).hexdigest()[:12]
+        peer_id = f"miner_{peer_id_hash}"
         self.w_state_recovery=P2PClientWStateRecovery(
             oracle_url=oracle_url,
             peer_id=peer_id,
@@ -5820,7 +5822,9 @@ def main():
         logger.info("[P2P] 🚀 Initializing P2P network layer...")
         
         # 1. Start P2P server (listen for peer connections)
-        peer_id = f"qtcl_miner_{uuid.uuid4().hex[:12]}"
+        # Derive deterministic peer_id from wallet address — miner identity persists across restarts
+        peer_id_hash = hashlib.sha256(address.encode()).hexdigest()[:12]
+        peer_id = f"qtcl_miner_{peer_id_hash}"
         global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC
         
         _P2P_SERVER = P2PServer(peer_id, port=8000, db_connection=db)
