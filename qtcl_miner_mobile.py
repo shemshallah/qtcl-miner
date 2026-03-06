@@ -3097,7 +3097,7 @@ class DifficultyRetargeting:
         self.retarget_window=retarget_window
         self.ema_alpha=ema_alpha
         self.min_difficulty=12   # 2^12/12k h/s ≈ 0.34s — absolute floor
-        self.max_difficulty=24   # 2^24/12k h/s ≈ 1374s (~23 min) — hard ceiling
+        self.max_difficulty=32   # raised from 24 — let network difficulty grow freely
         self._lock=threading.RLock()
 
         # Load state from database
@@ -3558,7 +3558,7 @@ class QuantumMiner:
                 current_difficulty = 21
                 logger.warning(f"[MINING] ⚠️  No difficulty_engine! Using hardcoded 21")
             
-            # Sanity check: difficulty must be within engine bounds [12, 24]
+            # Sanity check: difficulty must be within engine bounds [12, max_difficulty]
             if current_difficulty < 12:
                 logger.error(f"[MINING] ❌ DIFFICULTY ALERT: {current_difficulty} < 12 (floor). Resetting to 21.")
                 logger.error(f"[MINING]    This would solve in milliseconds — engine state corrupt.")
@@ -6968,6 +6968,24 @@ class QTCLFullNode:
                 
                 logger.info(f"[MINING] Block #{tip.height+1} | pending_txs={tx_count} | F={current_fidelity:.4f}")
                 
+                # ── SYNC local difficulty engine with server tip ──────────────────
+                # Server is authoritative. If tip.difficulty_bits > local EMA, force
+                # the engine up before mining so we never submit a block the server rejects.
+                server_diff = getattr(tip, 'difficulty_bits', 0)
+                if server_diff and self.miner.difficulty_engine:
+                    local_diff = self.miner.difficulty_engine.get_current_difficulty()
+                    if server_diff > local_diff:
+                        logger.warning(
+                            f"[MINING] ⚡ Server diff {server_diff} > local EMA {local_diff} "
+                            f"— force-syncing engine to {server_diff}"
+                        )
+                        with self.miner.difficulty_engine._lock:
+                            self.miner.difficulty_engine.current_difficulty = min(
+                                server_diff,
+                                self.miner.difficulty_engine.max_difficulty,
+                            )
+                        self.miner.difficulty_engine._save_state()
+
                 block_start = time.time()
                 block = self.miner.mine_block(pending_txs, self.miner_address, tip.block_hash, tip.height+1)
                 block_time = time.time() - block_start
