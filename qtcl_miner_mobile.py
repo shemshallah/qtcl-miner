@@ -57,13 +57,12 @@
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac,sqlite3,struct,cmath,socket
+import os,sys,time,json,math,hashlib,secrets,threading,logging,argparse,traceback,hmac,sqlite3,struct,socket
 from typing import Dict,Any,Optional,List,Tuple,Deque,Set
 from dataclasses import dataclass,field,asdict
 from enum import Enum,auto
-from collections import deque,defaultdict,Counter
+from collections import deque,defaultdict
 from datetime import datetime,timezone
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
@@ -78,38 +77,9 @@ except ImportError:
     logger=logging.getLogger('QTCL_MINER')
     logger.warning("[MINER] python-socketio not available - will use HTTP-only registration")
 
-# ── gRPC streaming client ─────────────────────────────────────────────────────
-_GRPC_CLIENT_AVAILABLE = False
-_grpc_client_mod       = None
-_wstate_pb2_client     = None
-_wstate_pb2_grpc_client = None
-
-_PROTO_SRC = r"""
-syntax = "proto3";
-package qtcl;
-service WStateService {
-  rpc StreamSnapshots(StreamRequest) returns (stream WStateSnapshot);
-  rpc GetLatestSnapshot(StreamRequest) returns (WStateSnapshot);
-  rpc Ping(PingRequest) returns (PingResponse);
-}
-message StreamRequest  { string miner_id = 1; string miner_address = 2; uint64 known_ts = 3; }
-message PingRequest    { string miner_id = 1; }
-message PingResponse   { bool ok = 1; uint64 server_ts_ns = 2; uint32 miner_count = 3; }
-message HLWESignature  { string commitment = 1; string witness = 2; string proof = 3;
-                         string w_entropy_hash = 4; string derivation_path = 5; string public_key_hex = 6; }
-message WStateSnapshot { uint64 timestamp_ns = 1; string oracle_address = 2; string w_entropy_hash = 3;
-                         double fidelity = 4; double coherence = 5; double purity = 6; double entanglement = 7;
-                         string density_matrix_hex = 8; bool signature_valid = 9;
-                         HLWESignature hlwe_signature = 10; uint64 block_height = 11; }
-"""
-
-def _compile_grpc_client_proto():
-    pass  # gRPC client removed - using SSE
-# ── end gRPC client init ──────────────────────────────────────────────────────
 
 try:
-    from qiskit import QuantumCircuit,QuantumRegister,ClassicalRegister,execute
-    from qiskit.quantum_info import Statevector,DensityMatrix
+    from qiskit import QuantumCircuit, execute
     from qiskit.providers.aer import AerSimulator
     QISKIT_AVAILABLE=True
 except ImportError:
@@ -681,225 +651,9 @@ class P2PClient:
         return blocks
 
 
-class P2PServer:
-    """
-    Raw TCP P2P server — secondary channel for direct peer-to-peer communication.
-    Default port: 9092 (NOT 8000 — that conflicts with Koyeb oracle public endpoint).
-    All primary P2P HTTP traffic is handled by GossipListener on port 9091.
-    This server handles low-level block/TX relay between LAN peers or direct connections.
-    """
+# ── P2P Client global (set in main) ──────────────────────────────────────────
+_P2P_CLIENT: Optional["P2PClient"] = None
 
-    def __init__(self, peer_id: str, port: int = 9092, db_connection: Optional[sqlite3.Connection] = None):
-        self.peer_id = peer_id
-        self.port = port
-        self.running = False
-        self.server_socket = None
-        self.peers: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.RLock()
-        # Use supplied connection; fall back to schema-builder conn only if nothing else provided.
-        # This eliminates the split-brain: main() passes db= after initialising its own SQLite conn.
-        self._db: Optional[sqlite3.Connection] = db_connection
-    
-    def start(self):
-        """Start P2P server listening."""
-        self.running = True
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        try:
-            self.server_socket.bind(('0.0.0.0', self.port))
-            self.server_socket.listen(5)
-            logger.info(f"[P2P] 🎧 Server listening on port {self.port}")
-        except OSError as e:
-            logger.warning(f"[P2P] ⚠️  Could not bind to port {self.port}: {e}")
-            self.running = False
-            return
-        
-        while self.running:
-            try:
-                self.server_socket.settimeout(1)
-                client_socket, (client_host, client_port) = self.server_socket.accept()
-                
-                # Handle in thread
-                thread = threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, client_host, client_port),
-                    daemon=True
-                )
-                thread.start()
-                
-            except socket.timeout:
-                continue
-            except Exception as e:
-                logger.debug(f"[P2P] Server error: {e}")
-    
-    def _handle_client(self, client_socket, client_host, client_port):
-        """Handle incoming peer connection — always uses self._db (main node db) if set."""
-        # Resolve the correct db: prefer injected main db, fall back to schema-builder conn
-        _conn = self._db if self._db is not None else _DB_CONN
-        try:
-            data = client_socket.recv(4096).decode()
-            msg = P2PMessage.from_json(data.strip())
-
-            if msg.msg_type == 'HELLO':
-                response = P2PMessage(
-                    'HELLO_RESPONSE',
-                    self.peer_id,
-                    payload={'peers': [('localhost', self.port)]}
-                )
-                client_socket.send(response.to_json().encode() + b'\n')
-                logger.debug(f"[P2P] 👋 HELLO from {client_host}:{client_port}")
-            
-            elif msg.msg_type == 'GET_HEIGHT':
-                try:
-                    cursor = _conn.cursor()
-                    cursor.execute("SELECT MAX(height) FROM blocks")
-                    result = cursor.fetchone()
-                    height = result[0] if result[0] is not None else 0
-                except:
-                    height = 0
-                
-                response = P2PMessage('HEIGHT_RESPONSE', self.peer_id, height=height)
-                client_socket.send(response.to_json().encode() + b'\n')
-                logger.debug(f"[P2P] 📊 Height query from {client_host}:{client_port}: {height}")
-            
-            elif msg.msg_type == 'GET_BLOCK':
-                try:
-                    cursor = _conn.cursor()
-                    cursor.execute("""
-                        SELECT block_hash, parent_hash, merkle_root, timestamp_s, difficulty_bits, nonce, miner_address, w_state_fidelity, w_entropy_hash
-                        FROM blocks WHERE height = ?
-                    """, (msg.height,))
-                    row = cursor.fetchone()
-                    
-                    if row:
-                        block_data = {
-                            'height': msg.height,
-                            'block_hash': row[0],
-                            'parent_hash': row[1],
-                            'merkle_root': row[2],
-                            'timestamp_s': row[3],
-                            'difficulty_bits': row[4],
-                            'nonce': row[5],
-                            'miner_address': row[6],
-                            'w_state_fidelity': row[7],
-                            'w_entropy_hash': row[8]
-                        }
-                        response = P2PMessage('BLOCK_RESPONSE', self.peer_id, block_data=block_data)
-                    else:
-                        response = P2PMessage('BLOCK_RESPONSE', self.peer_id, payload={'error': 'Block not found'})
-                except Exception as e:
-                    response = P2PMessage('BLOCK_RESPONSE', self.peer_id, payload={'error': str(e)})
-                
-                client_socket.send(response.to_json().encode() + b'\n')
-                logger.debug(f"[P2P] 📦 Block request from {client_host}:{client_port}: height={msg.height}")
-            
-            elif msg.msg_type == 'GET_METRICS':
-                try:
-                    cursor = _conn.cursor()
-
-                    # Get current metrics
-                    cursor.execute("SELECT MAX(height) FROM blocks")
-                    height = cursor.fetchone()[0] or 0
-
-                    # broadcast_to_oracle column only exists after schema patches — guard it
-                    try:
-                        cursor.execute("SELECT COUNT(*) FROM transactions WHERE broadcast_to_oracle=0")
-                        pending_txs = cursor.fetchone()[0] or 0
-                    except Exception:
-                        pending_txs = 0
-                    
-                    cursor.execute("SELECT AVG(w_state_fidelity) FROM blocks WHERE w_state_fidelity > 0")
-                    avg_fidelity = cursor.fetchone()[0] or 0.9
-                    
-                    metrics = {
-                        'height': height,
-                        'pending_txs': pending_txs,
-                        'avg_fidelity': float(avg_fidelity),
-                        'timestamp': int(time.time() * 1000)
-                    }
-                    
-                    response = P2PMessage('METRICS_RESPONSE', self.peer_id, payload={'metrics': metrics})
-                except Exception as e:
-                    response = P2PMessage('METRICS_RESPONSE', self.peer_id, payload={'error': str(e)})
-                
-                client_socket.send(response.to_json().encode() + b'\n')
-                logger.debug(f"[P2P] 📊 Metrics query from {client_host}:{client_port}")
-            
-            elif msg.msg_type == 'SIGNED_TRANSACTION':
-                # Receive signed transaction from peer
-                try:
-                    signed_tx = msg.payload or {}
-                    tx_id = signed_tx.get('tx_id', 'unknown')
-                    
-                    # Verify signature
-                    cursor = _conn.cursor()
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO transactions 
-                        (tx_id, height, tx_index, from_address, to_address, amount, fee, 
-                         signature, hlwe_signature, signer_address, signature_valid)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        tx_id,
-                        signed_tx.get('height'),
-                        signed_tx.get('tx_index'),
-                        signed_tx.get('from_address'),
-                        signed_tx.get('to_address'),
-                        signed_tx.get('amount'),
-                        signed_tx.get('fee'),
-                        signed_tx.get('signature'),
-                        signed_tx.get('hlwe_signature'),
-                        signed_tx.get('signer_address'),
-                        1 if signed_tx.get('signature_valid') else 0
-                    ))
-                    _conn.commit()
-                    
-                    response = P2PMessage('ACK', self.peer_id, payload={'tx_id': tx_id})
-                    logger.info(f"[P2P] 📝 Received signed transaction: {tx_id}")
-                except Exception as e:
-                    response = P2PMessage('ERROR', self.peer_id, payload={'error': str(e)})
-                
-                client_socket.send(response.to_json().encode() + b'\n')
-            
-            elif msg.msg_type == 'SIGNED_BLOCK':
-                # Receive signed block from peer
-                try:
-                    signed_block = msg.block_data or {}
-                    block_hash = signed_block.get('block_hash', 'unknown')
-                    
-                    response = P2PMessage('ACK', self.peer_id, payload={'block_hash': block_hash})
-                    logger.info(f"[P2P] ⛏️  Received signed block: {block_hash}")
-                except Exception as e:
-                    response = P2PMessage('ERROR', self.peer_id, payload={'error': str(e)})
-                
-                client_socket.send(response.to_json().encode() + b'\n')
-            
-            elif msg.msg_type == 'NEW_BLOCK':
-                logger.info(f"[P2P] 🆕 New block from {client_host}:{client_port}: {msg.block_hash}")
-                # Process block (validation, storage)
-                response = P2PMessage('ACK', self.peer_id)
-                client_socket.send(response.to_json().encode() + b'\n')
-            
-            else:
-                response = P2PMessage('ERROR', self.peer_id, payload={'error': f'Unknown message type: {msg.msg_type}'})
-                client_socket.send(response.to_json().encode() + b'\n')
-            
-            client_socket.close()
-        
-        except Exception as e:
-            logger.debug(f"[P2P] Client handler error: {e}")
-    
-    def stop(self):
-        """Stop P2P server."""
-        self.running = False
-        if self.server_socket:
-            self.server_socket.close()
-        logger.info(f"[P2P] 🛑 Server stopped")
-
-
-# P2P initialization placeholder (will be called from main)
-_P2P_SERVER: Optional[P2PServer] = None
-_P2P_CLIENT: Optional[P2PClient] = None
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # HLWE TRANSACTION SIGNING & ORACLE BROADCAST LAYER
@@ -1011,87 +765,117 @@ class OracleBroadcaster:
     
     def broadcast_pending(self, timeout: int = 5) -> Dict[str, int]:
         """
-        Broadcast all pending items to Oracle and gossip peers.
+        Broadcast pending items to oracle and gossip peers.
 
-        Flow per item:
-          1. POST to oracle REST  (/api/transactions or /api/blocks)
-          2. On 200/201 → mark broadcast_to_oracle=1 in local SQLite
-          3. Fan-out to up to 5 best gossip peers via /gossip/ingest
-          4. Failed items are re-queued with an attempt counter (max 3 retries)
+        BLOCK items: oracle POST is SKIPPED — blocks are already submitted via
+        LiveNodeClient.submit_block() → /api/submit_block.  We only fan-out to
+        P2P gossip peers so the network converges quickly.
+
+        TX items: POST to /api/transactions on the oracle, then gossip fan-out.
+
+        Retry policy: up to 3 attempts for TX oracle; gossip fan-out is
+        fire-and-forget (no retry, 3s timeout) to avoid log spam.
+        Loopback peers (127.0.0.1, localhost) are always skipped for fan-out.
         """
         stats = {'sent': 0, 'failed': 0, 'queued': 0}
-        _session = getattr(self, '_http_session', None)
-        if _session is None:
-            _session = requests.Session()
-            _adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5,
-                                                      status_forcelist=[429, 500, 502, 503, 504]))
-            _session.mount('https://', _adapter)
-            _session.mount('http://', _adapter)
-            self._http_session = _session
 
-        # Collect gossip peers for fan-out (best 5 by quality)
+        # ── Oracle session: retry on 5xx ──────────────────────────────────────
+        _oracle_session = getattr(self, '_oracle_http_session', None)
+        if _oracle_session is None:
+            _oracle_session = requests.Session()
+            _a = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5,
+                                               status_forcelist=[429, 500, 502, 503, 504]))
+            _oracle_session.mount('https://', _a)
+            _oracle_session.mount('http://', _a)
+            self._oracle_http_session = _oracle_session
+
+        # ── Gossip session: NO retry — fire-and-forget only ───────────────────
+        _gossip_session = getattr(self, '_gossip_http_session', None)
+        if _gossip_session is None:
+            _gossip_session = requests.Session()
+            _ng = HTTPAdapter(max_retries=Retry(total=0))
+            _gossip_session.mount('https://', _ng)
+            _gossip_session.mount('http://', _ng)
+            self._gossip_http_session = _gossip_session
+
+        # ── Collect live gossip peers, skip loopback/dead ─────────────────────
         _gossip_peers: List[str] = []
         try:
             db_for_peers = getattr(self, '_db_ref', None)
             if db_for_peers is not None:
                 rows = db_for_peers.execute(
                     "SELECT gossip_url FROM gossip_peers WHERE online=1 AND gossip_url != '' "
-                    "ORDER BY last_seen DESC LIMIT 5"
+                    "AND last_seen > ? ORDER BY last_seen DESC LIMIT 8",
+                    (time.time() - 300,)
                 ).fetchall()
-                _gossip_peers = [r[0] for r in rows if r[0]]
+                for r in rows:
+                    gurl = r[0] or ''
+                    if not gurl:
+                        continue
+                    # Skip loopback peers — they are stale DB artefacts, not real P2P nodes
+                    if '127.0.0.1' in gurl or 'localhost' in gurl:
+                        continue
+                    _gossip_peers.append(gurl)
         except Exception:
             pass
 
         with self._lock:
             retry_queue: Deque[Dict[str, Any]] = deque()
             while self.broadcast_queue:
-                item = self.broadcast_queue.popleft()
+                item      = self.broadcast_queue.popleft()
                 item_type = item['type']
                 data      = item['data']
                 attempts  = item.get('attempts', 0)
 
+                oracle_ok = False  # tracks whether oracle accepted (TX only)
+
                 # ── 1. Oracle REST broadcast ──────────────────────────────────
-                oracle_ok = False
-                try:
-                    if item_type == 'transaction':
+                if item_type == 'transaction':
+                    # Only transactions are POSTed to oracle here;
+                    # blocks skip oracle POST — already sent via submit_block.
+                    try:
                         url = f"{self.oracle_url}/api/transactions"
                         payload = {
-                            'tx_hash':      data.get('tx_id', data.get('tx_hash', '')),
-                            'from_address': data.get('from_addr', data.get('from_address', '')),
-                            'to_address':   data.get('to_addr', data.get('to_address', '')),
-                            'amount':       data.get('amount', 0),
-                            'fee':          data.get('fee', 0),
-                            'nonce':        data.get('nonce', 0),
-                            'timestamp_ns': data.get('timestamp_ns', int(time.time_ns())),
-                            'signature':    data.get('signature', data.get('hlwe_signature', '')),
+                            'tx_hash':        data.get('tx_id', data.get('tx_hash', '')),
+                            'from_address':   data.get('from_addr', data.get('from_address', '')),
+                            'to_address':     data.get('to_addr', data.get('to_address', '')),
+                            'amount':         data.get('amount', 0),
+                            'fee':            data.get('fee', 0),
+                            'nonce':          data.get('nonce', 0),
+                            'timestamp_ns':   data.get('timestamp_ns', int(time.time_ns())),
+                            'signature':      data.get('signature', data.get('hlwe_signature', '')),
                             'hlwe_signature': data.get('hlwe_signature', ''),
                             'signer_address': data.get('signer_address', ''),
-                            'tx_type':      data.get('tx_type', 'transfer'),
-                            'source':       'miner_p2p',
+                            'tx_type':        data.get('tx_type', 'transfer'),
+                            'source':         'miner_p2p',
                         }
-                    else:  # block
-                        url = f"{self.oracle_url}/api/blocks"
-                        payload = data
+                        resp = _oracle_session.post(url, json=payload, timeout=timeout)
+                        if resp.status_code in (200, 201, 202):
+                            oracle_ok = True
+                            logger.info(
+                                f"[ORACLE-BROADCAST] ✅ TX → oracle | "
+                                f"id={data.get('tx_id', '?')[:24]} | HTTP {resp.status_code}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[ORACLE-BROADCAST] ⚠️  TX HTTP {resp.status_code} → {url} | "
+                                f"id={data.get('tx_id', '?')[:24]}"
+                            )
+                    except requests.Timeout:
+                        logger.warning(f"[ORACLE-BROADCAST] ⏱️  TX oracle timeout after {timeout}s")
+                    except Exception as e:
+                        logger.warning(f"[ORACLE-BROADCAST] ⚠️  TX oracle error: {e}")
 
-                    resp = _session.post(url, json=payload, timeout=timeout)
-                    if resp.status_code in (200, 201, 202):
-                        oracle_ok = True
-                        logger.info(
-                            f"[ORACLE-BROADCAST] ✅ {item_type.upper()} → oracle | "
-                            f"id={data.get('tx_id', data.get('block_hash', '?'))[:24]} | "
-                            f"HTTP {resp.status_code}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[ORACLE-BROADCAST] ⚠️  {item_type.upper()} HTTP {resp.status_code} "
-                            f"→ {url} | id={data.get('tx_id', data.get('block_hash', '?'))[:24]}"
-                        )
-                except requests.Timeout:
-                    logger.warning(f"[ORACLE-BROADCAST] ⏱️  {item_type} oracle timeout after {timeout}s")
-                except Exception as e:
-                    logger.warning(f"[ORACLE-BROADCAST] ⚠️  {item_type} oracle error: {e}")
+                elif item_type == 'block':
+                    # Block already sent via submit_block — treat as oracle-ok for metrics
+                    oracle_ok = True
+                    logger.debug(
+                        f"[ORACLE-BROADCAST] ⏭️  Block skipping oracle re-POST "
+                        f"(already submitted via submit_block) | "
+                        f"hash={data.get('block_hash', data.get('header', {}).get('block_hash', '?'))[:24]}"
+                    )
 
-                # ── 2. Mark broadcast in local SQLite ─────────────────────────
+                # ── 2. Mark in local SQLite ───────────────────────────────────
                 if oracle_ok:
                     try:
                         db_ref = getattr(self, '_db_ref', None)
@@ -1107,18 +891,19 @@ class OracleBroadcaster:
                                 db_ref.execute(
                                     "UPDATE blocks SET broadcast_to_oracle=1, oracle_timestamp=? "
                                     "WHERE block_hash=?",
-                                    (now_ts, data.get('block_hash', ''))
+                                    (now_ts, data.get('block_hash',
+                                             data.get('header', {}).get('block_hash', '')))
                                 )
                             db_ref.commit()
                     except Exception as dbe:
                         logger.debug(f"[ORACLE-BROADCAST] DB mark error: {dbe}")
                     stats['sent'] += 1
 
-                # ── 3. Gossip fan-out to P2P peers (best-effort, non-blocking) ──
+                # ── 3. Gossip fan-out (fire-and-forget, no retry) ─────────────
                 if _gossip_peers:
                     gossip_payload: Dict[str, Any] = {
-                        'origin': self.oracle_url,
-                        'peer_id': getattr(self, '_peer_id', 'oracle_broadcaster'),
+                        'origin':  self.oracle_url,
+                        'peer_id': getattr(self, '_peer_id', 'broadcaster'),
                     }
                     if item_type == 'transaction':
                         gossip_payload['txs'] = [{
@@ -1138,29 +923,28 @@ class OracleBroadcaster:
 
                     for gurl in _gossip_peers:
                         try:
-                            _session.post(
+                            _gossip_session.post(
                                 f"{gurl.rstrip('/')}/gossip/ingest",
                                 json=gossip_payload,
                                 timeout=3,
                             )
-                            logger.debug(f"[ORACLE-BROADCAST] 📡 Gossip fan-out → {gurl[:40]}")
+                            logger.debug(f"[ORACLE-BROADCAST] 📡 Gossip → {gurl[:40]}")
                         except Exception:
-                            pass
+                            pass   # fire-and-forget — never log individual peer failures
 
-                # ── 4. Re-queue on failure (max 3 retries) ────────────────────
-                if not oracle_ok:
+                # ── 4. Re-queue TX failures only (max 3 retries) ──────────────
+                if not oracle_ok and item_type == 'transaction':
                     if attempts < 3:
                         item['attempts'] = attempts + 1
                         item['status']   = 'retry'
                         retry_queue.append(item)
                     else:
                         logger.error(
-                            f"[ORACLE-BROADCAST] ❌ Giving up on {item_type} "
-                            f"after 3 attempts: {data.get('tx_id', data.get('block_hash', '?'))[:24]}"
+                            f"[ORACLE-BROADCAST] ❌ Giving up on TX after 3 attempts: "
+                            f"{data.get('tx_id', '?')[:24]}"
                         )
                     stats['failed'] += 1
 
-            # Restore retry items
             self.broadcast_queue.extend(retry_queue)
 
         stats['queued'] = len(self.broadcast_queue)
@@ -1968,6 +1752,7 @@ def apply_schema_patches(conn: sqlite3.Connection = None) -> None:
     Apply all schema patches to the local database.
     Called at startup (main) and can also be called with an explicit connection.
     Idempotent — safe to call multiple times.
+    Also purges stale loopback entries from peer tables on every call.
     """
     target = conn or _DB_CONN
     if target is None:
@@ -1975,14 +1760,12 @@ def apply_schema_patches(conn: sqlite3.Connection = None) -> None:
     with threading.RLock():
         for patch_name, patch_sql in SCHEMA_PATCHES.items():
             try:
-                # executescript auto-commits; use individual statements for safety
                 for stmt in patch_sql.strip().split(';'):
                     s = stmt.strip()
                     if s and not s.startswith('--'):
                         try:
                             target.execute(s)
                         except sqlite3.OperationalError as _e:
-                            # "duplicate column name" is expected on re-run — not an error
                             if 'duplicate column' not in str(_e).lower() and \
                                'already exists' not in str(_e).lower():
                                 logger.debug(f"[SCHEMA] stmt warn ({patch_name}): {_e}")
@@ -1990,6 +1773,25 @@ def apply_schema_patches(conn: sqlite3.Connection = None) -> None:
                 logger.debug(f"[SCHEMA] ✅ Applied patch: {patch_name}")
             except Exception as e:
                 logger.debug(f"[SCHEMA] ℹ️  Patch note ({patch_name}): {e}")
+
+        # ── Purge loopback / stale peer entries ───────────────────────────────
+        # 127.0.0.1 and localhost entries in gossip_peers/dht_peers are this
+        # node's own gossip listener URL leaking into peer tables.  They cause
+        # connection-refused spam on gossip fan-out.  Purge them every startup.
+        for tbl, col in [('gossip_peers', 'gossip_url'),
+                          ('dht_peers',    'peer_address')]:
+            try:
+                target.execute(
+                    f"DELETE FROM {tbl} WHERE {col} LIKE '%127.0.0.1%' "
+                    f"OR {col} LIKE '%localhost%'"
+                )
+            except Exception:
+                pass
+        try:
+            target.commit()
+            logger.debug("[SCHEMA] ✅ Loopback peer entries purged")
+        except Exception:
+            pass
 
 
 
@@ -2138,8 +1940,6 @@ MAX_MEMPOOL=10000
 SYNC_BATCH=50
 MEMPOOL_POLL_INTERVAL=5
 MINING_POLL_INTERVAL=2
-DIFFICULTY_WINDOW=2016
-TARGET_BLOCK_TIME=10          # target seconds per block
 
 # ── Block capacity ────────────────────────────────────────────────────────────
 # Max USER transactions per block (coinbase does NOT count toward this limit).
@@ -2154,7 +1954,6 @@ MAX_BLOCK_TX = 3
 DEFAULT_DIFFICULTY = 20
 
 # W-STATE CONFIGURATION
-W_STATE_STREAM_INTERVAL_MS=10
 NUM_QUBITS_WSTATE=3
 
 FIDELITY_THRESHOLD_STRICT = 0.90
@@ -2174,7 +1973,6 @@ COHERENCE_WEIGHT = 0.3
 
 RECOVERY_BUFFER_SIZE=100
 SYNC_INTERVAL_MS=10
-MAX_SYNC_LAG_MS=100
 HERMITICITY_TOLERANCE=1e-10
 EIGENVALUE_TOLERANCE=-1e-10
 
@@ -2188,7 +1986,6 @@ COINBASE_ADDRESS    = '000000000000000000000000000000000000000000000000000000000
 BLOCK_REWARD_QTCL   = 12.5          # QTCL per block (human-readable)
 BLOCK_REWARD_BASE   = 1250          # base units (NUMERIC(30,0), 1 QTCL = 100 base units)
 COINBASE_TX_VERSION = 1             # coinbase version field
-COINBASE_MATURITY   = 100           # blocks before coinbase output is spendable (future enforcement)
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE DATA STRUCTURES
@@ -2461,166 +2258,9 @@ class Block:
         return hashes[0]
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# MINER WEBSOCKET P2P CLIENT (Registration, Heartbeats, Snapshots)
+# W-STATE P2P CLIENT — Recovery, entanglement, SSE snapshot sync
 # ═════════════════════════════════════════════════════════════════════════════════
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# gRPC SNAPSHOT STREAM CLIENT
-# Opens a persistent server-streaming RPC; oracle pushes snapshots every ~10ms.
-# Feeds directly into the same snapshot_cache used by the WS path so the rest
-# of the codebase is unchanged.
-# ═════════════════════════════════════════════════════════════════════════════════
-
-class GRPCSnapshotStream:
-    """
-    Persistent gRPC server-streaming connection to the oracle.
-
-    Lifecycle:
-      start()  → background thread opens StreamSnapshots RPC, loops forever
-      stop()   → signals thread to exit, channel closed
-      get_latest() → latest snapshot dict or None
-
-    Thread-safety: snapshot_cache written under _lock; readable without lock
-    (slight eventual-consistency is fine — worst case one stale read per block).
-    """
-
-    def __init__(self, oracle_host: str, grpc_port: int,
-                 miner_id: str, miner_address: str):
-        self.oracle_host    = oracle_host   # bare hostname, no scheme
-        self.grpc_port      = grpc_port
-        self.miner_id       = miner_id
-        self.miner_address  = miner_address
-        self._running       = False
-        self._thread: Optional[threading.Thread] = None
-        self._lock          = threading.RLock()
-        self.latest_snapshot: Optional[Dict[str, Any]] = None
-        self.connected      = False
-        self.snapshots_received = 0
-
-    def _pb_to_dict(self, pb) -> Dict[str, Any]:
-        """Convert WStateSnapshot protobuf → plain dict (same shape as HTTP response)."""
-        sig = pb.hlwe_signature
-        return {
-            'timestamp_ns':       pb.timestamp_ns,
-            'oracle_address':     pb.oracle_address,
-            'w_entropy_hash':     pb.w_entropy_hash,
-            'fidelity':           pb.fidelity,
-            'w_state_fidelity':   pb.fidelity,   # alias used by recovery
-            'coherence':          pb.coherence,
-            'purity':             pb.purity,
-            'entanglement':       pb.entanglement,
-            'density_matrix_hex': pb.density_matrix_hex,
-            'signature_valid':    pb.signature_valid,
-            'block_height':       pb.block_height,
-            'hlwe_signature': {
-                'commitment':      sig.commitment,
-                'witness':         sig.witness,
-                'proof':           sig.proof,
-                'w_entropy_hash':  sig.w_entropy_hash,
-                'derivation_path': sig.derivation_path,
-                'public_key_hex':  sig.public_key_hex,
-            },
-        }
-
-    def _stream_loop(self):
-        """Background thread: reconnects on any error with exponential backoff."""
-        backoff = 1
-        target  = f'{self.oracle_host}:{self.grpc_port}'
-
-        while self._running:
-            channel = None
-            try:
-                channel = _grpc_client_mod.insecure_channel(
-                    target,
-                    options=[
-                        ('grpc.keepalive_time_ms',              15_000),
-                        ('grpc.keepalive_timeout_ms',            5_000),
-                        ('grpc.keepalive_permit_without_calls',      1),
-                        ('grpc.max_receive_message_length', 4 * 1024 * 1024),
-                    ],
-                )
-                stub = _wstate_pb2_grpc_client.WStateServiceStub(channel)
-
-                # Verify server is alive before opening stream
-                try:
-                    pong = stub.Ping(
-                        _wstate_pb2_client.PingRequest(miner_id=self.miner_id),
-                        timeout=5,
-                    )
-                    logger.info(f'[GRPC] ✅ Ping OK | server_miners={pong.miner_count}')
-                except Exception as ping_err:
-                    raise ConnectionError(f'Ping failed: {ping_err}')
-
-                req = _wstate_pb2_client.StreamRequest(
-                    miner_id      = self.miner_id,
-                    miner_address = self.miner_address,
-                    known_ts      = int(self.latest_snapshot.get('timestamp_ns', 0))
-                                    if self.latest_snapshot else 0,
-                )
-                logger.info(f'[GRPC] 🔗 Stream opened → {target}')
-                with self._lock:
-                    self.connected = True
-                backoff = 1  # reset on successful connect
-
-                for pb_snap in stub.StreamSnapshots(req):
-                    if not self._running:
-                        break
-                    snap = self._pb_to_dict(pb_snap)
-                    with self._lock:
-                        self.latest_snapshot = snap
-                        self.snapshots_received += 1
-                    # Log every 1000 received (≈10s at 100/s oracle rate)
-                    if self.snapshots_received % 1000 == 0:
-                        logger.info(f'[GRPC] 📡 {self.snapshots_received} snapshots received | '
-                                    f'latest_ts={snap["timestamp_ns"]} | F={snap["fidelity"]:.4f}')
-
-            except Exception as e:
-                with self._lock:
-                    self.connected = False
-                if self._running:
-                    logger.warning(f'[GRPC] ⚠️  Stream error: {type(e).__name__}: {e} — reconnect in {backoff}s')
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
-            finally:
-                if channel:
-                    try:
-                        channel.close()
-                    except Exception:
-                        pass
-
-        with self._lock:
-            self.connected = False
-        logger.info('[GRPC] 🛑 Stream loop exited')
-
-    def start(self) -> bool:
-        if not _GRPC_CLIENT_AVAILABLE:
-            logger.warning('[GRPC] Not available — snapshot stream disabled')
-            return False
-        self._running = True
-        self._thread  = threading.Thread(target=self._stream_loop, daemon=True, name='GRPCStream')
-        self._thread.start()
-        # Wait up to 8s for first snapshot
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            with self._lock:
-                if self.latest_snapshot:
-                    logger.info('[GRPC] ✅ First snapshot received — stream live')
-                    return True
-            time.sleep(0.1)
-        logger.warning('[GRPC] ⚠️  No snapshot within 8s of stream open (server may be slow)')
-        return self.connected  # connected but no snapshot yet is still a success
-
-    def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    def get_latest(self) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self.latest_snapshot
-
-
-# MinerWebSocketP2PClient removed - using SSE
 
 class P2PClientWStateRecovery:
     """
@@ -2649,25 +2289,6 @@ class P2PClientWStateRecovery:
                 logger.warning(f"[W-STATE] WebSocket initialization failed: {e}")
                 self.ws_client=None
 
-        # ✅ Initialize gRPC stream client (preferred transport — sub-ms delivery)
-        self.grpc_stream: Optional[GRPCSnapshotStream] = None
-        if _GRPC_CLIENT_AVAILABLE:
-            try:
-                from urllib.parse import urlparse
-                parsed   = urlparse(oracle_url if '://' in oracle_url else f'https://{oracle_url}')
-                grpc_host = parsed.hostname or 'qtcl-blockchain.koyeb.app'
-                grpc_port = int(os.getenv('GRPC_PORT', 50051))
-                self.grpc_stream = GRPCSnapshotStream(
-                    oracle_host   = grpc_host,
-                    grpc_port     = grpc_port,
-                    miner_id      = self.peer_id,
-                    miner_address = self.miner_address,
-                )
-                logger.info(f"[GRPC] 🌐 gRPC snapshot stream client initialized → {grpc_host}:{grpc_port}")
-            except Exception as e:
-                logger.warning(f"[GRPC] Stream client init failed: {e}")
-                self.grpc_stream = None
-        
         self.oracle_address=None
         self.trusted_oracles: Set[str]=set()
         
@@ -2791,16 +2412,7 @@ class P2PClientWStateRecovery:
           2. WS request + poll  — emit over connected Socket.IO, wait up to 4s
           3. HTTP GET           — fallback with adaptive timeout + backoff
         """
-        # ── 1. gRPC stream (fastest — background thread keeps this fresh) ──────
-        if self.grpc_stream and self.grpc_stream.connected:
-            snap = self.grpc_stream.get_latest()
-            if snap:
-                with self._state_lock:
-                    self.current_snapshot = snap
-                    self.snapshot_buffer.append(snap)
-                return snap
-
-        # ── 2. WebSocket request + short poll ────────────────────────────────
+        # ── 1. WebSocket request + short poll ────────────────────────────────
         ws = self.ws_client
         if ws:
             # Check existing cache first
@@ -2813,7 +2425,7 @@ class P2PClientWStateRecovery:
 
             if getattr(ws, 'connected', False):
                 ws.request_snapshot()
-                deadline = time.time() + 4   # shorter wait — gRPC is the real path
+                deadline = time.time() + 4
                 while time.time() < deadline:
                     time.sleep(0.1)
                     cached = ws.get_cached_snapshot()
@@ -2825,7 +2437,7 @@ class P2PClientWStateRecovery:
                         return cached
                 logger.warning("[W-STATE] ⚠️  WS snapshot not delivered within 4s — trying HTTP")
 
-        # ── 3. HTTP fallback ─────────────────────────────────────────────────
+        # ── 2. HTTP fallback ─────────────────────────────────────────────────
         max_attempts = 3
         for attempt in range(max_attempts):
             timeout = 10 + attempt * 5   # 10s, 15s, 20s
@@ -3399,15 +3011,6 @@ class P2PClientWStateRecovery:
             if not self.register_with_oracle():
                 logger.warning("[W-STATE] ⚠️  Registration inconclusive - attempting recovery anyway")
 
-            # ── Start gRPC stream FIRST (fastest path) ──────────────────────
-            if self.grpc_stream:
-                logger.info("[GRPC] 🚀 Starting snapshot stream...")
-                grpc_ok = self.grpc_stream.start()
-                if grpc_ok:
-                    logger.info("[GRPC] ✅ Live stream active — snapshots arriving continuously")
-                else:
-                    logger.warning("[GRPC] ⚠️  Stream not immediately live — will keep retrying in background")
-            
             snapshot=self.download_latest_snapshot()
             if snapshot is None:
                 logger.warning("[W-STATE] ⚠️  Failed to download initial snapshot - using synthetic snapshot")
@@ -3461,9 +3064,6 @@ class P2PClientWStateRecovery:
         """Stop the recovery client."""
         logger.info("[W-STATE] 🛑 Stopping...")
         self.running=False
-
-        if self.grpc_stream:
-            self.grpc_stream.stop()
 
         if self.sync_thread:
             self.sync_thread.join(timeout=5)
@@ -4120,7 +3720,7 @@ class QuantumMiner:
 #
 # Components:
 #   GossipHTTPHandler   — wsgiref micro-server handler: accepts POST /gossip/ingest
-#   GossipListener      — starts GossipHTTPHandler on a background thread (port 9001+)
+#   GossipListener      — starts GossipHTTPHandler on a background thread (port 9091, unified)
 #   SSESubscriber       — connects to oracle /api/events SSE stream, routes events
 #   PeerHeartbeat       — registers with oracle, sends periodic heartbeats
 #   P2PGossipOrchestrator — coordinates all above; started by QTCLFullNode.start()
@@ -4136,96 +3736,38 @@ import urllib.parse as _urlparse
 
 
 # ── Local SQLite schema for gossip mirror ─────────────────────────────────────
-_GOSSIP_DB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS pending_txs (
-    tx_hash     TEXT PRIMARY KEY,
-    from_addr   TEXT NOT NULL,
-    to_addr     TEXT NOT NULL,
-    amount_base INTEGER NOT NULL,
-    nonce       INTEGER DEFAULT 0,
-    fee_qtcl    REAL    DEFAULT 0.001,
-    timestamp_ns INTEGER DEFAULT 0,
-    signature   TEXT    DEFAULT '',
-    status      TEXT    DEFAULT 'pending',
-    source      TEXT    DEFAULT 'gossip',
-    received_at REAL    DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_pending_txs_status ON pending_txs(status);
-CREATE TABLE IF NOT EXISTS gossip_peers (
-    peer_id      TEXT PRIMARY KEY,
-    gossip_url   TEXT NOT NULL,
-    miner_addr   TEXT DEFAULT '',
-    block_height INTEGER DEFAULT 0,
-    last_seen    REAL DEFAULT 0,
-    online       INTEGER DEFAULT 1,
-    latency_ms   REAL DEFAULT 9999,
-    success_rate REAL DEFAULT 1.0,
-    fail_count   INTEGER DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_gossip_peers_online ON gossip_peers(online, last_seen DESC);
-CREATE TABLE IF NOT EXISTS block_cache (
-    height       INTEGER PRIMARY KEY,
-    block_hash   TEXT NOT NULL,
-    parent_hash  TEXT NOT NULL DEFAULT '',
-    merkle_root  TEXT NOT NULL DEFAULT '',
-    timestamp_s  INTEGER NOT NULL DEFAULT 0,
-    difficulty_bits INTEGER NOT NULL DEFAULT 20,
-    nonce        INTEGER NOT NULL DEFAULT 0,
-    miner_address TEXT NOT NULL DEFAULT '',
-    w_state_fidelity REAL DEFAULT 0.0,
-    w_entropy_hash TEXT DEFAULT '',
-    tx_count     INTEGER DEFAULT 0,
-    raw_json     TEXT DEFAULT '',
-    source       TEXT DEFAULT 'p2p',
-    cached_at    REAL DEFAULT (strftime('%s','now'))
-);
-CREATE TABLE IF NOT EXISTS confirmed_txs (
-    tx_hash      TEXT PRIMARY KEY,
-    block_height INTEGER NOT NULL,
-    block_hash   TEXT NOT NULL,
-    from_addr    TEXT NOT NULL,
-    to_addr      TEXT NOT NULL,
-    amount_base  INTEGER NOT NULL,
-    fee_qtcl     REAL DEFAULT 0.001,
-    confirmed_at REAL DEFAULT (strftime('%s','now'))
-);
-"""
-
-
 def _init_gossip_db(db) -> None:
-    """Add gossip tables to existing local SQLite DB connection."""
+    """Ensure gossip tables exist — delegates to apply_schema_patches (single source of truth)."""
     if db is None:
         return
-    try:
-        for stmt in _GOSSIP_DB_SCHEMA.strip().split(';'):
-            s = stmt.strip()
-            if s:
-                db.execute(s)
-        db.commit()
-    except Exception as e:
-        logger.debug(f"[GOSSIP/local] DB schema init: {e}")
+    apply_schema_patches(conn=db)
 
 
 def _local_db_upsert_tx(db, tx: dict) -> bool:
-    """Mirror a pending TX into local SQLite. Returns True if row was new."""
+    """Mirror a pending TX into local SQLite pending_txs. Returns True if row was new."""
     if db is None:
         return False
     try:
+        tx_id     = str(tx.get('tx_hash') or tx.get('tx_id', ''))
+        from_addr = str(tx.get('from_address') or tx.get('from_addr', ''))
+        to_addr   = str(tx.get('to_address') or tx.get('to_addr', ''))
+        amount_b  = int(tx.get('amount_base', int(float(tx.get('amount', 0)) * 100)))
         cur = db.execute("""
             INSERT OR IGNORE INTO pending_txs
-                (tx_hash, from_addr, to_addr, amount_base,
-                 nonce, fee_qtcl, timestamp_ns, signature, source)
-            VALUES (?,?,?,?,?,?,?,?,?)
+                (tx_id, from_addr, to_addr, amount, amount_base,
+                 nonce, fee, timestamp_ns, signature, hlwe_signature, source, expires_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            tx.get('tx_hash') or tx.get('tx_id',''),
-            tx.get('from_address') or tx.get('from_addr',''),
-            tx.get('to_address') or tx.get('to_addr',''),
-            int(tx.get('amount_base', int(float(tx.get('amount',0))*100))),
+            tx_id, from_addr, to_addr,
+            float(tx.get('amount', amount_b / 100)),
+            amount_b,
             int(tx.get('nonce', 0)),
             float(tx.get('fee', 0.001)),
             int(tx.get('timestamp_ns', 0)),
-            str(tx.get('signature','') or tx.get('quantum_state_hash','')),
-            str(tx.get('source','gossip')),
+            str(tx.get('signature', '') or tx.get('quantum_state_hash', '')),
+            str(tx.get('hlwe_signature', '')),
+            str(tx.get('source', 'gossip')),
+            time.time() + 3600,
         ))
         db.commit()
         return cur.rowcount > 0
@@ -4234,13 +3776,14 @@ def _local_db_upsert_tx(db, tx: dict) -> bool:
         return False
 
 
+
 def _local_db_clear_confirmed(db, tx_hashes: list) -> None:
-    """Mark TXs as confirmed in local mirror after block seal."""
+    """Remove confirmed TXs from local pending_txs mirror after block seal."""
     if db is None or not tx_hashes:
         return
     try:
         db.executemany(
-            "UPDATE pending_txs SET status='confirmed' WHERE tx_hash=?",
+            "DELETE FROM pending_txs WHERE tx_id=?",
             [(h,) for h in tx_hashes],
         )
         db.commit()
@@ -4249,25 +3792,25 @@ def _local_db_clear_confirmed(db, tx_hashes: list) -> None:
 
 
 def _local_db_get_pending(db) -> list:
-    """Read all pending TXs from local SQLite mirror."""
+    """Read all non-expired pending TXs from local SQLite mirror."""
     if db is None:
         return []
     try:
         cur = db.execute("""
-            SELECT tx_hash, from_addr, to_addr, amount_base,
-                   nonce, fee_qtcl, timestamp_ns, signature
+            SELECT tx_id, from_addr, to_addr, amount_base, amount,
+                   nonce, fee, timestamp_ns, signature
             FROM   pending_txs
-            WHERE  status = 'pending'
-            ORDER  BY received_at ASC
+            WHERE  expires_at > strftime('%s','now') OR expires_at = 0
+            ORDER  BY fee DESC, created_at ASC
         """)
         rows = cur.fetchall()
         return [{
             'tx_id'        : r[0], 'tx_hash'      : r[0],
             'from_addr'    : r[1], 'from_address' : r[1],
             'to_addr'      : r[2], 'to_address'   : r[2],
-            'amount_base'  : r[3], 'amount'        : r[3] / 100,
-            'nonce'        : r[4], 'fee'           : r[5],
-            'timestamp_ns' : r[6], 'signature'     : r[7],
+            'amount_base'  : r[3], 'amount'        : r[4] if r[4] else r[3] / 100,
+            'nonce'        : r[5], 'fee'           : r[6],
+            'timestamp_ns' : r[7], 'signature'     : r[8],
             'tx_type'      : 'transfer', 'status'  : 'pending',
         } for r in rows]
     except Exception as e:
@@ -4339,41 +3882,49 @@ def _local_db_get_tip(db) -> Optional[dict]:
 
 
 def _local_db_record_peer_result(db, peer_id: str, success: bool, latency_ms: float) -> None:
-    """Update peer score after each interaction — drives P2P peer selection."""
+    """Update peer EMA score after each interaction — drives P2P peer selection."""
     if db is None: return
     try:
         db.execute("""
             UPDATE gossip_peers SET
-                latency_ms   = (latency_ms * 0.8 + ? * 0.2),
-                success_rate = (success_rate * 0.9 + ? * 0.1),
-                fail_count   = CASE WHEN ? THEN fail_count ELSE fail_count + 1 END,
-                online       = ?,
-                last_seen    = CASE WHEN ? THEN strftime('%s','now') ELSE last_seen END
+                latency_ms    = (latency_ms * 0.8 + ? * 0.2),
+                fail_count    = CASE WHEN ? THEN fail_count ELSE fail_count + 1 END,
+                success_count = CASE WHEN ? THEN success_count + 1 ELSE success_count END,
+                online        = ?,
+                last_seen     = CASE WHEN ? THEN strftime('%s','now') ELSE last_seen END
             WHERE peer_id = ?
-        """, (latency_ms, 1.0 if success else 0.0, success, 1 if success else 0,
-              success, peer_id))
+        """, (latency_ms, success, success, 1 if success else 0, success, peer_id))
         db.commit()
     except Exception as e:
         logger.debug(f"[GOSSIP/local] record_peer_result: {e}")
 
 
 def _local_db_get_best_peers(db, limit: int = 10) -> list:
-    """Return peers ordered by composite score (latency + uptime + height)."""
+    """
+    Return peers ordered by composite score (latency + uptime + height).
+    Loopback entries (127.0.0.1 / localhost) are always excluded — they are
+    stale DB artefacts from the node's own gossip listener and cannot be
+    used for fan-out to actual network participants.
+    """
     if db is None: return []
     try:
         cur = db.execute("""
-            SELECT peer_id, gossip_url, miner_addr, block_height,
-                   latency_ms, success_rate,
-                   (success_rate * 100) - (latency_ms / 50.0) + (block_height / 100.0) AS score
+            SELECT peer_id, gossip_url, miner_address, block_height,
+                   latency_ms, success_count, fail_count,
+                   (CAST(success_count AS REAL) / MAX(1, success_count + fail_count) * 100)
+                   - (latency_ms / 50.0) + (block_height / 100.0) AS score
             FROM   gossip_peers
             WHERE  online = 1
               AND  last_seen > strftime('%s','now') - 120
+              AND  gossip_url NOT LIKE '%127.0.0.1%'
+              AND  gossip_url NOT LIKE '%localhost%'
             ORDER  BY score DESC
             LIMIT  ?
         """, (limit,))
-        return [{'peer_id': r[0], 'gossip_url': r[1], 'miner_addr': r[2],
+        return [{'peer_id': r[0], 'gossip_url': r[1], 'miner_address': r[2],
                  'block_height': r[3], 'latency_ms': r[4],
-                 'success_rate': r[5], 'score': r[6]} for r in cur.fetchall()]
+                 'success_count': r[5], 'fail_count': r[6], 'score': r[7]}
+                for r in cur.fetchall()]
     except Exception as e:
         logger.debug(f"[GOSSIP/local] get_best_peers: {e}")
         return []
@@ -4475,24 +4026,39 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {'transactions': txs or [], 'count': len(txs or [])})
 
         elif path.startswith('/api/blocks/tip'):
-            tip = _local_db_get_tip(db)
-            if tip:
-                h = tip.get('header', tip)
-                self._send_json(200, {'height': h.get('height', 0),
-                                      'block_height': h.get('height', 0),
-                                      'block_hash': h.get('block_hash', ''),
-                                      'source': 'local_cache'})
+            # Canonical chain tip — inventory dispatch queries local SQLite directly
+            result = P2PServiceInventory.dispatch_inbound(
+                P2PServiceRequestType.CHAIN_TIP, {}, db, mp
+            )
+            if result.get('ok'):
+                self._send_json(200, result)
             else:
-                self._send_json(404, {'error': 'no cached tip'})
+                # Fallback: legacy helper (handles blocks stored via _local_db_upsert_block)
+                tip = _local_db_get_tip(db)
+                if tip:
+                    h = tip.get('header', tip)
+                    self._send_json(200, {'height': h.get('height', 0),
+                                          'block_height': h.get('height', 0),
+                                          'block_hash': h.get('block_hash', ''),
+                                          'source': 'local_cache'})
+                else:
+                    self._send_json(404, {'error': 'no tip in local db'})
 
         elif path.startswith('/api/blocks/height/'):
             try:
                 height = int(path.split('/')[-1])
-                blk = _local_db_get_block(db, height)
-                if blk:
-                    self._send_json(200, blk)
+                result = P2PServiceInventory.dispatch_inbound(
+                    P2PServiceRequestType.BLOCK_BY_HEIGHT, {'height': height}, db, mp
+                )
+                if result.get('ok'):
+                    self._send_json(200, result)
                 else:
-                    self._send_json(404, {'error': f'block {height} not cached'})
+                    # Fallback: legacy block cache helper
+                    blk = _local_db_get_block(db, height)
+                    if blk:
+                        self._send_json(200, blk)
+                    else:
+                        self._send_json(404, {'error': f'block {height} not found'})
             except (ValueError, IndexError):
                 self._send_json(400, {'error': 'invalid height'})
 
@@ -4631,13 +4197,6 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {'live_peers': 0, 'live_oracles': 0, 'node_id': node_id,
                                        'gossip_url': gurl, 'ts': time.time()})
 
-        elif path == '/gossip/topology':
-            try:
-                n = db.execute("SELECT COUNT(*) FROM dht_peers WHERE last_seen > ?",
-                               (time.time() - 300,)).fetchone()[0] if db else 0
-            except Exception:
-                n = 0
-            self._send_json(200, {'live_peers': n, 'node_id': node_id, 'gossip_url': gurl})
 
         elif path == '/api/events':
             self.send_response(200)
@@ -4695,32 +4254,9 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
                     except Exception as te:
                         logger.debug(f"[P2P/ingest] TX→mempool: {te}")
                 tx['source'] = f"peer:{origin_peer}"
-                # Write to local gossip mirror (pending_txs + legacy store)
+                # Write to pending_txs (canonical store — handles both mirror and fan-out)
                 if _local_db_upsert_tx(db, tx):
                     new_tx += 1
-                # Also write to pending_txs table for OracleBroadcaster fan-out
-                if db is not None:
-                    try:
-                        db.execute("""
-                            INSERT OR IGNORE INTO pending_txs
-                                (tx_id, from_addr, to_addr, amount, amount_base, fee, nonce,
-                                 timestamp_ns, signature, hlwe_signature, source, expires_at)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                        """, (
-                            tx_hash, from_addr, to_addr,
-                            float(tx.get('amount', amount_b / 100)),
-                            amount_b,
-                            float(tx.get('fee', 0.001)),
-                            int(tx.get('nonce', 0)),
-                            int(tx.get('timestamp_ns', int(time.time_ns()))),
-                            str(tx.get('signature', '')),
-                            str(tx.get('hlwe_signature', '')),
-                            f"peer:{origin_peer}",
-                            time.time() + 3600,   # 1-hour TTL
-                        ))
-                        db.commit()
-                    except Exception:
-                        pass
             block = data.get('block')
             if block and isinstance(block, dict):
                 block['_source'] = f"peer:{origin_peer}"
@@ -5064,7 +4600,7 @@ class PeerHeartbeat(threading.Thread):
                             try:
                                 self.db.execute("""
                                     INSERT OR REPLACE INTO gossip_peers
-                                        (peer_id, gossip_url, miner_addr, block_height, last_seen, online)
+                                        (peer_id, gossip_url, miner_address, block_height, last_seen, online)
                                     VALUES (?,?,?,?,?,1)
                                 """, (p['peer_id'], gurl,
                                       p.get('miner_address',''),
@@ -5104,7 +4640,7 @@ class PeerHeartbeat(threading.Thread):
                         try:
                             self.db.execute("""
                                 INSERT OR REPLACE INTO gossip_peers
-                                    (peer_id, gossip_url, miner_addr, block_height, last_seen, online)
+                                    (peer_id, gossip_url, miner_address, block_height, last_seen, online)
                                 VALUES (?,?,?,?,?,1)
                             """, (p['peer_id'], gurl, p.get('miner_address',''),
                                   p.get('block_height',0), time.time()))
@@ -5289,142 +4825,6 @@ class P2PGossipOrchestrator:
 #   • Schema: dht_peers, dht_routing_table, oracle_registry, pseudoqubit_entanglement,
 #             peer_oracle_links, virtual_pq_state, network_topology
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
-
-# ─── DHT Schema Extensions ────────────────────────────────────────────────────────────────────────
-_DHT_SCHEMA_EXTENSION = """
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  DHT ROUTING TABLE — 160-bit Kademlia XOR peer discovery            ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS dht_peers (
-    node_id         TEXT PRIMARY KEY,               -- SHA1(pubkey) 160-bit hex
-    peer_address    TEXT NOT NULL,                  -- IP or hostname
-    gossip_port     INTEGER NOT NULL DEFAULT 9091,  -- gossip HTTP port
-    oracle_port     INTEGER,                        -- oracle REST port (NULL if not oracle)
-    miner_address   TEXT NOT NULL DEFAULT '',       -- QTCL wallet address
-    capabilities    TEXT NOT NULL DEFAULT '[]',     -- JSON array: ['mine','oracle','relay']
-    block_height    INTEGER NOT NULL DEFAULT 0,
-    w_fidelity      REAL NOT NULL DEFAULT 0.0,
-    is_oracle       INTEGER NOT NULL DEFAULT 0,     -- 1 if this peer is an oracle
-    is_bootstrap    INTEGER NOT NULL DEFAULT 0,     -- 1 if this is the bootstrap oracle
-    xor_bucket      INTEGER NOT NULL DEFAULT 0,     -- Kademlia k-bucket index [0..159]
-    last_seen       REAL NOT NULL DEFAULT 0,
-    last_ping_ms    REAL NOT NULL DEFAULT 9999,
-    fail_count      INTEGER NOT NULL DEFAULT 0,
-    success_count   INTEGER NOT NULL DEFAULT 0,
-    quality_score   REAL NOT NULL DEFAULT 0.5,      -- composite (latency+uptime+height)
-    created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
-    updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_dht_bucket    ON dht_peers(xor_bucket, quality_score DESC);
-CREATE INDEX IF NOT EXISTS idx_dht_oracle    ON dht_peers(is_oracle, block_height DESC);
-CREATE INDEX IF NOT EXISTS idx_dht_last_seen ON dht_peers(last_seen DESC);
-CREATE INDEX IF NOT EXISTS idx_dht_addr      ON dht_peers(miner_address);
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  ORACLE REGISTRY — tracks all known oracles (main + P2P promoted)   ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS oracle_registry (
-    oracle_id           TEXT PRIMARY KEY,           -- SHA256(oracle_address)[:32]
-    oracle_address      TEXT NOT NULL,              -- QTCL wallet address
-    oracle_url          TEXT NOT NULL,              -- https://... REST endpoint
-    gossip_url          TEXT NOT NULL DEFAULT '',   -- http://... P2P gossip endpoint
-    is_primary          INTEGER NOT NULL DEFAULT 0, -- 1 for main oracle
-    is_local            INTEGER NOT NULL DEFAULT 0, -- 1 if this node IS the oracle
-    node_id             TEXT NOT NULL DEFAULT '',   -- DHT node_id of oracle
-    pq0_fidelity        REAL NOT NULL DEFAULT 0.0,  -- current pq0 W-state fidelity
-    pq0_entropy_hash    TEXT NOT NULL DEFAULT '',   -- latest W-entropy hash
-    block_height        INTEGER NOT NULL DEFAULT 0,
-    peer_count          INTEGER NOT NULL DEFAULT 0,
-    promotion_height    INTEGER NOT NULL DEFAULT 0, -- block at which oracle was promoted
-    promotion_reason    TEXT NOT NULL DEFAULT '',   -- why it was promoted
-    entanglement_status TEXT NOT NULL DEFAULT 'none', -- none/pending/active/degraded
-    trust_score         REAL NOT NULL DEFAULT 0.5,
-    last_seen           REAL NOT NULL DEFAULT 0,
-    created_at          REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_oracle_primary  ON oracle_registry(is_primary);
-CREATE INDEX IF NOT EXISTS idx_oracle_trust    ON oracle_registry(trust_score DESC);
-CREATE INDEX IF NOT EXISTS idx_oracle_last     ON oracle_registry(last_seen DESC);
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  VIRTUAL PSEUDOQUBIT STATE — pq0 / virtual pq / inverse-virtual pq  ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS virtual_pq_state (
-    pq_id           TEXT PRIMARY KEY,               -- 'pq0', 'vpq_{n}', 'ivpq_{n}'
-    pq_type         TEXT NOT NULL,                  -- 'oracle','virtual','inverse_virtual'
-    oracle_id       TEXT NOT NULL,                  -- parent oracle
-    node_id         TEXT NOT NULL DEFAULT '',       -- owning DHT node
-    fidelity        REAL NOT NULL DEFAULT 0.0,
-    coherence       REAL NOT NULL DEFAULT 0.0,
-    purity          REAL NOT NULL DEFAULT 0.0,
-    entanglement_partner TEXT NOT NULL DEFAULT '', -- pq_id of entangled partner
-    w_entropy_hash  TEXT NOT NULL DEFAULT '',
-    density_matrix_hex TEXT NOT NULL DEFAULT '',   -- 8x8 complex128, hex-encoded
-    last_measured   REAL NOT NULL DEFAULT 0,
-    measurement_count INTEGER NOT NULL DEFAULT 0,
-    is_active       INTEGER NOT NULL DEFAULT 1,
-    created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
-    updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_vpq_type   ON virtual_pq_state(pq_type, is_active);
-CREATE INDEX IF NOT EXISTS idx_vpq_oracle ON virtual_pq_state(oracle_id);
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  PSEUDOQUBIT ENTANGLEMENT REGISTRY — tracks all entanglement links   ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS pq_entanglement_registry (
-    link_id         TEXT PRIMARY KEY,               -- SHA256(pq_a:pq_b)
-    pq_a_id         TEXT NOT NULL,
-    pq_b_id         TEXT NOT NULL,
-    oracle_a_id     TEXT NOT NULL,
-    oracle_b_id     TEXT NOT NULL,
-    link_type       TEXT NOT NULL,                  -- 'main_to_local','p2p_to_p2p','virtual_to_oracle'
-    fidelity_ab     REAL NOT NULL DEFAULT 0.0,      -- cross-entanglement fidelity
-    coherence_ab    REAL NOT NULL DEFAULT 0.0,
-    is_active       INTEGER NOT NULL DEFAULT 1,
-    established_at  REAL NOT NULL DEFAULT (strftime('%s','now')),
-    last_verified   REAL NOT NULL DEFAULT 0,
-    verification_count INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_pq_link_type ON pq_entanglement_registry(link_type, is_active);
-CREATE INDEX IF NOT EXISTS idx_pq_link_a    ON pq_entanglement_registry(pq_a_id);
-CREATE INDEX IF NOT EXISTS idx_pq_link_b    ON pq_entanglement_registry(pq_b_id);
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  ORACLE ELIGIBILITY LEDGER — tracks promotion criteria per node      ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS oracle_eligibility (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    check_height    INTEGER NOT NULL,
-    peer_count      INTEGER NOT NULL DEFAULT 0,
-    oracle_count    INTEGER NOT NULL DEFAULT 0,
-    blocks_mined    INTEGER NOT NULL DEFAULT 0,
-    avg_fidelity    REAL NOT NULL DEFAULT 0.0,
-    uptime_s        REAL NOT NULL DEFAULT 0.0,
-    eligible        INTEGER NOT NULL DEFAULT 0,
-    promoted        INTEGER NOT NULL DEFAULT 0,
-    promotion_type  TEXT NOT NULL DEFAULT '',       -- 'primary_failover','p2p_expansion','genesis'
-    notes           TEXT NOT NULL DEFAULT '',
-    checked_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_elig_height ON oracle_eligibility(check_height DESC);
-CREATE INDEX IF NOT EXISTS idx_elig_promo  ON oracle_eligibility(promoted);
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║  NETWORK TOPOLOGY SNAPSHOT — periodic graph of the P2P mesh         ║
--- ╚══════════════════════════════════════════════════════════════════════╝
-CREATE TABLE IF NOT EXISTS network_topology (
-    snapshot_id     TEXT PRIMARY KEY,
-    total_nodes     INTEGER NOT NULL DEFAULT 0,
-    total_oracles   INTEGER NOT NULL DEFAULT 0,
-    avg_peers       REAL NOT NULL DEFAULT 0.0,
-    diameter        INTEGER NOT NULL DEFAULT 0,    -- max hops to reach any node
-    density         REAL NOT NULL DEFAULT 0.0,     -- edges / (n*(n-1)/2)
-    topology_json   TEXT NOT NULL DEFAULT '{}',    -- adjacency list JSON
-    captured_at     REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-"""
-
 
 def _apply_dht_schema(db: sqlite3.Connection) -> None:
     """
@@ -6558,126 +5958,16 @@ class P2POracleServer:
             return 0
 
     def _make_handler(self):
-        """Factory: return a handler class with self (P2POracleServer) in closure."""
-        oracle_srv = self
-
-        class _OracleHandler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):
-                logger.debug(f"[P2PORACLE/http] {fmt % args}")
-
-            def _send_json(self, code: int, body: dict) -> None:
-                data = json.dumps(body).encode()
-                self.send_response(code)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def _read_json(self) -> Optional[dict]:
-                n = int(self.headers.get('Content-Length', 0))
-                if n <= 0 or n > 1_048_576:
-                    return None
-                try:
-                    return json.loads(self.rfile.read(n))
-                except Exception:
-                    return None
-
-            def do_GET(self):
-                path = _urlparse.urlparse(self.path).path
-                db   = oracle_srv.db
-
-                if path in ('/api/oracle/w-state', '/api/oracle/pq0'):
-                    self._send_json(200, oracle_srv.get_pq0_snapshot())
-
-                elif path == '/api/oracle/miners':
-                    miners = list(oracle_srv._registered_miners.values())
-                    self._send_json(200, {'miners': miners, 'count': len(miners)})
-
-                elif path == '/api/blocks/tip':
-                    h = oracle_srv._get_tip_height()
-                    tip_hash = ''
-                    if db:
-                        try:
-                            cur = db.execute("SELECT block_hash FROM blocks WHERE height=?", (h,))
-                            row = cur.fetchone()
-                            if row:
-                                tip_hash = row[0]
-                        except Exception:
-                            pass
-                    self._send_json(200, {'height': h, 'block_height': h,
-                                          'block_hash': tip_hash, 'source': 'p2p_oracle'})
-
-                elif path.startswith('/api/blocks/height/'):
-                    try:
-                        h = int(path.split('/')[-1])
-                        blk = _local_db_get_block(db, h)
-                        if blk:
-                            self._send_json(200, blk)
-                        else:
-                            self._send_json(404, {'error': f'block {h} not cached'})
-                    except (ValueError, IndexError):
-                        self._send_json(400, {'error': 'invalid height'})
-
-                elif path == '/api/mempool':
-                    txs = _local_db_get_pending(db)
-                    self._send_json(200, {'transactions': txs, 'count': len(txs)})
-
-                elif path == '/api/peers/list':
-                    peers = _local_db_get_best_peers(db, limit=20)
-                    self._send_json(200, {'peers': peers, 'count': len(peers)})
-
-                elif path == '/api/dht/hello':
-                    # DHT discovery — return closest known peers
-                    self._send_json(200, {
-                        'oracle_id':     oracle_srv.oracle_id,
-                        'node_id':       oracle_srv.local_node_id,
-                        'oracle_url':    f"http://localhost:{oracle_srv.port}",
-                        'is_p2p_oracle': True,
-                    })
-
-                else:
-                    self._send_json(404, {'error': 'not found'})
-
-            def do_POST(self):
-                path = _urlparse.urlparse(self.path).path
-                data = self._read_json()
-
-                if path == '/api/oracle/register':
-                    if data:
-                        miner_id = str(data.get('miner_id', ''))
-                        address  = str(data.get('address', ''))
-                        if miner_id and address:
-                            oracle_srv._registered_miners[miner_id] = {
-                                'miner_id': miner_id, 'address': address,
-                                'registered_at': time.time(), 'status': 'registered'
-                            }
-                            self._send_json(200, {'status': 'registered',
-                                                   'miner_id': miner_id, 'token': miner_id})
-                            return
-                    self._send_json(400, {'error': 'missing miner_id or address'})
-
-                elif path == '/api/peers/register':
-                    if data:
-                        self._send_json(200, {
-                            'status': 'registered',
-                            'live_peers': _local_db_get_best_peers(oracle_srv.db, limit=20),
-                            'sse_url': f"http://localhost:{oracle_srv.port}/api/events",
-                        })
-                        return
-                    self._send_json(400, {'error': 'bad request'})
-
-                elif path == '/api/peers/heartbeat':
-                    self._send_json(200, {'status': 'ok'})
-
-                elif path == '/gossip/oracle_handshake':
-                    # P2P oracle entanglement handshake
-                    snap = oracle_srv.get_pq0_snapshot()
-                    self._send_json(200, {**snap, 'handshake': True})
-
-                else:
-                    self._send_json(404, {'error': 'not found'})
-
-        return _OracleHandler
+        """
+        DEPRECATED — no longer used. P2POracleServer no longer binds its own port.
+        All oracle routes (/api/oracle/*, /api/blocks/*, etc.) are served by the unified
+        GossipListener on :9091 after GossipListener.inject_oracle(self) is called.
+        This method is kept as a stub to avoid AttributeError from any legacy call sites.
+        """
+        raise RuntimeError(
+            "_make_handler() is dead code — oracle routes live on GossipListener :9091. "
+            "Call GossipListener.inject_oracle(self) instead."
+        )
 
 
 # ─── DHT Peer Exchange Manager ────────────────────────────────────────────────────────────────────
@@ -7753,22 +7043,38 @@ class QTCLFullNode:
                                     best_peers = _local_db_get_best_peers(self.db, limit=10)
                                     gossip_payload_block = {
                                         'origin':  self._gossip.get_gossip_url() or 'unknown',
-                                        'peer_id': peer_id,
+                                        'peer_id': self._peer_id,
                                         'block':   block_payload,
                                     }
+                                    # Use a no-retry session for gossip fan-out — dead peers must
+                                    # not block mining or spam logs with retry warnings.
+                                    _gfan_session = getattr(self, '_gossip_fanout_session', None)
+                                    if _gfan_session is None:
+                                        _gfan_session = requests.Session()
+                                        _gfan_a = HTTPAdapter(max_retries=Retry(total=0))
+                                        _gfan_session.mount('https://', _gfan_a)
+                                        _gfan_session.mount('http://',  _gfan_a)
+                                        self._gossip_fanout_session = _gfan_session
+                                    gossiped = 0
                                     for gp in best_peers:
                                         gurl_p = gp.get('gossip_url', '')
                                         if not gurl_p:
                                             continue
+                                        # Skip loopback — stale DB artefacts, not real peers
+                                        if '127.0.0.1' in gurl_p or 'localhost' in gurl_p:
+                                            continue
                                         try:
-                                            self.client._session.post(
+                                            _gfan_session.post(
                                                 f"{gurl_p.rstrip('/')}/gossip/ingest",
                                                 json=gossip_payload_block,
-                                                timeout=4,
+                                                timeout=3,
                                             )
+                                            gossiped += 1
                                             logger.debug(f"[MINING] 📡 Block gossiped → {gurl_p[:40]}")
                                         except Exception:
-                                            pass
+                                            pass  # fire-and-forget
+                                    if gossiped:
+                                        logger.info(f"[MINING] 📡 Block gossip fan-out: {gossiped} peers notified")
                                 except Exception as _ge:
                                     logger.debug(f"[MINING] Gossip fan-out error: {_ge}")
                                 
@@ -9021,17 +8327,10 @@ def main():
 
         # ─── P2P INITIALIZATION SEQUENCE ────────────────────────────────────────────
         logger.info("[P2P] 🚀 Initializing P2P network layer...")
-        
-        # 1. Raw TCP P2PServer is DISABLED — all P2P traffic goes through GossipListener on :9091.
-        #    Port 8000 is reserved for the Koyeb oracle public endpoint.
-        #    P2PServer is kept in code for direct LAN connections only; not started by default.
         peer_id_hash = hashlib.sha256(address.encode()).hexdigest()[:12]
         peer_id = f"miner_{peer_id_hash}"
-        global _P2P_SERVER, _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC, _P2P_SERVICE_INVENTORY
+        global _P2P_CLIENT, _TX_SIGNER, _ORACLE_BROADCASTER, _CONSENSUS_MGR, _PEER_SYNC, _P2P_SERVICE_INVENTORY
 
-        _P2P_SERVER = None  # TCP raw socket server disabled — GossipListener on :9091 handles all P2P
-        logger.info("[P2P] ℹ️  Raw TCP P2PServer disabled (GossipListener on :9091 handles all traffic)")
-        
         # ── Canonical oracle URL — single source of truth for all P2P/REST calls ──
         oracle_url = args.oracle_url
 
