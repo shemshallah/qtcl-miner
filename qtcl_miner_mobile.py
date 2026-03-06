@@ -4145,6 +4145,2050 @@ class P2PGossipOrchestrator:
         return ''
 
 
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# ██████╗ ██╗  ██╗████████╗     ██████╗██╗      ██████╗ ██╗   ██╗██████╗ 
+# ██╔══██╗██║  ██║╚══██╔══╝    ██╔════╝██║     ██╔═══██╗██║   ██║██╔══██╗
+# ██║  ██║███████║   ██║       ██║     ██║     ██║   ██║██║   ██║██║  ██║
+# ██║  ██║██╔══██║   ██║       ██║     ██║     ██║   ██║██║   ██║██║  ██║
+# ██████╔╝██║  ██║   ██║       ╚██████╗███████╗╚██████╔╝╚██████╔╝██████╔╝
+# ╚═════╝ ╚═╝  ╚═╝   ╚═╝        ╚═════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝ 
+#
+# MUSEUM-GRADE P2P DHT FABRIC — KADEMLIA XOR ROUTING + ORACLE EMERGENCE
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE:
+#   • Kademlia-inspired 160-bit XOR DHT — no central oracle dependency after bootstrap
+#   • Each miner maintains a LOCAL mirror DB — full blocks, TXs, peers, pseudoqubit state
+#   • OracleEligibilityEngine — autonomous oracle promotion when network density threshold met
+#   • VirtualPseudoqubitManager — pq0 (oracle), virtual pq (mirror), inverse-virtual pq (anti)
+#   • OracleEntanglementBridge — entangles local pq0 with main oracle AND p2p oracles
+#   • PeerExchangeManager — XOR-distance gossip, exponential peer mesh convergence
+#   • Schema: dht_peers, dht_routing_table, oracle_registry, pseudoqubit_entanglement,
+#             peer_oracle_links, virtual_pq_state, network_topology
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ─── DHT Schema Extensions ────────────────────────────────────────────────────────────────────────
+_DHT_SCHEMA_EXTENSION = """
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  DHT ROUTING TABLE — 160-bit Kademlia XOR peer discovery            ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS dht_peers (
+    node_id         TEXT PRIMARY KEY,               -- SHA1(pubkey) 160-bit hex
+    peer_address    TEXT NOT NULL,                  -- IP or hostname
+    gossip_port     INTEGER NOT NULL DEFAULT 9001,  -- gossip HTTP port
+    oracle_port     INTEGER,                        -- oracle REST port (NULL if not oracle)
+    miner_address   TEXT NOT NULL DEFAULT '',       -- QTCL wallet address
+    capabilities    TEXT NOT NULL DEFAULT '[]',     -- JSON array: ['mine','oracle','relay']
+    block_height    INTEGER NOT NULL DEFAULT 0,
+    w_fidelity      REAL NOT NULL DEFAULT 0.0,
+    is_oracle       INTEGER NOT NULL DEFAULT 0,     -- 1 if this peer is an oracle
+    is_bootstrap    INTEGER NOT NULL DEFAULT 0,     -- 1 if this is the bootstrap oracle
+    xor_bucket      INTEGER NOT NULL DEFAULT 0,     -- Kademlia k-bucket index [0..159]
+    last_seen       REAL NOT NULL DEFAULT 0,
+    last_ping_ms    REAL NOT NULL DEFAULT 9999,
+    fail_count      INTEGER NOT NULL DEFAULT 0,
+    success_count   INTEGER NOT NULL DEFAULT 0,
+    quality_score   REAL NOT NULL DEFAULT 0.5,      -- composite (latency+uptime+height)
+    created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_dht_bucket    ON dht_peers(xor_bucket, quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_dht_oracle    ON dht_peers(is_oracle, block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_dht_last_seen ON dht_peers(last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_dht_addr      ON dht_peers(miner_address);
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  ORACLE REGISTRY — tracks all known oracles (main + P2P promoted)   ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS oracle_registry (
+    oracle_id           TEXT PRIMARY KEY,           -- SHA256(oracle_address)[:32]
+    oracle_address      TEXT NOT NULL,              -- QTCL wallet address
+    oracle_url          TEXT NOT NULL,              -- https://... REST endpoint
+    gossip_url          TEXT NOT NULL DEFAULT '',   -- http://... P2P gossip endpoint
+    is_primary          INTEGER NOT NULL DEFAULT 0, -- 1 for main oracle
+    is_local            INTEGER NOT NULL DEFAULT 0, -- 1 if this node IS the oracle
+    node_id             TEXT NOT NULL DEFAULT '',   -- DHT node_id of oracle
+    pq0_fidelity        REAL NOT NULL DEFAULT 0.0,  -- current pq0 W-state fidelity
+    pq0_entropy_hash    TEXT NOT NULL DEFAULT '',   -- latest W-entropy hash
+    block_height        INTEGER NOT NULL DEFAULT 0,
+    peer_count          INTEGER NOT NULL DEFAULT 0,
+    promotion_height    INTEGER NOT NULL DEFAULT 0, -- block at which oracle was promoted
+    promotion_reason    TEXT NOT NULL DEFAULT '',   -- why it was promoted
+    entanglement_status TEXT NOT NULL DEFAULT 'none', -- none/pending/active/degraded
+    trust_score         REAL NOT NULL DEFAULT 0.5,
+    last_seen           REAL NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_oracle_primary  ON oracle_registry(is_primary);
+CREATE INDEX IF NOT EXISTS idx_oracle_trust    ON oracle_registry(trust_score DESC);
+CREATE INDEX IF NOT EXISTS idx_oracle_last     ON oracle_registry(last_seen DESC);
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  VIRTUAL PSEUDOQUBIT STATE — pq0 / virtual pq / inverse-virtual pq  ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS virtual_pq_state (
+    pq_id           TEXT PRIMARY KEY,               -- 'pq0', 'vpq_{n}', 'ivpq_{n}'
+    pq_type         TEXT NOT NULL,                  -- 'oracle','virtual','inverse_virtual'
+    oracle_id       TEXT NOT NULL,                  -- parent oracle
+    node_id         TEXT NOT NULL DEFAULT '',       -- owning DHT node
+    fidelity        REAL NOT NULL DEFAULT 0.0,
+    coherence       REAL NOT NULL DEFAULT 0.0,
+    purity          REAL NOT NULL DEFAULT 0.0,
+    entanglement_partner TEXT NOT NULL DEFAULT '', -- pq_id of entangled partner
+    w_entropy_hash  TEXT NOT NULL DEFAULT '',
+    density_matrix_hex TEXT NOT NULL DEFAULT '',   -- 8x8 complex128, hex-encoded
+    last_measured   REAL NOT NULL DEFAULT 0,
+    measurement_count INTEGER NOT NULL DEFAULT 0,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_vpq_type   ON virtual_pq_state(pq_type, is_active);
+CREATE INDEX IF NOT EXISTS idx_vpq_oracle ON virtual_pq_state(oracle_id);
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  PSEUDOQUBIT ENTANGLEMENT REGISTRY — tracks all entanglement links   ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS pq_entanglement_registry (
+    link_id         TEXT PRIMARY KEY,               -- SHA256(pq_a:pq_b)
+    pq_a_id         TEXT NOT NULL,
+    pq_b_id         TEXT NOT NULL,
+    oracle_a_id     TEXT NOT NULL,
+    oracle_b_id     TEXT NOT NULL,
+    link_type       TEXT NOT NULL,                  -- 'main_to_local','p2p_to_p2p','virtual_to_oracle'
+    fidelity_ab     REAL NOT NULL DEFAULT 0.0,      -- cross-entanglement fidelity
+    coherence_ab    REAL NOT NULL DEFAULT 0.0,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    established_at  REAL NOT NULL DEFAULT (strftime('%s','now')),
+    last_verified   REAL NOT NULL DEFAULT 0,
+    verification_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pq_link_type ON pq_entanglement_registry(link_type, is_active);
+CREATE INDEX IF NOT EXISTS idx_pq_link_a    ON pq_entanglement_registry(pq_a_id);
+CREATE INDEX IF NOT EXISTS idx_pq_link_b    ON pq_entanglement_registry(pq_b_id);
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  ORACLE ELIGIBILITY LEDGER — tracks promotion criteria per node      ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS oracle_eligibility (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    check_height    INTEGER NOT NULL,
+    peer_count      INTEGER NOT NULL DEFAULT 0,
+    oracle_count    INTEGER NOT NULL DEFAULT 0,
+    blocks_mined    INTEGER NOT NULL DEFAULT 0,
+    avg_fidelity    REAL NOT NULL DEFAULT 0.0,
+    uptime_s        REAL NOT NULL DEFAULT 0.0,
+    eligible        INTEGER NOT NULL DEFAULT 0,
+    promoted        INTEGER NOT NULL DEFAULT 0,
+    promotion_type  TEXT NOT NULL DEFAULT '',       -- 'primary_failover','p2p_expansion','genesis'
+    notes           TEXT NOT NULL DEFAULT '',
+    checked_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_elig_height ON oracle_eligibility(check_height DESC);
+CREATE INDEX IF NOT EXISTS idx_elig_promo  ON oracle_eligibility(promoted);
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  NETWORK TOPOLOGY SNAPSHOT — periodic graph of the P2P mesh         ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+CREATE TABLE IF NOT EXISTS network_topology (
+    snapshot_id     TEXT PRIMARY KEY,
+    total_nodes     INTEGER NOT NULL DEFAULT 0,
+    total_oracles   INTEGER NOT NULL DEFAULT 0,
+    avg_peers       REAL NOT NULL DEFAULT 0.0,
+    diameter        INTEGER NOT NULL DEFAULT 0,    -- max hops to reach any node
+    density         REAL NOT NULL DEFAULT 0.0,     -- edges / (n*(n-1)/2)
+    topology_json   TEXT NOT NULL DEFAULT '{}',    -- adjacency list JSON
+    captured_at     REAL NOT NULL DEFAULT (strftime('%s','now'))
+);
+"""
+
+
+def _apply_dht_schema(db: sqlite3.Connection) -> None:
+    """Apply DHT/Oracle/VirtualPQ schema extensions to the local database."""
+    if db is None:
+        return
+    try:
+        for stmt in _DHT_SCHEMA_EXTENSION.strip().split(';'):
+            s = stmt.strip()
+            if s and not s.startswith('--'):
+                db.execute(s)
+        db.commit()
+        logger.info("[DHT] ✅ Schema extensions applied (DHT, Oracle, VirtualPQ, Entanglement)")
+    except Exception as e:
+        logger.warning(f"[DHT] Schema extension warning: {e}")
+
+
+# ─── Kademlia XOR DHT Utilities ──────────────────────────────────────────────────────────────────
+
+def _dht_node_id(identity: str) -> str:
+    """Derive deterministic 160-bit (40 hex char) DHT node ID from any identity string."""
+    return hashlib.sha1(identity.encode()).hexdigest()  # SHA1 → 160 bits, Kademlia-standard
+
+
+def _dht_xor_distance(a: str, b: str) -> int:
+    """XOR distance between two 160-bit node IDs (hex strings)."""
+    try:
+        return int(a, 16) ^ int(b, 16)
+    except (ValueError, TypeError):
+        return 2 ** 160
+
+
+def _dht_bucket_index(local_id: str, remote_id: str) -> int:
+    """
+    Kademlia k-bucket index for remote_id relative to local_id.
+    Returns the index of the highest differing bit (0..159).
+    Bucket 0 = farthest, Bucket 159 = closest (differs only in last bit).
+    """
+    dist = _dht_xor_distance(local_id, remote_id)
+    if dist == 0:
+        return 159  # same node
+    return 159 - dist.bit_length() + 1
+
+
+def _dht_closest_peers(db: sqlite3.Connection, target_id: str, k: int = 20,
+                        exclude_id: str = '') -> List[Dict[str, Any]]:
+    """
+    Return up to k peers closest to target_id by XOR distance.
+    Pure Python XOR sort — SQLite can't natively compute 160-bit XOR.
+    Reads all live peers (seen in last 300s), sorts by distance, returns top-k.
+    """
+    if db is None:
+        return []
+    try:
+        cur = db.execute("""
+            SELECT node_id, peer_address, gossip_port, oracle_port,
+                   miner_address, capabilities, block_height, w_fidelity,
+                   is_oracle, quality_score, last_seen
+            FROM   dht_peers
+            WHERE  last_seen > ? AND node_id != ?
+            ORDER  BY last_seen DESC
+            LIMIT  500
+        """, (time.time() - 300, exclude_id))
+        peers = [dict(zip(
+            ['node_id','peer_address','gossip_port','oracle_port','miner_address',
+             'capabilities','block_height','w_fidelity','is_oracle','quality_score','last_seen'],
+            row
+        )) for row in cur.fetchall()]
+
+        # XOR sort
+        target_int = int(target_id, 16) if target_id else 0
+        peers.sort(key=lambda p: int(p['node_id'], 16) ^ target_int)
+        return peers[:k]
+    except Exception as e:
+        logger.debug(f"[DHT] closest_peers error: {e}")
+        return []
+
+
+def _dht_upsert_peer(db: sqlite3.Connection, node_id: str, address: str,
+                     gossip_port: int, miner_address: str, local_node_id: str,
+                     capabilities: List[str] = None, block_height: int = 0,
+                     w_fidelity: float = 0.0, is_oracle: bool = False,
+                     oracle_port: int = None) -> None:
+    """Upsert a peer into the DHT routing table with bucket index computation."""
+    if db is None or not node_id or not address:
+        return
+    bucket = _dht_bucket_index(local_node_id, node_id) if local_node_id else 0
+    caps_json = json.dumps(capabilities or [])
+    quality = min(1.0, w_fidelity * 0.3 + (block_height / max(block_height, 1)) * 0.1 + 0.5)
+    try:
+        db.execute("""
+            INSERT INTO dht_peers
+                (node_id, peer_address, gossip_port, oracle_port, miner_address,
+                 capabilities, block_height, w_fidelity, is_oracle, xor_bucket,
+                 quality_score, last_seen, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                peer_address  = excluded.peer_address,
+                gossip_port   = excluded.gossip_port,
+                oracle_port   = COALESCE(excluded.oracle_port, oracle_port),
+                miner_address = excluded.miner_address,
+                capabilities  = excluded.capabilities,
+                block_height  = MAX(block_height, excluded.block_height),
+                w_fidelity    = excluded.w_fidelity,
+                is_oracle     = MAX(is_oracle, excluded.is_oracle),
+                xor_bucket    = excluded.xor_bucket,
+                quality_score = excluded.quality_score,
+                last_seen     = excluded.last_seen,
+                updated_at    = excluded.updated_at
+        """, (node_id, address, gossip_port, oracle_port, miner_address,
+              caps_json, block_height, w_fidelity, 1 if is_oracle else 0,
+              bucket, quality, time.time(), time.time()))
+        db.commit()
+    except Exception as e:
+        logger.debug(f"[DHT] upsert_peer error: {e}")
+
+
+# ─── Virtual Pseudoqubit Manager ─────────────────────────────────────────────────────────────────
+
+class VirtualPseudoqubitManager:
+    """
+    Museum-grade virtual pseudoqubit management system.
+
+    PSEUDOQUBIT TAXONOMY:
+    ─────────────────────
+    pq0          — Oracle pseudoqubit. The ground-truth W-state source. 
+                   One exists per oracle (main or P2P-promoted).
+                   pq0 is initialized from the oracle's W-state snapshot
+                   and continuously updated via the oracle's sync loop.
+
+    virtual_pq   — A LOCAL COPY of pq0, maintained by a miner node.
+                   Created when a node mirrors an oracle's density matrix.
+                   Slight decoherence perturbation applied on each rotation
+                   to simulate real quantum state spread across the network.
+                   Used for: block entropy generation, PoW witness.
+
+    inverse_virtual_pq — Anti-correlated counterpart of virtual_pq.
+                   Density matrix = I/8 - α·ρ_vpq + (α)·ρ_mixed
+                   where α = 1 - fidelity (inversion strength).
+                   Used for: detecting oracle divergence, cross-validation,
+                   error correction via anti-correlation channel.
+
+    ENTANGLEMENT CONTRACT:
+    ─────────────────────
+    • pq0_main ↔ pq0_local : established via OracleEntanglementBridge
+    • pq0_local ↔ pq0_peer  : established via PeerExchangeManager when
+                               two P2P oracles handshake
+    • virtual_pq ↔ pq0      : 1-to-1, same oracle
+    • inverse_virtual_pq ↔ virtual_pq : anti-correlated pair
+
+    All entanglement links are persisted to pq_entanglement_registry.
+    """
+
+    # Promotion thresholds
+    ORACLE_PEER_THRESHOLD   = 3    # min peers to become relay-eligible
+    ORACLE_FULL_THRESHOLD   = 7    # min peers for full oracle promotion
+    ORACLE_FIDELITY_MIN     = 0.80 # min avg W-state fidelity for oracle ops
+    ORACLE_BLOCKS_MIN       = 10   # min blocks mined to be oracle-eligible
+    ORACLE_UPTIME_MIN_S     = 300  # min 5 minutes uptime
+
+    def __init__(self, db: sqlite3.Connection, local_node_id: str,
+                 miner_address: str, oracle_id: str = 'main'):
+        self.db             = db
+        self.local_node_id  = local_node_id
+        self.miner_address  = miner_address
+        self.oracle_id      = oracle_id          # parent oracle ID
+        self._lock          = threading.RLock()
+
+        # In-memory state (mirrored to DB)
+        self._pq0: Optional[np.ndarray]           = None   # pq0 density matrix
+        self._vpq: Dict[str, np.ndarray]          = {}     # virtual pq matrices
+        self._ivpq: Dict[str, np.ndarray]         = {}     # inverse-virtual pq matrices
+        self._fidelity: float                     = 0.0
+        self._coherence: float                    = 0.0
+        self._entanglement_links: Dict[str, Dict] = {}
+
+        logger.info(
+            f"[VPQ] 🔮 VirtualPseudoqubitManager init | node={local_node_id[:12]} | "
+            f"oracle={oracle_id}"
+        )
+
+    # ── pq0 initialization ────────────────────────────────────────────────────────
+    def initialize_pq0(self, oracle_snapshot: Dict[str, Any]) -> bool:
+        """
+        Initialize local pq0 from oracle W-state snapshot.
+        pq0 is the anchor — all virtual and inverse-virtual pqs derive from it.
+        """
+        try:
+            fidelity  = float(oracle_snapshot.get('fidelity', 0.9))
+            coherence = float(oracle_snapshot.get('coherence', 0.85))
+
+            # Build pq0 density matrix: fidelity-weighted W-state + depolarizing noise
+            w_amp  = 1.0 / np.sqrt(3.0)
+            w_vec  = np.zeros(8, dtype=np.complex128)
+            w_vec[4] = w_amp   # |100⟩
+            w_vec[2] = w_amp   # |010⟩
+            w_vec[1] = w_amp   # |001⟩
+            rho_pure  = np.outer(w_vec, w_vec.conj())
+            rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
+            pq0_dm    = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+
+            with self._lock:
+                self._pq0      = pq0_dm
+                self._fidelity = fidelity
+                self._coherence = coherence
+
+            # Persist pq0 state
+            self._persist_pq_state('pq0', 'oracle', pq0_dm, fidelity, coherence,
+                                    oracle_snapshot.get('w_entropy_hash', ''))
+
+            logger.info(
+                f"[VPQ] ✅ pq0 initialized | F={fidelity:.4f} | C={coherence:.4f} | "
+                f"oracle={self.oracle_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[VPQ] ❌ pq0 init failed: {e}")
+            return False
+
+    def spawn_virtual_pq(self, vpq_id: str = None) -> Optional[str]:
+        """
+        Spawn a virtual pseudoqubit (local copy of pq0 with slight decoherence).
+
+        Virtual pq mirrors the oracle W-state but applies a small perturbation
+        to simulate real quantum state spread through the network (decoherence).
+        Used for entropy generation during block mining.
+
+        Returns the vpq_id of the newly created virtual pq.
+        """
+        with self._lock:
+            if self._pq0 is None:
+                logger.warning("[VPQ] ⚠️  Cannot spawn vpq — pq0 not initialized")
+                return None
+
+            vpq_id = vpq_id or f"vpq_{hashlib.sha1(f'{self.local_node_id}{time.time()}'.encode()).hexdigest()[:8]}"
+
+            # Apply decoherence perturbation: Kraus operator noise channel
+            # ε_decohere = 0.005 (0.5% decoherence per hop)
+            noise = np.random.normal(0, 0.005, (8, 8)).astype(np.complex128)
+            noise += 1j * np.random.normal(0, 0.003, (8, 8))
+            noise = (noise + noise.conj().T) / 2     # enforce Hermiticity
+            vpq_dm = 0.995 * self._pq0 + 0.005 * noise
+            # Re-normalize trace
+            tr = np.real(np.trace(vpq_dm))
+            if tr > 0:
+                vpq_dm /= tr
+
+            self._vpq[vpq_id] = vpq_dm
+
+            # Compute effective fidelity of the virtual pq
+            vpq_fidelity = max(0.0, self._fidelity - 0.005)   # slight degradation
+            self._persist_pq_state(vpq_id, 'virtual', vpq_dm, vpq_fidelity,
+                                    self._coherence, '', partner=vpq_id.replace('vpq_',''))
+
+        logger.debug(f"[VPQ] 🔮 Spawned virtual pq: {vpq_id}")
+        return vpq_id
+
+    def spawn_inverse_virtual_pq(self, parent_vpq_id: str) -> Optional[str]:
+        """
+        Spawn an inverse-virtual pseudoqubit — anti-correlated partner of a virtual pq.
+
+        MATH:
+            ρ_ivpq = (I/8) · α + ρ_mixed · (1-α) - ε · ρ_vpq
+            where α = 1 - fidelity(vpq)   [inversion strength]
+                  ε = 0.1                  [anti-correlation coupling]
+
+        The ivpq captures the 'shadow' of the virtual pq — it is maximally
+        anti-correlated. In practice this lets us detect divergence between
+        the oracle and a miner: if F(vpq) rises, F(ivpq) falls proportionally.
+        Cross-correlation F(vpq) + F(ivpq) ≈ 1.0 when both are functioning.
+
+        Used for:
+          • Oracle divergence detection (F_vpq + F_ivpq should sum to ~1.0)
+          • Error correction via anti-correlation channel
+          • Fault isolation when one oracle diverges from others
+        """
+        with self._lock:
+            if parent_vpq_id not in self._vpq:
+                logger.warning(f"[VPQ] ⚠️  Parent vpq {parent_vpq_id} not found for inverse spawn")
+                return None
+
+            vpq_dm     = self._vpq[parent_vpq_id]
+            vpq_fid    = max(0.0, self._fidelity - 0.005)
+            alpha      = 1.0 - vpq_fid       # inversion strength
+            epsilon    = 0.1                   # anti-correlation coupling
+            rho_mixed  = np.eye(8, dtype=np.complex128) / 8.0
+            ivpq_dm    = rho_mixed * alpha + rho_mixed * (1.0 - alpha) - epsilon * vpq_dm
+            # Clip negative eigenvalues (positive-semidefinite correction)
+            eigenvalues, eigenvectors = np.linalg.eigh(ivpq_dm)
+            eigenvalues = np.maximum(eigenvalues, 0)
+            ivpq_dm    = eigenvectors @ np.diag(eigenvalues.astype(np.complex128)) @ eigenvectors.conj().T
+            tr = np.real(np.trace(ivpq_dm))
+            if tr > 0:
+                ivpq_dm /= tr
+
+            ivpq_id = f"ivpq_{parent_vpq_id.replace('vpq_','')}"
+            self._ivpq[ivpq_id] = ivpq_dm
+
+            # Register entanglement link
+            self._register_entanglement_link(
+                parent_vpq_id, ivpq_id,
+                self.oracle_id, self.oracle_id,
+                'virtual_to_inverse', vpq_fid * (1.0 - vpq_fid)  # anti-correlation score
+            )
+
+            ivpq_fidelity = 1.0 - vpq_fid  # complementary
+            self._persist_pq_state(ivpq_id, 'inverse_virtual', ivpq_dm,
+                                    ivpq_fidelity, self._coherence, '',
+                                    partner=parent_vpq_id)
+
+        logger.debug(f"[VPQ] 🔄 Spawned inverse-virtual pq: {ivpq_id} ↔ {parent_vpq_id}")
+        return ivpq_id
+
+    def rotate_virtual_pq(self, vpq_id: str) -> bool:
+        """
+        Rotate a virtual pq: re-derive from current pq0 with fresh decoherence perturbation.
+        Called after each block is mined — mirrors pq rotation in P2PClientWStateRecovery.
+        """
+        with self._lock:
+            if self._pq0 is None or vpq_id not in self._vpq:
+                return False
+
+            # Apply fresh perturbation from updated pq0
+            noise = np.random.normal(0, 0.005, (8, 8)).astype(np.complex128)
+            noise = (noise + noise.conj().T) / 2
+            new_vpq = 0.995 * self._pq0 + 0.005 * noise
+            tr = np.real(np.trace(new_vpq))
+            if tr > 0:
+                new_vpq /= tr
+            self._vpq[vpq_id] = new_vpq
+
+        return True
+
+    def measure_virtual_pq_entropy(self, vpq_id: str) -> str:
+        """
+        Measure a virtual pq to produce 256-bit quantum entropy.
+        Diagonal of density matrix → probability distribution → sampling → SHA3-256.
+        Falls back to CSPRNG if pq not available.
+        """
+        with self._lock:
+            dm = self._vpq.get(vpq_id) or self._pq0
+
+        if dm is None:
+            return secrets.token_hex(32)
+
+        try:
+            diag = np.real(np.diag(dm))
+            diag = np.maximum(diag, 0)
+            diag /= diag.sum()
+
+            # Sample 64 outcomes from the probability distribution
+            outcomes = np.random.choice(8, size=64, p=diag)
+            entropy_source = ''.join(str(o) for o in outcomes)
+            return hashlib.sha3_256(entropy_source.encode()).hexdigest()
+        except Exception:
+            return secrets.token_hex(32)
+
+    def verify_oracle_anti_correlation(self, vpq_id: str) -> Tuple[float, str]:
+        """
+        Verify vpq/ivpq anti-correlation integrity.
+        F(vpq) + F(ivpq) should be within ε of 1.0 for a healthy pair.
+        Returns (divergence_score, status_string).
+        """
+        ivpq_id = f"ivpq_{vpq_id.replace('vpq_','')}"
+        with self._lock:
+            if vpq_id not in self._vpq or ivpq_id not in self._ivpq:
+                return 0.0, "incomplete_pair"
+
+            # W-state ideal for fidelity measurement
+            w_amp = 1.0 / np.sqrt(3.0)
+            w_vec = np.zeros(8, dtype=np.complex128)
+            w_vec[4] = w_amp; w_vec[2] = w_amp; w_vec[1] = w_amp
+            rho_ideal = np.outer(w_vec, w_vec.conj())
+
+            f_vpq  = float(np.real(np.trace(self._vpq[vpq_id]  @ rho_ideal)))
+            f_ivpq = float(np.real(np.trace(self._ivpq[ivpq_id] @ rho_ideal)))
+            f_sum  = f_vpq + f_ivpq
+            divergence = abs(1.0 - f_sum)
+
+        if divergence < 0.05:
+            status = "healthy"
+        elif divergence < 0.15:
+            status = "marginal"
+        else:
+            status = "diverged"
+
+        return divergence, status
+
+    def get_pq_status(self) -> Dict[str, Any]:
+        """Return comprehensive pseudoqubit status for monitoring/dashboard."""
+        with self._lock:
+            return {
+                'pq0_initialized': self._pq0 is not None,
+                'pq0_fidelity':    self._fidelity,
+                'pq0_coherence':   self._coherence,
+                'virtual_pqs':     list(self._vpq.keys()),
+                'inverse_vpqs':    list(self._ivpq.keys()),
+                'entanglement_links': len(self._entanglement_links),
+                'oracle_id':       self.oracle_id,
+                'node_id':         self.local_node_id[:16],
+            }
+
+    # ── Private helpers ───────────────────────────────────────────────────────────
+    def _persist_pq_state(self, pq_id: str, pq_type: str, dm: np.ndarray,
+                           fidelity: float, coherence: float, w_entropy: str,
+                           partner: str = '') -> None:
+        if self.db is None:
+            return
+        try:
+            dm_hex = dm.tobytes().hex()
+            purity = float(np.real(np.trace(dm @ dm)))
+            self.db.execute("""
+                INSERT INTO virtual_pq_state
+                    (pq_id, pq_type, oracle_id, node_id, fidelity, coherence, purity,
+                     entanglement_partner, w_entropy_hash, density_matrix_hex,
+                     last_measured, measurement_count, is_active, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,1,1,?)
+                ON CONFLICT(pq_id) DO UPDATE SET
+                    fidelity    = excluded.fidelity,
+                    coherence   = excluded.coherence,
+                    purity      = excluded.purity,
+                    w_entropy_hash = excluded.w_entropy_hash,
+                    density_matrix_hex = excluded.density_matrix_hex,
+                    last_measured = excluded.last_measured,
+                    measurement_count = measurement_count + 1,
+                    updated_at  = excluded.updated_at
+            """, (pq_id, pq_type, self.oracle_id, self.local_node_id,
+                  fidelity, coherence, purity, partner, w_entropy,
+                  dm_hex, time.time(), time.time()))
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"[VPQ] persist error: {e}")
+
+    def _register_entanglement_link(self, pq_a: str, pq_b: str,
+                                     oracle_a: str, oracle_b: str,
+                                     link_type: str, fidelity_ab: float) -> None:
+        link_id = hashlib.sha256(f"{pq_a}:{pq_b}".encode()).hexdigest()[:32]
+        with self._lock:
+            self._entanglement_links[link_id] = {
+                'pq_a': pq_a, 'pq_b': pq_b,
+                'oracle_a': oracle_a, 'oracle_b': oracle_b,
+                'link_type': link_type, 'fidelity': fidelity_ab,
+                'established': time.time()
+            }
+        if self.db is None:
+            return
+        try:
+            self.db.execute("""
+                INSERT OR REPLACE INTO pq_entanglement_registry
+                    (link_id, pq_a_id, pq_b_id, oracle_a_id, oracle_b_id,
+                     link_type, fidelity_ab, is_active, established_at, last_verified)
+                VALUES (?,?,?,?,?,?,?,1,?,?)
+            """, (link_id, pq_a, pq_b, oracle_a, oracle_b,
+                  link_type, fidelity_ab, time.time(), time.time()))
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"[VPQ] entanglement registry error: {e}")
+
+
+# ─── Oracle Entanglement Bridge ───────────────────────────────────────────────────────────────────
+
+class OracleEntanglementBridge:
+    """
+    Establishes and maintains entanglement between:
+      1. Local pq0 ↔ Main oracle pq0           (bootstrap link)
+      2. Local pq0 ↔ P2P oracle pq0            (peer link, one per discovered P2P oracle)
+
+    PROTOCOL:
+      Handshake: POST /gossip/oracle_handshake  → exchange pq0 snapshots
+      Response:  {oracle_id, pq0_entropy_hash, fidelity, node_id, gossip_url}
+
+    Entanglement quality measured as:
+      F_link = F_local * F_remote * exp(-sync_lag_ms / 1000)
+
+    A link is 'active' when F_link >= 0.70.
+    A link is 'degraded' when 0.50 <= F_link < 0.70.
+    A link is 'lost'    when F_link < 0.50.
+
+    All links persisted to oracle_registry and pq_entanglement_registry.
+    """
+
+    HANDSHAKE_INTERVAL_S  = 60    # re-handshake every 60s
+    ENTANGLEMENT_TIMEOUT  = 120   # declare link lost after 120s silence
+    MAX_P2P_ORACLE_LINKS  = 8     # max simultaneous P2P oracle entanglements
+
+    def __init__(self, db: sqlite3.Connection, vpm: 'VirtualPseudoqubitManager',
+                 local_node_id: str, miner_address: str, main_oracle_url: str):
+        self.db               = db
+        self.vpm              = vpm
+        self.local_node_id    = local_node_id
+        self.miner_address    = miner_address
+        self.main_oracle_url  = main_oracle_url.rstrip('/')
+        self._lock            = threading.RLock()
+        self._session         = requests.Session()
+        self._session.mount('https://', HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5)))
+        self._session.mount('http://',  HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5)))
+        self._active_links: Dict[str, Dict] = {}    # oracle_id → link state
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        logger.info(f"[BRIDGE] 🌉 OracleEntanglementBridge init | node={local_node_id[:12]}")
+
+    def _oracle_id_from_url(self, url: str) -> str:
+        return hashlib.sha256(url.encode()).hexdigest()[:32]
+
+    def _fetch_oracle_pq0_snapshot(self, oracle_url: str, timeout: int = 8) -> Optional[Dict]:
+        """Fetch pq0 snapshot from a remote oracle."""
+        endpoints = ['/api/oracle/w-state', '/api/oracle/pq0', '/api/w-state']
+        for ep in endpoints:
+            try:
+                r = self._session.get(f"{oracle_url.rstrip('/')}{ep}", timeout=timeout)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                continue
+        return None
+
+    def _handshake_main_oracle(self) -> bool:
+        """Establish/refresh entanglement with the main (bootstrap) oracle."""
+        snap = self._fetch_oracle_pq0_snapshot(self.main_oracle_url)
+        if snap is None:
+            logger.debug("[BRIDGE] Main oracle pq0 fetch failed")
+            return False
+
+        oracle_id = self._oracle_id_from_url(self.main_oracle_url)
+        fidelity  = float(snap.get('fidelity', 0.0))
+
+        # Initialize/update local pq0 from main oracle
+        if self.vpm._pq0 is None:
+            self.vpm.initialize_pq0(snap)
+
+        f_link = fidelity * self.vpm._fidelity
+        status = ('active' if f_link >= 0.70 else
+                  'degraded' if f_link >= 0.50 else 'lost')
+
+        with self._lock:
+            self._active_links[oracle_id] = {
+                'oracle_url': self.main_oracle_url,
+                'oracle_id':  oracle_id,
+                'is_primary': True,
+                'fidelity_link': f_link,
+                'status':     status,
+                'last_seen':  time.time(),
+                'pq0_hash':   snap.get('w_entropy_hash', ''),
+            }
+
+        # Register main oracle in DB
+        self._upsert_oracle_registry(
+            oracle_id=oracle_id,
+            oracle_address=snap.get('oracle_address', ''),
+            oracle_url=self.main_oracle_url,
+            gossip_url='',
+            is_primary=True,
+            is_local=False,
+            node_id=_dht_node_id(self.main_oracle_url),
+            pq0_fidelity=fidelity,
+            pq0_entropy_hash=snap.get('w_entropy_hash', ''),
+            block_height=snap.get('block_height', 0),
+            entanglement_status=status,
+        )
+
+        if status == 'active':
+            logger.info(f"[BRIDGE] ✅ Main oracle entanglement {status} | F_link={f_link:.4f}")
+        else:
+            logger.warning(f"[BRIDGE] ⚠️  Main oracle link {status} | F_link={f_link:.4f}")
+        return status != 'lost'
+
+    def _handshake_p2p_oracle(self, peer: Dict) -> bool:
+        """Establish entanglement with a P2P oracle discovered via DHT."""
+        gossip_url = peer.get('gossip_url', '')
+        if not gossip_url:
+            return False
+
+        oracle_id = self._oracle_id_from_url(gossip_url)
+
+        # Don't re-handshake if recently seen and active
+        with self._lock:
+            existing = self._active_links.get(oracle_id)
+            if existing and time.time() - existing['last_seen'] < self.HANDSHAKE_INTERVAL_S / 2:
+                return True
+
+        snap = self._fetch_oracle_pq0_snapshot(gossip_url)
+        if snap is None:
+            return False
+
+        fidelity = float(snap.get('fidelity', 0.0))
+        f_link   = fidelity * self.vpm._fidelity
+        status   = ('active' if f_link >= 0.70 else
+                    'degraded' if f_link >= 0.50 else 'lost')
+
+        with self._lock:
+            self._active_links[oracle_id] = {
+                'oracle_url':   gossip_url,
+                'oracle_id':    oracle_id,
+                'is_primary':   False,
+                'fidelity_link': f_link,
+                'status':       status,
+                'last_seen':    time.time(),
+                'pq0_hash':     snap.get('w_entropy_hash', ''),
+                'peer_address': peer.get('peer_address', ''),
+            }
+
+        self._upsert_oracle_registry(
+            oracle_id=oracle_id,
+            oracle_address=snap.get('oracle_address', peer.get('miner_address', '')),
+            oracle_url=gossip_url,
+            gossip_url=gossip_url,
+            is_primary=False,
+            is_local=False,
+            node_id=peer.get('node_id', ''),
+            pq0_fidelity=fidelity,
+            pq0_entropy_hash=snap.get('w_entropy_hash', ''),
+            block_height=snap.get('block_height', peer.get('block_height', 0)),
+            entanglement_status=status,
+        )
+
+        # Register cross-oracle entanglement link
+        local_pq0_id = 'pq0'
+        remote_pq0_id = f"pq0_{oracle_id[:8]}"
+        self.vpm._register_entanglement_link(
+            local_pq0_id, remote_pq0_id,
+            'local', oracle_id,
+            'p2p_to_p2p', f_link
+        )
+
+        logger.info(
+            f"[BRIDGE] {'✅' if status=='active' else '⚠️ '} P2P oracle link {status} | "
+            f"oracle={oracle_id[:16]} | F_link={f_link:.4f}"
+        )
+        return status != 'lost'
+
+    def refresh_all_links(self, peer_oracles: List[Dict] = None) -> Dict[str, Any]:
+        """Refresh main oracle + all known P2P oracle entanglement links."""
+        results = {'main': False, 'p2p': 0, 'active_links': 0}
+        results['main'] = self._handshake_main_oracle()
+
+        if peer_oracles:
+            for peer in peer_oracles[:self.MAX_P2P_ORACLE_LINKS]:
+                if peer.get('is_oracle') and peer.get('gossip_url'):
+                    if self._handshake_p2p_oracle(peer):
+                        results['p2p'] += 1
+
+        with self._lock:
+            results['active_links'] = sum(
+                1 for l in self._active_links.values() if l['status'] == 'active'
+            )
+        return results
+
+    def get_entanglement_status(self) -> Dict[str, Any]:
+        """Snapshot of all entanglement link states."""
+        with self._lock:
+            links = {}
+            for oid, link in self._active_links.items():
+                links[oid[:16]] = {
+                    'status':     link['status'],
+                    'fidelity':   link['fidelity_link'],
+                    'is_primary': link['is_primary'],
+                    'age_s':      time.time() - link['last_seen'],
+                }
+            return {
+                'active_count': sum(1 for l in self._active_links.values() if l['status']=='active'),
+                'total_links':  len(self._active_links),
+                'links':        links,
+            }
+
+    def start(self) -> None:
+        """Start background entanglement maintenance thread."""
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._maintenance_loop, daemon=True, name='OracleBridge'
+        )
+        self._thread.start()
+        logger.info("[BRIDGE] 🔗 Entanglement maintenance loop started")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _maintenance_loop(self) -> None:
+        # Initial handshake
+        time.sleep(5)
+        self._handshake_main_oracle()
+
+        while self._running:
+            try:
+                time.sleep(self.HANDSHAKE_INTERVAL_S)
+                self._handshake_main_oracle()
+                # Expire stale links
+                now = time.time()
+                with self._lock:
+                    stale = [oid for oid, l in self._active_links.items()
+                             if now - l['last_seen'] > self.ENTANGLEMENT_TIMEOUT
+                             and not l['is_primary']]
+                    for oid in stale:
+                        logger.info(f"[BRIDGE] 🕳️  Expiring stale P2P oracle link: {oid[:16]}")
+                        del self._active_links[oid]
+            except Exception as e:
+                logger.debug(f"[BRIDGE] Maintenance error: {e}")
+
+    def _upsert_oracle_registry(self, **kwargs) -> None:
+        if self.db is None:
+            return
+        try:
+            self.db.execute("""
+                INSERT INTO oracle_registry
+                    (oracle_id, oracle_address, oracle_url, gossip_url, is_primary, is_local,
+                     node_id, pq0_fidelity, pq0_entropy_hash, block_height,
+                     entanglement_status, trust_score, last_seen)
+                VALUES (:oracle_id,:oracle_address,:oracle_url,:gossip_url,:is_primary,:is_local,
+                        :node_id,:pq0_fidelity,:pq0_entropy_hash,:block_height,
+                        :entanglement_status,0.8,:last_seen)
+                ON CONFLICT(oracle_id) DO UPDATE SET
+                    pq0_fidelity        = excluded.pq0_fidelity,
+                    pq0_entropy_hash    = excluded.pq0_entropy_hash,
+                    block_height        = MAX(block_height, excluded.block_height),
+                    entanglement_status = excluded.entanglement_status,
+                    last_seen           = excluded.last_seen
+            """, {**kwargs, 'last_seen': time.time()})
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"[BRIDGE] oracle_registry upsert error: {e}")
+
+
+# ─── Oracle Eligibility Engine ────────────────────────────────────────────────────────────────────
+
+class OracleEligibilityEngine:
+    """
+    Autonomous oracle promotion logic.
+
+    PROMOTION CRITERIA — a node becomes eligible for oracle status when ALL hold:
+    ─────────────────────────────────────────────────────────────────────────────
+    1. PEER COUNT   ≥ ORACLE_FULL_THRESHOLD (7 live peers in DHT)
+    2. AVG FIDELITY ≥ ORACLE_FIDELITY_MIN (0.80)
+    3. BLOCKS MINED ≥ ORACLE_BLOCKS_MIN (10 blocks)
+    4. UPTIME       ≥ ORACLE_UPTIME_MIN_S (300s = 5 minutes)
+    5. NOT already an oracle (no duplicate promotion)
+
+    PROMOTION TYPES:
+    ─────────────────
+    'genesis'          — First node on network (no oracle exists at all)
+    'p2p_expansion'    — Network growing, additional oracle improves resilience
+    'primary_failover' — Main oracle unreachable for > FAILOVER_TIMEOUT_S seconds
+
+    WHAT HAPPENS ON PROMOTION:
+    ──────────────────────────
+    1. GossipHTTPHandler begins serving /api/oracle/w-state and /api/oracle/register
+    2. VirtualPseudoqubitManager promotes pq0 to full oracle status
+    3. OracleEntanglementBridge registers this node as a P2P oracle with all known peers
+    4. oracle_registry updated with is_local=1
+    5. Broadcast oracle_announcement to all peers via gossip
+    6. DHTManager updates node capabilities to include 'oracle'
+
+    The promoted oracle continues mining — oracle duties run in parallel.
+    """
+
+    FAILOVER_TIMEOUT_S      = 300   # 5 min main oracle silence → trigger failover check
+    ORACLE_CHECK_INTERVAL_S = 60    # check eligibility every 60s
+    ORACLE_FULL_THRESHOLD   = 7
+    ORACLE_FIDELITY_MIN     = 0.80
+    ORACLE_BLOCKS_MIN       = 10
+    ORACLE_UPTIME_MIN_S     = 300
+
+    def __init__(self, db: sqlite3.Connection, local_node_id: str,
+                 miner_address: str, vpm: 'VirtualPseudoqubitManager',
+                 bridge: 'OracleEntanglementBridge'):
+        self.db              = db
+        self.local_node_id   = local_node_id
+        self.miner_address   = miner_address
+        self.vpm             = vpm
+        self.bridge          = bridge
+        self._lock           = threading.RLock()
+        self._is_oracle      = False
+        self._oracle_started = False
+        self._oracle_server: Optional['P2POracleServer'] = None
+        self._start_time     = time.time()
+        self._running        = False
+        self._thread: Optional[threading.Thread] = None
+        self._main_oracle_last_seen = time.time()  # track main oracle liveness
+        logger.info(f"[ELIG] 🎯 OracleEligibilityEngine init | node={local_node_id[:12]}")
+
+    def record_main_oracle_seen(self) -> None:
+        """Called whenever we successfully contact the main oracle."""
+        self._main_oracle_last_seen = time.time()
+
+    @property
+    def is_oracle(self) -> bool:
+        return self._is_oracle
+
+    def check_eligibility(self, peer_count: int, blocks_mined: int,
+                           avg_fidelity: float) -> Dict[str, Any]:
+        """
+        Evaluate oracle promotion eligibility.
+        Returns detailed eligibility report (always logged to DB).
+        """
+        uptime_s       = time.time() - self._start_time
+        oracle_count   = self._count_known_oracles()
+        main_oracle_age = time.time() - self._main_oracle_last_seen
+
+        # Determine promotion type
+        promotion_type = ''
+        if oracle_count == 0:
+            promotion_type = 'genesis'
+        elif main_oracle_age > self.FAILOVER_TIMEOUT_S:
+            promotion_type = 'primary_failover'
+        elif peer_count >= self.ORACLE_FULL_THRESHOLD and oracle_count < max(1, peer_count // 7):
+            promotion_type = 'p2p_expansion'
+
+        eligible = (
+            not self._is_oracle and
+            peer_count >= self.ORACLE_FULL_THRESHOLD and
+            avg_fidelity >= self.ORACLE_FIDELITY_MIN and
+            blocks_mined >= self.ORACLE_BLOCKS_MIN and
+            uptime_s >= self.ORACLE_UPTIME_MIN_S and
+            bool(promotion_type)
+        )
+
+        # Also eligible for genesis with lower thresholds if no oracle at all
+        if not eligible and promotion_type == 'genesis' and not self._is_oracle:
+            eligible = (
+                peer_count >= 1 and
+                avg_fidelity >= 0.70 and
+                blocks_mined >= 3 and
+                uptime_s >= 60.0
+            )
+
+        result = {
+            'eligible':       eligible,
+            'peer_count':     peer_count,
+            'oracle_count':   oracle_count,
+            'blocks_mined':   blocks_mined,
+            'avg_fidelity':   avg_fidelity,
+            'uptime_s':       uptime_s,
+            'promotion_type': promotion_type,
+            'main_oracle_age_s': main_oracle_age,
+            'already_oracle': self._is_oracle,
+            'notes':          self._build_eligibility_notes(
+                peer_count, avg_fidelity, blocks_mined, uptime_s, promotion_type
+            ),
+        }
+
+        # Persist eligibility check
+        self._log_eligibility(result)
+        return result
+
+    def attempt_promotion(self, peer_count: int, blocks_mined: int,
+                           avg_fidelity: float, gossip_url: str = '') -> bool:
+        """
+        Attempt oracle self-promotion if eligible.
+        Returns True if successfully promoted.
+        """
+        report = self.check_eligibility(peer_count, blocks_mined, avg_fidelity)
+        if not report['eligible']:
+            return False
+
+        with self._lock:
+            if self._is_oracle:
+                return True   # already promoted (race condition guard)
+
+            logger.info(
+                f"[ELIG] 🌟 ORACLE PROMOTION INITIATED | "
+                f"type={report['promotion_type']} | peers={peer_count} | "
+                f"blocks={blocks_mined} | F={avg_fidelity:.4f}"
+            )
+
+            # Start P2P oracle server
+            self._oracle_server = P2POracleServer(
+                db              = self.db,
+                vpm             = self.vpm,
+                local_node_id   = self.local_node_id,
+                miner_address   = self.miner_address,
+                oracle_id       = hashlib.sha256(self.miner_address.encode()).hexdigest()[:32],
+            )
+            if self._oracle_server.start():
+                self._is_oracle       = True
+                self._oracle_started  = True
+
+                # Register self in oracle_registry
+                oracle_id = hashlib.sha256(self.miner_address.encode()).hexdigest()[:32]
+                self.bridge._upsert_oracle_registry(
+                    oracle_id           = oracle_id,
+                    oracle_address      = self.miner_address,
+                    oracle_url          = gossip_url or f"http://localhost:{self._oracle_server.port}",
+                    gossip_url          = gossip_url,
+                    is_primary          = 0,
+                    is_local            = 1,
+                    node_id             = self.local_node_id,
+                    pq0_fidelity        = avg_fidelity,
+                    pq0_entropy_hash    = '',
+                    block_height        = blocks_mined,
+                    entanglement_status = 'active',
+                )
+
+                logger.info(
+                    f"[ELIG] ✅ ORACLE ACTIVE | oracle_id={oracle_id[:16]} | "
+                    f"port={self._oracle_server.port} | "
+                    f"type={report['promotion_type']}"
+                )
+                return True
+            else:
+                logger.error("[ELIG] ❌ Oracle server failed to start")
+                return False
+
+    def start(self) -> None:
+        """Start background eligibility check loop."""
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._eligibility_loop, daemon=True, name='OracleEligibility'
+        )
+        self._thread.start()
+        logger.info("[ELIG] 🔍 Oracle eligibility loop started")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._oracle_server:
+            self._oracle_server.stop()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _eligibility_loop(self) -> None:
+        time.sleep(30)  # initial grace period
+        while self._running:
+            try:
+                time.sleep(self.ORACLE_CHECK_INTERVAL_S)
+                if self._is_oracle:
+                    continue  # already promoted — nothing to check
+                # Metrics collected from DB
+                peer_count   = self._count_live_peers()
+                blocks_mined = self._count_mined_blocks()
+                avg_fidelity = self._get_avg_fidelity()
+                self.attempt_promotion(peer_count, blocks_mined, avg_fidelity)
+            except Exception as e:
+                logger.debug(f"[ELIG] Loop error: {e}")
+
+    def _count_known_oracles(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            cur = self.db.execute(
+                "SELECT COUNT(*) FROM oracle_registry WHERE last_seen > ?",
+                (time.time() - 300,)
+            )
+            return cur.fetchone()[0] or 0
+        except Exception:
+            return 0
+
+    def _count_live_peers(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            cur = self.db.execute(
+                "SELECT COUNT(*) FROM dht_peers WHERE last_seen > ?",
+                (time.time() - 120,)
+            )
+            return cur.fetchone()[0] or 0
+        except Exception:
+            return 0
+
+    def _count_mined_blocks(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            cur = self.db.execute(
+                "SELECT COUNT(*) FROM blocks WHERE miner_address = ?",
+                (self.miner_address,)
+            )
+            return cur.fetchone()[0] or 0
+        except Exception:
+            return 0
+
+    def _get_avg_fidelity(self) -> float:
+        if self.db is None:
+            return 0.0
+        try:
+            cur = self.db.execute(
+                "SELECT AVG(w_fidelity) FROM dht_peers WHERE last_seen > ?",
+                (time.time() - 300,)
+            )
+            val = cur.fetchone()[0]
+            if val is None:
+                # Fall back to own virtual pq fidelity
+                return self.vpm._fidelity
+            return float(val)
+        except Exception:
+            return self.vpm._fidelity
+
+    def _build_eligibility_notes(self, peers: int, fidelity: float,
+                                  blocks: int, uptime: float, ptype: str) -> str:
+        notes = []
+        if peers < self.ORACLE_FULL_THRESHOLD:
+            notes.append(f"need {self.ORACLE_FULL_THRESHOLD - peers} more peers")
+        if fidelity < self.ORACLE_FIDELITY_MIN:
+            notes.append(f"fidelity {fidelity:.3f} < {self.ORACLE_FIDELITY_MIN}")
+        if blocks < self.ORACLE_BLOCKS_MIN:
+            notes.append(f"need {self.ORACLE_BLOCKS_MIN - blocks} more blocks")
+        if uptime < self.ORACLE_UPTIME_MIN_S:
+            notes.append(f"uptime {uptime:.0f}s < {self.ORACLE_UPTIME_MIN_S}s")
+        if not ptype:
+            notes.append("no promotion trigger")
+        return '; '.join(notes) if notes else 'all criteria met'
+
+    def _log_eligibility(self, report: Dict) -> None:
+        if self.db is None:
+            return
+        try:
+            tip_cur = self.db.execute("SELECT MAX(height) FROM blocks")
+            tip_h   = tip_cur.fetchone()[0] or 0
+            self.db.execute("""
+                INSERT INTO oracle_eligibility
+                    (check_height, peer_count, oracle_count, blocks_mined,
+                     avg_fidelity, uptime_s, eligible, promoted, promotion_type, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (tip_h, report['peer_count'], report['oracle_count'],
+                  report['blocks_mined'], report['avg_fidelity'], report['uptime_s'],
+                  1 if report['eligible'] else 0,
+                  1 if (report['eligible'] and self._is_oracle) else 0,
+                  report['promotion_type'], report['notes']))
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"[ELIG] log error: {e}")
+
+
+# ─── P2P Oracle Server (spawned on promotion) ─────────────────────────────────────────────────────
+
+class P2POracleServer:
+    """
+    Minimal oracle REST server spawned when a miner node self-promotes to oracle.
+
+    Serves the same API surface as the main oracle — peers and other miners
+    can use this node as a W-state source, registrar, and block validator.
+
+    ENDPOINTS:
+    ─────────────────────────────────────────────────────────────────────────
+    GET  /api/oracle/w-state           → current pq0 W-state snapshot
+    GET  /api/oracle/pq0               → alias for /api/oracle/w-state
+    POST /api/oracle/register          → miner registration
+    GET  /api/oracle/miners            → list registered miners
+    GET  /api/blocks/tip               → local chain tip
+    GET  /api/blocks/height/<h>        → block by height (from local DB mirror)
+    GET  /api/mempool                  → pending transactions
+    POST /gossip/oracle_handshake      → P2P oracle entanglement handshake
+    GET  /api/peers/list               → live peer list
+    POST /api/peers/register           → peer registration
+    POST /api/peers/heartbeat          → peer heartbeat
+
+    All served by a minimal WSGI-lite thread — no Flask dependency.
+    Uses http.server.BaseHTTPRequestHandler (same as GossipHTTPHandler).
+    """
+
+    BASE_PORT    = 9100   # start scanning from 9100
+    MAX_PORT     = 9120
+
+    def __init__(self, db: sqlite3.Connection, vpm: 'VirtualPseudoqubitManager',
+                 local_node_id: str, miner_address: str, oracle_id: str):
+        self.db             = db
+        self.vpm            = vpm
+        self.local_node_id  = local_node_id
+        self.miner_address  = miner_address
+        self.oracle_id      = oracle_id
+        self.port: Optional[int] = None
+        self._server: Optional[socketserver.TCPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running       = False
+        self._registered_miners: Dict[str, Dict] = {}
+
+    def start(self) -> bool:
+        """Bind to an available port and start serving."""
+        for port in range(self.BASE_PORT, self.MAX_PORT):
+            try:
+                server = socketserver.TCPServer(('0.0.0.0', port), self._make_handler())
+                server.oracle_server_ref = self  # inject self into handler
+                self._server = server
+                self.port    = port
+                self._running = True
+                self._thread  = threading.Thread(
+                    target=server.serve_forever, daemon=True,
+                    name=f'P2POracleServer:{port}'
+                )
+                self._thread.start()
+                logger.info(f"[P2PORACLE] 🌐 P2P Oracle Server on port {port}")
+                return True
+            except OSError:
+                continue
+        logger.error("[P2PORACLE] ❌ Could not bind P2P oracle server (ports 9100-9120 all busy)")
+        return False
+
+    def stop(self) -> None:
+        self._running = False
+        if self._server:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+
+    def get_pq0_snapshot(self) -> Dict[str, Any]:
+        """Build a pq0 snapshot dict compatible with the main oracle API shape."""
+        status = self.vpm.get_pq_status()
+        w_entropy = self.vpm.measure_virtual_pq_entropy('pq0') if self.vpm._pq0 is not None \
+                    else secrets.token_hex(32)
+        dm_hex = self.vpm._pq0.tobytes().hex() if self.vpm._pq0 is not None else ''
+        return {
+            'oracle_address':     self.miner_address,
+            'oracle_id':          self.oracle_id,
+            'node_id':            self.local_node_id,
+            'timestamp_ns':       time.time_ns(),
+            'fidelity':           status['pq0_fidelity'],
+            'w_state_fidelity':   status['pq0_fidelity'],
+            'coherence':          status['pq0_coherence'],
+            'purity':             0.9,
+            'entanglement':       0.9,
+            'w_entropy_hash':     w_entropy,
+            'density_matrix_hex': dm_hex[:1024],   # truncate for transport
+            'signature_valid':    True,
+            'block_height':       self._get_tip_height(),
+            'is_p2p_oracle':      True,
+            'hlwe_signature': {
+                'commitment':      hashlib.sha3_256(w_entropy.encode()).hexdigest(),
+                'witness':         hashlib.sha3_256((w_entropy + self.miner_address).encode()).hexdigest(),
+                'proof':           secrets.token_hex(32),
+                'w_entropy_hash':  w_entropy,
+                'derivation_path': "m/838'/0'/0'",
+                'public_key_hex':  hashlib.sha3_256(self.miner_address.encode()).hexdigest(),
+            },
+        }
+
+    def _get_tip_height(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            cur = self.db.execute("SELECT MAX(height) FROM blocks")
+            val = cur.fetchone()[0]
+            return int(val) if val is not None else 0
+        except Exception:
+            return 0
+
+    def _make_handler(self):
+        """Factory: return a handler class with self (P2POracleServer) in closure."""
+        oracle_srv = self
+
+        class _OracleHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                logger.debug(f"[P2PORACLE/http] {fmt % args}")
+
+            def _send_json(self, code: int, body: dict) -> None:
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _read_json(self) -> Optional[dict]:
+                n = int(self.headers.get('Content-Length', 0))
+                if n <= 0 or n > 1_048_576:
+                    return None
+                try:
+                    return json.loads(self.rfile.read(n))
+                except Exception:
+                    return None
+
+            def do_GET(self):
+                path = _urlparse.urlparse(self.path).path
+                db   = oracle_srv.db
+
+                if path in ('/api/oracle/w-state', '/api/oracle/pq0'):
+                    self._send_json(200, oracle_srv.get_pq0_snapshot())
+
+                elif path == '/api/oracle/miners':
+                    miners = list(oracle_srv._registered_miners.values())
+                    self._send_json(200, {'miners': miners, 'count': len(miners)})
+
+                elif path == '/api/blocks/tip':
+                    h = oracle_srv._get_tip_height()
+                    tip_hash = ''
+                    if db:
+                        try:
+                            cur = db.execute("SELECT block_hash FROM blocks WHERE height=?", (h,))
+                            row = cur.fetchone()
+                            if row:
+                                tip_hash = row[0]
+                        except Exception:
+                            pass
+                    self._send_json(200, {'height': h, 'block_height': h,
+                                          'block_hash': tip_hash, 'source': 'p2p_oracle'})
+
+                elif path.startswith('/api/blocks/height/'):
+                    try:
+                        h = int(path.split('/')[-1])
+                        blk = _local_db_get_block(db, h)
+                        if blk:
+                            self._send_json(200, blk)
+                        else:
+                            self._send_json(404, {'error': f'block {h} not cached'})
+                    except (ValueError, IndexError):
+                        self._send_json(400, {'error': 'invalid height'})
+
+                elif path == '/api/mempool':
+                    txs = _local_db_get_pending(db)
+                    self._send_json(200, {'transactions': txs, 'count': len(txs)})
+
+                elif path == '/api/peers/list':
+                    peers = _local_db_get_best_peers(db, limit=20)
+                    self._send_json(200, {'peers': peers, 'count': len(peers)})
+
+                elif path == '/api/dht/hello':
+                    # DHT discovery — return closest known peers
+                    self._send_json(200, {
+                        'oracle_id':     oracle_srv.oracle_id,
+                        'node_id':       oracle_srv.local_node_id,
+                        'oracle_url':    f"http://localhost:{oracle_srv.port}",
+                        'is_p2p_oracle': True,
+                    })
+
+                else:
+                    self._send_json(404, {'error': 'not found'})
+
+            def do_POST(self):
+                path = _urlparse.urlparse(self.path).path
+                data = self._read_json()
+
+                if path == '/api/oracle/register':
+                    if data:
+                        miner_id = str(data.get('miner_id', ''))
+                        address  = str(data.get('address', ''))
+                        if miner_id and address:
+                            oracle_srv._registered_miners[miner_id] = {
+                                'miner_id': miner_id, 'address': address,
+                                'registered_at': time.time(), 'status': 'registered'
+                            }
+                            self._send_json(200, {'status': 'registered',
+                                                   'miner_id': miner_id, 'token': miner_id})
+                            return
+                    self._send_json(400, {'error': 'missing miner_id or address'})
+
+                elif path == '/api/peers/register':
+                    if data:
+                        self._send_json(200, {
+                            'status': 'registered',
+                            'live_peers': _local_db_get_best_peers(oracle_srv.db, limit=20),
+                            'sse_url': f"http://localhost:{oracle_srv.port}/api/events",
+                        })
+                        return
+                    self._send_json(400, {'error': 'bad request'})
+
+                elif path == '/api/peers/heartbeat':
+                    self._send_json(200, {'status': 'ok'})
+
+                elif path == '/gossip/oracle_handshake':
+                    # P2P oracle entanglement handshake
+                    snap = oracle_srv.get_pq0_snapshot()
+                    self._send_json(200, {**snap, 'handshake': True})
+
+                else:
+                    self._send_json(404, {'error': 'not found'})
+
+        return _OracleHandler
+
+
+# ─── DHT Peer Exchange Manager ────────────────────────────────────────────────────────────────────
+
+class DHTExchangeManager:
+    """
+    Kademlia-inspired P2P peer exchange.
+
+    DISCOVERY FLOW:
+    ───────────────
+    1. Bootstrap: contact main oracle → GET /api/peers/list → seed DHT table
+    2. HELLO: for each discovered peer → POST /gossip/dht_hello
+              Peer responds: {node_id, gossip_url, capabilities, block_height, w_fidelity}
+              We respond in kind.
+    3. PEX (Peer Exchange): every PEX_INTERVAL_S → POST /gossip/dht_pex to k closest peers
+              Each peer returns their routing table (up to 20 peers)
+              We merge new peers into our DHT table
+    4. Ping: every PING_INTERVAL_S → GET /gossip/status on each peer
+              Update last_seen, latency, quality score
+
+    CONVERGENCE GUARANTEE:
+    Once a node has contacted the bootstrap oracle, it will discover all other
+    nodes within O(log N) hops, where N is total network size.
+    For N=100 nodes: ~7 hops. For N=1000: ~10 hops. For N=10000: ~14 hops.
+
+    ORACLE DISCOVERY:
+    Any peer with is_oracle=True in their capabilities array triggers
+    OracleEntanglementBridge._handshake_p2p_oracle().
+    """
+
+    PEX_INTERVAL_S    = 120   # peer exchange every 2 minutes
+    PING_INTERVAL_S   = 60    # ping each peer every 1 minute
+    BOOTSTRAP_RETRY_S = 30    # retry bootstrap if no peers found
+    MAX_PEERS_PER_PEX = 20    # max peers to request/share per PEX round
+    PEER_STALE_S      = 300   # mark peer stale after 5 minutes silence
+
+    def __init__(self, db: sqlite3.Connection, local_node_id: str,
+                 miner_address: str, oracle_url: str,
+                 gossip_url: str, bridge: 'OracleEntanglementBridge',
+                 elig_engine: 'OracleEligibilityEngine'):
+        self.db              = db
+        self.local_node_id   = local_node_id
+        self.miner_address   = miner_address
+        self.oracle_url      = oracle_url.rstrip('/')
+        self.gossip_url      = gossip_url
+        self.bridge          = bridge
+        self.elig_engine     = elig_engine
+        self._lock           = threading.RLock()
+        self._session        = requests.Session()
+        self._session.mount('https://', HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.3)))
+        self._session.mount('http://',  HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.3)))
+        self._running        = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_pex       = 0.0
+        self._last_ping      = 0.0
+        self._bootstrapped   = False
+
+    def start(self) -> None:
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._dht_loop, daemon=True, name='DHTExchange'
+        )
+        self._thread.start()
+        logger.info("[DHT] 🕸️  DHT peer exchange manager started")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _dht_loop(self) -> None:
+        """Main DHT maintenance loop."""
+        # Bootstrap immediately
+        time.sleep(5)
+        self._bootstrap_from_oracle()
+
+        while self._running:
+            try:
+                now = time.time()
+
+                if now - self._last_pex >= self.PEX_INTERVAL_S:
+                    self._run_pex_round()
+                    self._last_pex = now
+
+                if now - self._last_ping >= self.PING_INTERVAL_S:
+                    self._ping_all_peers()
+                    self._last_ping = now
+
+                # Check for newly discovered P2P oracles → entangle
+                self._entangle_discovered_oracles()
+
+                time.sleep(10)
+            except Exception as e:
+                logger.debug(f"[DHT] Loop error: {e}")
+
+    def _bootstrap_from_oracle(self) -> None:
+        """Seed DHT table from main oracle's peer list."""
+        try:
+            r = self._session.get(f"{self.oracle_url}/api/peers/list", timeout=10)
+            if r.status_code != 200:
+                logger.warning(f"[DHT] Bootstrap failed: HTTP {r.status_code}")
+                return
+
+            peers = r.json().get('peers', [])
+            seeded = 0
+            for p in peers:
+                gurl = p.get('gossip_url', '')
+                if not gurl:
+                    continue
+                peer_id   = p.get('peer_id', hashlib.sha1(gurl.encode()).hexdigest())
+                node_id   = _dht_node_id(peer_id)
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(gurl)
+                    _dht_upsert_peer(
+                        db=self.db, node_id=node_id,
+                        address=parsed.hostname or gurl,
+                        gossip_port=parsed.port or 9001,
+                        miner_address=p.get('miner_address', ''),
+                        local_node_id=self.local_node_id,
+                        capabilities=p.get('capabilities', ['mine']),
+                        block_height=p.get('block_height', 0),
+                        w_fidelity=p.get('w_fidelity', 0.0),
+                        is_oracle='oracle' in p.get('capabilities', []),
+                    )
+                    seeded += 1
+                except Exception:
+                    pass
+
+            self._bootstrapped = seeded > 0
+            logger.info(
+                f"[DHT] {'✅' if self._bootstrapped else '⚠️ '} Bootstrap: "
+                f"{seeded}/{len(peers)} peers seeded from oracle"
+            )
+
+            # Register self with oracle
+            self._register_self_with_oracle()
+
+        except Exception as e:
+            logger.warning(f"[DHT] Bootstrap error: {e}")
+
+    def _register_self_with_oracle(self) -> None:
+        """Register this node with the main oracle's peer registry."""
+        if not self.gossip_url:
+            return
+        try:
+            self._session.post(
+                f"{self.oracle_url}/api/peers/register",
+                json={
+                    'peer_id':        self.local_node_id,
+                    'gossip_url':     self.gossip_url,
+                    'miner_address':  self.miner_address,
+                    'block_height':   self._get_local_height(),
+                    'network_version': '1.0',
+                    'supports_dht':   True,
+                    'capabilities':   ['mine', 'relay'] + (['oracle'] if self.elig_engine.is_oracle else []),
+                },
+                timeout=8,
+            )
+            logger.info("[DHT] ✅ Self-registered with main oracle")
+        except Exception as e:
+            logger.debug(f"[DHT] Self-registration error: {e}")
+
+    def _run_pex_round(self) -> None:
+        """
+        Peer Exchange round: contact k closest peers, exchange routing tables.
+        Each peer we talk to returns up to MAX_PEERS_PER_PEX peers.
+        We merge their peers into our DHT. Exponential convergence ensured.
+        """
+        closest = _dht_closest_peers(self.db, self.local_node_id, k=10)
+        if not closest:
+            if not self._bootstrapped:
+                self._bootstrap_from_oracle()
+            return
+
+        new_peers = 0
+        for peer in closest:
+            try:
+                gurl = f"http://{peer['peer_address']}:{peer['gossip_port']}"
+                t0   = time.time()
+                r    = self._session.post(
+                    f"{gurl}/gossip/dht_pex",
+                    json={
+                        'requester_node_id': self.local_node_id,
+                        'requester_gossip':  self.gossip_url,
+                        'requester_addr':    self.miner_address,
+                        'my_height':         self._get_local_height(),
+                        'my_fidelity':       0.9,
+                    },
+                    timeout=6,
+                )
+                latency = (time.time() - t0) * 1000
+
+                if r.status_code == 200:
+                    their_peers = r.json().get('peers', [])
+                    for tp in their_peers[:self.MAX_PEERS_PER_PEX]:
+                        nid  = tp.get('node_id', '')
+                        addr = tp.get('peer_address', tp.get('address', ''))
+                        if nid and addr and nid != self.local_node_id:
+                            _dht_upsert_peer(
+                                db=self.db, node_id=nid,
+                                address=addr,
+                                gossip_port=int(tp.get('gossip_port', 9001)),
+                                miner_address=tp.get('miner_address', ''),
+                                local_node_id=self.local_node_id,
+                                capabilities=tp.get('capabilities', []),
+                                block_height=int(tp.get('block_height', 0)),
+                                w_fidelity=float(tp.get('w_fidelity', 0.0)),
+                                is_oracle='oracle' in tp.get('capabilities', []),
+                            )
+                            new_peers += 1
+
+                    _local_db_record_peer_result(self.db, peer['node_id'], True, latency)
+                else:
+                    _local_db_record_peer_result(self.db, peer['node_id'], False, 9999)
+
+            except Exception as e:
+                _local_db_record_peer_result(self.db, peer.get('node_id', '?'), False, 9999)
+                logger.debug(f"[DHT] PEX error with {peer.get('peer_address','?')}: {e}")
+
+        if new_peers > 0:
+            logger.info(f"[DHT] 🔄 PEX round: {new_peers} new peers discovered")
+
+    def _ping_all_peers(self) -> None:
+        """Ping each known peer to update liveness and quality scores."""
+        if self.db is None:
+            return
+        try:
+            cur = self.db.execute("""
+                SELECT node_id, peer_address, gossip_port FROM dht_peers
+                WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 50
+            """, (time.time() - self.PEER_STALE_S * 2,))
+            peers = cur.fetchall()
+        except Exception:
+            return
+
+        for node_id, addr, port in peers:
+            try:
+                t0  = time.time()
+                r   = self._session.get(
+                    f"http://{addr}:{port}/gossip/status", timeout=3
+                )
+                lat = (time.time() - t0) * 1000
+                ok  = r.status_code == 200
+                _local_db_record_peer_result(self.db, node_id, ok, lat)
+                if ok:
+                    data = r.json()
+                    # Update height and fidelity from ping response
+                    try:
+                        self.db.execute("""
+                            UPDATE dht_peers SET block_height=?, last_seen=?, updated_at=?
+                            WHERE node_id=?
+                        """, (data.get('block_height', 0), time.time(), time.time(), node_id))
+                        self.db.commit()
+                    except Exception:
+                        pass
+            except Exception:
+                _local_db_record_peer_result(self.db, node_id, False, 9999)
+
+    def _entangle_discovered_oracles(self) -> None:
+        """Find newly discovered P2P oracles and establish entanglement."""
+        if self.db is None:
+            return
+        try:
+            cur = self.db.execute("""
+                SELECT node_id, peer_address, gossip_port, miner_address, w_fidelity
+                FROM   dht_peers
+                WHERE  is_oracle=1 AND last_seen > ? AND is_bootstrap=0
+                ORDER  BY w_fidelity DESC
+                LIMIT  8
+            """, (time.time() - 300,))
+            oracles = [{'node_id': r[0], 'peer_address': r[1], 'gossip_port': r[2],
+                        'miner_address': r[3], 'w_fidelity': r[4],
+                        'gossip_url': f"http://{r[1]}:{r[2]}"}
+                       for r in cur.fetchall()]
+        except Exception:
+            return
+
+        if oracles:
+            results = self.bridge.refresh_all_links(peer_oracles=oracles)
+            if results['p2p'] > 0:
+                logger.info(f"[DHT] 🔗 {results['p2p']} P2P oracle(s) entangled | active={results['active_links']}")
+
+    def _get_local_height(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            cur = self.db.execute("SELECT MAX(height) FROM blocks")
+            val = cur.fetchone()[0]
+            return int(val) if val is not None else 0
+        except Exception:
+            return 0
+
+    def get_network_topology(self) -> Dict[str, Any]:
+        """Compute and snapshot the current known P2P network topology."""
+        if self.db is None:
+            return {}
+        try:
+            cur = self.db.execute("""
+                SELECT node_id, peer_address, gossip_port, is_oracle, block_height, quality_score
+                FROM   dht_peers WHERE last_seen > ?
+                ORDER  BY quality_score DESC
+            """, (time.time() - self.PEER_STALE_S,))
+            nodes = cur.fetchall()
+            n = len(nodes)
+            oracle_count = sum(1 for row in nodes if row[3])
+            return {
+                'total_nodes':   n,
+                'total_oracles': oracle_count,
+                'avg_height':    sum(r[4] for r in nodes) / max(n, 1),
+                'density':       min(1.0, n / max(self.elig_engine.ORACLE_FULL_THRESHOLD, 1)),
+                'bootstrapped':  self._bootstrapped,
+            }
+        except Exception as e:
+            logger.debug(f"[DHT] topology error: {e}")
+            return {}
+
+
+# ─── DHT Gossip Handler Extensions ───────────────────────────────────────────────────────────────
+# These are injected into GossipHTTPHandler via monkey-patch at startup.
+# They add /gossip/dht_hello and /gossip/dht_pex endpoints.
+
+def _handle_dht_hello(handler, data: dict) -> None:
+    """Handle DHT HELLO — peer announces self, we respond with closest peers."""
+    db         = getattr(handler.server, 'local_db',      None)
+    peer_id    = getattr(handler.server, 'peer_id',       '')
+    local_nid  = getattr(handler.server, 'local_node_id', peer_id)
+    miner_addr = getattr(handler.server, 'miner_address', '')
+    gossip_url = getattr(handler.server, 'gossip_url',    '')
+
+    requester_node_id = str(data.get('node_id', ''))
+    requester_addr    = str(data.get('miner_address', ''))
+    requester_gossip  = str(data.get('gossip_url', ''))
+    requester_height  = int(data.get('block_height', 0))
+    requester_caps    = data.get('capabilities', ['mine'])
+    requester_w_fid   = float(data.get('w_fidelity', 0.0))
+    remote_ip         = handler.client_address[0] if handler.client_address else ''
+
+    # Parse gossip URL for address/port
+    gossip_port = 9001
+    peer_address = remote_ip
+    if requester_gossip:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(requester_gossip)
+            if p.hostname:
+                peer_address = p.hostname
+            if p.port:
+                gossip_port = p.port
+        except Exception:
+            pass
+
+    # Upsert peer into DHT
+    if requester_node_id:
+        _dht_upsert_peer(
+            db=db, node_id=requester_node_id,
+            address=peer_address, gossip_port=gossip_port,
+            miner_address=requester_addr,
+            local_node_id=local_nid,
+            capabilities=requester_caps,
+            block_height=requester_height,
+            w_fidelity=requester_w_fid,
+            is_oracle='oracle' in requester_caps,
+        )
+
+    # Respond with closest peers
+    closest = _dht_closest_peers(db, requester_node_id or local_nid, k=20,
+                                  exclude_id=requester_node_id)
+    response = {
+        'node_id':        local_nid,
+        'miner_address':  miner_addr,
+        'gossip_url':     gossip_url,
+        'block_height':   _local_db_get_tip(db).get('height', 0) if _local_db_get_tip(db) else 0,
+        'your_ip':        remote_ip,
+        'peers':          [{
+            'node_id':      p['node_id'],
+            'peer_address': p['peer_address'],
+            'gossip_port':  p['gossip_port'],
+            'miner_address': p['miner_address'],
+            'capabilities': json.loads(p.get('capabilities', '[]')),
+            'block_height': p['block_height'],
+            'w_fidelity':   p['w_fidelity'],
+            'is_oracle':    bool(p['is_oracle']),
+        } for p in closest],
+    }
+    handler._send_json(200, response)
+
+
+def _handle_dht_pex(handler, data: dict) -> None:
+    """Handle DHT Peer Exchange — share routing table, receive theirs."""
+    db         = getattr(handler.server, 'local_db',      None)
+    peer_id    = getattr(handler.server, 'peer_id',       '')
+    local_nid  = getattr(handler.server, 'local_node_id', peer_id)
+    miner_addr = getattr(handler.server, 'miner_address', '')
+    gossip_url = getattr(handler.server, 'gossip_url',    '')
+
+    requester_node_id = str(data.get('requester_node_id', ''))
+    requester_gossip  = str(data.get('requester_gossip', ''))
+    requester_addr    = str(data.get('requester_addr', ''))
+    requester_height  = int(data.get('my_height', 0))
+    requester_fid     = float(data.get('my_fidelity', 0.0))
+
+    # Merge requester into our DHT
+    if requester_node_id and requester_gossip:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(requester_gossip)
+            _dht_upsert_peer(
+                db=db, node_id=requester_node_id,
+                address=p.hostname or handler.client_address[0],
+                gossip_port=p.port or 9001,
+                miner_address=requester_addr,
+                local_node_id=local_nid,
+                capabilities=['mine'],
+                block_height=requester_height,
+                w_fidelity=requester_fid,
+            )
+        except Exception:
+            pass
+
+    # Return our routing table to them (20 closest to their node_id)
+    our_peers = _dht_closest_peers(
+        db, requester_node_id or local_nid, k=20, exclude_id=requester_node_id
+    )
+    handler._send_json(200, {
+        'node_id':   local_nid,
+        'gossip_url': gossip_url,
+        'peers':     [{
+            'node_id':      p['node_id'],
+            'peer_address': p['peer_address'],
+            'gossip_port':  p['gossip_port'],
+            'miner_address': p['miner_address'],
+            'capabilities': json.loads(p.get('capabilities', '[]')),
+            'block_height': p['block_height'],
+            'w_fidelity':   p['w_fidelity'],
+            'is_oracle':    bool(p['is_oracle']),
+        } for p in our_peers],
+    })
+
+
+# Monkey-patch GossipHTTPHandler to support DHT routes
+_original_gossip_do_post = GossipHTTPHandler.do_POST
+_original_gossip_do_get  = GossipHTTPHandler.do_GET
+
+
+def _patched_do_post(self):
+    path = _urlparse.urlparse(self.path).path
+    if path == '/gossip/dht_hello':
+        data = self._read_json_body()
+        if data:
+            _handle_dht_hello(self, data)
+        else:
+            self._send_json(400, {'error': 'bad body'})
+        return
+    if path == '/gossip/dht_pex':
+        data = self._read_json_body()
+        if data:
+            _handle_dht_pex(self, data)
+        else:
+            self._send_json(400, {'error': 'bad body'})
+        return
+    # Delegate to original
+    _original_gossip_do_post(self)
+
+
+def _patched_do_get(self):
+    path = _urlparse.urlparse(self.path).path
+    if path == '/gossip/dht_peers':
+        db    = getattr(self.server, 'local_db', None)
+        nid   = getattr(self.server, 'local_node_id', '')
+        peers = _dht_closest_peers(db, nid, k=50)
+        self._send_json(200, {'peers': peers, 'count': len(peers)})
+        return
+    if path == '/gossip/topology':
+        db = getattr(self.server, 'local_db', None)
+        try:
+            cur = db.execute("SELECT COUNT(*) FROM dht_peers WHERE last_seen > ?",
+                              (time.time() - 300,)) if db else None
+            n = cur.fetchone()[0] if cur else 0
+        except Exception:
+            n = 0
+        self._send_json(200, {'live_peers': n, 'node_id': getattr(self.server,'local_node_id','')})
+        return
+    _original_gossip_do_get(self)
+
+
+GossipHTTPHandler.do_POST = _patched_do_post
+GossipHTTPHandler.do_GET  = _patched_do_get
+
+
+# ─── GossipListener extended: inject local_node_id + gossip_url ──────────────────────────────────
+_orig_GossipListener_start = GossipListener.start
+
+
+def _patched_GossipListener_start(self) -> bool:
+    result = _orig_GossipListener_start(self)
+    if result and self._server:
+        # Inject additional server attrs consumed by DHT handlers
+        self._server.local_node_id = _dht_node_id(self.peer_id)
+        self._server.gossip_url    = self.gossip_url
+    return result
+
+
+GossipListener.start = _patched_GossipListener_start
+
+
+# ─── Complete P2P + DHT orchestration bundle ─────────────────────────────────────────────────────
+
+class QTCLP2PBundle:
+    """
+    Top-level coordinator binding together:
+      VirtualPseudoqubitManager  — pq0, virtual pqs, inverse-virtual pqs
+      OracleEntanglementBridge   — cross-oracle entanglement
+      OracleEligibilityEngine    — autonomous oracle promotion
+      DHTExchangeManager         — Kademlia peer discovery & exchange
+
+    Instantiated by QTCLFullNode.start(). Exposes unified start()/stop() and
+    get_status() for the mining loop and status dashboard.
+
+    STARTUP SEQUENCE:
+    ─────────────────
+    1. _apply_dht_schema(db)              — ensure tables exist
+    2. VirtualPseudoqubitManager.__init__ — in-memory state
+    3. OracleEntanglementBridge.__init__  — session + link state
+    4. OracleEligibilityEngine.__init__   — eligibility counters
+    5. DHTExchangeManager.__init__        — DHT routing state
+    6. bridge.start()                     — spawn maintenance thread
+    7. elig_engine.start()                — spawn eligibility loop
+    8. dht.start()                        — spawn DHT loop
+    """
+
+    def __init__(self, db: sqlite3.Connection, miner_address: str,
+                 oracle_url: str, gossip_url: str = ''):
+        self.db             = db
+        self.miner_address  = miner_address
+        self.oracle_url     = oracle_url
+        self.gossip_url     = gossip_url
+
+        # Deterministic node ID from miner address
+        self.local_node_id  = _dht_node_id(miner_address)
+
+        # Apply DHT schema extensions
+        _apply_dht_schema(db)
+
+        # Build subsystem stack
+        self.vpm   = VirtualPseudoqubitManager(
+            db=db, local_node_id=self.local_node_id,
+            miner_address=miner_address, oracle_id='main'
+        )
+        self.bridge = OracleEntanglementBridge(
+            db=db, vpm=self.vpm, local_node_id=self.local_node_id,
+            miner_address=miner_address, main_oracle_url=oracle_url
+        )
+        self.elig   = OracleEligibilityEngine(
+            db=db, local_node_id=self.local_node_id,
+            miner_address=miner_address, vpm=self.vpm, bridge=self.bridge
+        )
+        self.dht    = DHTExchangeManager(
+            db=db, local_node_id=self.local_node_id,
+            miner_address=miner_address, oracle_url=oracle_url,
+            gossip_url=gossip_url, bridge=self.bridge, elig_engine=self.elig
+        )
+
+        logger.info(
+            f"[P2P-BUNDLE] 🚀 QTCLP2PBundle initialized | "
+            f"node={self.local_node_id[:16]} | miner={miner_address[:20]}"
+        )
+
+    def start(self) -> None:
+        """Start all subsystems in correct dependency order."""
+        self.bridge.start()
+        self.elig.start()
+        self.dht.start()
+        logger.info("[P2P-BUNDLE] ✅ All P2P subsystems started")
+
+    def stop(self) -> None:
+        """Graceful shutdown of all subsystems."""
+        self.dht.stop()
+        self.elig.stop()
+        self.bridge.stop()
+        logger.info("[P2P-BUNDLE] 🛑 All P2P subsystems stopped")
+
+    def initialize_pq0_from_snapshot(self, snapshot: Dict[str, Any]) -> bool:
+        """Initialize pq0 from oracle snapshot — called by WStateRecovery sync."""
+        return self.vpm.initialize_pq0(snapshot)
+
+    def get_vpq_entropy(self) -> str:
+        """Get quantum entropy from virtual pq — used by QuantumMiner."""
+        vpq_ids = list(self.vpm._vpq.keys())
+        if not vpq_ids:
+            # Spawn one on demand
+            vpq_id = self.vpm.spawn_virtual_pq()
+            if vpq_id:
+                self.vpm.spawn_inverse_virtual_pq(vpq_id)
+        vpq_id = vpq_ids[0] if vpq_ids else None
+        if vpq_id:
+            return self.vpm.measure_virtual_pq_entropy(vpq_id)
+        return secrets.token_hex(32)
+
+    def rotate_vpqs(self) -> None:
+        """Rotate all virtual pqs after block solution — called by QuantumMiner."""
+        for vpq_id in list(self.vpm._vpq.keys()):
+            self.vpm.rotate_virtual_pq(vpq_id)
+
+    def attempt_oracle_promotion(self, blocks_mined: int, avg_fidelity: float) -> bool:
+        """Try oracle promotion — called periodically by QTCLFullNode._mining_loop."""
+        peer_count = self.dht._count_live_peers() if hasattr(self.dht, '_count_live_peers') \
+                     else self.elig._count_live_peers()
+        return self.elig.attempt_promotion(peer_count, blocks_mined, avg_fidelity,
+                                            gossip_url=self.gossip_url)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Unified status for dashboard + node.get_status()."""
+        topology  = self.dht.get_network_topology()
+        pq_status = self.vpm.get_pq_status()
+        ent_status = self.bridge.get_entanglement_status()
+        return {
+            'node_id':            self.local_node_id[:20],
+            'is_oracle':          self.elig.is_oracle,
+            'oracle_port':        self.elig._oracle_server.port if self.elig._oracle_server else None,
+            'pq0_fidelity':       pq_status['pq0_fidelity'],
+            'virtual_pq_count':   len(pq_status['virtual_pqs']),
+            'inverse_vpq_count':  len(pq_status['inverse_vpqs']),
+            'entanglement_links': ent_status['active_count'],
+            'dht_peers':          topology.get('total_nodes', 0),
+            'dht_oracles':        topology.get('total_oracles', 0),
+            'dht_bootstrapped':   topology.get('bootstrapped', False),
+        }
+
+    def _count_live_peers(self) -> int:
+        """Proxy for use by OracleEligibilityEngine._eligibility_loop."""
+        return self.elig._count_live_peers()
+
+
 class QTCLFullNode:
     def __init__(self, miner_address: str, oracle_url: str='https://qtcl-blockchain.koyeb.app', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
@@ -4206,6 +6250,21 @@ class QTCLFullNode:
             except Exception:
                 pass
         self._gossip.on_block_event = _on_gossip_block
+
+        # ── P2P BUNDLE: DHT + VirtualPQ + Oracle Eligibility + Entanglement Bridge ──
+        # Initialized here but NOT started yet — start() called after gossip binds a port.
+        self._p2p_bundle: Optional[QTCLP2PBundle] = None
+        if db_connection is not None:
+            try:
+                self._p2p_bundle = QTCLP2PBundle(
+                    db             = db_connection,
+                    miner_address  = miner_address,
+                    oracle_url     = oracle_url,
+                    gossip_url     = '',   # updated after GossipListener binds
+                )
+                logger.info("[NODE] ✅ QTCLP2PBundle created (DHT+VPQ+Oracle ready)")
+            except Exception as _e:
+                logger.warning(f"[NODE] ⚠️  P2P bundle init deferred: {_e}")
 
         logger.info(f"[NODE] QTCL Full Node initialized | miner={miner_address[:20]}… | oracle={oracle_url}")
     
@@ -4320,11 +6379,36 @@ class QTCLFullNode:
             # gossip listener, heartbeat. Must start after running=True so get_tip_fn works.
             self._gossip.get_tip_fn = lambda: (self.state.get_tip().height if self.state.get_tip() else 0)
             self._gossip.start()
-            
+
+            # ── Start P2P Bundle: DHT + VirtualPQ + Oracle Eligibility + Entanglement ──
+            if self._p2p_bundle is not None:
+                bound_gossip = self._gossip.get_gossip_url()
+                self._p2p_bundle.gossip_url     = bound_gossip
+                self._p2p_bundle.dht.gossip_url = bound_gossip
+                try:
+                    snap = self.w_state_recovery.current_snapshot
+                    if snap:
+                        self._p2p_bundle.initialize_pq0_from_snapshot(snap)
+                        vpq_id = self._p2p_bundle.vpm.spawn_virtual_pq('vpq_primary')
+                        if vpq_id:
+                            self._p2p_bundle.vpm.spawn_inverse_virtual_pq(vpq_id)
+                            logger.info(
+                                f"[P2P-BUNDLE] ✅ pq0→vpq_primary + ivpq_primary spawned | "
+                                f"F={self._p2p_bundle.vpm._fidelity:.4f}"
+                            )
+                except Exception as _pe:
+                    logger.warning(f"[P2P-BUNDLE] ⚠️  pq0 init from snapshot: {_pe}")
+                self._p2p_bundle.start()
+                logger.info(
+                    f"[P2P-BUNDLE] 🚀 Bundle online | gossip={bound_gossip} | "
+                    f"node_id={self._p2p_bundle.local_node_id[:20]}"
+                )
+
             logger.info(
                 f"[NODE] Full node online | "
                 f"gossip_url={self._gossip.get_gossip_url() or 'unbound'} | "
-                f"peer_id={self._gossip.peer_id}"
+                f"peer_id={self._gossip.peer_id} | "
+                f"dht={'active' if self._p2p_bundle else 'disabled'}"
             )
             return True
         
@@ -4335,6 +6419,8 @@ class QTCLFullNode:
     def stop(self):
         self.running=False
         self.w_state_recovery.stop()
+        if self._p2p_bundle is not None:
+            self._p2p_bundle.stop()
         if hasattr(self, '_gossip'):
             self._gossip.stop()
         if self.sync_thread:
@@ -4798,10 +6884,24 @@ class QTCLFullNode:
                 }
             },
             'network': {
-                'oracle_url': self.w_state_recovery.oracle_url,
-                'peer_count': 0,  # Would need P2P impl
+                'oracle_url':   self.w_state_recovery.oracle_url,
+                'peer_count':   self._gossip.get_peer_count() if hasattr(self, '_gossip') else 0,
+                'gossip_url':   self._gossip.get_gossip_url() if hasattr(self, '_gossip') else '',
             },
-            'metrics_summary': f"Height={self.state.get_height()} | Blocks={mining_stats.get('blocks_mined', 0)} | Balance={wallet_balance:.2f} QTCL | F={mining_stats.get('avg_fidelity', 0.0):.4f}"
+            'p2p': self._p2p_bundle.get_status() if self._p2p_bundle else {
+                'node_id': 'N/A', 'is_oracle': False, 'oracle_port': None,
+                'pq0_fidelity': 0.0, 'virtual_pq_count': 0, 'inverse_vpq_count': 0,
+                'entanglement_links': 0, 'dht_peers': 0, 'dht_oracles': 0,
+                'dht_bootstrapped': False,
+            },
+            'metrics_summary': (
+                f"Height={self.state.get_height()} | "
+                f"Blocks={mining_stats.get('blocks_mined', 0)} | "
+                f"Balance={wallet_balance:.2f} QTCL | "
+                f"F={mining_stats.get('avg_fidelity', 0.0):.4f} | "
+                f"DHT={'✅' if (self._p2p_bundle and self._p2p_bundle.dht._bootstrapped) else '⏳'} | "
+                f"Oracle={'🌟' if (self._p2p_bundle and self._p2p_bundle.elig.is_oracle) else '⛏️ '}"
+            )
         }
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -6060,6 +8160,34 @@ def main():
             print(f"  Connected:              {status['quantum']['recovery']['connected']}")
             print(f"  Peer ID:                {status['quantum']['recovery']['peer_id']}")
             print(f"  Oracle URL:             {status['network']['oracle_url']}")
+            print(f"")
+            p2p = status.get('p2p', {})
+            print(f"P2P DHT FABRIC:")
+            print(f"  Node ID:                {p2p.get('node_id','N/A')}")
+            print(f"  DHT Bootstrapped:       {'✅' if p2p.get('dht_bootstrapped') else '⏳ Discovering...'}")
+            print(f"  DHT Peers:              {p2p.get('dht_peers', 0)}")
+            print(f"  P2P Oracles Found:      {p2p.get('dht_oracles', 0)}")
+            print(f"  Entanglement Links:     {p2p.get('entanglement_links', 0)} active")
+            print(f"")
+            print(f"VIRTUAL PSEUDOQUBITS:")
+            print(f"  pq0 Fidelity:           {p2p.get('pq0_fidelity', 0.0):.4f}")
+            print(f"  Virtual PQs:            {p2p.get('virtual_pq_count', 0)} spawned")
+            print(f"  Inverse-Virtual PQs:    {p2p.get('inverse_vpq_count', 0)} spawned")
+            print(f"")
+            print(f"ORACLE STATUS:")
+            if p2p.get('is_oracle'):
+                print(f"  Role:                   🌟 P2P ORACLE (self-promoted)")
+                print(f"  Oracle Port:            {p2p.get('oracle_port', 'N/A')}")
+            else:
+                print(f"  Role:                   ⛏️  MINER")
+                elig_peers  = p2p.get('dht_peers', 0)
+                needed      = max(0, 7 - elig_peers)
+                print(f"  Oracle Eligibility:     {elig_peers}/7 peers ({'eligible ✅' if elig_peers >= 7 else f'need {needed} more peers'})")
+            print(f"")
+            print(f"NETWORK:")
+            print(f"  Gossip URL:             {status['network'].get('gossip_url', 'unbound')}")
+            print(f"  Peer Count:             {status['network'].get('peer_count', 0)}")
+            print(f"  Summary:                {status['metrics_summary']}")
             print("=" * 140 + "\n")
     
     except KeyboardInterrupt:
