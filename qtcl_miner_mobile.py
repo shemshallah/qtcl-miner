@@ -5398,10 +5398,10 @@ def _run_transaction_wizard(args, wallet):
     witness = hashlib.shake_256(witness_input).digest(64).hex()
     witness_bytes = hashlib.shake_256(witness_input).digest(64)
     
-    # 3. Proof = HMAC-SHA3(pubkey, witness || message_hash)
-    # NOTE: Uses pubkey, not private_key (critical fix!)
+    # 3. Proof = HMAC-SHA3(private, witness || message_hash)
+    # NOTE: Uses private_key, matching oracle.HLWESigner (line 589-591)
     proof_input = witness_bytes + message_hash_bytes
-    proof = hmac.new(pubkey_bytes, proof_input, digestmod=hashlib.sha3_256).digest().hex()
+    proof = hmac.new(private_key_bytes, proof_input, digestmod=hashlib.sha3_256).digest().hex()
     
     # Complete signature with all 7 required HLWESignature fields
     payload['signature'] = {
