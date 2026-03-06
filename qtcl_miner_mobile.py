@@ -5019,8 +5019,9 @@ class QTCLWallet:
                 {'address':self.address,'private_key':self.private_key,'public_key':self.public_key})
         if not self.is_loaded():
             logger.error(f"[WALLET] Incomplete fields after decrypt"); self._clear(); return False
-        # verify address integrity
-        exp = self.PREFIX + hashlib.sha3_256(self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
+        # verify address integrity - must match _derive_keys() method
+        public_key_bytes = bytes.fromhex(self.public_key)
+        exp = self.PREFIX + hashlib.sha3_256(public_key_bytes).digest()[:20].hex()
         if self.address != exp:
             self.address = exp; self._backup()
             self._atomic_save(self.wallet_file, password,
@@ -5074,8 +5075,11 @@ class QTCLWallet:
             key, chain = self._bip32_child(key, chain, idx)
         self.private_key = hashlib.sha3_256(key).hexdigest()
         self.public_key  = hashlib.sha3_256(self.private_key.encode()).hexdigest()
+        # Address derivation must match oracle.OracleKeyPair.address():
+        # SHA3-256(pubkey_bytes)[:20].hex(), not SHA3-256(hex_string)
+        public_key_bytes = bytes.fromhex(self.public_key)
         self.address     = self.PREFIX + hashlib.sha3_256(
-            self.public_key.encode()).hexdigest()[:self.ADDR_LEN]
+            public_key_bytes).digest()[:20].hex()
 
     # BIP-38 encryption
     def _encrypt(self, password, payload):
@@ -5487,7 +5491,9 @@ def _display_wallet_keys(wallet: 'QTCLWallet', mask_keys: bool = False, show_pri
     except:
         C_HEADER = C_ADDR = C_PUBKEY = C_PRIVKEY = C_BORDER = C_RESET = C_BOLD = ''
     try:
-        expected_addr = 'qtcl' + hashlib.sha3_256(wallet.public_key.encode()).hexdigest()[:40]
+        # Address derivation must match _derive_keys(): SHA3(pubkey_bytes)[:20].hex()
+        public_key_bytes = bytes.fromhex(wallet.public_key)
+        expected_addr = 'qtcl' + hashlib.sha3_256(public_key_bytes).digest()[:20].hex()
         if wallet.address != expected_addr:
             logger.warning(f"[WALLET-KEYS] Address mismatch detected - wallet may be corrupted")
     except Exception as e:
