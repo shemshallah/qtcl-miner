@@ -5370,7 +5370,23 @@ def _run_transaction_wizard(args, wallet):
     commit  = hashlib.sha3_256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     witness = hashlib.sha3_256((wallet.private_key + commit).encode()).hexdigest()
     proof   = hashlib.sha3_256((commit + witness).encode()).hexdigest()
-    payload['hlwe_signature'] = {'commitment': commit, 'witness': witness, 'proof': proof}
+    
+    # W-state entropy: deterministic source from wallet + nonce + timestamp
+    timestamp_ns = int(_time.time() * 1e9)
+    w_entropy_input = f"{wallet.public_key}:{nonce}:{timestamp_ns}".encode()
+    w_entropy_hash = hashlib.sha3_256(w_entropy_input).hexdigest()
+    
+    # Complete signature with all 7 required HLWESignature fields
+    payload['signature'] = {
+        'commitment'      : commit,
+        'witness'         : witness,
+        'proof'           : proof,
+        'w_entropy_hash'  : w_entropy_hash,
+        'public_key_hex'  : wallet.public_key,
+        'derivation_path' : "m/838'/0'/0'/0/0",
+        'timestamp_ns'    : timestamp_ns,
+    }
+    payload['hlwe_signature'] = payload['signature']
 
     print(f"\n  Client TX ID : {tx_id}")
     print(f"  From         : {wallet.address}")
