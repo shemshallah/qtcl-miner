@@ -591,8 +591,8 @@ class P2PClient:
         if self._oracle_base:
             urls.append(self._oracle_base)
         for host, _port in self.known_peers:
-            scheme = 'https' if host not in ('localhost', '127.0.0.1') else 'http'
-            port_s = '' if host not in ('localhost', '127.0.0.1') else ':8000'
+            scheme = 'http'
+            port_s = ':8000' if ':' not in host else ''
             urls.append(f"{scheme}://{host}{port_s}")
         return list(dict.fromkeys(urls))  # deduplicate, preserve order
 
@@ -957,7 +957,7 @@ class HLWETransactionSigner:
 class OracleBroadcaster:
     """Broadcasts signed transactions and blocks to Oracle (main database)."""
     
-    def __init__(self, oracle_url: str = 'https://qtcl-blockchain.koyeb.app'):
+    def __init__(self, oracle_url: str = 'http://qtcl-blockchain.koyeb.app:8000'):
         self.oracle_url = oracle_url.rstrip('/')
         self.broadcast_queue: Deque[Dict[str, Any]] = deque(maxlen=1000)
         self._lock = threading.RLock()
@@ -1271,7 +1271,7 @@ _CONSENSUS_MGR: Optional[ConsensusManager] = None
 _PEER_SYNC: Optional[PeriodicPeerSync] = None
 db: Optional[sqlite3.Connection] = None  # Global database connection for schema and state
 
-LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
+LIVE_NODE_URL='http://qtcl-blockchain.koyeb.app:8000'
 API_PREFIX='/api'
 MAX_MEMPOOL=10000
 SYNC_BATCH=50
@@ -1793,7 +1793,7 @@ class P2PClientWStateRecovery:
         if _GRPC_CLIENT_AVAILABLE:
             try:
                 from urllib.parse import urlparse
-                parsed   = urlparse(oracle_url if '://' in oracle_url else f'https://{oracle_url}')
+                parsed   = urlparse(oracle_url if '://' in oracle_url else f'http://{oracle_url}')
                 grpc_host = parsed.hostname or 'qtcl-blockchain.koyeb.app'
                 grpc_port = int(os.getenv('GRPC_PORT', 50051))
                 self.grpc_stream = GRPCSnapshotStream(
@@ -5259,7 +5259,7 @@ def parse_args():
     """Parse CLI arguments for QTCL Miner with enterprise-grade validation."""
     parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
+    parser.add_argument('--oracle-url','-o',default='http://qtcl-blockchain.koyeb.app:8000',help='Oracle URL (for W-state recovery)')
     parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
