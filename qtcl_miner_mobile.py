@@ -584,17 +584,27 @@ class P2PClient:
         self._session.mount('http://',  _a)
 
     def _base_urls(self, oracle_url: str = None) -> List[str]:
-        """Build ordered list of base REST URLs to try."""
-        urls = []
-        if oracle_url:
-            urls.append(oracle_url.rstrip('/'))
+        """
+        Build priority-ordered URL list: P2P peers FIRST, oracle LAST.
+        Oracle is authoritative for lattice metrics + validation but P2P
+        peers are preferred for TX/block data to form a real network.
+        An explicit oracle_url override (e.g. for W-state) goes to end.
+        """
+        peer_urls, oracle_urls = [], []
+        # 1. Known P2P peers by score (high-score = low-latency, high-uptime)
+        scored = sorted(self.known_peers, key=lambda x: x[2] if len(x) > 2 else 0, reverse=True)
+        for entry in scored:
+            host = entry[0]; _port = entry[1]
+            is_local = host in ('localhost', '127.0.0.1')
+            scheme = 'http' if is_local else 'https'
+            port_s = f':{_port}' if is_local else ''
+            peer_urls.append(f"{scheme}://{host}{port_s}")
+        # 2. Oracle — authoritative fallback
         if self._oracle_base:
-            urls.append(self._oracle_base)
-        for host, _port in self.known_peers:
-            scheme = 'http'
-            port_s = ':8000' if ':' not in host else ''
-            urls.append(f"{scheme}://{host}{port_s}")
-        return list(dict.fromkeys(urls))  # deduplicate, preserve order
+            oracle_urls.append(self._oracle_base)
+        if oracle_url:
+            oracle_urls.append(oracle_url.rstrip('/'))
+        return list(dict.fromkeys(peer_urls + oracle_urls))
 
     def discover_peers(self, timeout: int = 8) -> List[Tuple[str, int]]:
         """
@@ -957,7 +967,7 @@ class HLWETransactionSigner:
 class OracleBroadcaster:
     """Broadcasts signed transactions and blocks to Oracle (main database)."""
     
-    def __init__(self, oracle_url: str = 'http://qtcl-blockchain.koyeb.app:8000'):
+    def __init__(self, oracle_url: str = 'https://qtcl-blockchain.koyeb.app'):
         self.oracle_url = oracle_url.rstrip('/')
         self.broadcast_queue: Deque[Dict[str, Any]] = deque(maxlen=1000)
         self._lock = threading.RLock()
@@ -1271,7 +1281,7 @@ _CONSENSUS_MGR: Optional[ConsensusManager] = None
 _PEER_SYNC: Optional[PeriodicPeerSync] = None
 db: Optional[sqlite3.Connection] = None  # Global database connection for schema and state
 
-LIVE_NODE_URL='http://qtcl-blockchain.koyeb.app:8000'
+LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
 API_PREFIX='/api'
 MAX_MEMPOOL=10000
 SYNC_BATCH=50
@@ -1793,7 +1803,7 @@ class P2PClientWStateRecovery:
         if _GRPC_CLIENT_AVAILABLE:
             try:
                 from urllib.parse import urlparse
-                parsed   = urlparse(oracle_url if '://' in oracle_url else f'http://{oracle_url}')
+                parsed   = urlparse(oracle_url if '://' in oracle_url else f'https://{oracle_url}')
                 grpc_host = parsed.hostname or 'qtcl-blockchain.koyeb.app'
                 grpc_port = int(os.getenv('GRPC_PORT', 50051))
                 self.grpc_stream = GRPCSnapshotStream(
@@ -3291,12 +3301,42 @@ CREATE TABLE IF NOT EXISTS pending_txs (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_txs_status ON pending_txs(status);
 CREATE TABLE IF NOT EXISTS gossip_peers (
-    peer_id     TEXT PRIMARY KEY,
-    gossip_url  TEXT NOT NULL,
-    miner_addr  TEXT DEFAULT '',
+    peer_id      TEXT PRIMARY KEY,
+    gossip_url   TEXT NOT NULL,
+    miner_addr   TEXT DEFAULT '',
     block_height INTEGER DEFAULT 0,
-    last_seen   REAL DEFAULT 0,
-    online      INTEGER DEFAULT 1
+    last_seen    REAL DEFAULT 0,
+    online       INTEGER DEFAULT 1,
+    latency_ms   REAL DEFAULT 9999,
+    success_rate REAL DEFAULT 1.0,
+    fail_count   INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_gossip_peers_online ON gossip_peers(online, last_seen DESC);
+CREATE TABLE IF NOT EXISTS block_cache (
+    height       INTEGER PRIMARY KEY,
+    block_hash   TEXT NOT NULL,
+    parent_hash  TEXT NOT NULL DEFAULT '',
+    merkle_root  TEXT NOT NULL DEFAULT '',
+    timestamp_s  INTEGER NOT NULL DEFAULT 0,
+    difficulty_bits INTEGER NOT NULL DEFAULT 20,
+    nonce        INTEGER NOT NULL DEFAULT 0,
+    miner_address TEXT NOT NULL DEFAULT '',
+    w_state_fidelity REAL DEFAULT 0.0,
+    w_entropy_hash TEXT DEFAULT '',
+    tx_count     INTEGER DEFAULT 0,
+    raw_json     TEXT DEFAULT '',
+    source       TEXT DEFAULT 'p2p',
+    cached_at    REAL DEFAULT (strftime('%s','now'))
+);
+CREATE TABLE IF NOT EXISTS confirmed_txs (
+    tx_hash      TEXT PRIMARY KEY,
+    block_height INTEGER NOT NULL,
+    block_hash   TEXT NOT NULL,
+    from_addr    TEXT NOT NULL,
+    to_addr      TEXT NOT NULL,
+    amount_base  INTEGER NOT NULL,
+    fee_qtcl     REAL DEFAULT 0.001,
+    confirmed_at REAL DEFAULT (strftime('%s','now'))
 );
 """
 
@@ -3384,6 +3424,110 @@ def _local_db_get_pending(db) -> list:
         return []
 
 
+def _local_db_upsert_block(db, block: dict) -> bool:
+    """Cache a full block in local SQLite. Source of truth for chain state."""
+    if db is None: return False
+    try:
+        h = block.get('header', block)
+        height = int(h.get('height', 0) or h.get('block_height', 0))
+        if not height: return False
+        db.execute("""
+            INSERT OR REPLACE INTO block_cache
+                (height, block_hash, parent_hash, merkle_root, timestamp_s,
+                 difficulty_bits, nonce, miner_address, w_state_fidelity,
+                 w_entropy_hash, tx_count, raw_json, source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            height,
+            str(h.get('block_hash', '')),
+            str(h.get('parent_hash', '')),
+            str(h.get('merkle_root', '')),
+            int(h.get('timestamp_s', 0)),
+            int(h.get('difficulty_bits', 20)),
+            int(h.get('nonce', 0)),
+            str(h.get('miner_address', '')),
+            float(h.get('w_state_fidelity', 0.0)),
+            str(h.get('w_entropy_hash', '')),
+            int(h.get('tx_count', 0)),
+            json.dumps(block),
+            str(block.get('_source', 'p2p')),
+        ))
+        db.commit()
+        return True
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] upsert_block: {e}")
+        return False
+
+
+def _local_db_get_block(db, height: int) -> Optional[dict]:
+    """Fetch cached block by height. Returns None if not cached or empty."""
+    if db is None: return None
+    try:
+        cur = db.execute(
+            "SELECT raw_json FROM block_cache WHERE height=?", (height,))
+        row = cur.fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] get_block: {e}")
+    return None
+
+
+def _local_db_get_tip(db) -> Optional[dict]:
+    """Return highest cached block header. Local-first chain tip."""
+    if db is None: return None
+    try:
+        cur = db.execute(
+            "SELECT raw_json FROM block_cache ORDER BY height DESC LIMIT 1")
+        row = cur.fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] get_tip: {e}")
+    return None
+
+
+def _local_db_record_peer_result(db, peer_id: str, success: bool, latency_ms: float) -> None:
+    """Update peer score after each interaction — drives P2P peer selection."""
+    if db is None: return
+    try:
+        db.execute("""
+            UPDATE gossip_peers SET
+                latency_ms   = (latency_ms * 0.8 + ? * 0.2),
+                success_rate = (success_rate * 0.9 + ? * 0.1),
+                fail_count   = CASE WHEN ? THEN fail_count ELSE fail_count + 1 END,
+                online       = ?,
+                last_seen    = CASE WHEN ? THEN strftime('%s','now') ELSE last_seen END
+            WHERE peer_id = ?
+        """, (latency_ms, 1.0 if success else 0.0, success, 1 if success else 0,
+              success, peer_id))
+        db.commit()
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] record_peer_result: {e}")
+
+
+def _local_db_get_best_peers(db, limit: int = 10) -> list:
+    """Return peers ordered by composite score (latency + uptime + height)."""
+    if db is None: return []
+    try:
+        cur = db.execute("""
+            SELECT peer_id, gossip_url, miner_addr, block_height,
+                   latency_ms, success_rate,
+                   (success_rate * 100) - (latency_ms / 50.0) + (block_height / 100.0) AS score
+            FROM   gossip_peers
+            WHERE  online = 1
+              AND  last_seen > strftime('%s','now') - 120
+            ORDER  BY score DESC
+            LIMIT  ?
+        """, (limit,))
+        return [{'peer_id': r[0], 'gossip_url': r[1], 'miner_addr': r[2],
+                 'block_height': r[3], 'latency_ms': r[4],
+                 'success_rate': r[5], 'score': r[6]} for r in cur.fetchall()]
+    except Exception as e:
+        logger.debug(f"[GOSSIP/local] get_best_peers: {e}")
+        return []
+
+
 # ── GossipHTTPHandler ─────────────────────────────────────────────────────────
 class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
     """
@@ -3425,21 +3569,60 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = _urlparse.urlparse(self.path).path
+        mp   = getattr(self.server, 'local_mempool', None)
+        db   = getattr(self.server, 'local_db', None)
+
         if path == '/gossip/status':
-            mp   = getattr(self.server, 'local_mempool', None)
-            size = mp.get_size() if mp else 0
+            best = _local_db_get_best_peers(db, limit=5)
+            tip  = _local_db_get_tip(db)
             self._send_json(200, {
                 'peer_id'       : getattr(self.server, 'peer_id', ''),
                 'miner_address' : getattr(self.server, 'miner_address', ''),
-                'mempool_size'  : size,
+                'mempool_size'  : mp.get_size() if mp else 0,
+                'block_height'  : tip.get('header', tip).get('height', 0) if tip else 0,
+                'peer_count'    : len(best),
                 'ts'            : time.time(),
             })
+
+        elif path == '/api/mempool':
+            txs = _local_db_get_pending(db)
+            if not txs and mp:
+                txs = [t.__dict__ if hasattr(t, '__dict__') else t
+                       for t in (mp.get_pending(limit=200) or [])]
+            self._send_json(200, {'transactions': txs or [], 'count': len(txs or [])})
+
+        elif path.startswith('/api/blocks/tip'):
+            tip = _local_db_get_tip(db)
+            if tip:
+                h = tip.get('header', tip)
+                self._send_json(200, {'height': h.get('height', 0),
+                                      'block_height': h.get('height', 0),
+                                      'block_hash': h.get('block_hash', ''),
+                                      'source': 'local_cache'})
+            else:
+                self._send_json(404, {'error': 'no cached tip'})
+
+        elif path.startswith('/api/blocks/height/'):
+            try:
+                height = int(path.split('/')[-1])
+                blk = _local_db_get_block(db, height)
+                if blk:
+                    self._send_json(200, blk)
+                else:
+                    self._send_json(404, {'error': f'block {height} not cached'})
+            except (ValueError, IndexError):
+                self._send_json(400, {'error': 'invalid height'})
+
+        elif path == '/api/peers/list':
+            peers = _local_db_get_best_peers(db, limit=20)
+            self._send_json(200, {'peers': peers, 'count': len(peers)})
+
         else:
             self._send_json(404, {'error': 'not found'})
 
     def do_POST(self):
         path = _urlparse.urlparse(self.path).path
-        if path != '/gossip/ingest':
+        if path not in ('/gossip/ingest', '/api/transactions'):
             self._send_json(404, {'error': 'not found'})
             return
 
@@ -3451,54 +3634,66 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
         mp     = getattr(self.server, 'local_mempool', None)
         db     = getattr(self.server, 'local_db',      None)
         new_tx = 0
+        origin_peer = str(data.get('origin', data.get('peer_id', '?')))[:64]
 
         # ── Ingest transactions ───────────────────────────────────────────────
-        for tx in (data.get('txs') or [])[:50]:
+        for tx in (data.get('txs') or ([data] if path == '/api/transactions' else []))[:50]:
             tx_hash   = str(tx.get('tx_hash') or tx.get('tx_id', ''))
             from_addr = str(tx.get('from_address') or tx.get('from_addr', ''))
             to_addr   = str(tx.get('to_address') or tx.get('to_addr', ''))
             if not tx_hash or not from_addr or len(tx_hash) != 64:
                 continue
-            amount_b  = int(tx.get('amount_base', int(float(tx.get('amount',0))*100)))
-            # Push to in-memory Mempool
+            amount_b  = int(tx.get('amount_base', int(float(tx.get('amount', 0)) * 100)))
             if mp:
                 try:
                     mapped = Transaction(
-                        tx_id        = tx_hash,
-                        from_addr    = from_addr,
-                        to_addr      = to_addr,
-                        amount       = amount_b / 100,
+                        tx_id        = tx_hash, from_addr    = from_addr,
+                        to_addr      = to_addr, amount       = amount_b / 100,
                         nonce        = int(tx.get('nonce', 0)),
-                        timestamp_ns = int(tx.get('timestamp_ns', int(time.time()*1e9))),
-                        signature    = str(tx.get('signature','')),
+                        timestamp_ns = int(tx.get('timestamp_ns', int(time.time() * 1e9))),
+                        signature    = str(tx.get('signature', '')),
                         fee          = float(tx.get('fee', 0.001)),
                     )
                     mp.add_transaction(mapped)
                 except Exception as te:
                     logger.debug(f"[GOSSIP/ingest] TX→Mempool: {te}")
-            # Mirror to local SQLite
-            tx['source'] = f"peer:{data.get('origin','?')[:32]}"
+            tx['source'] = f"peer:{origin_peer}"
             if _local_db_upsert_tx(db, tx):
                 new_tx += 1
 
-        # ── Ingest block notification ─────────────────────────────────────────
+        # ── Ingest block notification + cache it ──────────────────────────────
         block = data.get('block')
         if block and isinstance(block, dict):
-            bh = int(block.get('height', 0))
-            bk = str(block.get('block_hash', ''))
+            block['_source'] = f"peer:{origin_peer}"
+            _local_db_upsert_block(db, block)
+            bh = int(block.get('height', block.get('header', {}).get('height', 0)))
+            bk = str(block.get('block_hash', block.get('header', {}).get('block_hash', '')))
             on_block = getattr(self.server, 'on_block_event', None)
             if on_block and bh > 0 and callable(on_block):
-                try:
-                    on_block(bh, bk)
+                try: on_block(bh, bk)
                 except Exception as be:
                     logger.debug(f"[GOSSIP/ingest] on_block_event: {be}")
-            if new_tx or bh:
-                logger.info(
-                    f"[GOSSIP/ingest] {new_tx} new TX(s) | "
-                    f"{'block #' + str(bh) if bh else 'no block'} "
-                    f"from {data.get('origin','?')[:40]}"
-                )
 
+        # ── Update peer score for this origin ─────────────────────────────────
+        if origin_peer and origin_peer != '?' and db:
+            try:
+                gossip_url = str(data.get('origin', ''))
+                if gossip_url.startswith('http'):
+                    db.execute("""
+                        INSERT OR IGNORE INTO gossip_peers
+                            (peer_id, gossip_url, block_height, last_seen)
+                        VALUES (?, ?, ?, strftime('%s','now'))
+                    """, (origin_peer, gossip_url,
+                          int(block.get('height', 0) if block else 0)))
+                    _local_db_record_peer_result(db, origin_peer, True, 0)
+            except Exception: pass
+
+        if new_tx or block:
+            logger.info(
+                f"[GOSSIP/ingest] {new_tx} new TX(s) | "
+                f"{'block #' + str(bh) if block else 'no block'} "
+                f"from {origin_peer[:40]}"
+            )
         self._send_json(200, {'ok': True, 'new_txs': new_tx})
 
 
@@ -4240,44 +4435,91 @@ class QTCLFullNode:
                     time.sleep(5)
                     continue
                 
-                # ── FETCH PENDING TXs FROM SERVER — DB is the single source of truth ──
-                # ── FETCH PENDING TXs — three-tier priority ─────────────────────────
-                # 1. Oracle /api/mempool (DB-backed, authoritative)
-                # 2. In-memory Mempool (populated by SSE + peer gossip in real-time)
-                # 3. Local SQLite mirror (last resort — survives network partition)
-                pending_txs = self.client.get_mempool()
-                # Merge server TXs into local Mempool buffer for dedup tracking
-                for tx in pending_txs:
-                    self.mempool.add_transaction(tx)
+                # ── FETCH PENDING TXs — LOCAL → P2P → ORACLE (fallback chain) ──────
+                # Tier 1: Local SQLite (instant, survives network partition, always try first)
+                pending_txs = []
+                sqlite_txs = _local_db_get_pending(self.db) if self.db else []
+                if sqlite_txs:
+                    for raw in sqlite_txs[:MAX_BLOCK_TX]:
+                        try:
+                            pending_txs.append(Transaction(
+                                tx_id        = raw['tx_hash'],
+                                from_addr    = raw['from_addr'],
+                                to_addr      = raw['to_addr'],
+                                amount       = raw['amount'],
+                                nonce        = raw['nonce'],
+                                timestamp_ns = raw['timestamp_ns'] or int(time.time()*1e9),
+                                signature    = raw['signature'],
+                                fee          = raw['fee'],
+                            ))
+                        except Exception: pass
+                    if pending_txs:
+                        logger.info(f"[MINING] 💾 Tier-1 local SQLite: {len(pending_txs)} TX(s)")
 
-                # If server returned nothing, check what gossip/SSE has populated locally
+                # Tier 2: In-memory gossip pool (SSE + peer ingest, zero-latency)
                 if not pending_txs:
                     in_mem = self.mempool.get_pending(limit=MAX_BLOCK_TX)
                     if in_mem:
                         pending_txs = in_mem
-                        logger.info(f"[MINING] Using {len(pending_txs)} in-memory gossip TX(s)")
+                        logger.info(f"[MINING] 🧠 Tier-2 in-memory gossip: {len(pending_txs)} TX(s)")
 
-                # Last resort: local SQLite mirror (peer gossip, SSE, pre-server)
+                # Tier 3: Best P2P peers (scored by latency + uptime — oracle not needed)
                 if not pending_txs and self.db:
-                    sqlite_txs = _local_db_get_pending(self.db)
-                    if sqlite_txs:
-                        for raw in sqlite_txs[:MAX_BLOCK_TX]:
+                    best_peers = _local_db_get_best_peers(self.db, limit=5)
+                    for peer in best_peers:
+                        try:
+                            t0 = time.time()
+                            r = self.client._session.get(
+                                f"{peer['gossip_url'].rstrip('/')}/api/mempool", timeout=5)
+                            latency = (time.time() - t0) * 1000
+                            if r.status_code == 200:
+                                p_txs = r.json().get('transactions', [])
+                                for raw in p_txs[:MAX_BLOCK_TX]:
+                                    try:
+                                        t = Transaction(
+                                            tx_id        = raw.get('tx_hash', raw.get('tx_id','')),
+                                            from_addr    = raw.get('from_addr', raw.get('from_address','')),
+                                            to_addr      = raw.get('to_addr', raw.get('to_address','')),
+                                            amount       = float(raw.get('amount', raw.get('amount_base',0)/100)),
+                                            nonce        = int(raw.get('nonce', 0)),
+                                            timestamp_ns = int(raw.get('timestamp_ns', int(time.time()*1e9))),
+                                            signature    = str(raw.get('signature','')),
+                                            fee          = float(raw.get('fee', 0.001)),
+                                        )
+                                        pending_txs.append(t)
+                                        _local_db_upsert_tx(self.db, raw)
+                                    except Exception: pass
+                                _local_db_record_peer_result(self.db, peer['peer_id'], True, latency)
+                                if pending_txs:
+                                    logger.info(f"[MINING] 🌐 Tier-3 P2P peer {peer['gossip_url'][:40]}: {len(pending_txs)} TX(s)")
+                                    break
+                            else:
+                                _local_db_record_peer_result(self.db, peer['peer_id'], False, latency)
+                        except Exception as pe:
+                            _local_db_record_peer_result(self.db, peer.get('peer_id','?'), False, 9999)
+                            logger.debug(f"[MINING] P2P peer fetch failed: {pe}")
+
+                # Tier 4: Oracle — authoritative fallback only when all local/P2P sources empty
+                if not pending_txs:
+                    oracle_txs = self.client.get_mempool()
+                    if oracle_txs:
+                        pending_txs = oracle_txs
+                        # Mirror into local DB so future rounds use Tier-1
+                        for tx in oracle_txs:
                             try:
-                                t = Transaction(
-                                    tx_id        = raw['tx_hash'],
-                                    from_addr    = raw['from_addr'],
-                                    to_addr      = raw['to_addr'],
-                                    amount       = raw['amount'],
-                                    nonce        = raw['nonce'],
-                                    timestamp_ns = raw['timestamp_ns'] or int(time.time()*1e9),
-                                    signature    = raw['signature'],
-                                    fee          = raw['fee'],
-                                )
-                                pending_txs.append(t)
-                            except Exception:
-                                pass
-                        if pending_txs:
-                            logger.info(f"[MINING] Using {len(pending_txs)} local SQLite TX(s)")
+                                _local_db_upsert_tx(self.db, {
+                                    'tx_hash': tx.tx_id, 'from_addr': tx.from_addr,
+                                    'to_addr': tx.to_addr, 'amount': tx.amount,
+                                    'nonce': tx.nonce, 'timestamp_ns': tx.timestamp_ns,
+                                    'signature': tx.signature, 'fee': tx.fee,
+                                    'source': 'oracle',
+                                })
+                            except Exception: pass
+                        logger.info(f"[MINING] 🔮 Tier-4 oracle: {len(pending_txs)} TX(s)")
+                # Merge all found TXs into local mempool for dedup tracking
+                for tx in pending_txs:
+                    try: self.mempool.add_transaction(tx)
+                    except Exception: pass
 
                 tx_count = len(pending_txs)
                 current_fidelity = entanglement.get('w_state_fidelity', 0.0)
@@ -5259,7 +5501,7 @@ def parse_args():
     """Parse CLI arguments for QTCL Miner with enterprise-grade validation."""
     parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url','-o',default='http://qtcl-blockchain.koyeb.app:8000',help='Oracle URL (for W-state recovery)')
+    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
     parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
