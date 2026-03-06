@@ -1127,19 +1127,158 @@ SCHEMA_PATCHES = {
         );
         CREATE INDEX IF NOT EXISTS idx_sync_peer ON peer_sync_log(peer_id);
         CREATE INDEX IF NOT EXISTS idx_sync_type ON peer_sync_log(sync_type);
-    """
+    """,
+    # ── DHT + Oracle + VirtualPQ schema (MUST run before QTCLP2PBundle init) ────
+    'dht_peers': """
+        CREATE TABLE IF NOT EXISTS dht_peers (
+            node_id         TEXT PRIMARY KEY,
+            peer_address    TEXT NOT NULL,
+            gossip_port     INTEGER NOT NULL DEFAULT 9091,
+            oracle_port     INTEGER,
+            miner_address   TEXT NOT NULL DEFAULT '',
+            capabilities    TEXT NOT NULL DEFAULT '[]',
+            block_height    INTEGER NOT NULL DEFAULT 0,
+            w_fidelity      REAL NOT NULL DEFAULT 0.0,
+            is_oracle       INTEGER NOT NULL DEFAULT 0,
+            is_bootstrap    INTEGER NOT NULL DEFAULT 0,
+            xor_bucket      INTEGER NOT NULL DEFAULT 0,
+            last_seen       REAL NOT NULL DEFAULT 0,
+            last_ping_ms    REAL NOT NULL DEFAULT 9999,
+            fail_count      INTEGER NOT NULL DEFAULT 0,
+            success_count   INTEGER NOT NULL DEFAULT 0,
+            quality_score   REAL NOT NULL DEFAULT 0.5,
+            created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
+            updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_dht_bucket    ON dht_peers(xor_bucket, quality_score);
+        CREATE INDEX IF NOT EXISTS idx_dht_oracle    ON dht_peers(is_oracle, block_height);
+        CREATE INDEX IF NOT EXISTS idx_dht_last_seen ON dht_peers(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_dht_addr      ON dht_peers(miner_address);
+    """,
+    'oracle_registry': """
+        CREATE TABLE IF NOT EXISTS oracle_registry (
+            oracle_id           TEXT PRIMARY KEY,
+            oracle_address      TEXT NOT NULL,
+            oracle_url          TEXT NOT NULL,
+            gossip_url          TEXT NOT NULL DEFAULT '',
+            is_primary          INTEGER NOT NULL DEFAULT 0,
+            is_local            INTEGER NOT NULL DEFAULT 0,
+            node_id             TEXT NOT NULL DEFAULT '',
+            pq0_fidelity        REAL NOT NULL DEFAULT 0.0,
+            pq0_entropy_hash    TEXT NOT NULL DEFAULT '',
+            block_height        INTEGER NOT NULL DEFAULT 0,
+            peer_count          INTEGER NOT NULL DEFAULT 0,
+            promotion_height    INTEGER NOT NULL DEFAULT 0,
+            promotion_reason    TEXT NOT NULL DEFAULT '',
+            entanglement_status TEXT NOT NULL DEFAULT 'none',
+            trust_score         REAL NOT NULL DEFAULT 0.5,
+            last_seen           REAL NOT NULL DEFAULT 0,
+            created_at          REAL NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_oracle_primary ON oracle_registry(is_primary);
+        CREATE INDEX IF NOT EXISTS idx_oracle_trust   ON oracle_registry(trust_score);
+        CREATE INDEX IF NOT EXISTS idx_oracle_last    ON oracle_registry(last_seen);
+    """,
+    'virtual_pq_state': """
+        CREATE TABLE IF NOT EXISTS virtual_pq_state (
+            pq_id           TEXT PRIMARY KEY,
+            pq_type         TEXT NOT NULL,
+            oracle_id       TEXT NOT NULL,
+            node_id         TEXT NOT NULL DEFAULT '',
+            fidelity        REAL NOT NULL DEFAULT 0.0,
+            coherence       REAL NOT NULL DEFAULT 0.0,
+            purity          REAL NOT NULL DEFAULT 0.0,
+            entanglement_partner TEXT NOT NULL DEFAULT '',
+            w_entropy_hash  TEXT NOT NULL DEFAULT '',
+            density_matrix_hex TEXT NOT NULL DEFAULT '',
+            last_measured   REAL NOT NULL DEFAULT 0,
+            measurement_count INTEGER NOT NULL DEFAULT 0,
+            is_active       INTEGER NOT NULL DEFAULT 1,
+            created_at      REAL NOT NULL DEFAULT (strftime('%s','now')),
+            updated_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_vpq_type   ON virtual_pq_state(pq_type, is_active);
+        CREATE INDEX IF NOT EXISTS idx_vpq_oracle ON virtual_pq_state(oracle_id);
+    """,
+    'pq_entanglement_registry': """
+        CREATE TABLE IF NOT EXISTS pq_entanglement_registry (
+            link_id         TEXT PRIMARY KEY,
+            pq_a_id         TEXT NOT NULL,
+            pq_b_id         TEXT NOT NULL,
+            oracle_a_id     TEXT NOT NULL,
+            oracle_b_id     TEXT NOT NULL,
+            link_type       TEXT NOT NULL,
+            fidelity_ab     REAL NOT NULL DEFAULT 0.0,
+            coherence_ab    REAL NOT NULL DEFAULT 0.0,
+            is_active       INTEGER NOT NULL DEFAULT 1,
+            established_at  REAL NOT NULL DEFAULT (strftime('%s','now')),
+            last_verified   REAL NOT NULL DEFAULT 0,
+            verification_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_pq_link_type ON pq_entanglement_registry(link_type, is_active);
+        CREATE INDEX IF NOT EXISTS idx_pq_link_a    ON pq_entanglement_registry(pq_a_id);
+        CREATE INDEX IF NOT EXISTS idx_pq_link_b    ON pq_entanglement_registry(pq_b_id);
+    """,
+    'oracle_eligibility': """
+        CREATE TABLE IF NOT EXISTS oracle_eligibility (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            check_height    INTEGER NOT NULL,
+            peer_count      INTEGER NOT NULL DEFAULT 0,
+            oracle_count    INTEGER NOT NULL DEFAULT 0,
+            blocks_mined    INTEGER NOT NULL DEFAULT 0,
+            avg_fidelity    REAL NOT NULL DEFAULT 0.0,
+            uptime_s        REAL NOT NULL DEFAULT 0.0,
+            eligible        INTEGER NOT NULL DEFAULT 0,
+            promoted        INTEGER NOT NULL DEFAULT 0,
+            promotion_type  TEXT NOT NULL DEFAULT '',
+            notes           TEXT NOT NULL DEFAULT '',
+            checked_at      REAL NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_elig_height ON oracle_eligibility(check_height);
+        CREATE INDEX IF NOT EXISTS idx_elig_promo  ON oracle_eligibility(promoted);
+    """,
+    'network_topology': """
+        CREATE TABLE IF NOT EXISTS network_topology (
+            snapshot_id     TEXT PRIMARY KEY,
+            total_nodes     INTEGER NOT NULL DEFAULT 0,
+            total_oracles   INTEGER NOT NULL DEFAULT 0,
+            avg_peers       REAL NOT NULL DEFAULT 0.0,
+            diameter        INTEGER NOT NULL DEFAULT 0,
+            density         REAL NOT NULL DEFAULT 0.0,
+            topology_json   TEXT NOT NULL DEFAULT '{}',
+            captured_at     REAL NOT NULL DEFAULT (strftime('%s','now'))
+        );
+    """,
 }
 
-def apply_schema_patches():
-    """Apply schema patches to local database."""
+def apply_schema_patches(conn: sqlite3.Connection = None) -> None:
+    """
+    Apply all schema patches to the local database.
+    Called at startup (main) and can also be called with an explicit connection.
+    Idempotent — safe to call multiple times.
+    """
+    target = conn or _DB_CONN
+    if target is None:
+        return
     with threading.RLock():
         for patch_name, patch_sql in SCHEMA_PATCHES.items():
             try:
-                _DB_CONN.executescript(patch_sql)
-                _DB_CONN.commit()
+                # executescript auto-commits; use individual statements for safety
+                for stmt in patch_sql.strip().split(';'):
+                    s = stmt.strip()
+                    if s and not s.startswith('--'):
+                        try:
+                            target.execute(s)
+                        except sqlite3.OperationalError as _e:
+                            # "duplicate column name" is expected on re-run — not an error
+                            if 'duplicate column' not in str(_e).lower() and \
+                               'already exists' not in str(_e).lower():
+                                logger.debug(f"[SCHEMA] stmt warn ({patch_name}): {_e}")
+                target.commit()
                 logger.debug(f"[SCHEMA] ✅ Applied patch: {patch_name}")
             except Exception as e:
-                logger.debug(f"[SCHEMA] ℹ️  Patch already applied: {patch_name}")
+                logger.debug(f"[SCHEMA] ℹ️  Patch note ({patch_name}): {e}")
+
 
 
 class ConsensusManager:
@@ -3531,29 +3670,41 @@ def _local_db_get_best_peers(db, limit: int = 10) -> list:
 # ── GossipHTTPHandler ─────────────────────────────────────────────────────────
 class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
     """
-    Minimal HTTP request handler for peer-to-peer gossip.
+    UNIFIED P2P HTTP HANDLER — single port (default 9091), all path-prefixed routes.
 
-    Accepts:
-        POST /gossip/ingest   — receive TX + block gossip bundle from another peer
-        GET  /gossip/status   — liveness probe (returns JSON with peer info)
+    Koyeb constraint: one exposed port per deployment. All P2P traffic shares
+    port 9091, routed by URL path prefix:
 
-    Injected attributes (set by GossipListener):
-        server.local_mempool  — Mempool instance to push received TXs into
-        server.local_db       — sqlite3 connection for local TX mirror
-        server.miner_address  — this node's address
-        server.peer_id        — this node's peer_id
-        server.on_block_event — callable(height, block_hash) for block gossip
+        /gossip/*        — peer gossip: ingest, status, DHT hello/pex
+        /api/mempool     — pending transactions
+        /api/blocks/*    — block cache
+        /api/peers/*     — peer registry: list, register, heartbeat
+        /api/oracle/*    — W-state + oracle ops (active only when promoted)
+        /api/dht/*       — DHT routing queries
+        /api/events      — SSE stub
+        /health          — Koyeb liveness probe
+
+    Injected server attributes (set by GossipListener):
+        server.local_mempool    — Mempool
+        server.local_db         — sqlite3.Connection
+        server.miner_address    — str
+        server.peer_id          — str
+        server.local_node_id    — str  (DHT node ID)
+        server.gossip_url       — str
+        server.on_block_event   — callable(height, block_hash) | None
+        server.oracle_ref       — P2POracleServer | None
     """
-    _MAX_BODY = 1_048_576  # 1 MB per ingest call
+    _MAX_BODY = 1_048_576
 
     def log_message(self, fmt, *args):
-        logger.debug(f"[GOSSIP/http] {fmt % args}")
+        logger.debug(f"[P2P/http] {fmt % args}")
 
     def _send_json(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(data)
 
@@ -3561,27 +3712,47 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         if length <= 0 or length > self._MAX_BODY:
             return None
-        raw = self.rfile.read(length)
         try:
-            return json.loads(raw)
+            return json.loads(self.rfile.read(length))
         except Exception:
             return None
 
-    def do_GET(self):
-        path = _urlparse.urlparse(self.path).path
-        mp   = getattr(self.server, 'local_mempool', None)
-        db   = getattr(self.server, 'local_db', None)
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
 
-        if path == '/gossip/status':
+    def do_GET(self):
+        path    = _urlparse.urlparse(self.path).path
+        db      = getattr(self.server, 'local_db',      None)
+        mp      = getattr(self.server, 'local_mempool', None)
+        peer_id = getattr(self.server, 'peer_id',       '')
+        node_id = getattr(self.server, 'local_node_id',  peer_id)
+        miner   = getattr(self.server, 'miner_address', '')
+        gurl    = getattr(self.server, 'gossip_url',    '')
+        oracle  = getattr(self.server, 'oracle_ref',    None)
+
+        if path in ('/', '/health', '/ping'):
+            tip = _local_db_get_tip(db)
+            self._send_json(200, {'status': 'ok', 'node': 'qtcl-miner',
+                                   'peer_id': peer_id, 'is_oracle': oracle is not None,
+                                   'block_height': tip.get('header', tip).get('height', 0) if tip else 0,
+                                   'ts': time.time()})
+
+        elif path == '/gossip/status':
             best = _local_db_get_best_peers(db, limit=5)
             tip  = _local_db_get_tip(db)
             self._send_json(200, {
-                'peer_id'       : getattr(self.server, 'peer_id', ''),
-                'miner_address' : getattr(self.server, 'miner_address', ''),
-                'mempool_size'  : mp.get_size() if mp else 0,
-                'block_height'  : tip.get('header', tip).get('height', 0) if tip else 0,
-                'peer_count'    : len(best),
-                'ts'            : time.time(),
+                'peer_id':       peer_id,
+                'miner_address': miner,
+                'gossip_url':    gurl,
+                'mempool_size':  mp.get_size() if mp else 0,
+                'block_height':  tip.get('header', tip).get('height', 0) if tip else 0,
+                'peer_count':    len(best),
+                'is_oracle':     oracle is not None,
+                'ts':            time.time(),
             })
 
         elif path == '/api/mempool':
@@ -3615,143 +3786,256 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == '/api/peers/list':
             peers = _local_db_get_best_peers(db, limit=20)
+            for p in peers:
+                if 'gossip_url' not in p or not p['gossip_url']:
+                    addr = p.get('address', p.get('peer_address', ''))
+                    port = p.get('port', p.get('gossip_port', 9091))
+                    p['gossip_url'] = f"http://{addr}:{port}" if addr else ''
             self._send_json(200, {'peers': peers, 'count': len(peers)})
 
+        elif path in ('/api/oracle/w-state', '/api/oracle/pq0'):
+            if oracle is not None:
+                self._send_json(200, oracle.get_pq0_snapshot())
+            else:
+                self._send_json(503, {'error': 'not an oracle', 'is_oracle': False})
+
+        elif path == '/api/oracle/miners':
+            if oracle is not None:
+                miners = list(oracle._registered_miners.values())
+                self._send_json(200, {'miners': miners, 'count': len(miners)})
+            else:
+                self._send_json(503, {'error': 'not an oracle'})
+
+        elif path in ('/api/dht/peers', '/gossip/dht_peers'):
+            peers = _dht_closest_peers(db, node_id, k=50)
+            self._send_json(200, {'peers': peers, 'count': len(peers)})
+
+        elif path == '/api/dht/hello':
+            self._send_json(200, {
+                'node_id':       node_id,
+                'gossip_url':    gurl,
+                'is_p2p_oracle': oracle is not None,
+                'block_height':  _local_db_get_tip(db).get('header', {}).get('height', 0)
+                                   if _local_db_get_tip(db) else 0,
+            })
+
+        elif path == '/gossip/topology':
+            try:
+                n = db.execute("SELECT COUNT(*) FROM dht_peers WHERE last_seen > ?",
+                               (time.time() - 300,)).fetchone()[0] if db else 0
+            except Exception:
+                n = 0
+            self._send_json(200, {'live_peers': n, 'node_id': node_id, 'gossip_url': gurl})
+
+        elif path == '/api/events':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            try:
+                tip = _local_db_get_tip(db)
+                h   = tip.get('header', tip).get('height', 0) if tip else 0
+                msg = json.dumps({'type': 'hello', 'height': h, 'peer_id': peer_id})
+                self.wfile.write(f"data: {msg}\n\n".encode())
+                self.wfile.flush()
+            except Exception:
+                pass
+
         else:
-            self._send_json(404, {'error': 'not found'})
+            self._send_json(404, {'error': 'not found', 'path': path})
 
     def do_POST(self):
-        path = _urlparse.urlparse(self.path).path
-        if path not in ('/gossip/ingest', '/api/transactions'):
-            self._send_json(404, {'error': 'not found'})
-            return
+        path    = _urlparse.urlparse(self.path).path
+        db      = getattr(self.server, 'local_db',      None)
+        mp      = getattr(self.server, 'local_mempool', None)
+        peer_id = getattr(self.server, 'peer_id',       '')
+        node_id = getattr(self.server, 'local_node_id',  peer_id)
+        gurl    = getattr(self.server, 'gossip_url',    '')
+        oracle  = getattr(self.server, 'oracle_ref',    None)
 
-        data = self._read_json_body()
-        if not data:
-            self._send_json(400, {'error': 'invalid body'})
-            return
-
-        mp     = getattr(self.server, 'local_mempool', None)
-        db     = getattr(self.server, 'local_db',      None)
-        new_tx = 0
-        origin_peer = str(data.get('origin', data.get('peer_id', '?')))[:64]
-
-        # ── Ingest transactions ───────────────────────────────────────────────
-        for tx in (data.get('txs') or ([data] if path == '/api/transactions' else []))[:50]:
-            tx_hash   = str(tx.get('tx_hash') or tx.get('tx_id', ''))
-            from_addr = str(tx.get('from_address') or tx.get('from_addr', ''))
-            to_addr   = str(tx.get('to_address') or tx.get('to_addr', ''))
-            if not tx_hash or not from_addr or len(tx_hash) != 64:
-                continue
-            amount_b  = int(tx.get('amount_base', int(float(tx.get('amount', 0)) * 100)))
-            if mp:
+        if path in ('/gossip/ingest', '/api/transactions'):
+            data = self._read_json_body()
+            if not data:
+                self._send_json(400, {'error': 'invalid body'})
+                return
+            new_tx = 0
+            origin_peer = str(data.get('origin', data.get('peer_id', '?')))[: 64]
+            bh = 0
+            for tx in (data.get('txs') or ([data] if path == '/api/transactions' else []))[:50]:
+                tx_hash   = str(tx.get('tx_hash') or tx.get('tx_id', ''))
+                from_addr = str(tx.get('from_address') or tx.get('from_addr', ''))
+                to_addr   = str(tx.get('to_address') or tx.get('to_addr', ''))
+                if not tx_hash or not from_addr or len(tx_hash) != 64:
+                    continue
+                amount_b = int(tx.get('amount_base', int(float(tx.get('amount', 0)) * 100)))
+                if mp:
+                    try:
+                        mp.add_transaction(Transaction(
+                            tx_id=tx_hash, from_addr=from_addr, to_addr=to_addr,
+                            amount=amount_b/100, nonce=int(tx.get('nonce', 0)),
+                            timestamp_ns=int(tx.get('timestamp_ns', int(time.time()*1e9))),
+                            signature=str(tx.get('signature', '')),
+                            fee=float(tx.get('fee', 0.001)),
+                        ))
+                    except Exception as te:
+                        logger.debug(f"[P2P/ingest] TX: {te}")
+                tx['source'] = f"peer:{origin_peer}"
+                if _local_db_upsert_tx(db, tx):
+                    new_tx += 1
+            block = data.get('block')
+            if block and isinstance(block, dict):
+                block['_source'] = f"peer:{origin_peer}"
+                _local_db_upsert_block(db, block)
+                bh = int(block.get('height', block.get('header', {}).get('height', 0)))
+                bk = str(block.get('block_hash', block.get('header', {}).get('block_hash', '')))
+                on_block = getattr(self.server, 'on_block_event', None)
+                if on_block and bh > 0 and callable(on_block):
+                    try: on_block(bh, bk)
+                    except Exception: pass
+            if origin_peer and origin_peer != '?' and db:
                 try:
-                    mapped = Transaction(
-                        tx_id        = tx_hash, from_addr    = from_addr,
-                        to_addr      = to_addr, amount       = amount_b / 100,
-                        nonce        = int(tx.get('nonce', 0)),
-                        timestamp_ns = int(tx.get('timestamp_ns', int(time.time() * 1e9))),
-                        signature    = str(tx.get('signature', '')),
-                        fee          = float(tx.get('fee', 0.001)),
-                    )
-                    mp.add_transaction(mapped)
-                except Exception as te:
-                    logger.debug(f"[GOSSIP/ingest] TX→Mempool: {te}")
-            tx['source'] = f"peer:{origin_peer}"
-            if _local_db_upsert_tx(db, tx):
-                new_tx += 1
-
-        # ── Ingest block notification + cache it ──────────────────────────────
-        block = data.get('block')
-        if block and isinstance(block, dict):
-            block['_source'] = f"peer:{origin_peer}"
-            _local_db_upsert_block(db, block)
-            bh = int(block.get('height', block.get('header', {}).get('height', 0)))
-            bk = str(block.get('block_hash', block.get('header', {}).get('block_hash', '')))
-            on_block = getattr(self.server, 'on_block_event', None)
-            if on_block and bh > 0 and callable(on_block):
-                try: on_block(bh, bk)
-                except Exception as be:
-                    logger.debug(f"[GOSSIP/ingest] on_block_event: {be}")
-
-        # ── Update peer score for this origin ─────────────────────────────────
-        if origin_peer and origin_peer != '?' and db:
-            try:
-                gossip_url = str(data.get('origin', ''))
-                if gossip_url.startswith('http'):
-                    db.execute("""
-                        INSERT OR IGNORE INTO gossip_peers
+                    gu = str(data.get('origin', ''))
+                    if gu.startswith('http'):
+                        db.execute("""INSERT OR IGNORE INTO gossip_peers
                             (peer_id, gossip_url, block_height, last_seen)
-                        VALUES (?, ?, ?, strftime('%s','now'))
-                    """, (origin_peer, gossip_url,
-                          int(block.get('height', 0) if block else 0)))
-                    _local_db_record_peer_result(db, origin_peer, True, 0)
-            except Exception: pass
+                            VALUES (?,?,?,strftime('%s','now'))""",
+                            (origin_peer, gu, bh))
+                        _local_db_record_peer_result(db, origin_peer, True, 0)
+                except Exception: pass
+            self._send_json(200, {'ok': True, 'new_txs': new_tx})
 
-        if new_tx or block:
-            logger.info(
-                f"[GOSSIP/ingest] {new_tx} new TX(s) | "
-                f"{'block #' + str(bh) if block else 'no block'} "
-                f"from {origin_peer[:40]}"
-            )
-        self._send_json(200, {'ok': True, 'new_txs': new_tx})
+        elif path == '/api/peers/register':
+            data  = self._read_json_body() or {}
+            pid   = str(data.get('peer_id', ''))
+            gurl_peer = str(data.get('gossip_url', ''))
+            maddr = str(data.get('miner_address', ''))
+            bh    = int(data.get('block_height', 0))
+            caps  = data.get('capabilities', ['mine'])
+            if pid and gurl_peer and db:
+                try:
+                    from urllib.parse import urlparse as _up
+                    _p = _up(gurl_peer)
+                    _dht_upsert_peer(db=db, node_id=_dht_node_id(pid),
+                        address=_p.hostname or gurl_peer, gossip_port=_p.port or 9091,
+                        miner_address=maddr, local_node_id=node_id,
+                        capabilities=caps, block_height=bh, is_oracle='oracle' in caps)
+                except Exception as _e:
+                    logger.debug(f"[P2P/register] {_e}")
+            self._send_json(200, {'status': 'registered', 'peer_id': pid,
+                                   'live_peers': _local_db_get_best_peers(db, limit=20),
+                                   'sse_url': f"{gurl}/api/events", 'token': pid})
+
+        elif path == '/api/peers/heartbeat':
+            data = self._read_json_body() or {}
+            pid  = str(data.get('peer_id', ''))
+            bh   = int(data.get('block_height', 0))
+            if pid and db:
+                try:
+                    db.execute("UPDATE gossip_peers SET last_seen=strftime('%s','now'), block_height=? WHERE peer_id=?", (bh, pid))
+                    db.commit()
+                except Exception: pass
+            self._send_json(200, {'status': 'ok', 'ts': time.time()})
+
+        elif path == '/api/oracle/register':
+            data  = self._read_json_body() or {}
+            mid   = str(data.get('miner_id', data.get('peer_id', '')))
+            maddr = str(data.get('address', data.get('miner_address', '')))
+            if oracle is not None and mid and maddr:
+                oracle._registered_miners[mid] = {'miner_id': mid, 'address': maddr,
+                                                   'registered_at': time.time(), 'status': 'registered'}
+                self._send_json(200, {'status': 'registered', 'miner_id': mid, 'token': mid,
+                                      'sse_url': f"{gurl}/api/events"})
+            else:
+                self._send_json(503 if oracle is None else 400, {'error': 'not an oracle' if oracle is None else 'bad request'})
+
+        elif path == '/gossip/oracle_handshake':
+            if oracle is not None:
+                self._send_json(200, {**oracle.get_pq0_snapshot(), 'handshake': True})
+            else:
+                self._send_json(200, {'is_oracle': False, 'peer_id': peer_id,
+                                      'gossip_url': gurl, 'handshake': True})
+
+        elif path == '/gossip/dht_hello':
+            data = self._read_json_body() or {}
+            _handle_dht_hello(self, data)
+
+        elif path == '/gossip/dht_pex':
+            data = self._read_json_body() or {}
+            _handle_dht_pex(self, data)
+
+        else:
+            self._send_json(404, {'error': 'not found', 'path': path})
 
 
 class GossipListener:
     """
-    Starts a GossipHTTPHandler on a background daemon thread.
-    Probes ports 9001-9010 for an available one.
+    Unified P2P HTTP server — binds on a SINGLE port (default 9091).
+
+    Koyeb exposes one port per deployment. All peer traffic is path-multiplexed:
+        /gossip/*  /api/*  /health
+
+    No port scanning. No fallback. One socket, always 9091.
+    On oracle promotion, caller sets server.oracle_ref to activate /api/oracle/* routes.
     """
-    def __init__(self, mempool: 'Mempool', db, miner_address: str, peer_id: str,
-                 preferred_port: int = 9001):
+
+    UNIFIED_PORT = 9091
+
+    def __init__(self, mempool, db, miner_address: str, peer_id: str,
+                 preferred_port: int = 9091):
         self.mempool        = mempool
         self.db             = db
         self.miner_address  = miner_address
         self.peer_id        = peer_id
-        self.preferred_port = preferred_port
+        self.preferred_port = self.UNIFIED_PORT
         self.bound_port: Optional[int] = None
         self.gossip_url: str = ''
-        self._server: Optional[socketserver.TCPServer] = None
-        self._thread: Optional[threading.Thread] = None
-        self.on_block_event = None   # callable(height, block_hash)
+        self._server        = None
+        self._thread        = None
+        self.on_block_event = None
 
     def start(self) -> bool:
-        for port in range(self.preferred_port, self.preferred_port + 10):
-            try:
-                server = socketserver.TCPServer(('0.0.0.0', port), GossipHTTPHandler)
-                server.local_mempool  = self.mempool
-                server.local_db       = self.db
-                server.miner_address  = self.miner_address
-                server.peer_id        = self.peer_id
-                server.on_block_event = self.on_block_event
-                self._server   = server
-                self.bound_port = port
-                # Build public gossip URL — use env override if behind NAT/proxy
-                host = os.getenv('GOSSIP_PUBLIC_HOST', '')
-                if not host:
-                    try:
-                        import socket as _sock
-                        host = _sock.gethostbyname(_sock.gethostname())
-                    except Exception:
-                        host = '127.0.0.1'
-                self.gossip_url = f"http://{host}:{port}"
-                self._thread = threading.Thread(
-                    target=server.serve_forever, daemon=True, name=f"GossipListener:{port}"
-                )
-                self._thread.start()
-                logger.info(f"[GOSSIP] Listener on port {port} | url={self.gossip_url}")
-                return True
-            except OSError:
-                continue
-        logger.warning("[GOSSIP] Could not bind gossip listener on ports 9001-9010")
-        return False
+        port = self.UNIFIED_PORT
+        try:
+            socketserver.TCPServer.allow_reuse_address = True
+            server = socketserver.TCPServer(('0.0.0.0', port), GossipHTTPHandler)
+            server.local_mempool  = self.mempool
+            server.local_db       = self.db
+            server.miner_address  = self.miner_address
+            server.peer_id        = self.peer_id
+            server.local_node_id  = _dht_node_id(self.peer_id)
+            server.on_block_event = self.on_block_event
+            server.oracle_ref     = None
+            self._server    = server
+            self.bound_port = port
+            host = os.getenv('GOSSIP_PUBLIC_HOST', '')
+            if not host:
+                try:
+                    import socket as _sock
+                    host = _sock.gethostbyname(_sock.gethostname())
+                except Exception:
+                    host = '127.0.0.1'
+            self.gossip_url = f"http://{host}:{port}"
+            self._thread = threading.Thread(
+                target=server.serve_forever, daemon=True, name=f"UnifiedP2P:{port}"
+            )
+            self._thread.start()
+            logger.info(f"[P2P] ✅ Unified P2P server on :{port} | {self.gossip_url} | /gossip/* /api/* /health")
+            return True
+        except OSError as e:
+            logger.error(f"[P2P] ❌ Cannot bind port {port}: {e}  →  lsof -i :{port}")
+            return False
 
     def stop(self) -> None:
         if self._server:
-            try:
-                self._server.shutdown()
-            except Exception:
-                pass
+            try: self._server.shutdown()
+            except Exception: pass
+
+    def inject_oracle(self, oracle_ref) -> None:
+        """Activate /api/oracle/* routes without restart. Called on promotion."""
+        if self._server is not None:
+            self._server.oracle_ref = oracle_ref
+            logger.info(f"[P2P] 🌟 Oracle routes LIVE on :{self.bound_port} (/api/oracle/w-state etc.)")
 
 
 # ── SSESubscriber ─────────────────────────────────────────────────────────────
@@ -4060,7 +4344,7 @@ class P2PGossipOrchestrator:
     def __init__(self, oracle_url: str, miner_address: str,
                  mempool: 'Mempool', db,
                  on_block_event=None,
-                 gossip_port: int = 9001):
+                 gossip_port: int = 9091):
         self.oracle_url      = oracle_url
         self.miner_address   = miner_address
         self.mempool         = mempool
@@ -4174,7 +4458,7 @@ _DHT_SCHEMA_EXTENSION = """
 CREATE TABLE IF NOT EXISTS dht_peers (
     node_id         TEXT PRIMARY KEY,               -- SHA1(pubkey) 160-bit hex
     peer_address    TEXT NOT NULL,                  -- IP or hostname
-    gossip_port     INTEGER NOT NULL DEFAULT 9001,  -- gossip HTTP port
+    gossip_port     INTEGER NOT NULL DEFAULT 9091,  -- gossip HTTP port
     oracle_port     INTEGER,                        -- oracle REST port (NULL if not oracle)
     miner_address   TEXT NOT NULL DEFAULT '',       -- QTCL wallet address
     capabilities    TEXT NOT NULL DEFAULT '[]',     -- JSON array: ['mine','oracle','relay']
@@ -4303,18 +4587,17 @@ CREATE TABLE IF NOT EXISTS network_topology (
 
 
 def _apply_dht_schema(db: sqlite3.Connection) -> None:
-    """Apply DHT/Oracle/VirtualPQ schema extensions to the local database."""
+    """
+    Apply DHT/Oracle/VirtualPQ schema extensions.
+    All tables are now declared in SCHEMA_PATCHES so this simply calls
+    apply_schema_patches() with the given connection — idempotent and safe
+    to call even if patches already ran at startup via main().
+    """
     if db is None:
         return
-    try:
-        for stmt in _DHT_SCHEMA_EXTENSION.strip().split(';'):
-            s = stmt.strip()
-            if s and not s.startswith('--'):
-                db.execute(s)
-        db.commit()
-        logger.info("[DHT] ✅ Schema extensions applied (DHT, Oracle, VirtualPQ, Entanglement)")
-    except Exception as e:
-        logger.warning(f"[DHT] Schema extension warning: {e}")
+    apply_schema_patches(conn=db)
+    logger.debug("[DHT] ✅ Schema verified (via SCHEMA_PATCHES)")
+
 
 
 # ─── Kademlia XOR DHT Utilities ──────────────────────────────────────────────────────────────────
@@ -5074,6 +5357,7 @@ class OracleEligibilityEngine:
         self._is_oracle      = False
         self._oracle_started = False
         self._oracle_server: Optional['P2POracleServer'] = None
+        self._listener_ref: Optional['GossipListener'] = None   # set by QTCLP2PBundle
         self._start_time     = time.time()
         self._running        = False
         self._thread: Optional[threading.Thread] = None
@@ -5175,6 +5459,12 @@ class OracleEligibilityEngine:
             if self._oracle_server.start():
                 self._is_oracle       = True
                 self._oracle_started  = True
+
+                # Activate oracle routes on the unified 9091 server (no new port)
+                if self._listener_ref is not None:
+                    self._listener_ref.inject_oracle(self._oracle_server)
+                else:
+                    logger.warning("[ELIG] ⚠️  No listener_ref — oracle routes not yet active on HTTP server")
 
                 # Register self in oracle_registry
                 oracle_id = hashlib.sha256(self.miner_address.encode()).hexdigest()[:32]
@@ -5348,8 +5638,12 @@ class P2POracleServer:
     Uses http.server.BaseHTTPRequestHandler (same as GossipHTTPHandler).
     """
 
-    BASE_PORT    = 9100   # start scanning from 9100
-    MAX_PORT     = 9120
+    # P2POracleServer no longer binds its own port.
+    # Oracle routes (/api/oracle/*) are activated on the unified 9091 server
+    # via GossipListener.inject_oracle(self) when this node is promoted.
+    # BASE_PORT / MAX_PORT kept for backwards compat but unused.
+    BASE_PORT    = 9091
+    MAX_PORT     = 9091
 
     def __init__(self, db: sqlite3.Connection, vpm: 'VirtualPseudoqubitManager',
                  local_node_id: str, miner_address: str, oracle_id: str):
@@ -5358,32 +5652,21 @@ class P2POracleServer:
         self.local_node_id  = local_node_id
         self.miner_address  = miner_address
         self.oracle_id      = oracle_id
-        self.port: Optional[int] = None
-        self._server: Optional[socketserver.TCPServer] = None
-        self._thread: Optional[threading.Thread] = None
+        self.port: Optional[int] = 9091     # always the unified port
+        self._server        = None          # no separate server — uses GossipListener's
+        self._thread        = None
         self._running       = False
         self._registered_miners: Dict[str, Dict] = {}
 
     def start(self) -> bool:
-        """Bind to an available port and start serving."""
-        for port in range(self.BASE_PORT, self.MAX_PORT):
-            try:
-                server = socketserver.TCPServer(('0.0.0.0', port), self._make_handler())
-                server.oracle_server_ref = self  # inject self into handler
-                self._server = server
-                self.port    = port
-                self._running = True
-                self._thread  = threading.Thread(
-                    target=server.serve_forever, daemon=True,
-                    name=f'P2POracleServer:{port}'
-                )
-                self._thread.start()
-                logger.info(f"[P2PORACLE] 🌐 P2P Oracle Server on port {port}")
-                return True
-            except OSError:
-                continue
-        logger.error("[P2PORACLE] ❌ Could not bind P2P oracle server (ports 9100-9120 all busy)")
-        return False
+        """
+        Oracle 'start' no longer binds a port.
+        The caller (OracleEligibilityEngine) is responsible for calling
+        GossipListener.inject_oracle(self) to activate routes on the unified server.
+        """
+        self._running = True
+        logger.info(f"[P2PORACLE] 🌟 Oracle state ready | routes activate on unified :{self.port}")
+        return True
 
     def stop(self) -> None:
         self._running = False
@@ -5672,7 +5955,7 @@ class DHTExchangeManager:
                     _dht_upsert_peer(
                         db=self.db, node_id=node_id,
                         address=parsed.hostname or gurl,
-                        gossip_port=parsed.port or 9001,
+                        gossip_port=parsed.port or 9091,
                         miner_address=p.get('miner_address', ''),
                         local_node_id=self.local_node_id,
                         capabilities=p.get('capabilities', ['mine']),
@@ -5757,7 +6040,7 @@ class DHTExchangeManager:
                             _dht_upsert_peer(
                                 db=self.db, node_id=nid,
                                 address=addr,
-                                gossip_port=int(tp.get('gossip_port', 9001)),
+                                gossip_port=int(tp.get('gossip_port', 9091)),
                                 miner_address=tp.get('miner_address', ''),
                                 local_node_id=self.local_node_id,
                                 capabilities=tp.get('capabilities', []),
@@ -5894,7 +6177,7 @@ def _handle_dht_hello(handler, data: dict) -> None:
     remote_ip         = handler.client_address[0] if handler.client_address else ''
 
     # Parse gossip URL for address/port
-    gossip_port = 9001
+    gossip_port = 9091
     peer_address = remote_ip
     if requester_gossip:
         try:
@@ -5965,7 +6248,7 @@ def _handle_dht_pex(handler, data: dict) -> None:
             _dht_upsert_peer(
                 db=db, node_id=requester_node_id,
                 address=p.hostname or handler.client_address[0],
-                gossip_port=p.port or 9001,
+                gossip_port=p.port or 9091,
                 miner_address=requester_addr,
                 local_node_id=local_nid,
                 capabilities=['mine'],
@@ -5995,70 +6278,6 @@ def _handle_dht_pex(handler, data: dict) -> None:
     })
 
 
-# Monkey-patch GossipHTTPHandler to support DHT routes
-_original_gossip_do_post = GossipHTTPHandler.do_POST
-_original_gossip_do_get  = GossipHTTPHandler.do_GET
-
-
-def _patched_do_post(self):
-    path = _urlparse.urlparse(self.path).path
-    if path == '/gossip/dht_hello':
-        data = self._read_json_body()
-        if data:
-            _handle_dht_hello(self, data)
-        else:
-            self._send_json(400, {'error': 'bad body'})
-        return
-    if path == '/gossip/dht_pex':
-        data = self._read_json_body()
-        if data:
-            _handle_dht_pex(self, data)
-        else:
-            self._send_json(400, {'error': 'bad body'})
-        return
-    # Delegate to original
-    _original_gossip_do_post(self)
-
-
-def _patched_do_get(self):
-    path = _urlparse.urlparse(self.path).path
-    if path == '/gossip/dht_peers':
-        db    = getattr(self.server, 'local_db', None)
-        nid   = getattr(self.server, 'local_node_id', '')
-        peers = _dht_closest_peers(db, nid, k=50)
-        self._send_json(200, {'peers': peers, 'count': len(peers)})
-        return
-    if path == '/gossip/topology':
-        db = getattr(self.server, 'local_db', None)
-        try:
-            cur = db.execute("SELECT COUNT(*) FROM dht_peers WHERE last_seen > ?",
-                              (time.time() - 300,)) if db else None
-            n = cur.fetchone()[0] if cur else 0
-        except Exception:
-            n = 0
-        self._send_json(200, {'live_peers': n, 'node_id': getattr(self.server,'local_node_id','')})
-        return
-    _original_gossip_do_get(self)
-
-
-GossipHTTPHandler.do_POST = _patched_do_post
-GossipHTTPHandler.do_GET  = _patched_do_get
-
-
-# ─── GossipListener extended: inject local_node_id + gossip_url ──────────────────────────────────
-_orig_GossipListener_start = GossipListener.start
-
-
-def _patched_GossipListener_start(self) -> bool:
-    result = _orig_GossipListener_start(self)
-    if result and self._server:
-        # Inject additional server attrs consumed by DHT handlers
-        self._server.local_node_id = _dht_node_id(self.peer_id)
-        self._server.gossip_url    = self.gossip_url
-    return result
-
-
-GossipListener.start = _patched_GossipListener_start
 
 
 # ─── Complete P2P + DHT orchestration bundle ─────────────────────────────────────────────────────
@@ -6385,6 +6604,9 @@ class QTCLFullNode:
                 bound_gossip = self._gossip.get_gossip_url()
                 self._p2p_bundle.gossip_url     = bound_gossip
                 self._p2p_bundle.dht.gossip_url = bound_gossip
+                # Give eligibility engine a reference to the live listener so
+                # inject_oracle() can activate routes without binding a new port
+                self._p2p_bundle.elig._listener_ref = self._gossip._listener
                 try:
                     snap = self.w_state_recovery.current_snapshot
                     if snap:
@@ -7671,6 +7893,11 @@ def parse_args():
     parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
     parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',help='W-state fidelity threshold mode: strict (F>=0.90), normal (F>=0.80, recommended), relaxed (F>=0.70)')
     parser.add_argument('--strict-w-verification',action='store_true',default=False,help='Enable strict W-state verification (rejects marginal states)')
+    parser.add_argument('--p2p-api-port',type=int,default=9091,
+                        help='Port for local P2P REST API (other nodes contact you here, default 9091). '
+                             'Set this to a port your firewall allows for incoming connections.')
+    parser.add_argument('--oracle-min-peers',type=int,default=7,
+                        help='Minimum DHT peers required before this node can self-promote to oracle (default 7)')
     return parser.parse_args()
 
 def main():
@@ -7899,25 +8126,25 @@ def main():
             logger.error(f"[DB] ❌ Database initialization failed: {e}")
             traceback.print_exc()   # module already imported at top-level — NO local re-import
             sys.exit(1)
-        
+
+        # ─── SCHEMA PATCHES ─── MUST run before QTCLFullNode init (QTCLP2PBundle needs tables) ──
+        logger.info("[INIT] 🔧 Applying database schema patches...")
+        apply_schema_patches()      # covers all tables including DHT/Oracle/VirtualPQ
+
         node=QTCLFullNode(
             miner_address=address,
             oracle_url=args.oracle_url,
             difficulty=args.difficulty,
             db_connection=db
         )
-        
+
         node.fidelity_mode = args.fidelity_mode
         node.strict_verification = args.strict_w_verification
-        
+
         logger.info(f"[INIT] W-state fidelity mode: {args.fidelity_mode}")
         if args.strict_w_verification:
             logger.warning("[INIT] Strict W-state verification enabled")
-        
-        # ─── SCHEMA PATCHES ─────────────────────────────────────────────────────────────
-        logger.info("[INIT] 🔧 Applying database schema patches...")
-        apply_schema_patches()
-        
+
         # ─── P2P INITIALIZATION SEQUENCE ────────────────────────────────────────────
         logger.info("[P2P] 🚀 Initializing P2P network layer...")
         
@@ -7951,26 +8178,44 @@ def main():
         logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
 
         # 5. Sync chain height from oracle / peers
+        # Short initial timeout (3s) — Koyeb free tier may be cold-starting.
+        # Mining starts from local state immediately; background sync catches up.
         current_height = 0
-        p2p_success = False
+        p2p_success    = False
 
-        logger.info("[P2P] 📊 Querying oracle for current block height...")
-        current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
+        logger.info("[P2P] 📊 Querying oracle for current block height (3s timeout — non-blocking)...")
+        current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
 
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
         else:
-            logger.warning("[P2P] ⚠️  Could not get height from oracle, attempting peer discovery...")
-
-            # Try peer discovery as fallback
-            logger.info("[P2P] 🔍 Discovering other peers...")
-            discovered = _P2P_CLIENT.discover_peers(timeout=5)
+            logger.info(
+                "[P2P] ℹ️  Oracle cold-starting or unreachable — mining from local state. "
+                "Background sync will catch up within 30s."
+            )
+            # Try peer-to-peer height discovery (no oracle needed)
+            discovered = _P2P_CLIENT.discover_peers(timeout=3)
             if discovered:
                 _P2P_CLIENT.known_peers.extend(discovered)
-                logger.info(f"[P2P] ✅ Discovered {len(discovered)} additional peers")
-                # Retry height query with freshly discovered peers
-                current_height = _P2P_CLIENT.get_block_height(timeout=8, oracle_url=oracle_url)
-        
+                current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
+                if current_height:
+                    logger.info(f"[P2P] ✅ Got height from peers: {current_height}")
+
+            # Fallback: read local DB height — always available
+            if not current_height:
+                try:
+                    cursor = db.cursor()
+                    cursor.execute("SELECT MAX(height) FROM blocks")
+                    result = cursor.fetchone()
+                    if result and result[0] is not None:
+                        current_height = int(result[0])
+                        logger.info(f"[P2P] 📦 Mining from local DB height: {current_height}")
+                    else:
+                        current_height = 0
+                        logger.info("[P2P] 📦 No local blocks — starting genesis mining")
+                except Exception:
+                    current_height = 0
+
         if current_height is not None and current_height > 0:
             logger.info(f"[P2P] ✅ P2P sync: Current height = {current_height}")
 
@@ -8103,19 +8348,37 @@ def main():
         
         # ─── START PERIODIC PEER SYNC ───────────────────────────────────────────────
         _PEER_SYNC.start()
-        
+
         logger.info("[INIT] ✨ P2P layer, consensus, and signing initialized and monitoring started")
-        
+
+        # ── Apply CLI overrides to P2P bundle before start ────────────────────────
+        if node._p2p_bundle is not None:
+            # --p2p-api-port: set oracle server base port (where peers call us)
+            node._p2p_bundle.elig._oracle_server_port_override = args.p2p_api_port
+            if hasattr(node._p2p_bundle.elig, '_oracle_server') and \
+               node._p2p_bundle.elig._oracle_server is not None:
+                node._p2p_bundle.elig._oracle_server.BASE_PORT = args.p2p_api_port
+            # Also patch class default so any future P2POracleServer uses this port
+            P2POracleServer.BASE_PORT = args.p2p_api_port
+            P2POracleServer.MAX_PORT  = args.p2p_api_port + 10
+            # --oracle-min-peers: override promotion threshold
+            node._p2p_bundle.elig.ORACLE_FULL_THRESHOLD = args.oracle_min_peers
+            node._p2p_bundle.elig.ORACLE_PEER_THRESHOLD = max(1, args.oracle_min_peers // 2)
+            logger.info(
+                f"[P2P-BUNDLE] ⚙️  CLI config | p2p-api-port={args.p2p_api_port} | "
+                f"oracle-min-peers={args.oracle_min_peers}"
+            )
+
         # 6. Start node (W-state recovery, blockchain sync, mining)
         if not node.start():
             logger.error("[MAIN] ❌ Failed to start node")
             sys.exit(1)
-        
+
         # 🎯 START BACKGROUND LOOPS AFTER node.start() so they can access node.db
         p2p_monitor_thread.start()
         oracle_sync_thread.start()
         logger.info("[MONITORING] 🔄 Started: P2P monitor, Oracle real-time sync")
-        
+
         logger.info("[MAIN] 🎯 Mining loop started in foreground")
         
         while True:
