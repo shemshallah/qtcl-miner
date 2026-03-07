@@ -2463,48 +2463,41 @@ class P2PClientWStateRecovery:
     def _normalize_snapshot(data: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
         """Normalize any oracle endpoint response to the canonical snapshot shape.
 
-        pq0-bloch returns: {pq0_bloch_theta, pq0_bloch_phi, w3_fidelity, coherence,
-                            negativity, qfi, discord, purity, block_height, ...}
-        w-state / pq0 return: {fidelity, w_state_fidelity, coherence, ...}
-
-        Canonical shape (what recover_w_state expects):
-          fidelity, coherence, timestamp_ns, block_height, oracle_address,
-          w_entropy_hash, hlwe_signature, signature_valid, pq_current, pq_last
+        pq0-bloch: {w3_fidelity, coherence, pq0_bloch_theta/phi, ...}
+        w-state/pq0: {fidelity, w_state_fidelity, coherence, ...}
+        → canonical: fidelity, coherence, timestamp_ns, block_height,
+                     w_entropy_hash, hlwe_signature, signature_valid
         """
+        import hashlib as _hl   # local — module-level _hlib is del'd after LATTICE_FINGERPRINT
         out = dict(data)
 
-        # ── fidelity normalisation ─────────────────────────────────────────
-        if 'fidelity' not in out or not out['fidelity']:
-            # pq0-bloch uses w3_fidelity; w-state uses w_state_fidelity
+        # ── fidelity ──────────────────────────────────────────────────────
+        if not out.get('fidelity'):
             out['fidelity'] = float(
-                out.get('w3_fidelity') or
-                out.get('w_state_fidelity') or
+                out.get('w3_fidelity') or out.get('w_state_fidelity') or
                 out.get('pq0_fidelity') or 0.90
             )
 
-        # ── coherence normalisation ────────────────────────────────────────
-        if 'coherence' not in out or not out['coherence']:
+        # ── coherence ─────────────────────────────────────────────────────
+        if not out.get('coherence'):
             out['coherence'] = float(out.get('coherence_l1') or 0.85)
 
         # ── timestamp ─────────────────────────────────────────────────────
         if 'timestamp_ns' not in out:
             out['timestamp_ns'] = int(time.time() * 1e9)
 
-        # ── hlwe_signature stub if absent (pq0-bloch omits it) ────────────
-        if 'hlwe_signature' not in out or not out.get('hlwe_signature'):
+        # ── hlwe_signature stub (pq0-bloch omits it) ──────────────────────
+        if not out.get('hlwe_signature'):
             w_ent = out.get('w_entropy_hash') or secrets.token_hex(32)
-            out['w_entropy_hash']  = w_ent
-            out['hlwe_signature']  = {
-                'commitment':      _hlib.sha3_256(w_ent.encode()).hexdigest(),
-                'witness':         _hlib.sha3_256(
-                                       (w_ent + (out.get('oracle_address') or '')).encode()
-                                   ).hexdigest(),
+            addr  = (out.get('oracle_address') or 'oracle').encode()
+            out['w_entropy_hash'] = w_ent
+            out['hlwe_signature'] = {
+                'commitment':      _hl.sha3_256(w_ent.encode()).hexdigest(),
+                'witness':         _hl.sha3_256(w_ent.encode() + addr).hexdigest(),
                 'proof':           secrets.token_hex(32),
                 'w_entropy_hash':  w_ent,
                 'derivation_path': "m/838'/0'/0'",
-                'public_key_hex':  _hlib.sha3_256(
-                                       (out.get('oracle_address') or 'oracle').encode()
-                                   ).hexdigest(),
+                'public_key_hex':  _hl.sha3_256(addr).hexdigest(),
             }
             out['signature_valid'] = True
 
