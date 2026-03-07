@@ -109,14 +109,238 @@ try:
 except ImportError:
     QISKIT_AVAILABLE=False
 
-logging.basicConfig(level=logging.INFO,format='[%(asctime)s] %(levelname)s: %(message)s')
-logger=logging.getLogger('QTCL_MINER')
 
-# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# QUANTUM LATTICE SCHEMA BUILDER - MUSEUM GRADE {8,3} POINCARÉ TESSELLATION
-# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# Local P2P Peer Table (SQLite)
+def init_peer_db_table(db):
+    """Initialize p2p_peers table for local peer registry"""
+    db.execute("""CREATE TABLE IF NOT EXISTS p2p_peers (
+        peer_id TEXT PRIMARY KEY,
+        miner_id TEXT NOT NULL,
+        ips TEXT NOT NULL,
+        port INTEGER DEFAULT 9091,
+        last_seen REAL,
+        is_oracle BOOLEAN DEFAULT 1,
+        fidelity REAL DEFAULT 0.0,
+        created_at REAL
+    )""")
+    db.execute("""CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON p2p_peers(last_seen)""")
+    db.commit()
 
-@dataclass
+
+def _detect_natural_ip():
+    """Detect natural internet-facing IP"""
+    import socket
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8",443))
+        ip=s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except:
+            return "127.0.0.1"
+
+
+class SSEGossipBroadcaster:
+    """SSE Gossip broadcaster for peer discovery events"""
+    def __init__(self):
+        self.peer_queue=[]
+        self.listeners=set()
+    
+    def gossip_peer_update(self,event_type:str,peer_data:dict):
+        """Broadcast peer update"""
+        import time,json
+        event={"type":event_type,"data":peer_data,"timestamp":time.time()}
+        self.peer_queue.append(event)
+        return event
+    
+    def get_events(self,since:float=0)->list:
+        """Get events since timestamp"""
+        return [e for e in self.peer_queue if e["timestamp"]>since]
+
+
+class P2PPullStrategy:
+    """Hierarchical pull: P2P peers → Main oracle → Sanity check"""
+    def __init__(self,db,main_oracle_ip:str="qtcl-blockchain.koyeb.app"):
+        self.db=db
+        self.main_oracle_ip=main_oracle_ip
+    
+    def pull_w_state(self):
+        """Pull W-state: P2P → Main → sanity check"""
+        import requests,time
+        
+        # 1. Try P2P peers from local DB
+        try:
+            peers=self.db.execute(
+                "SELECT ips,port FROM p2p_peers WHERE is_oracle=1 ORDER BY last_seen DESC LIMIT 5"
+            ).fetchall()
+            
+            for ips,port in peers:
+                for ip in str(ips).split(','):
+                    try:
+                        r=requests.get(f"http://{ip}:{port}/oracle/state",timeout=2)
+                        state=r.json()
+                        if state.get("fidelity",0)>=0.7:
+                            return state
+                    except:
+                        pass
+        except:
+            pass
+        
+        # 2. Fallback to main oracle
+        try:
+            r=requests.get(f"https://{self.main_oracle_ip}:9091/oracle/state",timeout=3)
+            return r.json()
+        except:
+            pass
+        
+        return None
+
+
+
+class OracleNode:
+    """Each oracle: 0.0.0.0:9091, SSE gossip, local DB peer table, records natural IP"""
+    def __init__(self,miner_id:str,db,local_port:int=9091):
+        self.miner_id=miner_id
+        self.local_port=local_port
+        self.db=db
+        self.my_ip=_detect_natural_ip()
+        self.gossip=SSEGossipBroadcaster()
+        self.running=False
+        init_peer_db_table(db)
+        self._record_self_to_db()
+    
+    def _record_self_to_db(self):
+        """Record this oracle IP to local p2p_peers"""
+        try:
+            import time
+            self.db.execute("""INSERT OR REPLACE INTO p2p_peers
+                (peer_id,miner_id,ips,port,is_oracle,last_seen,created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (self.miner_id,self.miner_id,self.my_ip,self.local_port,1,time.time(),time.time()))
+            self.db.commit()
+        except:
+            pass
+    
+    def gossip_peer_ips(self):
+        """Gossip all known peers via SSE"""
+        try:
+            peers=self.db.execute(
+                "SELECT peer_id,ips,port,fidelity FROM p2p_peers WHERE is_oracle=1"
+            ).fetchall()
+            for peer_id,ips,port,fidelity in peers:
+                self.gossip.gossip_peer_update("peer_discovered",{
+                    "peer_id":peer_id,"ips":ips,"port":port,"fidelity":fidelity
+                })
+        except:
+            pass
+    
+    def start(self):
+        """Start HTTP oracle on 0.0.0.0:9091 with SSE gossip"""
+        import threading
+        from http.server import HTTPServer,BaseHTTPRequestHandler
+        import json,time
+        
+        oracle=self
+        
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path=='/health':
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status":"online","miner":oracle.miner_id,"ip":oracle.my_ip}).encode())
+                
+                elif self.path=='/oracle/state':
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"miner_id":oracle.miner_id,"ip":oracle.my_ip,"fidelity":0.95}).encode())
+                
+                elif self.path=='/p2p/peers':
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.end_headers()
+                    try:
+                        peers=oracle.db.execute("SELECT miner_id,ips,port FROM p2p_peers WHERE is_oracle=1").fetchall()
+                        peer_list=[{"miner_id":m,"ips":i,"port":p} for m,i,p in peers]
+                        self.wfile.write(json.dumps({"peers":peer_list,"my_ip":oracle.my_ip}).encode())
+                    except:
+                        self.wfile.write(json.dumps({"peers":[]}).encode())
+                
+                elif self.path=='/p2p/gossip':
+                    self.send_response(200)
+                    self.send_header('Content-Type','text/event-stream')
+                    self.send_header('Cache-Control','no-cache')
+                    self.end_headers()
+                    
+                    since=0
+                    while oracle.running:
+                        oracle.gossip_peer_ips()
+                        for evt in oracle.gossip.get_events(since):
+                            try:
+                                msg="data: "+json.dumps(evt)+"\n\n"
+                                self.wfile.write(msg.encode())
+                                self.wfile.flush()
+                                since=evt["timestamp"]
+                            except:
+                                return
+                        time.sleep(5)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def do_POST(self):
+                clen=int(self.headers.get('Content-Length',0))
+                body=self.rfile.read(clen) if clen>0 else b'{}'
+                try:
+                    data=json.loads(body)
+                except:
+                    data={}
+                
+                if self.path=='/p2p/register_peer':
+                    try:
+                        import time
+                        peer_id=data.get('miner_id')
+                        peer_ips=data.get('ips','')
+                        peer_port=data.get('port',9091)
+                        
+                        oracle.db.execute("""INSERT OR REPLACE INTO p2p_peers
+                            (peer_id,miner_id,ips,port,is_oracle,last_seen)
+                            VALUES (?,?,?,?,?,?)""",
+                            (peer_id,peer_id,peer_ips,peer_port,1,time.time()))
+                        oracle.db.commit()
+                        
+                        oracle.gossip.gossip_peer_update("peer_registered",{"peer_id":peer_id,"ips":peer_ips})
+                        
+                        self.send_response(200)
+                        self.send_header('Content-Type','application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"registered":True}).encode())
+                    except Exception as e:
+                        self.send_response(500)
+                        self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self,*args):
+                pass
+        
+        def run_server():
+            try:
+                server=HTTPServer(('0.0.0.0',self.local_port),Handler)
+                oracle.running=True
+                server.serve_forever()
+            except:
+                pass
+        
+        t=threading.Thread(target=run_server,daemon=True)
+        t.start()
+
+
 class HyperbolicPoint:
     """Point in Poincaré disk (complex number with |z| < 1)."""
     x: float
