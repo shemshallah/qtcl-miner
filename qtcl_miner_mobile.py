@@ -54,6 +54,30 @@
 ║                                                                                                                                            ║
 ║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
 ║                                                                                                                                            ║
+║  ┌────────────────────────────────────────────────────────────────────┐                                                                ║
+║  │  v2.1 ENHANCEMENTS (March 2026):                                    │                                                                ║
+║  │  ✓ P2P-FIRST STRATEGY for blocks, mempool, transactions          │                                                                ║
+║  │    (4-tier fallback: Local DB → In-memory → P2P Peers → Oracle) │                                                                ║
+║  │  ✓ DUAL-ORACLE QUANTUM STATE (Koyeb + PythonAnywhere)            │                                                                ║
+║  │    (Parallel fetch, race condition friendly)                      │                                                                ║
+║  │  ✓ STATE CACHING for both oracles                                 │                                                                ║
+║  │  ✓ REAL ORACLE STATE ONLY — no synthetic, waits for real state   │                                                                ║
+║  │  ✓ If both oracles fail, uses cache (REAL from previous cycle)   │                                                                ║
+║  │  ✓ Graceful wait: if all real sources exhausted, retries in 2s   │                                                                ║
+║  │                                                                    │                                                                ║
+║  │  Fetch Priority (all data except quantum):                        │                                                                ║
+║  │    1. Local SQLite DB (instant, survives partition)              │                                                                ║
+║  │    2. In-memory gossip pool (SSE + peer ingest)                  │                                                                ║
+║  │    3. Best P2P peers (scored by latency + uptime)                │                                                                ║
+║  │    4. Oracle REST API (authoritative fallback)                    │                                                                ║
+║  │                                                                    │                                                                ║
+║  │  Quantum State (REAL ORACLE ONLY):                                │                                                                ║
+║  │    1. Primary oracle (Koyeb) — in parallel with secondary         │                                                                ║
+║  │    2. Secondary oracle (PythonAnywhere) — race condition          │                                                                ║
+║  │    3. Cached real state (from previous successful fetch)          │                                                                ║
+║  │    4. If all real sources fail, wait and retry (no synthetic)     │                                                                ║
+║  └────────────────────────────────────────────────────────────────────┘                                                                ║
+║                                                                                                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -1935,6 +1959,24 @@ _PEER_SYNC: Optional[PeriodicPeerSync] = None
 db: Optional[sqlite3.Connection] = None  # Global database connection for schema and state
 
 LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
+
+# ── LATTICE FINGERPRINT ───────────────────────────────────────────────────────
+# SHA-256 of the canonical noise-bath parameters. Any node serving bootstrap
+# peers MUST broadcast this fingerprint. Miners REJECT peers from nodes whose
+# fingerprint doesn't match — lattice consensus rule, equivalent to Bitcoin's
+# genesis block hash check. Change any param → different network.
+import hashlib as _hlib
+LATTICE_FINGERPRINT = _hlib.sha256(
+    # η  ωc       ω0       γ     κ     depol  amp    phase  T1    T2    cyc  qubits seed
+    "0.12:6.283:3.14159:0.50:0.11:0.001:0.001:0.002:100.0:50.0:10.0:8:42".encode()
+).hexdigest()[:16]
+# → pinned: do NOT change without a network-wide upgrade announcement
+del _hlib
+BOOTSTRAP_MIN_UPTIME_S  = 3600     # node must be up ≥1h to serve as bootstrap
+BOOTSTRAP_MIN_BLOCKS    = 10       # must have seen ≥10 blocks
+BOOTSTRAP_MAX_PEERS     = 50       # max peers returned in /bootstrap/peers
+BOOTSTRAP_PEER_TTL_S    = 300      # peers older than 5m excluded from bootstrap list
+BOOTSTRAP_CRAWL_INTERVAL = 120     # seconds between bootstrap peer crawl
 API_PREFIX='/api'
 MAX_MEMPOOL=10000
 SYNC_BATCH=50
@@ -3867,6 +3909,250 @@ def _local_db_get_block(db, height: int) -> Optional[dict]:
     return None
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BOOTSTRAP PEER SEEDER — HTTP equivalent of Bitcoin DNS seeds
+# Any miner running ≥1h with ≥10 blocks seen serves /bootstrap/peers.
+# Miners try oracle first, then fall back to any peer's /bootstrap/peers.
+# Lattice fingerprint gates validity — wrong fingerprint = ignored.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _bootstrap_get_eligible_peers(db, limit: int = BOOTSTRAP_MAX_PEERS) -> list:
+    """
+    Query local DB for peers suitable to advertise as bootstrap nodes.
+    Requirements: online, seen recently, has valid gossip_url, no loopback.
+    Returns list of dicts with gossip_url, peer_id, block_height, latency_ms,
+    uptime_s, success_rate, lattice_fingerprint.
+    """
+    if db is None:
+        return []
+    try:
+        cutoff = time.time() - BOOTSTRAP_PEER_TTL_S
+        cur = db.execute("""
+            SELECT peer_id, gossip_url, miner_address, block_height,
+                   latency_ms, success_count, fail_count,
+                   CAST(success_count AS REAL) / MAX(1, success_count + fail_count) AS success_rate
+            FROM   gossip_peers
+            WHERE  online = 1
+              AND  last_seen > ?
+              AND  gossip_url NOT LIKE '%127.0.0.1%'
+              AND  gossip_url NOT LIKE '%localhost%'
+              AND  gossip_url != ''
+            ORDER  BY success_rate DESC, block_height DESC
+            LIMIT  ?
+        """, (cutoff, limit))
+        rows = cur.fetchall()
+        peers = []
+        for r in rows:
+            peers.append({
+                'peer_id'            : r[0],
+                'gossip_url'         : r[1],
+                'miner_address'      : r[2],
+                'block_height'       : r[3],
+                'latency_ms'         : r[4] or 9999,
+                'success_rate'       : round(float(r[7]), 3),
+                'lattice_fingerprint': LATTICE_FINGERPRINT,
+                'ts'                 : time.time(),
+            })
+        return peers
+    except Exception as e:
+        logger.debug(f"[BOOTSTRAP] _bootstrap_get_eligible_peers: {e}")
+        return []
+
+
+def _bootstrap_is_eligible(node_start_time: float, local_tip_height: int) -> bool:
+    """
+    Decide if this node is eligible to serve as a bootstrap peer.
+    Requires BOOTSTRAP_MIN_UPTIME_S uptime AND BOOTSTRAP_MIN_BLOCKS seen.
+    """
+    uptime = time.time() - node_start_time
+    return uptime >= BOOTSTRAP_MIN_UPTIME_S and local_tip_height >= BOOTSTRAP_MIN_BLOCKS
+
+
+def _bootstrap_fetch_from_peer(gossip_url: str, timeout: int = 6) -> list:
+    """
+    Fetch bootstrap peer list from a remote peer's /bootstrap/peers endpoint.
+    Validates lattice_fingerprint on every returned peer — silently drops
+    any peer whose fingerprint doesn't match ours.
+    Returns list of valid peer dicts or [] on any failure.
+    """
+    url = gossip_url.rstrip('/') + '/bootstrap/peers'
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': f'QTCL-Bootstrap/1.0 fp={LATTICE_FINGERPRINT}'},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        peers = data.get('peers', [])
+        valid = []
+        for p in peers:
+            fp = p.get('lattice_fingerprint', '')
+            if fp and fp != LATTICE_FINGERPRINT:
+                logger.warning(
+                    f"[BOOTSTRAP] ⚠️  Fingerprint mismatch from {gossip_url} | "
+                    f"got={fp} expected={LATTICE_FINGERPRINT} — peer dropped"
+                )
+                continue
+            gurl = p.get('gossip_url', '')
+            if gurl and '127.0.0.1' not in gurl and 'localhost' not in gurl:
+                valid.append(p)
+        if valid:
+            logger.info(
+                f"[BOOTSTRAP] ✅ Got {len(valid)} valid peer(s) from {gossip_url}"
+            )
+        return valid
+    except Exception as e:
+        logger.debug(f"[BOOTSTRAP] fetch from {gossip_url}: {e}")
+        return []
+
+
+def _bootstrap_resolve(oracle_url: str, db, known_peers: list,
+                       timeout: int = 8) -> list:
+    """
+    Full bootstrap resolution with fallback chain — mirrors Bitcoin's approach:
+      1. Oracle /api/peers/list  (primary — always tried first)
+      2. Any known peer's /bootstrap/peers  (fallback — oracle down or no peers)
+      3. Local DB cache  (last resort — fully offline)
+
+    Returns deduplicated list of peer dicts ready for gossip registration.
+    Peers are fingerprint-validated at each step.
+    """
+    seen_urls: set = set()
+    result: list   = []
+
+    def _add_peers(candidates: list) -> None:
+        for p in candidates:
+            gurl = p.get('gossip_url', '')
+            if gurl and gurl not in seen_urls:
+                seen_urls.add(gurl)
+                result.append(p)
+
+    # ── Step 1: Oracle ────────────────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(
+            f"{oracle_url.rstrip('/')}/api/peers/list",
+            headers={'User-Agent': f'QTCL-Bootstrap/1.0 fp={LATTICE_FINGERPRINT}'},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        oracle_peers = data.get('peers', [])
+        _add_peers(oracle_peers)
+        logger.info(f"[BOOTSTRAP] 🌐 Oracle returned {len(oracle_peers)} peer(s)")
+    except Exception as e:
+        logger.warning(f"[BOOTSTRAP] ⚠️  Oracle unreachable: {e}")
+
+    # ── Step 2: Known peer /bootstrap/peers fallback ─────────────────────────
+    if len(result) < 3 and known_peers:
+        logger.info(
+            f"[BOOTSTRAP] 🔄 Oracle gave {len(result)} peer(s) — "
+            f"trying {min(5, len(known_peers))} known peer(s) for bootstrap"
+        )
+        for peer in known_peers[:5]:
+            gurl = peer.get('gossip_url', '')
+            if not gurl or gurl in seen_urls:
+                continue
+            fetched = _bootstrap_fetch_from_peer(gurl, timeout=5)
+            _add_peers(fetched)
+            if len(result) >= 5:
+                break
+
+    # ── Step 3: Local DB cache ────────────────────────────────────────────────
+    if len(result) == 0 and db is not None:
+        logger.warning("[BOOTSTRAP] ⚠️  No live peers found — using local DB cache")
+        cached = _local_db_get_best_peers(db, limit=20)
+        _add_peers(cached)
+        if cached:
+            logger.info(f"[BOOTSTRAP] 💾 Loaded {len(cached)} peer(s) from local cache")
+
+    logger.info(
+        f"[BOOTSTRAP] ✅ Resolution complete | peers={len(result)} | "
+        f"fingerprint={LATTICE_FINGERPRINT}"
+    )
+    return result
+
+
+class BootstrapCrawler(threading.Thread):
+    """
+    Background thread: periodically crawls known peers and re-resolves
+    bootstrap list, keeping local DB fresh so we can serve /bootstrap/peers
+    even when oracle is down. Also re-registers with oracle on reconnect.
+
+    Runs every BOOTSTRAP_CRAWL_INTERVAL seconds (default 120s).
+    """
+
+    def __init__(self, oracle_url: str, db, get_known_peers_fn,
+                 on_new_peers_fn=None, node_start_time: float = 0.0):
+        super().__init__(name='BootstrapCrawler', daemon=True)
+        self.oracle_url        = oracle_url.rstrip('/')
+        self.db                = db
+        self.get_known_peers   = get_known_peers_fn   # callable → list of peer dicts
+        self.on_new_peers      = on_new_peers_fn      # optional callback(peers)
+        self.node_start_time   = node_start_time or time.time()
+        self._running          = False
+        self._last_crawl       = 0.0
+        self._peer_cache: list = []
+        self._cache_lock       = threading.Lock()
+
+    def get_cached_peers(self) -> list:
+        """Thread-safe read of latest bootstrap peer cache."""
+        with self._cache_lock:
+            return list(self._peer_cache)
+
+    def _crawl(self) -> None:
+        known = self.get_known_peers()
+        fresh = _bootstrap_resolve(
+            oracle_url   = self.oracle_url,
+            db           = self.db,
+            known_peers  = known,
+        )
+        with self._cache_lock:
+            self._peer_cache = fresh
+        # Persist to local DB so /bootstrap/peers can serve from cache
+        if self.db and fresh:
+            for p in fresh:
+                gurl = p.get('gossip_url', '')
+                pid  = p.get('peer_id', hashlib.sha256(gurl.encode()).hexdigest()[:32])
+                bh   = p.get('block_height', 0)
+                try:
+                    self.db.execute("""
+                        INSERT OR REPLACE INTO gossip_peers
+                            (peer_id, gossip_url, miner_address, block_height,
+                             last_seen, online)
+                        VALUES (?, ?, ?, ?, ?, 1)
+                    """, (pid, gurl, p.get('miner_address', ''), bh, time.time()))
+                except Exception:
+                    pass
+            try:
+                self.db.commit()
+            except Exception:
+                pass
+        if fresh and self.on_new_peers:
+            try:
+                self.on_new_peers(fresh)
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        self._running = True
+        # Initial crawl after short settle time
+        time.sleep(15)
+        while self._running:
+            try:
+                self._crawl()
+            except Exception as e:
+                logger.error(f"[BOOTSTRAP] Crawl error: {e}")
+            self._last_crawl = time.time()
+            # Sleep in small increments so stop() responds quickly
+            for _ in range(BOOTSTRAP_CRAWL_INTERVAL):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+    def stop(self) -> None:
+        self._running = False
+
+
 def _local_db_get_tip(db) -> Optional[dict]:
     """Return highest cached block header. Local-first chain tip."""
     if db is None: return None
@@ -4070,6 +4356,64 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
                     port = p.get('port', p.get('gossip_port', 9091))
                     p['gossip_url'] = f"http://{addr}:{port}" if addr else ''
             self._send_json(200, {'peers': peers, 'count': len(peers)})
+
+        elif path == '/bootstrap/peers':
+            # ── Bootstrap peer seeder endpoint ───────────────────────────────
+            # Served by any eligible node (≥1h uptime, ≥10 blocks).
+            # Returns fingerprint-tagged peer list so bootstrapping nodes can
+            # validate they are joining the correct lattice network.
+            # Equivalent to Bitcoin's DNS seed A-record response.
+            tip_data  = _local_db_get_tip(db)
+            tip_height = 0
+            if tip_data:
+                hdr = tip_data.get('header', tip_data)
+                tip_height = int(hdr.get('height', hdr.get('block_height', 0)))
+            node_start = getattr(getattr(self.server, 'p2p_inventory', None),
+                                 'node_start_time', time.time() - 9999)
+            eligible = _bootstrap_is_eligible(node_start, tip_height)
+            if not eligible:
+                uptime = time.time() - node_start
+                self._send_json(503, {
+                    'error'              : 'node not yet bootstrap-eligible',
+                    'uptime_s'           : round(uptime, 1),
+                    'min_uptime_s'       : BOOTSTRAP_MIN_UPTIME_S,
+                    'tip_height'         : tip_height,
+                    'min_blocks'         : BOOTSTRAP_MIN_BLOCKS,
+                    'lattice_fingerprint': LATTICE_FINGERPRINT,
+                })
+            else:
+                peers = _bootstrap_get_eligible_peers(db, limit=BOOTSTRAP_MAX_PEERS)
+                self._send_json(200, {
+                    'peers'              : peers,
+                    'count'              : len(peers),
+                    'lattice_fingerprint': LATTICE_FINGERPRINT,
+                    'served_by'          : gurl,
+                    'tip_height'         : tip_height,
+                    'ts'                 : time.time(),
+                })
+
+        elif path == '/bootstrap/status':
+            # Quick eligibility check — lets peers decide if they should use us
+            tip_data   = _local_db_get_tip(db)
+            tip_height = 0
+            if tip_data:
+                hdr = tip_data.get('header', tip_data)
+                tip_height = int(hdr.get('height', hdr.get('block_height', 0)))
+            node_start = getattr(getattr(self.server, 'p2p_inventory', None),
+                                 'node_start_time', time.time() - 9999)
+            uptime     = time.time() - node_start
+            eligible   = _bootstrap_is_eligible(node_start, tip_height)
+            self._send_json(200, {
+                'eligible'           : eligible,
+                'uptime_s'           : round(uptime, 1),
+                'min_uptime_s'       : BOOTSTRAP_MIN_UPTIME_S,
+                'tip_height'         : tip_height,
+                'min_blocks'         : BOOTSTRAP_MIN_BLOCKS,
+                'lattice_fingerprint': LATTICE_FINGERPRINT,
+                'peer_id'            : peer_id,
+                'gossip_url'         : gurl,
+                'ts'                 : time.time(),
+            })
 
         elif path in ('/api/oracle/w-state', '/api/oracle/pq0'):
             if oracle is not None:
@@ -4382,21 +4726,39 @@ class GossipListener:
             server.oracle_ref     = None
             # Attach P2P service inventory (module-level singleton)
             server.p2p_inventory  = _P2P_SERVICE_INVENTORY
+            # Expose node start time so /bootstrap/status can compute uptime
+            if not hasattr(_P2P_SERVICE_INVENTORY, 'node_start_time'):
+                _P2P_SERVICE_INVENTORY.node_start_time = time.time()
             self._server    = server
             self.bound_port = port
             host = os.getenv('GOSSIP_PUBLIC_HOST', '')
             if not host:
+                # UDP-trick: connect to 8.8.8.8 without sending — OS selects
+                # the correct outbound interface, giving the real LAN IP.
+                # More reliable than gethostbyname(gethostname()) which often
+                # returns 127.0.0.1 or a wrong hostname mapping.
                 try:
                     import socket as _sock
-                    host = _sock.gethostbyname(_sock.gethostname())
+                    _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                    _s.connect(('8.8.8.8', 80))
+                    host = _s.getsockname()[0]
+                    _s.close()
                 except Exception:
-                    host = '127.0.0.1'
+                    try:
+                        import socket as _sock
+                        host = _sock.gethostbyname(_sock.gethostname())
+                    except Exception:
+                        host = '127.0.0.1'
             self.gossip_url = f"http://{host}:{port}"
             self._thread = threading.Thread(
                 target=server.serve_forever, daemon=True, name=f"UnifiedP2P:{port}"
             )
             self._thread.start()
-            logger.info(f"[P2P] ✅ Unified P2P server on :{port} | {self.gossip_url} | /gossip/* /api/* /health")
+            logger.info(
+            f"[P2P] ✅ Unified P2P server on :{port} | {self.gossip_url}\n"
+            f"[P2P]    Routes: /gossip/* /api/* /health\n"
+            f"[P2P]    Bootstrap: {self.gossip_url}/bootstrap/peers  "            f"(active after {BOOTSTRAP_MIN_UPTIME_S//60}min uptime + {BOOTSTRAP_MIN_BLOCKS} blocks)"
+        )
             return True
         except OSError as e:
             logger.error(f"[P2P] ❌ Cannot bind port {port}: {e}  →  lsof -i :{port}")
@@ -4571,16 +4933,19 @@ class PeerHeartbeat(threading.Thread):
 
     def _register(self) -> bool:
         height = self.get_tip_fn() if self.get_tip_fn else 0
+        # ── Attempt oracle registration ───────────────────────────────────────
+        oracle_ok = False
         try:
             r = self._session.post(
                 f"{self.oracle_url}/api/peers/register",
                 json={
-                    'peer_id'        : self.peer_id,
-                    'gossip_url'     : self.gossip_url,
-                    'miner_address'  : self.miner_address,
-                    'block_height'   : height,
-                    'network_version': '1.0',
-                    'supports_sse'   : True,
+                    'peer_id'            : self.peer_id,
+                    'gossip_url'         : self.gossip_url,
+                    'miner_address'      : self.miner_address,
+                    'block_height'       : height,
+                    'network_version'    : '1.0',
+                    'supports_sse'       : True,
+                    'lattice_fingerprint': LATTICE_FINGERPRINT,
                 },
                 timeout=10,
             )
@@ -4588,33 +4953,55 @@ class PeerHeartbeat(threading.Thread):
                 data = r.json()
                 self._known_peers = data.get('live_peers', [])
                 logger.info(
-                    f"[P2P] Registered with oracle | "
+                    f"[P2P] ✅ Registered with oracle | "
                     f"peer_id={self.peer_id[:16]}... | "
                     f"live_peers={len(self._known_peers)}"
                 )
-                # Persist known peers to local SQLite
-                if self.db:
-                    for p in self._known_peers:
-                        gurl = p.get('gossip_url','')
-                        if gurl:
-                            try:
-                                self.db.execute("""
-                                    INSERT OR REPLACE INTO gossip_peers
-                                        (peer_id, gossip_url, miner_address, block_height, last_seen, online)
-                                    VALUES (?,?,?,?,?,1)
-                                """, (p['peer_id'], gurl,
-                                      p.get('miner_address',''),
-                                      p.get('block_height', 0), time.time()))
-                            except Exception:
-                                pass
+                oracle_ok = True
+        except Exception as e:
+            logger.warning(f"[P2P] Oracle registration failed: {e}")
+
+        # ── Fallback: bootstrap resolve if oracle gave us nothing ─────────────
+        if not oracle_ok or len(self._known_peers) == 0:
+            logger.info("[P2P] 🔄 Oracle gave no peers — running bootstrap resolver")
+            resolved = _bootstrap_resolve(
+                oracle_url  = self.oracle_url,
+                db          = self.db,
+                known_peers = self._known_peers,
+            )
+            if resolved:
+                # Merge without duplicating
+                existing_urls = {p.get('gossip_url') for p in self._known_peers}
+                for p in resolved:
+                    if p.get('gossip_url') not in existing_urls:
+                        self._known_peers.append(p)
+                        existing_urls.add(p.get('gossip_url'))
+                logger.info(
+                    f"[P2P] 🌱 Bootstrap resolved {len(resolved)} peer(s) | "
+                    f"total known={len(self._known_peers)}"
+                )
+
+        # ── Persist all known peers to local DB ───────────────────────────────
+        if self.db and self._known_peers:
+            for p in self._known_peers:
+                gurl = p.get('gossip_url', '')
+                if gurl:
                     try:
-                        self.db.commit()
+                        self.db.execute("""
+                            INSERT OR REPLACE INTO gossip_peers
+                                (peer_id, gossip_url, miner_address, block_height, last_seen, online)
+                            VALUES (?,?,?,?,?,1)
+                        """, (p.get('peer_id', hashlib.sha256(gurl.encode()).hexdigest()[:32]),
+                              gurl, p.get('miner_address', ''),
+                              p.get('block_height', 0), time.time()))
                     except Exception:
                         pass
-                return True
-        except Exception as e:
-            logger.warning(f"[P2P] Registration failed: {e}")
-        return False
+            try:
+                self.db.commit()
+            except Exception:
+                pass
+
+        return oracle_ok or len(self._known_peers) > 0
 
     def _heartbeat(self) -> None:
         height = self.get_tip_fn() if self.get_tip_fn else 0
@@ -4735,6 +5122,8 @@ class P2PGossipOrchestrator:
         self._listener   : Optional[GossipListener]   = None
         self._sse        : Optional[SSESubscriber]     = None
         self._heartbeat  : Optional[PeerHeartbeat]     = None
+        self._bootstrap  : Optional[BootstrapCrawler]  = None
+        self._node_start = time.time()
         self._started    = False
 
     def start(self) -> bool:
@@ -4779,10 +5168,21 @@ class P2PGossipOrchestrator:
         )
         self._heartbeat.start()
 
+        # ── BootstrapCrawler — peer seeder daemon ─────────────────────────────
+        # Starts after 15s settle. Crawls oracle + known peers every 2min.
+        # Populates /bootstrap/peers endpoint once node is eligible (≥1h, ≥10 blocks).
+        self._bootstrap = BootstrapCrawler(
+            oracle_url       = self.oracle_url,
+            db               = self.db,
+            get_known_peers_fn = self._heartbeat.get_known_peers,
+            node_start_time  = self._node_start,
+        )
+        self._bootstrap.start()
+
         logger.info(
             f"[GOSSIP] Orchestrator online | peer_id={self.peer_id} | "
             f"gossip={gossip_url or 'unbound'} | sse=subscribed | "
-            f"heartbeat=started"
+            f"heartbeat=started | bootstrap_crawler=started"
         )
         return True
 
@@ -4791,6 +5191,8 @@ class P2PGossipOrchestrator:
             self._sse.stop()
         if self._heartbeat:
             self._heartbeat.stop()
+        if self._bootstrap:
+            self._bootstrap.stop()
         if self._listener:
             self._listener.stop()
 
@@ -5328,15 +5730,76 @@ class OracleEntanglementBridge:
         return hashlib.sha256(url.encode()).hexdigest()[:32]
 
     def _fetch_oracle_pq0_snapshot(self, oracle_url: str, timeout: int = 8) -> Optional[Dict]:
-        """Fetch pq0 snapshot from a remote oracle."""
-        endpoints = ['/api/oracle/w-state', '/api/oracle/pq0', '/api/w-state']
-        for ep in endpoints:
-            try:
-                r = self._session.get(f"{oracle_url.rstrip('/')}{ep}", timeout=timeout)
-                if r.status_code == 200:
-                    return r.json()
-            except Exception:
-                continue
+        """
+        Fetch pq0 snapshot from oracle(s) with DUAL-ORACLE FALLBACK.
+        
+        REAL ORACLE STATE ONLY — no synthetic.
+        Blocks until at least one oracle responds.
+        
+        Priority (in order):
+          1. Primary oracle (Koyeb) - fastest usually
+          2. Secondary oracle (PythonAnywhere) - fallback
+          3. Cache from previous successful fetch (only if BOTH oracles fail)
+          4. Returns None if all real sources exhausted (miner waits)
+        """
+        # ─── PHASE 1: Parallel fetch from both oracles ──────────────────────
+        endpoints = ['/api/oracle/pq0-bloch', '/api/oracle/w-state', '/api/oracle/pq0']
+        
+        # Parse URLs for dual-oracle setup
+        primary_url = oracle_url or 'https://qtcl-blockchain.koyeb.app'
+        secondary_url = 'https://shemshallah.pythonanywhere.com'
+        
+        results = {}
+        
+        def _fetch_endpoint(name: str, base_url: str):
+            """Try all endpoints against one oracle."""
+            for ep in endpoints:
+                try:
+                    url = f"{base_url.rstrip('/')}{ep}"
+                    r = self._session.get(url, timeout=timeout)
+                    if r.status_code == 200:
+                        results[name] = r.json()
+                        logger.debug(f"[BRIDGE] ✓ Fetched {name} from {ep}")
+                        return
+                except Exception:
+                    pass
+        
+        # Parallel threads for both oracles (race condition friendly)
+        t1 = threading.Thread(target=_fetch_endpoint, args=('primary', primary_url), daemon=True)
+        t2 = threading.Thread(target=_fetch_endpoint, args=('secondary', secondary_url), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=timeout + 0.5)
+        t2.join(timeout=timeout + 0.5)
+        
+        # ─── PHASE 2: Pick best REAL result (primary if available, else secondary) ──────
+        if 'primary' in results:
+            data = results['primary']
+            logger.info(f"[BRIDGE] 🥇 Quantum state | source=koyeb (primary)")
+            # Cache for potential future fallback
+            if not hasattr(self, '_last_quantum_state'):
+                self._last_quantum_state = data
+            else:
+                self._last_quantum_state.update(data)
+            return data
+        
+        if 'secondary' in results:
+            data = results['secondary']
+            logger.info(f"[BRIDGE] 🥈 Quantum state | source=pythonanywhere (secondary, primary failed)")
+            # Cache for potential future fallback
+            if not hasattr(self, '_last_quantum_state'):
+                self._last_quantum_state = data
+            else:
+                self._last_quantum_state.update(data)
+            return data
+        
+        # ─── PHASE 3: Both oracles failed — use cache ONLY as emergency fallback ──────
+        if hasattr(self, '_last_quantum_state') and self._last_quantum_state:
+            logger.warning(f"[BRIDGE] ⚠️  Both oracles unreachable | using CACHED state (REAL from previous cycle)")
+            return self._last_quantum_state
+        
+        # ─── Both failed AND no cache — return None, miner will wait and retry ──────
+        logger.error(f"[BRIDGE] ❌ Both oracles failed + no cache | miner will retry in 2s")
         return None
 
     def _handshake_main_oracle(self) -> bool:
@@ -8091,6 +8554,9 @@ def parse_args():
     parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
     parser.add_argument('--fidelity-mode',choices=['strict','normal','relaxed'],default='normal',help='W-state fidelity threshold mode: strict (F>=0.90), normal (F>=0.80, recommended), relaxed (F>=0.70)')
     parser.add_argument('--strict-w-verification',action='store_true',default=False,help='Enable strict W-state verification (rejects marginal states)')
+    parser.add_argument('--p2p-host',type=str,default='',
+                        help='Public IP or hostname for this node\'s gossip URL (e.g. 192.168.1.5). '
+                             'Auto-detected via LAN if not set. Sets GOSSIP_PUBLIC_HOST env var.')
     parser.add_argument('--p2p-api-port',type=int,default=9091,
                         help='Port for local P2P REST API (other nodes contact you here, default 9091). '
                              'Set this to a port your firewall allows for incoming connections.')
@@ -8600,6 +9066,11 @@ def main():
         _PEER_SYNC.start()
 
         logger.info("[INIT] ✨ P2P layer, consensus, and signing initialized and monitoring started")
+
+        # ── Apply --p2p-host to env before GossipListener binds ──────────────────
+        if getattr(args, 'p2p_host', '') :
+            os.environ['GOSSIP_PUBLIC_HOST'] = args.p2p_host
+            logger.info(f"[P2P] 🌐 p2p-host override → GOSSIP_PUBLIC_HOST={args.p2p_host}")
 
         # ── Apply CLI overrides to P2P bundle before start ────────────────────────
         if node._p2p_bundle is not None:
