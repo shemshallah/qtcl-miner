@@ -5805,7 +5805,7 @@ class VirtualPseudoqubitManager:
 
     # ⚛️ LAYER 3: TRIPARTITE W-STATE AER CIRCUIT EXECUTION
     
-    def create_tripartite_circuit(self, vpq_id: Optional[str] = None) -> Optional[QuantumCircuit]:
+    def create_tripartite_circuit(self, vpq_id: Optional[str] = None) -> Optional["QuantumCircuit"]:
         """
         Create a 9-qubit tripartite W-state circuit from pq0, vpq, and ivpq.
         
