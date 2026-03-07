@@ -1958,11 +1958,11 @@ _CONSENSUS_MGR: Optional[ConsensusManager] = None
 _PEER_SYNC: Optional[PeriodicPeerSync] = None
 db: Optional[sqlite3.Connection] = None  # Global database connection for schema and state
 
-# ⚛️ BUGFIX: Use local port 8000 for oracle REST, not 443 (Koyeb HTTPS)
-# For development/testing: http://localhost:8000
-# For production: http://qtcl-blockchain.koyeb.app:8000 or custom oracle URL
-LIVE_NODE_URL='http://localhost:8000'  # LOCAL DEVELOPMENT
-# LIVE_NODE_URL='http://qtcl-blockchain.koyeb.app:8000'  # PRODUCTION
+# ⚛️ ORACLE URL: 
+# For Koyeb: Use your app URL (e.g., https://qtcl-blockchain.koyeb.app)
+# Koyeb routes /api/* to port 9091, / to port 8000 internally
+# You MUST specify your actual oracle server URL via --oracle-url or set environment variable
+LIVE_NODE_URL='http://localhost:8000'  # CHANGE THIS OR PASS --oracle-url
 
 # ── LATTICE FINGERPRINT ───────────────────────────────────────────────────────
 # SHA-256 of the canonical noise-bath parameters. Any node serving bootstrap
@@ -8973,7 +8973,9 @@ def parse_args():
     """Parse CLI arguments for QTCL Miner with enterprise-grade validation."""
     parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url','-o',default='http://localhost:8000',help='Oracle URL (for W-state recovery) - default: http://localhost:8000 (use http://qtcl-blockchain.koyeb.app:8000 for production)')
+    parser.add_argument('--oracle-url','-o',
+                       default=os.getenv('ORACLE_URL', ''),  # Check env var first
+                       help='Oracle URL (REQUIRED) - e.g., https://your-koyeb-app-url. Can set via ORACLE_URL env var')
     parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
@@ -9232,6 +9234,14 @@ def main():
         # ─── SCHEMA PATCHES ─── MUST run before QTCLFullNode init (QTCLP2PBundle needs tables) ──
         logger.info("[INIT] 🔧 Applying database schema patches...")
         apply_schema_patches()      # covers all tables including DHT/Oracle/VirtualPQ
+
+        # ⚛️ CRITICAL: Validate oracle_url is specified
+        if not args.oracle_url or args.oracle_url.strip() == '':
+            logger.error("[INIT] ❌ ORACLE_URL REQUIRED")
+            logger.error("[INIT] ❌ You must specify --oracle-url or set ORACLE_URL environment variable")
+            logger.error("[INIT] ❌ Example: python qtcl_miner_mobile.py --address qtcl1... --oracle-url https://your-koyeb-app-url")
+            logger.error("[INIT] ❌ Or: export ORACLE_URL=https://your-koyeb-app-url && python qtcl_miner_mobile.py --address qtcl1...")
+            sys.exit(1)
 
         node=QTCLFullNode(
             miner_address=address,
