@@ -101,7 +101,6 @@ except ImportError:
     logger=logging.getLogger('QTCL_MINER')
     logger.warning("[MINER] python-socketio not available - will use HTTP-only registration")
 
-
 try:
     from qiskit import QuantumCircuit, execute
     from qiskit.providers.aer import AerSimulator
@@ -109,238 +108,15 @@ try:
 except ImportError:
     QISKIT_AVAILABLE=False
 
+import logging
+logging.basicConfig(level=logging.INFO,format='[%(asctime)s] %(levelname)s: %(message)s')
+logger=logging.getLogger('QTCL_MINER')
 
-# Local P2P Peer Table (SQLite)
-def init_peer_db_table(db):
-    """Initialize p2p_peers table for local peer registry"""
-    db.execute("""CREATE TABLE IF NOT EXISTS p2p_peers (
-        peer_id TEXT PRIMARY KEY,
-        miner_id TEXT NOT NULL,
-        ips TEXT NOT NULL,
-        port INTEGER DEFAULT 9091,
-        last_seen REAL,
-        is_oracle BOOLEAN DEFAULT 1,
-        fidelity REAL DEFAULT 0.0,
-        created_at REAL
-    )""")
-    db.execute("""CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON p2p_peers(last_seen)""")
-    db.commit()
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# QUANTUM LATTICE SCHEMA BUILDER - MUSEUM GRADE {8,3} POINCARÉ TESSELLATION
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-
-def _detect_natural_ip():
-    """Detect natural internet-facing IP"""
-    import socket
-    try:
-        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8",443))
-        ip=s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except:
-            return "127.0.0.1"
-
-
-class SSEGossipBroadcaster:
-    """SSE Gossip broadcaster for peer discovery events"""
-    def __init__(self):
-        self.peer_queue=[]
-        self.listeners=set()
-    
-    def gossip_peer_update(self,event_type:str,peer_data:dict):
-        """Broadcast peer update"""
-        import time,json
-        event={"type":event_type,"data":peer_data,"timestamp":time.time()}
-        self.peer_queue.append(event)
-        return event
-    
-    def get_events(self,since:float=0)->list:
-        """Get events since timestamp"""
-        return [e for e in self.peer_queue if e["timestamp"]>since]
-
-
-class P2PPullStrategy:
-    """Hierarchical pull: P2P peers → Main oracle → Sanity check"""
-    def __init__(self,db,main_oracle_ip:str="qtcl-blockchain.koyeb.app"):
-        self.db=db
-        self.main_oracle_ip=main_oracle_ip
-    
-    def pull_w_state(self):
-        """Pull W-state: P2P → Main → sanity check"""
-        import requests,time
-        
-        # 1. Try P2P peers from local DB
-        try:
-            peers=self.db.execute(
-                "SELECT ips,port FROM p2p_peers WHERE is_oracle=1 ORDER BY last_seen DESC LIMIT 5"
-            ).fetchall()
-            
-            for ips,port in peers:
-                for ip in str(ips).split(','):
-                    try:
-                        r=requests.get(f"http://{ip}:{port}/oracle/state",timeout=2)
-                        state=r.json()
-                        if state.get("fidelity",0)>=0.7:
-                            return state
-                    except:
-                        pass
-        except:
-            pass
-        
-        # 2. Fallback to main oracle
-        try:
-            r=requests.get(f"https://{self.main_oracle_ip}:9091/oracle/state",timeout=3)
-            return r.json()
-        except:
-            pass
-        
-        return None
-
-
-
-class OracleNode:
-    """Each oracle: 0.0.0.0:9091, SSE gossip, local DB peer table, records natural IP"""
-    def __init__(self,miner_id:str,db,local_port:int=9091):
-        self.miner_id=miner_id
-        self.local_port=local_port
-        self.db=db
-        self.my_ip=_detect_natural_ip()
-        self.gossip=SSEGossipBroadcaster()
-        self.running=False
-        init_peer_db_table(db)
-        self._record_self_to_db()
-    
-    def _record_self_to_db(self):
-        """Record this oracle IP to local p2p_peers"""
-        try:
-            import time
-            self.db.execute("""INSERT OR REPLACE INTO p2p_peers
-                (peer_id,miner_id,ips,port,is_oracle,last_seen,created_at)
-                VALUES (?,?,?,?,?,?,?)""",
-                (self.miner_id,self.miner_id,self.my_ip,self.local_port,1,time.time(),time.time()))
-            self.db.commit()
-        except:
-            pass
-    
-    def gossip_peer_ips(self):
-        """Gossip all known peers via SSE"""
-        try:
-            peers=self.db.execute(
-                "SELECT peer_id,ips,port,fidelity FROM p2p_peers WHERE is_oracle=1"
-            ).fetchall()
-            for peer_id,ips,port,fidelity in peers:
-                self.gossip.gossip_peer_update("peer_discovered",{
-                    "peer_id":peer_id,"ips":ips,"port":port,"fidelity":fidelity
-                })
-        except:
-            pass
-    
-    def start(self):
-        """Start HTTP oracle on 0.0.0.0:9091 with SSE gossip"""
-        import threading
-        from http.server import HTTPServer,BaseHTTPRequestHandler
-        import json,time
-        
-        oracle=self
-        
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path=='/health':
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status":"online","miner":oracle.miner_id,"ip":oracle.my_ip}).encode())
-                
-                elif self.path=='/oracle/state':
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"miner_id":oracle.miner_id,"ip":oracle.my_ip,"fidelity":0.95}).encode())
-                
-                elif self.path=='/p2p/peers':
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    try:
-                        peers=oracle.db.execute("SELECT miner_id,ips,port FROM p2p_peers WHERE is_oracle=1").fetchall()
-                        peer_list=[{"miner_id":m,"ips":i,"port":p} for m,i,p in peers]
-                        self.wfile.write(json.dumps({"peers":peer_list,"my_ip":oracle.my_ip}).encode())
-                    except:
-                        self.wfile.write(json.dumps({"peers":[]}).encode())
-                
-                elif self.path=='/p2p/gossip':
-                    self.send_response(200)
-                    self.send_header('Content-Type','text/event-stream')
-                    self.send_header('Cache-Control','no-cache')
-                    self.end_headers()
-                    
-                    since=0
-                    while oracle.running:
-                        oracle.gossip_peer_ips()
-                        for evt in oracle.gossip.get_events(since):
-                            try:
-                                msg="data: "+json.dumps(evt)+"\n\n"
-                                self.wfile.write(msg.encode())
-                                self.wfile.flush()
-                                since=evt["timestamp"]
-                            except:
-                                return
-                        time.sleep(5)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            
-            def do_POST(self):
-                clen=int(self.headers.get('Content-Length',0))
-                body=self.rfile.read(clen) if clen>0 else b'{}'
-                try:
-                    data=json.loads(body)
-                except:
-                    data={}
-                
-                if self.path=='/p2p/register_peer':
-                    try:
-                        import time
-                        peer_id=data.get('miner_id')
-                        peer_ips=data.get('ips','')
-                        peer_port=data.get('port',9091)
-                        
-                        oracle.db.execute("""INSERT OR REPLACE INTO p2p_peers
-                            (peer_id,miner_id,ips,port,is_oracle,last_seen)
-                            VALUES (?,?,?,?,?,?)""",
-                            (peer_id,peer_id,peer_ips,peer_port,1,time.time()))
-                        oracle.db.commit()
-                        
-                        oracle.gossip.gossip_peer_update("peer_registered",{"peer_id":peer_id,"ips":peer_ips})
-                        
-                        self.send_response(200)
-                        self.send_header('Content-Type','application/json')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"registered":True}).encode())
-                    except Exception as e:
-                        self.send_response(500)
-                        self.end_headers()
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            
-            def log_message(self,*args):
-                pass
-        
-        def run_server():
-            try:
-                server=HTTPServer(('0.0.0.0',self.local_port),Handler)
-                oracle.running=True
-                server.serve_forever()
-            except:
-                pass
-        
-        t=threading.Thread(target=run_server,daemon=True)
-        t.start()
-
-
+@dataclass
 class HyperbolicPoint:
     """Point in Poincaré disk (complex number with |z| < 1)."""
     x: float
@@ -369,7 +145,6 @@ class HyperbolicPoint:
     def from_polar(r: float, theta: float) -> 'HyperbolicPoint':
         return HyperbolicPoint(r * math.cos(theta), r * math.sin(theta))
 
-
 @dataclass
 class HyperbolicTriangle:
     """Triangle in {8,3} tessellation."""
@@ -384,7 +159,6 @@ class HyperbolicTriangle:
     
     def area(self) -> float:
         return (math.pi / 4) / (2 ** self.depth)
-
 
 class PoincareHyperbolicTessellator:
     """Builds {8,3} regular tessellation of Poincaré disk."""
@@ -448,7 +222,6 @@ class PoincareHyperbolicTessellator:
             triangles.extend(subdivide_recursive(rotated_tri))
         self.triangles = triangles
         return triangles
-
 
 class QuantumLatticeSchemaBuilder:
     """Builds museum-grade quantum lattice database with hyperbolic tessellation."""
@@ -736,7 +509,6 @@ class QuantumLatticeSchemaBuilder:
         if self.conn:
             self.conn.close()
 
-
 # Initialize quantum lattice database BEFORE anything else
 _SCHEMA_BUILDER = QuantumLatticeSchemaBuilder('data/qtcl_blockchain.db')
 _SCHEMA_BUILDER.initialize_schema()
@@ -777,7 +549,6 @@ class P2PMessage:
             block_data=d.get('block_data'),
             payload=d.get('payload')
         )
-
 
 class P2PClient:
     """
@@ -898,10 +669,8 @@ class P2PClient:
                     logger.debug(f"[P2P] sync_blocks #{height} from {base}: {e}")
         return blocks
 
-
 # ── P2P Client global (set in main) ──────────────────────────────────────────
 _P2P_CLIENT: Optional["P2PClient"] = None
-
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # HLWE TRANSACTION SIGNING & ORACLE BROADCAST LAYER
@@ -969,7 +738,6 @@ class HLWETransactionSigner:
         
         except Exception as e:
             return False, f"verification_error: {e}"
-
 
 class OracleBroadcaster:
     """Broadcasts signed transactions and blocks to Oracle (main database)."""
@@ -1203,7 +971,6 @@ class OracleBroadcaster:
             )
         return stats
 
-
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # P2P SERVICE REQUEST INVENTORY — per-client request tracking, sub-logic dispatch, circuit-breaker, metrics
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1252,7 +1019,6 @@ class P2PServiceRequest:
         self.latency_ms   = (self.completed_at - self.initiated_at) * 1000
         self.status       = status
         self.response_summary = summary[:200]
-
 
 class P2PServiceInventory:
     """
@@ -1732,10 +1498,8 @@ class P2PServiceInventory:
                 f"(streak={cb['fail_streak']})"
             )
 
-
 # Module-level singleton — injected into QTCLFullNode and GossipHTTPHandler
 _P2P_SERVICE_INVENTORY: Optional[P2PServiceInventory] = None
-
 
 # Schema patch definitions (run on DB init)
 SCHEMA_PATCHES = {
@@ -2094,8 +1858,6 @@ def detect_oracle_url() -> str:
         except Exception:
             pass
 
-
-
 class ConsensusManager:
     """Manages consensus on system metrics across peer network."""
     
@@ -2161,7 +1923,6 @@ class ConsensusManager:
                 except Exception as e:
                     logger.debug(f"[CONSENSUS] Failed to update metric: {e}")
 
-
 class PeriodicPeerSync:
     """Periodic synchronization with peers to maintain consensus."""
     
@@ -2226,7 +1987,6 @@ class PeriodicPeerSync:
         """Stop periodic sync."""
         self.running = False
         logger.info("[CONSENSUS] 🛑 Periodic peer sync stopped")
-
 
 # Global instances
 _TX_SIGNER: Optional[HLWETransactionSigner] = None
@@ -2534,7 +2294,6 @@ class CoinbaseTx:
             'signature':    self.signature,
         }
 
-
 def build_coinbase_tx(height: int, miner_address: str, w_entropy_hash: str,
                       fee_total_base: int = 0) -> CoinbaseTx:
     """
@@ -2592,7 +2351,6 @@ class Block:
 # ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE P2P CLIENT — Recovery, entanglement, SSE snapshot sync
 # ═════════════════════════════════════════════════════════════════════════════════
-
 
 class P2PClientWStateRecovery:
     """
@@ -3991,6 +3749,152 @@ class Mempool:
 # QUANTUM MINER WITH W-STATE ENTANGLEMENT
 # ═════════════════════════════════════════════════════════════════════════════════
 
+# Local P2P Peer Table
+def init_peer_db_table(db):
+    """Initialize p2p_peers table"""
+    db.execute("""CREATE TABLE IF NOT EXISTS p2p_peers (
+        peer_id TEXT PRIMARY KEY, miner_id TEXT NOT NULL, ips TEXT NOT NULL,
+        port INTEGER DEFAULT 9091, last_seen REAL, is_oracle BOOLEAN DEFAULT 1,
+        fidelity REAL DEFAULT 0.0, created_at REAL)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON p2p_peers(last_seen)""")
+    db.commit()
+
+def _detect_natural_ip():
+    """Detect natural internet-facing IP"""
+    import socket
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8",443))
+        ip=s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except:
+            return "127.0.0.1"
+
+class SSEGossipBroadcaster:
+    """SSE gossip broadcaster"""
+    def __init__(self):
+        self.peer_queue=[]
+    def gossip_peer_update(self,event_type:str,peer_data:dict):
+        import time,json
+        event={"type":event_type,"data":peer_data,"timestamp":time.time()}
+        self.peer_queue.append(event)
+    def get_events(self,since:float=0)->list:
+        return [e for e in self.peer_queue if e["timestamp"]>since]
+
+class P2PPullStrategy:
+    """P2P-first pull: Peers → Main → sanity check"""
+    def __init__(self,db,main_oracle_ip:str="qtcl-blockchain.koyeb.app"):
+        self.db=db
+        self.main_oracle_ip=main_oracle_ip
+    def pull_w_state(self):
+        import requests
+        try:
+            peers=self.db.execute(
+                "SELECT ips,port FROM p2p_peers WHERE is_oracle=1 ORDER BY last_seen DESC LIMIT 5"
+            ).fetchall()
+            for ips,port in peers:
+                for ip in str(ips).split(','):
+                    try:
+                        r=requests.get(f"http://{ip}:{port}/oracle/state",timeout=2)
+                        state=r.json()
+                        if state.get("fidelity",0)>=0.7:
+                            return state
+                    except:
+                        pass
+        except:
+            pass
+        try:
+            r=requests.get(f"https://{self.main_oracle_ip}:9091/oracle/state",timeout=3)
+            return r.json()
+        except:
+            pass
+        return None
+
+class OracleNode:
+    """Local oracle: 0.0.0.0:9091, SSE gossip, DB peer table"""
+    def __init__(self,miner_id:str,db,local_port:int=9091):
+        self.miner_id=miner_id
+        self.local_port=local_port
+        self.db=db
+        self.my_ip=_detect_natural_ip()
+        self.gossip=SSEGossipBroadcaster()
+        self.running=False
+        init_peer_db_table(db)
+        self._record_self_to_db()
+    
+    def _record_self_to_db(self):
+        try:
+            import time
+            self.db.execute("""INSERT OR REPLACE INTO p2p_peers
+                (peer_id,miner_id,ips,port,is_oracle,last_seen,created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (self.miner_id,self.miner_id,self.my_ip,self.local_port,1,time.time(),time.time()))
+            self.db.commit()
+        except:
+            pass
+    
+    def gossip_peer_ips(self):
+        try:
+            peers=self.db.execute(
+                "SELECT peer_id,ips,port,fidelity FROM p2p_peers WHERE is_oracle=1"
+            ).fetchall()
+            for peer_id,ips,port,fidelity in peers:
+                self.gossip.gossip_peer_update("peer_discovered",{
+                    "peer_id":peer_id,"ips":ips,"port":port,"fidelity":fidelity})
+        except:
+            pass
+    
+    def start(self):
+        import threading
+        from http.server import HTTPServer,BaseHTTPRequestHandler
+        import json,time
+        oracle=self
+        
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path=='/health':
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status":"online","miner":oracle.miner_id,"ip":oracle.my_ip}).encode())
+                elif self.path=='/p2p/gossip':
+                    self.send_response(200)
+                    self.send_header('Content-Type','text/event-stream')
+                    self.send_header('Cache-Control','no-cache')
+                    self.end_headers()
+                    since=0
+                    while oracle.running:
+                        oracle.gossip_peer_ips()
+                        for evt in oracle.gossip.get_events(since):
+                            try:
+                                msg="data: "+json.dumps(evt)+"\n\n"
+                                self.wfile.write(msg.encode())
+                                self.wfile.flush()
+                                since=evt["timestamp"]
+                            except:
+                                return
+                        time.sleep(5)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self,*args):
+                pass
+        
+        def run_server():
+            try:
+                server=HTTPServer(('0.0.0.0',self.local_port),Handler)
+                oracle.running=True
+                server.serve_forever()
+            except:
+                pass
+        
+        t=threading.Thread(target=run_server,daemon=True)
+        t.start()
+
 class QuantumMiner:
     def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12):
         self.w_state_recovery=w_state_recovery
@@ -4169,7 +4073,6 @@ class QuantumMiner:
 # FULL NODE WITH W-STATE MINING
 # ═════════════════════════════════════════════════════════════════════════════════
 
-
 # ═════════════════════════════════════════════════════════════════════════════════════════
 # QTCL P2P GOSSIP CLIENT — Production Grade
 # ═════════════════════════════════════════════════════════════════════════════════════════
@@ -4190,14 +4093,12 @@ import http.server
 import socketserver
 import urllib.parse as _urlparse
 
-
 # ── Local SQLite schema for gossip mirror ─────────────────────────────────────
 def _init_gossip_db(db) -> None:
     """Ensure gossip tables exist — delegates to apply_schema_patches (single source of truth)."""
     if db is None:
         return
     apply_schema_patches(conn=db)
-
 
 def _local_db_upsert_tx(db, tx: dict) -> bool:
     """Mirror a pending TX into local SQLite pending_txs. Returns True if row was new."""
@@ -4231,8 +4132,6 @@ def _local_db_upsert_tx(db, tx: dict) -> bool:
         logger.debug(f"[GOSSIP/local] upsert_tx: {e}")
         return False
 
-
-
 def _local_db_clear_confirmed(db, tx_hashes: list) -> None:
     """Remove confirmed TXs from local pending_txs mirror after block seal."""
     if db is None or not tx_hashes:
@@ -4245,7 +4144,6 @@ def _local_db_clear_confirmed(db, tx_hashes: list) -> None:
         db.commit()
     except Exception as e:
         logger.debug(f"[GOSSIP/local] clear_confirmed: {e}")
-
 
 def _local_db_get_pending(db) -> list:
     """Read all non-expired pending TXs from local SQLite mirror."""
@@ -4272,7 +4170,6 @@ def _local_db_get_pending(db) -> list:
     except Exception as e:
         logger.debug(f"[GOSSIP/local] get_pending: {e}")
         return []
-
 
 def _local_db_upsert_block(db, block: dict) -> bool:
     """Cache a full block in local SQLite. Source of truth for chain state."""
@@ -4308,7 +4205,6 @@ def _local_db_upsert_block(db, block: dict) -> bool:
         logger.debug(f"[GOSSIP/local] upsert_block: {e}")
         return False
 
-
 def _local_db_get_block(db, height: int) -> Optional[dict]:
     """Fetch cached block by height. Returns None if not cached or empty."""
     if db is None: return None
@@ -4321,8 +4217,6 @@ def _local_db_get_block(db, height: int) -> Optional[dict]:
     except Exception as e:
         logger.debug(f"[GOSSIP/local] get_block: {e}")
     return None
-
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BOOTSTRAP PEER SEEDER — HTTP equivalent of Bitcoin DNS seeds
@@ -4373,7 +4267,6 @@ def _bootstrap_get_eligible_peers(db, limit: int = BOOTSTRAP_MAX_PEERS) -> list:
         logger.debug(f"[BOOTSTRAP] _bootstrap_get_eligible_peers: {e}")
         return []
 
-
 def _bootstrap_is_eligible(node_start_time: float, local_tip_height: int) -> bool:
     """
     Decide if this node is eligible to serve as a bootstrap peer.
@@ -4381,7 +4274,6 @@ def _bootstrap_is_eligible(node_start_time: float, local_tip_height: int) -> boo
     """
     uptime = time.time() - node_start_time
     return uptime >= BOOTSTRAP_MIN_UPTIME_S and local_tip_height >= BOOTSTRAP_MIN_BLOCKS
-
 
 def _bootstrap_fetch_from_peer(gossip_url: str, timeout: int = 6) -> list:
     """
@@ -4419,7 +4311,6 @@ def _bootstrap_fetch_from_peer(gossip_url: str, timeout: int = 6) -> list:
     except Exception as e:
         logger.debug(f"[BOOTSTRAP] fetch from {gossip_url}: {e}")
         return []
-
 
 def _bootstrap_resolve(oracle_url: str, db, known_peers: list,
                        timeout: int = 8) -> list:
@@ -4484,7 +4375,6 @@ def _bootstrap_resolve(oracle_url: str, db, known_peers: list,
         f"fingerprint={LATTICE_FINGERPRINT}"
     )
     return result
-
 
 class BootstrapCrawler(threading.Thread):
     """
@@ -4566,7 +4456,6 @@ class BootstrapCrawler(threading.Thread):
     def stop(self) -> None:
         self._running = False
 
-
 def _local_db_get_tip(db) -> Optional[dict]:
     """Return highest cached block header. Local-first chain tip."""
     if db is None: return None
@@ -4579,7 +4468,6 @@ def _local_db_get_tip(db) -> Optional[dict]:
     except Exception as e:
         logger.debug(f"[GOSSIP/local] get_tip: {e}")
     return None
-
 
 def _local_db_record_peer_result(db, peer_id: str, success: bool, latency_ms: float) -> None:
     """Update peer EMA score after each interaction — drives P2P peer selection."""
@@ -4597,7 +4485,6 @@ def _local_db_record_peer_result(db, peer_id: str, success: bool, latency_ms: fl
         db.commit()
     except Exception as e:
         logger.debug(f"[GOSSIP/local] record_peer_result: {e}")
-
 
 def _local_db_get_best_peers(db, limit: int = 10) -> list:
     """
@@ -4628,7 +4515,6 @@ def _local_db_get_best_peers(db, limit: int = 10) -> list:
     except Exception as e:
         logger.debug(f"[GOSSIP/local] get_best_peers: {e}")
         return []
-
 
 # ── GossipHTTPHandler ─────────────────────────────────────────────────────────
 class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
@@ -4955,7 +4841,6 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {'live_peers': 0, 'live_oracles': 0, 'node_id': node_id,
                                        'gossip_url': gurl, 'ts': time.time()})
 
-
         elif path == '/api/events':
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -5099,7 +4984,6 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_json(404, {'error': 'not found', 'path': path})
 
-
 class GossipListener:
     """
     Unified P2P HTTP server — binds on a SINGLE port (default 9091).
@@ -5188,7 +5072,6 @@ class GossipListener:
         if self._server is not None:
             self._server.oracle_ref = oracle_ref
             logger.info(f"[P2P] 🌟 Oracle routes LIVE on :{self.bound_port} (/api/oracle/w-state etc.)")
-
 
 # ── SSESubscriber ─────────────────────────────────────────────────────────────
 class SSESubscriber(threading.Thread):
@@ -5318,7 +5201,6 @@ class SSESubscriber(threading.Thread):
 
     def stop(self):
         self._running = False
-
 
 # ── PeerHeartbeat ─────────────────────────────────────────────────────────────
 class PeerHeartbeat(threading.Thread):
@@ -5502,7 +5384,6 @@ class PeerHeartbeat(threading.Thread):
     def get_known_peers(self) -> List[Dict]:
         return list(self._known_peers)
 
-
 # ── P2PGossipOrchestrator ─────────────────────────────────────────────────────
 class P2PGossipOrchestrator:
     """
@@ -5620,7 +5501,6 @@ class P2PGossipOrchestrator:
             return self._listener.gossip_url
         return ''
 
-
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 # ██████╗ ██╗  ██╗████████╗     ██████╗██╗      ██████╗ ██╗   ██╗██████╗ 
 # ██╔══██╗██║  ██║╚══██╔══╝    ██╔════╝██║     ██╔═══██╗██║   ██║██╔══██╗
@@ -5654,14 +5534,11 @@ def _apply_dht_schema(db: sqlite3.Connection) -> None:
     apply_schema_patches(conn=db)
     logger.debug("[DHT] ✅ Schema verified (via SCHEMA_PATCHES)")
 
-
-
 # ─── Kademlia XOR DHT Utilities ──────────────────────────────────────────────────────────────────
 
 def _dht_node_id(identity: str) -> str:
     """Derive deterministic 160-bit (40 hex char) DHT node ID from any identity string."""
     return hashlib.sha1(identity.encode()).hexdigest()  # SHA1 → 160 bits, Kademlia-standard
-
 
 def _dht_xor_distance(a: str, b: str) -> int:
     """XOR distance between two 160-bit node IDs (hex strings)."""
@@ -5669,7 +5546,6 @@ def _dht_xor_distance(a: str, b: str) -> int:
         return int(a, 16) ^ int(b, 16)
     except (ValueError, TypeError):
         return 2 ** 160
-
 
 def _dht_bucket_index(local_id: str, remote_id: str) -> int:
     """
@@ -5681,7 +5557,6 @@ def _dht_bucket_index(local_id: str, remote_id: str) -> int:
     if dist == 0:
         return 159  # same node
     return 159 - dist.bit_length() + 1
-
 
 def _dht_closest_peers(db: sqlite3.Connection, target_id: str, k: int = 20,
                         exclude_id: str = '') -> List[Dict[str, Any]]:
@@ -5715,7 +5590,6 @@ def _dht_closest_peers(db: sqlite3.Connection, target_id: str, k: int = 20,
     except Exception as e:
         logger.debug(f"[DHT] closest_peers error: {e}")
         return []
-
 
 def _dht_upsert_peer(db: sqlite3.Connection, node_id: str, address: str,
                      gossip_port: int, miner_address: str, local_node_id: str,
@@ -5754,7 +5628,6 @@ def _dht_upsert_peer(db: sqlite3.Connection, node_id: str, address: str,
         db.commit()
     except Exception as e:
         logger.debug(f"[DHT] upsert_peer error: {e}")
-
 
 # ─── Virtual Pseudoqubit Manager ─────────────────────────────────────────────────────────────────
 
@@ -6399,7 +6272,6 @@ class VirtualPseudoqubitManager:
         except Exception as e:
             logger.debug(f"[VPQ] entanglement registry error: {e}")
 
-
 # ─── Oracle Entanglement Bridge ───────────────────────────────────────────────────────────────────
 
 class OracleEntanglementBridge:
@@ -6723,7 +6595,6 @@ class OracleEntanglementBridge:
         except Exception as e:
             logger.debug(f"[BRIDGE] oracle_registry upsert error: {e}")
 
-
 # ─── Oracle Eligibility Engine ────────────────────────────────────────────────────────────────────
 
 class OracleEligibilityEngine:
@@ -7028,7 +6899,6 @@ class OracleEligibilityEngine:
         except Exception as e:
             logger.debug(f"[ELIG] log error: {e}")
 
-
 # ─── P2P Oracle Server (spawned on promotion) ─────────────────────────────────────────────────────
 
 class P2POracleServer:
@@ -7146,7 +7016,6 @@ class P2POracleServer:
             "_make_handler() is dead code — oracle routes live on GossipListener :9091. "
             "Call GossipListener.inject_oracle(self) instead."
         )
-
 
 # ─── DHT Peer Exchange Manager ────────────────────────────────────────────────────────────────────
 
@@ -7463,7 +7332,6 @@ class DHTExchangeManager:
             logger.debug(f"[DHT] topology error: {e}")
             return {}
 
-
 # ─── DHT Gossip Handler Extensions ───────────────────────────────────────────────────────────────
 # These are injected into GossipHTTPHandler via monkey-patch at startup.
 # They add /gossip/dht_hello and /gossip/dht_pex endpoints.
@@ -7533,7 +7401,6 @@ def _handle_dht_hello(handler, data: dict) -> None:
     }
     handler._send_json(200, response)
 
-
 def _handle_dht_pex(handler, data: dict) -> None:
     """Handle DHT Peer Exchange — share routing table, receive theirs."""
     db         = getattr(handler.server, 'local_db',      None)
@@ -7584,9 +7451,6 @@ def _handle_dht_pex(handler, data: dict) -> None:
             'is_oracle':    bool(p['is_oracle']),
         } for p in our_peers],
     })
-
-
-
 
 # ─── Complete P2P + DHT orchestration bundle ─────────────────────────────────────────────────────
 
@@ -7714,7 +7578,6 @@ class QTCLP2PBundle:
     def _count_live_peers(self) -> int:
         """Proxy for use by OracleEligibilityEngine._eligibility_loop."""
         return self.elig._count_live_peers()
-
 
 class QTCLFullNode:
     def __init__(self, miner_address: str, oracle_url: str='http://localhost:8000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
@@ -8834,7 +8697,6 @@ class QTCLWallet:
             print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
         print("═"*60 + "\n")
 
-
 class MinerRegistry:
     """Register miner with oracle. Token stored in data/.qtcl_registered."""
     def __init__(self, oracle_url):
@@ -8863,11 +8725,9 @@ class MinerRegistry:
         try: return self._tok_file.read_text().strip() or None if self._tok_file.exists() else None
         except: return None
 
-
 # ═════════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════════
-
 
 def _wallet_recover(args):
     """Exhaustive scan of data/*.json|*.enc — tries BIP-38 decrypt on each."""
@@ -8905,7 +8765,6 @@ def _wallet_recover(args):
         w._atomic_save(w.mnemonic_file, pw, {'mnemonic':w.mnemonic})
     print(f"  💾  Saved → {w.wallet_file}\n")
     sys.exit(0)
-
 
 def _query_transaction_status(tx_hash, node_url="http://localhost:8000"):
     """
@@ -8984,7 +8843,6 @@ def _query_transaction_status(tx_hash, node_url="http://localhost:8000"):
 
     print("\n" + "="*70 + "\n")
 
-
 def _run_transaction_menu(args, wallet):
     """Secondary menu: Send transaction or view transaction status."""
     while True:
@@ -9016,7 +8874,6 @@ def _run_transaction_menu(args, wallet):
             break
         else:
             print("  ❌ Invalid choice")
-
 
 def _run_transaction_wizard(args, wallet):
     """Interactive HLWE transaction wizard — Bitcoin-model mempool broadcast."""
@@ -9171,7 +9028,6 @@ def _run_transaction_wizard(args, wallet):
         print("\n❌  Node timed out")
     except Exception as e:
         print(f"❌  Broadcast error: {e}")
-
 
 def _mask_sensitive_string(s: str, mask: bool = False) -> str:
     """Enterprise-grade key masking utility. Redacts sensitive cryptographic material. Args: s=string to mask, mask=if True shows first 8 and last 8 chars with … separator. Returns: original string if mask=False, masked if mask=True."""
