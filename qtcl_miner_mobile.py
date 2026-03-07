@@ -1771,7 +1771,60 @@ SCHEMA_PATCHES = {
     """,
 }
 
-def apply_schema_patches(conn: sqlite3.Connection = None) -> None:
+def detect_oracle_url() -> str:
+    """
+    ⚛️ SMART ORACLE URL DETECTION
+    
+    Try sources in this order:
+    1. ORACLE_URL environment variable (explicit override)
+    2. Koyeb environment (running on Koyeb? use standard koyeb URL)
+    3. KOYEB_APP environment variable 
+    4. Try localhost:8000 (local development)
+    5. Hardcoded known production URL
+    
+    Never fails — returns best guess at oracle URL
+    """
+    import os
+    
+    # 1. Explicit environment variable
+    if 'ORACLE_URL' in os.environ:
+        url = os.environ.get('ORACLE_URL', '').strip()
+        if url:
+            logger.info(f"[ORACLE] 🔍 Using ORACLE_URL from environment: {url}")
+            return url
+    
+    # 2. Running on Koyeb? Detect from environment
+    if 'KOYEB_APP_NAME' in os.environ:
+        app_name = os.environ.get('KOYEB_APP_NAME', '')
+        if app_name:
+            url = f"https://{app_name}"
+            logger.info(f"[ORACLE] 🔍 Detected Koyeb deployment: {url}")
+            return url
+    
+    # 3. KOYEB_APP env variable
+    if 'KOYEB_APP' in os.environ:
+        app = os.environ.get('KOYEB_APP', '').strip()
+        if app:
+            url = f"https://{app}"
+            logger.info(f"[ORACLE] 🔍 Using KOYEB_APP environment: {url}")
+            return url
+    
+    # 4. Try localhost (local development)
+    logger.info("[ORACLE] 🔍 Trying localhost:8000 (local development)...")
+    try:
+        import requests
+        r = requests.get("http://localhost:8000/api/blocks/tip", timeout=2)
+        if r.status_code in [200, 400, 500]:  # Server is up, even if error
+            logger.info("[ORACLE] ✅ Found oracle on localhost:8000")
+            return "http://localhost:8000"
+    except:
+        pass
+    
+    # 5. Try known production URL (your Koyeb app)
+    url = "https://qtcl-blockchain.koyeb.app"
+    logger.info(f"[ORACLE] 🔍 Using default production URL: {url}")
+    logger.warning("[ORACLE] ⚠️  If this is wrong, set ORACLE_URL environment variable")
+    return url
     """
     Apply all schema patches to the local database.
     Called at startup (main) and can also be called with an explicit connection.
@@ -8974,8 +9027,8 @@ def parse_args():
     parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
     parser.add_argument('--oracle-url','-o',
-                       default=os.getenv('ORACLE_URL', ''),  # Check env var first
-                       help='Oracle URL (REQUIRED) - e.g., https://your-koyeb-app-url. Can set via ORACLE_URL env var')
+                       default='',  # Empty by default, will be auto-detected
+                       help='Oracle URL (optional, auto-detects from ORACLE_URL env, Koyeb, or localhost:8000)')
     parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
@@ -9232,16 +9285,16 @@ def main():
             sys.exit(1)
 
         # ─── SCHEMA PATCHES ─── MUST run before QTCLFullNode init (QTCLP2PBundle needs tables) ──
-        logger.info("[INIT] 🔧 Applying database schema patches...")
+        logger.debug("[INIT] 🔧 Applying database schema patches...")
         apply_schema_patches()      # covers all tables including DHT/Oracle/VirtualPQ
+        logger.debug("[INIT] ✅ Schema patches applied")
 
-        # ⚛️ CRITICAL: Validate oracle_url is specified
+        # ⚛️ SMART ORACLE URL DETECTION
+        # If oracle_url not provided via CLI, auto-detect from environment/Koyeb/localhost
         if not args.oracle_url or args.oracle_url.strip() == '':
-            logger.error("[INIT] ❌ ORACLE_URL REQUIRED")
-            logger.error("[INIT] ❌ You must specify --oracle-url or set ORACLE_URL environment variable")
-            logger.error("[INIT] ❌ Example: python qtcl_miner_mobile.py --address qtcl1... --oracle-url https://your-koyeb-app-url")
-            logger.error("[INIT] ❌ Or: export ORACLE_URL=https://your-koyeb-app-url && python qtcl_miner_mobile.py --address qtcl1...")
-            sys.exit(1)
+            args.oracle_url = detect_oracle_url()
+        else:
+            logger.info(f"[ORACLE] 📍 Using oracle URL from CLI: {args.oracle_url}")
 
         node=QTCLFullNode(
             miner_address=address,
