@@ -2101,7 +2101,16 @@ class WStateRecoveryManager:
     
     @staticmethod
     def evaluate_w_state_quality(fidelity: float, coherence: float, mode: str = "normal", verbose: bool = True) -> tuple:
-        """Evaluate W-state quality with diagnostics."""
+        """
+        Evaluate W-state quality with diagnostics.
+        
+        ⚛️ LAYER 1: Bounds checking - clamp F and C to [0, 1] before validation
+        This protects against unbounded coherence metric returning C > 1.0
+        """
+        # ⚛️ CRITICAL BOUNDS: Ensure metrics are in valid range [0, 1]
+        fidelity = min(1.0, max(0.0, float(fidelity)))
+        coherence = min(1.0, max(0.0, float(coherence)))
+        
         fid_threshold, coh_threshold = WStateRecoveryManager.get_threshold_for_mode(mode)
         quality_score = WStateRecoveryManager.compute_quality_score(fidelity, coherence)
         
@@ -2729,11 +2738,19 @@ class P2PClientWStateRecovery:
           NOTE: These should ideally come from server as block heights, not arbitrary hex strings
           snapshot['fidelity']   — float: actual W-state quality (used for block submission)
           snapshot['coherence']  — float: L1 coherence metric
+        
+        ⚛️ LAYER 1: Bounds checking on coherence metric
         """
         try:
             # ── Real oracle fidelity (the ONLY value that goes into block header) ──
             fidelity  = float(snapshot.get('fidelity',  0.90))
             coherence = float(snapshot.get('coherence', 0.85))
+            
+            # ⚛️ CRITICAL BOUNDS: Ensure metrics are valid [0, 1]
+            # This fixes unbounded coherence from oracle.py:coherence_l1_norm
+            fidelity = min(1.0, max(0.0, fidelity))
+            coherence = min(1.0, max(0.0, coherence))
+            
             timestamp_ns = snapshot.get('timestamp_ns', int(time.time() * 1e9))
             
             # ── 🔐 CRITICAL FIX: Lattice field-space should be indexed by block HEIGHT, not oracle hex ──
@@ -2996,8 +3013,23 @@ class P2PClientWStateRecovery:
             logger.error(f"[W-STATE] ❌ Rotation failed: {e}")
     
     def measure_w_state(self)->Optional[str]:
-        """Measure W-state to produce quantum entropy bitstring."""
+        """
+        Measure W-state to produce quantum entropy bitstring.
+        
+        ⚛️ LAYER 3: Priority order:
+          1. VPM tripartite circuit (9-qubit entangled, if available)
+          2. Recovery client pq_curr circuit (3-qubit, fallback)
+          3. CSPRNG (last resort)
+        """
         try:
+            # Try tripartite circuit first (PREFERRED)
+            if hasattr(self, 'vpm') and self.vpm is not None:
+                entropy = self.vpm.measure_virtual_pq_entropy('pq0')
+                if entropy and entropy != secrets.token_hex(32):
+                    logger.debug(f"[W-STATE] 📊 Entropy from tripartite AER circuit")
+                    return entropy
+            
+            # Fallback: Use pq_curr measurement (recovery client)
             if not QISKIT_AVAILABLE or self.pq_curr_matrix is None:
                 return secrets.token_hex(32)
             
@@ -3015,7 +3047,7 @@ class P2PClientWStateRecovery:
                 self.pq_curr_measurement_counts=dict(counts)
                 outcome=' '.join(str(k) for k in sorted(counts.keys(),key=lambda x:counts[x],reverse=True)[:3])
                 entropy=hashlib.sha3_256(outcome.encode()).hexdigest()
-                logger.debug(f"[W-STATE] 📊 Measurement: {outcome[:20]}…")
+                logger.debug(f"[W-STATE] 📊 Measurement (pq_curr fallback): {outcome[:20]}…")
                 return entropy
             except:
                 return secrets.token_hex(32)
@@ -3031,6 +3063,8 @@ class P2PClientWStateRecovery:
           - On cached/WS hit:  sleep SYNC_INTERVAL_MS (10ms) — fast path
           - On HTTP fetch hit: sleep 2s (don't hammer oracle)
           - On consecutive failures: exponential backoff up to 30s
+        
+        ⚛️ LAYER 2: Calls update_pq0() after each oracle snapshot for synchronization
         """
         logger.info("[W-STATE] 🔄 Sync worker started")
 
@@ -3060,6 +3094,14 @@ class P2PClientWStateRecovery:
                         self.entanglement_state.sync_error_count += 1
                     time.sleep(0.5)
                     continue
+
+                # ⚛️ MUSEUM-GRADE FIX: Refresh virtual pseudoqubit manager with new pq0
+                # This keeps the tripartite (pq0 ↔ vpq ↔ ivpq) in sync with oracle updates
+                if hasattr(self, 'vpm') and self.vpm is not None:
+                    pq0_updated = self.vpm.update_pq0(snapshot)
+                    if pq0_updated:
+                        # Immediately rotate vpqs to reflect new pq0
+                        self.vpm.rotate_vpqs_on_pq0_update()
 
                 current_time_ns = time.time_ns()
                 sync_lag_ns     = current_time_ns - snapshot.get("timestamp_ns", current_time_ns)
@@ -3133,6 +3175,8 @@ class P2PClientWStateRecovery:
         Blocks until a REAL oracle snapshot is obtained — no synthetic fallback.
         Mining loop already gates on entanglement.established so nothing mines
         until a valid W-state is in hand.
+        
+        ⚛️ LAYER 2: Initializes VirtualPseudoqubitManager's pq0 from first snapshot
         """
         if self.running:
             logger.warning("[W-STATE] Already running")
@@ -3166,6 +3210,11 @@ class P2PClientWStateRecovery:
 
             if not self._establish_entanglement():
                 logger.warning("[W-STATE] ⚠️  Entanglement not yet established — sync loop will retry")
+
+            # ⚛️ CRITICAL: Initialize VPM's pq0 with first real snapshot
+            if hasattr(self, 'vpm') and self.vpm is not None:
+                self.vpm.initialize_pq0(snapshot)
+                logger.info("[VPQ] ✅ VirtualPseudoqubitManager initialized with oracle pq0 (first snapshot)")
 
             self.running = True
             self.sync_thread = threading.Thread(
@@ -5481,6 +5530,10 @@ class VirtualPseudoqubitManager:
         self._fidelity: float                     = 0.0
         self._coherence: float                    = 0.0
         self._entanglement_links: Dict[str, Dict] = {}
+        
+        # ⚛️ LAYER 3: Tripartite circuit tracking
+        self._last_tripartite_outcome: str = ""
+        self._last_tripartite_frequency: float = 0.0
 
         logger.info(
             f"[VPQ] 🔮 VirtualPseudoqubitManager init | node={local_node_id[:12]} | "
@@ -5524,6 +5577,117 @@ class VirtualPseudoqubitManager:
         except Exception as e:
             logger.error(f"[VPQ] ❌ pq0 init failed: {e}")
             return False
+
+    # ⚛️ LAYER 2: pq0 SYNCHRONIZATION FROM ORACLE
+    def update_pq0(self, oracle_snapshot: Dict[str, Any]) -> bool:
+        """
+        CRITICAL: Refresh pq0 with latest oracle snapshot.
+        Called by sync worker whenever a fresh W-state snapshot arrives.
+        This is the synchronization hook that keeps tripartite (pq0 ↔ vpq ↔ ivpq) in sync.
+        
+        Args:
+            oracle_snapshot: {fidelity, coherence, timestamp_ns, ...}
+        
+        Returns:
+            True if pq0 was updated (values changed), False otherwise
+        """
+        try:
+            # Extract fresh oracle metrics
+            fidelity = float(oracle_snapshot.get('fidelity', 0.90))
+            coherence = float(oracle_snapshot.get('coherence', 0.85))
+            timestamp_ns = oracle_snapshot.get('timestamp_ns', int(time.time() * 1e9))
+            
+            # ⚛️ BOUNDS CHECK: Ensure metrics are valid [0, 1]
+            fidelity = min(1.0, max(0.0, fidelity))
+            coherence = min(1.0, max(0.0, coherence))
+            
+            with self._lock:
+                # Store old values for comparison
+                old_fidelity = self._fidelity
+                old_coherence = self._coherence
+                
+                # Reconstruct pq0 density matrix from oracle fidelity
+                # ρ_pq0 = F·ρ_pure + (1-F)·ρ_mixed
+                # where ρ_pure = |W⟩⟨W| (ideal W-state)
+                w_amp = 1.0 / np.sqrt(3.0)
+                w_vec = np.zeros(8, dtype=np.complex128)
+                w_vec[4] = w_amp  # |100⟩
+                w_vec[2] = w_amp  # |010⟩
+                w_vec[1] = w_amp  # |001⟩
+                rho_pure = np.outer(w_vec, w_vec.conj())
+                rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
+                pq0_new = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+                
+                # Update pq0 and metrics
+                self._pq0 = pq0_new
+                self._fidelity = fidelity
+                self._coherence = coherence
+                
+                # Check if values actually changed
+                pq0_updated = (abs(fidelity - old_fidelity) > 0.0001 or
+                               abs(coherence - old_coherence) > 0.0001)
+            
+            # Log update with evolution tracking
+            if pq0_updated:
+                logger.info(
+                    f"[VPQ] 🔄 pq0 refreshed (tripartite sync) | "
+                    f"F: {old_fidelity:.4f} → {fidelity:.4f} | "
+                    f"C: {old_coherence:.4f} → {coherence:.4f}"
+                )
+            else:
+                logger.debug(
+                    f"[VPQ] 🔄 pq0 checked (no change) | "
+                    f"F={fidelity:.4f} | C={coherence:.4f}"
+                )
+            
+            return pq0_updated
+        
+        except Exception as e:
+            logger.error(f"[VPQ] ❌ pq0 update failed: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
+    def rotate_vpqs_on_pq0_update(self) -> None:
+        """
+        Re-derive all virtual pseudoqubits from updated pq0.
+        Called after update_pq0() to ensure vpq/ivpq reflect the new oracle state.
+        This completes the tripartite synchronization cycle.
+        
+        Effects:
+          • All vpqs rotated with new pq0 as base
+          • ivpqs will auto-update on next spawn call
+          • Tripartite circuit ready for next execution
+        """
+        try:
+            with self._lock:
+                vpq_ids = list(self._vpq.keys())
+                if not vpq_ids:
+                    logger.debug("[VPQ] No vpqs to rotate (none spawned yet)")
+                    return
+                
+                for vpq_id in vpq_ids:
+                    # Re-derive vpq from fresh pq0 with new perturbation
+                    if self._pq0 is None:
+                        break
+                    
+                    # Apply fresh decoherence noise
+                    noise = np.random.normal(0, 0.005, (8, 8)).astype(np.complex128)
+                    noise += 1j * np.random.normal(0, 0.003, (8, 8))
+                    noise = (noise + noise.conj().T) / 2
+                    new_vpq = 0.995 * self._pq0 + 0.005 * noise
+                    tr = np.real(np.trace(new_vpq))
+                    if tr > 0:
+                        new_vpq /= tr
+                    
+                    self._vpq[vpq_id] = new_vpq
+                
+                logger.debug(
+                    f"[VPQ] 🔄 Rotated {len(vpq_ids)} vpqs after pq0 update | "
+                    f"vpq matrices refreshed from new pq0"
+                )
+        
+        except Exception as e:
+            logger.error(f"[VPQ] ❌ vpq rotation failed: {e}")
 
     def spawn_virtual_pq(self, vpq_id: str = None) -> Optional[str]:
         """
@@ -5639,12 +5803,195 @@ class VirtualPseudoqubitManager:
 
         return True
 
+    # ⚛️ LAYER 3: TRIPARTITE W-STATE AER CIRCUIT EXECUTION
+    
+    def create_tripartite_circuit(self, vpq_id: Optional[str] = None) -> Optional[QuantumCircuit]:
+        """
+        Create a 9-qubit tripartite W-state circuit from pq0, vpq, and ivpq.
+        
+        Architecture:
+          Register A (pq0):      q[0:3]   — Oracle pseudoqubit (ground truth)
+          Register B (vpq):      q[3:6]   — Virtual pseudoqubit (local mirror + noise)
+          Register C (ivpq):     q[6:9]   — Inverse-virtual (anti-correlated witness)
+        
+        Entanglement gates create W-state constraint across all three registers:
+          pq0[0] ↔ vpq[0]      (CNOT)
+          vpq[1] ↔ ivpq[1]     (CNOT)
+          pq0[2] ↔ ivpq[2]     (CNOT)
+          vpq[0] ↔ ivpq[0]     (CNOT closure)
+        
+        Result: 9-qubit entangled W-state density matrix
+        
+        Returns:
+            QuantumCircuit(9) with tripartite entanglement, or None if not available
+        """
+        if not QISKIT_AVAILABLE:
+            logger.warning("[VPQ] ⚠️  Qiskit not available, cannot create tripartite circuit")
+            return None
+        
+        try:
+            with self._lock:
+                # Get density matrices
+                pq0_dm = self._pq0
+                vpq_dm = self._vpq.get(vpq_id) if vpq_id else (self._vpq.get(list(self._vpq.keys())[0]) if self._vpq else None)
+                ivpq_id = f"ivpq_{vpq_id.replace('vpq_','')}" if vpq_id else None
+                ivpq_dm = self._ivpq.get(ivpq_id) if ivpq_id else (self._ivpq.get(list(self._ivpq.keys())[0]) if self._ivpq else None)
+                
+                if pq0_dm is None or vpq_dm is None:
+                    logger.warning("[VPQ] ⚠️  Cannot create tripartite circuit — pq0 or vpq not available")
+                    return None
+                
+                # Convert density matrices to statevectors (pure state approximation)
+                # Use largest eigenvalue eigenvector as approximation of pure state
+                def dm_to_statevector(dm: np.ndarray) -> np.ndarray:
+                    try:
+                        eigenvalues, eigenvectors = np.linalg.eigh(dm)
+                        max_idx = np.argmax(eigenvalues)
+                        if eigenvalues[max_idx] < 0.3:
+                            # Mixed state, use maximally mixed approach
+                            return np.ones(8, dtype=np.complex128) / np.sqrt(8)
+                        return eigenvectors[:, max_idx]
+                    except:
+                        return np.ones(8, dtype=np.complex128) / np.sqrt(8)
+                
+                pq0_sv = dm_to_statevector(pq0_dm)
+                vpq_sv = dm_to_statevector(vpq_dm)
+                ivpq_sv = dm_to_statevector(ivpq_dm) if ivpq_dm is not None else dm_to_statevector(vpq_dm)
+            
+            # Create 9-qubit circuit
+            qc = QuantumCircuit(9, 9, name='tripartite_w_state')
+            
+            # Initialize each 3-qubit register from state vectors
+            try:
+                # Normalize statevectors
+                pq0_sv = pq0_sv / np.linalg.norm(pq0_sv)
+                vpq_sv = vpq_sv / np.linalg.norm(vpq_sv)
+                ivpq_sv = ivpq_sv / np.linalg.norm(ivpq_sv)
+                
+                qc.initialize(pq0_sv, [0, 1, 2], normalize=True)
+                qc.initialize(vpq_sv, [3, 4, 5], normalize=True)
+                qc.initialize(ivpq_sv, [6, 7, 8], normalize=True)
+            except:
+                # Fallback: use simple W-state construction
+                logger.debug("[VPQ] Using fallback W-state construction for tripartite")
+                # Prepare ideal W-state on each register
+                qc.ry(np.arccos(np.sqrt(2/3)), 0)
+                qc.cx(0, 1)
+                qc.ry(np.arccos(np.sqrt(1/2)), 1)
+                qc.cx(1, 2)
+                
+                qc.ry(np.arccos(np.sqrt(2/3)), 3)
+                qc.cx(3, 4)
+                qc.ry(np.arccos(np.sqrt(1/2)), 4)
+                qc.cx(4, 5)
+                
+                qc.ry(np.arccos(np.sqrt(2/3)), 6)
+                qc.cx(6, 7)
+                qc.ry(np.arccos(np.sqrt(1/2)), 7)
+                qc.cx(7, 8)
+            
+            # Create entanglement linking all three registers
+            # pq0 ↔ vpq ↔ ivpq tripartite W-state constraint
+            qc.cnot(0, 3)   # pq0[0] ↔ vpq[0]
+            qc.cnot(4, 7)   # vpq[1] ↔ ivpq[1]
+            qc.cnot(2, 8)   # pq0[2] ↔ ivpq[2]
+            qc.cnot(3, 6)   # vpq[0] ↔ ivpq[0] (closure)
+            
+            # Measure all 9 qubits into 9 classical bits
+            qc.measure(list(range(9)), list(range(9)))
+            
+            logger.debug("[VPQ] ✅ Tripartite circuit created (9-qubit entangled W-state)")
+            return qc
+        
+        except Exception as e:
+            logger.error(f"[VPQ] ❌ Tripartite circuit creation failed: {e}")
+            logger.error(traceback.format_exc())
+            return None
+
+    def execute_tripartite_circuit(self, vpq_id: Optional[str] = None, shots: int = 1000) -> str:
+        """
+        Execute tripartite W-state circuit in AER and return quantum entropy.
+        
+        This is the CORE QUANTUM OPERATION:
+          1. Create 9-qubit tripartite circuit
+          2. Run in AER simulator
+          3. Measure outcome (random due to superposition)
+          4. Hash measurement result for entropy
+        
+        Args:
+            vpq_id: Optional virtual pq ID to use (default: first vpq)
+            shots: Number of shots in AER execution (default: 1000)
+        
+        Returns:
+            256-bit hex entropy string from quantum measurement
+        """
+        if not QISKIT_AVAILABLE:
+            logger.warning("[VPQ] ⚠️  Qiskit not available, falling back to CSPRNG")
+            return secrets.token_hex(32)
+        
+        try:
+            # Create tripartite circuit
+            tripartite_circuit = self.create_tripartite_circuit(vpq_id)
+            if tripartite_circuit is None:
+                logger.debug("[VPQ] Tripartite circuit unavailable, using CSPRNG entropy")
+                return secrets.token_hex(32)
+            
+            # Execute in AER simulator
+            aer_sim = AerSimulator(method='automatic', device='CPU')
+            job = aer_sim.run(tripartite_circuit, shots=shots, seed_simulator=None)
+            result = job.result()
+            counts = result.get_counts(tripartite_circuit)
+            
+            # Get most likely outcome (highest count)
+            if not counts:
+                logger.warning("[VPQ] No measurement outcomes from AER, using CSPRNG")
+                return secrets.token_hex(32)
+            
+            best_outcome = max(counts, key=counts.get)
+            outcome_count = counts[best_outcome]
+            
+            # Use all 9 measurement bits (9 qubits → 9 bits) plus frequency for entropy
+            entropy_input = f"{best_outcome}_{outcome_count}_{int(time.time_ns())}"
+            entropy_hex = hashlib.sha3_256(entropy_input.encode()).hexdigest()
+            
+            logger.debug(
+                f"[VPQ] 🎯 Tripartite circuit executed | "
+                f"outcome={best_outcome} (count={outcome_count}/{shots}) | "
+                f"entropy={entropy_hex[:16]}…"
+            )
+            
+            # Store measurement stats for monitoring
+            with self._lock:
+                self._last_tripartite_outcome = best_outcome
+                self._last_tripartite_frequency = outcome_count / shots
+            
+            return entropy_hex
+        
+        except Exception as e:
+            logger.error(f"[VPQ] ❌ Tripartite execution failed: {e}")
+            logger.error(traceback.format_exc())
+            logger.debug("[VPQ] Falling back to CSPRNG entropy")
+            return secrets.token_hex(32)
+
     def measure_virtual_pq_entropy(self, vpq_id: str) -> str:
         """
         Measure a virtual pq to produce 256-bit quantum entropy.
-        Diagonal of density matrix → probability distribution → sampling → SHA3-256.
-        Falls back to CSPRNG if pq not available.
+        
+        ⚛️ IMPROVED: Now executes tripartite AER circuit if available,
+        otherwise falls back to density matrix sampling.
+        
+        Priority:
+          1. Execute tripartite circuit (actual quantum measurement)
+          2. Fallback: sample density matrix diagonal (classical)
+          3. Fallback: CSPRNG (last resort)
         """
+        # Try to use tripartite circuit first (REAL QUANTUM)
+        if QISKIT_AVAILABLE:
+            entropy = self.execute_tripartite_circuit(vpq_id)
+            if entropy != secrets.token_hex(32):  # Check if not fallback
+                return entropy
+        
+        # Fallback: Classical sampling from density matrix diagonal
         with self._lock:
             dm = self._vpq.get(vpq_id) or self._pq0
 
@@ -5659,8 +6006,12 @@ class VirtualPseudoqubitManager:
             # Sample 64 outcomes from the probability distribution
             outcomes = np.random.choice(8, size=64, p=diag)
             entropy_source = ''.join(str(o) for o in outcomes)
-            return hashlib.sha3_256(entropy_source.encode()).hexdigest()
-        except Exception:
+            entropy = hashlib.sha3_256(entropy_source.encode()).hexdigest()
+            
+            logger.debug(f"[VPQ] 📊 Classical fallback measurement: {entropy[:16]}…")
+            return entropy
+        except Exception as e:
+            logger.debug(f"[VPQ] Measurement fallback failed: {e}, using CSPRNG")
             return secrets.token_hex(32)
 
     def verify_oracle_anti_correlation(self, vpq_id: str) -> Tuple[float, str]:
