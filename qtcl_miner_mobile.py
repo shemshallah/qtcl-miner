@@ -3825,6 +3825,7 @@ class OracleNode:
         self.running=False
         init_peer_db_table(db)
         self._record_self_to_db()
+        logger.info(f"[ORACLE] {self.miner_id} initialized and ready")
     
     def _record_self_to_db(self):
         try:
@@ -3856,11 +3857,14 @@ class OracleNode:
         
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                
                 if self.path=='/health':
                     self.send_response(200)
                     self.send_header('Content-Type','application/json')
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status":"online","miner":oracle.miner_id,"ip":oracle.my_ip}).encode())
+                    msg=json.dumps({"status":"healthy","miner":oracle.miner_id,"ip":oracle.my_ip,"uptime":"active"})
+                    self.wfile.write(msg.encode())
+
                 elif self.path=='/p2p/gossip':
                     self.send_response(200)
                     self.send_header('Content-Type','text/event-stream')
@@ -3884,16 +3888,22 @@ class OracleNode:
             def log_message(self,*args):
                 pass
         
+        
         def run_server():
             try:
                 server=HTTPServer(('0.0.0.0',self.local_port),Handler)
                 oracle.running=True
                 server.serve_forever()
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"[ORACLE] Server error: {e}")
+                oracle.running=False
         
-        t=threading.Thread(target=run_server,daemon=True)
-        t.start()
+        try:
+            t=threading.Thread(target=run_server,daemon=True,name="OracleServer")
+            t.start()
+        except Exception as e:
+            logger.error(f"[ORACLE] Failed to start server: {e}")
+
 
 class QuantumMiner:
     def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12):
