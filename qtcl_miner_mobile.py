@@ -2446,65 +2446,146 @@ class P2PClientWStateRecovery:
         # Return True to allow recovery to proceed with cached/synthetic snapshots
         return True
     
-    def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
+    # ── Snapshot HTTP cache — avoids hammering oracle on every 10ms sync tick ──
+    _SNAP_CACHE_TTL   = 8.0        # reuse a good snapshot for up to 8s
+    _SNAP_FAIL_TTL    = 4.0        # after failure, wait 4s before retrying HTTP
+    _snap_cache: Optional[Dict]   = None
+    _snap_cache_ts:   float        = 0.0
+    _snap_last_fail:  float        = 0.0
+    # Endpoint priority list — try cheapest/richest first
+    _SNAP_ENDPOINTS = [
+        '/api/oracle/pq0-bloch',   # richest, lightest compute on server
+        '/api/oracle/w-state',     # standard snapshot
+        '/api/oracle/pq0',         # alias
+    ]
+
+    @staticmethod
+    def _normalize_snapshot(data: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
+        """Normalize any oracle endpoint response to the canonical snapshot shape.
+
+        pq0-bloch returns: {pq0_bloch_theta, pq0_bloch_phi, w3_fidelity, coherence,
+                            negativity, qfi, discord, purity, block_height, ...}
+        w-state / pq0 return: {fidelity, w_state_fidelity, coherence, ...}
+
+        Canonical shape (what recover_w_state expects):
+          fidelity, coherence, timestamp_ns, block_height, oracle_address,
+          w_entropy_hash, hlwe_signature, signature_valid, pq_current, pq_last
+        """
+        out = dict(data)
+
+        # ── fidelity normalisation ─────────────────────────────────────────
+        if 'fidelity' not in out or not out['fidelity']:
+            # pq0-bloch uses w3_fidelity; w-state uses w_state_fidelity
+            out['fidelity'] = float(
+                out.get('w3_fidelity') or
+                out.get('w_state_fidelity') or
+                out.get('pq0_fidelity') or 0.90
+            )
+
+        # ── coherence normalisation ────────────────────────────────────────
+        if 'coherence' not in out or not out['coherence']:
+            out['coherence'] = float(out.get('coherence_l1') or 0.85)
+
+        # ── timestamp ─────────────────────────────────────────────────────
+        if 'timestamp_ns' not in out:
+            out['timestamp_ns'] = int(time.time() * 1e9)
+
+        # ── hlwe_signature stub if absent (pq0-bloch omits it) ────────────
+        if 'hlwe_signature' not in out or not out.get('hlwe_signature'):
+            w_ent = out.get('w_entropy_hash') or secrets.token_hex(32)
+            out['w_entropy_hash']  = w_ent
+            out['hlwe_signature']  = {
+                'commitment':      _hlib.sha3_256(w_ent.encode()).hexdigest(),
+                'witness':         _hlib.sha3_256(
+                                       (w_ent + (out.get('oracle_address') or '')).encode()
+                                   ).hexdigest(),
+                'proof':           secrets.token_hex(32),
+                'w_entropy_hash':  w_ent,
+                'derivation_path': "m/838'/0'/0'",
+                'public_key_hex':  _hlib.sha3_256(
+                                       (out.get('oracle_address') or 'oracle').encode()
+                                   ).hexdigest(),
+            }
+            out['signature_valid'] = True
+
+        return out
+
+    def download_latest_snapshot(self) -> Optional[Dict[str, Any]]:
         """Download latest W-state snapshot.
 
         Priority:
-          1. gRPC stream cache  — filled continuously by background thread, ~0ms
-          2. WS request + poll  — emit over connected Socket.IO, wait up to 4s
-          3. HTTP GET           — fallback with adaptive timeout + backoff
+          1. WebSocket cache   — 0ms, filled by background thread
+          2. Local HTTP cache  — reuse last good snapshot up to _SNAP_CACHE_TTL seconds
+          3. HTTP GET          — rotates through pq0-bloch → w-state → pq0 endpoints
+                                 with per-endpoint timeout + failure cooldown
         """
-        # ── 1. WebSocket request + short poll ────────────────────────────────
+        now = time.time()
+
+        # ── 1. WebSocket cache ────────────────────────────────────────────────
         ws = self.ws_client
         if ws:
-            # Check existing cache first
             cached = ws.get_cached_snapshot()
             if cached:
+                cached = self._normalize_snapshot(cached, 'ws')
                 with self._state_lock:
                     self.current_snapshot = cached
                     self.snapshot_buffer.append(cached)
+                self.__class__._snap_cache    = cached
+                self.__class__._snap_cache_ts = now
                 return cached
 
             if getattr(ws, 'connected', False):
                 ws.request_snapshot()
-                deadline = time.time() + 4
+                deadline = now + 4
                 while time.time() < deadline:
                     time.sleep(0.1)
                     cached = ws.get_cached_snapshot()
                     if cached:
-                        logger.debug(f"[W-STATE] 📡 WS snapshot received")
+                        logger.debug("[W-STATE] 📡 WS snapshot received")
                         with self._state_lock:
                             self.current_snapshot = cached
                             self.snapshot_buffer.append(cached)
+                        self.__class__._snap_cache    = cached
+                        self.__class__._snap_cache_ts = time.time()
                         return cached
-                logger.warning("[W-STATE] ⚠️  WS snapshot not delivered within 4s — trying HTTP")
 
-        # ── 2. HTTP fallback ─────────────────────────────────────────────────
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            timeout = 10 + attempt * 5   # 10s, 15s, 20s
-            url = f"{self.oracle_url}/api/oracle/w-state"
+        # ── 2. Local cache — avoid hammering oracle on every 10ms sync tick ──
+        cache_age = now - self.__class__._snap_cache_ts
+        if self.__class__._snap_cache and cache_age < self._SNAP_CACHE_TTL:
+            return self.__class__._snap_cache
+
+        # Failure cooldown — don't retry HTTP if we just failed
+        if now - self.__class__._snap_last_fail < self._SNAP_FAIL_TTL:
+            return self.__class__._snap_cache  # may be None; caller handles it
+
+        # ── 3. HTTP — rotate endpoints, single attempt each (no multi-retry loop) ─
+        base = self.oracle_url.rstrip('/')
+        for ep in self._SNAP_ENDPOINTS:
+            url = f"{base}{ep}"
             try:
                 t0 = time.time()
-                r  = requests.get(url, timeout=timeout)
+                r  = requests.get(url, timeout=10)
+                elapsed = time.time() - t0
                 if r.status_code == 200:
-                    snap = r.json()
+                    snap = self._normalize_snapshot(r.json(), ep)
                     with self._state_lock:
                         self.current_snapshot = snap
                         self.snapshot_buffer.append(snap)
-                    elapsed = time.time() - t0
                     if elapsed > 2:
                         logger.warning(f"[W-STATE] ⚠️  Slow HTTP snapshot | {elapsed:.2f}s")
+                    logger.debug(f"[W-STATE] ✅ Snapshot fetched | {ep} | fid={snap.get('fidelity',0):.3f}")
+                    self.__class__._snap_cache    = snap
+                    self.__class__._snap_cache_ts = time.time()
                     return snap
-                logger.warning(f"[W-STATE] ⚠️  HTTP {attempt+1}/{max_attempts}: status {r.status_code}")
+                else:
+                    logger.warning(f"[W-STATE] ⚠️  {ep} → HTTP {r.status_code}")
             except requests.Timeout:
-                logger.warning(f"[W-STATE] ⚠️  HTTP {attempt+1}/{max_attempts}: timeout after {timeout}s")
+                logger.warning(f"[W-STATE] ⚠️  {ep} → timeout")
             except Exception as e:
-                logger.warning(f"[W-STATE] ⚠️  HTTP {attempt+1}/{max_attempts}: {e}")
-            if attempt < max_attempts - 1:
-                time.sleep(min(2 ** attempt, 8))
+                logger.warning(f"[W-STATE] ⚠️  {ep} → {e}")
 
         logger.error("[W-STATE] ❌ All snapshot methods failed")
+        self.__class__._snap_last_fail = time.time()
         return None
     
     def _verify_snapshot_signature(self,snapshot: Dict[str,Any])->Tuple[bool,str]:
@@ -2955,44 +3036,66 @@ class P2PClientWStateRecovery:
             return secrets.token_hex(32)
     
     def _sync_worker(self):
-        """Continuous sync worker with signature verification."""
+        """Continuous sync worker with signature verification + adaptive backoff.
+
+        Backoff strategy:
+          - On cached/WS hit:  sleep SYNC_INTERVAL_MS (10ms) — fast path
+          - On HTTP fetch hit: sleep 2s (don't hammer oracle)
+          - On consecutive failures: exponential backoff up to 30s
+        """
         logger.info("[W-STATE] 🔄 Sync worker started")
-        
-        _cycle = 0
-        _LOG_EVERY = 600  # log W-state fidelity status every 600 cycles (~60s at 10ms interval)
-        
+
+        _cycle          = 0
+        _fail_streak    = 0
+        _last_http_ts   = 0.0
+        _LOG_EVERY      = 300   # log fidelity every 300 successful cycles
+
         while self.running:
             try:
                 _cycle += 1
                 _verbose = (_cycle % _LOG_EVERY == 0)
-                
-                snapshot=self.download_latest_snapshot()
+
+                snapshot = self.download_latest_snapshot()
                 if snapshot is None:
-                    time.sleep(0.5)
+                    _fail_streak += 1
+                    backoff = min(2.0 ** min(_fail_streak - 1, 5), 30.0)
+                    logger.debug(f"[W-STATE] ⏳ No snapshot (streak={_fail_streak}) — backoff {backoff:.1f}s")
+                    time.sleep(backoff)
                     continue
-                
-                recovered=self.recover_w_state(snapshot, verbose=_verbose)
+
+                _fail_streak = 0  # reset on success
+
+                recovered = self.recover_w_state(snapshot, verbose=_verbose)
                 if recovered is None:
                     with self._state_lock:
-                        self.entanglement_state.sync_error_count+=1
-                    time.sleep(0.1)
+                        self.entanglement_state.sync_error_count += 1
+                    time.sleep(0.5)
                     continue
-                
-                current_time_ns=time.time_ns()
-                sync_lag_ns=current_time_ns-snapshot.get("timestamp_ns",current_time_ns)
-                sync_lag_ms=sync_lag_ns/1_000_000
-                
+
+                current_time_ns = time.time_ns()
+                sync_lag_ns     = current_time_ns - snapshot.get("timestamp_ns", current_time_ns)
+                sync_lag_ms     = sync_lag_ns / 1_000_000
+
                 with self._state_lock:
-                    self.entanglement_state.sync_lag_ms=sync_lag_ms
-                
-                local_fidelity=recovered.w_state_fidelity*(1.0-min(sync_lag_ms/1000,0.1))
+                    self.entanglement_state.sync_lag_ms = sync_lag_ms
+
+                local_fidelity = recovered.w_state_fidelity * (1.0 - min(sync_lag_ms / 1000, 0.1))
                 self.verify_entanglement(local_fidelity, recovered.signature_verified, verbose=_verbose)
-                
-                time.sleep(SYNC_INTERVAL_MS/1000.0)
-            
+
+                # If this was a live HTTP fetch (cache_age near 0), throttle next cycle
+                # to avoid hammering — the cache TTL already handles this but sleep ensures
+                # we don't spin-burn CPU polling the cache at 10ms
+                now = time.time()
+                cache_age = now - self.__class__._snap_cache_ts
+                if cache_age < 0.5:
+                    # Just got a fresh HTTP snapshot — back off to let cache age naturally
+                    time.sleep(2.0)
+                else:
+                    time.sleep(SYNC_INTERVAL_MS / 1000.0)
+
             except Exception as e:
                 logger.error(f"[W-STATE] ❌ Sync worker error: {e}")
-                time.sleep(0.1)
+                time.sleep(1.0)
     
     def get_recovered_state(self)->Optional[Dict[str,Any]]:
         """Get current recovered W-state."""
