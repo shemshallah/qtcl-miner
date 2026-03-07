@@ -2676,22 +2676,18 @@ class P2PClientWStateRecovery:
             return 0.0
     
     def _compute_w_state_fidelity(self,matrix: np.ndarray)->float:
-        """Compute fidelity to ideal W-state."""
+        """Fidelity to ideal 3-qubit W-state |W>=( |100>+|010>+|001> )/√3.
+        Basis: |000>=0,|001>=1,|010>=2,|011>=3,|100>=4,...,|111>=7
+        F = Tr(ρ · ρ_W) where ρ_W = |W><W|, all off-diag = 1/3 for {1,2,4}.
+        """
         try:
             if matrix is None or matrix.shape[0]!=8:
                 return 0.0
-            w_ideal=np.array([
-                [0,0,0,0,0,0,0,0],
-                [0,1/3,0,1/3,0,0,0,0],
-                [0,0,1/3,0,0,0,0,0],
-                [0,1/3,0,1/3,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-            ])/3
-            f=float(np.real(np.trace(matrix@w_ideal)))
-            return min(1.0,max(0.0,f))
+            w = np.zeros(8, dtype=np.complex128)
+            w[4] = w[2] = w[1] = 1.0/np.sqrt(3.0)   # |100>,|010>,|001>
+            w_ideal = np.outer(w, w.conj())            # 8×8, Tr=1
+            f = float(np.real(np.trace(matrix @ w_ideal)))
+            return min(1.0, max(0.0, f))
         except:
             return 0.0
     
@@ -3133,69 +3129,58 @@ class P2PClientWStateRecovery:
     
     def start(self)->bool:
         """Start the recovery client.
-        
-        FIXED: Now tolerates registration and snapshot download failures with
-        graceful degradation. Mining can continue with cached/synthetic snapshots.
+
+        Blocks until a REAL oracle snapshot is obtained — no synthetic fallback.
+        Mining loop already gates on entanglement.established so nothing mines
+        until a valid W-state is in hand.
         """
         if self.running:
             logger.warning("[W-STATE] Already running")
             return True
-        
-        try:
-            logger.info(f"[W-STATE] 🚀 Starting recovery client...")
-            
-            # Try to register with oracle (now with exponential backoff)
-            # If fails, continue with cached/synthetic snapshots
-            if not self.register_with_oracle():
-                logger.warning("[W-STATE] ⚠️  Registration inconclusive - attempting recovery anyway")
 
-            snapshot=self.download_latest_snapshot()
-            if snapshot is None:
-                logger.warning("[W-STATE] ⚠️  Failed to download initial snapshot - using synthetic snapshot")
-                # Create a synthetic snapshot so recovery can proceed
-                snapshot={
-                    'oracle_address': self.oracle_address,
-                    'timestamp_ns': int(time.time() * 1e9),
-                    'w_entropy_hash': secrets.token_hex(32),
-                    'fidelity': 0.95,
-                    'density_matrix_hex': 'a' * 512,
-                    'hlwe_signature': {
-                        'commitment': secrets.token_hex(32),
-                        'witness': secrets.token_hex(32),
-                        'proof': secrets.token_hex(64),
-                        'w_entropy_hash': secrets.token_hex(32),
-                        'derivation_path': "m/838'/0'/0'",
-                        'public_key_hex': secrets.token_hex(33),
-                    },
-                    'signature_valid': True
-                }
-            
-            recovered=self.recover_w_state(snapshot)
+        try:
+            logger.info("[W-STATE] 🚀 Starting recovery client...")
+
+            # Register — non-fatal, sync loop will retry in background
+            if not self.register_with_oracle():
+                logger.warning("[W-STATE] ⚠️  Registration inconclusive — will retry in sync loop")
+
+            # ── Block until real oracle snapshot arrives ───────────────────────
+            # No synthetic fallback. Mining is gated on entanglement.established
+            # so the miner simply waits here rather than mining on fake data.
+            attempt = 0
+            snapshot = None
+            while snapshot is None:
+                snapshot = self.download_latest_snapshot()
+                if snapshot is None:
+                    attempt += 1
+                    wait = min(2 ** min(attempt, 5), 30)
+                    logger.info(f"[W-STATE] ⏳ Waiting for oracle snapshot (attempt {attempt}) — retry in {wait}s")
+                    time.sleep(wait)
+
+            logger.info(f"[W-STATE] ✅ Real oracle snapshot received | fidelity={snapshot.get('fidelity', '?')}")
+
+            recovered = self.recover_w_state(snapshot)
             if recovered is None:
-                logger.warning("[W-STATE] ⚠️  Initial recovery inconclusive - continuing with best-effort recovery")
-                # Don't fail here - recovery will attempt again in sync loop
-            
+                logger.warning("[W-STATE] ⚠️  Initial recovery inconclusive — sync loop will retry")
+
             if not self._establish_entanglement():
-                logger.warning("[W-STATE] ⚠️  Entanglement establishment inconclusive - will retry in background")
-                # Don't fail here - sync loop will retry
-            
-            self.running=True
-            self.sync_thread=threading.Thread(
+                logger.warning("[W-STATE] ⚠️  Entanglement not yet established — sync loop will retry")
+
+            self.running = True
+            self.sync_thread = threading.Thread(
                 target=self._sync_worker,
                 daemon=True,
                 name=f"WStateSync_{self.peer_id[:8]}"
             )
             self.sync_thread.start()
-            
-            logger.info(f"[W-STATE] ✨ Recovery client running with W-state entanglement")
+
+            logger.info("[W-STATE] ✨ Recovery client running with W-state entanglement")
             return True
-        
+
         except Exception as e:
             logger.error(f"[W-STATE] ❌ Start error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-            logger.error(f"[W-STATE] ❌ Startup failed: {e}")
+            import traceback; traceback.print_exc()
             return False
     
     def stop(self):
@@ -5908,9 +5893,8 @@ class OracleEntanglementBridge:
         oracle_id = self._oracle_id_from_url(self.main_oracle_url)
         fidelity  = float(snap.get('fidelity', 0.0))
 
-        # Initialize/update local pq0 from main oracle
-        if self.vpm._pq0 is None:
-            self.vpm.initialize_pq0(snap)
+        # Always refresh pq0 from oracle — keeps fidelity live, not frozen at boot
+        self.vpm.initialize_pq0(snap)
 
         f_link = fidelity * self.vpm._fidelity
         status = ('active' if f_link >= 0.70 else
