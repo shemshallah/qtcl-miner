@@ -550,6 +550,23 @@ class P2PMessage:
             payload=d.get('payload')
         )
 
+def _safe_json(response, default=None, label=''):
+    """Parse response.json() without raising on empty/non-JSON bodies.
+    Koyeb cold-start returns HTTP 200 with empty body; bare .json() raises
+    JSONDecodeError which gets swallowed by broad except clauses and looks like
+    a network error. This helper returns `default` instead and logs the body."""
+    try:
+        return response.json()
+    except Exception as _je:
+        try:
+            _body = response.text[:200] if response.text else '<empty>'
+        except Exception:
+            _body = '<unreadable>'
+        _tag = f'[{label}] ' if label else ''
+        logger.debug(f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | body={_body!r}")
+        return default
+
+
 class P2PClient:
     """
     P2P client for peer discovery and block synchronisation.
@@ -605,7 +622,7 @@ class P2PClient:
             try:
                 r = self._session.get(f"{base}/api/oracle/miners", timeout=timeout)
                 if r.status_code == 200:
-                    data = r.json()
+                    data = _safe_json(r, default={}, label='P2P/discover')
                     miners = data if isinstance(data, list) else data.get('miners', [])
                     for m in miners:
                         url = m.get('url') or m.get('oracle_url', '')
@@ -635,7 +652,7 @@ class P2PClient:
             try:
                 r = self._session.get(f"{base}/api/blocks/tip", timeout=timeout)
                 if r.status_code == 200:
-                    data = r.json()
+                    data = _safe_json(r, default={}, label='P2P/height')
                     h = data.get('block_height') or data.get('height')
                     if h is not None:
                         logger.info(f"[P2P] ✅ Chain tip height={h} from {base}")
@@ -659,7 +676,7 @@ class P2PClient:
                         f"{base}/api/blocks/height/{height}", timeout=timeout
                     )
                     if r.status_code == 200:
-                        data = r.json()
+                        data = _safe_json(r, default={}, label='P2P/sync_blocks')
                         # Unwrap nested header if present
                         block = data.get('header', data)
                         blocks.append(block)
@@ -2001,7 +2018,7 @@ class PeriodicPeerSync:
                         f"{base}/api/blocks/tip", timeout=5
                     )
                     if r.status_code == 200:
-                        data   = r.json()
+                        data   = _safe_json(r, default={}, label='CONSENSUS/tip')
                         height = data.get('block_height') or data.get('height') or 0
                         peer_id = base
                         if self.consensus_mgr:
@@ -2503,7 +2520,10 @@ class P2PClientWStateRecovery:
                 )
 
                 if response.status_code in [200, 201]:
-                    data = response.json()
+                    data = _safe_json(response, default={}, label='W-STATE/register')
+                    if not data:
+                        logger.warning("[W-STATE] ⚠️  Registration HTTP 200 but empty body — oracle initialising, treating as registered")
+                        return True
                     self.oracle_address = data.get('miner_id', self.peer_id)
                     if self.oracle_address:
                         self.trusted_oracles.add(self.oracle_address)
@@ -2641,7 +2661,11 @@ class P2PClientWStateRecovery:
                 r  = requests.get(url, timeout=10)
                 elapsed = time.time() - t0
                 if r.status_code == 200:
-                    snap = self._normalize_snapshot(r.json(), ep)
+                    _raw = _safe_json(r, default=None, label=f'W-STATE{ep}')
+                    if _raw is None:
+                        logger.warning(f"[W-STATE] ⚠️  {ep} → HTTP 200 but empty body (oracle initialising?)")
+                        continue
+                    snap = self._normalize_snapshot(_raw, ep)
                     with self._state_lock:
                         self.current_snapshot = snap
                         self.snapshot_buffer.append(snap)
@@ -3264,20 +3288,29 @@ class P2PClientWStateRecovery:
             if not self.register_with_oracle():
                 logger.warning("[W-STATE] ⚠️  Registration inconclusive — will retry in sync loop")
 
-            # ── Block until real oracle snapshot arrives ───────────────────────
-            # No synthetic fallback. Mining is gated on entanglement.established
-            # so the miner simply waits here rather than mining on fake data.
+            # ── Block until REAL oracle snapshot arrives — NO synthetic fallback ──
+            # Architecture mandate: real W-state only. Empty-body 200s are handled
+            # by _safe_json() → None → retry. Failure cooldown cleared each loop.
+            # Backoff: 2 4 8 16 30 30 30… seconds.
             attempt = 0
             snapshot = None
+            _BACKOFF = [2, 4, 8, 16, 30]
             while snapshot is None:
+                attempt += 1
+                self.__class__._snap_last_fail = 0.0  # bypass HTTP cooldown
                 snapshot = self.download_latest_snapshot()
-                if snapshot is None:
-                    attempt += 1
-                    wait = min(2 ** min(attempt, 5), 30)
-                    logger.info(f"[W-STATE] ⏳ Waiting for oracle snapshot (attempt {attempt}) — retry in {wait}s")
-                    time.sleep(wait)
-
-            logger.info(f"[W-STATE] ✅ Real oracle snapshot received | fidelity={snapshot.get('fidelity', '?')}")
+                if snapshot is not None:
+                    logger.info(
+                        f"[W-STATE] ✅ Real oracle snapshot received "
+                        f"(attempt {attempt}) | fidelity={snapshot.get('fidelity', '?')}"
+                    )
+                    break
+                wait = _BACKOFF[min(attempt - 1, len(_BACKOFF) - 1)]
+                logger.info(
+                    f"[W-STATE] ⏳ No oracle snapshot yet (attempt {attempt}) — "
+                    f"oracle initialising. Retrying in {wait}s… (mining gated on real W-state)"
+                )
+                time.sleep(wait)
 
             recovered = self.recover_w_state(snapshot)
             if recovered is None:
@@ -3506,7 +3539,7 @@ class LiveNodeClient:
         try:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/tip",timeout=10)
             if r.status_code==200:
-                return BlockHeader.from_dict(r.json())
+                return BlockHeader.from_dict(_safe_json(r, default={}, label='LiveNode/tip') or {})
         except:
             pass
         return None
@@ -3515,7 +3548,7 @@ class LiveNodeClient:
         try:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/height/{height}",timeout=10)
             if r.status_code==200:
-                return r.json()
+                return _safe_json(r, default=None, label='LiveNode/block')
         except:
             pass
         return None
@@ -3525,7 +3558,7 @@ class LiveNodeClient:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/mempool",timeout=10)
             if r.status_code==200:
                 txs=[]
-                for tx in r.json().get('transactions',[])[:MAX_MEMPOOL]:
+                for tx in (_safe_json(r, default={}, label='LiveNode/mempool') or {}).get('transactions',[])[:MAX_MEMPOOL]:
                     try:
                         # Remap server field names → Transaction dataclass fields
                         # Server returns from_address/to_address/tx_hash (DB column names)
@@ -3558,11 +3591,11 @@ class LiveNodeClient:
             logger.debug(f"[SUBMIT] Status: {r.status_code} | Headers: {dict(r.headers)}")
             
             if r.status_code in [200,201]:
-                return True,r.json().get('message','Block accepted')
+                return True,(_safe_json(r, default={}, label='LiveNode/submit_ok') or {}).get('message','Block accepted')
             
             # ❌ SUBMISSION FAILED - LOG FULL DETAILS
             try:
-                error_data = r.json()
+                error_data = _safe_json(r, default={}, label='LiveNode/submit_err')
                 error_msg = error_data.get('error', f'HTTP {r.status_code}')
             except:
                 error_msg = f'HTTP {r.status_code}: {r.text[:200]}'
@@ -3578,7 +3611,7 @@ class LiveNodeClient:
         try:
             r = self.session.get(f"{self.base_url}{API_PREFIX}/wallet?address={address}", timeout=10)
             if r.status_code == 200:
-                return r.json(), None
+                return _safe_json(r, default=None, label='LiveNode/balance'), None
             return None, f"Status {r.status_code}: {r.text}"
         except Exception as e:
             return None, str(e)
@@ -5289,7 +5322,7 @@ class PeerHeartbeat(threading.Thread):
                 timeout=10,
             )
             if r.status_code in (200, 201):
-                data = r.json()
+                data = _safe_json(r, default={}, label='PeerHeartbeat/register')
                 self._known_peers = data.get('live_peers', [])
                 logger.info(
                     f"[P2P] ✅ Registered with oracle | "
@@ -7304,7 +7337,7 @@ class DHTExchangeManager:
                 ok  = r.status_code == 200
                 _local_db_record_peer_result(self.db, node_id, ok, lat)
                 if ok:
-                    data = r.json()
+                    data = _safe_json(r, default={}, label='DHT/ping')
                     # Update height and fidelity from ping response
                     try:
                         self.db.execute("""
@@ -9470,30 +9503,33 @@ def main():
         logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
 
         # 5. Sync chain height from oracle / peers
-        # Short initial timeout (3s) — Koyeb free tier may be cold-starting.
-        # Mining starts from local state immediately; background sync catches up.
+        # ── Oracle height query: retry ladder then local DB fallback ──────────
         current_height = 0
         p2p_success    = False
+        logger.info("[P2P] 📊 Querying oracle for current block height…")
+        for _t_timeout, _t_sleep in [(3, 0), (5, 2), (8, 3)]:
+            if _t_sleep: time.sleep(_t_sleep)
+            try:
+                _h = _P2P_CLIENT.get_block_height(timeout=_t_timeout, oracle_url=oracle_url)
+                if _h is not None and _h > 0:
+                    current_height = _h
+                    logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
+                    break
+            except Exception as _he:
+                logger.debug(f"[P2P] height attempt (timeout={_t_timeout}s): {_he}")
 
-        logger.info("[P2P] 📊 Querying oracle for current block height (3s timeout — non-blocking)...")
-        current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
-
-        if current_height is not None and current_height > 0:
-            logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
-        else:
-            logger.info(
-                "[P2P] ℹ️  Oracle cold-starting or unreachable — mining from local state. "
-                "Background sync will catch up within 30s."
-            )
-            # Try peer-to-peer height discovery (no oracle needed)
-            discovered = _P2P_CLIENT.discover_peers(timeout=3)
-            if discovered:
-                _P2P_CLIENT.known_peers.extend(discovered)
-                current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
-                if current_height:
-                    logger.info(f"[P2P] ✅ Got height from peers: {current_height}")
-
-            # Fallback: read local DB height — always available
+        if not current_height:
+            logger.info("[P2P] ℹ️  Oracle unreachable — trying P2P peers then local DB…")
+            try:
+                discovered = _P2P_CLIENT.discover_peers(timeout=5)
+                if discovered:
+                    _P2P_CLIENT.known_peers.extend(discovered)
+                    _h = _P2P_CLIENT.get_block_height(timeout=5, oracle_url=oracle_url)
+                    if _h:
+                        current_height = _h
+                        logger.info(f"[P2P] ✅ Got height from peers: {current_height}")
+            except Exception as _de:
+                logger.debug(f"[P2P] peer discovery: {_de}")
             if not current_height:
                 try:
                     cursor = db.cursor()
