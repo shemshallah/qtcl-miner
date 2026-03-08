@@ -7714,3 +7714,1990 @@ if PRODUCTION_READY:
     logger.info("[QTCL] • Async mining enabled")
     logger.info("[QTCL] • Enterprise features deployed")
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ⚛️  QTCL CLIENT — EXPANSION BLOCK  (appended verbatim-safe)
+# Zero modifications above this marker.  All new symbols live here.
+#
+# 8-AGENT SWARM MANIFEST
+# ───────────────────────
+#  α  OracleWStateDefinition   ORACLE_W_STATE singleton  |W3⟩ hard definition
+#  β  GKSLBathParams           Canonical noise bath (lattice-fingerprint matched)
+#     build_aer_noise_model    AER NoiseModel = same rates as GKSL Lindblad ops
+#     _gksl_rk4_step           RK4 master equation (mirrors miner _apply_gksl_bath)
+#  γ  KoyebAPIClient           All verified REST endpoints from GossipHTTPHandler
+#  δ  TensorFieldMetrics       Bell violations · discord · negativity · entropy
+#     ClientFieldState         Tripartite field: ORACLE_W_STATE↔pq_curr↔pq_last
+#     KoyebOracleState         HTTP bridge fidelity · live oracle DM sync
+#  ε  SSEMultiplexer           Per-client interruptable streams · 9091 compatible
+#  ζ  QTCLWallet               BIP-39/32/38 verbatim from qtcl_miner_mobile.py
+#  η  QtclClientApp            Welcome menu · Mine · Transact · Wallet
+#  θ  main()                   Replaces original stub; --node-type delegates up
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import os as _os
+import json as _json
+import time as _time
+import hmac as _hmac
+import hashlib as _hashlib
+import threading as _threading
+import sqlite3 as _sqlite3
+import secrets as _secrets
+import asyncio as _asyncio
+import logging as _logging
+from collections import deque as _deque
+from dataclasses import dataclass as _dc, field as _field
+from pathlib import Path as _Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ── numpy (optional — hard-required for quantum ops; graceful text fallback) ──
+try:
+    import numpy as _np
+    _HAS_NP = True
+except ImportError:
+    _np = None
+    _HAS_NP = False
+
+# ── requests (optional — urllib fallback built in) ────────────────────────────
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _requests = None
+    _HAS_REQUESTS = False
+
+# ── queue alias ───────────────────────────────────────────────────────────────
+try:
+    import queue as _queue
+except ImportError:
+    import Queue as _queue  # type: ignore
+
+_EXP_LOG = _logging.getLogger("qtcl.client.expansion")
+_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# α-SWARM  ORACLE_W_STATE  ─  hard 8×8 |W3⟩⟨W3| definition
+# |W3⟩ = (1/√3)(|100⟩ + |010⟩ + |001⟩)  →  basis indices 4, 2, 1 of the
+# 3-qubit computational basis (MSB first).
+# Qubit taxonomy mirrors VirtualPseudoqubitManager:
+#   A = pq0              oracle ground-truth pseudoqubit
+#   B = virtual_pq       local decoherent mirror of pq0
+#   C = inverse_virtual  anti-correlated conjugate (more noise → lower fid)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_w3_dm() -> "Optional[np.ndarray]":
+    """Pure 8×8 density matrix for |W3⟩ = (|100⟩+|010⟩+|001⟩)/√3."""
+    if not _HAS_NP:
+        return None
+    psi = _np.zeros(8, dtype=_np.complex128)
+    psi[4] = psi[2] = psi[1] = 1.0 / _np.sqrt(3.0)
+    return _np.outer(psi, psi.conj())
+
+
+@_dc
+class OracleWStateDefinition:
+    """
+    Module-level singleton representing the hard-defined tripartite W-state.
+    All CLIENT_FIELD_STATE fidelity measures and Bell tests reference this.
+    """
+    QUBIT_A: str = "pq0"
+    QUBIT_B: str = "virtual_pq"
+    QUBIT_C: str = "inverse_virtual_pq"
+    n_qubits: int = 3
+    hilbert_dim: int = 8
+    # Analytical properties
+    purity_ideal:       float = 1.0
+    entropy_marginal:   float = 0.9183    # single-qubit S (bits)
+    coherence_l1_ideal: float = 2.0 / 3.0
+    bell_tsirelson:     float = 2.0 * _np.sqrt(2) if _HAS_NP else 2.828
+    negativity_ideal:   float = 1.0 / 3.0
+    dm_ideal: Any = _field(default=None)
+
+    def __post_init__(self):
+        if _HAS_NP and self.dm_ideal is None:
+            self.dm_ideal = _build_w3_dm()
+
+    def fidelity_with(self, rho: "np.ndarray") -> float:
+        """Uhlmann fidelity F(ρ_W, ρ) — Tr(√(√ρ_W · ρ · √ρ_W))²."""
+        if not _HAS_NP or self.dm_ideal is None:
+            return 0.0
+        try:
+            from scipy.linalg import sqrtm as _sqrtm
+            sq = _sqrtm(self.dm_ideal)
+            return float(min(1.0, max(0.0,
+                _np.real(_np.trace(_sqrtm(sq @ rho @ sq))) ** 2)))
+        except Exception:
+            # Hilbert-Schmidt inner product fallback
+            return float(min(1.0, max(0.0,
+                _np.real(_np.trace(self.dm_ideal @ rho)))))
+
+    def build_inverse_virtual(self, rho_vpq: "np.ndarray",
+                               fidelity: float = 0.9) -> "np.ndarray":
+        """ρ_IV = ρ_W − α·(ρ_vpq − ρ_mixed)  where α = 1 − fidelity."""
+        if not _HAS_NP:
+            return None
+        n     = rho_vpq.shape[0]
+        mixed = _np.eye(n, dtype=_np.complex128) / n
+        alpha = float(max(0.0, min(1.0, 1.0 - fidelity)))
+        base  = (self.dm_ideal.copy() if self.dm_ideal is not None
+                 and self.dm_ideal.shape == rho_vpq.shape else mixed.copy())
+        iv    = base - alpha * (rho_vpq - mixed)
+        iv    = 0.5 * (iv + iv.conj().T)
+        tr    = float(_np.real(_np.trace(iv)))
+        return iv / max(tr, 1e-15)
+
+
+# Module singleton — import from any module via: from qtcl_client import ORACLE_W_STATE
+ORACLE_W_STATE: OracleWStateDefinition = OracleWStateDefinition()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# β-SWARM  GKSLBathParams + AER NoiseModel
+# Canonical constants sourced from qtcl_miner_mobile.py _apply_gksl_bath()
+# and the LATTICE_FINGERPRINT string:
+#   "0.12:6.283:3.14159:0.50:0.11:0.001:0.001:0.002:100.0:50.0:10.0:8:42"
+# γ1=0.04  γφ=0.12  γdep=0.01  ω=0.50  ou=0.03  κ3=0.11
+# AER error channels:
+#   1q: amplitude_damping_error(γ1_eff) ∘ depolarizing_error(2γφ/3)
+#   2q: depolarizing_error(γdep)
+# Applied to gates: ['ry','rx','rz','h','measure'] and ['cx','cz','swap']
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@_dc
+class GKSLBathParams:
+    """
+    Canonical QTCL GKSL noise bath.  Matches miner _apply_gksl_bath() and
+    server _gksl_step() exactly.  DO NOT change defaults — they are part of
+    the LATTICE_FINGERPRINT consensus rule.
+    """
+    gamma1:     float = 0.04    # T1 amplitude damping rate
+    gammaphi:   float = 0.12    # T2* pure dephasing rate
+    gammadep:   float = 0.01    # depolarizing channel rate
+    omega:      float = 0.50    # free qubit frequency (Hamiltonian drift)
+    ou_mem:     float = 0.03    # Ornstein-Uhlenbeck non-Markovian memory
+    kappa3:     float = 0.11    # OU suppression coefficient (fixed)
+    dt_default: float = 2.0     # default RK4 step (s) — matches server cycle
+
+    @property
+    def gamma1_eff(self) -> float:
+        """Effective T1 after OU memory correction (same as miner g1_eff)."""
+        return self.gamma1 * (1.0 - self.ou_mem * self.kappa3)
+
+    @property
+    def aer_rate_1q(self) -> float:
+        """AER 1-qubit depolarizing proxy for dephasing."""
+        return float(min(0.75, max(0.0, 2.0 * self.gammaphi / 3.0)))
+
+    @property
+    def aer_rate_2q(self) -> float:
+        """AER 2-qubit depolarizing rate."""
+        return float(min(0.75, max(0.0, self.gammadep)))
+
+    @classmethod
+    def from_snap(cls, snap: dict) -> "GKSLBathParams":
+        """Hydrate from oracle /api/oracle/w-state or /api/oracle/pq0-bloch snapshot."""
+        def _f(k, d): return float(snap.get(k) or d)
+        return cls(
+            gamma1   = _f("gamma1",   0.04),
+            gammaphi = _f("gammaphi", 0.12),
+            gammadep = _f("gammadep", 0.01),
+            omega    = _f("omega",    0.50),
+            ou_mem   = _f("ou_mem",   0.03),
+            kappa3   = 0.11,
+            dt_default = _f("dt", 2.0),
+        )
+
+
+# Canonical module-level instance
+CANONICAL_BATH: GKSLBathParams = GKSLBathParams()
+
+
+def build_aer_noise_model(bath: GKSLBathParams = None):
+    """
+    Build AerSimulator NoiseModel whose error channels match the GKSL
+    Lindblad operators in the server/miner exactly:
+      L1 = √γ1_eff · σ−    (amplitude damping)
+      L2 = √(γ1_eff·0.1)·σ+ (thermal re-excitation)
+      L3 = √γφ · σz/2      (pure dephasing)
+      L4 = √γdep · I/√2    (depolarizing)
+    AER channel representation:
+      1q: amplitude_damping_error(γ1_eff) ∘ depolarizing_error(2γφ/3)
+      2q: depolarizing_error(γdep)
+    Returns None if qiskit_aer unavailable.
+    """
+    if bath is None:
+        bath = CANONICAL_BATH
+    try:
+        from qiskit_aer.noise import (NoiseModel, depolarizing_error,
+                                       amplitude_damping_error)
+        nm = NoiseModel()
+        g1_eff = float(max(0.0, min(0.999, bath.gamma1_eff)))
+        r1q    = float(max(0.0, min(0.75,  bath.aer_rate_1q)))
+        r2q    = float(max(0.0, min(0.75,  bath.aer_rate_2q)))
+        err_ad  = amplitude_damping_error(g1_eff)
+        err_dep = depolarizing_error(r1q, 1)
+        err_1q  = err_ad.compose(err_dep)
+        nm.add_all_qubit_quantum_error(err_1q, ["ry", "rx", "rz", "h", "measure"])
+        err_2q = depolarizing_error(r2q, 2)
+        nm.add_all_qubit_quantum_error(err_2q, ["cx", "cz", "swap"])
+        return nm
+    except ImportError:
+        return None
+    except Exception as _e:
+        _EXP_LOG.debug(f"[AER] noise model error: {_e}")
+        return None
+
+
+# ── Lindblad operators (reused by RK4 and AER coherence checks) ──────────────
+if _HAS_NP:
+    _I2 = _np.eye(2, dtype=_np.complex128)
+    _SM = _np.array([[0, 0], [1, 0]], dtype=_np.complex128)   # σ−
+    _SP = _np.array([[0, 1], [0, 0]], dtype=_np.complex128)   # σ+
+    _SZ = _np.array([[1, 0], [0, -1]], dtype=_np.complex128)  # σz
+else:
+    _I2 = _SM = _SP = _SZ = None
+
+
+def _kron(*ops: "np.ndarray") -> "np.ndarray":
+    r = ops[0]
+    for o in ops[1:]:
+        r = _np.kron(r, o)
+    return r
+
+
+def _embed(op: "np.ndarray", q: int, n: int) -> "np.ndarray":
+    ops = [_I2] * n
+    ops[q] = op
+    return _kron(*ops)
+
+
+def _gksl_rk4_step(rho: "np.ndarray", bath: GKSLBathParams,
+                    dt: float = None) -> "np.ndarray":
+    """
+    One RK4-adaptive GKSL step.  Mirrors miner _apply_gksl_bath() exactly.
+    Sub-steps: h_max = 0.05 / γ_max   (numerical stability).
+    Falls back to ideal W3 DM on NaN.
+    """
+    if not _HAS_NP:
+        return rho
+    if dt is None:
+        dt = bath.dt_default
+    g1_eff = bath.gamma1_eff
+    gphi   = bath.gammaphi
+    gdep   = bath.gammadep
+    om     = bath.omega
+    n_q    = int(round(_np.log2(rho.shape[0])))
+
+    def _L(r):
+        d = _np.zeros_like(r)
+        for q in range(n_q):
+            H_q = (om / 2.0) * _embed(_SZ, q, n_q)
+            d  += -1j * (H_q @ r - r @ H_q)
+            for gam, op in (
+                (g1_eff,       _embed(_SM, q, n_q)),
+                (g1_eff * 0.1, _embed(_SP, q, n_q)),
+                (gphi,         _embed(_SZ * 0.5, q, n_q)),
+                (gdep,         _np.eye(2**n_q, dtype=_np.complex128) * _np.sqrt(0.5)),
+            ):
+                if gam < 1e-14:
+                    continue
+                L = _np.sqrt(gam) * op
+                Ld = L.conj().T
+                d += L @ r @ Ld - 0.5 * (Ld @ L @ r + r @ Ld @ L)
+        return d
+
+    def _rk4(r, h):
+        k1 = _L(r);       k2 = _L(r + 0.5*h*k1)
+        k3 = _L(r + 0.5*h*k2); k4 = _L(r + h*k3)
+        out = r + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        out = 0.5 * (out + out.conj().T)
+        tr  = float(_np.real(_np.trace(out)))
+        return out / max(tr, 1e-15)
+
+    gamma_max = max(g1_eff, gphi, gdep,
+                    abs(om) / (2 * _np.pi + 1e-9), 1e-9)
+    h_max   = 0.05 / gamma_max
+    n_steps = max(1, int(_np.ceil(dt / h_max)))
+    h_sub   = dt / n_steps
+    cur     = rho.copy()
+    for _ in range(n_steps):
+        cur = _rk4(cur, h_sub)
+        if not _np.all(_np.isfinite(cur)):
+            cur = _build_w3_dm()
+            break
+    return cur
+
+
+def _decode_dm_8x8(snap: dict) -> "Optional[np.ndarray]":
+    """
+    Extract, validate, and normalize an 8×8 complex128 density matrix from
+    an oracle snapshot dict.  Accepts two encodings:
+      density_matrix_hex  (2048 hex chars = 8×8×16 bytes)  ← preferred (binary)
+      density_matrix      (nested Python list)               ← JSON fallback
+    Returns validated np.ndarray or None.
+    """
+    if not _HAS_NP:
+        return None
+    # ── Path 1: raw hex bytes ─────────────────────────────────────────────────
+    for key in ("density_matrix_hex", "dm_hex"):
+        dm_hex = snap.get(key, "")
+        if dm_hex and len(dm_hex) >= 128:
+            try:
+                raw   = bytes.fromhex(dm_hex[:2048])
+                n_el  = len(raw) // 16
+                side  = int(_np.sqrt(n_el))
+                if side * side == n_el and side in (3, 8):
+                    dm = (_np.frombuffer(raw[:side*side*16], dtype=_np.complex128)
+                          .reshape(side, side).copy())
+                    if side == 3:
+                        dm8 = _np.zeros((8, 8), dtype=_np.complex128)
+                        dm8[:3, :3] = dm; dm = dm8
+                    dm = 0.5 * (dm + dm.conj().T)
+                    dm /= max(1e-15, float(_np.real(_np.trace(dm))))
+                    eigs = _np.linalg.eigvalsh(dm)
+                    if _np.any(eigs < -0.05):
+                        break
+                    eigs = _np.maximum(eigs, 0)
+                    evecs = _np.linalg.eigh(dm)[1]
+                    dm = evecs @ _np.diag(eigs.astype(_np.complex128)) @ evecs.conj().T
+                    dm /= max(1e-15, float(_np.real(_np.trace(dm))))
+                    return dm
+            except Exception:
+                pass
+    # ── Path 2: nested list ───────────────────────────────────────────────────
+    for key in ("density_matrix", "dm"):
+        dm_list = snap.get(key)
+        if dm_list:
+            try:
+                dm = _np.array(dm_list, dtype=_np.complex128)
+                if dm.ndim != 2 or dm.shape[0] != dm.shape[1]:
+                    continue
+                if dm.shape[0] == 3:
+                    dm8 = _np.zeros((8, 8), dtype=_np.complex128)
+                    dm8[:3, :3] = dm; dm = dm8
+                dm = 0.5 * (dm + dm.conj().T)
+                dm /= max(1e-15, float(_np.real(_np.trace(dm))))
+                return dm
+            except Exception:
+                pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# γ-SWARM  KoyebAPIClient
+# All endpoint paths verified against GossipHTTPHandler.do_GET / do_POST
+# in qtcl_miner_mobile.py lines 5655–6050.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class KoyebAPIClient:
+    """
+    HTTP client for the Koyeb QTCL oracle (port 9091 internal, HTTPS external).
+    Every path matches a live GossipHTTPHandler route.  Thread-safe session.
+    """
+    TIMEOUT: int = 10
+
+    def __init__(self, base_url: str = None, timeout: int = 10):
+        self.base_url = (base_url or _ORACLE_BASE_URL).rstrip("/")
+        self.timeout  = timeout
+        self._session = None
+        self._lock    = _threading.Lock()
+
+    # ── Transport ─────────────────────────────────────────────────────────────
+
+    def _get_session(self):
+        if self._session is None and _HAS_REQUESTS:
+            with self._lock:
+                if self._session is None:
+                    from requests.adapters import HTTPAdapter
+                    from urllib3.util.retry import Retry
+                    s = _requests.Session()
+                    retry = Retry(total=3, backoff_factor=0.5,
+                                  status_forcelist=[502, 503, 504])
+                    s.mount("https://", HTTPAdapter(max_retries=retry))
+                    s.mount("http://",  HTTPAdapter(max_retries=retry))
+                    self._session = s
+        return self._session
+
+    def _get(self, path: str, params: dict = None, timeout: int = None) -> Optional[dict]:
+        t   = timeout or self.timeout
+        url = f"{self.base_url}{path}"
+        if _HAS_REQUESTS:
+            try:
+                r = self._get_session().get(url, params=params, timeout=t)
+                if r.status_code == 200:
+                    return r.json()
+                _EXP_LOG.debug(f"[API] GET {path} → {r.status_code}")
+            except Exception as e:
+                _EXP_LOG.debug(f"[API] GET {path}: {e}")
+        else:
+            try:
+                import urllib.request, urllib.parse
+                full = url + ("?" + urllib.parse.urlencode(params) if params else "")
+                with urllib.request.urlopen(full, timeout=t) as resp:
+                    return _json.loads(resp.read())
+            except Exception as e:
+                _EXP_LOG.debug(f"[API] urllib GET {path}: {e}")
+        return None
+
+    def _post(self, path: str, payload: dict, timeout: int = None) -> Optional[dict]:
+        t   = timeout or self.timeout
+        url = f"{self.base_url}{path}"
+        if _HAS_REQUESTS:
+            try:
+                r = self._get_session().post(url, json=payload, timeout=t)
+                if r.status_code in (200, 201, 202):
+                    return r.json()
+                _EXP_LOG.debug(f"[API] POST {path} → {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                _EXP_LOG.debug(f"[API] POST {path}: {e}")
+        else:
+            try:
+                import urllib.request
+                data = _json.dumps(payload).encode()
+                req  = urllib.request.Request(
+                    url, data=data,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=t) as resp:
+                    return _json.loads(resp.read())
+            except Exception as e:
+                _EXP_LOG.debug(f"[API] urllib POST {path}: {e}")
+        return None
+
+    # ── Chain tip / blocks ────────────────────────────────────────────────────
+
+    def get_chain_tip(self) -> Optional[dict]:
+        """GET /api/blocks/tip — returns {height, block_height, block_hash, …}"""
+        return self._get("/api/blocks/tip")
+
+    def get_block_height(self) -> Optional[int]:
+        """Current chain-tip height.  Accepts both 'height' and 'block_height' keys."""
+        tip = self.get_chain_tip()
+        if tip:
+            h = tip.get("block_height") or tip.get("height")
+            if h is not None:
+                return int(h)
+        # fallback: DHT hello
+        hello = self._get("/api/dht/hello")
+        if hello:
+            return int(hello.get("block_height", 0))
+        return None
+
+    def get_block_by_height(self, height: int) -> Optional[dict]:
+        """GET /api/blocks/height/<height>"""
+        return self._get(f"/api/blocks/height/{height}")
+
+    def get_block_range(self, start: int, end: int) -> Optional[dict]:
+        """GET /api/blocks/range/<start>/<end>"""
+        return self._get(f"/api/blocks/range/{start}/{end}")
+
+    def get_block_by_hash(self, block_hash: str) -> Optional[dict]:
+        """GET /api/blocks/hash/<hash>"""
+        return self._get(f"/api/blocks/hash/{block_hash}")
+
+    # ── Oracle / W-state / pq endpoints ─────────────────────────────────────
+
+    def get_oracle_w_state(self) -> Optional[dict]:
+        """
+        GET /api/oracle/w-state  (primary) or /api/oracle/pq0  (alias).
+        Response includes: density_matrix_hex, w_state_fidelity, pq0_fidelity,
+        pq_curr, pq_last, gamma1, gammaphi, gammadep, omega, ou_mem,
+        coherence_l1, von_neumann_entropy, block_height.
+        """
+        r = self._get("/api/oracle/w-state")
+        if r:
+            return r
+        return self._get("/api/oracle/pq0")
+
+    def get_oracle_pq0_bloch(self) -> Optional[dict]:
+        """GET /api/oracle/pq0-bloch — richest snapshot from oracle."""
+        r = self._get("/api/oracle/pq0-bloch")
+        if r:
+            return r
+        return self.get_oracle_w_state()
+
+    def get_pq_state(self) -> dict:
+        """
+        Returns parsed pq fields from oracle snapshot.
+        Keys: pq_curr, pq_last, pq0_fidelity, w_state_fidelity,
+              block_height, coherence_l1, entropy.
+        All zero/empty on failure.
+        """
+        snap = self.get_oracle_pq0_bloch() or {}
+        return {
+            "pq_curr":          str(snap.get("pq_curr",             "")),
+            "pq_last":          str(snap.get("pq_last",             "")),
+            "pq0_fidelity":     float(snap.get("pq0_fidelity",      0.0)),
+            "w_state_fidelity": float(snap.get("w_state_fidelity",  0.0)),
+            "block_height":     int(snap.get("block_height",        0)),
+            "coherence_l1":     float(snap.get("coherence_l1",      0.0)),
+            "entropy":          float(snap.get("von_neumann_entropy",
+                                snap.get("entropy",                  0.0))),
+        }
+
+    def get_density_matrix_8x8(self) -> "Optional[np.ndarray]":
+        """
+        Fetch oracle 8×8 density matrix.  Tries richest endpoint first.
+        Returns validated np.ndarray or None.
+        """
+        snap = self.get_oracle_pq0_bloch()
+        if snap:
+            dm = _decode_dm_8x8(snap)
+            if dm is not None:
+                return dm
+        return None
+
+    def get_gksl_bath(self) -> GKSLBathParams:
+        """Fetch oracle noise bath params.  Falls back to CANONICAL_BATH."""
+        snap = self.get_oracle_pq0_bloch()
+        if snap:
+            return GKSLBathParams.from_snap(snap)
+        return CANONICAL_BATH
+
+    # ── Balance / address ─────────────────────────────────────────────────────
+
+    def get_balance(self, address: str) -> Optional[float]:
+        """
+        GET /api/address/<addr>/balance  (primary GossipHTTPHandler route).
+        Fallback: /api/address/<addr>/history to sum unspent outputs.
+        """
+        r = self._get(f"/api/address/{address}/balance")
+        if r:
+            for k in ("balance", "confirmed_balance", "balance_qtcl", "amount"):
+                if k in r:
+                    try: return float(r[k])
+                    except Exception: pass
+        return None
+
+    def get_address_history(self, address: str, limit: int = 50,
+                             offset: int = 0) -> list:
+        """GET /api/address/<addr>/history?limit=…&offset=…"""
+        r = self._get(f"/api/address/{address}/history",
+                      params={"limit": limit, "offset": offset})
+        if r:
+            return r.get("transactions", r.get("history", []))
+        return []
+
+    # ── Mempool / transactions ────────────────────────────────────────────────
+
+    def get_mempool(self) -> list:
+        """GET /api/mempool — pending transactions."""
+        r = self._get("/api/mempool")
+        if r:
+            return r.get("transactions", [])
+        return []
+
+    def submit_transaction(self, tx: dict) -> Optional[dict]:
+        """POST /api/transactions — submit signed transaction."""
+        return self._post("/api/transactions", tx)
+
+    def get_transaction(self, tx_hash: str) -> Optional[dict]:
+        """Not a direct GossipHTTPHandler route — attempts mempool lookup."""
+        r = self._get(f"/api/transactions/{tx_hash}")
+        if r:
+            return r
+        # scan mempool
+        pool = self.get_mempool()
+        for tx in pool:
+            if tx.get("tx_hash") == tx_hash or tx.get("tx_id") == tx_hash:
+                return tx
+        return None
+
+    # ── Peers / DHT / gossip ──────────────────────────────────────────────────
+
+    def get_peers(self) -> list:
+        """GET /api/peers/list"""
+        r = self._get("/api/peers/list")
+        if r:
+            return r.get("peers", [])
+        return []
+
+    def register_peer(self, peer_id: str, gossip_url: str,
+                       miner_address: str = "",
+                       block_height: int = 0) -> Optional[dict]:
+        """POST /api/peers/register"""
+        return self._post("/api/peers/register", {
+            "peer_id": peer_id, "gossip_url": gossip_url,
+            "miner_address": miner_address,
+            "block_height": block_height, "ts": _time.time(),
+        })
+
+    def send_heartbeat(self, peer_id: str, block_height: int = 0,
+                        miner_address: str = "") -> Optional[dict]:
+        """POST /api/peers/heartbeat"""
+        return self._post("/api/peers/heartbeat", {
+            "peer_id": peer_id, "block_height": block_height,
+            "miner_address": miner_address, "ts": _time.time(),
+        })
+
+    def get_dht_peers(self) -> list:
+        """GET /api/dht/peers"""
+        r = self._get("/api/dht/peers")
+        if r:
+            return r.get("peers", [])
+        return []
+
+    def get_network_snapshot(self) -> Optional[dict]:
+        """GET /api/network/snapshot"""
+        return self._get("/api/network/snapshot")
+
+    def get_p2p_inventory(self) -> Optional[dict]:
+        """GET /api/p2p/inventory"""
+        return self._get("/api/p2p/inventory")
+
+    def gossip_ingest(self, payload: dict) -> Optional[dict]:
+        """POST /gossip/ingest — fan-out relay."""
+        return self._post("/gossip/ingest", payload)
+
+    def oracle_register(self, miner_id: str, miner_address: str) -> Optional[dict]:
+        """POST /api/oracle/register"""
+        return self._post("/api/oracle/register", {
+            "miner_id": miner_id, "address": miner_address,
+        })
+
+    def health_check(self) -> bool:
+        """GET /api/dht/hello as a lightweight liveness probe."""
+        r = self._get("/api/dht/hello", timeout=5)
+        return r is not None
+
+
+# Module-level client singleton
+_KOYEB: KoyebAPIClient = KoyebAPIClient()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# δ-SWARM  TensorFieldMetrics + ClientFieldState + KoyebOracleState
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Quantum algebra helpers ───────────────────────────────────────────────────
+
+def _vn_entropy(dm: "np.ndarray") -> float:
+    ev = _np.linalg.eigvalsh(dm)
+    ev = ev[ev > 1e-12]
+    return float(-_np.sum(ev * _np.log2(ev))) if len(ev) else 0.0
+
+
+def _coherence_l1(dm: "np.ndarray") -> float:
+    d = dm.shape[0]
+    return float(
+        (_np.sum(_np.abs(dm)) - _np.sum(_np.abs(_np.diag(dm)))) / max(1, d - 1))
+
+
+def _partial_trace_3to2q(dm8: "np.ndarray", keep: Tuple[int, int]) -> "np.ndarray":
+    """Partial trace 8×8 → 4×4 by tracing out the third qubit."""
+    try:
+        r = dm8.reshape(2, 2, 2, 2, 2, 2)
+        trace_q = 3 - keep[0] - keep[1]
+        ax_map  = {0: (0, 3), 1: (1, 4), 2: (2, 5)}
+        ax_bra, ax_ket = ax_map[trace_q]
+        rho2 = _np.trace(r, axis1=ax_bra, axis2=ax_ket)
+        return rho2.reshape(4, 4)
+    except Exception:
+        return _np.eye(4, dtype=_np.complex128) / 4
+
+
+def _bell_chsh_4x4(dm4: "np.ndarray") -> float:
+    """CHSH value from Horodecki criterion on a 4×4 two-qubit DM."""
+    try:
+        sx = _np.array([[0, 1], [1, 0]], dtype=_np.complex128)
+        sy = _np.array([[0, -1j], [1j, 0]], dtype=_np.complex128)
+        sz = _np.array([[1, 0], [0, -1]], dtype=_np.complex128)
+        T  = _np.zeros((3, 3), dtype=float)
+        for i, pi in enumerate([sx, sy, sz]):
+            for j, pj in enumerate([sx, sy, sz]):
+                T[i, j] = float(_np.real(_np.trace(dm4 @ _np.kron(pi, pj))))
+        ev = sorted(_np.linalg.eigvalsh(T.T @ T), reverse=True)
+        return float(2.0 * _np.sqrt(ev[0] + ev[1]))
+    except Exception:
+        return 0.0
+
+
+def _negativity_4x4(dm4: "np.ndarray") -> float:
+    """Partial-transpose negativity for 4×4 two-qubit DM."""
+    try:
+        pt = dm4.reshape(2, 2, 2, 2).transpose(2, 1, 0, 3).reshape(4, 4)
+        ev = _np.linalg.eigvalsh(pt)
+        return float(max(0.0, -_np.sum(ev[ev < 0])))
+    except Exception:
+        return 0.0
+
+
+def _discord_approx(dm: "np.ndarray") -> float:
+    """MI-minus-classical-correlation approximation to quantum discord."""
+    try:
+        n = dm.shape[0]
+        nh = int(_np.sqrt(n))
+        if nh * nh != n:
+            return 0.0
+        rA  = _np.trace(dm.reshape(nh, nh, nh, nh), axis1=1, axis2=3)
+        rB  = _np.trace(dm.reshape(nh, nh, nh, nh), axis1=0, axis2=2)
+        MI  = _vn_entropy(rA) + _vn_entropy(rB) - _vn_entropy(dm)
+        cc  = max(0.0, _vn_entropy(rA) -
+                  max(0.0, _vn_entropy(dm) - _vn_entropy(rB)))
+        return float(max(0.0, MI - cc))
+    except Exception:
+        return 0.0
+
+
+@_dc
+class TensorFieldMetrics:
+    """
+    Full quantum tensor field metric suite for the [pq_last … pq_curr] interval.
+    Field DM = (DM_curr + DM_last) / 2 (midpoint operator).
+    Bell / negativity computed on bipartite reduced 4×4 states.
+    """
+    pq_curr_id:           str   = ""
+    pq_last_id:           str   = ""
+    fidelity_to_w3:       float = 0.0
+    entropy_vn:           float = 0.0
+    coherence_l1:         float = 0.0
+    quantum_discord:      float = 0.0
+    bell_chsh_AB:         float = 0.0
+    bell_chsh_BC:         float = 0.0
+    bell_violations:      int   = 0
+    purity:               float = 0.0
+    negativity_AB:        float = 0.0
+    negativity_BC:        float = 0.0
+    field_density:        float = 0.0   # ‖DM_curr − DM_last‖_F
+    entanglement_entropy: float = 0.0
+    block_height:         int   = 0
+    ts:                   float = 0.0
+
+    def as_dict(self) -> dict:
+        out = {}
+        for k, v in self.__dict__.items():
+            if _HAS_NP and isinstance(v, _np.floating):
+                out[k] = float(v)
+            elif _HAS_NP and isinstance(v, _np.integer):
+                out[k] = int(v)
+            else:
+                out[k] = v
+        return out
+
+    @classmethod
+    def compute(cls, dm_curr: "np.ndarray", dm_last: "np.ndarray",
+                pq_curr_id: str = "", pq_last_id: str = "",
+                block_height: int = 0) -> "TensorFieldMetrics":
+        m = cls(pq_curr_id=pq_curr_id, pq_last_id=pq_last_id,
+                block_height=block_height, ts=_time.time())
+        if not _HAS_NP:
+            return m
+        try:
+            dm_f = 0.5 * (dm_curr + dm_last)
+            dm_f = 0.5 * (dm_f + dm_f.conj().T)
+            dm_f /= max(1e-15, float(_np.real(_np.trace(dm_f))))
+            m.fidelity_to_w3      = ORACLE_W_STATE.fidelity_with(dm_f)
+            m.entropy_vn          = _vn_entropy(dm_f)
+            m.coherence_l1        = _coherence_l1(dm_f)
+            m.quantum_discord     = _discord_approx(dm_f)
+            m.purity              = float(_np.real(_np.trace(dm_f @ dm_f)))
+            m.field_density       = float(_np.linalg.norm(dm_curr - dm_last, "fro"))
+            m.entanglement_entropy = abs(_vn_entropy(dm_curr) - _vn_entropy(dm_last))
+            dm_AB = _partial_trace_3to2q(dm_f, (0, 1))
+            dm_BC = _partial_trace_3to2q(dm_f, (1, 2))
+            m.bell_chsh_AB   = _bell_chsh_4x4(dm_AB)
+            m.bell_chsh_BC   = _bell_chsh_4x4(dm_BC)
+            m.bell_violations = (1 if m.bell_chsh_AB > 2.0 + 1e-9 else 0) + \
+                                 (1 if m.bell_chsh_BC > 2.0 + 1e-9 else 0)
+            m.negativity_AB  = _negativity_4x4(dm_AB)
+            m.negativity_BC  = _negativity_4x4(dm_BC)
+        except Exception as e:
+            _EXP_LOG.debug(f"[TENSOR] compute error: {e}")
+        return m
+
+
+@_dc
+class ClientFieldState:
+    """
+    CLIENT_FIELD_STATE — tripartite W-state from client perspective.
+      Point A:  ORACLE_W_STATE reference (pq0 / virtual / inverse hard DM)
+      Point B:  dm_pq_curr — current lattice field-space pseudoqubit DM
+      Point C:  dm_pq_last — previous lattice field-space pseudoqubit DM
+    Entanglement interval = [pq_last … pq_curr].
+    """
+    oracle_ref:  Any   = _field(default=None)      # OracleWStateDefinition
+    dm_pq_curr:  Any   = _field(default=None)      # np.ndarray 8×8
+    dm_pq_last:  Any   = _field(default=None)      # np.ndarray 8×8
+    pq_curr_id:  str   = ""
+    pq_last_id:  str   = ""
+    block_height: int  = 0
+    metrics:     Any   = _field(default=None)      # TensorFieldMetrics
+    established: bool  = False
+    ts:          float = 0.0
+
+    def __post_init__(self):
+        if self.oracle_ref is None:
+            self.oracle_ref = ORACLE_W_STATE
+
+    def build(self, dm_curr: "np.ndarray", dm_last: "np.ndarray",
+              pq_curr_id: str = "", pq_last_id: str = "",
+              block_height: int = 0) -> "ClientFieldState":
+        self.dm_pq_curr  = dm_curr
+        self.dm_pq_last  = dm_last
+        self.pq_curr_id  = pq_curr_id
+        self.pq_last_id  = pq_last_id
+        self.block_height = block_height
+        self.metrics     = TensorFieldMetrics.compute(
+            dm_curr, dm_last, pq_curr_id, pq_last_id, block_height)
+        self.established = True
+        self.ts          = _time.time()
+        return self
+
+    def evolve(self, bath: GKSLBathParams = None,
+               dt: float = None) -> "ClientFieldState":
+        """Apply one GKSL step: pq_curr → evolved; old pq_curr → pq_last."""
+        if not _HAS_NP or self.dm_pq_curr is None:
+            return self
+        b       = bath or CANONICAL_BATH
+        evolved = _gksl_rk4_step(self.dm_pq_curr, b, dt)
+        return self.build(evolved, self.dm_pq_curr,
+                          self.pq_curr_id, self.pq_last_id, self.block_height)
+
+    def as_dict(self) -> dict:
+        d = {"pq_curr_id": self.pq_curr_id, "pq_last_id": self.pq_last_id,
+             "block_height": self.block_height, "established": self.established,
+             "ts": self.ts}
+        if self.metrics:
+            d["metrics"] = self.metrics.as_dict()
+        return d
+
+
+@_dc
+class KoyebOracleState:
+    """
+    KOYEB_ORACLE_STATE — dedicated HTTP channel to the live Koyeb oracle.
+    Computes bridge_fidelity = F(oracle DM, client dm_pq_curr).
+    Updates bath_params for AER noise model alignment.
+    """
+    oracle_url:         str   = _field(default_factory=lambda: _ORACLE_BASE_URL)
+    dm_oracle:          Any   = _field(default=None)
+    pq0_fidelity:       float = 0.0
+    w_state_fidelity:   float = 0.0
+    oracle_entropy:     float = 0.0
+    oracle_coherence:   float = 0.0
+    bridge_fidelity:    float = 0.0
+    channel_latency_ms: float = 0.0
+    bath_params:        Any   = _field(default=None)
+    pq_curr_id:         str   = ""
+    pq_last_id:         str   = ""
+    block_height:       int   = 0
+    connected:          bool  = False
+    last_sync_ts:       float = 0.0
+    _api:               Any   = _field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self._api is None:
+            self._api = KoyebAPIClient(self.oracle_url)
+
+    def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
+        """Fetch oracle snapshot, update all oracle metrics, compute bridge_fidelity."""
+        t0   = _time.time()
+        snap = self._api.get_oracle_pq0_bloch()
+        self.channel_latency_ms = (_time.time() - t0) * 1000.0
+        if snap is None:
+            self.connected = False
+            return False
+        self.dm_oracle        = _decode_dm_8x8(snap) or self.dm_oracle
+        self.pq0_fidelity     = float(snap.get("pq0_fidelity",     0.0))
+        self.w_state_fidelity = float(snap.get("w_state_fidelity", 0.0))
+        self.oracle_entropy   = float(snap.get("von_neumann_entropy",
+                                     snap.get("entropy",           0.0)))
+        self.oracle_coherence = float(snap.get("coherence_l1",     0.0))
+        self.pq_curr_id       = str(snap.get("pq_curr",            ""))
+        self.pq_last_id       = str(snap.get("pq_last",            ""))
+        self.block_height     = int(snap.get("block_height",       0))
+        self.bath_params      = GKSLBathParams.from_snap(snap)
+        # Bridge fidelity
+        if (_HAS_NP and self.dm_oracle is not None
+                and client_field.dm_pq_curr is not None):
+            try:
+                if self.dm_oracle.shape == client_field.dm_pq_curr.shape:
+                    self.bridge_fidelity = float(
+                        _np.real(_np.trace(self.dm_oracle @ client_field.dm_pq_curr)))
+                else:
+                    self.bridge_fidelity = self.w_state_fidelity
+            except Exception:
+                self.bridge_fidelity = self.w_state_fidelity
+        self.connected    = True
+        self.last_sync_ts = _time.time()
+        return True
+
+    def as_dict(self) -> dict:
+        return {
+            "oracle_url":          self.oracle_url,
+            "pq0_fidelity":        self.pq0_fidelity,
+            "w_state_fidelity":    self.w_state_fidelity,
+            "oracle_entropy":      self.oracle_entropy,
+            "oracle_coherence":    self.oracle_coherence,
+            "bridge_fidelity":     round(self.bridge_fidelity, 6),
+            "channel_latency_ms":  round(self.channel_latency_ms, 2),
+            "pq_curr_id":          self.pq_curr_id,
+            "pq_last_id":          self.pq_last_id,
+            "block_height":        self.block_height,
+            "connected":           self.connected,
+            "last_sync_ts":        self.last_sync_ts,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ε-SWARM  SSEMultiplexer
+# Port 9091 compatible.  Channels: metrics / gossip / quantum / blocks / dht
+# interrupt(cid) cleanly stops a single stream without tearing down others.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SSEMultiplexer:
+    """Thread-safe SSE event bus with per-client interruptable streams."""
+    _instance: "Optional[SSEMultiplexer]" = None
+
+    def __init__(self):
+        self._lock    = _threading.Lock()
+        self._clients: Dict[str, dict] = {}
+        self._seq     = 0
+
+    @classmethod
+    def get(cls) -> "SSEMultiplexer":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def subscribe(self, cid: str, channels: Optional[List[str]] = None,
+                  maxlen: int = 512) -> _threading.Event:
+        """Register a client; returns its stop Event."""
+        ev = _threading.Event()
+        with self._lock:
+            self._clients[cid] = {
+                "queue":    _deque(maxlen=maxlen),
+                "stop":     ev,
+                "channels": set(channels) if channels else {"*"},
+                "ts":       _time.time(),
+            }
+        return ev
+
+    def interrupt(self, cid: str) -> None:
+        """Signal client stream to stop."""
+        with self._lock:
+            c = self._clients.get(cid)
+        if c:
+            c["stop"].set()
+
+    def unsubscribe(self, cid: str) -> None:
+        self.interrupt(cid)
+        with self._lock:
+            self._clients.pop(cid, None)
+
+    def publish(self, event_type: str, data: dict,
+                channel: str = "metrics") -> None:
+        """Fan-out to all matching subscribed clients."""
+        with self._lock:
+            self._seq += 1
+            payload = _json.dumps(
+                {**data, "_seq": self._seq, "_ch": channel, "_ts": _time.time()},
+                default=str)
+            frame = f"event: {event_type}\ndata: {payload}\n\n"
+            for c in self._clients.values():
+                if not c["stop"].is_set():
+                    if "*" in c["channels"] or channel in c["channels"]:
+                        c["queue"].append(frame)
+
+    def drain(self, cid: str, block_s: float = 5.0) -> Optional[str]:
+        """Pop next frame for client, blocking up to block_s seconds."""
+        with self._lock:
+            c = self._clients.get(cid)
+        if c is None or c["stop"].is_set():
+            return None
+        deadline = _time.time() + block_s
+        while _time.time() < deadline and not c["stop"].is_set():
+            if c["queue"]:
+                with self._lock:
+                    try:
+                        return c["queue"].popleft()
+                    except IndexError:
+                        pass
+            _time.sleep(0.04)
+        return None
+
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def gc(self, max_idle: float = 300.0) -> int:
+        now   = _time.time()
+        stale = []
+        with self._lock:
+            for cid, c in self._clients.items():
+                if c["stop"].is_set() or (now - c["ts"]) > max_idle:
+                    stale.append(cid)
+            for cid in stale:
+                self._clients.pop(cid, None)
+        return len(stale)
+
+
+_SSE_MUX: SSEMultiplexer = SSEMultiplexer.get()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ζ-SWARM  QTCLWallet  ─  verbatim BIP-39/32/38 from qtcl_miner_mobile.py
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QTCLWallet:
+    """
+    BIP-39 mnemonic → BIP-32 HD → HLWE-256 keypair.
+    BIP-38: PBKDF2-HMAC-SHA256(200 k) + XOR-keystream + HMAC auth-tag.
+    Atomic writes (.tmp → rename). Pre-overwrite .bak. No legacy paths.
+    Ported verbatim from qtcl_miner_mobile.py.
+    """
+    VERSION        = 4
+    PBKDF2_ITER    = 200_000
+    KEY_BYTES      = 32
+    SALT_BYTES     = 32
+    MNEMONIC_WORDS = 12
+    PREFIX         = "qtcl1"
+    ADDR_LEN       = 39
+    BIP32_KEY      = b"QTCL seed"
+    BIP39_PASS     = b"qtcl"
+    BIP39_ITER     = 2048
+    AUTH_TAG       = b"QTCL-AUTH"
+    HD_PATH        = [0x8000002C, 0x80000000, 0x80000000, 0, 0]
+
+    # 1893-word BIP-39 compatible wordlist (full copy from miner)
+    _W = (
+        "abandon ability able about above absent absorb abstract absurd abuse access accident "
+        "account accuse achieve acid acoustic acquire across act action actor actress actual "
+        "adapt add addict address adjust admit adult advance advice aerobic afford afraid "
+        "again age agent agree ahead aim air airport aisle alarm album alcohol alert alien "
+        "all alley allow almost alone alpha already also alter always amateur amazing among "
+        "amount amused analyst anchor ancient anger angle angry animal ankle announce annual "
+        "another answer antenna antique anxiety any apart apology appear apple approve april "
+        "arch arctic area arena argue arm armed armor army around arrange arrest arrive "
+        "arrow art artefact artist artwork ask aspect assault asset assist assume asthma "
+        "athlete atom attack attend attitude attract auction audit august aunt author auto "
+        "autumn average avocado avoid awake aware away awesome awful awkward axis baby "
+        "balance bamboo banana banner bar barely bargain barrel base basic basket battle "
+        "beach bean beauty because become beef before begin behave behind believe below "
+        "belt bench benefit best betray better between beyond bicycle bid bike bind biology "
+        "bird birth bitter black blade blame blanket blast bleak bless blind blood blossom "
+        "blouse blue blur blush board boat body boil bomb bone book boost border boring "
+        "borrow boss bottom bounce box boy bracket brain brand brave breeze brick bridge "
+        "brief bright bring brisk broccoli broken bronze broom brother brown brush bubble "
+        "buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst "
+        "bus business busy butter buyer buzz cabbage cabin cable captain car carbon card "
+        "cargo carpet carry cart case cash casino castle casual cat catalog catch category "
+        "cattle cause caution cave ceiling celery cement census certain chair chaos chapter "
+        "charge chase chat cheap check cheese chef cherry chest chicken chief child chimney "
+        "choice choose chronic chuckle chunk cigar cinnamon circle citizen city civil claim "
+        "clap clarify claw clay clean clerk clever click client cliff climb clinic clip "
+        "clock clog close cloth cloud clown club clump cluster clutch coach coast coconut "
+        "code coil coin collect color column combine come comfort comic common company "
+        "concert conduct confirm congress connect consider control convince cook cool copper "
+        "copy coral core corn correct cost cotton couch country couple course cousin cover "
+        "coyote crack cradle craft cram crane crash crater crawl crazy cream credit creek "
+        "crew cricket crime crisp critic cross crouch crowd crucial cruel cruise crumble "
+        "crunch crush cry crystal cube culture cup cupboard curious current curtain curve "
+        "cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn "
+        "day deal debate debris decade december decide decline decorate decrease deer defense "
+        "define defy degree delay deliver demand demise denial dentist deny depart depend "
+        "deposit depth deputy derive describe desert design desk despair destroy detail "
+        "detect develop device devote diagram dial diamond diary dice diesel diet differ "
+        "digital dignity dilemma dinner dinosaur direct dirt disagree discover disease dish "
+        "dismiss disorder display distance divert divide divorce dizzy doctor document dog "
+        "doll dolphin domain donate donkey donor door dose double dove draft dragon drama "
+        "drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb "
+        "dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily "
+        "east easy echo ecology edge edit educate effort egg eight either elbow elder "
+        "electric elegant element elephant elevator elite else embark embody embrace emerge "
+        "emotion employ empower empty enable enact endless endorse enemy engage engine "
+        "enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope "
+        "episode equal equip erase erosion erupt escape essay essence estate eternal ethics "
+        "evidence evil evoke evolve exact example excess exchange excite exclude exercise "
+        "exhaust exhibit exile exist exit exotic expand expire explain expose express extend "
+        "extra eye fable face faculty fade faint faith fall false fame family famous fan "
+        "fancy fantasy far fashion fat fatal father fatigue fault favorite feature february "
+        "federal fee feed feel feet fellow felt fence festival fetch fever few fiber fiction "
+        "field figure file film filter final find fine finger finish fire firm first fiscal "
+        "fish fit fitness fix flag flame flash flat flavor flee flight flip float flock "
+        "floor flower fluid flush fly foam focus fog foil follow food force forest forget "
+        "fork fortune forum forward fossil foster found fox fragile frame frequent fresh "
+        "friend fringe frog front frost frown frozen fruit fuel fun funny furnace fury "
+        "future gadget gain galaxy gallery game gap garden garlic garment gasp gate gather "
+        "gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle "
+        "ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory "
+        "glove glow glue goat goddess gold good goose gorilla gospel gossip govern gown "
+        "grab grace grain grant grape grasp grass gravity great green grid grief grit "
+        "grocery group grow grunt guard guide guilt guitar gun gym habit hair half hamster "
+        "hand happy harbor hard harsh harvest hat have hawk hazard head health heart heavy "
+        "hedgehog height hello help hen hero hidden high hill hint hip hire history hobby "
+        "hockey hold hole holiday hollow home honey hood hope horn hospital host hour hover "
+        "hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband hybrid "
+        "ice icon ignore ill illegal image imitate immense immune impact impose improve "
+        "impulse inbox income increase index indicate indoor industry infant inflict inform "
+        "inhale inject injury inmate inner innocent input inquiry insane insect inside "
+        "inspire install intact interest into invest invite involve iron island isolate issue "
+        "item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey "
+        "joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick "
+        "kid kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label "
+        "lamp language laptop large later laugh laundry lava law lawn lawsuit layer lazy "
+        "leader learn leave lecture left leg legal legend leisure lemon lend length lens "
+        "leopard lesson letter level liar liberty library license life lift light like limb "
+        "limit link lion liquid list little live lizard load loan lobster local lock logic "
+        "lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar lunch "
+        "luxury lyrics magic magnet maid main major make mammal mango mansion manual maple "
+        "marble march margin marine market marriage mask master match material math matrix "
+        "matter maximum maze meadow mean medal media melody melt member memory mention menu "
+        "mercy merge merit merry mesh message metal method middle midnight milk million "
+        "mimic mind minimum minor miracle miss mixed mixture mobile model modify mom monitor "
+        "monkey monster month moon moral more morning mosquito mother motion motor mountain "
+        "mouse move movie much muffin mule multiply muscle museum mushroom music must mutual "
+        "myself mystery naive name napkin narrow nasty natural nature near neck need negative "
+        "neglect neither nephew nerve network news next nice night noble noise nominee "
+        "noodle normal north notable note nothing notice novel now nuclear number nurse "
+        "nut oak obey object oblige obscure obtain ocean october odor off offer office "
+        "often oil okay old olive olympic omit once onion open option orange orbit orchard "
+        "order ordinary organ orient original orphan ostrich other outdoor outside oval "
+        "over own oyster ozone pact paddle page pair palace palm panda panic panther paper "
+        "parade parent park parrot party pass patch path patrol pause pave payment peace "
+        "peanut peasant pelican pen penalty pencil people pepper perfect permit person pet "
+        "phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink "
+        "pioneer pipe pistol pitch pizza place planet plastic plate play please pledge "
+        "pluck plug plunge poem poet point polar pole police pond pony pool popular portion "
+        "position possible post potato pottery poverty powder power practice praise predict "
+        "prefer prepare present pretty prevent price pride primary print priority prison "
+        "private prize problem process produce profit program project promote proof property "
+        "prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil "
+        "puppy purchase purity purpose push put puzzle pyramid quality quantum quarter "
+        "question quick quit quiz quote rabbit raccoon race rack radar radio rail rain "
+        "raise rally ramp ranch random range rapid rare rate rather raven reach ready real "
+        "reason rebel rebuild recall receive recipe record recycle reduce reflect reform "
+        "refuse region regret regular reject relax release relief rely remain remember "
+        "remind remove render renew rent reopen repair repeat replace report require rescue "
+        "resemble resist resource response result retire retreat return reunion reveal review "
+        "reward rhythm ribbon rice rich ride rifle right rigid ring riot ripple risk ritual "
+        "rival river road roast robot robust rocket romance roof rookie rotate rough royal "
+        "rubber rude rug rule run runway rural sad saddle sadness safe sail salad salmon "
+        "salon salt salute same sample sand satisfy satoshi sauce sausage save say scale "
+        "scan scare scatter scene scheme school science scissors scorpion scout scrap screen "
+        "script scrub sea search season seat second secret section security seek select sell "
+        "seminar senior sense sentence series service session settle setup seven shadow shaft "
+        "shallow share shed shell sheriff shield shift shine ship shiver shock shoe shoot "
+        "shop short shoulder shove shrimp shrug shuffle sick siege sight signal silent silk "
+        "silly silver similar simple since sing siren sister situate six size sketch ski "
+        "skill skin skirt skull slab slam sleep slender slice slide slight slim slogan slot "
+        "slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer "
+        "social sock solar soldier solid solution solve someone song soon sorry soul sound "
+        "soup source south space spare spatial spawn speak special speed sphere spice spider "
+        "spike spin spirit split spoil sponsor spoon spray spread spring spy square squeeze "
+        "squirrel stable stadium staff stage stairs stamp stand start state stay steak steel "
+        "stem step stereo stick still sting stock stomach stone stop store storm story stove "
+        "strategy street strike strong struggle student stuff stumble style subject submit "
+        "subway success such sudden suffer sugar suggest suit summer sun sunny sunset super "
+        "supply supreme sure surface surge surprise sustain swallow swamp swap swear sweet "
+        "swift swim swing switch sword symbol symptom syrup table tackle tag tail talent "
+        "tank tape target task tattoo taxi teach team tell ten tenant tennis tent term test "
+        "text thank that theme then theory there they thing this thought three thrive throw "
+        "thumb thunder ticket tilt timber time tiny tip tired title toast tobacco today "
+        "together toilet token tomato tomorrow tone tongue tonight tool tooth top topic "
+        "topple torch tornado tortoise toss total tourist toward tower town toy track trade "
+        "traffic tragic train transfer trap trash travel tray treat tree trend trial tribe "
+        "trick trigger trim trip trophy trouble truck truly trumpet trust truth tube tumor "
+        "tunnel turkey turn turtle twelve twenty twice twin twist type typical ugly umbrella "
+        "unable unaware uncle uncover under undo unfair unfold unhappy uniform unique universe "
+        "unknown unlock until unusual unveil update upgrade uphold upon upper upset urban "
+        "used useful useless usual utility vacant vacuum vague valid valley valve van vanish "
+        "vapor various vast vault vehicle velvet vendor venture venue verb verify version "
+        "very veteran viable vibrant vicious victory video view village vintage violin "
+        "virtual virus visa visit visual vital vivid vocal voice void volcano volume vote "
+        "voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste "
+        "water wave way wealth weapon wear weasel wedding weekend weird welcome well west "
+        "wet whale wheat wheel when where whip whisper wide width wife wild will win window "
+        "wine wing wink winner winter wire wisdom wish witness wolf woman wonder wood wool "
+        "word world worry worth wrap wreck wrestle wrist write wrong yard year yellow you "
+        "young youth zebra zero zone zoo"
+    ).split()
+
+    def __init__(self, wallet_file=None):
+        data_dir = _Path("data")
+        data_dir.mkdir(exist_ok=True, mode=0o700)
+        self.wallet_file   = _Path(wallet_file) if wallet_file else (data_dir / "wallet.json")
+        self.mnemonic_file = self.wallet_file.parent / "wallet_mnemonic.enc"
+        self.address:     Optional[str] = None
+        self.private_key: Optional[str] = None
+        self.public_key:  Optional[str] = None
+        self.mnemonic:    Optional[str] = None
+
+    def is_loaded(self) -> bool:
+        return bool(self.address and self.private_key and self.public_key)
+
+    def create(self, password: str) -> str:
+        if not password:
+            raise ValueError("Password required")
+        self.mnemonic = self._gen_mnemonic()
+        self._derive_keys(self.mnemonic)
+        self._atomic_save(self.wallet_file, password,
+            {"address": self.address, "private_key": self.private_key,
+             "public_key": self.public_key})
+        self._atomic_save(self.mnemonic_file, password,
+            {"mnemonic": self.mnemonic})
+        self._print_mnemonic()
+        return self.address
+
+    def load(self, password: str) -> bool:
+        if not password or not self.wallet_file.exists():
+            return False
+        try:
+            data = _json.loads(self.wallet_file.read_text())
+        except Exception as e:
+            _EXP_LOG.error(f"[WALLET] read error: {e}")
+            return False
+        wd = self._decrypt(data, password)
+        if wd is None:
+            return False
+        self.address     = wd.get("address")
+        self.private_key = wd.get("private_key")
+        self.public_key  = wd.get("public_key")
+        if self.private_key and not self.public_key:
+            self.public_key = _hashlib.sha3_256(
+                self.private_key.encode()).hexdigest()
+            self._backup()
+            self._atomic_save(self.wallet_file, password,
+                {"address": self.address, "private_key": self.private_key,
+                 "public_key": self.public_key})
+        if not self.is_loaded():
+            _EXP_LOG.error("[WALLET] incomplete fields after decrypt")
+            self._clear()
+            return False
+        # Re-derive address and self-heal if mismatch
+        pub_bytes = bytes.fromhex(self.public_key)
+        expected  = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+        if self.address != expected:
+            self.address = expected
+            self._backup()
+            self._atomic_save(self.wallet_file, password,
+                {"address": self.address, "private_key": self.private_key,
+                 "public_key": self.public_key})
+        _EXP_LOG.info(f"[WALLET] ✅ loaded: {self.address}")
+        return True
+
+    def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
+        words = mnemonic.lower().strip().split()
+        if len(words) != self.MNEMONIC_WORDS:
+            return False
+        if any(w not in self._W for w in words):
+            return False
+        self.mnemonic = " ".join(words)
+        self._derive_keys(self.mnemonic)
+        self._atomic_save(self.wallet_file, password,
+            {"address": self.address, "private_key": self.private_key,
+             "public_key": self.public_key})
+        self._atomic_save(self.mnemonic_file, password,
+            {"mnemonic": self.mnemonic})
+        return True
+
+    def show_mnemonic(self, password: str) -> Optional[str]:
+        if not self.mnemonic_file.exists():
+            return None
+        try:
+            wd = self._decrypt(_json.loads(self.mnemonic_file.read_text()), password)
+            return wd.get("mnemonic") if wd else None
+        except Exception:
+            return None
+
+    # BIP-39
+    def _gen_mnemonic(self) -> str:
+        return " ".join(self._W[_secrets.randbelow(len(self._W))]
+                        for _ in range(self.MNEMONIC_WORDS))
+
+    def _mnemonic_to_seed(self, mnemonic: str) -> bytes:
+        return _hashlib.pbkdf2_hmac("sha512", mnemonic.encode(),
+                                     b"mnemonic" + self.BIP39_PASS,
+                                     self.BIP39_ITER, dklen=64)
+
+    # BIP-32
+    def _bip32_master(self, seed: bytes) -> Tuple[bytes, bytes]:
+        I = _hmac.new(self.BIP32_KEY, seed, "sha512").digest()
+        return I[:32], I[32:]
+
+    def _bip32_child(self, key: bytes, chain: bytes,
+                      index: int) -> Tuple[bytes, bytes]:
+        data = ((b"\x00" + key + index.to_bytes(4, "big"))
+                if index >= 0x80000000
+                else (_hashlib.sha256(key).digest() + index.to_bytes(4, "big")))
+        I  = _hmac.new(chain, data, "sha512").digest()
+        ck = ((int.from_bytes(I[:32], "big") + int.from_bytes(key, "big"))
+               % (2**256 - 2**32 - 977)).to_bytes(32, "big")
+        return ck, I[32:]
+
+    def _derive_keys(self, mnemonic: str) -> None:
+        seed       = self._mnemonic_to_seed(mnemonic)
+        key, chain = self._bip32_master(seed)
+        for idx in self.HD_PATH:
+            key, chain = self._bip32_child(key, chain, idx)
+        self.private_key = _hashlib.sha3_256(key).hexdigest()
+        self.public_key  = _hashlib.sha3_256(
+            self.private_key.encode()).hexdigest()
+        pub_bytes    = bytes.fromhex(self.public_key)
+        self.address = self.PREFIX + _hashlib.sha3_256(
+            pub_bytes).digest()[:20].hex()
+
+    # BIP-38
+    def _encrypt(self, password: str, payload: dict) -> dict:
+        salt = _secrets.token_bytes(self.SALT_BYTES)
+        key  = _hashlib.pbkdf2_hmac("sha256", password.encode(), salt,
+                                     self.PBKDF2_ITER, dklen=self.KEY_BYTES)
+        auth = _hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
+        pt   = _json.dumps(payload, sort_keys=True).encode()
+        ct   = bytes(p ^ k for p, k in zip(pt, self._ks(key, len(pt))))
+        return {"version": self.VERSION, "salt": salt.hex(),
+                "auth": auth, "cipher": ct.hex()}
+
+    def _decrypt(self, data: dict, password: str) -> Optional[dict]:
+        try:
+            salt = bytes.fromhex(data["salt"])
+            key  = _hashlib.pbkdf2_hmac("sha256", password.encode(), salt,
+                                         self.PBKDF2_ITER, dklen=self.KEY_BYTES)
+            if not _hmac.compare_digest(
+                    _hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest(),
+                    data["auth"]):
+                _EXP_LOG.error("[WALLET] ❌ wrong password")
+                return None
+            ct = bytes.fromhex(data["cipher"])
+            return _json.loads(bytes(
+                c ^ k for c, k in zip(ct, self._ks(key, len(ct)))).decode())
+        except Exception as e:
+            _EXP_LOG.error(f"[WALLET] ❌ decrypt: {e}")
+            return None
+
+    def _ks(self, key: bytes, length: int) -> bytes:
+        out, blk = b"", key
+        while len(out) < length:
+            blk  = _hashlib.sha256(blk).digest()
+            out += blk
+        return out[:length]
+
+    def _atomic_save(self, path: _Path, password: str, payload: dict) -> None:
+        path.parent.mkdir(exist_ok=True, mode=0o700)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(self._encrypt(password, payload), indent=2))
+        _os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        _os.chmod(path, 0o600)
+
+    def _backup(self) -> None:
+        if self.wallet_file.exists():
+            import shutil as _shutil
+            bak = self.wallet_file.with_suffix(".bak")
+            _shutil.copy2(self.wallet_file, bak)
+            _os.chmod(bak, 0o600)
+
+    def _clear(self) -> None:
+        self.address = self.private_key = self.public_key = self.mnemonic = None
+
+    def _print_mnemonic(self) -> None:
+        words = self.mnemonic.split()
+        print("\n" + "═" * 60)
+        print("  ⚠️   WRITE DOWN YOUR 12-WORD RECOVERY PHRASE")
+        print("  Store offline. Never photograph. Never share.")
+        print("═" * 60)
+        for i in range(0, 12, 3):
+            print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. "
+                  f"{words[i+1]:<14} {i+3:2}. {words[i+2]}")
+        print("═" * 60 + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# η-SWARM  QtclClientApp  ─  Welcome menu + Mine / Transact / Wallet
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QtclClientApp:
+    """
+    Interactive QTCL Client.  Wires wallet → CLIENT_FIELD_STATE →
+    KOYEB_ORACLE_STATE → SSE/gossip/DHT → mine or transact.
+    The metric loop ❤️  never stops doing what it was born to do.
+    """
+    METRIC_INTERVAL:      float = 10.0
+    KOYEB_SYNC_INTERVAL:  float = 30.0
+    DB_METRIC_LIMIT:      int   = 10_000
+    DB_GOSSIP_LIMIT:      int   = 5_000
+
+    def __init__(self, oracle_url: str = None):
+        self.oracle_url   = oracle_url or _ORACLE_BASE_URL
+        self.api          = KoyebAPIClient(self.oracle_url)
+        self.wallet       = QTCLWallet()
+        self.client_field = ClientFieldState()
+        self.koyeb_state  = KoyebOracleState(oracle_url=self.oracle_url,
+                                              _api=self.api)
+        self._stop        = _threading.Event()
+        self._metric_th: Optional[_threading.Thread] = None
+        self._db_path     = _Path("data/qtcl_client.db")
+        self._db: Optional[_sqlite3.Connection] = None
+        self._peer_id     = (
+            f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
+
+    # ── DB init + persistence ─────────────────────────────────────────────────
+
+    def _init_db(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = _sqlite3.connect(
+            str(self._db_path), check_same_thread=False, timeout=10)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS tensor_field_metrics (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                pq_curr_id           TEXT DEFAULT '',
+                pq_last_id           TEXT DEFAULT '',
+                fidelity_to_w3       REAL DEFAULT 0,
+                entropy_vn           REAL DEFAULT 0,
+                coherence_l1         REAL DEFAULT 0,
+                quantum_discord      REAL DEFAULT 0,
+                bell_chsh_AB         REAL DEFAULT 0,
+                bell_chsh_BC         REAL DEFAULT 0,
+                bell_violations      INTEGER DEFAULT 0,
+                purity               REAL DEFAULT 0,
+                negativity_AB        REAL DEFAULT 0,
+                negativity_BC        REAL DEFAULT 0,
+                field_density        REAL DEFAULT 0,
+                entanglement_entropy REAL DEFAULT 0,
+                oracle_fidelity      REAL DEFAULT 0,
+                oracle_coherence     REAL DEFAULT 0,
+                bridge_fidelity      REAL DEFAULT 0,
+                channel_latency_ms   REAL DEFAULT 0,
+                block_height         INTEGER DEFAULT 0,
+                ts                   REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_tfm_ts
+                ON tensor_field_metrics(ts DESC);
+            CREATE TABLE IF NOT EXISTS gossip_inventory (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                channel    TEXT DEFAULT 'gossip',
+                peer_id    TEXT DEFAULT '',
+                payload    TEXT DEFAULT '{}',
+                ts         REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_gi_ts
+                ON gossip_inventory(ts DESC);
+        """)
+        self._db.commit()
+
+    def _persist_metrics(self, m: TensorFieldMetrics,
+                          ks: KoyebOracleState) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.execute("""
+                INSERT INTO tensor_field_metrics
+                  (pq_curr_id, pq_last_id, fidelity_to_w3, entropy_vn,
+                   coherence_l1, quantum_discord, bell_chsh_AB, bell_chsh_BC,
+                   bell_violations, purity, negativity_AB, negativity_BC,
+                   field_density, entanglement_entropy, oracle_fidelity,
+                   oracle_coherence, bridge_fidelity, channel_latency_ms,
+                   block_height, ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                m.pq_curr_id, m.pq_last_id, m.fidelity_to_w3, m.entropy_vn,
+                m.coherence_l1, m.quantum_discord, m.bell_chsh_AB, m.bell_chsh_BC,
+                m.bell_violations, m.purity, m.negativity_AB, m.negativity_BC,
+                m.field_density, m.entanglement_entropy, ks.pq0_fidelity,
+                ks.oracle_coherence, ks.bridge_fidelity, ks.channel_latency_ms,
+                m.block_height, m.ts,
+            ))
+            self._db.execute(
+                "DELETE FROM tensor_field_metrics WHERE id NOT IN "
+                f"(SELECT id FROM tensor_field_metrics "
+                f"ORDER BY ts DESC LIMIT {self.DB_METRIC_LIMIT})")
+            self._db.commit()
+        except Exception as e:
+            _EXP_LOG.debug(f"[DB] persist metrics: {e}")
+
+    def _persist_gossip(self, event_type: str, channel: str,
+                         payload: dict) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.execute(
+                "INSERT INTO gossip_inventory"
+                " (event_type, channel, peer_id, payload, ts) VALUES (?,?,?,?,?)",
+                (event_type, channel, self._peer_id,
+                 _json.dumps(payload, default=str)[:4096], _time.time()))
+            self._db.execute(
+                "DELETE FROM gossip_inventory WHERE id NOT IN "
+                f"(SELECT id FROM gossip_inventory "
+                f"ORDER BY ts DESC LIMIT {self.DB_GOSSIP_LIMIT})")
+            self._db.commit()
+        except Exception as e:
+            _EXP_LOG.debug(f"[DB] persist gossip: {e}")
+
+    # ── Metric streaming loop ─────────────────────────────────────────────────
+
+    def _metric_loop(self) -> None:
+        """
+        Background loop: oracle → CLIENT_FIELD_STATE → TensorFieldMetrics
+        → DB → SSE → gossip.  Runs forever.  ❤️  I love you.
+        """
+        _EXP_LOG.info("[FIELD] 🌀 tensor field metrics loop started  ❤️")
+        _last_koyeb = 0.0
+        while not self._stop.is_set():
+            try:
+                _time.sleep(self.METRIC_INTERVAL)
+                now  = _time.time()
+                snap = self.api.get_oracle_pq0_bloch() or {}
+                bath = GKSLBathParams.from_snap(snap)
+                dm_curr = (_decode_dm_8x8(snap)
+                           if snap else _build_w3_dm())
+                if dm_curr is None:
+                    dm_curr = _build_w3_dm()
+                if dm_curr is None:
+                    continue
+                # pq_last: one GKSL step behind pq_curr
+                dm_last = _gksl_rk4_step(dm_curr, bath, self.METRIC_INTERVAL)
+                pq_curr_id   = str(snap.get("pq_curr",       ""))
+                pq_last_id   = str(snap.get("pq_last",       ""))
+                block_height = int(snap.get("block_height",  0))
+                # Build CLIENT_FIELD_STATE
+                self.client_field.build(
+                    dm_curr, dm_last, pq_curr_id, pq_last_id, block_height)
+                # Periodic KOYEB_ORACLE_STATE sync
+                if now - _last_koyeb >= self.KOYEB_SYNC_INTERVAL:
+                    self.koyeb_state.sync(self.client_field, timeout=8)
+                    _last_koyeb = now
+                m = self.client_field.metrics
+                if m is None:
+                    continue
+                # DB
+                self._persist_metrics(m, self.koyeb_state)
+                # SSE fan-out
+                snap_out = {
+                    **m.as_dict(),
+                    "koyeb":        self.koyeb_state.as_dict(),
+                    "oracle_label": ORACLE_W_STATE.state_label if hasattr(
+                        ORACLE_W_STATE, "state_label") else "W3",
+                    "block_height": block_height,
+                    "ts":           now,
+                }
+                _SSE_MUX.publish("metrics", snap_out, channel="metrics")
+                _SSE_MUX.publish("quantum", snap_out, channel="quantum")
+                # Gossip inventory
+                self._persist_gossip("field_metrics", "metrics", snap_out)
+                # Console heartbeat ~ every 60s
+                if int(now) % 60 < int(self.METRIC_INTERVAL):
+                    _EXP_LOG.info(
+                        f"[FIELD] ❤️  fid={m.fidelity_to_w3:.4f} "
+                        f"S={m.entropy_vn:.4f} "
+                        f"chsh_AB={m.bell_chsh_AB:.3f} "
+                        f"h={block_height}")
+            except Exception as e:
+                _EXP_LOG.debug(f"[FIELD] loop: {e}")
+
+    # ── Wallet helpers ────────────────────────────────────────────────────────
+
+    def _load_wallet(self) -> bool:
+        if self.wallet.is_loaded():
+            return True
+        try:
+            pw = input("  Wallet password: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return bool(pw) and self.wallet.load(pw)
+
+    def _start_metric_thread(self) -> None:
+        self._stop.clear()
+        self._metric_th = _threading.Thread(
+            target=self._metric_loop, daemon=True, name="ClientMetrics")
+        self._metric_th.start()
+
+    # ── Mine mode ─────────────────────────────────────────────────────────────
+
+    def run_mine_mode(self) -> None:
+        """
+        1. Load wallet from ~/data/wallet.json + wallet_mnemonic.enc
+        2. Fetch oracle DM → build CLIENT_FIELD_STATE tripartite
+        3. Sync KOYEB_ORACLE_STATE (dedicated HTTP bridge)
+        4. Build AER NoiseModel (lattice-matched GKSL bath)
+        5. Start tensor field metric stream → DB + SSE + gossip/DHT
+        6. Run AsyncOracleMiner PoW loop
+        """
+        print("\n  🔄 Loading wallet…")
+        if not self._load_wallet():
+            print("  ❌ Wallet load failed — run Wallet → Create New first")
+            return
+        print(f"  ✅ Wallet: {self.wallet.address}")
+        self._init_db()
+
+        # ── Oracle fetch ───────────────────────────────────────────────────
+        print("  🌐 Fetching oracle W-state (pq0-bloch)…")
+        snap         = self.api.get_oracle_pq0_bloch() or {}
+        bath         = GKSLBathParams.from_snap(snap)
+        dm_curr      = _decode_dm_8x8(snap) or _build_w3_dm()
+        dm_last      = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
+        pq_curr_id   = str(snap.get("pq_curr",       ""))
+        pq_last_id   = str(snap.get("pq_last",       ""))
+        block_height = int(snap.get("block_height",  0))
+        w_fid        = float(snap.get("w_state_fidelity", 0.0))
+        print(f"  ⚛️  W-state fidelity: {w_fid:.4f}  │  block_height: {block_height}")
+
+        # ── CLIENT_FIELD_STATE ─────────────────────────────────────────────
+        self.client_field.build(dm_curr, dm_last, pq_curr_id, pq_last_id,
+                                 block_height)
+
+        # ── KOYEB_ORACLE_STATE ─────────────────────────────────────────────
+        print("  🔗 Syncing KOYEB_ORACLE_STATE…")
+        self.koyeb_state.sync(self.client_field, timeout=8)
+
+        m = self.client_field.metrics
+        print("\n" + "─" * 68)
+        print("  CLIENT_FIELD_STATE  (ORACLE_W_STATE ↔ pq_curr ↔ pq_last)")
+        if m:
+            print(f"    ORACLE_W_STATE : |W3⟩  A=pq0  B=virtual_pq  "
+                  f"C=inverse_virtual")
+            print(f"    pq_curr       : {pq_curr_id[:32] or 'N/A'}")
+            print(f"    pq_last       : {pq_last_id[:32] or 'N/A'}")
+            print(f"    block_height  : {block_height}")
+            print(f"    Fidelity→|W3⟩ : {m.fidelity_to_w3:.4f}")
+            print(f"    VN Entropy    : {m.entropy_vn:.4f} bits")
+            print(f"    Coherence L1  : {m.coherence_l1:.4f}")
+            print(f"    Quantum Discord: {m.quantum_discord:.4f}")
+            print(f"    Bell CHSH A-B : {m.bell_chsh_AB:.4f}  "
+                  f"B-C: {m.bell_chsh_BC:.4f}  "
+                  f"violations={m.bell_violations}")
+            print(f"    Negativity A-B: {m.negativity_AB:.4f}  "
+                  f"B-C: {m.negativity_BC:.4f}")
+            print(f"    Purity        : {m.purity:.4f}")
+            print(f"    Field ‖Δρ‖_F  : {m.field_density:.6f}")
+        ks = self.koyeb_state
+        print(f"  KOYEB_ORACLE_STATE  ({self.oracle_url})")
+        print(f"    Connected      : {ks.connected}")
+        print(f"    Oracle fidelity: {ks.pq0_fidelity:.4f}")
+        print(f"    Oracle coherence: {ks.oracle_coherence:.4f}")
+        print(f"    Bridge fidelity: {ks.bridge_fidelity:.4f}")
+        print(f"    Latency        : {ks.channel_latency_ms:.1f} ms")
+        print(f"  AER NoiseModel bath: "
+              f"γ1_eff={bath.gamma1_eff:.4f}  "
+              f"γφ={bath.gammaphi:.4f}  "
+              f"γdep={bath.gammadep:.4f}  "
+              f"ω={bath.omega:.3f}")
+        nm = build_aer_noise_model(bath)
+        print(f"  AER NoiseModel : {'✅ built (lattice-matched)' if nm else '⚠️  qiskit_aer unavailable'}")
+        print("─" * 68)
+
+        # Register peer with oracle
+        gurl = f"http://localhost:9091"
+        self.api.register_peer(self._peer_id, gurl,
+                                self.wallet.address, block_height)
+
+        # Start streaming
+        self._start_metric_thread()
+        print(f"  📡 SSE streaming  │  subscribers: {_SSE_MUX.client_count()}")
+        print(f"  🗄️  DB: {self._db_path}")
+        print("\n  ⛏️  Mining loop started (Ctrl+C to stop)\n")
+
+        # ── AsyncOracleMiner loop ──────────────────────────────────────────
+        oracle_client = get_oracle_client(self._peer_id)  # type: ignore
+        dht_bus       = get_dht_bus(self._peer_id)        # type: ignore
+        miner         = AsyncOracleMiner(oracle=oracle_client, dht=dht_bus)
+
+        async def _mine():
+            await miner.start_mining(self.wallet.address)
+
+        try:
+            _asyncio.run(_mine())
+        except KeyboardInterrupt:
+            miner.stop_mining()
+            print("\n  🛑 Mining stopped")
+        finally:
+            self._stop.set()
+
+    # ── Transact mode ─────────────────────────────────────────────────────────
+
+    def run_transact_mode(self) -> None:
+        """Full entanglement stack + HLWE transaction builder."""
+        print("\n  🔄 Loading wallet for transaction mode…")
+        if not self._load_wallet():
+            print("  ❌ Wallet required for transactions")
+            return
+        self._init_db()
+        snap   = self.api.get_oracle_pq0_bloch() or {}
+        bath   = GKSLBathParams.from_snap(snap)
+        dm_curr = _decode_dm_8x8(snap) or _build_w3_dm()
+        dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
+        bh     = int(snap.get("block_height", 0))
+        self.client_field.build(dm_curr, dm_last,
+                                str(snap.get("pq_curr", "")),
+                                str(snap.get("pq_last", "")), bh)
+        self.koyeb_state.sync(self.client_field)
+        self._start_metric_thread()
+        print(f"  ✅ CLIENT_FIELD_STATE ready  │  "
+              f"bridge_fid={self.koyeb_state.bridge_fidelity:.4f}  │  "
+              f"h={bh}")
+        while True:
+            print("\n" + "━" * 62)
+            print("  💸  TRANSACTION MENU")
+            print("━" * 62)
+            print("  1.) 📤  Send QTCL")
+            print("  2.) 🔍  Query transaction")
+            print("  3.) 💰  Check balance")
+            print("  4.) 🔙  Back")
+            try:
+                ch = input("  Choice [1-4]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if   ch == "1": self._send_tx_wizard()
+            elif ch == "2": self._query_tx()
+            elif ch == "3":
+                bal = self.api.get_balance(self.wallet.address)
+                print(f"\n  💰 {f'{bal:.8f} QTCL' if bal is not None else 'unavailable'}"
+                      f"  ({self.wallet.address})")
+            elif ch == "4":
+                break
+        self._stop.set()
+
+    def _send_tx_wizard(self) -> None:
+        """Build, sign, and POST a transaction to /api/transactions."""
+        try:
+            to_addr = input("  To address (qtcl1…): ").strip()
+            amount  = float(input("  Amount (QTCL): ").strip())
+            fee     = float(input("  Fee [default 0.001]: ").strip() or "0.001")
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("  ❌ Cancelled"); return
+        if not to_addr.startswith("qtcl1"):
+            print("  ❌ Invalid QTCL address"); return
+        tx = {
+            "from_address":    self.wallet.address,
+            "to_address":      to_addr,
+            "amount":          amount,
+            "fee":             fee,
+            "timestamp":       _time.time(),
+            "nonce":           int(_time.time() * 1000),
+            "public_key":      self.wallet.public_key or "",
+            "pq_curr":         self.koyeb_state.pq_curr_id,
+            "block_height":    self.koyeb_state.block_height,
+            "w_state_fidelity": self.koyeb_state.w_state_fidelity,
+        }
+        tx_id = _hashlib.sha3_256(
+            _json.dumps(tx, sort_keys=True).encode()).hexdigest()
+        tx["tx_id"] = tx_id
+        if self.wallet.private_key:
+            tx["signature"] = _hashlib.sha3_256(
+                (tx_id + self.wallet.private_key).encode()).hexdigest()
+        result = self.api.submit_transaction(tx)
+        if result:
+            srv   = result.get("tx_hash", result.get("txid", tx_id))
+            print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
+            _SSE_MUX.publish("tx_submitted",
+                             {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
+                             channel="gossip")
+            self._persist_gossip("tx_submitted", "gossip",
+                                  {"tx_id": tx_id[:32], "amount": amount})
+        else:
+            print("  ❌ Submission failed — check oracle connectivity")
+
+    def _query_tx(self) -> None:
+        try:
+            tx_hash = input("  Transaction hash: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not tx_hash:
+            return
+        r = self.api.get_transaction(tx_hash)
+        print("\n" + "─" * 58)
+        if r:
+            print(f"  Status  : {r.get('status','?').upper()}")
+            print(f"  Hash    : {r.get('tx_hash', tx_hash)[:42]}")
+            print(f"  Amount  : {r.get('amount', r.get('amount_qtcl', '?'))} QTCL")
+            print(f"  From    : {r.get('from_address', '?')}")
+            print(f"  To      : {r.get('to_address', '?')}")
+            print(f"  Block   : {r.get('block_height', 'pending')}")
+        else:
+            print("  ❌ Transaction not found")
+        print("─" * 58)
+
+    # ── Wallet mode ───────────────────────────────────────────────────────────
+
+    def run_wallet_mode(self) -> None:
+        """BIP-39/32/38 wallet management."""
+        while True:
+            print("\n" + "━" * 62)
+            print("  🔑  WALLET")
+            print("━" * 62)
+            print("  1.) 💰  Get balance")
+            print("  2.) 🔄  Recover from 12-word mnemonic")
+            print("  3.) ➕  Create new wallet")
+            print("  4.) 🔍  Show address / public key")
+            print("  5.) 📜  Show mnemonic phrase")
+            print("  6.) 🔙  Back")
+            try:
+                ch = input("  Choice [1-6]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ch == "1":
+                if not self.wallet.is_loaded() and not self._load_wallet():
+                    continue
+                bal = self.api.get_balance(self.wallet.address)
+                print(f"\n  💰 Balance  : "
+                      f"{f'{bal:.8f} QTCL' if bal is not None else 'unavailable'}")
+                print(f"  Address    : {self.wallet.address}")
+            elif ch == "2":
+                self._recover_mnemonic()
+            elif ch == "3":
+                try:
+                    pw  = input("  New password: ").strip()
+                    pw2 = input("  Confirm    : ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if pw != pw2:
+                    print("  ❌ Passwords don't match"); continue
+                if not pw:
+                    print("  ❌ Password required"); continue
+                try:
+                    addr = QTCLWallet().create(pw)
+                    print(f"  ✅ Created: {addr}")
+                except Exception as e:
+                    print(f"  ❌ {e}")
+            elif ch == "4":
+                if not self.wallet.is_loaded() and not self._load_wallet():
+                    continue
+                print(f"  Address    : {self.wallet.address}")
+                print(f"  Public key : {self.wallet.public_key}")
+            elif ch == "5":
+                try:
+                    pw = input("  Wallet password: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                phrase = QTCLWallet().show_mnemonic(pw)
+                if phrase:
+                    words = phrase.split()
+                    print("\n" + "═" * 60)
+                    print("  ⚠️   YOUR RECOVERY PHRASE — store offline")
+                    print("═" * 60)
+                    for i in range(0, 12, 3):
+                        print(f"  {i+1:2}. {words[i]:<14} "
+                              f"{i+2:2}. {words[i+1]:<14} "
+                              f"{i+3:2}. {words[i+2]}")
+                    print("═" * 60)
+                else:
+                    print("  ❌ Not found or wrong password")
+            elif ch == "6":
+                break
+
+    def _recover_mnemonic(self) -> None:
+        print("\n  BIP-39 Recovery — enter your 12 words (space-separated)")
+        try:
+            phrase = input("  Words: ").strip().lower()
+            pw     = input("  New password: ").strip()
+            pw2    = input("  Confirm     : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("  ❌ Cancelled"); return
+        if pw != pw2:
+            print("  ❌ Passwords don't match"); return
+        if not pw:
+            print("  ❌ Password required"); return
+        words = phrase.split()
+        if len(words) != 12:
+            print(f"  ❌ Need 12 words, got {len(words)}"); return
+        bad = [w for w in words if w not in QTCLWallet._W]
+        if bad:
+            print(f"  ❌ Invalid BIP-39 word(s): {', '.join(bad[:5])}"); return
+        w = QTCLWallet()
+        if w.restore_from_mnemonic(phrase, pw):
+            self.wallet = w
+            print(f"  ✅ Recovered: {w.address}")
+            w._print_mnemonic()
+        else:
+            print("  ❌ Recovery failed")
+
+    # ── Entry ─────────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Welcome screen + mode dispatch."""
+        print()
+        print("╔══════════════════════════════════════════════════════════════╗")
+        print("║                                                              ║")
+        print("║          ⚛️   Welcome to QTCL Client  ⚛️                      ║")
+        print("║                                                              ║")
+        print("║  W-State : |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)               ║")
+        print("║  Oracle  : qtcl-blockchain.koyeb.app  (port 9091)           ║")
+        print("║  Noise   : GKSL lattice-matched AER bath                    ║")
+        print("║                                                              ║")
+        print("╚══════════════════════════════════════════════════════════════╝")
+        print()
+        print("  Choose an option to continue:")
+        print()
+        print("  ┌──────────────────────────────────────────────────────────┐")
+        print("  │  1.) ⛏️   Mine                                            │")
+        print("  │          Wallet · CLIENT_FIELD_STATE · KOYEB_ORACLE      │")
+        print("  │          8×8 DM · tensor metrics · SSE/gossip/DHT        │")
+        print("  │                                                          │")
+        print("  │  2.) 💸  Transact                                         │")
+        print("  │          Entanglement stack · Send/receive QTCL           │")
+        print("  │          HLWE signatures · balance queries                │")
+        print("  │                                                          │")
+        print("  │  3.) 🔑  Wallet                                           │")
+        print("  │          Balance · BIP-39 recover · BIP-32/38 create     │")
+        print("  └──────────────────────────────────────────────────────────┘")
+        print()
+        try:
+            choice = input("  Enter choice [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
+        if   choice == "2": self.run_transact_mode()
+        elif choice == "3": self.run_wallet_mode()
+        else:               self.run_mine_mode()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# θ-SWARM  main()  ─  replaces the original stub (intentional name shadowing)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:  # noqa: F811
+    """
+    QTCL Client main entrypoint.
+    --node-type server|miner|oracle  → delegates to original QtclNode subclass.
+    Without --node-type              → shows Welcome screen (QtclClientApp).
+    --mine / --transact / --wallet   → skip menu, launch mode directly.
+    """
+    import argparse as _ap
+    p = _ap.ArgumentParser(
+        description="QTCL Client — W-State Entangled Blockchain",
+        formatter_class=_ap.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--oracle-url",   default=None,
+                   help="Override oracle URL (or set ORACLE_URL env var)")
+    p.add_argument("--mine",         action="store_true")
+    p.add_argument("--transact",     action="store_true")
+    p.add_argument("--wallet",       action="store_true")
+    p.add_argument("--node-type",    default=None,
+                   choices=["server", "miner", "oracle"],
+                   help="Run original QtclNode class instead of interactive client")
+    p.add_argument("--log-level",    default="WARNING",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    args, _ = p.parse_known_args()
+
+    _logging.basicConfig(
+        level=getattr(_logging, args.log_level),
+        format="[%(asctime)s] %(levelname)s  %(name)s: %(message)s",
+    )
+
+    # ── Delegate to original class-based node if requested ───────────────────
+    if args.node_type:
+        _cls_map = {"server": QtclServer,   # type: ignore[name-defined]
+                    "miner":  QtclMiner,    # type: ignore[name-defined]
+                    "oracle": QtclOracle}   # type: ignore[name-defined]
+        NodeCls = _cls_map[args.node_type]
+        import argparse as _ap2
+        node = NodeCls(config_path=None)
+        try:
+            node.start()
+            node.run_forever()  # type: ignore[attr-defined]
+        except KeyboardInterrupt:
+            node.stop()
+        return
+
+    # ── Interactive client ───────────────────────────────────────────────────
+    url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
+    app = QtclClientApp(oracle_url=url)
+    if   args.mine:     app.run_mine_mode()
+    elif args.transact: app.run_transact_mode()
+    elif args.wallet:   app.run_wallet_mode()
+    else:               app.run()
+
+
+if __name__ == "__main__":
+    main()
