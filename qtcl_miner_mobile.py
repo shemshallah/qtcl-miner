@@ -559,12 +559,11 @@ def _safe_json(response, default=None, label=''):
         return response.json()
     except Exception as _je:
         try:
-            _body = response.text[:400] if response.text else '<empty>'
+            _body = response.text[:200] if response.text else '<empty>'
         except Exception:
             _body = '<unreadable>'
         _tag = f'[{label}] ' if label else ''
-        # WARNING level so empty-body issues appear in production logs (debug is filtered)
-        logger.warning(f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | body={_body!r}")
+        logger.debug(f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | body={_body!r}")
         return default
 
 
@@ -648,17 +647,13 @@ class P2PClient:
         """
         Get current chain tip height from oracle REST /api/blocks/tip.
         Accepts both 'block_height' and 'height' keys for compatibility.
-        FIX: use explicit `is not None` check — `or` treats height=0 as falsy.
         """
         for base in self._base_urls(oracle_url):
             try:
                 r = self._session.get(f"{base}/api/blocks/tip", timeout=timeout)
                 if r.status_code == 200:
                     data = _safe_json(r, default={}, label='P2P/height')
-                    # Explicit None checks — `or` would silently skip height=0
-                    h = data.get('block_height')
-                    if h is None:
-                        h = data.get('height')
+                    h = data.get('block_height') or data.get('height')
                     if h is not None:
                         logger.info(f"[P2P] ✅ Chain tip height={h} from {base}")
                         return int(h)
@@ -764,7 +759,7 @@ class HLWETransactionSigner:
 class OracleBroadcaster:
     """Broadcasts signed transactions and blocks to Oracle (main database)."""
     
-    def __init__(self, oracle_url: str = 'http://localhost:8000'):
+    def __init__(self, oracle_url: str = 'https://qtcl-blockchain.koyeb.app'):
         self.oracle_url = oracle_url.rstrip('/')
         self.broadcast_queue: Deque[Dict[str, Any]] = deque(maxlen=1000)
         self._lock = threading.RLock()
@@ -1859,57 +1854,38 @@ def apply_schema_patches(conn=None):
 
 def detect_oracle_url() -> str:
     """
-    ⚛️ SMART ORACLE URL DETECTION
-    
-    Try sources in this order:
-    1. ORACLE_URL environment variable (explicit override)
-    2. Koyeb environment (running on Koyeb? use standard koyeb URL)
-    3. KOYEB_APP environment variable 
-    4. Try localhost:8000 (local development)
-    5. Hardcoded known production URL
-    
-    Never fails — returns best guess at oracle URL
+    Authoritative oracle URL resolution.
+
+    Resolution order (first match wins):
+      1. ORACLE_URL environment variable  — explicit operator override, always wins
+      2. KOYEB_APP_NAME env var           — set automatically by Koyeb runtime
+      3. KOYEB_APP env var                — alternate Koyeb naming convention
+      4. Production default               — https://qtcl-blockchain.koyeb.app
+
+    DELIBERATELY no localhost probe:
+      - Connecting to localhost:8000 when the oracle is remote silently burns the
+        entire retry budget on ConnectionRefused errors before the real URL is tried.
+      - A Termux/mobile miner is NEVER the oracle — there is no local server to probe.
+      - If you genuinely need to target a local dev server, set ORACLE_URL=http://localhost:8000.
     """
-    import os
-    
-    # 1. Explicit environment variable
-    if 'ORACLE_URL' in os.environ:
-        url = os.environ.get('ORACLE_URL', '').strip()
-        if url:
-            logger.info(f"[ORACLE] 🔍 Using ORACLE_URL from environment: {url}")
+    # 1. Explicit env override — always wins, supports any URL scheme
+    url = os.environ.get('ORACLE_URL', '').strip()
+    if url:
+        logger.info(f"[ORACLE] 📌 ORACLE_URL env: {url}")
+        return url
+
+    # 2. Koyeb runtime env (set by Koyeb automatically)
+    for _kvar in ('KOYEB_APP_NAME', 'KOYEB_APP'):
+        val = os.environ.get(_kvar, '').strip()
+        if val:
+            url = f"https://{val}"
+            logger.info(f"[ORACLE] ☁️  Koyeb env ({_kvar}): {url}")
             return url
-    
-    # 2. Running on Koyeb? Detect from environment
-    if 'KOYEB_APP_NAME' in os.environ:
-        app_name = os.environ.get('KOYEB_APP_NAME', '')
-        if app_name:
-            url = f"https://{app_name}"
-            logger.info(f"[ORACLE] 🔍 Detected Koyeb deployment: {url}")
-            return url
-    
-    # 3. KOYEB_APP env variable
-    if 'KOYEB_APP' in os.environ:
-        app = os.environ.get('KOYEB_APP', '').strip()
-        if app:
-            url = f"https://{app}"
-            logger.info(f"[ORACLE] 🔍 Using KOYEB_APP environment: {url}")
-            return url
-    
-    # 4. Try localhost (local development)
-    logger.info("[ORACLE] 🔍 Trying localhost:8000 (local development)...")
-    try:
-        import requests
-        r = requests.get("http://localhost:8000/api/blocks/tip", timeout=2)
-        if r.status_code in [200, 400, 500]:  # Server is up, even if error
-            logger.info("[ORACLE] ✅ Found oracle on localhost:8000")
-            return "http://localhost:8000"
-    except:
-        pass
-    
-    # 5. Try known production URL (your Koyeb app)
-    url = "https://qtcl-blockchain.koyeb.app"
-    logger.info(f"[ORACLE] 🔍 Using default production URL: {url}")
-    logger.warning("[ORACLE] ⚠️  If this is wrong, set ORACLE_URL environment variable")
+
+    # 4. Hardcoded production fallback — no localhost, no probe, no latency
+    url = 'https://qtcl-blockchain.koyeb.app'
+    logger.info(f"[ORACLE] 🌐 Using production default: {url}")
+    logger.warning("[ORACLE] ⚠️  Override with: export ORACLE_URL=<your-url>")
     return url
 
 
@@ -2024,10 +2000,7 @@ class PeriodicPeerSync:
                     )
                     if r.status_code == 200:
                         data   = _safe_json(r, default={}, label='CONSENSUS/tip')
-                        _h_tmp = data.get('block_height')
-                        if _h_tmp is None:
-                            _h_tmp = data.get('height')
-                        height = int(_h_tmp) if _h_tmp is not None else 0
+                        height = data.get('block_height') or data.get('height') or 0
                         peer_id = base
                         if self.consensus_mgr:
                             self.consensus_mgr.record_peer_metric(peer_id, 'chain_height', height)
@@ -2057,7 +2030,7 @@ db: Optional[sqlite3.Connection] = None  # Global database connection for schema
 # For Koyeb: Use your app URL (e.g., https://qtcl-blockchain.koyeb.app)
 # Koyeb routes /api/* to port 9091, / to port 8000 internally
 # You MUST specify your actual oracle server URL via --oracle-url or set environment variable
-LIVE_NODE_URL='http://localhost:8000'  # CHANGE THIS OR PASS --oracle-url
+LIVE_NODE_URL = os.environ.get('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')  # set ORACLE_URL env var to override
 
 # ── LATTICE FINGERPRINT ───────────────────────────────────────────────────────
 # SHA-256 of the canonical noise-bath parameters. Any node serving bootstrap
@@ -3036,52 +3009,67 @@ class P2PClientWStateRecovery:
             logger.error(f"[W-STATE] ❌ Entanglement failed: {e}")
             return False
     
-    def verify_entanglement(self, local_fidelity: float, signature_verified: bool, verbose: bool = True) -> bool:
-        """Verify entanglement quality with adaptive thresholds.
-        
-        local_fidelity is the oracle-reported W-state fidelity (degraded by sync lag).
-        This is the REAL field quality — stored directly as w_state_fidelity for
-        block submission. We do NOT re-compute fidelity from the density matrix
-        (that would give the meaningless 0.0417 identity-matrix trace value).
+    def verify_entanglement(self, local_fidelity: float, signature_verified: bool,
+                            verbose: bool = False) -> bool:
+        """
+        Classify the current oracle fidelity against the configured threshold mode.
+
+        PURE CLASSIFIER — updates EntanglementState and returns a bool.
+        Does NOT emit log messages on the failure path; callers are responsible
+        for all rate-limited logging.  This prevents log spam when the caller
+        is a tight loop (e.g. _sync_worker running at 10ms intervals).
+
+        Returns:
+            True  → fidelity ≥ fid_threshold (established) OR ≥ fid_minimal (marginal)
+                    Both cases allow mining to proceed.
+            False → fidelity < fid_minimal  (genuinely degraded, mining should pause)
+
+        The `verbose` flag is kept for callers that want a one-off log (e.g. initial
+        entanglement or scheduled status dumps) but is False by default.
         """
         try:
+            mode          = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
+            fid_threshold, _ = WStateRecoveryManager.get_threshold_for_mode(mode)
+            fid_minimal   = FIDELITY_THRESHOLD_RELAXED
+
+            # Atomically update state
             with self._state_lock:
                 self.entanglement_state.local_fidelity     = local_fidelity
-                self.entanglement_state.w_state_fidelity   = local_fidelity  # ← real value for blocks
+                self.entanglement_state.w_state_fidelity   = local_fidelity
                 self.entanglement_state.signature_verified = signature_verified
-            
-            mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
-            fid_threshold, coh_threshold = WStateRecoveryManager.get_threshold_for_mode(mode)
-            fid_minimal = FIDELITY_THRESHOLD_RELAXED
-            
+
             if local_fidelity >= fid_threshold and signature_verified:
                 with self._state_lock:
-                    self.entanglement_state.established = True
+                    self.entanglement_state.established      = True
                     self.entanglement_state.coherence_verified = True
-                
                 if verbose:
-                    logger.info(f"[W-STATE] 🔗 Entanglement verified | F={local_fidelity:.4f} (≥{fid_threshold:.2f}) | sig=✓")
+                    logger.info(
+                        f"[W-STATE] 🔗 Entanglement verified | "
+                        f"F={local_fidelity:.4f} ≥ {fid_threshold:.2f} [{mode}] | sig=✓"
+                    )
                 return True
-            
+
             elif local_fidelity >= fid_minimal and signature_verified:
+                # Marginal — accepted for mining, noted but NOT a warning per-cycle
                 with self._state_lock:
-                    self.entanglement_state.established = True
+                    self.entanglement_state.established      = True
                     self.entanglement_state.coherence_verified = True
-                
                 if verbose:
-                    logger.warning(f"[W-STATE] ⚠️  Marginal entanglement accepted | F={local_fidelity:.4f} (≥{fid_minimal:.2f}) | sig={signature_verified}")
+                    logger.info(
+                        f"[W-STATE] ⚡ Marginal fidelity accepted | "
+                        f"F={local_fidelity:.4f} ≥ {fid_minimal:.2f} [relaxed] | "
+                        f"(below {mode} threshold {fid_threshold:.2f})"
+                    )
                 return True
-            
+
             else:
                 with self._state_lock:
                     self.entanglement_state.established = False
-                
-                # Always log failures — these are actionable
-                logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | F={local_fidelity:.4f} | sig={signature_verified}")
+                # NO logger call here — _sync_worker owns rate-limited failure reporting
                 return False
-        
+
         except Exception as e:
-            logger.error(f"[W-STATE] ❌ Entanglement verification failed: {e}")
+            logger.error(f"[W-STATE] ❌ verify_entanglement error: {e}")
             return False
     
     def rotate_entanglement_state(self)->None:
@@ -3164,70 +3152,135 @@ class P2PClientWStateRecovery:
             return secrets.token_hex(32)
     
     def _sync_worker(self):
-        """Continuous sync worker with signature verification + adaptive backoff.
+        """
+        Continuous W-state synchronisation loop — enterprise-grade state machine.
 
-        Backoff strategy:
-          - On cached/WS hit:  sleep SYNC_INTERVAL_MS (10ms) — fast path
-          - On HTTP fetch hit: sleep 2s (don't hammer oracle)
-          - On consecutive failures: exponential backoff up to 30s
-        
-        ⚛️ LAYER 2: Calls update_pq0() after each oracle snapshot for synchronization
+        ARCHITECTURE CONTRACT:
+        ─────────────────────
+        This loop runs at ~10ms intervals when healthy.  It MUST NEVER emit the
+        same log message more than once per rate-limit window regardless of loop speed.
+
+        Oracle fidelity (recovered.w_state_fidelity) is a QUANTUM STATE PROPERTY
+        measured by the oracle's AerSimulator circuit.  It must NOT be penalised by
+        network/cache latency — a snapshot cached 8 seconds ago still describes the
+        same quantum state that was measured.  The sync_lag_ms field is retained for
+        telemetry and block header timestamps only.
+
+        STATES:
+          HEALTHY  → fidelity ≥ threshold, brief heartbeat every 120s
+          MARGINAL → fidelity ≥ relaxed threshold, mining proceeds, warn every 30s
+          DEGRADED → fidelity < relaxed threshold, warn every 30s, progressive backoff
+          FETCH_FAIL → no snapshot, exponential backoff 1→2→4→8→16→30s
+
+        LOGGING INVARIANT:
+          verify_entanglement() is called with verbose=False — it is a pure classifier.
+          ALL human-visible log messages live here, guarded by time-based gates.
         """
         logger.info("[W-STATE] 🔄 Sync worker started")
 
-        _cycle          = 0
-        _fail_streak    = 0
-        _last_http_ts   = 0.0
-        _LOG_EVERY      = 300   # log fidelity every 300 successful cycles
+        _cycle               = 0
+        _fetch_fail_streak   = 0
+        _low_fid_streak      = 0    # consecutive cycles where ent_ok == False
+        _prev_ent_ok         = True  # track state transitions
+        _last_warn_ts        = 0.0   # last time we emitted a fidelity warning
+        _last_heartbeat_ts   = 0.0   # last time we emitted a healthy heartbeat
+        _WARN_GATE_S         = 30.0  # minimum seconds between repeated fidelity warnings
+        _HEARTBEAT_GATE_S    = 120.0 # minimum seconds between healthy heartbeat logs
 
         while self.running:
             try:
                 _cycle += 1
-                _verbose = (_cycle % _LOG_EVERY == 0)
 
+                # ── 1. Acquire oracle snapshot ───────────────────────────────
                 snapshot = self.download_latest_snapshot()
                 if snapshot is None:
-                    _fail_streak += 1
-                    backoff = min(2.0 ** min(_fail_streak - 1, 5), 30.0)
-                    logger.debug(f"[W-STATE] ⏳ No snapshot (streak={_fail_streak}) — backoff {backoff:.1f}s")
+                    _fetch_fail_streak += 1
+                    backoff = min(2.0 ** min(_fetch_fail_streak - 1, 5), 30.0)
+                    # First failure + every 5th thereafter — not every cycle
+                    if _fetch_fail_streak == 1 or _fetch_fail_streak % 5 == 0:
+                        logger.warning(
+                            f"[W-STATE] ⏳ Oracle snapshot unavailable | "
+                            f"fetch_fails={_fetch_fail_streak} | backoff={backoff:.1f}s"
+                        )
                     time.sleep(backoff)
                     continue
+                _fetch_fail_streak = 0  # clear on success
 
-                _fail_streak = 0  # reset on success
-
-                recovered = self.recover_w_state(snapshot, verbose=_verbose)
+                # ── 2. Recover W-state from snapshot ─────────────────────────
+                # verbose=False: recover_w_state must NOT log — we own all logs here
+                recovered = self.recover_w_state(snapshot, verbose=False)
                 if recovered is None:
                     with self._state_lock:
                         self.entanglement_state.sync_error_count += 1
                     time.sleep(0.5)
                     continue
 
-                # ⚛️ MUSEUM-GRADE FIX: Refresh virtual pseudoqubit manager with new pq0
-                # This keeps the tripartite (pq0 ↔ vpq ↔ ivpq) in sync with oracle updates
+                # ── 3. Keep VPM pq0 in sync ──────────────────────────────────
                 if hasattr(self, 'vpm') and self.vpm is not None:
-                    pq0_updated = self.vpm.update_pq0(snapshot)
-                    if pq0_updated:
-                        # Immediately rotate vpqs to reflect new pq0
+                    if self.vpm.update_pq0(snapshot):
                         self.vpm.rotate_vpqs_on_pq0_update()
 
-                current_time_ns = time.time_ns()
-                sync_lag_ns     = current_time_ns - snapshot.get("timestamp_ns", current_time_ns)
-                sync_lag_ms     = sync_lag_ns / 1_000_000
-
+                # ── 4. Sync lag — telemetry only, NOT a fidelity penalty ──────
+                now_ns      = time.time_ns()
+                snap_ts_ns  = snapshot.get("timestamp_ns", now_ns)
+                sync_lag_ms = max(0.0, (now_ns - snap_ts_ns) / 1_000_000)
                 with self._state_lock:
                     self.entanglement_state.sync_lag_ms = sync_lag_ms
 
-                local_fidelity = recovered.w_state_fidelity * (1.0 - min(sync_lag_ms / 1000, 0.1))
-                self.verify_entanglement(local_fidelity, recovered.signature_verified, verbose=_verbose)
+                # ── 5. Classify entanglement quality ─────────────────────────
+                # Oracle fidelity = quantum state property — use it directly
+                local_fidelity = recovered.w_state_fidelity
+                ent_ok = self.verify_entanglement(
+                    local_fidelity, recovered.signature_verified, verbose=False
+                )
 
-                # If this was a live HTTP fetch (cache_age near 0), throttle next cycle
-                # to avoid hammering — the cache TTL already handles this but sleep ensures
-                # we don't spin-burn CPU polling the cache at 10ms
                 now = time.time()
-                cache_age = now - self.__class__._snap_cache_ts
+                if ent_ok:
+                    # Emit re-establishment notice on state transition only
+                    if not _prev_ent_ok and _low_fid_streak > 0:
+                        logger.info(
+                            f"[W-STATE] ✅ Entanglement re-established | "
+                            f"F={local_fidelity:.4f} | "
+                            f"after {_low_fid_streak} degraded cycles"
+                        )
+                        _last_warn_ts = 0.0   # reset so next degradation logs immediately
+                    _low_fid_streak  = 0
+                    _prev_ent_ok     = True
+                    # Healthy heartbeat — rate-limited, not per-cycle
+                    if now - _last_heartbeat_ts >= _HEARTBEAT_GATE_S:
+                        mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
+                        fid_thr, _ = WStateRecoveryManager.get_threshold_for_mode(mode)
+                        logger.info(
+                            f"[W-STATE] 💚 Healthy | F={local_fidelity:.4f} ≥ {fid_thr:.2f} [{mode}] | "
+                            f"lag={sync_lag_ms:.0f}ms | cycle={_cycle}"
+                        )
+                        _last_heartbeat_ts = now
+                else:
+                    _low_fid_streak += 1
+                    _prev_ent_ok     = False
+                    # Warn once per _WARN_GATE_S — not once per 10ms cycle
+                    if now - _last_warn_ts >= _WARN_GATE_S:
+                        mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
+                        fid_thr, _ = WStateRecoveryManager.get_threshold_for_mode(mode)
+                        logger.warning(
+                            f"[W-STATE] ⚠️  Fidelity below threshold | "
+                            f"F={local_fidelity:.4f} (need ≥{FIDELITY_THRESHOLD_RELAXED:.2f} min, "
+                            f"≥{fid_thr:.2f} for [{mode}]) | "
+                            f"sig={recovered.signature_verified} | "
+                            f"consec_low={_low_fid_streak} | "
+                            f"mining proceeds (blocks still submitted) | "
+                            f"next warning in {_WARN_GATE_S:.0f}s"
+                        )
+                        _last_warn_ts = now
+
+                # ── 6. Adaptive sleep ─────────────────────────────────────────
+                cache_age = time.time() - self.__class__._snap_cache_ts
                 if cache_age < 0.5:
-                    # Just got a fresh HTTP snapshot — back off to let cache age naturally
+                    # Fresh HTTP fetch just landed — let the cache build up before polling
                     time.sleep(2.0)
+                elif not ent_ok and _low_fid_streak > 20:
+                    # Persistently degraded — back off to save CPU / battery on mobile
+                    time.sleep(min(_low_fid_streak * 0.25, 10.0))
                 else:
                     time.sleep(SYNC_INTERVAL_MS / 1000.0)
 
@@ -4368,12 +4421,14 @@ def _bootstrap_fetch_from_peer(gossip_url: str, timeout: int = 6) -> list:
     """
     url = gossip_url.rstrip('/') + '/bootstrap/peers'
     try:
-        req = urllib.request.Request(
+        # Use requests (module-level import) — urllib.request is NOT imported at module level
+        resp = requests.get(
             url,
             headers={'User-Agent': f'QTCL-Bootstrap/1.0 fp={LATTICE_FINGERPRINT}'},
+            timeout=timeout,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
+        resp.raise_for_status()
+        data = resp.json()
         peers = data.get('peers', [])
         valid = []
         for p in peers:
@@ -4418,14 +4473,15 @@ def _bootstrap_resolve(oracle_url: str, db, known_peers: list,
                 result.append(p)
 
     # ── Step 1: Oracle ────────────────────────────────────────────────────────
+    # Use requests (module-level import) — urllib.request NOT imported at module level
     try:
-        req = urllib.request.Request(
+        resp = requests.get(
             f"{oracle_url.rstrip('/')}/api/peers/list",
             headers={'User-Agent': f'QTCL-Bootstrap/1.0 fp={LATTICE_FINGERPRINT}'},
+            timeout=timeout,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-        oracle_peers = data.get('peers', [])
+        resp.raise_for_status()
+        oracle_peers = resp.json().get('peers', [])
         _add_peers(oracle_peers)
         logger.info(f"[BOOTSTRAP] 🌐 Oracle returned {len(oracle_peers)} peer(s)")
     except Exception as e:
@@ -6418,7 +6474,13 @@ class OracleEntanglementBridge:
         endpoints = ['/api/oracle/pq0-bloch', '/api/oracle/w-state', '/api/oracle/pq0']
         
         # Parse URLs for dual-oracle setup
-        primary_url = oracle_url or 'http://localhost:8000'
+        # Never fall back to localhost — if oracle_url is empty the bridge
+        # was constructed incorrectly; fail fast with a clear error rather than
+        # silently trying localhost and burning the timeout budget.
+        if not oracle_url or not oracle_url.strip():
+            logger.error('[BRIDGE] ❌ oracle_url is empty — set ORACLE_URL env var')
+            return None
+        primary_url   = oracle_url.rstrip('/')
         secondary_url = 'https://shemshallah.pythonanywhere.com'
         
         results = {}
@@ -6844,7 +6906,11 @@ class OracleEligibilityEngine:
                 self.bridge._upsert_oracle_registry(
                     oracle_id           = oracle_id,
                     oracle_address      = self.miner_address,
-                    oracle_url          = gossip_url or f"http://localhost:{self._oracle_server.port}",
+                    # gossip_url is the authoritative public URL for this oracle.
+                    # If not yet known (e.g. P2P handshake not yet completed),
+                    # store a pending sentinel rather than a localhost URL that
+                    # would be invalid for remote peers.
+                    oracle_url          = gossip_url or 'pending:local-oracle',
                     gossip_url          = gossip_url,
                     is_primary          = 0,
                     is_local            = 1,
@@ -7664,7 +7730,7 @@ class QTCLP2PBundle:
         return self.elig._count_live_peers()
 
 class QTCLFullNode:
-    def __init__(self, miner_address: str, oracle_url: str='http://localhost:8000', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
+    def __init__(self, miner_address: str, oracle_url: str='https://qtcl-blockchain.koyeb.app', difficulty: int=12, db_connection: Optional[sqlite3.Connection]=None):
         self.miner_address=miner_address
         self.running=False
         self.db=db_connection  # Database connection for difficulty state
@@ -8850,7 +8916,9 @@ def _wallet_recover(args):
     print(f"  💾  Saved → {w.wallet_file}\n")
     sys.exit(0)
 
-def _query_transaction_status(tx_hash, node_url="http://localhost:8000"):
+def _query_transaction_status(tx_hash, node_url=None):
+    if node_url is None:
+        node_url = os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
     """
     Query and display transaction status — checks DB (confirmed+pending) and DHT.
     Bitcoin model: TX is queryable immediately after broadcast (status=pending).
@@ -9192,7 +9260,7 @@ def parse_args():
     parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
     parser.add_argument('--oracle-url','-o',
                        default='',  # Empty by default, will be auto-detected
-                       help='Oracle URL (optional, auto-detects from ORACLE_URL env, Koyeb, or localhost:8000)')
+                       help='Oracle URL. Auto-detects: ORACLE_URL env → KOYEB_APP_NAME → production default. Never probes localhost.')
     parser.add_argument('--difficulty','-d',type=int,default=DEFAULT_DIFFICULTY,help='Mining difficulty bits (default 20 ≈ 10-20s per block at ~50k h/s)')
     parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
     parser.add_argument('--wallet-init',action='store_true',help='Generate new wallet with mnemonic')
