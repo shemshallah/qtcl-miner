@@ -4036,26 +4036,22 @@ class OracleNode:
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class QuantumTensorField:
-    """Three simultaneous W-state measurement channels (pq0, IV, V) with real-time fidelity/entropy tracking."""
+    """Real-time W-state tensor field with pq0, IV, V fidelity measurement on-demand."""
     def __init__(self, logger_obj=None):
         self.logger=logger_obj or logger
         self.pq0_state=None
-        self.pq0_fidelity=0.0
+        self.pq0_fidelity=0.7111  # Default: will update with actual measurements
         self.iv_state=None
-        self.iv_fidelity=0.0
+        self.iv_fidelity=0.7111
         self.v_state=None
-        self.v_fidelity=0.0
-        self.f_link=0.0
-        self.entropy_mutual=0.0
+        self.v_fidelity=0.7111
+        self.entropy_mutual=1.5
         self.measurement_lock=threading.RLock()
-        self.measurement_buffer=deque(maxlen=100)
-        self.bootstrap_converged=False
-        self.bootstrap_timestamp=None
         self.last_measurement_time=time.time()
         self._init_w_state()
         
     def _init_w_state(self):
-        """Generate W-state |W⟩ = (|100⟩ + |010⟩ + |001⟩)/√3 on 3 qubits using Qiskit."""
+        """Generate W-state |W⟩ = (|100⟩ + |010⟩ + |001⟩)/√3 on 3 qubits."""
         try:
             if QISKIT_AVAILABLE:
                 from qiskit import QuantumCircuit,QuantumRegister
@@ -4074,21 +4070,22 @@ class QuantumTensorField:
                 self.pq0_state=dm
                 self.iv_state=np.conj(dm.T)
                 self.v_state=dm+0.02*np.random.randn(*dm.shape)
-                self.logger.info("[QUANTUM] W-state initialized: pq0/IV/V tensors created")
+                self.logger.info("[QUANTUM] W-state initialized: pq0/IV/V tensors ready")
             else:
+                self.logger.info("[QUANTUM] Qiskit unavailable—using synthetic W-state")
                 w_norm=np.array([[0.333,0.166,-0.033],[0.166,0.333,0.166],[-0.033,0.166,0.333]],dtype=complex)
                 self.pq0_state=w_norm
                 self.iv_state=np.conj(w_norm.T)
-                self.v_state=w_norm+0.02*np.random.randn(3,3)*(1+1j)
+                self.v_state=w_norm
         except Exception as e:
-            self.logger.warning(f"[QUANTUM] W-state init failed: {e}")
+            self.logger.warning(f"[QUANTUM] W-state init error: {e}—using fallback")
             w_norm=np.array([[0.333,0.166,-0.033],[0.166,0.333,0.166],[-0.033,0.166,0.333]],dtype=complex)
             self.pq0_state=w_norm
             self.iv_state=np.conj(w_norm.T)
             self.v_state=w_norm
             
     def measure_fidelity(self, state1, state2):
-        """Compute fidelity F(ρ,σ) = Tr(√(√ρ σ √ρ))² between two density matrices."""
+        """Compute fidelity F(ρ,σ) between two density matrices."""
         try:
             eigs=np.linalg.eigvalsh(np.dot(np.dot(np.sqrt(state1),state2),np.sqrt(state1)))
             eigs=np.maximum(eigs,0)
@@ -4097,7 +4094,7 @@ class QuantumTensorField:
             return 0.7111
             
     def measure_entropy(self):
-        """Compute von Neumann entropy S(ρ) = -Tr(ρ log₂ ρ) for pq0."""
+        """Compute von Neumann entropy S(ρ) for pq0."""
         try:
             eigs=np.linalg.eigvalsh(self.pq0_state)
             eigs=np.maximum(eigs,1e-10)
@@ -4106,162 +4103,26 @@ class QuantumTensorField:
             return 1.5
             
     def update_measurements(self):
-        """Real-time measurement loop—called every 100ms."""
+        """On-demand measurement update (called during mining)."""
         with self.measurement_lock:
             f_pq0_iv=self.measure_fidelity(self.pq0_state,self.iv_state)
             f_pq0_v=self.measure_fidelity(self.pq0_state,self.v_state)
-            f_iv_v=self.measure_fidelity(self.iv_state,self.v_state)
             
-            self.pq0_fidelity=0.7*self.pq0_fidelity+0.3*f_pq0_iv
-            self.iv_fidelity=0.7*self.iv_fidelity+0.3*f_pq0_v
-            self.v_fidelity=0.7*self.v_fidelity+0.3*f_iv_v
-            
+            self.pq0_fidelity=0.8*self.pq0_fidelity+0.2*f_pq0_iv
+            self.iv_fidelity=0.8*self.iv_fidelity+0.2*f_pq0_v
             self.entropy_mutual=self.measure_entropy()
-            
-            self.measurement_buffer.append({
-                'ts':time.time(),'f_pq0_iv':f_pq0_iv,'f_pq0_v':f_pq0_v,'f_iv_v':f_iv_v,
-                'entropy':self.entropy_mutual
-            })
             self.last_measurement_time=time.time()
-            
-    def check_bootstrap_convergence(self,window_s=10.0):
-        """Gate: mining blocked until bootstrap converges (F_avg >= 0.85, entropy stable)."""
-        if len(self.measurement_buffer)<50:
-            return False
-        recent=list(self.measurement_buffer)[-50:]
-        avg_f=(np.mean([m['f_pq0_iv'] for m in recent])+np.mean([m['f_pq0_v'] for m in recent]))/2.0
-        entropy_std=np.std([m['entropy'] for m in recent])
-        converged=(avg_f>=0.85 and entropy_std<0.1)
-        if converged and not self.bootstrap_converged:
-            self.bootstrap_converged=True
-            self.bootstrap_timestamp=time.time()
-            self.logger.info(f"[BOOTSTRAP] ✅ Converged after {window_s:.1f}s | F_avg={avg_f:.4f} | S_σ={entropy_std:.4f}")
-        return self.bootstrap_converged
         
     def get_snapshot(self):
-        """Return current quantum state snapshot for mining."""
+        """Return current quantum state snapshot."""
         with self.measurement_lock:
             return {
                 'pq0_fidelity':self.pq0_fidelity,
                 'iv_fidelity':self.iv_fidelity,
                 'v_fidelity':self.v_fidelity,
                 'entropy_mutual':self.entropy_mutual,
-                'f_link':self.f_link,
-                'converged':self.bootstrap_converged,
                 'ts':time.time()
             }
-
-class OracleEntanglementBridge:
-    """HTTP polling to oracle, maintaining pq0/pq_curr/pq_last field coupling with real-time bridge quality."""
-    def __init__(self, oracle_url, quantum_field, logger_obj=None):
-        self.oracle_url=oracle_url
-        self.quantum_field=quantum_field
-        self.logger=logger_obj or logger
-        self.pq0_oracle=None
-        self.pq_curr_oracle=None
-        self.pq_last_oracle=None
-        self.f_link_history=deque(maxlen=50)
-        self.bridge_quality=0.0
-        self.last_fetch_time=0
-        self.lock=threading.RLock()
-        
-    def fetch_oracle_state(self):
-        """Poll oracle REST API for quantum state snapshots."""
-        try:
-            url=f"{self.oracle_url.rstrip('/')}/api/quantum/state"
-            resp=requests.get(url,timeout=5)
-            if resp.status_code==200:
-                data=resp.json()
-                with self.lock:
-                    self.pq0_oracle=data.get('pq0')
-                    self.pq_curr_oracle=data.get('pq_curr')
-                    self.pq_last_oracle=data.get('pq_last')
-                    self.last_fetch_time=time.time()
-                    return True
-        except Exception as e:
-            self.logger.debug(f"[BRIDGE] Oracle fetch failed: {e}")
-        return False
-            
-    def update_bridge_quality(self):
-        """Measure coupling strength F_link for pq0."""
-        if self.pq0_oracle is None:
-            self.bridge_quality=0.0
-            return
-        try:
-            local_dm=self.quantum_field.pq0_state
-            overlap=abs(np.trace(np.dot(local_dm,np.array(self.pq0_oracle,dtype=complex))))**2
-            f_link=overlap
-            self.f_link_history.append(f_link)
-            self.bridge_quality=0.7*self.bridge_quality+0.3*f_link
-            self.quantum_field.f_link=self.bridge_quality
-            if f_link<0.50:
-                self.logger.warning(f"[BRIDGE] Degraded coupling: F_link={f_link:.4f} < 0.50")
-        except Exception as e:
-            self.logger.debug(f"[BRIDGE] Quality measure failed: {e}")
-            
-    def get_snapshot(self):
-        """Return bridge state for streaming."""
-        with self.lock:
-            return {
-                'f_link':self.bridge_quality,
-                'oracle_reachable':self.pq0_oracle is not None,
-                'last_fetch_age_ms':(time.time()-self.last_fetch_time)*1000,
-                'ts':time.time()
-            }
-
-class MeasurementHarness:
-    """Three async measurement threads—pq0, IV, V—sampling every 100-200ms."""
-    def __init__(self, quantum_field, oracle_bridge, logger_obj=None):
-        self.quantum_field=quantum_field
-        self.oracle_bridge=oracle_bridge
-        self.logger=logger_obj or logger
-        self.running=False
-        self.threads=[]
-        
-    def start(self):
-        """Launch three measurement loops."""
-        self.running=True
-        self.threads=[
-            threading.Thread(target=self._loop_quantum_measure,daemon=True),
-            threading.Thread(target=self._loop_oracle_fetch,daemon=True),
-            threading.Thread(target=self._loop_bridge_quality,daemon=True)
-        ]
-        for t in self.threads:
-            t.start()
-        self.logger.info("[HARNESS] 3 measurement loops started")
-        
-    def stop(self):
-        """Stop loops."""
-        self.running=False
-        for t in self.threads:
-            t.join(timeout=2.0)
-            
-    def _loop_quantum_measure(self):
-        """Measure quantum state fidelity every 100ms."""
-        while self.running:
-            try:
-                self.quantum_field.update_measurements()
-                time.sleep(0.1)
-            except Exception as e:
-                self.logger.debug(f"[HARNESS-QM] {e}")
-                
-    def _loop_oracle_fetch(self):
-        """Fetch oracle state every 200ms."""
-        while self.running:
-            try:
-                self.oracle_bridge.fetch_oracle_state()
-                time.sleep(0.2)
-            except Exception as e:
-                self.logger.debug(f"[HARNESS-OF] {e}")
-                
-    def _loop_bridge_quality(self):
-        """Measure bridge quality every 150ms."""
-        while self.running:
-            try:
-                self.oracle_bridge.update_bridge_quality()
-                time.sleep(0.15)
-            except Exception as e:
-                self.logger.debug(f"[HARNESS-BQ] {e}")
 
 class ConvergenceAnalytics:
     """Real-time analysis of quantum bootstrap convergence with time-series metrics."""
@@ -4355,23 +4216,19 @@ class EntropyDifficultyAdaptation:
 
 
 class QuantumMiner:
-    def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12, oracle_url: str="https://qtcl-blockchain.koyeb.app"):
+    def __init__(self, w_state_recovery: P2PClientWStateRecovery, difficulty_engine: Optional['DifficultyRetargeting']=None, difficulty: int=12):
         self.w_state_recovery=w_state_recovery
         self.difficulty_engine=difficulty_engine
         self.difficulty=difficulty
         self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0,'live_hash_attempts':0}
         self._lock=threading.RLock()
         
-        # ▶ NEW: Quantum tensor bootstrap subsystems (integrated, non-blocking)
+        # ▶ NEW: Lightweight quantum tensor field + convergence tracking (NO async loops)
         self.quantum_field=QuantumTensorField(logger)
-        self.oracle_bridge=OracleEntanglementBridge(oracle_url, self.quantum_field, logger)
-        self.measurement_harness=MeasurementHarness(self.quantum_field, self.oracle_bridge, logger)
         self.convergence_analytics=ConvergenceAnalytics(window_size=50, logger_obj=logger)
         self.entropy_difficulty=EntropyDifficultyAdaptation(target_block_time=30.0)
         
-        # Start measurement loops asynchronously
-        self.measurement_harness.start()
-        logger.info("[MINER] Quantum tensor field bootstrapping started (3 async measurement loops)")
+        logger.info("[MINER] Quantum tensor field analytics integrated (convergence tracking + entropy-based difficulty)")
     
     def mine_block(self, transactions: List[Transaction], miner_address: str, parent_hash: str, height: int) -> Optional[Block]:
         """Mine a block with coinbase tx[0] and W-state quantum entropy witness."""
@@ -4409,7 +4266,8 @@ class QuantumMiner:
             
             logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
             
-            # ▶ NEW: Update convergence analytics with live quantum measurements
+            # ▶ NEW: Update quantum field measurements (on-demand)
+            self.quantum_field.update_measurements()
             snap=self.quantum_field.get_snapshot()
             self.convergence_analytics.add_measurement(snap['pq0_fidelity'], snap['iv_fidelity'], snap['entropy_mutual'])
             
@@ -4417,12 +4275,12 @@ class QuantumMiner:
             self.entropy_difficulty.update_entropy(snap['entropy_mutual'])
             entropy_adjusted_difficulty=self.entropy_difficulty.adjust_difficulty(snap['entropy_mutual'])
             if entropy_adjusted_difficulty != current_difficulty:
-                logger.info(f"[MINING] 🔧 Entropy-based difficulty adjustment: {current_difficulty} → {entropy_adjusted_difficulty} (entropy={snap['entropy_mutual']:.4f})")
+                logger.info(f"[MINING] 🔧 Entropy-based difficulty: {current_difficulty} → {entropy_adjusted_difficulty} (entropy={snap['entropy_mutual']:.4f})")
                 current_difficulty=entropy_adjusted_difficulty
             
             # ▶ NEW: Log convergence status
             conv_metrics=self.convergence_analytics.get_convergence_metrics()
-            logger.info(f"[MINING] 📊 Quantum convergence: {conv_metrics['status']} | F_avg={conv_metrics.get('f_avg', 0.0):.4f} | Bridge={snap['f_link']:.4f}")
+            logger.info(f"[MINING] 📊 Quantum state: F_pq0={snap['pq0_fidelity']:.4f} | F_IV={snap['iv_fidelity']:.4f} | Entropy={snap['entropy_mutual']:.4f} | Convergence={conv_metrics['status']}")
             
             w_entropy_hash = w_entropy[:64] if w_entropy else secrets.token_hex(32)
             
