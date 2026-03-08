@@ -9119,11 +9119,9 @@ class QTCLFullNode:
                         submit_start = time.time()
                         
                         try:
-                            # ✅ ENTERPRISE FIX: pq_curr = height + 1, pq_last = height
-                            # Genesis (height=0): pq_curr=1, pq_last=0
-                            # Block 1 (height=1): pq_curr=2, pq_last=1
-                            pq_curr_int = int(block.header.height) + 1
-                            pq_last_int = int(block.header.height)
+                            # pq_curr = current block height, pq_last = height - 1
+                            pq_curr_int = max(1, int(block.header.height))
+                            pq_last_int = max(0, int(block.header.height) - 1)
                             
                             header_dict = {
                                 'height': int(block.header.height),
