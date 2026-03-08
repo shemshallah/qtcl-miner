@@ -2526,7 +2526,7 @@ class SSEBroadcaster(ComponentBase):
     def __init__(
         self,
         host: str = "0.0.0.0",
-        port: int = 8765,
+        port: int = 9091,
         path: str = "/events",
         name: str = "SSEBroadcaster",
         config: Optional[Dict] = None,
@@ -4524,10 +4524,11 @@ class QtclNode(ComponentBase):
         )
         # Snapshot
         self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
-        # SSE Broadcaster
+        # SSE Broadcaster (assign to 9091, HTTP will be 9091, so let SSE use 9092 as fallback)
+        sse_port = int(self._cfg.get("sse_port", 9092))  # Default to 9092 if HTTP is on 9091
         self.broadcaster = SSEBroadcaster(
             host=self._cfg.get("sse_host", "0.0.0.0"),
-            port=int(self._cfg.get("sse_port", 8765)),
+            port=sse_port,
         )
         # Registry
         self.registry = RegistryManager(db=self.db)
@@ -4629,7 +4630,7 @@ class QtclServer(QtclNode):
 
     def _start_http_server(self) -> None:
         handler = self._make_http_handler()
-        port = int(self._cfg.get("http_port", 8080))
+        port = int(self._cfg.get("http_port", 9091))
         host = self._cfg.get("http_host", "0.0.0.0")
 
         class ReusableServer(socketserver.TCPServer):
@@ -4769,7 +4770,7 @@ class QtclServer(QtclNode):
                             }
                         )
                 # Insert block
-                self.db.insert_block(block)
+                self.db.insert_block(block["height"], block)
                 # Confirm transactions
                 for tx in pending_txs:
                     self.db.confirm_transaction(
