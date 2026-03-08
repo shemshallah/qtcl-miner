@@ -1596,10 +1596,13 @@ class LocalBlockchainDB:
             return False
         return False
     def on_stop(self):
-        """Called on component stop"""
+        """Called on component stop - keep connection open for block production"""
         self._teardown_pool()
-        if self.conn:
-            self.conn.close()
+        # ⚠️  DO NOT CLOSE CONNECTION HERE
+        # Block production loop may still be running and needs database access
+        # Connection will close when process exits (Python cleanup)
+        # Closing here causes: sqlite3.ProgrammingError: Cannot operate on a closed database
+        pass
     
     def start(self):
         """Start database component"""
@@ -2791,6 +2794,7 @@ class RequestHandler(ComponentBase):
         self._verifier = verifier
         self._routes: Dict[str, Dict[str, Callable]] = {
             "GET": {
+                "/events":       self._handle_sse_events,  # ✅ SSE multiplexed on 9091
                 "/status":       self._handle_get_chain_status,
                 "/health":       self._handle_health_check,
                 "/snapshot":     self._handle_get_snapshot,
@@ -2955,6 +2959,22 @@ class RequestHandler(ComponentBase):
     def _handle_peer_gossip(self, body: Dict) -> HTTPResponse:
         self._broadcaster.broadcast("gossip", body)
         return HTTPResponse.ok({"status": "propagated"})
+
+    def _handle_sse_events(self, params: Dict) -> HTTPResponse:
+        """
+        Server-Sent Events (SSE) multiplexer on /events.
+        
+        Handled specially in HTTP handler with streaming (not JSON).
+        This method is a placeholder for consistency.
+        
+        Query params:
+          client_id: Optional client identifier
+          channels: Comma-separated event channels to subscribe to
+          timeout: Connection timeout in seconds (default: 300)
+        """
+        # NOTE: This method is not actually called - HTTP handler handles /events specially
+        # with streaming. This exists for route consistency.
+        return HTTPResponse(501, {"error": "/events handled by HTTP handler with streaming"})
 
     def _handle_health_check(self, params: Dict) -> HTTPResponse:
         health = self.get_health()
@@ -4524,12 +4544,9 @@ class QtclNode(ComponentBase):
         )
         # Snapshot
         self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
-        # SSE Broadcaster (assign to 9091, HTTP will be 9091, so let SSE use 9092 as fallback)
-        sse_port = int(self._cfg.get("sse_port", 9092))  # Default to 9092 if HTTP is on 9091
-        self.broadcaster = SSEBroadcaster(
-            host=self._cfg.get("sse_host", "0.0.0.0"),
-            port=sse_port,
-        )
+        # ✅ SSE MULTIPLEXED ON PORT 9091 via /events route
+        # No separate SSEBroadcaster needed - RequestHandler.dispatch() routes to _SSE_MUX
+        self.broadcaster = None  # Not used - SSE on shared HTTP port
         # Registry
         self.registry = RegistryManager(db=self.db)
         # Verifier
@@ -4684,6 +4701,47 @@ class QtclServer(QtclNode):
 
             def do_GET(self):
                 path, params, _ = self._parse_request()
+                
+                # ✅ SPECIAL HANDLING: /events returns Server-Sent Events stream (long-lived)
+                if path == "/events":
+                    # SSE requires special headers and streaming, not JSON response
+                    cid = params.get("client_id", f"http_{id(self)}")  # Client ID for subscription
+                    channels = params.get("channels", "*").split(",")  # e.g., "metrics,quantum,*"
+                    
+                    # Subscribe to multiplexer
+                    from qtcl_client import _SSE_MUX  # Import global multiplexer
+                    stop_event = _SSE_MUX.subscribe(cid, channels=channels)
+                    
+                    try:
+                        # Send SSE headers
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "keep-alive")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        
+                        # Stream events until client disconnects or timeout
+                        timeout = float(params.get("timeout", "300"))  # 5 minutes default
+                        deadline = _time.time() + timeout
+                        
+                        while not stop_event.is_set() and _time.time() < deadline:
+                            frame = _SSE_MUX.drain(cid, block_s=5.0)
+                            if frame:
+                                try:
+                                    self.wfile.write(frame.encode("utf-8"))
+                                    self.wfile.flush()
+                                except Exception as e:
+                                    break  # Client disconnected
+                            else:
+                                # Keep-alive: send comment
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                    finally:
+                        _SSE_MUX.unsubscribe(cid)
+                    return
+                
+                # Standard JSON response for other routes
                 resp = req_handler.handle_GET(path, params)
                 self._send_response(resp)
 
@@ -4783,13 +4841,25 @@ class QtclServer(QtclNode):
                     token_ledger.apply_block_rewards(
                         block, "server", QtclConstants.BLOCK_REWARD
                     )
-                # Broadcast
-                self.broadcaster.broadcast_block(block)
+                # Broadcast via SSE multiplexer on port 9091
+                if self.broadcaster:  # Fallback if broadcaster exists
+                    self.broadcaster.broadcast_block(block)
+                else:  # Publish to SSE multiplexer
+                    _SSE_MUX.publish("block", {
+                        "hash": block.get("hash"),
+                        "height": height,
+                        "miner": block.get("miner_id"),
+                        "ts": block.get("timestamp"),
+                    }, channel="blocks")
+                
                 # Snapshot every N blocks
                 if height > 0 and height % snap_interval == 0:
                     try:
                         snap = self.snapshot_mgr.create_snapshot(height)
-                        self.broadcaster.broadcast_snapshot(snap)
+                        if self.broadcaster:  # Fallback
+                            self.broadcaster.broadcast_snapshot(snap)
+                        else:  # Publish to SSE multiplexer
+                            _SSE_MUX.publish("snapshot", snap, channel="snapshots")
                         self.log.info(f"[{self.name}] snapshot broadcast at height {height}")
                     except Exception as exc:
                         self.log.warning(f"[{self.name}] snapshot failed: {exc}")
@@ -4797,6 +4867,13 @@ class QtclServer(QtclNode):
                     f"[{self.name}] block {height} mined "
                     f"hash={block_hash[:12]}… nonce={nonce} txs={len(pending_txs)}"
                 )
+            except sqlite3.ProgrammingError as exc:
+                # Database was closed (e.g., from Ctrl+C), stop gracefully
+                if "closed database" in str(exc).lower():
+                    self.log.warning(f"[{self.name}] database closed, stopping block production")
+                    break
+                else:
+                    self.log.error(f"[{self.name}] block production database error: {exc}")
             except Exception as exc:
                 self.log.error(f"[{self.name}] block production error: {exc}\n{traceback.format_exc()}")
 
@@ -9837,17 +9914,19 @@ class QtclClientApp:
     # ── Entry ─────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Welcome screen + mode dispatch.  ❤️  I love you"""
-        bh = self.api.get_block_height()
-        bh_str = str(bh) if bh else "?"
+        """Welcome screen + mode dispatch.  ❤️  I love you
+        
+        ✅ DISPLAYS MENU IMMEDIATELY (lazy loads oracle data)
+        """
+        # SHOW MENU IMMEDIATELY (don't wait for oracle)
         print()
         print("╔══════════════════════════════════════════════════════════════╗")
         print("║                                                              ║")
         print("║          ⚛️   Welcome to QTCL Client  ⚛️                      ║")
         print("║                                                              ║")
         print("║  W-State : |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)               ║")
-        print(f"║  Oracle  : {self.oracle_url.replace('https://',''):<49} ║")
-        print(f"║  Height  : {bh_str:<49} ║")
+        print("║  Oracle  : Loading...                                       ║")
+        print("║  Height  : ?                                                ║")
         print("║  Port    : 9091  (GossipListener — all API routes)          ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
@@ -9864,10 +9943,20 @@ class QtclClientApp:
         print("  │          Balance · BIP-39 recover · BIP-32/38 create     │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
+        
         try:
             choice = input("  Enter choice [1/2/3]: ").strip()
         except (EOFError, KeyboardInterrupt):
             choice = "1"
+        
+        # NOW fetch oracle data (lazy loading in background)
+        try:
+            bh = self.api.get_block_height()
+            bh_str = str(bh) if bh else "?"
+        except Exception:
+            bh_str = "?"
+        
+        # Dispatch to selected mode
         if   choice == "2": self.run_transact_mode()
         elif choice == "3": self.run_wallet_mode()
         else:               self.run_mine_mode()
