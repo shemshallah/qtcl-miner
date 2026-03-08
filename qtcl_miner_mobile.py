@@ -4264,6 +4264,12 @@ class QuantumMiner:
             pq_curr_id = entanglement.get('pq_curr', '')
             pq_last_id = entanglement.get('pq_last', '')
             
+            # ▶ FIX: Ensure pq_curr/pq_last are set to block heights (height, height-1)
+            # This fixes the bug where they show as hash values instead of 140/139
+            if not pq_curr_id or not str(pq_curr_id).isdigit():
+                pq_curr_id = str(height)
+                pq_last_id = str(max(0, height - 1))
+            
             logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
             
             # ▶ NEW: Update quantum field measurements (on-demand)
@@ -6755,11 +6761,15 @@ class OracleEntanglementBridge:
 
         oracle_id = self._oracle_id_from_url(self.main_oracle_url)
         fidelity  = float(snap.get('fidelity', 0.0))
-
-        # Always refresh pq0 from oracle — keeps fidelity live, not frozen at boot
-        self.vpm.initialize_pq0(snap)
-
-        f_link = fidelity * self.vpm._fidelity
+        
+        # ▶ FIX: Always refresh pq0 from oracle FIRST — keeps fidelity live
+        if self.vpm.update_pq0(snap):
+            logger.debug("[BRIDGE] Main oracle pq0 updated with fresh snapshot")
+        
+        # ▶ FIX: Use current VPQ fidelity (just updated), not snapshot's stale value
+        # This ensures F_link reflects the REAL quantum state, not a static default
+        current_vpm_fidelity = self.vpm._fidelity  # Just updated above
+        f_link = fidelity * current_vpm_fidelity
         status = ('active' if f_link >= 0.70 else
                   'degraded' if f_link >= 0.50 else 'lost')
 
