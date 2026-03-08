@@ -8642,13 +8642,19 @@ class TensorFieldMetrics:
 
     def bell_summary(self) -> str:
         """Human-readable Bell summary with all 4 params per pair."""
+        # FIX-5: explicit int() cast guards against stale None defaults;
+        # violation flag (✗/·) makes non-zero violations instantly visible.
+        vAB = int(self.bell_violations_AB or 0)
+        vBC = int(self.bell_violations_BC or 0)
+        fAB = "✗" if vAB else "·"
+        fBC = "✗" if vBC else "·"
         return (
             f"  A-B │ S1={self.bell_S1_AB:+.4f}  S2={self.bell_S2_AB:+.4f}  "
             f"S3={self.bell_S3_AB:+.4f}  S4={self.bell_S4_AB:+.4f}  "
-            f"max={self.bell_chsh_AB:.4f}  viol={self.bell_violations_AB}\n"
+            f"max={self.bell_chsh_AB:.4f}  viol={vAB} {fAB}\n"
             f"  B-C │ S1={self.bell_S1_BC:+.4f}  S2={self.bell_S2_BC:+.4f}  "
             f"S3={self.bell_S3_BC:+.4f}  S4={self.bell_S4_BC:+.4f}  "
-            f"max={self.bell_chsh_BC:.4f}  viol={self.bell_violations_BC}"
+            f"max={self.bell_chsh_BC:.4f}  viol={vBC} {fBC}"
         )
 
     @classmethod
@@ -8792,11 +8798,23 @@ class KoyebOracleState:
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
+        # FIX-1/2: chain-tip fallback — oracle snapshots sometimes return height=0
+        if bh == 0:
+            try:
+                _fb = self._api.get_block_height()
+                if _fb and int(_fb) > 0:
+                    bh = int(_fb)
+            except Exception:
+                pass
 
         self.pq0_fidelity     = float(fid)
         self.w_state_fidelity = float(fid)
         self.oracle_entropy   = float(ent)
-        self.oracle_coherence = float(coh)
+        # FIX-4: oracle reports raw L1 coherence for 8-dim (3-qubit) DM.
+        # L1 coherence is bounded by (d-1)=7 for d=8; normalize to [0,1]
+        # so display is consistent with client-side coherence_l1 (~0.01-0.1).
+        _coh_raw = float(coh)
+        self.oracle_coherence = float(_coh_raw / 7.0) if _coh_raw > 1.0 else _coh_raw
         self.block_height     = bh
         self.bath_params      = GKSLBathParams.from_snap(snap)
         self.pq_curr_id       = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
@@ -9384,7 +9402,7 @@ class QtclClientApp:
     ❤️  I love you  ❤️
     """
     METRIC_INTERVAL:      float = 10.0
-    KOYEB_SYNC_INTERVAL:  float = 30.0
+    KOYEB_SYNC_INTERVAL:  float = 10.0   # FIX-3: was 30s; match METRIC_INTERVAL
     DB_METRIC_LIMIT:      int   = 10_000
     DB_GOSSIP_LIMIT:      int   = 5_000
 
@@ -9647,6 +9665,15 @@ class QtclClientApp:
         snap  = self.api.get_oracle_pq0_bloch() or {}
         bath  = GKSLBathParams.from_snap(snap)
         bh    = int(snap.get("block_height") or snap.get("height") or 0)
+        # FIX-1/2: oracle pq0-bloch may omit block_height — fall back to
+        # chain-tip endpoint so pq_curr/pq_last are never stuck at "?"
+        if bh == 0:
+            try:
+                _fb = self.api.get_block_height()
+                if _fb and int(_fb) > 0:
+                    bh = int(_fb)
+            except Exception:
+                pass
         # FIX-9: pq identifiers are block heights
         pq_curr_id = str(bh)     if bh > 0 else "?"
         pq_last_id = str(bh - 1) if bh > 0 else "?"
@@ -9711,7 +9738,7 @@ class QtclClientApp:
         print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
         print(f"  📡 SSE clients  : {_SSE_MUX.client_count()}")
         print(f"  🗄️  DB           : {self._db_path}")
-        print(f"\n  ⛏️  Mining loop started (Ctrl+C to stop)\n")
+        print(f"\n  ⛏️  Mining active — menu below (no Ctrl+C needed)\n")
 
         oracle_client = get_oracle_client(self._peer_id)  # type: ignore[name-defined]
         dht_bus       = get_dht_bus(self._peer_id)        # type: ignore[name-defined]
@@ -9720,13 +9747,52 @@ class QtclClientApp:
         async def _mine():
             await miner.start_mining(self.wallet.address)
 
+        # FIX-6: run async mining in a daemon thread so the main thread is FREE
+        # for the interactive menu. _asyncio.run() was blocking startup before.
+        _mine_thread = _threading.Thread(
+            target=lambda: _asyncio.run(_mine()),
+            daemon=True, name="MineAsync"
+        )
+        _mine_thread.start()
+
+        # ── Interactive mining menu (foreground) ──────────────────────────────
+        def _show_mine_status():
+            ks2 = self.koyeb_state
+            m2  = self.client_field.metrics
+            bh2 = ks2.block_height
+            print("\n" + "─" * 72)
+            print("  ⛏️  MINING STATUS")
+            print(f"    block_height : {bh2}   pq: {ks2.pq_curr_id} → {ks2.pq_last_id}")
+            print(f"    Oracle fid   : {ks2.pq0_fidelity:.4f}   "
+                  f"coherence: {ks2.oracle_coherence:.4f}   "
+                  f"latency: {ks2.channel_latency_ms:.0f}ms")
+            if m2:
+                print(f"    Fid→|W3⟩    : {m2.fidelity_to_w3:.4f}   "
+                      f"VN entropy: {m2.entropy_vn:.4f}   "
+                      f"purity: {m2.purity:.4f}")
+            print(f"    Thread alive : {_mine_thread.is_alive()}")
+            print("─" * 72)
+
         try:
-            _asyncio.run(_mine())
+            while not self._stop.is_set() and _mine_thread.is_alive():
+                print("\n" + "━" * 52)
+                print("  ⛏️   MINING MENU")
+                print("━" * 52)
+                print("  1.) 📊  Refresh status")
+                print("  2.) 🛑  Stop mining & return to main menu")
+                try:
+                    ch = input("  Choice [1-2, Enter=status]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if ch == "2" or ch.lower() in ("q", "stop", "quit"):
+                    break
+                _show_mine_status()
         except KeyboardInterrupt:
-            miner.stop_mining()
-            print("\n  🛑 Mining stopped  ❤️")
+            pass
         finally:
+            miner.stop_mining()
             self._stop.set()
+            print("\n  🛑 Mining stopped  ❤️")
 
     # ── Transact mode ─────────────────────────────────────────────────────────
 
