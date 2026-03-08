@@ -6785,8 +6785,9 @@ class VirtualPseudoqubitManager:
         pq0 is the anchor — all virtual and inverse-virtual pqs derive from it.
         """
         try:
-            fidelity  = _sf(oracle_snapshot.get('fidelity'),  0.9)
-            coherence = _sf(oracle_snapshot.get('coherence'), 0.85)
+            # ✅ CLAMP to [0,1] - oracle may return unbounded coherence
+            fidelity  = max(0.0, min(1.0, _sf(oracle_snapshot.get('fidelity'),  0.9)))
+            coherence = max(0.0, min(1.0, _sf(oracle_snapshot.get('coherence'), 0.85)))
 
             # ── Use actual lattice GKSL DM if present (ground truth from noise bath) ──
             pq0_dm = _extract_gksl_dm(oracle_snapshot)
