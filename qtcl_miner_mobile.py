@@ -1759,6 +1759,113 @@ SCHEMA_PATCHES = {
     """,
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# SCHEMA PATCH ENGINE — single source of truth for all SQLite schema migrations
+# Covers: core tables, HLWE extensions, gossip, P2P service log, DHT, oracle,
+#         virtual pseudoqubit state, entanglement registry, eligibility, topology.
+# Called by: main() at startup, _init_gossip_db(), _apply_dht_schema(), QTCLP2PBundle.
+# Signature: apply_schema_patches(conn=None)
+#   conn=None  → uses module-level _DB_CONN (schema-builder connection to data/qtcl_blockchain.db)
+#   conn=<db>  → uses the caller-supplied SQLite connection (e.g. the main() `db` handle)
+# Idempotent: CREATE IF NOT EXISTS + ALTER IF NOT EXISTS guards on every statement.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+def apply_schema_patches(conn: Optional['sqlite3.Connection'] = None) -> None:
+    """
+    Apply all SCHEMA_PATCHES to the local SQLite database.
+
+    Resilient execution model:
+      • Each patch is split on ';' and every statement executed individually.
+      • sqlite3.OperationalError from 'duplicate column' / 'already exists' is silently
+        swallowed (idempotent re-runs on an already-migrated DB).
+      • All other errors are logged at DEBUG level — never fatal, never block startup.
+      • p2p_peers table is also ensured here (owned by init_peer_db_table but must
+        exist before QTCLP2PBundle runs and before gossip fan-out begins).
+      • Loopback peer entries (127.0.0.1, localhost) are purged on every call to
+        prevent connection-refused spam from this node's own gossip URL leaking
+        into the peer tables.
+
+    Threading: acquires a fresh RLock per call — safe to call from any thread.
+    """
+    # Resolve target connection: prefer explicit arg, then main() `db`, then _DB_CONN
+    _fallback: Optional['sqlite3.Connection'] = None
+    try:
+        _fallback = globals().get('db') or _DB_CONN
+    except Exception:
+        _fallback = _DB_CONN
+
+    target = conn or _fallback
+    if target is None:
+        logger.warning("[SCHEMA] ⚠️  apply_schema_patches called with no available connection — skipping")
+        return
+
+    _lock = threading.RLock()
+    with _lock:
+        # ── 1. Ensure p2p_peers exists (not in SCHEMA_PATCHES dict) ──────────
+        _P2P_PEERS_SQL = """
+            CREATE TABLE IF NOT EXISTS p2p_peers (
+                peer_id       TEXT PRIMARY KEY,
+                miner_id      TEXT NOT NULL,
+                ips           TEXT NOT NULL,
+                port          INTEGER DEFAULT 9091,
+                last_seen     REAL,
+                is_oracle     BOOLEAN DEFAULT 1,
+                fidelity      REAL DEFAULT 0.0,
+                created_at    REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON p2p_peers(last_seen);
+        """
+        for _stmt in _P2P_PEERS_SQL.strip().split(';'):
+            _s = _stmt.strip()
+            if _s:
+                try:
+                    target.execute(_s)
+                except sqlite3.OperationalError as _e:
+                    if 'already exists' not in str(_e).lower():
+                        logger.debug(f"[SCHEMA] p2p_peers note: {_e}")
+        try:
+            target.commit()
+        except Exception:
+            pass
+
+        # ── 2. Apply every named patch in SCHEMA_PATCHES ─────────────────────
+        for patch_name, patch_sql in SCHEMA_PATCHES.items():
+            try:
+                for stmt in patch_sql.strip().split(';'):
+                    s = stmt.strip()
+                    if s and not s.startswith('--'):
+                        try:
+                            target.execute(s)
+                        except sqlite3.OperationalError as _e:
+                            _em = str(_e).lower()
+                            if 'duplicate column' not in _em and 'already exists' not in _em:
+                                logger.debug(f"[SCHEMA] stmt warn [{patch_name}]: {_e}")
+                target.commit()
+                logger.debug(f"[SCHEMA] ✅ patch applied: {patch_name}")
+            except Exception as _ex:
+                logger.debug(f"[SCHEMA] ℹ️  patch note [{patch_name}]: {_ex}")
+
+        # ── 3. Purge loopback / stale self-referential peer rows ──────────────
+        # This node's gossip listener URL (127.0.0.1 / localhost) sometimes leaks
+        # into gossip_peers and dht_peers during bootstrap.  Purge every startup.
+        for _tbl, _col in [('gossip_peers', 'gossip_url'),
+                            ('dht_peers',    'peer_address'),
+                            ('p2p_peers',    'ips')]:
+            try:
+                target.execute(
+                    f"DELETE FROM {_tbl} WHERE {_col} LIKE '%127.0.0.1%' "
+                    f"OR {_col} LIKE '%localhost%'"
+                )
+            except Exception:
+                pass
+        try:
+            target.commit()
+            logger.debug("[SCHEMA] ✅ Loopback peer entries purged")
+        except Exception:
+            pass
+
+    logger.debug(f"[SCHEMA] ✅ apply_schema_patches complete ({len(SCHEMA_PATCHES)} patches + p2p_peers + loopback purge)")
+
+
 def detect_oracle_url() -> str:
     """
     ⚛️ SMART ORACLE URL DETECTION
@@ -1813,50 +1920,7 @@ def detect_oracle_url() -> str:
     logger.info(f"[ORACLE] 🔍 Using default production URL: {url}")
     logger.warning("[ORACLE] ⚠️  If this is wrong, set ORACLE_URL environment variable")
     return url
-    """
-    Apply all schema patches to the local database.
-    Called at startup (main) and can also be called with an explicit connection.
-    Idempotent — safe to call multiple times.
-    Also purges stale loopback entries from peer tables on every call.
-    """
-    target = conn or _DB_CONN
-    if target is None:
-        return
-    with threading.RLock():
-        for patch_name, patch_sql in SCHEMA_PATCHES.items():
-            try:
-                for stmt in patch_sql.strip().split(';'):
-                    s = stmt.strip()
-                    if s and not s.startswith('--'):
-                        try:
-                            target.execute(s)
-                        except sqlite3.OperationalError as _e:
-                            if 'duplicate column' not in str(_e).lower() and \
-                               'already exists' not in str(_e).lower():
-                                logger.debug(f"[SCHEMA] stmt warn ({patch_name}): {_e}")
-                target.commit()
-                logger.debug(f"[SCHEMA] ✅ Applied patch: {patch_name}")
-            except Exception as e:
-                logger.debug(f"[SCHEMA] ℹ️  Patch note ({patch_name}): {e}")
 
-        # ── Purge loopback / stale peer entries ───────────────────────────────
-        # 127.0.0.1 and localhost entries in gossip_peers/dht_peers are this
-        # node's own gossip listener URL leaking into peer tables.  They cause
-        # connection-refused spam on gossip fan-out.  Purge them every startup.
-        for tbl, col in [('gossip_peers', 'gossip_url'),
-                          ('dht_peers',    'peer_address')]:
-            try:
-                target.execute(
-                    f"DELETE FROM {tbl} WHERE {col} LIKE '%127.0.0.1%' "
-                    f"OR {col} LIKE '%localhost%'"
-                )
-            except Exception:
-                pass
-        try:
-            target.commit()
-            logger.debug("[SCHEMA] ✅ Loopback peer entries purged")
-        except Exception:
-            pass
 
 class ConsensusManager:
     """Manages consensus on system metrics across peer network."""
