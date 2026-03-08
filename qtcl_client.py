@@ -1486,6 +1486,17 @@ class LocalBlockchainDB:
         if self.conn:
             self.conn.close()
     
+    def start(self):
+        """Start database component"""
+        self.on_start()
+        logging.debug(f"LocalBlockchainDB.start() called")
+    
+    def stop(self):
+        """Stop database component"""
+        self.on_stop()
+        logging.debug(f"LocalBlockchainDB.stop() called")
+    
+
     def close(self):
         """Close database"""
         if self.conn:
