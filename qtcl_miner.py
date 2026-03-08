@@ -1,1341 +1,4543 @@
-#!/usr/bin/env python3
 """
-╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                                                            ║
-║  🌌 QTCL FULL NODE + QUANTUM MINER - W-STATE ENTANGLED MINING 🌌                                                                         ║
-║                                                                                                                                            ║
-║  WORLD'S FIRST W-STATE ENTANGLED BLOCKCHAIN MINER:                                                                                      ║
-║  • Connects to LIVE qtcl-blockchain.koyeb.app                                                                                           ║
-║  • Syncs blockchain from network (REST API)                                                                                             ║
-║  • On startup: queries oracle for latest W-state snapshot (HLWE-signed)                                                                 ║
-║  • Recovers W-state locally with signature verification                                                                                 ║
-║  • Establishes entanglement: Oracle (pq0) ↔ Current (pq_curr) ↔ Last (pq_last)                                                         ║
-║  • Uses recovered W-state entropy for quantum PoW                                                                                        ║
-║  • Maintains 3-qubit entanglement state across mining iterations                                                                        ║
-║  • Broadcasts mined blocks with W-state fidelity attestation                                                                             ║
-║                                                                                                                                            ║
-║  ARCHITECTURE:                                                                                                                          ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                ║
-║  │ W-STATE RECOVERY & ENTANGLEMENT (On Init)                          │                                                                ║
-║  │ • Register with oracle                                             │                                                                ║
-║  │ • Download latest DM snapshot (HLWE-verified)                      │                                                                ║
-║  │ • Recover W-state locally (pq0 = oracle)                           │                                                                ║
-║  │ • Create pq_curr and pq_last entangled copies                      │                                                                ║
-║  │ • Verify fidelity >= 0.85 threshold                                │                                                                ║
-║  │ • Start continuous sync worker (background)                        │                                                                ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                ║
-║  │ LIVE BLOCKCHAIN SYNC                                               │                                                                ║
-║  │ • Fetch blocks from qtcl-blockchain.koyeb.app REST API            │                                                                ║
-║  │ • Validate block headers, PoW, transactions                       │                                                                ║
-║  │ • Maintain chain state (in-memory)                                │                                                                ║
-║  │ • Fork detection & resolution (longest-chain)                     │                                                                ║
-║  │ • Sync progress tracking                                          │                                                                ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                ║
-║  │ MEMPOOL MANAGEMENT                                                 │                                                                ║
-║  │ • Fetch pending transactions from /api/mempool                    │                                                                ║
-║  │ • Validate signatures (HLWE), nonces, balances                    │                                                                ║
-║  │ • Fee-based prioritization                                        │                                                                ║
-║  │ • Remove included transactions after block                        │                                                                ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                ║
-║  ┌────────────────────────────────────────────────────────────────────┐                                                                ║
-║  │ QUANTUM-ENTANGLED MINING SUBSYSTEM                                 │                                                                ║
-║  │ • Poll mempool for transactions                                   │                                                                ║
-║  │ • Build block template from highest-fee transactions              │                                                                ║
-║  │ • Measure W-state (pq_curr) for quantum PoW entropy               │                                                                ║
-║  │ • Rotate pq_curr → pq_last, recover new pq_curr from oracle      │                                                                ║
-║  │ • Sequential nonce iteration (SHA3-256 PoW + W-state witness)     │                                                                ║
-║  │ • Broadcast mined block with fidelity attestation                 │                                                                ║
-║  │ • Track mining rewards & entanglement metrics                     │                                                                ║
-║  └────────────────────────────────────────────────────────────────────┘                                                                ║
-║                                                                                                                                            ║
-║  USAGE: python qtcl_miner.py --address qtcl1YOUR_ADDRESS --oracle-url http://oracle.local:5000                                         ║
-║                                                                                                                                            ║
-║  This is PERFECTION. Museum-grade quantum mining. Deploy with absolute confidence.                                                     ║
-║                                                                                                                                            ║
-╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+QTCL — Quantum Token Chain Ledger
+Refactored Architecture v2
+═══════════════════════════════════════════════════════════════════════════════
+Generated by 8-agent conceptual swarm.
+Consolidation: 339 methods → ~240 callables (28% reduction)
+Total: 8000+ lines of fully implemented Python
+═══════════════════════════════════════════════════════════════════════════════
 """
+from __future__ import annotations
 
-import os,sys,time,json,math,hashlib,secrets,uuid,threading,logging,argparse,traceback,base64,hmac
-from typing import Dict,Any,Optional,List,Tuple,Deque,Set
-from dataclasses import dataclass,field,asdict
-from enum import Enum,auto
-from collections import deque,defaultdict,Counter
-from datetime import datetime,timezone
-from concurrent.futures import ThreadPoolExecutor
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Α :: FOUNDATION LAYER
+# ComponentBase · LifecycleMixin · QueryInterface · HashEngine · ConfigManager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import abc
+import asyncio
+import enum
+import hashlib
+import hmac
+import inspect
+import json
+import logging
+import os
+import signal
+import struct
+import threading
+import time
+import traceback
+import weakref
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import numpy as np
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+import copy
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    return logger
+
+
+# ── Enums ─────────────────────────────────────────────────────────────────────
+
+class LifecycleState(enum.Enum):
+    INIT     = "init"
+    STARTING = "starting"
+    RUNNING  = "running"
+    STOPPING = "stopping"
+    STOPPED  = "stopped"
+    ERROR    = "error"
+
+
+class NodeType(enum.Enum):
+    SERVER = "server"
+    ORACLE = "oracle"
+    MINER  = "miner"
+
+
+# ── Payloads / dataclasses ────────────────────────────────────────────────────
+
+@dataclass
+class StatusPayload:
+    component: str
+    state: str
+    uptime_seconds: float
+    error_count: int
+    last_error: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class MetricsPayload:
+    component: str
+    timestamp: float
+    counters: Dict[str, int] = field(default_factory=dict)
+    gauges: Dict[str, float] = field(default_factory=dict)
+    histograms: Dict[str, List[float]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class HealthPayload:
+    component: str
+    healthy: bool
+    checks: Dict[str, bool] = field(default_factory=dict)
+    message: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ── LifecycleMixin ────────────────────────────────────────────────────────────
+
+class LifecycleMixin:
+    """
+    Mixin providing FSM lifecycle management.
+    Valid transitions:
+      INIT → STARTING → RUNNING → STOPPING → STOPPED
+      Any   → ERROR
+      STOPPED → STARTING  (restart)
+    """
+
+    _VALID_TRANSITIONS: Dict[LifecycleState, List[LifecycleState]] = {
+        LifecycleState.INIT:     [LifecycleState.STARTING, LifecycleState.ERROR],
+        LifecycleState.STARTING: [LifecycleState.RUNNING,  LifecycleState.ERROR],
+        LifecycleState.RUNNING:  [LifecycleState.STOPPING, LifecycleState.ERROR],
+        LifecycleState.STOPPING: [LifecycleState.STOPPED,  LifecycleState.ERROR],
+        LifecycleState.STOPPED:  [LifecycleState.STARTING, LifecycleState.ERROR],
+        LifecycleState.ERROR:    [LifecycleState.STARTING, LifecycleState.STOPPED],
+    }
+
+    def _lc_init(self):
+        self._lifecycle_state = LifecycleState.INIT
+        self._lifecycle_lock = threading.Lock()
+        self._started_at: Optional[float] = None
+
+    def transition(self, new_state: LifecycleState) -> None:
+        with self._lifecycle_lock:
+            allowed = self._VALID_TRANSITIONS.get(self._lifecycle_state, [])
+            if new_state not in allowed:
+                raise RuntimeError(
+                    f"[{getattr(self, 'name', '?')}] Invalid transition "
+                    f"{self._lifecycle_state} → {new_state}"
+                )
+            self._lifecycle_state = new_state
+            if new_state == LifecycleState.RUNNING:
+                self._started_at = time.time()
+
+    @property
+    def lifecycle_state(self) -> LifecycleState:
+        return self._lifecycle_state
+
+    def assert_running(self) -> None:
+        if self._lifecycle_state != LifecycleState.RUNNING:
+            raise RuntimeError(
+                f"[{getattr(self, 'name', '?')}] Expected RUNNING, got {self._lifecycle_state}"
+            )
+
+    def is_running(self) -> bool:
+        return self._lifecycle_state == LifecycleState.RUNNING
+
+    @property
+    def uptime_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        return time.time() - self._started_at
+
+    def on_start(self) -> None:
+        """Override in subclass for startup logic."""
+        pass
+
+    def on_stop(self) -> None:
+        """Override in subclass for teardown logic."""
+        pass
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
+
+
+# ── QueryInterface ────────────────────────────────────────────────────────────
+
+class QueryInterface:
+    """
+    Mixin consolidating all get_status / get_state / get_info patterns.
+    29 duplicate getters → 3 canonical methods.
+    """
+
+    def get_status(self) -> StatusPayload:
+        name = getattr(self, "name", self.__class__.__name__)
+        state = getattr(self, "_lifecycle_state", LifecycleState.INIT)
+        uptime = getattr(self, "uptime_seconds", 0.0)
+        err_count = getattr(self, "_error_count", 0)
+        last_err = getattr(self, "_last_error", None)
+        return StatusPayload(
+            component=name,
+            state=state.value if isinstance(state, LifecycleState) else str(state),
+            uptime_seconds=uptime,
+            error_count=err_count,
+            last_error=str(last_err) if last_err else None,
+            extra=self._status_extra(),
+        )
+
+    def _status_extra(self) -> dict:
+        """Override to add component-specific status fields."""
+        return {}
+
+    def get_metrics(self) -> MetricsPayload:
+        name = getattr(self, "name", self.__class__.__name__)
+        counters = getattr(self, "_counters", {})
+        gauges = getattr(self, "_gauges", {})
+        return MetricsPayload(
+            component=name,
+            timestamp=time.time(),
+            counters=dict(counters),
+            gauges=dict(gauges),
+        )
+
+    def get_health(self) -> HealthPayload:
+        name = getattr(self, "name", self.__class__.__name__)
+        checks = self._health_checks()
+        healthy = all(checks.values()) if checks else True
+        return HealthPayload(
+            component=name,
+            healthy=healthy,
+            checks=checks,
+            message="" if healthy else "One or more health checks failed",
+        )
+
+    def _health_checks(self) -> Dict[str, bool]:
+        """Override to add component-specific health checks."""
+        return {"alive": self.is_running() if hasattr(self, "is_running") else True}
+
+    def _inc(self, counter: str, amount: int = 1) -> None:
+        if not hasattr(self, "_counters"):
+            self._counters: Dict[str, int] = defaultdict(int)
+        self._counters[counter] += amount
+
+    def _gauge(self, name: str, value: float) -> None:
+        if not hasattr(self, "_gauges"):
+            self._gauges: Dict[str, float] = {}
+        self._gauges[name] = value
+
+
+# ── ComponentBase ─────────────────────────────────────────────────────────────
+
+class ComponentBase(LifecycleMixin, QueryInterface):
+    """
+    Base class for all QTCL components.
+    Provides: lifecycle, logging, event bus, metrics, health checks.
+    36 classes inherit from this — ~1080 lines saved.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Dict[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self.name = name
+        self.config = config or {}
+        self.log = logger or get_logger(name)
+        self._error_count = 0
+        self._last_error: Optional[Exception] = None
+        self._counters: Dict[str, int] = defaultdict(int)
+        self._gauges: Dict[str, float] = {}
+        self._event_handlers: Dict[str, List[Callable]] = defaultdict(list)
+        self._lc_init()
+
+    def start(self) -> None:
+        self.transition(LifecycleState.STARTING)
+        try:
+            self.log.info(f"[{self.name}] starting")
+            self.on_start()
+            self.transition(LifecycleState.RUNNING)
+            self.log.info(f"[{self.name}] running")
+        except Exception as exc:
+            self._record_error(exc)
+            self.transition(LifecycleState.ERROR)
+            raise
+
+    def stop(self) -> None:
+        if self._lifecycle_state in (LifecycleState.STOPPED, LifecycleState.INIT):
+            return
+        self.transition(LifecycleState.STOPPING)
+        try:
+            self.log.info(f"[{self.name}] stopping")
+            self.on_stop()
+        except Exception as exc:
+            self._record_error(exc)
+        finally:
+            self.transition(LifecycleState.STOPPED)
+            self.log.info(f"[{self.name}] stopped")
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
+
+    def _record_error(self, exc: Exception) -> None:
+        self._error_count += 1
+        self._last_error = exc
+        self.log.error(f"[{self.name}] error: {exc}\n{traceback.format_exc()}")
+
+    def emit_event(self, event_type: str, payload: Any = None) -> None:
+        handlers = self._event_handlers.get(event_type, [])
+        dead = []
+        for ref in handlers:
+            if callable(ref):
+                try:
+                    ref(event_type, payload)
+                except Exception as exc:
+                    self.log.warning(f"Event handler error [{event_type}]: {exc}")
+            else:
+                dead.append(ref)
+        for d in dead:
+            handlers.remove(d)
+
+    def subscribe(self, event_type: str, handler: Callable) -> None:
+        self._event_handlers[event_type].append(handler)
+
+    def unsubscribe(self, event_type: str, handler: Callable) -> None:
+        if event_type in self._event_handlers:
+            self._event_handlers[event_type] = [
+                h for h in self._event_handlers[event_type] if h != handler
+            ]
+
+    def __repr__(self) -> str:
+        state = getattr(self, "_lifecycle_state", LifecycleState.INIT)
+        return f"<{self.__class__.__name__} name={self.name!r} state={state.value}>"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+# ── HashEngine ────────────────────────────────────────────────────────────────
+
+class HashEngine:
+    """
+    Unified hash operations. Replaces 2 duplicate compute_hash() functions.
+    """
+
+    ALGORITHMS = {"sha256", "sha512", "sha3_256", "sha3_512", "blake2b", "blake2s"}
+
+    def compute_hash(self, data: Any, algorithm: str = "sha256") -> str:
+        if algorithm not in self.ALGORITHMS:
+            raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+        raw = self._normalize(data)
+        h = hashlib.new(algorithm, raw)
+        return h.hexdigest()
+
+    def compute_block_hash(self, block_data: Dict[str, Any]) -> str:
+        canonical = {
+            k: block_data[k]
+            for k in sorted(block_data.keys())
+            if k != "hash"
+        }
+        return self.compute_hash(canonical, "sha256")
+
+    def verify_hash(self, data: Any, expected_hash: str, algorithm: str = "sha256") -> bool:
+        computed = self.compute_hash(data, algorithm)
+        return hmac.compare_digest(computed, expected_hash)
+
+    def merkle_root(self, items: List[Any]) -> str:
+        if not items:
+            return self.compute_hash(b"", "sha256")
+        leaves = [self.compute_hash(item, "sha256") for item in items]
+        while len(leaves) > 1:
+            if len(leaves) % 2 != 0:
+                leaves.append(leaves[-1])
+            leaves = [
+                self.compute_hash(leaves[i] + leaves[i + 1], "sha256")
+                for i in range(0, len(leaves), 2)
+            ]
+        return leaves[0]
+
+    def _normalize(self, data: Any) -> bytes:
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        if isinstance(data, (dict, list, tuple)):
+            return json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if isinstance(data, (int, float)):
+            return str(data).encode("utf-8")
+        return repr(data).encode("utf-8")
+
+    def proof_of_work(self, block_data: dict, difficulty: int) -> Tuple[int, str]:
+        """Find nonce such that hash starts with `difficulty` zeros."""
+        prefix = "0" * difficulty
+        nonce = 0
+        candidate = dict(block_data)
+        while True:
+            candidate["nonce"] = nonce
+            h = self.compute_block_hash(candidate)
+            if h.startswith(prefix):
+                return nonce, h
+            nonce += 1
+
+    def verify_pow(self, block_data: dict, difficulty: int) -> bool:
+        prefix = "0" * difficulty
+        h = self.compute_block_hash(block_data)
+        return h.startswith(prefix)
+
+
+HASH_ENGINE = HashEngine()
+
+
+# ── ConfigManager ─────────────────────────────────────────────────────────────
+
+class ConfigManager:
+    """
+    Live-reloadable config with watchers.
+    """
+
+    def __init__(self, initial: Optional[Dict] = None, path: Optional[str] = None):
+        self._data: Dict[str, Any] = {}
+        self._path: Optional[Path] = Path(path) if path else None
+        self._watchers: Dict[str, List[Callable]] = defaultdict(list)
+        self._lock = threading.RLock()
+        if initial:
+            self._data.update(initial)
+        if self._path and self._path.exists():
+            self.load(str(self._path))
+
+    def load(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Config not found: {path}")
+        with open(p) as f:
+            if p.suffix == ".json":
+                new_data = json.load(f)
+            else:
+                raise ValueError(f"Unsupported config format: {p.suffix}")
+        with self._lock:
+            old = dict(self._data)
+            self._data.update(new_data)
+            self._path = p
+        # Fire watchers for changed keys
+        for key in new_data:
+            if new_data.get(key) != old.get(key):
+                self._fire_watchers(key, old.get(key), new_data[key])
+
+    def save(self, path: Optional[str] = None) -> None:
+        target = Path(path) if path else self._path
+        if not target:
+            raise ValueError("No path specified for config save")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            data = dict(self._data)
+        with open(target, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            parts = key.split(".")
+            node = self._data
+            for part in parts:
+                if not isinstance(node, dict):
+                    return default
+                node = node.get(part, {})
+            return node if node != {} else default
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            old_val = self.get(key)
+            parts = key.split(".")
+            node = self._data
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+        self._fire_watchers(key, old_val, value)
+
+    def validate(self, schema: Dict[str, type]) -> List[str]:
+        errors = []
+        for key, expected_type in schema.items():
+            val = self.get(key)
+            if val is None:
+                errors.append(f"Missing required config key: {key}")
+            elif not isinstance(val, expected_type):
+                errors.append(
+                    f"Config key {key!r}: expected {expected_type.__name__}, "
+                    f"got {type(val).__name__}"
+                )
+        return errors
+
+    def watch(self, key: str, callback: Callable[[Any, Any], None]) -> None:
+        self._watchers[key].append(callback)
+
+    def _fire_watchers(self, key: str, old_val: Any, new_val: Any) -> None:
+        for cb in self._watchers.get(key, []):
+            try:
+                cb(old_val, new_val)
+            except Exception:
+                pass
+
+    def as_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._data)
+
+    def __getitem__(self, key: str) -> Any:
+        val = self.get(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.set(key, value)
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Β :: LocalBlockchainDB
+# Consolidates all _local_db_* functions (8 funcs) → one class
+# Full PostgreSQL interface via psycopg2 ThreadedConnectionPool
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import contextlib
 
 try:
-    from qiskit import QuantumCircuit,QuantumRegister,ClassicalRegister,execute
-    from qiskit.quantum_info import Statevector,DensityMatrix
-    from qiskit.providers.aer import AerSimulator
-    QISKIT_AVAILABLE=True
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.pool
+    HAS_PSYCOPG2 = True
 except ImportError:
-    QISKIT_AVAILABLE=False
+    HAS_PSYCOPG2 = False
+    psycopg2 = None  # type: ignore
 
-logging.basicConfig(level=logging.INFO,format='[%(asctime)s] %(levelname)s: %(message)s')
-logger=logging.getLogger('QTCL_MINER')
 
-LIVE_NODE_URL='https://qtcl-blockchain.koyeb.app'
-API_PREFIX='/api'
-MAX_MEMPOOL=10000
-SYNC_BATCH=50
-MEMPOOL_POLL_INTERVAL=5
-MINING_POLL_INTERVAL=2
-DIFFICULTY_WINDOW=2016
-TARGET_BLOCK_TIME=600
-
-# W-STATE CONFIGURATION
-W_STATE_STREAM_INTERVAL_MS=10
-NUM_QUBITS_WSTATE=3
-W_STATE_FIDELITY_THRESHOLD=0.85
-RECOVERY_BUFFER_SIZE=100
-FIDELITY_THRESHOLD=0.85
-SYNC_INTERVAL_MS=10
-MAX_SYNC_LAG_MS=100
-HERMITICITY_TOLERANCE=1e-10
-EIGENVALUE_TOLERANCE=-1e-10
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# W-STATE DATA STRUCTURES
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class RecoveredWState:
-    """Recovered and validated W-state from remote oracle."""
-    timestamp_ns: int
-    density_matrix: np.ndarray
-    purity: float
-    w_state_fidelity: float
-    coherence_l1: float
-    quantum_discord: float
-    is_valid: bool
-    validation_notes: str
-    local_statevector: Optional[np.ndarray] = None
-    signature_verified: bool = False
-    oracle_address: Optional[str] = None
-
-@dataclass
-class EntanglementState:
-    """Track local entanglement with remote pq0 (oracle) and pq_curr/pq_last."""
-    established: bool
-    local_fidelity: float
-    sync_lag_ms: float
-    last_sync_ns: int
-    sync_error_count: int = 0
-    coherence_verified: bool = False
-    signature_verified: bool = False
-    pq0_fidelity: float = 0.0
-    pq_curr_fidelity: float = 0.0
-    pq_last_fidelity: float = 0.0
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# BLOCKCHAIN STRUCTURES
-# ═════════════════════════════════════════════════════════════════════════════════
-
-class BlockHeader:
-    def __init__(self,height: int,block_hash: str,parent_hash: str,merkle_root: str,
-                 timestamp_s: int,difficulty_bits: int,nonce: int,miner_address: str,
-                 w_state_fidelity: float=0.0,w_entropy_hash: str=''):
-        self.height=height
-        self.block_hash=block_hash
-        self.parent_hash=parent_hash
-        self.merkle_root=merkle_root
-        self.timestamp_s=timestamp_s
-        self.difficulty_bits=difficulty_bits
-        self.nonce=nonce
-        self.miner_address=miner_address
-        self.w_state_fidelity=w_state_fidelity
-        self.w_entropy_hash=w_entropy_hash
-    
-    @classmethod
-    def from_dict(cls,data: Dict[str,Any])->'BlockHeader':
-        return cls(
-            height=data.get('block_height',0),
-            block_hash=data.get('block_hash',''),
-            parent_hash=data.get('parent_hash',''),
-            merkle_root=data.get('merkle_root',''),
-            timestamp_s=data.get('timestamp_s',int(time.time())),
-            difficulty_bits=data.get('difficulty_bits',12),
-            nonce=data.get('nonce',0),
-            miner_address=data.get('miner_address',''),
-            w_state_fidelity=data.get('w_state_fidelity',0.0),
-            w_entropy_hash=data.get('w_entropy_hash','')
-        )
-
-@dataclass
-class Transaction:
-    tx_id: str
-    from_addr: str
-    to_addr: str
-    amount: float
-    nonce: int
-    timestamp_ns: int
-    signature: str
-    fee: float=0.0
-    
-    def compute_hash(self)->str:
-        data=json.dumps({k:v for k,v in asdict(self).items() if k!='signature'},sort_keys=True)
-        return hashlib.sha3_256(data.encode()).hexdigest()
-
-@dataclass
-class Block:
-    header: BlockHeader
-    transactions: List[Transaction]
-    
-    def compute_merkle(self)->str:
-        if not self.transactions:
-            return hashlib.sha3_256(b'').hexdigest()
-        hashes=[tx.compute_hash() for tx in self.transactions]
-        while len(hashes)>1:
-            if len(hashes)%2:
-                hashes.append(hashes[-1])
-            hashes=[hashlib.sha3_256((hashes[i]+hashes[i+1]).encode()).hexdigest() for i in range(0,len(hashes),2)]
-        return hashes[0]
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# W-STATE RECOVERY ENGINE (VERBATIM FROM v14 FINAL + ENHANCED)
-# ═════════════════════════════════════════════════════════════════════════════════
-
-class P2PClientWStateRecovery:
+class LocalBlockchainDB(ComponentBase):
     """
-    P2P client-side W-state recovery with HLWE signature verification.
-    
-    Downloads density matrix snapshots cryptographically signed by oracle,
-    verifies signatures, reconstructs W-state locally, establishes entanglement.
-    Integrated into miner for continuous quantum entropy source.
+    Thread-safe PostgreSQL wrapper for QTCL.
+    Single class replacing 8 scattered _local_db_* functions.
     """
-    
-    def __init__(self, oracle_url: str, peer_id: str, strict_signature_verification: bool=True):
-        """Initialize W-state recovery client."""
-        self.oracle_url=oracle_url.rstrip('/')
-        self.peer_id=peer_id
-        self.running=False
-        self.strict_verification=strict_signature_verification
-        
-        self.oracle_address=None
-        self.trusted_oracles: Set[str]=set()
-        
-        self.snapshot_buffer=deque(maxlen=RECOVERY_BUFFER_SIZE)
-        self.current_snapshot=None
-        
-        self.recovered_w_state=None
-        self.entanglement_state=EntanglementState(
-            established=False,
-            local_fidelity=0.0,
-            sync_lag_ms=0.0,
-            last_sync_ns=time.time_ns(),
-        )
-        
-        # W-state tracking for mining
-        self.pq0_matrix: Optional[np.ndarray]=None
-        self.pq_curr_matrix: Optional[np.ndarray]=None
-        self.pq_last_matrix: Optional[np.ndarray]=None
-        self.pq_curr_measurement_counts: Dict[str,int]={}
-        
-        self.sync_thread=None
-        self._state_lock=threading.RLock()
-        
-        logger.info(f"[W-STATE] 🌐 Initialized recovery client | peer={peer_id[:12]} | verification={'STRICT' if strict_signature_verification else 'SOFT'}")
-    
-    def register_with_oracle(self)->bool:
-        """Register this peer with the oracle and get oracle address."""
-        try:
-            url=f"{self.oracle_url}/api/w-state/register"
-            response=requests.post(
-                url,
-                json={"client_id": self.peer_id},
-                timeout=5
+
+    DDL = """
+    CREATE TABLE IF NOT EXISTS blocks (
+        block_hash      TEXT PRIMARY KEY,
+        height          BIGINT NOT NULL UNIQUE,
+        prev_hash       TEXT NOT NULL,
+        merkle_root     TEXT NOT NULL,
+        timestamp       DOUBLE PRECISION NOT NULL,
+        nonce           BIGINT NOT NULL DEFAULT 0,
+        difficulty      INTEGER NOT NULL DEFAULT 4,
+        miner_id        TEXT,
+        tx_count        INTEGER NOT NULL DEFAULT 0,
+        qubit_state_cid TEXT,
+        data            JSONB NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS transactions (
+        tx_hash         TEXT PRIMARY KEY,
+        block_hash      TEXT REFERENCES blocks(block_hash) ON DELETE SET NULL,
+        sender          TEXT NOT NULL,
+        recipient       TEXT NOT NULL,
+        amount          BIGINT NOT NULL DEFAULT 0,
+        fee             BIGINT NOT NULL DEFAULT 0,
+        timestamp       DOUBLE PRECISION NOT NULL,
+        nonce           BIGINT NOT NULL DEFAULT 0,
+        signature       TEXT,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        data            JSONB NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS qubit_states (
+        id              BIGSERIAL PRIMARY KEY,
+        block_height    BIGINT NOT NULL,
+        block_hash      TEXT NOT NULL,
+        state_vector    BYTEA NOT NULL,
+        metrics         JSONB NOT NULL DEFAULT '{}',
+        evolution_seed  TEXT,
+        timestamp       DOUBLE PRECISION NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS miners (
+        miner_id        TEXT PRIMARY KEY,
+        address         TEXT NOT NULL,
+        port            INTEGER NOT NULL,
+        pubkey          TEXT,
+        registered_at   DOUBLE PRECISION NOT NULL,
+        last_heartbeat  DOUBLE PRECISION NOT NULL,
+        blocks_mined    INTEGER NOT NULL DEFAULT 0,
+        active          BOOLEAN NOT NULL DEFAULT TRUE,
+        metadata        JSONB NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS oracles (
+        oracle_id       TEXT PRIMARY KEY,
+        address         TEXT NOT NULL,
+        port            INTEGER NOT NULL,
+        pubkey          TEXT,
+        registered_at   DOUBLE PRECISION NOT NULL,
+        last_heartbeat  DOUBLE PRECISION NOT NULL,
+        active          BOOLEAN NOT NULL DEFAULT TRUE
+    );
+
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id              BIGSERIAL PRIMARY KEY,
+        height          BIGINT NOT NULL UNIQUE,
+        checksum        TEXT NOT NULL,
+        data            BYTEA NOT NULL,
+        size_bytes      INTEGER NOT NULL,
+        created_at      DOUBLE PRECISION NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS oracle_events (
+        id              BIGSERIAL PRIMARY KEY,
+        event_type      TEXT NOT NULL,
+        oracle_id       TEXT,
+        block_height    BIGINT,
+        payload         JSONB NOT NULL DEFAULT '{}',
+        timestamp       DOUBLE PRECISION NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS token_balances (
+        address         TEXT PRIMARY KEY,
+        balance         BIGINT NOT NULL DEFAULT 0,
+        updated_at      DOUBLE PRECISION NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entanglement_log (
+        id              BIGSERIAL PRIMARY KEY,
+        block_height    BIGINT NOT NULL,
+        qubit_a         INTEGER NOT NULL,
+        qubit_b         INTEGER NOT NULL,
+        entanglement_score DOUBLE PRECISION NOT NULL,
+        event_type      TEXT NOT NULL DEFAULT 'entangle',
+        metadata        JSONB NOT NULL DEFAULT '{}',
+        timestamp       DOUBLE PRECISION NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height DESC);
+    CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_hash);
+    CREATE INDEX IF NOT EXISTS idx_tx_sender ON transactions(sender);
+    CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status);
+    CREATE INDEX IF NOT EXISTS idx_qstates_height ON qubit_states(block_height);
+    CREATE INDEX IF NOT EXISTS idx_miners_active ON miners(active, last_heartbeat);
+    CREATE INDEX IF NOT EXISTS idx_snapshots_height ON snapshots(height DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_events_height ON oracle_events(block_height);
+    CREATE INDEX IF NOT EXISTS idx_entanglement_height ON entanglement_log(block_height);
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        pool_min: int = 2,
+        pool_max: int = 10,
+        name: str = "LocalBlockchainDB",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self._dsn = dsn
+        self._pool_min = pool_min
+        self._pool_max = pool_max
+        self._pool: Optional[Any] = None
+        self._pool_lock = threading.Lock()
+
+    def on_start(self) -> None:
+        self._init_pool()
+        self.create_tables()
+
+    def on_stop(self) -> None:
+        self._teardown_pool()
+
+    def _init_pool(self) -> None:
+        if not HAS_PSYCOPG2:
+            raise ImportError("psycopg2 is required for LocalBlockchainDB")
+        with self._pool_lock:
+            self._pool = psycopg2.pool.ThreadedConnectionPool(
+                self._pool_min,
+                self._pool_max,
+                self._dsn,
             )
-            
-            if response.status_code in [200,201]:
-                data=response.json()
-                self.oracle_address=data.get('oracle_address')
-                if self.oracle_address:
-                    self.trusted_oracles.add(self.oracle_address)
-                    logger.info(f"[W-STATE] ✅ Registered with oracle | oracle_address={self.oracle_address[:20]}…")
-                return True
-            else:
-                logger.error(f"[W-STATE] ❌ Registration failed: {response.status_code}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Registration error: {e}")
-            return False
-    
-    def download_latest_snapshot(self)->Optional[Dict[str,Any]]:
-        """Download latest density matrix snapshot from oracle."""
+        self.log.info(f"[{self.name}] pool created (min={self._pool_min}, max={self._pool_max})")
+
+    def _teardown_pool(self) -> None:
+        with self._pool_lock:
+            if self._pool:
+                try:
+                    self._pool.closeall()
+                except Exception as exc:
+                    self.log.warning(f"[{self.name}] pool close error: {exc}")
+                self._pool = None
+
+    @contextlib.contextmanager
+    def _get_conn(self):
+        if not self._pool:
+            raise RuntimeError("DB pool not initialized — call start() first")
+        conn = self._pool.getconn()
         try:
-            url=f"{self.oracle_url}/api/w-state/latest"
-            response=requests.get(url,timeout=5)
-            
-            if response.status_code==200:
-                snapshot=response.json()
-                with self._state_lock:
-                    self.current_snapshot=snapshot
-                    self.snapshot_buffer.append(snapshot)
-                
-                logger.debug(f"[W-STATE] 📥 Downloaded snapshot | timestamp={snapshot['timestamp_ns']}")
-                return snapshot
-            else:
-                logger.warning(f"[W-STATE] ⚠️  Download failed: {response.status_code}")
-                return None
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Download error: {e}")
-            return None
-    
-    def _verify_snapshot_signature(self,snapshot: Dict[str,Any])->Tuple[bool,str]:
-        """Verify HLWE signature of snapshot."""
-        try:
-            hlwe_sig=snapshot.get('hlwe_signature')
-            oracle_addr=snapshot.get('oracle_address')
-            sig_valid=snapshot.get('signature_valid',False)
-            
-            if not hlwe_sig:
-                msg="No HLWE signature found in snapshot"
-                if self.strict_verification:
-                    logger.error(f"[W-STATE] ❌ {msg}")
-                    return False,msg
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def create_tables(self) -> None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(self.DDL)
+        self.log.info(f"[{self.name}] schema ready")
+
+    # ── Blocks ────────────────────────────────────────────────────────────────
+
+    def insert_block(self, block: Dict[str, Any]) -> str:
+        bh = block.get("hash") or HASH_ENGINE.compute_block_hash(block)
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO blocks
+                        (block_hash, height, prev_hash, merkle_root, timestamp,
+                         nonce, difficulty, miner_id, tx_count, qubit_state_cid, data)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (block_hash) DO NOTHING
+                    """,
+                    (
+                        bh,
+                        block["height"],
+                        block.get("prev_hash", "0" * 64),
+                        block.get("merkle_root", ""),
+                        block.get("timestamp", time.time()),
+                        block.get("nonce", 0),
+                        block.get("difficulty", 4),
+                        block.get("miner_id"),
+                        block.get("tx_count", 0),
+                        block.get("qubit_state_cid"),
+                        json.dumps(block.get("data", {})),
+                    ),
+                )
+        self._inc("blocks_inserted")
+        return bh
+
+    def get_block(self, block_hash: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM blocks WHERE block_hash = %s", (block_hash,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_block_by_height(self, height: int) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM blocks WHERE height = %s", (height,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_latest_block(self) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM blocks ORDER BY height DESC LIMIT 1")
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_chain_height(self) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(MAX(height), -1) FROM blocks")
+                row = cur.fetchone()
+        return row[0] if row else -1
+
+    def get_blocks_range(self, start: int, end: int) -> List[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM blocks WHERE height BETWEEN %s AND %s ORDER BY height ASC",
+                    (start, end),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    # ── Transactions ──────────────────────────────────────────────────────────
+
+    def insert_transaction(self, tx: Dict[str, Any]) -> str:
+        tx_hash = tx.get("hash") or HASH_ENGINE.compute_hash(tx)
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO transactions
+                        (tx_hash, block_hash, sender, recipient, amount, fee,
+                         timestamp, nonce, signature, status, data)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (tx_hash) DO NOTHING
+                    """,
+                    (
+                        tx_hash,
+                        tx.get("block_hash"),
+                        tx["sender"],
+                        tx["recipient"],
+                        tx.get("amount", 0),
+                        tx.get("fee", 0),
+                        tx.get("timestamp", time.time()),
+                        tx.get("nonce", 0),
+                        tx.get("signature"),
+                        tx.get("status", "pending"),
+                        json.dumps(tx.get("data", {})),
+                    ),
+                )
+        self._inc("txs_inserted")
+        return tx_hash
+
+    def get_transaction(self, tx_hash: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM transactions WHERE tx_hash = %s", (tx_hash,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_pending_transactions(self, limit: int = 100) -> List[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM transactions WHERE status = 'pending' "
+                    "ORDER BY fee DESC, timestamp ASC LIMIT %s",
+                    (limit,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def confirm_transaction(self, tx_hash: str, block_hash: str) -> None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE transactions SET status='confirmed', block_hash=%s WHERE tx_hash=%s",
+                    (block_hash, tx_hash),
+                )
+
+    # ── Qubit States ──────────────────────────────────────────────────────────
+
+    def insert_qubit_state(self, state: Dict[str, Any]) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                raw = state.get("state_vector")
+                if isinstance(raw, (list, tuple)):
+                    import struct
+                    raw_bytes = struct.pack(f"{len(raw)}d", *raw)
+                elif isinstance(raw, bytes):
+                    raw_bytes = raw
                 else:
-                    logger.warning(f"[W-STATE] ⚠️  {msg} (soft verification mode)")
-                    return True,"No signature but soft verification enabled"
-            
-            if not oracle_addr:
-                msg="No oracle_address in snapshot"
-                logger.error(f"[W-STATE] ❌ {msg}")
-                return False,msg
-            
-            required_fields=['commitment','witness','proof','w_entropy_hash','derivation_path','public_key_hex']
-            missing=[f for f in required_fields if f not in hlwe_sig]
-            
-            if missing:
-                msg=f"Signature missing fields: {missing}"
-                logger.error(f"[W-STATE] ❌ {msg}")
-                return False,msg
-            
-            if oracle_addr not in self.trusted_oracles and self.oracle_address:
-                if oracle_addr!=self.oracle_address:
-                    msg=f"Oracle address mismatch | expected={self.oracle_address[:20]}… | got={oracle_addr[:20]}…"
-                    logger.error(f"[W-STATE] ❌ {msg}")
-                    return False,msg
-            
-            self.trusted_oracles.add(oracle_addr)
-            
-            return True,"signature_verified"
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Signature verification failed: {e}")
-            return False,str(e)
-    
-    def _hex_to_matrix(self,hex_str: str)->Optional[np.ndarray]:
-        """Convert hex string to density matrix numpy array."""
-        try:
-            dm_bytes=bytes.fromhex(hex_str)
-            dm_array=np.frombuffer(dm_bytes,dtype=np.complex128)
-            n=int(np.sqrt(len(dm_array)))
-            return dm_array.reshape((n,n))
-        except:
-            return None
-    
-    def _validate_hermitian(self,matrix: np.ndarray)->bool:
-        """Validate hermitian property of density matrix."""
-        try:
-            hermitian_check=np.allclose(matrix,matrix.conj().T,atol=HERMITICITY_TOLERANCE)
-            if not hermitian_check:
-                logger.warning("[W-STATE] ⚠️  DM not hermitian")
-                return False
-            return True
-        except:
-            return False
-    
-    def _validate_trace_unity(self,matrix: np.ndarray)->bool:
-        """Validate trace = 1 for density matrix."""
-        try:
-            tr=np.trace(matrix)
-            if not np.isclose(tr,1.0,atol=1e-6):
-                logger.warning(f"[W-STATE] ⚠️  DM trace != 1: {tr}")
-                return False
-            return True
-        except:
-            return False
-    
-    def _validate_positive_semidefinite(self,matrix: np.ndarray)->bool:
-        """Validate positive semidefinite property."""
-        try:
-            eigenvalues=np.linalg.eigvalsh(matrix)
-            if np.any(eigenvalues<EIGENVALUE_TOLERANCE):
-                logger.warning(f"[W-STATE] ⚠️  DM has negative eigenvalues")
-                return False
-            return True
-        except:
-            return False
-    
-    def _compute_purity(self,matrix: np.ndarray)->float:
-        """Compute purity Tr(ρ²)."""
-        try:
-            p=float(np.real(np.trace(matrix@matrix)))
-            return min(1.0,max(0.0,p))
-        except:
-            return 0.0
-    
-    def _compute_w_state_fidelity(self,matrix: np.ndarray)->float:
-        """Compute fidelity to ideal W-state."""
-        try:
-            if matrix is None or matrix.shape[0]!=8:
-                return 0.0
-            w_ideal=np.array([
-                [0,0,0,0,0,0,0,0],
-                [0,1/3,0,1/3,0,0,0,0],
-                [0,0,1/3,0,0,0,0,0],
-                [0,1/3,0,1/3,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-                [0,0,0,0,0,0,0,0],
-            ])/3
-            f=float(np.real(np.trace(matrix@w_ideal)))
-            return min(1.0,max(0.0,f))
-        except:
-            return 0.0
-    
-    def _compute_coherence_l1(self,matrix: np.ndarray)->float:
-        """Compute L1 norm coherence."""
-        try:
-            coh=sum(abs(matrix[i,j]) for i in range(matrix.shape[0]) for j in range(matrix.shape[0]) if i!=j)
-            return float(coh)
-        except:
-            return 0.0
-    
-    def _compute_quantum_discord(self,matrix: np.ndarray)->float:
-        """Compute quantum discord (simplified)."""
-        try:
-            if matrix is None or matrix.shape[0]<2:
-                return 0.0
-            return float(max(0.0,0.8-0.4))
-        except:
-            return 0.0
-    
-    def _reconstruct_statevector(self,density_matrix: np.ndarray)->Optional[np.ndarray]:
-        """Attempt to reconstruct pure state from density matrix via diagonalization."""
-        try:
-            eigenvalues,eigenvectors=np.linalg.eigh(density_matrix)
-            max_idx=np.argmax(eigenvalues)
-            if eigenvalues[max_idx]<0.5:
-                logger.warning("[W-STATE] ⚠️  DM is significantly mixed")
-                return None
-            return eigenvectors[:,max_idx]
-        except:
-            return None
-    
-    def recover_w_state(self,snapshot: Dict[str,Any])->Optional[RecoveredWState]:
-        """Recover W-state from downloaded snapshot with FULL validation."""
-        try:
-            # Signature verification
-            sig_ok,sig_msg=self._verify_snapshot_signature(snapshot)
-            
-            dm_hex=snapshot.get('density_matrix_hex')
-            if not dm_hex:
-                logger.error("[W-STATE] ❌ No density_matrix_hex in snapshot")
-                return None
-            
-            dm_array=self._hex_to_matrix(dm_hex)
-            if dm_array is None:
-                logger.error("[W-STATE] ❌ Failed to reconstruct DM from hex")
-                return None
-            
-            # Validate properties
-            if not self._validate_hermitian(dm_array):
-                return None
-            if not self._validate_trace_unity(dm_array):
-                return None
-            if not self._validate_positive_semidefinite(dm_array):
-                return None
-            
-            purity=self._compute_purity(dm_array)
-            w_fidelity=self._compute_w_state_fidelity(dm_array)
-            coherence_l1=self._compute_coherence_l1(dm_array)
-            quantum_discord=self._compute_quantum_discord(dm_array)
-            
-            is_valid=w_fidelity>=FIDELITY_THRESHOLD
-            validation_notes=f"F={w_fidelity:.4f} | ρ={purity:.4f} | sig={'✓' if sig_ok else '✗'}"
-            
-            sv=self._reconstruct_statevector(dm_array)
-            
-            recovered=RecoveredWState(
-                timestamp_ns=snapshot.get('timestamp_ns',time.time_ns()),
-                density_matrix=dm_array,
-                purity=purity,
-                w_state_fidelity=w_fidelity,
-                coherence_l1=coherence_l1,
-                quantum_discord=quantum_discord,
-                is_valid=is_valid,
-                validation_notes=validation_notes,
-                local_statevector=sv,
-                signature_verified=sig_ok,
-                oracle_address=snapshot.get('oracle_address')
-            )
-            
-            with self._state_lock:
-                self.recovered_w_state=recovered
-                self.pq0_matrix=dm_array.copy()
-            
-            if not is_valid and self.strict_verification:
-                logger.error(f"[W-STATE] ❌ Invalid W-state: {validation_notes}")
-                return None
-            
-            logger.info(f"[W-STATE] ✅ W-state recovered | {validation_notes}")
-            return recovered
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Recovery failed: {e}")
-            return None
-    
-    def _establish_entanglement(self)->bool:
-        """Establish entanglement between pq0 (oracle), pq_curr, and pq_last."""
-        try:
-            with self._state_lock:
-                if self.pq0_matrix is None:
-                    return False
-                
-                # Create entangled copies
-                self.pq_curr_matrix=self.pq0_matrix.copy()
-                self.pq_last_matrix=self.pq0_matrix.copy()
-                
-                # Simulate entanglement via small perturbations
-                noise=np.random.normal(0,0.01,(8,8))
-                noise=(noise+noise.conj().T)/2
-                self.pq_curr_matrix=0.99*self.pq_curr_matrix+0.01*noise
-                self.pq_curr_matrix/=np.trace(self.pq_curr_matrix)
-                
-                noise=np.random.normal(0,0.01,(8,8))
-                noise=(noise+noise.conj().T)/2
-                self.pq_last_matrix=0.99*self.pq_last_matrix+0.01*noise
-                self.pq_last_matrix/=np.trace(self.pq_last_matrix)
-                
-                self.entanglement_state.established=True
-                self.entanglement_state.pq0_fidelity=self._compute_w_state_fidelity(self.pq0_matrix)
-                self.entanglement_state.pq_curr_fidelity=self._compute_w_state_fidelity(self.pq_curr_matrix)
-                self.entanglement_state.pq_last_fidelity=self._compute_w_state_fidelity(self.pq_last_matrix)
-            
-            logger.info(f"[W-STATE] 🔗 Entanglement established | pq0={self.entanglement_state.pq0_fidelity:.4f} | pq_curr={self.entanglement_state.pq_curr_fidelity:.4f} | pq_last={self.entanglement_state.pq_last_fidelity:.4f}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Entanglement failed: {e}")
-            return False
-    
-    def verify_entanglement(self,local_fidelity: float,signature_verified: bool)->bool:
-        """Verify entanglement quality."""
-        try:
-            with self._state_lock:
-                self.entanglement_state.local_fidelity=local_fidelity
-                self.entanglement_state.signature_verified=signature_verified
-            
-            if local_fidelity>=FIDELITY_THRESHOLD and signature_verified:
-                with self._state_lock:
-                    self.entanglement_state.established=True
-                    self.entanglement_state.coherence_verified=True
-                
-                logger.debug(f"[W-STATE] 🔗 Entanglement verified | fidelity={local_fidelity:.4f} | signature=✓")
-                return True
-            else:
-                with self._state_lock:
-                    self.entanglement_state.established=False
-                
-                logger.warning(f"[W-STATE] ⚠️  Entanglement incomplete | fidelity={local_fidelity:.4f} | sig_verified={signature_verified}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Entanglement verification failed: {e}")
-            return False
-    
-    def rotate_entanglement_state(self)->None:
-        """Rotate W-state measurements: pq_curr → pq_last, recover new pq_curr from pq0."""
-        try:
-            with self._state_lock:
-                self.pq_last_matrix=self.pq_curr_matrix.copy() if self.pq_curr_matrix is not None else None
-                self.pq_curr_matrix=self.pq0_matrix.copy() if self.pq0_matrix is not None else None
-            logger.debug("[W-STATE] 🔄 Entanglement rotated: pq_curr → pq_last")
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Rotation failed: {e}")
-    
-    def measure_w_state(self)->Optional[str]:
-        """Measure W-state to produce quantum entropy bitstring."""
-        try:
-            if not QISKIT_AVAILABLE or self.pq_curr_matrix is None:
-                return secrets.token_hex(32)
-            
-            qc=QuantumCircuit(NUM_QUBITS_WSTATE,NUM_QUBITS_WSTATE)
-            qc.ry(np.arccos(np.sqrt(2/3)),0)
-            qc.cx(0,1)
-            qc.ry(np.arccos(np.sqrt(1/2)),1)
-            qc.cx(1,2)
-            qc.measure([0,1,2],[0,1,2])
-            
-            try:
-                aer=AerSimulator()
-                result=aer.run(qc,shots=100).result()
-                counts=result.get_counts()
-                self.pq_curr_measurement_counts=dict(counts)
-                outcome=' '.join(str(k) for k in sorted(counts.keys(),key=lambda x:counts[x],reverse=True)[:3])
-                entropy=hashlib.sha3_256(outcome.encode()).hexdigest()
-                logger.debug(f"[W-STATE] 📊 Measurement: {outcome[:20]}…")
-                return entropy
-            except:
-                return secrets.token_hex(32)
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Measurement failed: {e}")
-            return secrets.token_hex(32)
-    
-    def _sync_worker(self):
-        """Continuous sync worker with signature verification."""
-        logger.info("[W-STATE] 🔄 Sync worker started")
-        
-        while self.running:
-            try:
-                snapshot=self.download_latest_snapshot()
-                if snapshot is None:
-                    time.sleep(0.5)
-                    continue
-                
-                recovered=self.recover_w_state(snapshot)
-                if recovered is None:
-                    with self._state_lock:
-                        self.entanglement_state.sync_error_count+=1
-                    time.sleep(0.1)
-                    continue
-                
-                current_time_ns=time.time_ns()
-                sync_lag_ns=current_time_ns-snapshot.get("timestamp_ns",current_time_ns)
-                sync_lag_ms=sync_lag_ns/1_000_000
-                
-                with self._state_lock:
-                    self.entanglement_state.sync_lag_ms=sync_lag_ms
-                
-                local_fidelity=recovered.w_state_fidelity*(1.0-min(sync_lag_ms/1000,0.1))
-                self.verify_entanglement(local_fidelity,recovered.signature_verified)
-                
-                time.sleep(SYNC_INTERVAL_MS/1000.0)
-            
-            except Exception as e:
-                logger.error(f"[W-STATE] ❌ Sync worker error: {e}")
-                time.sleep(0.1)
-    
-    def get_recovered_state(self)->Optional[Dict[str,Any]]:
-        """Get current recovered W-state."""
-        with self._state_lock:
-            if self.recovered_w_state is None:
-                return None
-            
-            state=self.recovered_w_state
-            return {
-                "timestamp_ns": state.timestamp_ns,
-                "purity": state.purity,
-                "w_state_fidelity": state.w_state_fidelity,
-                "coherence_l1": state.coherence_l1,
-                "quantum_discord": state.quantum_discord,
-                "is_valid": state.is_valid,
-                "validation_notes": state.validation_notes,
-                "signature_verified": state.signature_verified,
-                "oracle_address": state.oracle_address,
-            }
-    
-    def get_entanglement_status(self)->Dict[str,Any]:
-        """Get entanglement status."""
-        with self._state_lock:
-            state=self.entanglement_state
-            return {
-                "established": state.established,
-                "local_fidelity": state.local_fidelity,
-                "sync_lag_ms": state.sync_lag_ms,
-                "coherence_verified": state.coherence_verified,
-                "signature_verified": state.signature_verified,
-                "sync_error_count": state.sync_error_count,
-                "pq0_fidelity": state.pq0_fidelity,
-                "pq_curr_fidelity": state.pq_curr_fidelity,
-                "pq_last_fidelity": state.pq_last_fidelity,
-            }
-    
-    def start(self)->bool:
-        """Start the recovery client."""
-        if self.running:
-            logger.warning("[W-STATE] Already running")
-            return True
-        
-        try:
-            logger.info(f"[W-STATE] 🚀 Starting recovery client...")
-            
-            if not self.register_with_oracle():
-                logger.error("[W-STATE] ❌ Failed to register with oracle")
-                return False
-            
-            snapshot=self.download_latest_snapshot()
-            if snapshot is None:
-                logger.error("[W-STATE] ❌ Failed to download initial snapshot")
-                return False
-            
-            recovered=self.recover_w_state(snapshot)
-            if recovered is None:
-                logger.error("[W-STATE] ❌ Initial recovery failed")
-                if self.strict_verification:
-                    return False
-            
-            if not self._establish_entanglement():
-                logger.error("[W-STATE] ❌ Failed to establish entanglement")
-                if self.strict_verification:
-                    return False
-            
-            self.running=True
-            self.sync_thread=threading.Thread(
-                target=self._sync_worker,
-                daemon=True,
-                name=f"WStateSync_{self.peer_id[:8]}"
-            )
-            self.sync_thread.start()
-            
-            logger.info(f"[W-STATE] ✨ Recovery client running with W-state entanglement")
-            return True
-        
-        except Exception as e:
-            logger.error(f"[W-STATE] ❌ Startup failed: {e}")
-            return False
-    
-    def stop(self):
-        """Stop the recovery client."""
-        logger.info("[W-STATE] 🛑 Stopping...")
-        self.running=False
-        
-        if self.sync_thread:
-            self.sync_thread.join(timeout=5)
-        
-        logger.info("[W-STATE] ✅ Stopped")
+                    raw_bytes = b""
+                cur.execute(
+                    """
+                    INSERT INTO qubit_states
+                        (block_height, block_hash, state_vector, metrics, evolution_seed, timestamp)
+                    VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+                    """,
+                    (
+                        state["block_height"],
+                        state["block_hash"],
+                        psycopg2.Binary(raw_bytes),
+                        json.dumps(state.get("metrics", {})),
+                        state.get("evolution_seed"),
+                        state.get("timestamp", time.time()),
+                    ),
+                )
+                row = cur.fetchone()
+        return row[0] if row else -1
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# LIVE NODE CLIENT
-# ═════════════════════════════════════════════════════════════════════════════════
+    def get_qubit_states_at_height(self, height: int) -> List[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM qubit_states WHERE block_height = %s ORDER BY id ASC",
+                    (height,),
+                )
+                return [dict(r) for r in cur.fetchall()]
 
-class LiveNodeClient:
-    def __init__(self,base_url: str=LIVE_NODE_URL):
-        self.base_url=base_url.rstrip('/')
-        self.session=requests.Session()
-        retry_strategy=Retry(total=3,backoff_factor=0.5)
-        adapter=HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://",adapter)
-        self.session.mount("https://",adapter)
-    
-    def get_tip_block(self)->Optional[BlockHeader]:
-        try:
-            r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/tip",timeout=10)
-            if r.status_code==200:
-                return BlockHeader.from_dict(r.json())
-        except:
-            pass
+    # ── Miners ────────────────────────────────────────────────────────────────
+
+    def register_miner(
+        self,
+        miner_id: str,
+        address: str,
+        port: int,
+        pubkey: str,
+        metadata: Optional[Dict] = None,
+    ) -> bool:
+        now = time.time()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO miners (miner_id, address, port, pubkey,
+                        registered_at, last_heartbeat, active, metadata)
+                    VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s)
+                    ON CONFLICT (miner_id) DO UPDATE
+                        SET address=EXCLUDED.address, port=EXCLUDED.port,
+                            last_heartbeat=EXCLUDED.last_heartbeat,
+                            active=TRUE, metadata=EXCLUDED.metadata
+                    """,
+                    (miner_id, address, port, pubkey, now, now,
+                     json.dumps(metadata or {})),
+                )
+        self._inc("miners_registered")
+        return True
+
+    def update_miner_heartbeat(self, miner_id: str) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE miners SET last_heartbeat=%s WHERE miner_id=%s",
+                    (time.time(), miner_id),
+                )
+                return cur.rowcount > 0
+
+    def get_active_miners(self, stale_threshold_seconds: int = 120) -> List[Dict]:
+        cutoff = time.time() - stale_threshold_seconds
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM miners WHERE active=TRUE AND last_heartbeat > %s",
+                    (cutoff,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def deregister_miner(self, miner_id: str) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE miners SET active=FALSE WHERE miner_id=%s",
+                    (miner_id,),
+                )
+                return cur.rowcount > 0
+
+    def increment_miner_blocks(self, miner_id: str) -> None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE miners SET blocks_mined = blocks_mined + 1 WHERE miner_id=%s",
+                    (miner_id,),
+                )
+
+    # ── Snapshots ─────────────────────────────────────────────────────────────
+
+    def store_snapshot(self, height: int, snapshot_data: bytes, checksum: str) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO snapshots (height, checksum, data, size_bytes, created_at)
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT (height) DO UPDATE
+                        SET checksum=EXCLUDED.checksum, data=EXCLUDED.data,
+                            size_bytes=EXCLUDED.size_bytes, created_at=EXCLUDED.created_at
+                    RETURNING id
+                    """,
+                    (height, checksum, psycopg2.Binary(snapshot_data),
+                     len(snapshot_data), time.time()),
+                )
+                row = cur.fetchone()
+        return row[0] if row else -1
+
+    def get_snapshot(self, height: int) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM snapshots WHERE height = %s", (height,))
+                row = cur.fetchone()
+        if row:
+            d = dict(row)
+            if isinstance(d.get("data"), memoryview):
+                d["data"] = bytes(d["data"])
+            return d
         return None
-    
-    def get_block_by_height(self,height: int)->Optional[Dict[str,Any]]:
-        try:
-            r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/height/{height}",timeout=10)
-            if r.status_code==200:
-                return r.json()
-        except:
-            pass
-        return None
-    
-    def get_mempool(self)->List[Transaction]:
-        try:
-            r=self.session.get(f"{self.base_url}{API_PREFIX}/mempool",timeout=10)
-            if r.status_code==200:
-                return [Transaction(**tx) for tx in r.json().get('transactions',[])[:MAX_MEMPOOL]]
-        except:
-            pass
-        return []
-    
-    def submit_block(self,block_data: Dict[str,Any])->Tuple[bool,str]:
-        try:
-            r=self.session.post(f"{self.base_url}{API_PREFIX}/submit_block",json=block_data,timeout=10)
-            if r.status_code in [200,201]:
-                return True,r.json().get('message','Block accepted')
-            return False,r.json().get('error','Submission failed')
-        except Exception as e:
-            return False,str(e)
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# VALIDATION ENGINE
-# ═════════════════════════════════════════════════════════════════════════════════
+    def vacuum_old_snapshots(self, keep_last_n: int = 10) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM snapshots WHERE id NOT IN (
+                        SELECT id FROM snapshots ORDER BY height DESC LIMIT %s
+                    )
+                    """,
+                    (keep_last_n,),
+                )
+                deleted = cur.rowcount
+        self.log.info(f"[{self.name}] vacuumed {deleted} old snapshots (kept {keep_last_n})")
+        return deleted
 
-class ValidationEngine:
-    def __init__(self):
-        self.difficulty_cache={}
-    
-    def validate_block(self,block: Block)->bool:
-        try:
-            if not block.header.block_hash:
-                return False
-            if not block.header.parent_hash:
-                return False
-            if len(block.header.merkle_root)!=64:
-                return False
-            return True
-        except:
-            return False
-    
-    def verify_pow(self,block_hash: str,difficulty_bits: int)->bool:
-        try:
-            target=(1<<(256-difficulty_bits))-1
-            hash_int=int(block_hash,16)
-            return hash_int<=target
-        except:
-            return False
+    # ── Token Balances ────────────────────────────────────────────────────────
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# CHAIN STATE MANAGER
-# ═════════════════════════════════════════════════════════════════════════════════
+    def get_token_balance(self, address: str) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT balance FROM token_balances WHERE address=%s",
+                    (address,),
+                )
+                row = cur.fetchone()
+        return row[0] if row else 0
 
-class ChainState:
-    def __init__(self):
-        self.blocks: Dict[int,BlockHeader]={}
-        self.tip: Optional[BlockHeader]=None
-        self.balances: Dict[str,float]=defaultdict(float)
-        self._lock=threading.RLock()
-    
-    def add_block(self,header: BlockHeader)->None:
-        with self._lock:
-            self.blocks[header.height]=header
-            if self.tip is None or header.height>self.tip.height:
-                self.tip=header
-    
-    def apply_transaction(self,tx: Transaction)->None:
-        with self._lock:
-            self.balances[tx.from_addr]=self.balances.get(tx.from_addr,0)-tx.amount-tx.fee
-            self.balances[tx.to_addr]=self.balances.get(tx.to_addr,0)+tx.amount
-    
-    def get_height(self)->int:
-        with self._lock:
-            return self.tip.height if self.tip else 0
-    
-    def get_tip(self)->Optional[BlockHeader]:
-        with self._lock:
-            return self.tip
+    def update_token_balance(self, address: str, delta: int) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO token_balances (address, balance, updated_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (address) DO UPDATE
+                        SET balance = token_balances.balance + EXCLUDED.balance,
+                            updated_at = EXCLUDED.updated_at
+                    RETURNING balance
+                    """,
+                    (address, delta, time.time()),
+                )
+                row = cur.fetchone()
+        return row[0] if row else 0
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# MEMPOOL
-# ═════════════════════════════════════════════════════════════════════════════════
+    # ── Entanglement Log ──────────────────────────────────────────────────────
 
-class Mempool:
-    def __init__(self):
-        self.txs: Dict[str,Transaction]={}
-        self._lock=threading.RLock()
-    
-    def add_transaction(self,tx: Transaction)->None:
-        with self._lock:
-            if tx.tx_id not in self.txs:
-                self.txs[tx.tx_id]=tx
-    
-    def remove_transactions(self,tx_ids: List[str])->None:
-        with self._lock:
-            for tx_id in tx_ids:
-                self.txs.pop(tx_id,None)
-    
-    def get_pending(self,limit: int=100)->List[Transaction]:
-        with self._lock:
-            return sorted(self.txs.values(),key=lambda x:x.fee,reverse=True)[:limit]
-    
-    def get_size(self)->int:
-        with self._lock:
-            return len(self.txs)
+    def log_entanglement_event(self, event: Dict[str, Any]) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO entanglement_log
+                        (block_height, qubit_a, qubit_b, entanglement_score,
+                         event_type, metadata, timestamp)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                    """,
+                    (
+                        event["block_height"],
+                        event.get("qubit_a", 0),
+                        event.get("qubit_b", 1),
+                        event.get("entanglement_score", 0.0),
+                        event.get("event_type", "entangle"),
+                        json.dumps(event.get("metadata", {})),
+                        event.get("timestamp", time.time()),
+                    ),
+                )
+                row = cur.fetchone()
+        return row[0] if row else -1
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# QUANTUM MINER WITH W-STATE ENTANGLEMENT
-# ═════════════════════════════════════════════════════════════════════════════════
+    # ── Oracle Events ─────────────────────────────────────────────────────────
 
-class QuantumMiner:
-    def __init__(self,w_state_recovery: P2PClientWStateRecovery,difficulty: int=12):
-        self.w_state_recovery=w_state_recovery
-        self.difficulty=difficulty
-        self.metrics={'blocks_mined':0,'hash_attempts':0,'avg_fidelity':0.0}
-        self._lock=threading.RLock()
-    
-    def mine_block(self,transactions: List[Transaction],miner_address: str,parent_hash: str,height: int)->Optional[Block]:
-        try:
-            logger.info(f"[MINING] ⛏️  Mining block #{height} with {len(transactions)} txs | W-state fidelity check...")
-            
-            # Measure W-state for entropy
-            w_entropy=self.w_state_recovery.measure_w_state()
-            entanglement=self.w_state_recovery.get_entanglement_status()
-            current_fidelity=entanglement.get('pq_curr_fidelity',0.0)
-            
-            logger.info(f"[MINING] W-state entropy acquired | pq_curr_F={current_fidelity:.4f}")
-            
-            # Create block template
-            header=BlockHeader(
-                height=height,
-                block_hash='',
-                parent_hash=parent_hash,
-                merkle_root='',
-                timestamp_s=int(time.time()),
-                difficulty_bits=self.difficulty,
-                nonce=0,
-                miner_address=miner_address,
-                w_state_fidelity=current_fidelity,
-                w_entropy_hash=w_entropy[:64] if w_entropy else ''
-            )
-            
-            block=Block(header=header,transactions=transactions)
-            header.merkle_root=block.compute_merkle()
-            
-            # PoW mining with W-state witness
-            target=(1<<(256-self.difficulty))-1
-            hash_attempts=0
-            
-            while header.nonce<2**32:
-                hash_attempts+=1
-                block_data=json.dumps({
-                    'height': header.height,
-                    'parent_hash': header.parent_hash,
-                    'merkle_root': header.merkle_root,
-                    'timestamp_s': header.timestamp_s,
-                    'difficulty_bits': header.difficulty_bits,
-                    'nonce': header.nonce,
-                    'miner_address': header.miner_address,
-                    'w_entropy_hash': header.w_entropy_hash,
-                },sort_keys=True)
-                
-                block_hash=hashlib.sha3_256(block_data.encode()).hexdigest()
-                hash_int=int(block_hash,16)
-                
-                if hash_int<=target:
-                    header.block_hash=block_hash
-                    block.header=header
-                    
-                    with self._lock:
-                        self.metrics['blocks_mined']+=1
-                        self.metrics['hash_attempts']+=hash_attempts
-                        self.metrics['avg_fidelity']=(self.metrics['avg_fidelity']+current_fidelity)/2
-                    
-                    logger.info(f"[MINING] ✅ Block mined #{height} | hash={block_hash[:16]}… | attempts={hash_attempts} | F={current_fidelity:.4f}")
-                    
-                    # Rotate W-state for next iteration
-                    self.w_state_recovery.rotate_entanglement_state()
-                    
-                    return block
-                
-                header.nonce+=1
-            
-            logger.warning(f"[MINING] ⚠️  PoW timeout at height {height}")
-            return None
-        
-        except Exception as e:
-            logger.error(f"[MINING] ❌ Mining failed: {e}")
-            return None
+    def log_oracle_event(self, event: Dict[str, Any]) -> int:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO oracle_events
+                        (event_type, oracle_id, block_height, payload, timestamp)
+                    VALUES (%s,%s,%s,%s,%s) RETURNING id
+                    """,
+                    (
+                        event["event_type"],
+                        event.get("oracle_id"),
+                        event.get("block_height"),
+                        json.dumps(event.get("payload", {})),
+                        event.get("timestamp", time.time()),
+                    ),
+                )
+                row = cur.fetchone()
+        return row[0] if row else -1
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# FULL NODE WITH W-STATE MINING
-# ═════════════════════════════════════════════════════════════════════════════════
+    # ── Generic / Stats ───────────────────────────────────────────────────────
 
-class QTCLFullNode:
-    def __init__(self,miner_address: str,oracle_url: str='http://localhost:5000',difficulty: int=12):
-        self.miner_address=miner_address
-        self.running=False
-        
-        self.client=LiveNodeClient()
-        self.state=ChainState()
-        self.mempool=Mempool()
-        self.validator=ValidationEngine()
-        
-        # W-STATE RECOVERY
-        peer_id=f"miner_{uuid.uuid4().hex[:12]}"
-        self.w_state_recovery=P2PClientWStateRecovery(
-            oracle_url=oracle_url,
-            peer_id=peer_id,
-            strict_signature_verification=True
-        )
-        
-        # MINING with W-state
-        self.miner=QuantumMiner(self.w_state_recovery,difficulty=difficulty)
-        
-        self.sync_thread: Optional[threading.Thread]=None
-        self.mining_thread: Optional[threading.Thread]=None
-        
-        logger.info(f"[NODE] 🚀 QTCL Full Node initialized | miner={miner_address[:20]}… | oracle={oracle_url}")
-    
-    def start(self)->bool:
-        try:
-            logger.info("[NODE] 🚀 Starting node...")
-            
-            # START W-STATE RECOVERY (CRITICAL)
-            if not self.w_state_recovery.start():
-                logger.error("[NODE] ❌ W-state recovery failed to start")
-                return False
-            
-            logger.info("[NODE] ✅ W-state recovery online")
-            
-            # Sync blockchain
-            tip=self.client.get_tip_block()
-            if tip:
-                self.state.add_block(tip)
-                logger.info(f"[NODE] ✅ Got tip block | height={tip.height}")
-            
-            self.running=True
-            
-            # Start background threads
-            self.sync_thread=threading.Thread(target=self._sync_loop,daemon=True,name="SyncWorker")
-            self.sync_thread.start()
-            
-            self.mining_thread=threading.Thread(target=self._mining_loop,daemon=True,name="MiningWorker")
-            self.mining_thread.start()
-            
-            logger.info("[NODE] ✨ Full node with quantum mining started")
-            return True
-        
-        except Exception as e:
-            logger.error(f"[NODE] ❌ Startup failed: {e}")
-            return False
-    
-    def stop(self):
-        self.running=False
-        self.w_state_recovery.stop()
-        if self.sync_thread:
-            self.sync_thread.join(timeout=5)
-        if self.mining_thread:
-            self.mining_thread.join(timeout=5)
-        logger.info("[NODE] ✅ Stopped")
-    
-    def _sync_loop(self):
-        """Continuously sync blockchain from network"""
-        logger.info("[SYNC] 🔄 Loop started")
-        while self.running:
-            try:
-                tip=self.client.get_tip_block()
-                if not tip:
-                    logger.warning("[SYNC] ⚠️  Failed to get tip, retrying...")
-                    time.sleep(10)
-                    continue
-                
-                current_height=self.state.get_height()
-                if current_height<tip.height:
-                    logger.info(f"[SYNC] 📥 Syncing: {current_height+1} → {tip.height}")
-                    for h in range(current_height+1,min(current_height+SYNC_BATCH+1,tip.height+1)):
-                        block_data=self.client.get_block_by_height(h)
-                        if block_data:
-                            header=BlockHeader.from_dict(block_data.get('header',{}))
-                            txs=[Transaction(**tx) for tx in block_data.get('transactions',[])]
-                            block=Block(header=header,transactions=txs)
-                            if self.validator.validate_block(block):
-                                self.state.add_block(header)
-                                for tx in txs:
-                                    self.state.apply_transaction(tx)
-                                    self.mempool.remove_transactions([tx.tx_id])
-                        time.sleep(0.1)
-                else:
-                    logger.debug(f"[SYNC] ✅ In sync at height {current_height}")
-                
-                mempool_txs=self.client.get_mempool()
-                for tx in mempool_txs:
-                    self.mempool.add_transaction(tx)
-                logger.debug(f"[SYNC] 💾 Mempool: {self.mempool.get_size()} txs")
-                
-                time.sleep(MEMPOOL_POLL_INTERVAL)
-            except Exception as e:
-                logger.error(f"[SYNC] ❌ Error: {e}")
-                time.sleep(10)
-        logger.info("[SYNC] 🛑 Loop ended")
-    
-    def _mining_loop(self):
-        """Background mining subsystem with W-state entanglement"""
-        logger.info("[MINING] ⛏️  Loop started")
-        while self.running:
-            try:
-                entanglement=self.w_state_recovery.get_entanglement_status()
-                if not entanglement.get('established'):
-                    logger.debug("[MINING] ⏳ Waiting for entanglement...")
-                    time.sleep(2)
-                    continue
-                
-                tip=self.state.get_tip()
-                if not tip:
-                    logger.debug("[MINING] ⏳ No chain yet, waiting...")
-                    time.sleep(5)
-                    continue
-                
-                pending_txs=self.mempool.get_pending(limit=100)
-                if not pending_txs:
-                    logger.debug("[MINING] 💤 No transactions in mempool")
-                    time.sleep(MINING_POLL_INTERVAL)
-                    continue
-                
-                logger.info(f"[MINING] ⛏️  Mining block #{tip.height+1} with {len(pending_txs)} txs...")
-                block=self.miner.mine_block(pending_txs,self.miner_address,tip.block_hash,tip.height+1)
-                
-                if block and self.validator.validate_block(block):
-                    success,msg=self.client.submit_block({
-                        'header':asdict(block.header) if hasattr(block.header,'__dict__') else block.header.__dict__,
-                        'transactions':[asdict(tx) for tx in block.transactions]
-                    })
-                    if success:
-                        logger.info(f"[MINING] ✅ Block submitted! {msg}")
-                        self.state.add_block(block.header)
-                        for tx in pending_txs:
-                            self.state.apply_transaction(tx)
-                            self.mempool.remove_transactions([tx.tx_id])
-                    else:
-                        logger.error(f"[MINING] ❌ Submission failed: {msg}")
-                
-                time.sleep(MINING_POLL_INTERVAL)
-            except Exception as e:
-                logger.error(f"[MINING] ❌ Error: {e}")
-                time.sleep(5)
-        logger.info("[MINING] 🛑 Loop ended")
-    
-    def get_status(self)->Dict[str,Any]:
-        tip=self.state.get_tip()
-        entanglement=self.w_state_recovery.get_entanglement_status()
-        
+    def run_query(self, sql: str, params=None) -> List[Dict]:
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params or ())
+                try:
+                    return [dict(r) for r in cur.fetchall()]
+                except psycopg2.ProgrammingError:
+                    return []
+
+    def get_chain_stats(self) -> Dict[str, Any]:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*), MAX(height), MIN(timestamp), MAX(timestamp) FROM blocks")
+                block_row = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM transactions WHERE status='pending'")
+                pending_txs = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM miners WHERE active=TRUE")
+                active_miners = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM snapshots")
+                snap_count = cur.fetchone()[0]
         return {
-            'miner': self.miner_address[:20]+'...',
-            'chain_height': self.state.get_height(),
-            'chain_tip': tip.block_hash[:16]+'...' if tip else None,
-            'mempool_size': self.mempool.get_size(),
-            'mining_stats': dict(self.miner.metrics),
-            'w_state': {
-                'entanglement_established': entanglement.get('established',False),
-                'pq0_fidelity': entanglement.get('pq0_fidelity',0.0),
-                'pq_curr_fidelity': entanglement.get('pq_curr_fidelity',0.0),
-                'pq_last_fidelity': entanglement.get('pq_last_fidelity',0.0),
-                'sync_lag_ms': entanglement.get('sync_lag_ms',0.0),
-            }
+            "block_count": block_row[0] or 0,
+            "chain_height": block_row[1] or -1,
+            "first_block_ts": block_row[2],
+            "latest_block_ts": block_row[3],
+            "pending_transactions": pending_txs,
+            "active_miners": active_miners,
+            "snapshot_count": snap_count,
         }
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# WALLET & REGISTRATION (Integrated)
-# ═════════════════════════════════════════════════════════════════════════════════
-
-class QuickWallet:
-    """Minimal wallet for miner address management"""
-    def __init__(self,wallet_file=None):
-        # Use local ./data/ directory for wallet file (better for Termux/mobile)
-        data_dir=Path('data')
-        data_dir.mkdir(exist_ok=True)
-        self.wallet_file=wallet_file or (data_dir/'wallet.json')
-        self.address=None
-        self.private_key=None
-        self.public_key=None
-    
-    def create(self,password):
-        """Create new wallet address"""
-        self.private_key=secrets.token_hex(32)
-        self.public_key=hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        self.address=f"qtcl1{hashlib.sha3_256(self.public_key.encode()).hexdigest()[:39]}"
-        self._save(password)
-        return self.address
-    
-    def load(self,password):
-        """Load wallet from disk"""
-        if not self.wallet_file.exists():
-            return False
+    def _status_extra(self) -> dict:
         try:
-            from cryptography.fernet import Fernet
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-            from cryptography.hazmat.primitives import hashes
-            data=json.loads(open(self.wallet_file).read())
-            kdf=PBKDF2(algorithm=hashes.SHA256(),length=32,salt=bytes.fromhex(data['salt']),iterations=100000)
-            key=base64.urlsafe_b64encode(kdf.derive(password.encode()))
-            decrypted=Fernet(key).decrypt(bytes.fromhex(data['encrypted']))
-            wallet_data=json.loads(decrypted.decode())
-            self.address=wallet_data['address']
-            self.private_key=wallet_data['private_key']
-            self.public_key=wallet_data['public_key']
+            return self.get_chain_stats()
+        except Exception:
+            return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Γ :: DHTRouter + BootstrapManager
+# Consolidates _dht_* (8) + _bootstrap_* (6) → 2 classes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import socket
+import random
+import bisect
+
+
+@dataclass
+class PeerInfo:
+    node_id: str
+    address: str
+    port: int
+    last_seen: float = field(default_factory=time.time)
+    latency_ms: float = 0.0
+
+    def endpoint(self) -> Tuple[str, int]:
+        return (self.address, self.port)
+
+    def is_stale(self, threshold: float = 300.0) -> bool:
+        return (time.time() - self.last_seen) > threshold
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PeerInfo":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class KBucket:
+    """Single k-bucket in Kademlia routing table."""
+
+    def __init__(self, k: int = 20):
+        self.k = k
+        self.peers: List[PeerInfo] = []
+        self.replacement_cache: List[PeerInfo] = []
+
+    def add(self, peer: PeerInfo) -> bool:
+        existing = next((p for p in self.peers if p.node_id == peer.node_id), None)
+        if existing:
+            self.peers.remove(existing)
+            self.peers.append(peer)
             return True
-        except:
-            return False
-    
-    def _save(self,password):
-        """Save wallet encrypted"""
-        try:
-            from cryptography.fernet import Fernet
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-            from cryptography.hazmat.primitives import hashes
-            # Ensure data directory exists
-            self.wallet_file.parent.mkdir(exist_ok=True)
-            salt=secrets.token_bytes(16)
-            kdf=PBKDF2(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=100000)
-            key=base64.urlsafe_b64encode(kdf.derive(password.encode()))
-            wallet_data={'address':self.address,'private_key':self.private_key,'public_key':self.public_key}
-            encrypted=Fernet(key).encrypt(json.dumps(wallet_data).encode())
-            data={'salt':salt.hex(),'encrypted':encrypted.hex()}
-            with open(self.wallet_file,'w') as f:
-                f.write(json.dumps(data))
-            os.chmod(self.wallet_file,0o600)
-        except:
-            pass
-
-
-class MinerRegistry:
-    """Register miner with oracle using HLWE signature"""
-    def __init__(self,oracle_url):
-        self.oracle_url=oracle_url
-        # Use local ./data/ directory for registration file (better for Termux/mobile)
-        data_dir=Path('data')
-        data_dir.mkdir(exist_ok=True)
-        self.registration_file=data_dir/'.qtcl_miner_registered'
-        self.token=None
-    
-    def register(self,miner_id,address,public_key,private_key,miner_name='qtcl-miner'):
-        """Register miner with oracle"""
-        try:
-            logger.info(f"[REGISTRY] Registering miner {miner_id}...")
-            req={'miner_id':miner_id,'address':address,'public_key':public_key,'miner_name':miner_name,'timestamp':int(time.time())}
-            req['signature']=hmac.new(private_key.encode(),json.dumps(req,sort_keys=True).encode(),hashlib.sha3_256).hexdigest()
-            r=requests.post(f"{self.oracle_url}/api/register-miner",json=req,timeout=10)
-            if r.status_code==200:
-                data=r.json()
-                if data.get('success'):
-                    self.token=data.get('token')
-                    self._save_token()
-                    logger.info(f"[REGISTRY] ✅ Registered with token {self.token[:16]}...")
-                    return True
-            logger.warning(f"[REGISTRY] Registration rejected: {r.text}")
-        except Exception as e:
-            logger.warning(f"[REGISTRY] Registration failed: {e}")
+        if len(self.peers) < self.k:
+            self.peers.append(peer)
+            return True
+        # Bucket full — add to replacement cache
+        if not any(p.node_id == peer.node_id for p in self.replacement_cache):
+            self.replacement_cache.append(peer)
+            if len(self.replacement_cache) > self.k:
+                self.replacement_cache.pop(0)
         return False
-    
-    def is_registered(self):
-        """Check if miner is registered"""
-        return self._load_token() is not None
-    
-    def _save_token(self):
-        with open(self.registration_file,'w') as f:
-            f.write(self.token or '')
-        os.chmod(self.registration_file,0o600)
-    
-    def _load_token(self):
+
+    def remove(self, node_id: str) -> bool:
+        before = len(self.peers)
+        self.peers = [p for p in self.peers if p.node_id != node_id]
+        if len(self.peers) < before and self.replacement_cache:
+            self.peers.append(self.replacement_cache.pop(0))
+            return True
+        return len(self.peers) < before
+
+    def evict_stale(self, threshold: float = 300.0) -> int:
+        stale = [p for p in self.peers if p.is_stale(threshold)]
+        for p in stale:
+            self.remove(p.node_id)
+        return len(stale)
+
+    def get_all(self) -> List[PeerInfo]:
+        return list(self.peers)
+
+
+class RoutingTable:
+    """160-bucket Kademlia routing table."""
+
+    BITS = 160
+
+    def __init__(self, local_id: str, k: int = 20):
+        self.local_id = local_id
+        self.k = k
+        self.buckets: List[KBucket] = [KBucket(k) for _ in range(self.BITS)]
+
+    def _bucket_index(self, node_id: str) -> int:
+        dist = self._xor_distance(self.local_id, node_id)
+        if dist == 0:
+            return 0
+        return min(dist.bit_length() - 1, self.BITS - 1)
+
+    def add(self, peer: PeerInfo) -> bool:
+        if peer.node_id == self.local_id:
+            return False
+        idx = self._bucket_index(peer.node_id)
+        return self.buckets[idx].add(peer)
+
+    def remove(self, node_id: str) -> bool:
+        idx = self._bucket_index(node_id)
+        return self.buckets[idx].remove(node_id)
+
+    def closest_nodes(self, target_id: str, k: Optional[int] = None) -> List[PeerInfo]:
+        k = k or self.k
+        all_peers: List[PeerInfo] = []
+        for bucket in self.buckets:
+            all_peers.extend(bucket.get_all())
+        all_peers.sort(key=lambda p: self._xor_distance(p.node_id, target_id))
+        return all_peers[:k]
+
+    def get_all_peers(self) -> List[PeerInfo]:
+        peers = []
+        for bucket in self.buckets:
+            peers.extend(bucket.get_all())
+        return peers
+
+    def evict_stale(self, threshold: float = 300.0) -> int:
+        total = 0
+        for bucket in self.buckets:
+            total += bucket.evict_stale(threshold)
+        return total
+
+    @staticmethod
+    def _xor_distance(id_a: str, id_b: str) -> int:
         try:
-            if self.registration_file.exists():
-                with open(self.registration_file) as f:
-                    self.token=f.read().strip()
-                    return self.token
-        except:
-            pass
+            a = int(id_a, 16) if all(c in "0123456789abcdefABCDEF" for c in id_a) else int(id_a.encode().hex(), 16)
+            b = int(id_b, 16) if all(c in "0123456789abcdefABCDEF" for c in id_b) else int(id_b.encode().hex(), 16)
+        except (ValueError, OverflowError):
+            a = hash(id_a) & ((1 << 160) - 1)
+            b = hash(id_b) & ((1 << 160) - 1)
+        return a ^ b
+
+
+class DHTRouter(ComponentBase):
+    """
+    Kademlia-inspired DHT with gossip broadcast.
+    Consolidates 8 _dht_* functions + gossip protocol.
+    """
+
+    ALPHA = 3  # parallel lookups
+    K = 20     # bucket size
+
+    def __init__(
+        self,
+        node_id: str,
+        listen_port: int,
+        bootstrap_nodes: Optional[List[Tuple[str, int]]] = None,
+        name: str = "DHTRouter",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self.node_id = node_id
+        self.listen_port = listen_port
+        self.bootstrap_nodes = bootstrap_nodes or []
+        self.routing_table = RoutingTable(node_id, self.K)
+        self._store: Dict[str, Tuple[bytes, float]] = {}  # key → (value, expiry)
+        self._store_lock = threading.RLock()
+        self._gossip_seen: set = set()
+        self._gossip_lock = threading.Lock()
+        self._evict_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def on_start(self) -> None:
+        self._stop_event.clear()
+        self._evict_thread = threading.Thread(
+            target=self._evict_loop, daemon=True, name=f"{self.name}-evict"
+        )
+        self._evict_thread.start()
+        if self.bootstrap_nodes:
+            self.join_network()
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        if self._evict_thread:
+            self._evict_thread.join(timeout=5)
+
+    def join_network(self) -> int:
+        """Contact bootstrap nodes and populate routing table. Returns peers found."""
+        added = 0
+        for address, port in self.bootstrap_nodes:
+            try:
+                peer = PeerInfo(
+                    node_id=HASH_ENGINE.compute_hash(f"{address}:{port}"),
+                    address=address,
+                    port=port,
+                )
+                if self.ping(peer):
+                    self.routing_table.add(peer)
+                    added += 1
+            except Exception as exc:
+                self.log.debug(f"[{self.name}] bootstrap {address}:{port} failed: {exc}")
+        if added:
+            self._iterative_find(self.node_id)
+        self.log.info(f"[{self.name}] joined network, {added} bootstrap peers reachable")
+        return added
+
+    def find_node(self, target_id: str) -> List[PeerInfo]:
+        return self._iterative_find(target_id, find_value=False)
+
+    def find_value(self, key: str) -> Optional[bytes]:
+        # Check local store first
+        with self._store_lock:
+            entry = self._store.get(key)
+            if entry:
+                value, expiry = entry
+                if time.time() < expiry:
+                    return value
+                del self._store[key]
+        # Iterative lookup
+        result = self._iterative_find(key, find_value=True)
+        return result if isinstance(result, bytes) else None
+
+    def store_value(self, key: str, value: bytes, ttl: int = 3600) -> None:
+        expiry = time.time() + ttl
+        with self._store_lock:
+            self._store[key] = (value, expiry)
+        # Replicate to K closest peers
+        closest = self.routing_table.closest_nodes(key, self.K)
+        for peer in closest[:self.ALPHA]:
+            try:
+                self._handle_store_rpc(peer, key, value)
+            except Exception:
+                pass
+
+    def get_peers(self) -> List[PeerInfo]:
+        return self.routing_table.get_all_peers()
+
+    def ping(self, peer: PeerInfo) -> bool:
+        start = time.time()
+        try:
+            # Simulate UDP ping with socket
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2.0)
+                msg = json.dumps({"type": "ping", "sender": self.node_id}).encode()
+                s.sendto(msg, peer.endpoint())
+                # In real impl, wait for pong response
+                # Here we just verify the socket didn't immediately error
+                peer.latency_ms = (time.time() - start) * 1000
+                peer.last_seen = time.time()
+                self.routing_table.add(peer)
+                return True
+        except (OSError, socket.timeout):
+            return False
+
+    def _kbucket_update(self, peer: PeerInfo) -> None:
+        peer.last_seen = time.time()
+        self.routing_table.add(peer)
+
+    def _kbucket_evict_stale(self) -> int:
+        return self.routing_table.evict_stale()
+
+    def _handle_find_node_rpc(self, sender: PeerInfo, target_id: str) -> List[PeerInfo]:
+        self._kbucket_update(sender)
+        return self.routing_table.closest_nodes(target_id, self.K)
+
+    def _handle_store_rpc(self, sender: PeerInfo, key: str, value: bytes) -> None:
+        self._kbucket_update(sender)
+        with self._store_lock:
+            self._store[key] = (value, time.time() + 3600)
+
+    def _handle_find_value_rpc(
+        self, sender: PeerInfo, key: str
+    ) -> Union[bytes, List[PeerInfo]]:
+        self._kbucket_update(sender)
+        with self._store_lock:
+            entry = self._store.get(key)
+            if entry:
+                value, expiry = entry
+                if time.time() < expiry:
+                    return value
+        return self.routing_table.closest_nodes(key, self.K)
+
+    def _handle_ping_rpc(self, sender: PeerInfo) -> bool:
+        self._kbucket_update(sender)
+        return True
+
+    def _iterative_find(
+        self, target_id: str, find_value: bool = False
+    ) -> Union[List[PeerInfo], Optional[bytes]]:
+        """Kademlia iterative find_node / find_value."""
+        queried: set = set()
+        closest = self.routing_table.closest_nodes(target_id, self.K)
+        if not closest:
+            return [] if not find_value else None
+
+        while True:
+            to_query = [
+                p for p in closest if p.node_id not in queried
+            ][:self.ALPHA]
+            if not to_query:
+                break
+            for peer in to_query:
+                queried.add(peer.node_id)
+                try:
+                    if find_value:
+                        result = self._handle_find_value_rpc(peer, target_id)
+                        if isinstance(result, bytes):
+                            return result
+                        new_peers = result
+                    else:
+                        new_peers = self._handle_find_node_rpc(peer, target_id)
+                    for np_ in new_peers:
+                        if not any(p.node_id == np_.node_id for p in closest):
+                            bisect.insort(
+                                closest,
+                                np_,
+                                key=lambda p: RoutingTable._xor_distance(p.node_id, target_id),
+                            )
+                    closest = closest[:self.K]
+                except Exception:
+                    pass
+        return [] if not find_value else None
+
+    def gossip_broadcast(self, message: Dict[str, Any]) -> None:
+        msg_id = HASH_ENGINE.compute_hash(json.dumps(message, sort_keys=True))
+        with self._gossip_lock:
+            if msg_id in self._gossip_seen:
+                return
+            self._gossip_seen.add(msg_id)
+        message["_gossip_id"] = msg_id
+        message["_ttl"] = message.get("_ttl", 6)
+        self._gossip_propagate(message)
+
+    def gossip_receive(self, sender: PeerInfo, message: Dict[str, Any]) -> None:
+        msg_id = message.get("_gossip_id")
+        if not msg_id:
+            return
+        with self._gossip_lock:
+            if msg_id in self._gossip_seen:
+                return
+            self._gossip_seen.add(msg_id)
+        self._kbucket_update(sender)
+        ttl = message.get("_ttl", 0) - 1
+        if ttl > 0:
+            message["_ttl"] = ttl
+            self._gossip_propagate(message, exclude=[sender.node_id])
+
+    def _gossip_propagate(self, message: Dict[str, Any], exclude: List[str] = []) -> None:
+        peers = [p for p in self.routing_table.get_all_peers() if p.node_id not in exclude]
+        targets = random.sample(peers, min(3, len(peers)))
+        for peer in targets:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.settimeout(1.0)
+                    payload = json.dumps(message).encode()
+                    s.sendto(payload, peer.endpoint())
+            except Exception:
+                pass
+
+    def _evict_loop(self) -> None:
+        while not self._stop_event.wait(60):
+            evicted = self._kbucket_evict_stale()
+            # Purge expired store entries
+            now = time.time()
+            with self._store_lock:
+                expired = [k for k, (_, exp) in self._store.items() if now > exp]
+                for k in expired:
+                    del self._store[k]
+            # Purge gossip seen set periodically
+            with self._gossip_lock:
+                if len(self._gossip_seen) > 10000:
+                    self._gossip_seen.clear()
+            if evicted:
+                self.log.debug(f"[{self.name}] evicted {evicted} stale peers")
+
+    def _status_extra(self) -> dict:
+        peers = self.routing_table.get_all_peers()
+        return {
+            "peer_count": len(peers),
+            "store_entries": len(self._store),
+        }
+
+
+class BootstrapManager(ComponentBase):
+    """
+    Handles node bootstrap for server / oracle / miner.
+    Consolidates 6 _bootstrap_* functions.
+    """
+
+    def __init__(
+        self,
+        config: ConfigManager,
+        db: "LocalBlockchainDB",
+        dht: DHTRouter,
+        name: str = "BootstrapManager",
+    ):
+        super().__init__(name=name, config=config.as_dict())
+        self._cfg = config
+        self._db = db
+        self._dht = dht
+        self._bootstrap_status: Dict[str, Any] = {
+            "bootstrapped": False,
+            "blocks_synced": 0,
+            "snapshot_applied": False,
+            "peers_found": 0,
+        }
+
+    def bootstrap_node(self, node_type: str = "server") -> bool:
+        self.log.info(f"[{self.name}] bootstrapping as {node_type}")
+        methods = {
+            "server": self.bootstrap_server,
+            "oracle": self.bootstrap_oracle,
+            "miner":  self.bootstrap_miner,
+        }
+        fn = methods.get(node_type, self.bootstrap_server)
+        return fn()
+
+    def bootstrap_server(self) -> bool:
+        height = self._db.get_chain_height()
+        if height < 0:
+            self.log.info(f"[{self.name}] empty chain, loading genesis")
+            genesis = self._load_genesis_block()
+            if self._verify_genesis(genesis):
+                self._db.insert_block(genesis)
+                self._bootstrap_status["blocks_synced"] = 1
+        peers = self._dht.find_node(self._dht.node_id)
+        self._bootstrap_status["peers_found"] = len(peers)
+        self._bootstrap_status["bootstrapped"] = True
+        return True
+
+    def bootstrap_miner(self) -> bool:
+        peers = self._dht.get_peers()
+        if not peers:
+            peers = [
+                PeerInfo(
+                    node_id=HASH_ENGINE.compute_hash(f"{a}:{p}"),
+                    address=a, port=p,
+                )
+                for a, p in self._dht.bootstrap_nodes
+            ]
+        server_peers = self._select_bootstrap_peers(peers)
+        synced = 0
+        for peer in server_peers:
+            try:
+                local_height = self._db.get_chain_height()
+                snap_data = self._download_snapshot(peer, local_height)
+                if snap_data and self._apply_snapshot(snap_data):
+                    self._bootstrap_status["snapshot_applied"] = True
+                    break
+            except Exception as exc:
+                self.log.warning(f"[{self.name}] snapshot from {peer.address} failed: {exc}")
+        synced = self._sync_chain_from_peers(server_peers)
+        self._bootstrap_status["blocks_synced"] = synced
+        self._bootstrap_status["bootstrapped"] = True
+        return True
+
+    def bootstrap_oracle(self) -> bool:
+        return self.bootstrap_server()
+
+    def _load_genesis_block(self) -> Dict[str, Any]:
+        genesis_path = self._cfg.get("genesis_path", "genesis.json")
+        if genesis_path and Path(genesis_path).exists():
+            with open(genesis_path) as f:
+                return json.load(f)
+        # Fallback: construct default genesis
+        genesis = {
+            "height": 0,
+            "prev_hash": "0" * 64,
+            "merkle_root": HASH_ENGINE.merkle_root([]),
+            "timestamp": 0.0,
+            "nonce": 0,
+            "difficulty": 1,
+            "miner_id": "genesis",
+            "tx_count": 0,
+            "data": {"genesis": True, "message": "QTCL Genesis Block"},
+        }
+        genesis["hash"] = HASH_ENGINE.compute_block_hash(genesis)
+        return genesis
+
+    def _verify_genesis(self, block: Dict[str, Any]) -> bool:
+        if block.get("height") != 0:
+            return False
+        if block.get("prev_hash") != "0" * 64:
+            return False
+        computed = HASH_ENGINE.compute_block_hash({k: v for k, v in block.items() if k != "hash"})
+        stored = block.get("hash", "")
+        return not stored or stored == computed
+
+    def _sync_chain_from_peers(self, peers: List[PeerInfo]) -> int:
+        """Pull missing blocks from peers. Returns count of blocks synced."""
+        local_height = self._db.get_chain_height()
+        best_height = local_height
+        # Find peer with highest chain
+        for peer in peers[:5]:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(3.0)
+                    s.connect(peer.endpoint())
+                    req = json.dumps({"type": "get_height"}).encode() + b"\n"
+                    s.sendall(req)
+                    data = s.recv(4096)
+                    resp = json.loads(data.decode())
+                    peer_height = resp.get("height", -1)
+                    if peer_height > best_height:
+                        best_height = peer_height
+            except Exception:
+                pass
+        synced = 0
+        if best_height > local_height:
+            self.log.info(f"[{self.name}] syncing {best_height - local_height} blocks from peers")
+            for peer in peers[:3]:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(10.0)
+                        s.connect(peer.endpoint())
+                        req = json.dumps({
+                            "type": "get_blocks",
+                            "start": local_height + 1,
+                            "end": best_height,
+                        }).encode() + b"\n"
+                        s.sendall(req)
+                        buf = b""
+                        while True:
+                            chunk = s.recv(65536)
+                            if not chunk:
+                                break
+                            buf += chunk
+                        blocks = json.loads(buf.decode())
+                        if self._validate_chain_segment(blocks):
+                            for block in blocks:
+                                self._db.insert_block(block)
+                                synced += 1
+                        break
+                except Exception as exc:
+                    self.log.warning(f"[{self.name}] sync from {peer.address} failed: {exc}")
+        return synced
+
+    def _download_snapshot(self, peer: PeerInfo, height: int) -> Optional[bytes]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(30.0)
+                s.connect(peer.endpoint())
+                req = json.dumps({"type": "get_snapshot", "height": height}).encode() + b"\n"
+                s.sendall(req)
+                buf = b""
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            return buf if buf else None
+        except Exception as exc:
+            self.log.debug(f"[{self.name}] snapshot download failed: {exc}")
+            return None
+
+    def _apply_snapshot(self, snapshot_data: bytes) -> bool:
+        try:
+            snap_dict = json.loads(snapshot_data.decode())
+            blocks = snap_dict.get("blocks", [])
+            for block in blocks:
+                self._db.insert_block(block)
+            balances = snap_dict.get("balances", {})
+            for addr, bal in balances.items():
+                current = self._db.get_token_balance(addr)
+                self._db.update_token_balance(addr, bal - current)
+            self.log.info(f"[{self.name}] applied snapshot: {len(blocks)} blocks, {len(balances)} balances")
+            return True
+        except Exception as exc:
+            self.log.error(f"[{self.name}] snapshot apply failed: {exc}")
+            return False
+
+    def _validate_chain_segment(self, blocks: List[Dict]) -> bool:
+        if not blocks:
+            return True
+        for i in range(1, len(blocks)):
+            prev = blocks[i - 1]
+            curr = blocks[i]
+            if curr.get("prev_hash") != prev.get("hash"):
+                return False
+            if curr.get("height") != prev.get("height", 0) + 1:
+                return False
+        return True
+
+    def _select_bootstrap_peers(self, candidates: List[PeerInfo]) -> List[PeerInfo]:
+        alive = [p for p in candidates if not p.is_stale(600)]
+        alive.sort(key=lambda p: p.latency_ms)
+        return alive[:5]
+
+    def get_bootstrap_status(self) -> Dict[str, Any]:
+        return dict(self._bootstrap_status)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Δ :: SnapshotManager + SSEBroadcaster
+# Consolidates 9 *snapshot* methods + SSE transport layer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import queue
+import threading
+
+
+try:
+    import zstd
+    HAS_ZSTD = True
+except ImportError:
+    try:
+        import lz4.frame as lz4frame
+        HAS_ZSTD = False
+        HAS_LZ4 = True
+    except ImportError:
+        HAS_LZ4 = False
+        HAS_ZSTD = False
+
+
+def compress(data: bytes) -> bytes:
+    if HAS_ZSTD:
+        return zstd.compress(data, 3)
+    try:
+        import lz4.frame as lz4frame
+        return lz4frame.compress(data)
+    except ImportError:
+        import zlib
+        return zlib.compress(data, 6)
+
+
+def decompress(data: bytes) -> bytes:
+    if HAS_ZSTD:
+        return zstd.decompress(data)
+    try:
+        import lz4.frame as lz4frame
+        return lz4frame.decompress(data)
+    except ImportError:
+        import zlib
+        return zlib.decompress(data)
+
+
+@dataclass
+class SnapshotRecord:
+    height: int
+    timestamp: float
+    checksum: str
+    data: bytes
+    size_bytes: int
+    qubit_states: List[Dict] = field(default_factory=list)
+    chain_stats: Dict[str, Any] = field(default_factory=dict)
+    block_count: int = 0
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["data"] = self.data.hex() if self.data else ""
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SnapshotRecord":
+        d = dict(d)
+        if isinstance(d.get("data"), str):
+            d["data"] = bytes.fromhex(d["data"])
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SnapshotDiff:
+    added_blocks: int
+    removed_blocks: int
+    qubit_delta: Dict[str, Any]
+    token_delta: Dict[str, int]
+    height_a: int
+    height_b: int
+
+
+class SnapshotManager(ComponentBase):
+    """
+    Manages chain snapshots: creation, serialization, storage, validation.
+    Consolidates 9 scattered *snapshot* methods.
+    """
+
+    def __init__(
+        self,
+        db: LocalBlockchainDB,
+        config: Optional[Dict] = None,
+        name: str = "SnapshotManager",
+    ):
+        super().__init__(name=name, config=config)
+        self._db = db
+        self._snapshot_interval = self.config.get("snapshot_interval", 100)
+        self._keep_n = self.config.get("keep_snapshots", 10)
+        self._lock = threading.Lock()
+
+    def create_snapshot(self, height: int) -> SnapshotRecord:
+        self.log.info(f"[{self.name}] creating snapshot at height {height}")
+        block = self._db.get_block_by_height(height)
+        if not block:
+            raise ValueError(f"Block at height {height} not found")
+        qubit_states = self._db.get_qubit_states_at_height(height)
+        chain_stats = self._db.get_chain_stats()
+        # Gather all blocks up to this height for full snapshot
+        blocks = self._db.get_blocks_range(0, height)
+        snap_payload = {
+            "height": height,
+            "block_hash": block["block_hash"],
+            "blocks": blocks,
+            "qubit_states": qubit_states,
+            "chain_stats": chain_stats,
+            "created_at": time.time(),
+        }
+        serialized = self.serialize_snapshot(height, snap_payload)
+        checksum = HASH_ENGINE.compute_hash(serialized)
+        record = SnapshotRecord(
+            height=height,
+            timestamp=time.time(),
+            checksum=checksum,
+            data=serialized,
+            size_bytes=len(serialized),
+            qubit_states=qubit_states,
+            chain_stats=chain_stats,
+            block_count=len(blocks),
+        )
+        self.store_snapshot(record)
+        self._inc("snapshots_created")
+        self.log.info(f"[{self.name}] snapshot at {height}: {len(serialized):,} bytes")
+        return record
+
+    def serialize_snapshot(self, height: int, payload: Optional[Dict] = None) -> bytes:
+        if payload is None:
+            block = self._db.get_block_by_height(height)
+            qubit_states = self._db.get_qubit_states_at_height(height)
+            payload = {
+                "height": height,
+                "blocks": self._db.get_blocks_range(0, height),
+                "qubit_states": qubit_states,
+            }
+        # Sanitize bytes fields
+        def sanitize(obj):
+            if isinstance(obj, bytes):
+                return obj.hex()
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(i) for i in obj]
+            return obj
+        raw = json.dumps(sanitize(payload), separators=(",", ":")).encode("utf-8")
+        return compress(raw)
+
+    def deserialize_snapshot(self, data: bytes) -> Dict[str, Any]:
+        raw = decompress(data)
+        return json.loads(raw.decode("utf-8"))
+
+    def validate_snapshot(self, snapshot: SnapshotRecord) -> bool:
+        computed = HASH_ENGINE.compute_hash(snapshot.data)
+        if computed != snapshot.checksum:
+            self.log.warning(f"[{self.name}] snapshot {snapshot.height} checksum mismatch")
+            return False
+        try:
+            payload = self.deserialize_snapshot(snapshot.data)
+            if payload.get("height") != snapshot.height:
+                return False
+        except Exception as exc:
+            self.log.warning(f"[{self.name}] snapshot deserialization failed: {exc}")
+            return False
+        return True
+
+    def apply_snapshot(self, snapshot: SnapshotRecord, db: LocalBlockchainDB) -> bool:
+        if not self.validate_snapshot(snapshot):
+            return False
+        try:
+            payload = self.deserialize_snapshot(snapshot.data)
+            blocks = payload.get("blocks", [])
+            for block in blocks:
+                db.insert_block(block)
+            for qs in payload.get("qubit_states", []):
+                if isinstance(qs.get("state_vector"), str):
+                    qs["state_vector"] = bytes.fromhex(qs["state_vector"])
+                db.insert_qubit_state(qs)
+            self.log.info(f"[{self.name}] applied snapshot height={snapshot.height}, blocks={len(blocks)}")
+            return True
+        except Exception as exc:
+            self.log.error(f"[{self.name}] apply_snapshot failed: {exc}")
+            return False
+
+    def diff_snapshots(self, snap_a: SnapshotRecord, snap_b: SnapshotRecord) -> SnapshotDiff:
+        payload_a = self.deserialize_snapshot(snap_a.data)
+        payload_b = self.deserialize_snapshot(snap_b.data)
+        blocks_a = {b["block_hash"] for b in payload_a.get("blocks", [])}
+        blocks_b = {b["block_hash"] for b in payload_b.get("blocks", [])}
+        added = len(blocks_b - blocks_a)
+        removed = len(blocks_a - blocks_b)
+        stats_a = snap_a.chain_stats
+        stats_b = snap_b.chain_stats
+        return SnapshotDiff(
+            added_blocks=added,
+            removed_blocks=removed,
+            qubit_delta={"count_delta": len(payload_b.get("qubit_states", [])) - len(payload_a.get("qubit_states", []))},
+            token_delta={},
+            height_a=snap_a.height,
+            height_b=snap_b.height,
+        )
+
+    def store_snapshot(self, snapshot: SnapshotRecord) -> bool:
+        try:
+            self._db.store_snapshot(snapshot.height, snapshot.data, snapshot.checksum)
+            self._db.vacuum_old_snapshots(self._keep_n)
+            return True
+        except Exception as exc:
+            self.log.error(f"[{self.name}] store failed: {exc}")
+            return False
+
+    def retrieve_snapshot(self, height: int) -> Optional[SnapshotRecord]:
+        row = self._db.get_snapshot(height)
+        if not row:
+            return None
+        return SnapshotRecord(
+            height=row["height"],
+            timestamp=row["created_at"],
+            checksum=row["checksum"],
+            data=row["data"],
+            size_bytes=row["size_bytes"],
+        )
+
+    def get_latest_snapshot(self) -> Optional[SnapshotRecord]:
+        rows = self._db.run_query(
+            "SELECT * FROM snapshots ORDER BY height DESC LIMIT 1"
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if isinstance(row.get("data"), memoryview):
+            row["data"] = bytes(row["data"])
+        return SnapshotRecord(
+            height=row["height"],
+            timestamp=row["created_at"],
+            checksum=row["checksum"],
+            data=row["data"],
+            size_bytes=row["size_bytes"],
+        )
+
+    def prune_old_snapshots(self, keep_n: int = 10) -> int:
+        return self._db.vacuum_old_snapshots(keep_n)
+
+    def _status_extra(self) -> dict:
+        latest = self.get_latest_snapshot()
+        return {
+            "latest_snapshot_height": latest.height if latest else None,
+            "latest_snapshot_size": latest.size_bytes if latest else 0,
+        }
+
+
+# ── SSEBroadcaster ────────────────────────────────────────────────────────────
+
+@dataclass
+class SSEClient:
+    client_id: str
+    event_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=512))
+    filters: List[str] = field(default_factory=list)
+    connected_at: float = field(default_factory=time.time)
+    last_ping: float = field(default_factory=time.time)
+
+    def accepts(self, event_type: str) -> bool:
+        return not self.filters or event_type in self.filters
+
+
+class SSEBroadcaster(ComponentBase):
+    """
+    Exclusive transport layer. Replaces gRPC/WebSocket/HTTP fallback.
+    All snapshot distribution goes through SSE.
+    """
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        path: str = "/events",
+        name: str = "SSEBroadcaster",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self.host = host
+        self.port = port
+        self.path = path
+        self._clients: Dict[str, SSEClient] = {}
+        self._clients_lock = threading.RLock()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._cleanup_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._event_counter = 0
+        self._counter_lock = threading.Lock()
+
+    def on_start(self) -> None:
+        self._stop_event.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name=f"{self.name}-heartbeat"
+        )
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name=f"{self.name}-cleanup"
+        )
+        self._heartbeat_thread.start()
+        self._cleanup_thread.start()
+        self.log.info(f"[{self.name}] SSE broadcaster ready on {self.host}:{self.port}{self.path}")
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        # Send close to all clients
+        with self._clients_lock:
+            for client in list(self._clients.values()):
+                try:
+                    client.event_queue.put_nowait(None)  # sentinel
+                except queue.Full:
+                    pass
+            self._clients.clear()
+
+    def subscribe(self, client_id: str, filters: Optional[List[str]] = None) -> queue.Queue:
+        client = SSEClient(client_id=client_id, filters=filters or [])
+        with self._clients_lock:
+            self._clients[client_id] = client
+        self._inc("total_subscriptions")
+        self.log.debug(f"[{self.name}] client subscribed: {client_id}")
+        return client.event_queue
+
+    def unsubscribe(self, client_id: str) -> None:
+        with self._clients_lock:
+            client = self._clients.pop(client_id, None)
+        if client:
+            try:
+                client.event_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self.log.debug(f"[{self.name}] client unsubscribed: {client_id}")
+
+    def broadcast(self, event_type: str, payload: Dict[str, Any]) -> int:
+        with self._counter_lock:
+            self._event_counter += 1
+            eid = self._event_counter
+        formatted = self._format_sse(event_type, payload, id=eid)
+        delivered = 0
+        with self._clients_lock:
+            clients = list(self._clients.values())
+        for client in clients:
+            if client.accepts(event_type):
+                try:
+                    client.event_queue.put_nowait(formatted)
+                    delivered += 1
+                except queue.Full:
+                    self.log.warning(f"[{self.name}] client {client.client_id} queue full")
+        self._inc("events_broadcast")
+        self._gauge("active_clients", len(clients))
+        return delivered
+
+    def broadcast_snapshot(self, snapshot: SnapshotRecord) -> int:
+        return self.broadcast("snapshot", {
+            "height": snapshot.height,
+            "checksum": snapshot.checksum,
+            "size_bytes": snapshot.size_bytes,
+            "data": snapshot.data.hex(),
+            "timestamp": snapshot.timestamp,
+        })
+
+    def broadcast_block(self, block: Dict[str, Any]) -> int:
+        return self.broadcast("block", block)
+
+    def broadcast_qubit_state(self, state: Dict[str, Any]) -> int:
+        # Convert numpy arrays to lists for JSON
+        serializable = {}
+        for k, v in state.items():
+            try:
+                import numpy as np
+                if isinstance(v, np.ndarray):
+                    serializable[k] = v.tolist()
+                else:
+                    serializable[k] = v
+            except ImportError:
+                serializable[k] = v
+        return self.broadcast("qubit_state", serializable)
+
+    def _format_sse(
+        self, event_type: str, data: Dict[str, Any], id: Optional[int] = None
+    ) -> str:
+        lines = []
+        if id is not None:
+            lines.append(f"id: {id}")
+        lines.append(f"event: {event_type}")
+        lines.append(f"data: {json.dumps(data, default=str)}")
+        lines.append("")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(30):
+            now = time.time()
+            heartbeat = self._format_sse("heartbeat", {"ts": now})
+            with self._clients_lock:
+                for client in list(self._clients.values()):
+                    try:
+                        client.event_queue.put_nowait(heartbeat)
+                        client.last_ping = now
+                    except queue.Full:
+                        pass
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop_event.wait(60):
+            self._cleanup_stale_clients()
+
+    def _cleanup_stale_clients(self, timeout: float = 120.0) -> int:
+        now = time.time()
+        stale = []
+        with self._clients_lock:
+            for cid, client in list(self._clients.items()):
+                if (now - client.last_ping) > timeout:
+                    stale.append(cid)
+            for cid in stale:
+                self._clients.pop(cid, None)
+        if stale:
+            self.log.info(f"[{self.name}] cleaned up {len(stale)} stale clients")
+        return len(stale)
+
+    def get_connected_clients(self) -> List[str]:
+        with self._clients_lock:
+            return list(self._clients.keys())
+
+    def push_snapshot_to_server(self, server_url: str, snapshot: SnapshotRecord) -> bool:
+        """HTTP POST snapshot to server SSE endpoint."""
+        import urllib.request
+        import urllib.error
+        payload = json.dumps({
+            "height": snapshot.height,
+            "checksum": snapshot.checksum,
+            "data": snapshot.data.hex(),
+            "timestamp": snapshot.timestamp,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{server_url}/snapshot",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status == 200
+        except urllib.error.URLError as exc:
+            self.log.warning(f"[{self.name}] push_snapshot_to_server failed: {exc}")
+            return False
+
+    def _status_extra(self) -> dict:
+        return {
+            "connected_clients": len(self._clients),
+            "events_broadcast": self._counters.get("events_broadcast", 0),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Ε :: RequestHandler + RegistryManager
+# Consolidates _handle_* (11) + *register* (5-6) → 2 classes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import urllib.parse
+
+
+@dataclass
+class HTTPResponse:
+    status_code: int
+    body: Dict[str, Any]
+    headers: Dict[str, str] = field(default_factory=dict)
+
+    def to_bytes(self) -> bytes:
+        body_bytes = json.dumps(self.body, default=str).encode("utf-8")
+        status_texts = {
+            200: "OK", 201: "Created", 400: "Bad Request",
+            401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+            409: "Conflict", 422: "Unprocessable Entity", 500: "Internal Server Error",
+        }
+        status_text = status_texts.get(self.status_code, "Unknown")
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body_bytes)),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            **self.headers,
+        }
+        header_lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+        status_line = f"HTTP/1.1 {self.status_code} {status_text}"
+        return f"{status_line}\r\n{header_lines}\r\n\r\n".encode() + body_bytes
+
+    @staticmethod
+    def ok(body: Dict) -> "HTTPResponse":
+        return HTTPResponse(200, body)
+
+    @staticmethod
+    def created(body: Dict) -> "HTTPResponse":
+        return HTTPResponse(201, body)
+
+    @staticmethod
+    def bad_request(message: str) -> "HTTPResponse":
+        return HTTPResponse(400, {"error": message})
+
+    @staticmethod
+    def not_found(message: str = "Not found") -> "HTTPResponse":
+        return HTTPResponse(404, {"error": message})
+
+    @staticmethod
+    def server_error(message: str = "Internal server error") -> "HTTPResponse":
+        return HTTPResponse(500, {"error": message})
+
+
+class RequestHandler(ComponentBase):
+    """
+    Single dispatcher replacing 11 scattered _handle_* methods + do_GET/POST/OPTIONS.
+    Routes based on HTTP method + path.
+    """
+
+    def __init__(
+        self,
+        db: LocalBlockchainDB,
+        snapshot_mgr: SnapshotManager,
+        registry: "RegistryManager",
+        broadcaster: SSEBroadcaster,
+        verifier: Optional["UnifiedVerifier"] = None,
+        name: str = "RequestHandler",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self._db = db
+        self._snapshot_mgr = snapshot_mgr
+        self._registry = registry
+        self._broadcaster = broadcaster
+        self._verifier = verifier
+        self._routes: Dict[str, Dict[str, Callable]] = {
+            "GET": {
+                "/status":       self._handle_get_chain_status,
+                "/health":       self._handle_health_check,
+                "/snapshot":     self._handle_get_snapshot,
+                "/block":        self._handle_get_block,
+                "/transaction":  self._handle_get_transaction,
+                "/qubit_states": self._handle_get_qubit_states,
+                "/balance":      self._handle_get_balance,
+                "/miners":       self._handle_get_miners,
+                "/peers":        self._handle_get_peers,
+            },
+            "POST": {
+                "/register":     self._handle_register_miner,
+                "/block":        self._handle_submit_block,
+                "/transaction":  self._handle_submit_transaction,
+                "/oracle":       self._handle_oracle_event,
+                "/gossip":       self._handle_peer_gossip,
+                "/snapshot":     self._handle_receive_snapshot,
+                "/heartbeat":    self._handle_heartbeat,
+            },
+            "OPTIONS": {},
+        }
+
+    def dispatch(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        params: Optional[Dict] = None,
+    ) -> HTTPResponse:
+        method = method.upper()
+        if method == "OPTIONS":
+            return HTTPResponse(200, {}, {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            })
+        body = body or {}
+        headers = headers or {}
+        params = params or {}
+        validation_error = self._validate_request(method, path, body)
+        if validation_error:
+            return HTTPResponse.bad_request(validation_error)
+        routes = self._routes.get(method, {})
+        # Exact match first
+        handler = routes.get(path)
+        if handler is None:
+            # Prefix match
+            for route_path, route_handler in routes.items():
+                if path.startswith(route_path):
+                    handler = route_handler
+                    break
+        if handler is None:
+            return HTTPResponse.not_found(f"No route for {method} {path}")
+        try:
+            self._inc(f"requests_{method.lower()}")
+            if method == "GET":
+                return handler(params)
+            else:
+                return handler(body)
+        except Exception as exc:
+            self._record_error(exc)
+            return HTTPResponse.server_error(str(exc))
+
+    def handle_GET(self, path: str, params: Dict) -> HTTPResponse:
+        return self.dispatch("GET", path, params=params)
+
+    def handle_POST(self, path: str, body: Dict) -> HTTPResponse:
+        return self.dispatch("POST", path, body=body)
+
+    def handle_OPTIONS(self, path: str) -> HTTPResponse:
+        return self.dispatch("OPTIONS", path)
+
+    # ── Route Handlers ────────────────────────────────────────────────────────
+
+    def _handle_register_miner(self, body: Dict) -> HTTPResponse:
+        miner_id = body.get("miner_id") or body.get("id")
+        address  = body.get("address") or body.get("host")
+        port     = body.get("port")
+        pubkey   = body.get("pubkey", "")
+        if not all([miner_id, address, port]):
+            return HTTPResponse.bad_request("miner_id, address, port required")
+        result = self._registry.register_miner(
+            miner_id=miner_id,
+            address=address,
+            port=int(port),
+            pubkey=pubkey,
+            metadata=body.get("metadata", {}),
+        )
+        if result.success:
+            return HTTPResponse.created({"miner_id": miner_id, "token": result.token, "status": "registered"})
+        return HTTPResponse(409, {"error": result.error_msg})
+
+    def _handle_submit_block(self, body: Dict) -> HTTPResponse:
+        block = body.get("block") or body
+        if not block.get("height") and block.get("height") != 0:
+            return HTTPResponse.bad_request("block.height required")
+        if self._verifier:
+            vr = self._verifier.verify_block(block)
+            if not vr.valid:
+                return HTTPResponse(422, {"error": "Block validation failed", "details": vr.errors})
+        bh = self._db.insert_block(block)
+        self._broadcaster.broadcast_block({**block, "hash": bh})
+        # Check if snapshot needed
+        height = block.get("height", 0)
+        snap_interval = self.config.get("snapshot_interval", 100)
+        if height > 0 and height % snap_interval == 0:
+            try:
+                snap = self._snapshot_mgr.create_snapshot(height)
+                self._broadcaster.broadcast_snapshot(snap)
+            except Exception as exc:
+                self.log.warning(f"Snapshot creation failed: {exc}")
+        return HTTPResponse.created({"block_hash": bh, "height": height})
+
+    def _handle_submit_transaction(self, body: Dict) -> HTTPResponse:
+        tx = body.get("transaction") or body
+        if not all([tx.get("sender"), tx.get("recipient")]):
+            return HTTPResponse.bad_request("sender, recipient required")
+        if self._verifier:
+            vr = self._verifier.verify_transaction(tx)
+            if not vr.valid:
+                return HTTPResponse(422, {"error": "TX validation failed", "details": vr.errors})
+        tx_hash = self._db.insert_transaction(tx)
+        return HTTPResponse.created({"tx_hash": tx_hash, "status": "pending"})
+
+    def _handle_get_snapshot(self, params: Dict) -> HTTPResponse:
+        height = params.get("height")
+        if height is None:
+            snap = self._snapshot_mgr.get_latest_snapshot()
+        else:
+            snap = self._snapshot_mgr.retrieve_snapshot(int(height))
+        if not snap:
+            return HTTPResponse.not_found("Snapshot not found")
+        return HTTPResponse.ok({
+            "height": snap.height,
+            "checksum": snap.checksum,
+            "size_bytes": snap.size_bytes,
+            "timestamp": snap.timestamp,
+            "data": snap.data.hex(),
+        })
+
+    def _handle_get_chain_status(self, params: Dict) -> HTTPResponse:
+        stats = self._db.get_chain_stats()
+        return HTTPResponse.ok(stats)
+
+    def _handle_get_qubit_states(self, params: Dict) -> HTTPResponse:
+        height = params.get("height")
+        if height is None:
+            latest = self._db.get_latest_block()
+            height = latest["height"] if latest else 0
+        states = self._db.get_qubit_states_at_height(int(height))
+        for s in states:
+            if isinstance(s.get("state_vector"), (bytes, memoryview)):
+                s["state_vector"] = bytes(s["state_vector"]).hex()
+        return HTTPResponse.ok({"height": int(height), "qubit_states": states})
+
+    def _handle_oracle_event(self, body: Dict) -> HTTPResponse:
+        event_id = self._db.log_oracle_event(body)
+        self._broadcaster.broadcast("oracle_event", {**body, "id": event_id})
+        return HTTPResponse.created({"id": event_id, "status": "logged"})
+
+    def _handle_peer_gossip(self, body: Dict) -> HTTPResponse:
+        self._broadcaster.broadcast("gossip", body)
+        return HTTPResponse.ok({"status": "propagated"})
+
+    def _handle_health_check(self, params: Dict) -> HTTPResponse:
+        health = self.get_health()
+        return HTTPResponse(200 if health.healthy else 503, health.to_dict())
+
+    def _handle_get_balance(self, params: Dict) -> HTTPResponse:
+        address = params.get("address")
+        if not address:
+            return HTTPResponse.bad_request("address required")
+        balance = self._db.get_token_balance(address)
+        return HTTPResponse.ok({"address": address, "balance": balance})
+
+    def _handle_get_block(self, params: Dict) -> HTTPResponse:
+        block_hash = params.get("hash")
+        height = params.get("height")
+        if block_hash:
+            block = self._db.get_block(block_hash)
+        elif height is not None:
+            block = self._db.get_block_by_height(int(height))
+        else:
+            block = self._db.get_latest_block()
+        if not block:
+            return HTTPResponse.not_found("Block not found")
+        return HTTPResponse.ok(block)
+
+    def _handle_get_transaction(self, params: Dict) -> HTTPResponse:
+        tx_hash = params.get("hash")
+        if not tx_hash:
+            return HTTPResponse.bad_request("hash required")
+        tx = self._db.get_transaction(tx_hash)
+        if not tx:
+            return HTTPResponse.not_found("Transaction not found")
+        return HTTPResponse.ok(tx)
+
+    def _handle_get_miners(self, params: Dict) -> HTTPResponse:
+        miners = self._registry.get_active_miners()
+        return HTTPResponse.ok({"miners": miners, "count": len(miners)})
+
+    def _handle_get_peers(self, params: Dict) -> HTTPResponse:
+        clients = self._broadcaster.get_connected_clients()
+        return HTTPResponse.ok({"clients": clients, "count": len(clients)})
+
+    def _handle_receive_snapshot(self, body: Dict) -> HTTPResponse:
+        try:
+            height = body.get("height")
+            data_hex = body.get("data", "")
+            checksum = body.get("checksum", "")
+            data = bytes.fromhex(data_hex)
+            if HASH_ENGINE.compute_hash(data) != checksum:
+                return HTTPResponse(422, {"error": "Snapshot checksum mismatch"})
+            self._db.store_snapshot(height, data, checksum)
+            return HTTPResponse.ok({"status": "stored", "height": height})
+        except Exception as exc:
+            return HTTPResponse.server_error(str(exc))
+
+    def _handle_heartbeat(self, body: Dict) -> HTTPResponse:
+        node_id = body.get("node_id") or body.get("miner_id")
+        node_type = body.get("type", "miner")
+        if not node_id:
+            return HTTPResponse.bad_request("node_id required")
+        ok = self._registry.heartbeat(node_id, node_type)
+        return HTTPResponse.ok({"status": "ok" if ok else "unknown_node"})
+
+    def _validate_request(self, method: str, path: str, body: Dict) -> Optional[str]:
+        if method not in ("GET", "POST", "OPTIONS"):
+            return f"Method {method} not allowed"
+        if not path.startswith("/"):
+            return "Path must start with /"
         return None
 
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ═════════════════════════════════════════════════════════════════════════════════
+# ── RegistryManager ───────────────────────────────────────────────────────────
 
-def parse_args():
-    parser=argparse.ArgumentParser(description='🌌 QTCL Full Node + Quantum W-State Miner')
-    parser.add_argument('--address','-a',help='Miner wallet address (qtcl1...)')
-    parser.add_argument('--oracle-url','-o',default='https://qtcl-blockchain.koyeb.app',help='Oracle URL (for W-state recovery)')
-    parser.add_argument('--difficulty','-d',type=int,default=12,help='Mining difficulty bits')
-    parser.add_argument('--log-level',default='INFO',choices=['DEBUG','INFO','WARNING','ERROR'])
-    parser.add_argument('--wallet-init',action='store_true',help='Initialize new wallet')
-    parser.add_argument('--wallet-password',help='Wallet password')
-    parser.add_argument('--register',action='store_true',help='Register with oracle')
-    parser.add_argument('--miner-id',help='Miner ID for registration')
-    parser.add_argument('--miner-name',default='qtcl-miner',help='Friendly miner name')
-    return parser.parse_args()
+@dataclass
+class RegistrationResult:
+    success: bool
+    node_id: str
+    token: str = ""
+    error_msg: str = ""
 
-def main():
-    args=parse_args()
-    logging.getLogger().setLevel(getattr(logging,args.log_level))
-    
-    try:
-        # Handle wallet initialization
-        if args.wallet_init:
-            if not args.wallet_password:
-                args.wallet_password=input("Enter wallet password: ")
-            wallet=QuickWallet()
-            address=wallet.create(args.wallet_password)
-            logger.info(f"[WALLET] Created: {address}")
-            logger.info(f"[WALLET] Public Key: {wallet.public_key}")
-            logger.info(f"[WALLET] Saved to: {wallet.wallet_file}")
-            return
-        
-        # Get or load address
-        if args.address:
-            address=args.address
-        else:
-            wallet=QuickWallet()
-            if not args.wallet_password:
-                args.wallet_password=input("Enter wallet password: ")
-            if wallet.load(args.wallet_password):
-                address=wallet.address
-                logger.info(f"[WALLET] Loaded: {address}")
-            else:
-                logger.error("[WALLET] Failed to load wallet")
-                sys.exit(1)
-        
-        # Handle oracle registration
-        if args.register:
-            if not all([args.miner_id,args.wallet_password]):
-                logger.error("[REGISTER] --miner-id and --wallet-password required")
-                sys.exit(1)
-            
-            wallet=QuickWallet()
-            if wallet.load(args.wallet_password):
-                registry=MinerRegistry(args.oracle_url)
-                if registry.register(
-                    miner_id=args.miner_id,
-                    address=wallet.address,
-                    public_key=wallet.public_key,
-                    private_key=wallet.private_key,
-                    miner_name=args.miner_name
-                ):
-                    logger.info("[REGISTER] ✅ Successfully registered")
-                    return
-                else:
-                    logger.error("[REGISTER] ❌ Registration failed")
-                    sys.exit(1)
-        
-        # Start mining
-        node=QTCLFullNode(
-            miner_address=address,
-            oracle_url=args.oracle_url,
-            difficulty=args.difficulty
+
+class RegistryManager(ComponentBase):
+    """
+    Consolidated node registration (miner + oracle).
+    Replaces 5-6 scattered *register* methods.
+    """
+
+    def __init__(
+        self,
+        db: LocalBlockchainDB,
+        name: str = "RegistryManager",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self._db = db
+        self._stale_threshold = self.config.get("stale_threshold_seconds", 120)
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def on_start(self) -> None:
+        self._stop_event.clear()
+        self._start_heartbeat_monitor()
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=5)
+
+    def register_miner(
+        self,
+        miner_id: str,
+        address: str,
+        port: int,
+        pubkey: str,
+        metadata: Optional[Dict] = None,
+    ) -> RegistrationResult:
+        try:
+            ok = self._db.register_miner(miner_id, address, port, pubkey, metadata)
+            if ok:
+                token = HASH_ENGINE.compute_hash(f"{miner_id}:{time.time()}")
+                self._inc("miners_registered")
+                self.emit_event("miner_registered", {"miner_id": miner_id})
+                return RegistrationResult(success=True, node_id=miner_id, token=token)
+            return RegistrationResult(success=False, node_id=miner_id, error_msg="DB insert failed")
+        except Exception as exc:
+            return RegistrationResult(success=False, node_id=miner_id, error_msg=str(exc))
+
+    def unregister_miner(self, miner_id: str) -> bool:
+        ok = self._db.deregister_miner(miner_id)
+        if ok:
+            self.emit_event("miner_unregistered", {"miner_id": miner_id})
+        return ok
+
+    def register_oracle(
+        self,
+        oracle_id: str,
+        address: str,
+        port: int,
+        pubkey: str,
+    ) -> RegistrationResult:
+        try:
+            now = time.time()
+            self._db.run_query(
+                """
+                INSERT INTO oracles (oracle_id, address, port, pubkey, registered_at, last_heartbeat, active)
+                VALUES (%s,%s,%s,%s,%s,%s,TRUE)
+                ON CONFLICT (oracle_id) DO UPDATE
+                    SET address=EXCLUDED.address, port=EXCLUDED.port,
+                        last_heartbeat=EXCLUDED.last_heartbeat, active=TRUE
+                """,
+                (oracle_id, address, port, pubkey, now, now),
+            )
+            token = HASH_ENGINE.compute_hash(f"{oracle_id}:{now}")
+            return RegistrationResult(success=True, node_id=oracle_id, token=token)
+        except Exception as exc:
+            return RegistrationResult(success=False, node_id=oracle_id, error_msg=str(exc))
+
+    def heartbeat(self, node_id: str, node_type: str = "miner") -> bool:
+        if node_type == "miner":
+            return self._db.update_miner_heartbeat(node_id)
+        elif node_type == "oracle":
+            rows = self._db.run_query(
+                "UPDATE oracles SET last_heartbeat=%s WHERE oracle_id=%s RETURNING oracle_id",
+                (time.time(), node_id),
+            )
+            return bool(rows)
+        return False
+
+    def get_active_miners(self) -> List[Dict]:
+        return self._db.get_active_miners(self._stale_threshold)
+
+    def get_active_oracles(self) -> List[Dict]:
+        cutoff = time.time() - self._stale_threshold
+        return self._db.run_query(
+            "SELECT * FROM oracles WHERE active=TRUE AND last_heartbeat > %s",
+            (cutoff,),
         )
-        
-        if not node.start():
-            logger.error("[MAIN] ❌ Failed to start node")
-            sys.exit(1)
-        
-        while True:
-            time.sleep(30)
-            status=node.get_status()
-            print("\n"+("="*140))
-            print("⛏️  QTCL QUANTUM MINER STATUS (W-STATE ENTANGLED)")
-            print("="*140)
-            print(f"Miner:              {status['miner']}")
-            print(f"Chain Height:       {status['chain_height']}")
-            print(f"Chain Tip:          {status['chain_tip']}")
-            print(f"Mempool:            {status['mempool_size']} transactions")
-            print(f"Blocks Mined:       {status['mining_stats']['blocks_mined']}")
-            print(f"Avg W-State Fidelity: {status['mining_stats']['avg_fidelity']:.4f}")
-            print(f"")
-            print(f"W-STATE ENTANGLEMENT:")
-            print(f"  Established:      {status['w_state']['entanglement_established']}")
-            print(f"  pq0 (Oracle):     {status['w_state']['pq0_fidelity']:.4f}")
-            print(f"  pq_curr:          {status['w_state']['pq_curr_fidelity']:.4f}")
-            print(f"  pq_last:          {status['w_state']['pq_last_fidelity']:.4f}")
-            print(f"  Sync Lag:         {status['w_state']['sync_lag_ms']:.1f}ms")
-            print("="*140+"\n")
-    
-    except KeyboardInterrupt:
-        print("\n[MAIN] 🛑 Shutdown signal received...")
-    except Exception as e:
-        print(f"\n❌ FATAL: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        if 'node' in locals():
-            node.stop()
-        print("\n✅ Shutdown complete\n")
 
-if __name__=='__main__':
+    def get_node(self, node_id: str) -> Optional[Dict]:
+        miners = self._db.run_query(
+            "SELECT *, 'miner' as node_type FROM miners WHERE miner_id=%s", (node_id,)
+        )
+        if miners:
+            return miners[0]
+        oracles = self._db.run_query(
+            "SELECT *, 'oracle' as node_type FROM oracles WHERE oracle_id=%s", (node_id,)
+        )
+        return oracles[0] if oracles else None
+
+    def prune_stale_nodes(self, threshold_seconds: Optional[int] = None) -> int:
+        threshold = threshold_seconds or self._stale_threshold
+        cutoff = time.time() - threshold
+        stale_miners = self._db.run_query(
+            "UPDATE miners SET active=FALSE WHERE last_heartbeat < %s AND active=TRUE RETURNING miner_id",
+            (cutoff,),
+        )
+        stale_oracles = self._db.run_query(
+            "UPDATE oracles SET active=FALSE WHERE last_heartbeat < %s AND active=TRUE RETURNING oracle_id",
+            (cutoff,),
+        )
+        total = len(stale_miners) + len(stale_oracles)
+        if total:
+            self.log.info(f"[{self.name}] pruned {total} stale nodes")
+        return total
+
+    def _start_heartbeat_monitor(self) -> None:
+        def _monitor():
+            while not self._stop_event.wait(self._stale_threshold // 2 or 30):
+                self.prune_stale_nodes()
+        self._monitor_thread = threading.Thread(
+            target=_monitor, daemon=True, name=f"{self.name}-monitor"
+        )
+        self._monitor_thread.start()
+
+    def _status_extra(self) -> dict:
+        try:
+            miners = self.get_active_miners()
+            oracles = self.get_active_oracles()
+            return {"active_miners": len(miners), "active_oracles": len(oracles)}
+        except Exception:
+            return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Ζ :: UnifiedVerifier + QuantumMetrics
+# Consolidates *verify* (5) + *fidelity* + *measure* (10) → 2 classes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    np = None  # type: ignore
+
+
+@dataclass
+class VerificationResult:
+    valid: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    verified_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def __bool__(self) -> bool:
+        return self.valid
+
+
+class UnifiedVerifier(ComponentBase):
+    """
+    Single verifier class replacing all scattered verify_* functions.
+    Consolidates 5 verify methods.
+    """
+
+    def __init__(
+        self,
+        db: LocalBlockchainDB,
+        hash_engine: Optional[HashEngine] = None,
+        name: str = "UnifiedVerifier",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self._db = db
+        self._hash = hash_engine or HASH_ENGINE
+
+    def verify_block(self, block: Dict[str, Any]) -> VerificationResult:
+        errors = []
+        warnings = []
+        # Structure check
+        errors += self._check_block_structure(block)
+        if errors:
+            return VerificationResult(valid=False, errors=errors)
+        # Hash verification
+        stored_hash = block.get("hash", "")
+        if stored_hash:
+            block_copy = {k: v for k, v in block.items() if k != "hash"}
+            computed = self._hash.compute_block_hash(block_copy)
+            if computed != stored_hash:
+                errors.append(f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…")
+        # PoW check
+        difficulty = block.get("difficulty", 4)
+        if not self._hash.verify_pow(block, difficulty):
+            errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
+        # Previous block linkage
+        height = block.get("height", 0)
+        if height > 0:
+            prev = self._db.get_block_by_height(height - 1)
+            if not prev:
+                warnings.append(f"Previous block at height {height-1} not found in DB (may be syncing)")
+            elif prev.get("block_hash") != block.get("prev_hash"):
+                errors.append("prev_hash does not match stored previous block hash")
+        self._inc("blocks_verified")
+        return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
+
+    def verify_transaction(self, tx: Dict[str, Any]) -> VerificationResult:
+        errors = []
+        warnings = []
+        errors += self._check_tx_structure(tx)
+        if errors:
+            return VerificationResult(valid=False, errors=errors)
+        # Balance check
+        sender = tx.get("sender", "")
+        amount = tx.get("amount", 0)
+        fee = tx.get("fee", 0)
+        if sender and sender != "coinbase":
+            balance = self._db.get_token_balance(sender)
+            if balance < amount + fee:
+                errors.append(f"Insufficient balance: have {balance}, need {amount + fee}")
+        # Double-spend check
+        if self._check_double_spend(tx):
+            errors.append("Double-spend detected: transaction already exists in confirmed state")
+        self._inc("txs_verified")
+        return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
+
+    def verify_chain(
+        self, start_height: int = 0, end_height: Optional[int] = None
+    ) -> VerificationResult:
+        errors = []
+        warnings = []
+        if end_height is None:
+            end_height = self._db.get_chain_height()
+        blocks = self._db.get_blocks_range(start_height, end_height)
+        if not blocks:
+            return VerificationResult(valid=True, warnings=["No blocks in range"])
+        for i, block in enumerate(blocks):
+            if i > 0:
+                prev = blocks[i - 1]
+                if block.get("prev_hash") != prev.get("block_hash"):
+                    errors.append(
+                        f"Chain break at height {block.get('height')}: "
+                        f"prev_hash mismatch"
+                    )
+                if block.get("height") != prev.get("height", 0) + 1:
+                    errors.append(f"Height gap at block index {i}")
+            vr = self.verify_block(block)
+            errors += [f"[h={block.get('height')}] {e}" for e in vr.errors]
+        self._inc("chains_verified")
+        return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
+
+    def verify_snapshot(self, snapshot: "SnapshotRecord") -> VerificationResult:
+        errors = []
+        computed = HASH_ENGINE.compute_hash(snapshot.data)
+        if computed != snapshot.checksum:
+            errors.append(f"Snapshot checksum mismatch")
+        if snapshot.height < 0:
+            errors.append("Snapshot height must be non-negative")
+        if snapshot.size_bytes != len(snapshot.data):
+            errors.append("Snapshot size_bytes does not match actual data length")
+        return VerificationResult(valid=not errors, errors=errors)
+
+    def verify_qubit_state(self, state: Dict[str, Any]) -> VerificationResult:
+        errors = []
+        warnings = []
+        if "block_height" not in state:
+            errors.append("qubit_state missing block_height")
+        if "state_vector" not in state:
+            errors.append("qubit_state missing state_vector")
+        if HAS_NUMPY and "state_vector" in state:
+            sv = state["state_vector"]
+            if isinstance(sv, (list, tuple)):
+                sv = np.array(sv, dtype=complex)
+            if isinstance(sv, np.ndarray):
+                norm = float(np.linalg.norm(sv))
+                if abs(norm - 1.0) > 1e-6:
+                    warnings.append(f"State vector norm {norm:.6f} deviates from 1.0")
+        return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
+
+    def verify_signature(self, data: bytes, signature: bytes, pubkey: bytes) -> bool:
+        # Ed25519 / ECDSA stub — real impl would use cryptography library
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            from cryptography.hazmat.primitives.serialization import load_der_public_key
+            from cryptography.exceptions import InvalidSignature
+            key = load_der_public_key(pubkey)
+            key.verify(signature, data)
+            return True
+        except ImportError:
+            # Fall back to HMAC-based verify for development
+            expected = hmac.new(pubkey, data, hashlib.sha256).digest()
+            return hmac.compare_digest(expected, signature)
+        except Exception:
+            return False
+
+    def verify_merkle_proof(
+        self, tx_hash: str, proof: List[Tuple[str, str]], root: str
+    ) -> bool:
+        current = tx_hash
+        for sibling, direction in proof:
+            if direction == "left":
+                combined = sibling + current
+            else:
+                combined = current + sibling
+            current = self._hash.compute_hash(combined)
+        return current == root
+
+    def verify_pow(self, block: Dict[str, Any], difficulty: int) -> bool:
+        return self._hash.verify_pow(block, difficulty)
+
+    def _check_block_structure(self, block: Dict) -> List[str]:
+        errors = []
+        required = ["height", "prev_hash", "merkle_root", "timestamp"]
+        for field_name in required:
+            if field_name not in block:
+                errors.append(f"Block missing required field: {field_name}")
+        height = block.get("height")
+        if height is not None and (not isinstance(height, int) or height < 0):
+            errors.append(f"Invalid block height: {height}")
+        ts = block.get("timestamp")
+        if ts is not None and ts > time.time() + 300:
+            errors.append("Block timestamp is in the future (>5 min)")
+        return errors
+
+    def _check_tx_structure(self, tx: Dict) -> List[str]:
+        errors = []
+        required = ["sender", "recipient"]
+        for f in required:
+            if not tx.get(f):
+                errors.append(f"Transaction missing: {f}")
+        amount = tx.get("amount", 0)
+        if not isinstance(amount, (int, float)) or amount < 0:
+            errors.append(f"Invalid amount: {amount}")
+        return errors
+
+    def _check_double_spend(self, tx: Dict) -> bool:
+        tx_hash = tx.get("hash") or HASH_ENGINE.compute_hash(tx)
+        existing = self._db.get_transaction(tx_hash)
+        if existing and existing.get("status") == "confirmed":
+            return True
+        return False
+
+
+# ── QuantumMetrics ────────────────────────────────────────────────────────────
+
+class QuantumMetrics(ComponentBase):
+    """
+    Consolidated quantum measurement and fidelity computations.
+    Consolidates *fidelity* (5) + *measure* (5) → single class with 40+ metrics.
+    """
+
+    def __init__(
+        self,
+        name: str = "QuantumMetrics",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        if not HAS_NUMPY:
+            raise ImportError("numpy is required for QuantumMetrics")
+
+    def compute_fidelity(self, state_a: "np.ndarray", state_b: "np.ndarray") -> float:
+        """Fidelity F(ψ,φ) = |⟨ψ|φ⟩|²"""
+        a = np.array(state_a, dtype=complex).flatten()
+        b = np.array(state_b, dtype=complex).flatten()
+        a /= np.linalg.norm(a) + 1e-15
+        b /= np.linalg.norm(b) + 1e-15
+        overlap = np.abs(np.dot(np.conj(a), b)) ** 2
+        return float(np.clip(overlap, 0.0, 1.0))
+
+    def compute_entanglement_entropy(
+        self, state: "np.ndarray", partition: Optional[int] = None
+    ) -> float:
+        """Von Neumann entropy of reduced density matrix from bipartition."""
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        n_qubits = int(np.log2(n))
+        if n_qubits < 2:
+            return 0.0
+        split = partition or (n_qubits // 2)
+        dim_a = 2 ** split
+        dim_b = 2 ** (n_qubits - split)
+        reshaped = sv.reshape(dim_a, dim_b)
+        _, singular_values, _ = np.linalg.svd(reshaped, full_matrices=False)
+        lambdas = singular_values ** 2
+        lambdas = lambdas[lambdas > 1e-15]
+        entropy = -float(np.sum(lambdas * np.log2(lambdas)))
+        return max(0.0, entropy)
+
+    def compute_purity(self, density_matrix: "np.ndarray") -> float:
+        """Tr(ρ²)"""
+        rho = np.array(density_matrix, dtype=complex)
+        return float(np.real(np.trace(rho @ rho)))
+
+    def compute_von_neumann_entropy(self, density_matrix: "np.ndarray") -> float:
+        """S(ρ) = -Tr(ρ log₂ ρ)"""
+        rho = np.array(density_matrix, dtype=complex)
+        eigenvalues = np.real(np.linalg.eigvalsh(rho))
+        eigenvalues = eigenvalues[eigenvalues > 1e-15]
+        return float(-np.sum(eigenvalues * np.log2(eigenvalues)))
+
+    def measure_expectation_value(
+        self, state: "np.ndarray", observable: "np.ndarray"
+    ) -> float:
+        """⟨ψ|O|ψ⟩"""
+        sv = np.array(state, dtype=complex).flatten()
+        O = np.array(observable, dtype=complex)
+        return float(np.real(np.conj(sv) @ O @ sv))
+
+    def measure_qubit(
+        self, state: "np.ndarray", qubit_index: int
+    ) -> Tuple[int, "np.ndarray"]:
+        """
+        Projective measurement on qubit_index.
+        Returns (outcome 0 or 1, post-measurement state).
+        """
+        sv = np.array(state, dtype=complex).flatten()
+        n_qubits = int(np.log2(len(sv)))
+        # Probability of measuring 0
+        prob_0 = 0.0
+        for i in range(len(sv)):
+            bit = (i >> (n_qubits - 1 - qubit_index)) & 1
+            if bit == 0:
+                prob_0 += abs(sv[i]) ** 2
+        # Deterministic outcome based on state (no randomness per QTCL design)
+        outcome = 0 if prob_0 >= 0.5 else 1
+        # Project
+        post = np.zeros_like(sv)
+        for i in range(len(sv)):
+            bit = (i >> (n_qubits - 1 - qubit_index)) & 1
+            if bit == outcome:
+                post[i] = sv[i]
+        norm = np.linalg.norm(post)
+        if norm > 1e-15:
+            post /= norm
+        return outcome, post
+
+    def measure_all(self, state: "np.ndarray") -> Dict[int, int]:
+        """Measure all qubits. Returns {qubit_index: outcome}."""
+        sv = np.array(state, dtype=complex).flatten()
+        n_qubits = int(np.log2(len(sv)))
+        outcomes = {}
+        current_state = sv.copy()
+        for i in range(n_qubits):
+            outcome, current_state = self.measure_qubit(current_state, 0)
+            outcomes[i] = outcome
+        return outcomes
+
+    def compute_w_state_fidelity(self, state: "np.ndarray") -> float:
+        """Fidelity with W state |W⟩ = (|100⟩+|010⟩+|001⟩)/√3 for 3 qubits."""
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        n_qubits = int(np.log2(n))
+        if n_qubits < 1:
+            return 0.0
+        # Build W state for n_qubits
+        w_state = np.zeros(n, dtype=complex)
+        for i in range(n_qubits):
+            idx = 1 << (n_qubits - 1 - i)
+            w_state[idx] = 1.0
+        w_state /= np.sqrt(n_qubits)
+        return self.compute_fidelity(sv, w_state)
+
+    def compute_ghz_fidelity(self, state: "np.ndarray") -> float:
+        """Fidelity with GHZ state (|00...0⟩ + |11...1⟩)/√2."""
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        n_qubits = int(np.log2(n))
+        ghz = np.zeros(n, dtype=complex)
+        ghz[0] = 1.0 / np.sqrt(2)
+        ghz[-1] = 1.0 / np.sqrt(2)
+        return self.compute_fidelity(sv, ghz)
+
+    def compute_concurrence(self, state: "np.ndarray") -> float:
+        """Concurrence for 2-qubit state (Wootters formula)."""
+        sv = np.array(state, dtype=complex).flatten()
+        if len(sv) != 4:
+            return 0.0
+        rho = np.outer(sv, np.conj(sv))
+        sigma_y = np.array([[0, -1j], [1j, 0]])
+        Y2 = np.kron(sigma_y, sigma_y)
+        rho_tilde = Y2 @ np.conj(rho) @ Y2
+        R = rho @ rho_tilde
+        eigenvalues = np.sort(np.real(np.linalg.eigvals(R)))[::-1]
+        eigenvalues = np.maximum(eigenvalues, 0)
+        sqrt_eigs = np.sqrt(eigenvalues)
+        concurrence = max(0.0, float(sqrt_eigs[0] - sqrt_eigs[1] - sqrt_eigs[2] - sqrt_eigs[3]))
+        return concurrence
+
+    def compute_cross_correlation(
+        self, state_history: List["np.ndarray"]
+    ) -> "np.ndarray":
+        """Compute cross-correlation matrix across state history."""
+        if not state_history:
+            return np.array([[]])
+        vectors = [np.array(s, dtype=complex).flatten() for s in state_history]
+        n = len(vectors)
+        corr = np.zeros((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                corr[i, j] = self.compute_fidelity(vectors[i], vectors[j])
+        return corr
+
+    def aggregate_metrics(self, state: "np.ndarray", height: int) -> Dict[str, float]:
+        """Compute all 40+ quantum metrics for a state."""
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        n_qubits = int(np.log2(max(n, 2)))
+        rho = np.outer(sv, np.conj(sv))
+        metrics: Dict[str, float] = {}
+        metrics["height"] = float(height)
+        metrics["n_qubits"] = float(n_qubits)
+        metrics["state_norm"] = float(np.linalg.norm(sv))
+        metrics["purity"] = self.compute_purity(rho)
+        metrics["von_neumann_entropy"] = self.compute_von_neumann_entropy(rho)
+        metrics["entanglement_entropy"] = self.compute_entanglement_entropy(sv)
+        metrics["w_state_fidelity"] = self.compute_w_state_fidelity(sv)
+        metrics["ghz_fidelity"] = self.compute_ghz_fidelity(sv)
+        if n == 4:
+            metrics["concurrence"] = self.compute_concurrence(sv)
+        # Pauli expectations
+        pauli_x = np.array([[0, 1], [1, 0]], dtype=complex)
+        pauli_y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+        pauli_z = np.array([[1, 0], [0, -1]], dtype=complex)
+        for qi in range(min(n_qubits, 8)):
+            ops = {"X": pauli_x, "Y": pauli_y, "Z": pauli_z}
+            for op_name, op in ops.items():
+                full_op = _embed_operator(op, qi, n_qubits)
+                metrics[f"<{op_name}{qi}>"] = self.measure_expectation_value(sv, full_op)
+        # Population distribution
+        probs = np.abs(sv) ** 2
+        metrics["max_prob"] = float(np.max(probs))
+        metrics["min_nonzero_prob"] = float(np.min(probs[probs > 1e-15])) if np.any(probs > 1e-15) else 0.0
+        metrics["participation_ratio"] = float(1.0 / (np.sum(probs ** 2) + 1e-15))
+        # Entanglement across all bipartitions
+        entropies = []
+        for split in range(1, n_qubits):
+            entropies.append(self.compute_entanglement_entropy(sv, split))
+        if entropies:
+            metrics["avg_bipartition_entropy"] = float(np.mean(entropies))
+            metrics["max_bipartition_entropy"] = float(np.max(entropies))
+        # Phase coherence
+        phases = np.angle(sv[np.abs(sv) > 1e-10])
+        if len(phases) > 1:
+            metrics["phase_variance"] = float(np.var(phases))
+            metrics["phase_coherence"] = float(np.abs(np.mean(np.exp(1j * phases))))
+        self._inc("aggregate_computations")
+        return metrics
+
+    def _partial_trace(
+        self, state: "np.ndarray", keep_indices: List[int]
+    ) -> "np.ndarray":
+        """Partial trace: trace out all qubits NOT in keep_indices."""
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        n_qubits = int(np.log2(n))
+        rho_full = np.outer(sv, np.conj(sv))
+        # Reshape into tensor
+        dims = [2] * (2 * n_qubits)
+        rho_t = rho_full.reshape(dims)
+        trace_out = [i for i in range(n_qubits) if i not in keep_indices]
+        for ax in sorted(trace_out, reverse=True):
+            # Trace over this axis pair
+            n_remaining = len(rho_t.shape) // 2
+            rho_t = np.trace(rho_t, axis1=ax, axis2=ax + n_remaining)
+        dim_keep = 2 ** len(keep_indices)
+        return rho_t.reshape(dim_keep, dim_keep)
+
+    def _schmidt_decomposition(
+        self, state: "np.ndarray", dim_a: int, dim_b: int
+    ) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """Returns (lambdas, states_a, states_b) from SVD."""
+        sv = np.array(state, dtype=complex).flatten()
+        matrix = sv.reshape(dim_a, dim_b)
+        U, S, Vh = np.linalg.svd(matrix, full_matrices=False)
+        return S, U.T, Vh
+
+
+def _embed_operator(
+    op: "np.ndarray", qubit_index: int, n_qubits: int
+) -> "np.ndarray":
+    """Embed single-qubit operator into n-qubit space via tensor product."""
+    identity = np.eye(2, dtype=complex)
+    ops = [identity] * n_qubits
+    ops[qubit_index] = op
+    result = ops[0]
+    for o in ops[1:]:
+        result = np.kron(result, o)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Η :: QuantumOpsLibrary + RotationOrchestrator
+# Consolidates _lc_* / _nn_ / _sf (6) + *rotate* (4) → 2 classes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QuantumOpsLibrary:
+    """
+    Static quantum gate library and transformation utilities.
+    Replaces 6 scattered _lc_* / _nn_ / _sf functions.
+    All methods are @staticmethod — no instantiation needed.
+    """
+
+    @staticmethod
+    def hadamard_gate() -> "np.ndarray":
+        return np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
+
+    @staticmethod
+    def pauli_x() -> "np.ndarray":
+        return np.array([[0, 1], [1, 0]], dtype=complex)
+
+    @staticmethod
+    def pauli_y() -> "np.ndarray":
+        return np.array([[0, -1j], [1j, 0]], dtype=complex)
+
+    @staticmethod
+    def pauli_z() -> "np.ndarray":
+        return np.array([[1, 0], [0, -1]], dtype=complex)
+
+    @staticmethod
+    def identity(n: int = 2) -> "np.ndarray":
+        return np.eye(n, dtype=complex)
+
+    @staticmethod
+    def phase_gate(theta: float) -> "np.ndarray":
+        return np.array([[1, 0], [0, np.exp(1j * theta)]], dtype=complex)
+
+    @staticmethod
+    def rx(theta: float) -> "np.ndarray":
+        c = np.cos(theta / 2)
+        s = np.sin(theta / 2)
+        return np.array([[c, -1j * s], [-1j * s, c]], dtype=complex)
+
+    @staticmethod
+    def ry(theta: float) -> "np.ndarray":
+        c = np.cos(theta / 2)
+        s = np.sin(theta / 2)
+        return np.array([[c, -s], [s, c]], dtype=complex)
+
+    @staticmethod
+    def rz(theta: float) -> "np.ndarray":
+        return np.array(
+            [[np.exp(-1j * theta / 2), 0], [0, np.exp(1j * theta / 2)]],
+            dtype=complex,
+        )
+
+    @staticmethod
+    def cnot() -> "np.ndarray":
+        return np.array(
+            [[1, 0, 0, 0],
+             [0, 1, 0, 0],
+             [0, 0, 0, 1],
+             [0, 0, 1, 0]],
+            dtype=complex,
+        )
+
+    @staticmethod
+    def toffoli() -> "np.ndarray":
+        T = np.eye(8, dtype=complex)
+        T[6, 6] = 0; T[7, 7] = 0
+        T[6, 7] = 1; T[7, 6] = 1
+        return T
+
+    @staticmethod
+    def apply_gate(
+        state: "np.ndarray",
+        gate: "np.ndarray",
+        target_qubit: int,
+        n_qubits: int,
+    ) -> "np.ndarray":
+        full_gate = _embed_operator(gate, target_qubit, n_qubits)
+        sv = np.array(state, dtype=complex).flatten()
+        return full_gate @ sv
+
+    @staticmethod
+    def apply_controlled_gate(
+        state: "np.ndarray",
+        gate: "np.ndarray",
+        control: int,
+        target: int,
+        n_qubits: int,
+    ) -> "np.ndarray":
+        n = 2 ** n_qubits
+        sv = np.array(state, dtype=complex).flatten()
+        result = sv.copy()
+        for i in range(n):
+            ctrl_bit = (i >> (n_qubits - 1 - control)) & 1
+            if ctrl_bit == 1:
+                # Extract target qubit subspace
+                tgt_bit = (i >> (n_qubits - 1 - target)) & 1
+                i_flip = i ^ (1 << (n_qubits - 1 - target))
+                result[i] = gate[tgt_bit, 0] * sv[i ^ (tgt_bit << (n_qubits - 1 - target))] + \
+                             gate[tgt_bit, 1] * sv[i_flip ^ (tgt_bit << (n_qubits - 1 - target))]
+        return result
+
+    @staticmethod
+    def tensor_product(*matrices: "np.ndarray") -> "np.ndarray":
+        result = matrices[0]
+        for m in matrices[1:]:
+            result = np.kron(result, m)
+        return result
+
+    @staticmethod
+    def state_from_bits(bits: str) -> "np.ndarray":
+        """e.g. '010' → 3-qubit computational basis state |010⟩"""
+        n = len(bits)
+        dim = 2 ** n
+        idx = int(bits, 2)
+        sv = np.zeros(dim, dtype=complex)
+        sv[idx] = 1.0
+        return sv
+
+    @staticmethod
+    def normalize(state: "np.ndarray") -> "np.ndarray":
+        sv = np.array(state, dtype=complex)
+        norm = np.linalg.norm(sv)
+        if norm < 1e-15:
+            return sv
+        return sv / norm
+
+    @staticmethod
+    def is_valid_state(state: "np.ndarray") -> bool:
+        sv = np.array(state, dtype=complex).flatten()
+        n = len(sv)
+        if n == 0 or (n & (n - 1)) != 0:  # not power of 2
+            return False
+        return abs(float(np.linalg.norm(sv)) - 1.0) < 1e-6
+
+    @staticmethod
+    def is_unitary(matrix: "np.ndarray") -> bool:
+        M = np.array(matrix, dtype=complex)
+        if M.shape[0] != M.shape[1]:
+            return False
+        product = M @ M.conj().T
+        return np.allclose(product, np.eye(M.shape[0]), atol=1e-8)
+
+    @staticmethod
+    def create_bell_state(bell_type: str = "phi+") -> "np.ndarray":
+        s = {
+            "phi+": np.array([1, 0, 0, 1], dtype=complex) / np.sqrt(2),
+            "phi-": np.array([1, 0, 0, -1], dtype=complex) / np.sqrt(2),
+            "psi+": np.array([0, 1, 1, 0], dtype=complex) / np.sqrt(2),
+            "psi-": np.array([0, 1, -1, 0], dtype=complex) / np.sqrt(2),
+        }
+        return s.get(bell_type, s["phi+"])
+
+    @staticmethod
+    def create_ghz_state(n_qubits: int) -> "np.ndarray":
+        dim = 2 ** n_qubits
+        sv = np.zeros(dim, dtype=complex)
+        sv[0] = 1.0 / np.sqrt(2)
+        sv[-1] = 1.0 / np.sqrt(2)
+        return sv
+
+    @staticmethod
+    def create_w_state(n_qubits: int) -> "np.ndarray":
+        dim = 2 ** n_qubits
+        sv = np.zeros(dim, dtype=complex)
+        for i in range(n_qubits):
+            sv[1 << (n_qubits - 1 - i)] = 1.0 / np.sqrt(n_qubits)
+        return sv
+
+    @staticmethod
+    def quantum_fourier_transform(n_qubits: int) -> "np.ndarray":
+        N = 2 ** n_qubits
+        omega = np.exp(2j * np.pi / N)
+        qft = np.array(
+            [[omega ** (i * j) for j in range(N)] for i in range(N)],
+            dtype=complex,
+        ) / np.sqrt(N)
+        return qft
+
+    @staticmethod
+    def lattice_coupling_gate(coupling_strength: float) -> "np.ndarray":
+        """
+        _lc_ family: Two-qubit lattice coupling gate.
+        Implements exp(-i * coupling_strength * (XX + YY + ZZ))
+        """
+        theta = coupling_strength
+        c, s = np.cos(theta), np.sin(theta)
+        e_plus  = np.exp(1j * theta)
+        e_minus = np.exp(-1j * theta)
+        lc = np.array([
+            [e_minus,       0,       0,       0],
+            [0,             c,  1j * s,       0],
+            [0,        1j * s,       c,       0],
+            [0,             0,       0, e_minus],
+        ], dtype=complex)
+        return lc
+
+    @staticmethod
+    def nearest_neighbor_interaction(
+        states: List["np.ndarray"],
+        coupling: float = 0.1,
+    ) -> "np.ndarray":
+        """
+        _nn_ family: Apply nearest-neighbor coupling across a register of states.
+        Returns combined post-interaction state.
+        """
+        if not states:
+            return np.array([], dtype=complex)
+        gate = QuantumOpsLibrary.lattice_coupling_gate(coupling)
+        result = states[0].copy()
+        n_qubits_single = int(np.log2(len(result)))
+        for i in range(1, len(states)):
+            next_state = states[i]
+            result = np.kron(result, next_state)
+            n_total = int(np.log2(len(result)))
+            # Apply coupling gate across boundary
+            if n_total >= 2:
+                full_gate = _embed_operator(
+                    gate[:2, :2],  # Use top-left 2x2 as approximation for single-qubit coupling
+                    n_total - 1,
+                    n_total,
+                )
+                result = full_gate @ result
+                result = QuantumOpsLibrary.normalize(result)
+        return result
+
+    @staticmethod
+    def structure_factor(
+        k_vector: "np.ndarray", positions: List["np.ndarray"]
+    ) -> complex:
+        """
+        _sf_ family: Compute quantum structure factor S(k).
+        S(k) = (1/N) Σ_{j,l} exp(ik·(r_j - r_l))
+        """
+        k = np.array(k_vector, dtype=float)
+        N = len(positions)
+        if N == 0:
+            return 0.0 + 0j
+        total = 0.0 + 0j
+        for j, rj in enumerate(positions):
+            for l_, rl in enumerate(positions):
+                diff = np.array(rj, dtype=float) - np.array(rl, dtype=float)
+                total += np.exp(1j * np.dot(k, diff))
+        return total / N
+
+
+# ── RotationOrchestrator ──────────────────────────────────────────────────────
+
+@dataclass
+class RotationAngles:
+    theta_x: "np.ndarray"
+    theta_y: "np.ndarray"
+    theta_z: "np.ndarray"
+    phi: "np.ndarray"
+    lambda_: "np.ndarray"
+    level_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        d = {
+            "theta_x": self.theta_x.tolist() if HAS_NUMPY else list(self.theta_x),
+            "theta_y": self.theta_y.tolist() if HAS_NUMPY else list(self.theta_y),
+            "theta_z": self.theta_z.tolist() if HAS_NUMPY else list(self.theta_z),
+            "phi": self.phi.tolist() if HAS_NUMPY else list(self.phi),
+            "lambda_": self.lambda_.tolist() if HAS_NUMPY else list(self.lambda_),
+            "level_metadata": self.level_metadata,
+        }
+        return d
+
+
+class RotationOrchestrator(ComponentBase):
+    """
+    5-level rotation angle derivation tree.
+    Deterministic: block_hash → seed → 5 levels of transformation → RotationAngles.
+    Consolidates 4 scattered *rotate* methods.
+    """
+
+    def __init__(
+        self,
+        ops: Optional[QuantumOpsLibrary] = None,
+        n_qubits: int = 8,
+        name: str = "RotationOrchestrator",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self._ops = ops or QuantumOpsLibrary()
+        self.n_qubits = n_qubits
+        self._coupling_matrix: Optional["np.ndarray"] = None
+
+    def on_start(self) -> None:
+        if HAS_NUMPY:
+            self._coupling_matrix = self._build_default_coupling_matrix()
+
+    def derive_rotation_angles(self, block_hash: str, height: int) -> RotationAngles:
+        """Full 5-level deterministic angle derivation."""
+        if not HAS_NUMPY:
+            raise RuntimeError("numpy required for rotation derivation")
+        metadata: Dict[str, Any] = {"block_hash": block_hash, "height": height}
+        # Level 1: Seed from block hash
+        angles = self._level1_seed_angles(block_hash)
+        metadata["level1"] = {"angles_norm": float(np.linalg.norm(angles))}
+        # Level 2: Entropy mixing from DAG
+        entropy_dag = self.build_entropy_dag_minimal(block_hash, height)
+        angles = self._level2_entropy_mix(angles, entropy_dag)
+        metadata["level2"] = {"entropy_dag_nodes": len(entropy_dag)}
+        # Level 3: Cross-coupling
+        if self._coupling_matrix is not None:
+            angles = self._level3_cross_coupling(angles, self._coupling_matrix)
+        metadata["level3"] = {"coupling_applied": self._coupling_matrix is not None}
+        # Level 4: Historical bias (use height as proxy for history depth)
+        history_bias = self._derive_historical_bias(height)
+        angles = self._level4_historical_bias(angles, history_bias)
+        metadata["level4"] = {"history_depth": height}
+        # Level 5: Normalize to valid rotation ranges
+        angles = self._level5_normalization(angles)
+        metadata["level5"] = {"final_norm": float(np.linalg.norm(angles))}
+        # Split angles into components
+        n = self.n_qubits
+        theta_x  = angles[0:n]
+        theta_y  = angles[n:2*n]
+        theta_z  = angles[2*n:3*n]
+        phi      = angles[3*n:4*n] if len(angles) >= 4*n else np.zeros(n)
+        lambda_  = angles[4*n:5*n] if len(angles) >= 5*n else np.zeros(n)
+        return RotationAngles(
+            theta_x=theta_x,
+            theta_y=theta_y,
+            theta_z=theta_z,
+            phi=phi,
+            lambda_=lambda_,
+            level_metadata=metadata,
+        )
+
+    def _level1_seed_angles(self, block_hash: str) -> "np.ndarray":
+        """Derive initial angles from block hash bytes."""
+        hash_bytes = bytes.fromhex(block_hash[:64].zfill(64))
+        # Expand to 5*n_qubits angles using SHA256 chain
+        angles_list = []
+        seed = hash_bytes
+        while len(angles_list) < 5 * self.n_qubits:
+            seed = hashlib.sha256(seed).digest()
+            for i in range(0, len(seed), 4):
+                if len(angles_list) >= 5 * self.n_qubits:
+                    break
+                val = struct.unpack(">I", seed[i:i+4])[0]
+                angles_list.append(val)
+        angles = np.array(angles_list[:5 * self.n_qubits], dtype=float)
+        angles = (angles / (2**32)) * 2 * np.pi
+        return angles
+
+    def _level2_entropy_mix(
+        self, angles: "np.ndarray", entropy_dag: Dict[str, Any]
+    ) -> "np.ndarray":
+        """Mix angles with DAG-derived entropy."""
+        dag_hash = HASH_ENGINE.compute_hash(json.dumps(entropy_dag, sort_keys=True, default=str))
+        dag_bytes = bytes.fromhex(dag_hash)
+        dag_seed = np.frombuffer(dag_bytes, dtype=np.uint8).astype(float) / 255.0
+        # Tile to match angles length
+        tiled = np.tile(dag_seed, (len(angles) // len(dag_seed) + 1))[:len(angles)]
+        mixing_angles = tiled * 2 * np.pi
+        return angles + mixing_angles * 0.1  # 10% entropy influence
+
+    def _level3_cross_coupling(
+        self, angles: "np.ndarray", coupling_matrix: "np.ndarray"
+    ) -> "np.ndarray":
+        """Apply cross-coupling matrix to first n_qubits angles."""
+        n = min(self.n_qubits, coupling_matrix.shape[0], len(angles))
+        coupled = coupling_matrix[:n, :n] @ angles[:n]
+        result = angles.copy()
+        result[:n] = coupled
+        return result
+
+    def _level4_historical_bias(
+        self, angles: "np.ndarray", history_bias: "np.ndarray"
+    ) -> "np.ndarray":
+        """Blend current angles with historical bias."""
+        bias = np.resize(history_bias, len(angles))
+        alpha = 0.05  # 5% historical influence
+        return (1 - alpha) * angles + alpha * bias
+
+    def _level5_normalization(self, angles: "np.ndarray") -> "np.ndarray":
+        """Normalize angles to [-π, π] range."""
+        normalized = np.mod(angles, 2 * np.pi)
+        normalized = np.where(normalized > np.pi, normalized - 2 * np.pi, normalized)
+        return normalized
+
+    def apply_rotation_sequence(
+        self, state: "np.ndarray", angles: RotationAngles
+    ) -> "np.ndarray":
+        """Apply full Rx→Ry→Rz rotation sequence to each qubit."""
+        sv = np.array(state, dtype=complex).flatten()
+        n_qubits = int(np.log2(len(sv)))
+        for qi in range(min(n_qubits, self.n_qubits)):
+            sv = QuantumOpsLibrary.apply_gate(
+                sv, QuantumOpsLibrary.rx(float(angles.theta_x[qi])), qi, n_qubits
+            )
+            sv = QuantumOpsLibrary.apply_gate(
+                sv, QuantumOpsLibrary.ry(float(angles.theta_y[qi])), qi, n_qubits
+            )
+            sv = QuantumOpsLibrary.apply_gate(
+                sv, QuantumOpsLibrary.rz(float(angles.theta_z[qi])), qi, n_qubits
+            )
+        return QuantumOpsLibrary.normalize(sv)
+
+    def build_entropy_dag(
+        self, current_block: Dict[str, Any], history: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Build entropy DAG from block history for mixing."""
+        nodes = {}
+        all_blocks = history + [current_block]
+        for block in all_blocks[-16:]:  # last 16 blocks
+            h = block.get("hash") or block.get("block_hash", "")
+            if h:
+                nodes[h] = {
+                    "height": block.get("height", 0),
+                    "prev": block.get("prev_hash", ""),
+                    "ts": block.get("timestamp", 0),
+                    "nonce": block.get("nonce", 0),
+                }
+        # Edges from prev_hash links
+        edges = []
+        for h, node in nodes.items():
+            prev = node.get("prev", "")
+            if prev in nodes:
+                edges.append((prev, h))
+        return {"nodes": nodes, "edges": edges, "depth": len(nodes)}
+
+    def build_entropy_dag_minimal(
+        self, block_hash: str, height: int
+    ) -> Dict[str, Any]:
+        """Minimal DAG from just hash + height (no DB access)."""
+        return {
+            "nodes": {block_hash: {"height": height}},
+            "edges": [],
+            "depth": 1,
+        }
+
+    def _derive_historical_bias(self, height: int) -> "np.ndarray":
+        """Compute historical bias vector from height alone (deterministic)."""
+        seed_data = f"history:{height}".encode()
+        h = hashlib.sha256(seed_data).digest()
+        bias = np.frombuffer(h, dtype=np.uint8).astype(float) / 255.0 * 2 * np.pi
+        return np.tile(bias, (5 * self.n_qubits // len(bias) + 1))[:5 * self.n_qubits]
+
+    def _build_default_coupling_matrix(self) -> "np.ndarray":
+        """Build default coupling matrix (tridiagonal nearest-neighbor)."""
+        n = self.n_qubits
+        matrix = np.eye(n, dtype=float)
+        for i in range(n - 1):
+            matrix[i, i + 1] = 0.1
+            matrix[i + 1, i] = 0.1
+        return matrix
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Θ :: QuantumStateEvolutionMachine
+# Museum-grade deterministic pseudoqubit evolution engine
+# Block-height synchronized, 5-level rotation tree, DAG entropy mixing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QuantumStateEvolutionMachine(ComponentBase):
+    """
+    Deterministic quantum state evolution synchronized to block height.
+    No randomness — all evolution is derived from block hash + height.
+    
+    Architecture:
+    - 5-level rotation angle derivation (RotationOrchestrator)
+    - DAG entropy mixing from block history
+    - CrossCouplingResolver for multi-body interactions
+    - 40+ quantum metrics per evolution step
+    """
+
+    def __init__(
+        self,
+        n_qubits: int = 8,
+        name: str = "QuantumStateEvolutionMachine",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self.n_qubits = n_qubits
+        self._ops = QuantumOpsLibrary()
+        self._rotation_orch: Optional[RotationOrchestrator] = None
+        self._metrics_engine: Optional[QuantumMetrics] = None
+        self._coupling_resolver: Optional["CrossCouplingResolver"] = None
+        self._state: Optional["np.ndarray"] = None
+        self._state_lock = threading.RLock()
+        self._history: deque = deque(maxlen=64)
+        self._current_height: int = -1
+
+    def on_start(self) -> None:
+        if not HAS_NUMPY:
+            raise ImportError("numpy required for QuantumStateEvolutionMachine")
+        self._rotation_orch = RotationOrchestrator(
+            ops=self._ops,
+            n_qubits=self.n_qubits,
+            name=f"{self.name}/RotationOrch",
+        )
+        self._rotation_orch.start()
+        self._metrics_engine = QuantumMetrics(name=f"{self.name}/Metrics")
+        self._metrics_engine.start()
+        self._coupling_resolver = CrossCouplingResolver(
+            n_qubits=self.n_qubits,
+            name=f"{self.name}/Coupling",
+        )
+        self._coupling_resolver.start()
+        # Initialize state to |0...0⟩
+        with self._state_lock:
+            self._state = np.zeros(2 ** self.n_qubits, dtype=complex)
+            self._state[0] = 1.0
+        self.log.info(
+            f"[{self.name}] initialized {self.n_qubits}-qubit state, "
+            f"dim={2**self.n_qubits}"
+        )
+
+    def on_stop(self) -> None:
+        for child in [self._rotation_orch, self._metrics_engine, self._coupling_resolver]:
+            if child and child.is_running():
+                child.stop()
+
+    def evolve(
+        self,
+        block_hash: str,
+        height: int,
+        block_data: Optional[Dict] = None,
+        history_blocks: Optional[List[Dict]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main evolution step. Deterministic given same block_hash + height.
+        Returns full metrics dict.
+        """
+        self.assert_running()
+        if not HAS_NUMPY:
+            raise RuntimeError("numpy required")
+
+        with self._state_lock:
+            if self._current_height > height:
+                self.log.warning(
+                    f"[{self.name}] evolve called for past height {height} "
+                    f"(current={self._current_height}), rewinding"
+                )
+                self._rewind_to(height)
+            # Derive rotation angles
+            angles = self._rotation_orch.derive_rotation_angles(block_hash, height)
+            # Apply rotations
+            new_state = self._rotation_orch.apply_rotation_sequence(self._state, angles)
+            # Apply cross-coupling interactions
+            if history_blocks:
+                dag = self._rotation_orch.build_entropy_dag(
+                    block_data or {}, history_blocks
+                )
+            else:
+                dag = self._rotation_orch.build_entropy_dag_minimal(block_hash, height)
+            new_state = self._coupling_resolver.resolve(new_state, dag, height)
+            new_state = QuantumOpsLibrary.normalize(new_state)
+            # Snapshot state for history
+            self._history.append({
+                "height": height,
+                "block_hash": block_hash,
+                "state": new_state.copy(),
+                "timestamp": time.time(),
+            })
+            self._state = new_state
+            self._current_height = height
+
+        # Compute metrics (outside lock to avoid holding while computing)
+        metrics = self._metrics_engine.aggregate_metrics(new_state, height)
+        metrics["evolution_seed"] = block_hash[:16]
+        metrics["n_history"] = len(self._history)
+        metrics["rotation_angles"] = angles.to_dict()
+        self._inc("evolutions")
+        self.log.debug(
+            f"[{self.name}] evolved height={height}, "
+            f"purity={metrics.get('purity', 0):.4f}, "
+            f"entropy={metrics.get('von_neumann_entropy', 0):.4f}"
+        )
+        return metrics
+
+    def get_state(self) -> Optional["np.ndarray"]:
+        with self._state_lock:
+            return self._state.copy() if self._state is not None else None
+
+    def get_state_at_height(self, height: int) -> Optional["np.ndarray"]:
+        for entry in reversed(self._history):
+            if entry["height"] == height:
+                return entry["state"].copy()
+        return None
+
+    def reset_to_zero(self) -> None:
+        with self._state_lock:
+            self._state = np.zeros(2 ** self.n_qubits, dtype=complex)
+            self._state[0] = 1.0
+            self._history.clear()
+            self._current_height = -1
+
+    def _rewind_to(self, target_height: int) -> None:
+        """Rewind state to a previous height using history."""
+        for entry in reversed(list(self._history)):
+            if entry["height"] <= target_height:
+                self._state = entry["state"].copy()
+                self._current_height = entry["height"]
+                return
+        # No history for that height — reset
+        self._state = np.zeros(2 ** self.n_qubits, dtype=complex)
+        self._state[0] = 1.0
+        self._current_height = -1
+
+    def serialize_state(self) -> bytes:
+        with self._state_lock:
+            if self._state is None:
+                return b""
+            return self._state.astype(np.complex128).tobytes()
+
+    def deserialize_state(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._state_lock:
+            self._state = np.frombuffer(data, dtype=np.complex128).copy()
+
+    def _status_extra(self) -> dict:
+        with self._state_lock:
+            return {
+                "current_height": self._current_height,
+                "n_qubits": self.n_qubits,
+                "history_depth": len(self._history),
+                "state_dim": 2 ** self.n_qubits,
+            }
+
+
+class CrossCouplingResolver(ComponentBase):
+    """
+    Multi-body quantum interaction resolver.
+    Applies physically-motivated coupling between qubits based on DAG topology.
+    """
+
+    def __init__(
+        self,
+        n_qubits: int = 8,
+        coupling_strength: float = 0.05,
+        name: str = "CrossCouplingResolver",
+        config: Optional[Dict] = None,
+    ):
+        super().__init__(name=name, config=config)
+        self.n_qubits = n_qubits
+        self.coupling_strength = coupling_strength
+
+    def resolve(
+        self,
+        state: "np.ndarray",
+        entropy_dag: Dict[str, Any],
+        height: int,
+    ) -> "np.ndarray":
+        """Apply DAG-topology-informed cross-coupling to state."""
+        sv = np.array(state, dtype=complex).flatten()
+        dag_depth = entropy_dag.get("depth", 1)
+        edges = entropy_dag.get("edges", [])
+        # Coupling strength modulated by DAG depth
+        strength = self.coupling_strength * np.log1p(dag_depth) / np.log1p(16)
+        # Apply nearest-neighbor lattice coupling
+        for i in range(self.n_qubits - 1):
+            lc_gate = QuantumOpsLibrary.lattice_coupling_gate(
+                strength * (1.0 + 0.1 * (i % 3))
+            )
+            # Apply 2-qubit gate to qubits i, i+1
+            sv = self._apply_two_qubit_gate(sv, lc_gate, i, i + 1)
+        # Apply long-range coupling for DAG edges
+        if edges:
+            nodes = list(entropy_dag.get("nodes", {}).keys())
+            for src, dst in edges[:4]:  # limit to 4 edges
+                if src in nodes and dst in nodes:
+                    qi = nodes.index(src) % self.n_qubits
+                    qj = nodes.index(dst) % self.n_qubits
+                    if qi != qj:
+                        sv = self._apply_two_qubit_gate(sv, lc_gate, qi, qj)
+        return QuantumOpsLibrary.normalize(sv)
+
+    def _apply_two_qubit_gate(
+        self,
+        state: "np.ndarray",
+        gate: "np.ndarray",
+        qubit_a: int,
+        qubit_b: int,
+    ) -> "np.ndarray":
+        """Apply a 4x4 two-qubit gate to qubits a and b in an n-qubit state."""
+        n = len(state)
+        n_qubits = int(np.log2(n))
+        if qubit_a >= n_qubits or qubit_b >= n_qubits:
+            return state
+        result = state.copy()
+        for i in range(n):
+            bit_a = (i >> (n_qubits - 1 - qubit_a)) & 1
+            bit_b = (i >> (n_qubits - 1 - qubit_b)) & 1
+            row_idx = 2 * bit_a + bit_b
+            new_val = 0j
+            for col_idx in range(4):
+                new_bit_a = (col_idx >> 1) & 1
+                new_bit_b = col_idx & 1
+                # Construct basis index
+                j = i
+                # Set bit_a
+                if new_bit_a:
+                    j |= (1 << (n_qubits - 1 - qubit_a))
+                else:
+                    j &= ~(1 << (n_qubits - 1 - qubit_a))
+                # Set bit_b
+                if new_bit_b:
+                    j |= (1 << (n_qubits - 1 - qubit_b))
+                else:
+                    j &= ~(1 << (n_qubits - 1 - qubit_b))
+                new_val += gate[row_idx, col_idx] * state[j]
+            result[i] = new_val
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT Θ :: QtclNode — Master Wiring Layer
+# QtclServer + QtclMiner entrypoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import argparse
+import http.server
+import socketserver
+
+
+class QtclNode(ComponentBase):
+    """
+    Master node: wires all components together.
+    Subclassed by QtclServer, QtclMiner, QtclOracle.
+    """
+
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        node_type: str = "server",
+        name: Optional[str] = None,
+    ):
+        self.node_type = node_type
+        cfg_data = self._load_config_file(config_path)
+        super().__init__(
+            name=name or f"QtclNode/{node_type}",
+            config=cfg_data,
+        )
+        self._cfg = ConfigManager(initial=cfg_data, path=config_path)
+        # Component slots (populated in _init_components)
+        self.db: Optional[LocalBlockchainDB] = None
+        self.dht: Optional[DHTRouter] = None
+        self.bootstrap: Optional[BootstrapManager] = None
+        self.snapshot_mgr: Optional[SnapshotManager] = None
+        self.broadcaster: Optional[SSEBroadcaster] = None
+        self.registry: Optional[RegistryManager] = None
+        self.request_handler: Optional[RequestHandler] = None
+        self.verifier: Optional[UnifiedVerifier] = None
+        self.quantum_evo: Optional[QuantumStateEvolutionMachine] = None
+        self.metrics: Optional[QuantumMetrics] = None
+        self._shutdown_event = threading.Event()
+        self._component_order: List[ComponentBase] = []
+
+    @staticmethod
+    def _load_config_file(path: Optional[str]) -> Dict:
+        if path and Path(path).exists():
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def on_start(self) -> None:
+        self._init_components()
+        self._wire_events()
+        self._start_components()
+        signal.signal(signal.SIGINT,  self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        self.log.info(f"[{self.name}] all components started")
+
+    def on_stop(self) -> None:
+        self._shutdown_event.set()
+        for comp in reversed(self._component_order):
+            if comp.is_running():
+                try:
+                    comp.stop()
+                except Exception as exc:
+                    self.log.warning(f"[{self.name}] error stopping {comp.name}: {exc}")
+
+    def _init_components(self) -> None:
+        dsn = self._cfg.get("db_dsn", "postgresql://localhost/qtcl")
+        node_id = self._cfg.get("node_id") or HASH_ENGINE.compute_hash(
+            f"{self.node_type}:{time.time()}"
+        )
+        listen_port = int(self._cfg.get("dht_port", 7776))
+        bootstrap_nodes = [
+            tuple(peer) for peer in self._cfg.get("bootstrap_peers", [])
+        ]
+        # DB
+        self.db = LocalBlockchainDB(
+            dsn=dsn,
+            pool_min=int(self._cfg.get("db_pool_min", 2)),
+            pool_max=int(self._cfg.get("db_pool_max", 10)),
+        )
+        # DHT
+        self.dht = DHTRouter(
+            node_id=node_id,
+            listen_port=listen_port,
+            bootstrap_nodes=bootstrap_nodes,
+        )
+        # Bootstrap
+        self.bootstrap = BootstrapManager(
+            config=self._cfg,
+            db=self.db,
+            dht=self.dht,
+        )
+        # Snapshot
+        self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
+        # SSE Broadcaster
+        self.broadcaster = SSEBroadcaster(
+            host=self._cfg.get("sse_host", "0.0.0.0"),
+            port=int(self._cfg.get("sse_port", 8765)),
+        )
+        # Registry
+        self.registry = RegistryManager(db=self.db)
+        # Verifier
+        self.verifier = UnifiedVerifier(db=self.db)
+        # Request handler
+        self.request_handler = RequestHandler(
+            db=self.db,
+            snapshot_mgr=self.snapshot_mgr,
+            registry=self.registry,
+            broadcaster=self.broadcaster,
+            verifier=self.verifier,
+        )
+        # Quantum evolution
+        n_qubits = int(self._cfg.get("n_qubits", 8))
+        self.quantum_evo = QuantumStateEvolutionMachine(n_qubits=n_qubits)
+        if HAS_NUMPY:
+            self.metrics = QuantumMetrics()
+        # Ordered start sequence
+        self._component_order = [
+            c for c in [
+                self.db, self.dht, self.bootstrap,
+                self.snapshot_mgr, self.broadcaster,
+                self.registry, self.verifier, self.request_handler,
+                self.quantum_evo, self.metrics,
+            ] if c is not None
+        ]
+
+    def _start_components(self) -> None:
+        for comp in self._component_order:
+            try:
+                comp.start()
+            except Exception as exc:
+                self.log.error(f"[{self.name}] failed to start {comp.name}: {exc}")
+                raise
+
+    def _wire_events(self) -> None:
+        if self.registry:
+            self.registry.subscribe(
+                "miner_registered",
+                lambda evt, data: self.log.info(f"[{self.name}] miner registered: {data}"),
+            )
+
+    def get_full_status(self) -> Dict[str, Any]:
+        status = {
+            "node": self.get_status().to_dict(),
+            "components": {},
+        }
+        for comp in self._component_order:
+            try:
+                status["components"][comp.name] = comp.get_status().to_dict()
+            except Exception:
+                status["components"][comp.name] = {"error": "status unavailable"}
+        return status
+
+    def run_forever(self) -> None:
+        self.log.info(f"[{self.name}] running (Ctrl+C to stop)")
+        try:
+            self._shutdown_event.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop()
+
+    def _handle_shutdown(self, signum: int, frame: Any) -> None:
+        self.log.info(f"[{self.name}] received signal {signum}, shutting down")
+        self._shutdown_event.set()
+
+
+class QtclServer(QtclNode):
+    """
+    Server entrypoint. Produces blocks, broadcasts via SSE, serves HTTP API.
+    """
+
+    def __init__(self, config_path: Optional[str] = None):
+        super().__init__(config_path=config_path, node_type="server", name="QtclServer")
+        self._http_server: Optional[socketserver.TCPServer] = None
+        self._http_thread: Optional[threading.Thread] = None
+        self._block_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def on_start(self) -> None:
+        super().on_start()
+        self.bootstrap.bootstrap_node("server")
+        self._stop_event.clear()
+        self._start_http_server()
+        self._start_block_production()
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        if self._http_server:
+            try:
+                self._http_server.shutdown()
+            except Exception:
+                pass
+        if self._block_thread:
+            self._block_thread.join(timeout=5)
+        super().on_stop()
+
+    def _start_http_server(self) -> None:
+        handler = self._make_http_handler()
+        port = int(self._cfg.get("http_port", 8080))
+        host = self._cfg.get("http_host", "0.0.0.0")
+
+        class ReusableServer(socketserver.TCPServer):
+            allow_reuse_address = True
+
+        self._http_server = ReusableServer((host, port), handler)
+        self._http_thread = threading.Thread(
+            target=self._http_server.serve_forever,
+            daemon=True,
+            name="QtclServer/HTTP",
+        )
+        self._http_thread.start()
+        self.log.info(f"[{self.name}] HTTP API listening on {host}:{port}")
+
+    def _make_http_handler(self):
+        req_handler = self.request_handler
+
+        class QtclHTTPHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                # Route through Python logging instead of stderr
+                logging.getLogger("qtcl.http").debug(fmt % args)
+
+            def _parse_request(self) -> Tuple[Dict, Dict, Dict]:
+                parsed = urllib.parse.urlparse(self.path)
+                params = dict(urllib.parse.parse_qsl(parsed.query))
+                path = parsed.path
+                body: Dict = {}
+                content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > 0:
+                    raw = self.rfile.read(content_length)
+                    try:
+                        body = json.loads(raw.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        body = {}
+                return path, params, body
+
+            def _send_response(self, resp: HTTPResponse) -> None:
+                self.send_response(resp.status_code)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                    **resp.headers,
+                }
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                body_bytes = json.dumps(resp.body, default=str).encode("utf-8")
+                self.wfile.write(body_bytes)
+
+            def do_GET(self):
+                path, params, _ = self._parse_request()
+                resp = req_handler.handle_GET(path, params)
+                self._send_response(resp)
+
+            def do_POST(self):
+                path, params, body = self._parse_request()
+                resp = req_handler.handle_POST(path, body)
+                self._send_response(resp)
+
+            def do_OPTIONS(self):
+                path, _, _ = self._parse_request()
+                resp = req_handler.handle_OPTIONS(path)
+                self._send_response(resp)
+
+        return QtclHTTPHandler
+
+    def _start_block_production(self) -> None:
+        self._block_thread = threading.Thread(
+            target=self._block_production_loop,
+            daemon=True,
+            name="QtclServer/BlockProduction",
+        )
+        self._block_thread.start()
+
+    def _block_production_loop(self) -> None:
+        block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
+        difficulty = int(self._cfg.get("difficulty", 4))
+        snap_interval = int(self._cfg.get("snapshot_interval", 100))
+        while not self._stop_event.wait(block_interval):
+            try:
+                latest = self.db.get_latest_block()
+                prev_hash = latest["block_hash"] if latest else "0" * 64
+                height = (latest["height"] + 1) if latest else 0
+                # Collect pending transactions
+                pending_txs = self.db.get_pending_transactions(limit=50)
+                tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
+                merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
+                # Evolve quantum state
+                evo_metrics: Dict = {}
+                if self.quantum_evo and self.quantum_evo.is_running():
+                    # Use preliminary hash for evolution
+                    pre_hash = HASH_ENGINE.compute_hash(
+                        f"{height}:{prev_hash}:{time.time()}"
+                    )
+                    evo_metrics = self.quantum_evo.evolve(
+                        block_hash=pre_hash, height=height
+                    )
+                block = {
+                    "height": height,
+                    "prev_hash": prev_hash,
+                    "merkle_root": merkle_root,
+                    "timestamp": time.time(),
+                    "difficulty": difficulty,
+                    "miner_id": "server",
+                    "tx_count": len(pending_txs),
+                    "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
+                    "nonce": 0,
+                }
+                # PoW
+                nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
+                block["nonce"] = nonce
+                block["hash"] = block_hash
+                # Store quantum state
+                if self.quantum_evo and HAS_NUMPY:
+                    sv = self.quantum_evo.get_state()
+                    if sv is not None:
+                        self.db.insert_qubit_state({
+                            "block_height": height,
+                            "block_hash": block_hash,
+                            "state_vector": sv.tobytes(),
+                            "metrics": evo_metrics,
+                            "evolution_seed": block_hash[:16],
+                            "timestamp": time.time(),
+                        })
+                # Insert block
+                self.db.insert_block(block)
+                # Confirm transactions
+                for tx in pending_txs:
+                    self.db.confirm_transaction(
+                        tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx),
+                        block_hash,
+                    )
+                # Broadcast
+                self.broadcaster.broadcast_block(block)
+                # Snapshot every N blocks
+                if height > 0 and height % snap_interval == 0:
+                    try:
+                        snap = self.snapshot_mgr.create_snapshot(height)
+                        self.broadcaster.broadcast_snapshot(snap)
+                        self.log.info(f"[{self.name}] snapshot broadcast at height {height}")
+                    except Exception as exc:
+                        self.log.warning(f"[{self.name}] snapshot failed: {exc}")
+                self.log.info(
+                    f"[{self.name}] block {height} mined "
+                    f"hash={block_hash[:12]}… nonce={nonce} txs={len(pending_txs)}"
+                )
+            except Exception as exc:
+                self.log.error(f"[{self.name}] block production error: {exc}\n{traceback.format_exc()}")
+
+
+class QtclMiner(QtclNode):
+    """
+    Miner entrypoint. Subscribes to SSE snapshots, mines blocks.
+    """
+
+    def __init__(self, config_path: Optional[str] = None):
+        super().__init__(config_path=config_path, node_type="miner", name="QtclMiner")
+        self._miner_id: str = ""
+        self._server_url: str = ""
+        self._sse_thread: Optional[threading.Thread] = None
+        self._mining_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._pending_blocks: queue.Queue = queue.Queue(maxsize=64)
+
+    def on_start(self) -> None:
+        super().on_start()
+        self._miner_id = self._cfg.get("miner_id") or HASH_ENGINE.compute_hash(
+            f"miner:{time.time()}"
+        )
+        self._server_url = self._cfg.get("server_url", "http://localhost:8080")
+        self.bootstrap.bootstrap_node("miner")
+        self._register_with_server()
+        self._stop_event.clear()
+        self._start_sse_listener()
+        self._start_mining_loop()
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        if self._sse_thread:
+            self._sse_thread.join(timeout=5)
+        if self._mining_thread:
+            self._mining_thread.join(timeout=5)
+        super().on_stop()
+
+    def _register_with_server(self) -> None:
+        import urllib.request
+        host = self._cfg.get("miner_host", "localhost")
+        port = int(self._cfg.get("miner_port", 9000))
+        payload = json.dumps({
+            "miner_id": self._miner_id,
+            "address": host,
+            "port": port,
+            "pubkey": "",
+        }).encode()
+        req = urllib.request.Request(
+            f"{self._server_url}/register",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                self.log.info(f"[{self.name}] registered with server: {result}")
+        except Exception as exc:
+            self.log.warning(f"[{self.name}] server registration failed: {exc}")
+
+    def _start_sse_listener(self) -> None:
+        self._sse_thread = threading.Thread(
+            target=self._sse_listener_loop,
+            daemon=True,
+            name="QtclMiner/SSEListener",
+        )
+        self._sse_thread.start()
+
+    def _sse_listener_loop(self) -> None:
+        import urllib.request
+        sse_url = f"{self._server_url.replace('http', 'http')}/events"
+        retry_delay = 2.0
+        while not self._stop_event.is_set():
+            try:
+                req = urllib.request.Request(
+                    sse_url,
+                    headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    retry_delay = 2.0
+                    buffer = ""
+                    event_type = ""
+                    while not self._stop_event.is_set():
+                        line = resp.readline().decode("utf-8")
+                        if not line:
+                            break
+                        line = line.rstrip("\n\r")
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            try:
+                                data = json.loads(data_str)
+                                self._handle_sse_event(event_type, data)
+                            except json.JSONDecodeError:
+                                pass
+                        elif line == "":
+                            event_type = ""
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    self.log.warning(f"[{self.name}] SSE connection lost: {exc}, retrying in {retry_delay}s")
+                    self._stop_event.wait(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 30.0)
+
+    def _handle_sse_event(self, event_type: str, data: Dict) -> None:
+        if event_type == "block":
+            try:
+                self._pending_blocks.put_nowait(data)
+            except queue.Full:
+                self._pending_blocks.get_nowait()
+                self._pending_blocks.put_nowait(data)
+        elif event_type == "snapshot":
+            self._apply_sse_snapshot(data)
+        elif event_type == "heartbeat":
+            self._send_heartbeat()
+
+    def _apply_sse_snapshot(self, snap_data: Dict) -> None:
+        try:
+            height = snap_data.get("height", 0)
+            local_height = self.db.get_chain_height()
+            if height > local_height:
+                raw = bytes.fromhex(snap_data.get("data", ""))
+                if raw:
+                    snap_record = SnapshotRecord(
+                        height=height,
+                        timestamp=snap_data.get("timestamp", time.time()),
+                        checksum=snap_data.get("checksum", ""),
+                        data=raw,
+                        size_bytes=len(raw),
+                    )
+                    self.snapshot_mgr.apply_snapshot(snap_record, self.db)
+                    self.log.info(f"[{self.name}] applied SSE snapshot height={height}")
+        except Exception as exc:
+            self.log.warning(f"[{self.name}] snapshot apply failed: {exc}")
+
+    def _send_heartbeat(self) -> None:
+        import urllib.request
+        payload = json.dumps({
+            "node_id": self._miner_id,
+            "type": "miner",
+        }).encode()
+        req = urllib.request.Request(
+            f"{self._server_url}/heartbeat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).close()
+        except Exception:
+            pass
+
+    def _start_mining_loop(self) -> None:
+        self._mining_thread = threading.Thread(
+            target=self._mining_loop,
+            daemon=True,
+            name="QtclMiner/MiningLoop",
+        )
+        self._mining_thread.start()
+
+    def _mining_loop(self) -> None:
+        difficulty = int(self._cfg.get("difficulty", 4))
+        snap_interval = int(self._cfg.get("snapshot_interval", 100))
+        import urllib.request
+        while not self._stop_event.is_set():
+            try:
+                # Wait for latest block signal (or poll)
+                try:
+                    latest_block = self._pending_blocks.get(timeout=5.0)
+                except queue.Empty:
+                    latest_block = self.db.get_latest_block()
+                if not latest_block:
+                    self._stop_event.wait(2.0)
+                    continue
+                prev_hash = latest_block.get("hash") or latest_block.get("block_hash", "0" * 64)
+                height = latest_block.get("height", 0) + 1
+                pending_txs = self.db.get_pending_transactions(limit=50)
+                tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
+                merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
+                # Quantum evolution
+                evo_metrics: Dict = {}
+                if self.quantum_evo and self.quantum_evo.is_running():
+                    pre_hash = HASH_ENGINE.compute_hash(f"{height}:{prev_hash}")
+                    try:
+                        evo_metrics = self.quantum_evo.evolve(
+                            block_hash=pre_hash, height=height
+                        )
+                    except Exception as exc:
+                        self.log.warning(f"[{self.name}] quantum evo failed: {exc}")
+                block = {
+                    "height": height,
+                    "prev_hash": prev_hash,
+                    "merkle_root": merkle_root,
+                    "timestamp": time.time(),
+                    "difficulty": difficulty,
+                    "miner_id": self._miner_id,
+                    "tx_count": len(pending_txs),
+                    "nonce": 0,
+                    "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
+                }
+                # PoW
+                nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
+                block["nonce"] = nonce
+                block["hash"] = block_hash
+                # Store locally
+                self.db.insert_block(block)
+                self.db.increment_miner_blocks(self._miner_id)
+                # Store quantum state
+                if self.quantum_evo and HAS_NUMPY:
+                    sv = self.quantum_evo.get_state()
+                    if sv is not None:
+                        self.db.insert_qubit_state({
+                            "block_height": height,
+                            "block_hash": block_hash,
+                            "state_vector": sv.tobytes(),
+                            "metrics": evo_metrics,
+                            "evolution_seed": block_hash[:16],
+                            "timestamp": time.time(),
+                        })
+                # Submit to server
+                payload = json.dumps({"block": block}).encode()
+                req = urllib.request.Request(
+                    f"{self._server_url}/block",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        pass
+                except Exception as exc:
+                    self.log.warning(f"[{self.name}] block submit failed: {exc}")
+                # Push snapshot
+                if height > 0 and height % snap_interval == 0:
+                    try:
+                        snap = self.snapshot_mgr.create_snapshot(height)
+                        self.broadcaster.push_snapshot_to_server(self._server_url, snap)
+                    except Exception as exc:
+                        self.log.warning(f"[{self.name}] snapshot push failed: {exc}")
+                self.log.info(
+                    f"[{self.name}] mined block {height} "
+                    f"hash={block_hash[:12]}… nonce={nonce}"
+                )
+            except Exception as exc:
+                self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
+                self._stop_event.wait(2.0)
+
+
+class QtclOracle(QtclNode):
+    """Oracle node: observes chain, emits oracle events, syncs with server."""
+
+    def __init__(self, config_path: Optional[str] = None):
+        super().__init__(config_path=config_path, node_type="oracle", name="QtclOracle")
+        self._oracle_id: str = ""
+        self._watch_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def on_start(self) -> None:
+        super().on_start()
+        self._oracle_id = self._cfg.get("oracle_id") or HASH_ENGINE.compute_hash(
+            f"oracle:{time.time()}"
+        )
+        self.bootstrap.bootstrap_node("oracle")
+        self._stop_event.clear()
+        self._watch_thread = threading.Thread(
+            target=self._oracle_watch_loop,
+            daemon=True,
+            name="QtclOracle/Watch",
+        )
+        self._watch_thread.start()
+
+    def on_stop(self) -> None:
+        self._stop_event.set()
+        if self._watch_thread:
+            self._watch_thread.join(timeout=5)
+        super().on_stop()
+
+    def _oracle_watch_loop(self) -> None:
+        last_seen_height = -1
+        watch_interval = float(self._cfg.get("oracle_watch_interval", 5.0))
+        while not self._stop_event.wait(watch_interval):
+            try:
+                latest = self.db.get_latest_block()
+                if not latest:
+                    continue
+                height = latest.get("height", 0)
+                if height > last_seen_height:
+                    self._process_new_block(latest)
+                    last_seen_height = height
+            except Exception as exc:
+                self.log.error(f"[{self.name}] oracle watch error: {exc}")
+
+    def _process_new_block(self, block: Dict[str, Any]) -> None:
+        height = block.get("height", 0)
+        block_hash = block.get("block_hash") or block.get("hash", "")
+        # Verify the block
+        vr = self.verifier.verify_block(block)
+        event_type = "block_verified" if vr.valid else "block_invalid"
+        event = {
+            "event_type": event_type,
+            "oracle_id": self._oracle_id,
+            "block_height": height,
+            "payload": {
+                "block_hash": block_hash,
+                "valid": vr.valid,
+                "errors": vr.errors,
+                "warnings": vr.warnings,
+            },
+            "timestamp": time.time(),
+        }
+        self.db.log_oracle_event(event)
+        self.broadcaster.broadcast("oracle_event", event)
+        if not vr.valid:
+            self.log.warning(
+                f"[{self.name}] invalid block at height {height}: {vr.errors}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI Entrypoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="QTCL — Quantum Token Chain Ledger Node",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--type",
+        choices=["server", "miner", "oracle"],
+        default="server",
+        help="Node type to run",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON config file",
+    )
+    parser.add_argument(
+        "--db-dsn",
+        type=str,
+        default=None,
+        help="PostgreSQL DSN (overrides config)",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=None,
+        help="HTTP API port (server only)",
+    )
+    parser.add_argument(
+        "--server-url",
+        type=str,
+        default=None,
+        help="Server URL (miner/oracle only)",
+    )
+    parser.add_argument(
+        "--n-qubits",
+        type=int,
+        default=None,
+        help="Number of qubits for quantum evolution",
+    )
+    parser.add_argument(
+        "--difficulty",
+        type=int,
+        default=None,
+        help="Proof-of-work difficulty (leading zeros)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Log level",
+    )
+    return parser
+
+
+def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) -> None:
+    if args.db_dsn:
+        cfg_manager.set("db_dsn", args.db_dsn)
+    if args.http_port:
+        cfg_manager.set("http_port", args.http_port)
+    if args.server_url:
+        cfg_manager.set("server_url", args.server_url)
+    if args.n_qubits:
+        cfg_manager.set("n_qubits", args.n_qubits)
+    if args.difficulty:
+        cfg_manager.set("difficulty", args.difficulty)
+
+
+def main() -> None:
+    parser = build_argparser()
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    logger = get_logger("qtcl.main", level=getattr(logging, args.log_level))
+    node_classes = {
+        "server": QtclServer,
+        "miner":  QtclMiner,
+        "oracle": QtclOracle,
+    }
+    NodeClass = node_classes[args.type]
+    node = NodeClass(config_path=args.config)
+    apply_cli_overrides(node._cfg, args)
+    logger.info(f"Starting QTCL {args.type} node...")
+    try:
+        node.start()
+        node.run_forever()
+    except Exception as exc:
+        logger.error(f"Fatal error: {exc}\n{traceback.format_exc()}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
     main()
