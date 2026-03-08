@@ -550,41 +550,6 @@ class P2PMessage:
             payload=d.get('payload')
         )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SAFE JSON UTILITY — defensive wrapper for all HTTP response.json() calls
-# ═══════════════════════════════════════════════════════════════════════════════
-def _safe_json(response: 'requests.Response', default: Any = None,
-               label: str = '') -> Any:
-    """
-    Parse response.json() without raising on empty body or non-JSON content.
-
-    Koyeb cold-start, load-balancer draining, and HTTP→TCP proxy misrouting all
-    produce HTTP 200 responses with empty or HTML bodies.  A bare .json() call in
-    those paths raises JSONDecodeError which propagates as a spurious Exception,
-    masks the real server state, and burns retry budget.
-
-    Behaviour:
-      • Returns parsed JSON dict/list on success.
-      • Returns `default` (None by default) on any parse failure.
-      • Logs the first 200 chars of response.text at DEBUG level so devs can
-        diagnose what the server actually sent.
-    """
-    try:
-        return response.json()
-    except Exception as _je:
-        _body = ''
-        try:
-            _body = response.text[:200] if response.text else '<empty body>'
-        except Exception:
-            _body = '<unreadable>'
-        _tag = f'[{label}] ' if label else ''
-        logger.debug(
-            f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | "
-            f"body={_body!r}"
-        )
-        return default
-
-
 class P2PClient:
     """
     P2P client for peer discovery and block synchronisation.
@@ -640,7 +605,7 @@ class P2PClient:
             try:
                 r = self._session.get(f"{base}/api/oracle/miners", timeout=timeout)
                 if r.status_code == 200:
-                    data = _safe_json(r, default={}, label='P2P/discover')
+                    data = r.json()
                     miners = data if isinstance(data, list) else data.get('miners', [])
                     for m in miners:
                         url = m.get('url') or m.get('oracle_url', '')
@@ -670,7 +635,7 @@ class P2PClient:
             try:
                 r = self._session.get(f"{base}/api/blocks/tip", timeout=timeout)
                 if r.status_code == 200:
-                    data = _safe_json(r, default={}, label='P2P/height')
+                    data = r.json()
                     h = data.get('block_height') or data.get('height')
                     if h is not None:
                         logger.info(f"[P2P] ✅ Chain tip height={h} from {base}")
@@ -694,7 +659,7 @@ class P2PClient:
                         f"{base}/api/blocks/height/{height}", timeout=timeout
                     )
                     if r.status_code == 200:
-                        data = _safe_json(r, default={}, label='P2P/sync_blocks')
+                        data = r.json()
                         # Unwrap nested header if present
                         block = data.get('header', data)
                         blocks.append(block)
@@ -1794,6 +1759,82 @@ SCHEMA_PATCHES = {
     """,
 }
 
+def apply_schema_patches(conn=None):
+    """Apply all SCHEMA_PATCHES to the SQLite database.
+
+    Single source of truth for all schema migrations.
+    Called by: main(), _init_gossip_db(), _apply_dht_schema(), QTCLP2PBundle.
+    Idempotent: CREATE IF NOT EXISTS + duplicate-column guards on every statement.
+    conn=None  -> uses module-level _DB_CONN (schema-builder connection).
+    conn=<db>  -> uses the supplied SQLite connection (e.g. main() `db` handle).
+    """
+    target = conn
+    if target is None:
+        # Prefer the runtime `db` global (set in main()) over the schema-builder
+        # connection, because main() opens a fresh handle with WAL+NORMAL pragmas.
+        import sys as _sys
+        _mmod = _sys.modules.get('__main__') or _sys.modules.get(__name__)
+        target = getattr(_mmod, 'db', None) or _DB_CONN
+    if target is None:
+        logger.warning("[SCHEMA] ⚠️  apply_schema_patches: no DB connection — skipping")
+        return
+    _lock = threading.RLock()
+    with _lock:
+        # ── Ensure p2p_peers (not in SCHEMA_PATCHES dict) ──────────────────
+        _P2P_SQL = """
+            CREATE TABLE IF NOT EXISTS p2p_peers (
+                peer_id    TEXT PRIMARY KEY,
+                miner_id   TEXT NOT NULL,
+                ips        TEXT NOT NULL,
+                port       INTEGER DEFAULT 9091,
+                last_seen  REAL,
+                is_oracle  BOOLEAN DEFAULT 1,
+                fidelity   REAL DEFAULT 0.0,
+                created_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON p2p_peers(last_seen);
+        """
+        for _s in _P2P_SQL.strip().split(';'):
+            _s = _s.strip()
+            if _s:
+                try:
+                    target.execute(_s)
+                except sqlite3.OperationalError as _e:
+                    if 'already exists' not in str(_e).lower():
+                        logger.debug(f"[SCHEMA] p2p_peers: {_e}")
+        try: target.commit()
+        except Exception: pass
+
+        # ── Apply every patch in SCHEMA_PATCHES ────────────────────────────
+        for patch_name, patch_sql in SCHEMA_PATCHES.items():
+            try:
+                for stmt in patch_sql.strip().split(';'):
+                    s = stmt.strip()
+                    if s and not s.startswith('--'):
+                        try:
+                            target.execute(s)
+                        except sqlite3.OperationalError as _e:
+                            _em = str(_e).lower()
+                            if 'duplicate column' not in _em and 'already exists' not in _em:
+                                logger.debug(f"[SCHEMA] [{patch_name}]: {_e}")
+                target.commit()
+                logger.debug(f"[SCHEMA] ✅ {patch_name}")
+            except Exception as _ex:
+                logger.debug(f"[SCHEMA] note [{patch_name}]: {_ex}")
+
+        # ── Purge loopback self-entries from peer tables ────────────────────
+        for _tbl, _col in [('gossip_peers','gossip_url'),('dht_peers','peer_address'),('p2p_peers','ips')]:
+            try:
+                target.execute(
+                    f"DELETE FROM {_tbl} WHERE {_col} LIKE '%127.0.0.1%' "
+                    f"OR {_col} LIKE '%localhost%'"
+                )
+            except Exception: pass
+        try: target.commit()
+        except Exception: pass
+    logger.debug(f"[SCHEMA] ✅ apply_schema_patches done ({len(SCHEMA_PATCHES)} patches)")
+
+
 def detect_oracle_url() -> str:
     """
     ⚛️ SMART ORACLE URL DETECTION
@@ -1848,50 +1889,7 @@ def detect_oracle_url() -> str:
     logger.info(f"[ORACLE] 🔍 Using default production URL: {url}")
     logger.warning("[ORACLE] ⚠️  If this is wrong, set ORACLE_URL environment variable")
     return url
-    """
-    Apply all schema patches to the local database.
-    Called at startup (main) and can also be called with an explicit connection.
-    Idempotent — safe to call multiple times.
-    Also purges stale loopback entries from peer tables on every call.
-    """
-    target = conn or _DB_CONN
-    if target is None:
-        return
-    with threading.RLock():
-        for patch_name, patch_sql in SCHEMA_PATCHES.items():
-            try:
-                for stmt in patch_sql.strip().split(';'):
-                    s = stmt.strip()
-                    if s and not s.startswith('--'):
-                        try:
-                            target.execute(s)
-                        except sqlite3.OperationalError as _e:
-                            if 'duplicate column' not in str(_e).lower() and \
-                               'already exists' not in str(_e).lower():
-                                logger.debug(f"[SCHEMA] stmt warn ({patch_name}): {_e}")
-                target.commit()
-                logger.debug(f"[SCHEMA] ✅ Applied patch: {patch_name}")
-            except Exception as e:
-                logger.debug(f"[SCHEMA] ℹ️  Patch note ({patch_name}): {e}")
 
-        # ── Purge loopback / stale peer entries ───────────────────────────────
-        # 127.0.0.1 and localhost entries in gossip_peers/dht_peers are this
-        # node's own gossip listener URL leaking into peer tables.  They cause
-        # connection-refused spam on gossip fan-out.  Purge them every startup.
-        for tbl, col in [('gossip_peers', 'gossip_url'),
-                          ('dht_peers',    'peer_address')]:
-            try:
-                target.execute(
-                    f"DELETE FROM {tbl} WHERE {col} LIKE '%127.0.0.1%' "
-                    f"OR {col} LIKE '%localhost%'"
-                )
-            except Exception:
-                pass
-        try:
-            target.commit()
-            logger.debug("[SCHEMA] ✅ Loopback peer entries purged")
-        except Exception:
-            pass
 
 class ConsensusManager:
     """Manages consensus on system metrics across peer network."""
@@ -2003,7 +2001,7 @@ class PeriodicPeerSync:
                         f"{base}/api/blocks/tip", timeout=5
                     )
                     if r.status_code == 200:
-                        data   = _safe_json(r, default={}, label='CONSENSUS/tip')
+                        data   = r.json()
                         height = data.get('block_height') or data.get('height') or 0
                         peer_id = base
                         if self.consensus_mgr:
@@ -2505,15 +2503,7 @@ class P2PClientWStateRecovery:
                 )
 
                 if response.status_code in [200, 201]:
-                    data = _safe_json(response, default={}, label='W-STATE/register')
-                    if data is None:
-                        # Server returned 200 but empty/non-JSON body — treat as registered
-                        # (Koyeb cold-start can return 200 OK with empty body during init)
-                        logger.warning(
-                            f"[W-STATE] ⚠️  Registration HTTP {response.status_code} but "
-                            f"empty/non-JSON body — assuming registered (server initialising)"
-                        )
-                        return True
+                    data = response.json()
                     self.oracle_address = data.get('miner_id', self.peer_id)
                     if self.oracle_address:
                         self.trusted_oracles.add(self.oracle_address)
@@ -2651,14 +2641,7 @@ class P2PClientWStateRecovery:
                 r  = requests.get(url, timeout=10)
                 elapsed = time.time() - t0
                 if r.status_code == 200:
-                    raw = _safe_json(r, default=None, label=f'W-STATE{ep}')
-                    if raw is None:
-                        logger.warning(
-                            f"[W-STATE] ⚠️  {ep} → HTTP 200 but empty/non-JSON body "
-                            f"(oracle initialising?). body={r.text[:80]!r}"
-                        )
-                        continue
-                    snap = self._normalize_snapshot(raw, ep)
+                    snap = self._normalize_snapshot(r.json(), ep)
                     with self._state_lock:
                         self.current_snapshot = snap
                         self.snapshot_buffer.append(snap)
@@ -3281,35 +3264,20 @@ class P2PClientWStateRecovery:
             if not self.register_with_oracle():
                 logger.warning("[W-STATE] ⚠️  Registration inconclusive — will retry in sync loop")
 
-            # ── Block until REAL oracle snapshot arrives — NO synthetic fallback ──────
-            # Architecture mandate: mining requires a genuine W-state from the oracle.
-            # Empty-body 200s during Koyeb cold-start are handled by _safe_json() —
-            # they return None and we retry.  The failure cooldown is cleared each loop
-            # so HTTP is always attempted.  Backoff: 2 4 8 16 30 30 30… seconds.
+            # ── Block until real oracle snapshot arrives ───────────────────────
+            # No synthetic fallback. Mining is gated on entanglement.established
+            # so the miner simply waits here rather than mining on fake data.
             attempt = 0
             snapshot = None
-            _BACKOFF = [2, 4, 8, 16, 30]
-
             while snapshot is None:
-                attempt += 1
-                # Clear failure cooldown so download_latest_snapshot always hits HTTP
-                self.__class__._snap_last_fail = 0.0
                 snapshot = self.download_latest_snapshot()
+                if snapshot is None:
+                    attempt += 1
+                    wait = min(2 ** min(attempt, 5), 30)
+                    logger.info(f"[W-STATE] ⏳ Waiting for oracle snapshot (attempt {attempt}) — retry in {wait}s")
+                    time.sleep(wait)
 
-                if snapshot is not None:
-                    logger.info(
-                        f"[W-STATE] ✅ Real oracle snapshot received "
-                        f"(attempt {attempt}) | fidelity={snapshot.get('fidelity', '?')}"
-                    )
-                    break
-
-                wait = _BACKOFF[min(attempt - 1, len(_BACKOFF) - 1)]
-                logger.info(
-                    f"[W-STATE] ⏳ No oracle snapshot yet (attempt {attempt}) — "
-                    f"oracle initialising or unreachable. Retrying in {wait}s… "
-                    f"(mining is GATED on real W-state)"
-                )
-                time.sleep(wait)
+            logger.info(f"[W-STATE] ✅ Real oracle snapshot received | fidelity={snapshot.get('fidelity', '?')}")
 
             recovered = self.recover_w_state(snapshot)
             if recovered is None:
@@ -3538,7 +3506,7 @@ class LiveNodeClient:
         try:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/tip",timeout=10)
             if r.status_code==200:
-                return BlockHeader.from_dict(_safe_json(r, default={}, label="LiveNode/tip") or {})
+                return BlockHeader.from_dict(r.json())
         except:
             pass
         return None
@@ -3547,7 +3515,7 @@ class LiveNodeClient:
         try:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/blocks/height/{height}",timeout=10)
             if r.status_code==200:
-                return _safe_json(r, default=None, label="LiveNode/block")
+                return r.json()
         except:
             pass
         return None
@@ -3557,7 +3525,7 @@ class LiveNodeClient:
             r=self.session.get(f"{self.base_url}{API_PREFIX}/mempool",timeout=10)
             if r.status_code==200:
                 txs=[]
-                for tx in (_safe_json(r, default={}, label='LiveNode/mempool') or {}).get('transactions',[])[:MAX_MEMPOOL]:
+                for tx in r.json().get('transactions',[])[:MAX_MEMPOOL]:
                     try:
                         # Remap server field names → Transaction dataclass fields
                         # Server returns from_address/to_address/tx_hash (DB column names)
@@ -3590,11 +3558,11 @@ class LiveNodeClient:
             logger.debug(f"[SUBMIT] Status: {r.status_code} | Headers: {dict(r.headers)}")
             
             if r.status_code in [200,201]:
-                return True,(_safe_json(r, default={}, label='LiveNode/submit_ok') or {}).get('message','Block accepted')
+                return True,r.json().get('message','Block accepted')
             
             # ❌ SUBMISSION FAILED - LOG FULL DETAILS
             try:
-                error_data = _safe_json(r, default={}, label='LiveNode/submit')
+                error_data = r.json()
                 error_msg = error_data.get('error', f'HTTP {r.status_code}')
             except:
                 error_msg = f'HTTP {r.status_code}: {r.text[:200]}'
@@ -3610,7 +3578,7 @@ class LiveNodeClient:
         try:
             r = self.session.get(f"{self.base_url}{API_PREFIX}/wallet?address={address}", timeout=10)
             if r.status_code == 200:
-                return _safe_json(r, default=None, label='LiveNode/balance'), None
+                return r.json(), None
             return None, f"Status {r.status_code}: {r.text}"
         except Exception as e:
             return None, str(e)
@@ -5321,7 +5289,7 @@ class PeerHeartbeat(threading.Thread):
                 timeout=10,
             )
             if r.status_code in (200, 201):
-                data = _safe_json(r, default={}, label='PeerHeartbeat/register')
+                data = r.json()
                 self._known_peers = data.get('live_peers', [])
                 logger.info(
                     f"[P2P] ✅ Registered with oracle | "
@@ -7336,7 +7304,7 @@ class DHTExchangeManager:
                 ok  = r.status_code == 200
                 _local_db_record_peer_result(self.db, node_id, ok, lat)
                 if ok:
-                    data = _safe_json(r, default={}, label='DHT/ping')
+                    data = r.json()
                     # Update height and fidelity from ping response
                     try:
                         self.db.execute("""
@@ -9502,42 +9470,30 @@ def main():
         logger.info("[CONSENSUS] 🤝 Consensus manager initialized")
 
         # 5. Sync chain height from oracle / peers
-        # ─── ORACLE HEIGHT QUERY — robust, with retry + local DB fallback ─────────
-        # Koyeb free tier can take 10-30s to cold-start; 3s is too aggressive.
-        # Strategy: 3 quick attempts (3s, 5s, 8s timeouts) with 2s back-off,
-        #           then fall back to local DB — mining starts immediately either way.
+        # Short initial timeout (3s) — Koyeb free tier may be cold-starting.
+        # Mining starts from local state immediately; background sync catches up.
         current_height = 0
         p2p_success    = False
-        _height_attempts = [(3, 0), (5, 2), (8, 3)]  # (timeout_s, sleep_before)
 
-        logger.info("[P2P] 📊 Querying oracle for current block height…")
-        for _t_timeout, _t_sleep in _height_attempts:
-            if _t_sleep:
-                time.sleep(_t_sleep)
-            try:
-                _h = _P2P_CLIENT.get_block_height(timeout=_t_timeout, oracle_url=oracle_url)
-                if _h is not None and _h > 0:
-                    current_height = _h
-                    logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
-                    break
-            except Exception as _he:
-                logger.debug(f"[P2P] height attempt (timeout={_t_timeout}s): {_he}")
+        logger.info("[P2P] 📊 Querying oracle for current block height (3s timeout — non-blocking)...")
+        current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
 
-        if not current_height:
-            logger.info("[P2P] ℹ️  Oracle unreachable — trying P2P peers then local DB…")
-            # Peer-to-peer height discovery
-            try:
-                discovered = _P2P_CLIENT.discover_peers(timeout=5)
-                if discovered:
-                    _P2P_CLIENT.known_peers.extend(discovered)
-                    _h = _P2P_CLIENT.get_block_height(timeout=5, oracle_url=oracle_url)
-                    if _h:
-                        current_height = _h
-                        logger.info(f"[P2P] ✅ Got height from peers: {current_height}")
-            except Exception as _de:
-                logger.debug(f"[P2P] peer discovery: {_de}")
+        if current_height is not None and current_height > 0:
+            logger.info(f"[P2P] ✅ Got height from oracle: {current_height}")
+        else:
+            logger.info(
+                "[P2P] ℹ️  Oracle cold-starting or unreachable — mining from local state. "
+                "Background sync will catch up within 30s."
+            )
+            # Try peer-to-peer height discovery (no oracle needed)
+            discovered = _P2P_CLIENT.discover_peers(timeout=3)
+            if discovered:
+                _P2P_CLIENT.known_peers.extend(discovered)
+                current_height = _P2P_CLIENT.get_block_height(timeout=3, oracle_url=oracle_url)
+                if current_height:
+                    logger.info(f"[P2P] ✅ Got height from peers: {current_height}")
 
-            # Final fallback: read local SQLite — always available
+            # Fallback: read local DB height — always available
             if not current_height:
                 try:
                     cursor = db.cursor()
