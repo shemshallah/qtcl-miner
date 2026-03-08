@@ -559,11 +559,12 @@ def _safe_json(response, default=None, label=''):
         return response.json()
     except Exception as _je:
         try:
-            _body = response.text[:200] if response.text else '<empty>'
+            _body = response.text[:400] if response.text else '<empty>'
         except Exception:
             _body = '<unreadable>'
         _tag = f'[{label}] ' if label else ''
-        logger.debug(f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | body={_body!r}")
+        # WARNING level so empty-body issues appear in production logs (debug is filtered)
+        logger.warning(f"{_tag}JSON parse failed (HTTP {response.status_code}): {_je} | body={_body!r}")
         return default
 
 
@@ -647,13 +648,17 @@ class P2PClient:
         """
         Get current chain tip height from oracle REST /api/blocks/tip.
         Accepts both 'block_height' and 'height' keys for compatibility.
+        FIX: use explicit `is not None` check — `or` treats height=0 as falsy.
         """
         for base in self._base_urls(oracle_url):
             try:
                 r = self._session.get(f"{base}/api/blocks/tip", timeout=timeout)
                 if r.status_code == 200:
                     data = _safe_json(r, default={}, label='P2P/height')
-                    h = data.get('block_height') or data.get('height')
+                    # Explicit None checks — `or` would silently skip height=0
+                    h = data.get('block_height')
+                    if h is None:
+                        h = data.get('height')
                     if h is not None:
                         logger.info(f"[P2P] ✅ Chain tip height={h} from {base}")
                         return int(h)
@@ -2019,7 +2024,10 @@ class PeriodicPeerSync:
                     )
                     if r.status_code == 200:
                         data   = _safe_json(r, default={}, label='CONSENSUS/tip')
-                        height = data.get('block_height') or data.get('height') or 0
+                        _h_tmp = data.get('block_height')
+                        if _h_tmp is None:
+                            _h_tmp = data.get('height')
+                        height = int(_h_tmp) if _h_tmp is not None else 0
                         peer_id = base
                         if self.consensus_mgr:
                             self.consensus_mgr.record_peer_metric(peer_id, 'chain_height', height)
