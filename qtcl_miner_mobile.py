@@ -1478,7 +1478,7 @@ class P2PServiceInventory:
                     nonce=int(payload.get('nonce', 0)),
                     timestamp_ns=int(payload.get('timestamp_ns', int(time.time_ns()))),
                     signature=str(payload.get('signature', '')),
-                    fee=float(payload.get('fee', 0.001)),
+                    fee=_sf(payload.get('fee'), 0.001),
                 )
                 mempool.add_transaction(t)
             except Exception as me:
@@ -2557,56 +2557,50 @@ class P2PClientWStateRecovery:
         pq0/IV/V construction. Never synthesize values that exist in the oracle response.
         """
         import hashlib as _hl
-        out = dict(data)
+        # Deep-copy and STRIP ALL NULL VALUES FIRST.
+        # Oracle sends {"fidelity": null, ...} during init — setdefault/get(k,d)
+        # both fail silently on keys that exist with null values.
+        # One pass: replace every None with sentinel missing so defaults apply cleanly.
+        out = {k: v for k, v in data.items() if v is not None and v != ''}
+        # Restore non-scalar keys that may legitimately be empty/null
+        for _k in ('hlwe_signature', 'density_matrix_hex', 'w_entropy_hash'):
+            if _k in data:
+                out[_k] = data[_k]
 
-        # ── fidelity ──────────────────────────────────────────────────────
-        if not out.get('fidelity'):
-            out['fidelity'] = float(
-                out.get('w3_fidelity') or out.get('w_state_fidelity') or
-                out.get('pq0_fidelity') or 0.90
-            )
-        # Also normalize fidelity aliases for downstream consumers
-        out.setdefault('w3_fidelity', out['fidelity'])
+        # ── fidelity — unconditional: set from any alias, never leave None ──
+        _f = (_nn(out.get('fidelity')) or _nn(out.get('w3_fidelity')) or
+              _nn(out.get('w_state_fidelity')) or _nn(out.get('pq0_fidelity')) or 0.90)
+        out['fidelity']    = float(_f)
+        out['w3_fidelity'] = out['fidelity']     # always overwrite — alias must match
 
         # ── coherence ─────────────────────────────────────────────────────
-        if not out.get('coherence'):
-            out['coherence'] = float(out.get('coherence_l1') or 0.85)
+        out['coherence'] = float(_nn(out.get('coherence')) or
+                                  _nn(out.get('coherence_l1')) or 0.85)
 
-        # ── GKSL noise bath params — preserve oracle values; never synthesize ──
-        # These are the real physical rates from the lattice's GKSL master equation.
-        # gamma1:   T1 amplitude damping (derived from DB round-trip EMA on oracle)
-        # gammaphi: pure dephasing T2* (from cycle jitter EMA)
-        # gammadep: depolarising noise floor (from QRNG source health)
-        # gamma_geo: geometry noise (hyperbolic geodesic pq0↔pq_max)
-        # ou_mem:   Ornstein-Uhlenbeck bath memory (non-Markovian correction)
-        # omega:    free precession frequency
-        out['gamma1']    = float(out.get('gamma1',    out.get('gamma_1',    0.04)))
-        out['gammaphi']  = float(out.get('gammaphi',  out.get('gamma_phi',  0.12)))
-        out['gammadep']  = float(out.get('gammadep',  out.get('gamma_dep',  0.01)))
-        out['gamma_geo'] = float(out.get('gamma_geo', 0.01))
-        out['ou_mem']    = float(out.get('ou_mem',    0.03))
-        out['omega']     = float(out.get('omega',     0.50))
+        # ── GKSL noise bath params — always overwrite with safe defaults ──
+        out['gamma1']    = _sf(out.get('gamma1')   or out.get('gamma_1'),   0.04)
+        out['gammaphi']  = _sf(out.get('gammaphi') or out.get('gamma_phi'), 0.12)
+        out['gammadep']  = _sf(out.get('gammadep') or out.get('gamma_dep'), 0.01)
+        out['gamma_geo'] = _sf(out.get('gamma_geo'), 0.01)
+        out['ou_mem']    = _sf(out.get('ou_mem'),    0.03)
+        out['omega']     = _sf(out.get('omega'),     0.50)
 
-        # ── density_matrix_hex — the actual GKSL-evolved 8×8 DM from the lattice ──
-        # This is the ground truth pq0 state. Use it directly instead of reconstructing.
-        # Preserve if present (from /api/oracle/w-state); absence means pq0-bloch endpoint.
-        if 'density_matrix_hex' not in out:
+        # ── density_matrix_hex ────────────────────────────────────────────
+        if not out.get('density_matrix_hex'):
             out['density_matrix_hex'] = ''
 
-        # ── Bloch angles ─────────────────────────────────────────────────
-        if 'theta' not in out:
-            out['theta'] = float(out.get('pq0_bloch_theta', np.pi / 2))
-        if 'phi' not in out:
-            out['phi'] = float(out.get('pq0_bloch_phi', 0.0))
+        # ── Bloch angles — always overwrite ──────────────────────────────
+        out['theta'] = _sf(out.get('theta') or out.get('pq0_bloch_theta'), np.pi / 2)
+        out['phi']   = _sf(out.get('phi')   or out.get('pq0_bloch_phi'),   0.0)
 
-        # ── entanglement measures — preserve oracle values ─────────────
+        # ── entanglement measures — always overwrite, never leave None ────
         for k, d in [('negativity',0.43),('concurrence',0.30),('qfi',6.5),
                      ('discord',1.5),('sector_occ',0.9),('tele_fidelity',0.6),
                      ('purity',0.80),('entanglement',0.65)]:
-            out.setdefault(k, float(out.get(k, d)))
+            out[k] = _sf(out.get(k), d)
 
-        # ── wN_fidelity (N-oracle joint) ──────────────────────────────────
-        out.setdefault('wN_fidelity', float(out.get('wN_fidelity', out['fidelity'] * 0.95)))
+        # ── wN_fidelity ───────────────────────────────────────────────────
+        out['wN_fidelity'] = _sf(out.get('wN_fidelity'), out['fidelity'] * 0.95)
 
         # ── timestamp ─────────────────────────────────────────────────────
         if 'timestamp_ns' not in out:
@@ -2867,8 +2861,8 @@ class P2PClientWStateRecovery:
         """
         try:
             # ── Real oracle fidelity (the ONLY value that goes into block header) ──
-            fidelity  = float(snapshot.get('fidelity',  0.90))
-            coherence = float(snapshot.get('coherence', 0.85))
+            fidelity  = _sf(snapshot.get('fidelity'),  0.90)
+            coherence = _sf(snapshot.get('coherence'), 0.85)
             
             # ⚛️ CRITICAL BOUNDS: Ensure metrics are valid [0, 1]
             # This fixes unbounded coherence from oracle.py:coherence_l1_norm
@@ -3682,7 +3676,7 @@ class LiveNodeClient:
                             'nonce'       : int(tx.get('nonce',0)),
                             'timestamp_ns': int(tx.get('timestamp_ns', int(time.time()*1e9))),
                             'signature'   : str(tx.get('signature') or tx.get('quantum_state_hash','')),
-                            'fee'         : float(tx.get('fee',0.001)),
+                            'fee'         : _sf(tx.get('fee'), 0.001),
                         }
                         if mapped['tx_id'] and mapped['from_addr'] and mapped['to_addr']:
                             txs.append(Transaction(**mapped))
@@ -4147,11 +4141,11 @@ def _apply_gksl_bath(rho: np.ndarray, snap: dict, dt: float = 2.0) -> np.ndarray
     For IV qubit: caller passes boosted gamma1 (more amplitude damping = anti-correlated degradation).
     For V  qubit: caller passes exact oracle rates (faithful local mirror).
     """
-    g1   = float(snap.get('gamma1',   0.04))
-    gphi = float(snap.get('gammaphi', 0.12))
-    gdep = float(snap.get('gammadep', 0.01))
-    om   = float(snap.get('omega',    0.50))
-    ou   = float(snap.get('ou_mem',   0.03))
+    g1   = _sf(snap.get('gamma1'),   0.04)
+    gphi = _sf(snap.get('gammaphi'), 0.12)
+    gdep = _sf(snap.get('gammadep'), 0.01)
+    om   = _sf(snap.get('omega'),    0.50)
+    ou   = _sf(snap.get('ou_mem'),   0.03)
 
     # OU memory correction: suppress γ1 non-Markovian (same as server _KAPPA3 = 0.11)
     _KAPPA3 = 0.11
@@ -4194,6 +4188,19 @@ def _apply_gksl_bath(rho: np.ndarray, snap: dict, dt: float = 2.0) -> np.ndarray
     return cur
 
 
+
+def _sf(v, d):
+    """Safe float: float(v) if v is a real value, else float(d). Never raises on None."""
+    return float(v if (v is not None and v != '' and v is not False) else d)
+
+def _nn(v):
+    """Non-null: returns float(v) if real numeric value, else None (for 'or' chaining)."""
+    if v is None or v == '' or v is False:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # QUANTUM TENSOR FIELD — ORACLE-SEEDED AER TRIPARTITE W-STATE WITH ROUND-ROBIN QUBIT FIDELITY
 # Architecture:
@@ -4328,20 +4335,20 @@ class QuantumTensorField:
           2. Reconstruct ideal W3 from fidelity, apply GKSL bath with oracle's rates
         Also caches all noise bath params for use in _derive_iv_v and field fidelity.
         """
-        theta = float(snap.get('theta', snap.get('pq0_bloch_theta', np.pi/2)))
-        phi   = float(snap.get('phi',   snap.get('pq0_bloch_phi',   0.0)))
-        f     = min(1.0, max(0.0, float(snap.get('w3_fidelity', snap.get('fidelity', 0.9)))))
+        theta = _sf(snap.get('theta') or snap.get('pq0_bloch_theta'), np.pi/2)
+        phi   = _sf(snap.get('phi')   or snap.get('pq0_bloch_phi'),   0.0)
+        f     = min(1.0, max(0.0, _sf(snap.get('w3_fidelity') or snap.get('fidelity'), 0.9)))
         self._oracle_theta       = theta
         self._oracle_phi         = phi
         self._oracle_w3_fidelity = f
-        self._oracle_coherence   = min(1.0, max(0.0, float(snap.get('coherence', 0.85))))
+        self._oracle_coherence   = min(1.0, max(0.0, _sf(snap.get('coherence'), 0.85)))
         # Cache all GKSL bath params — used by _derive_iv_v and field fidelity
-        self._snap_gamma1    = float(snap.get('gamma1',   0.04))
-        self._snap_gammaphi  = float(snap.get('gammaphi', 0.12))
-        self._snap_gammadep  = float(snap.get('gammadep', 0.01))
-        self._snap_ou_mem    = float(snap.get('ou_mem',   0.03))
-        self._snap_omega     = float(snap.get('omega',    0.50))
-        self._snap_sector    = float(snap.get('sector_occ', 0.9))
+        self._snap_gamma1    = _sf(snap.get('gamma1'),   0.04)
+        self._snap_gammaphi  = _sf(snap.get('gammaphi'), 0.12)
+        self._snap_gammadep  = _sf(snap.get('gammadep'), 0.01)
+        self._snap_ou_mem    = _sf(snap.get('ou_mem'),   0.03)
+        self._snap_omega     = _sf(snap.get('omega'),    0.50)
+        self._snap_sector    = _sf(snap.get('sector_occ'), 0.9)
 
         # ── 1. Extract actual GKSL DM from lattice if available ──────────
         dm = _extract_gksl_dm(snap)
@@ -5233,7 +5240,7 @@ def _local_db_upsert_block(db, block: dict) -> bool:
             int(h.get('difficulty_bits', 20)),
             int(h.get('nonce', 0)),
             str(h.get('miner_address', '')),
-            float(h.get('w_state_fidelity', 0.0)),
+            _sf(h.get('w_state_fidelity'), 0.0),
             str(h.get('w_entropy_hash', '')),
             int(h.get('tx_count', 0)),
             json.dumps(block),
@@ -6169,7 +6176,7 @@ class SSESubscriber(threading.Thread):
                         nonce        = int(edata.get('nonce', 0)),
                         timestamp_ns = int(time.time() * 1e9),
                         signature    = str(edata.get('signature','')),
-                        fee          = float(edata.get('fee', 0.001)),
+                        fee          = _sf(edata.get('fee'), 0.001),
                     )
                     self.mempool.add_transaction(tx)
                 except Exception as te:
@@ -6749,8 +6756,8 @@ class VirtualPseudoqubitManager:
         pq0 is the anchor — all virtual and inverse-virtual pqs derive from it.
         """
         try:
-            fidelity  = float(oracle_snapshot.get('fidelity', 0.9))
-            coherence = float(oracle_snapshot.get('coherence', 0.85))
+            fidelity  = _sf(oracle_snapshot.get('fidelity'),  0.9)
+            coherence = _sf(oracle_snapshot.get('coherence'), 0.85)
 
             # ── Use actual lattice GKSL DM if present (ground truth from noise bath) ──
             pq0_dm = _extract_gksl_dm(oracle_snapshot)
@@ -6786,8 +6793,8 @@ class VirtualPseudoqubitManager:
         This is the critical sync hook: snapshot IS the noise bath state, treat it as such.
         """
         try:
-            fidelity  = min(1.0, max(0.0, float(oracle_snapshot.get('fidelity', 0.90))))
-            coherence = min(1.0, max(0.0, float(oracle_snapshot.get('coherence', 0.85))))
+            fidelity  = min(1.0, max(0.0, _sf(oracle_snapshot.get('fidelity'),  0.90)))
+            coherence = min(1.0, max(0.0, _sf(oracle_snapshot.get('coherence'), 0.85)))
 
             # ── Use lattice GKSL DM directly; fall back to local GKSL evolution ──
             pq0_new = _extract_gksl_dm(oracle_snapshot)
@@ -7421,7 +7428,7 @@ class OracleEntanglementBridge:
             return False
 
         oracle_id = self._oracle_id_from_url(self.main_oracle_url)
-        fidelity  = float(snap.get('fidelity', 0.0))
+        fidelity  = _sf(snap.get('fidelity'), 0.0)
         
         # ▶ FIX: Always refresh pq0 from oracle FIRST — keeps fidelity live
         if self.vpm.update_pq0(snap):
@@ -7484,7 +7491,7 @@ class OracleEntanglementBridge:
         if snap is None:
             return False
 
-        fidelity = float(snap.get('fidelity', 0.0))
+        fidelity = _sf(snap.get('fidelity'), 0.0)
         f_link   = fidelity * self.vpm._fidelity
         status   = ('active' if f_link >= 0.70 else
                     'degraded' if f_link >= 0.50 else 'lost')
@@ -8253,7 +8260,7 @@ class DHTExchangeManager:
                                 local_node_id=self.local_node_id,
                                 capabilities=tp.get('capabilities', []),
                                 block_height=int(tp.get('block_height', 0)),
-                                w_fidelity=float(tp.get('w_fidelity', 0.0)),
+                                w_fidelity=_sf(tp.get('w_fidelity'), 0.0),
                                 is_oracle='oracle' in tp.get('capabilities', []),
                             )
                             new_peers += 1
@@ -8380,7 +8387,7 @@ def _handle_dht_hello(handler, data: dict) -> None:
     requester_gossip  = str(data.get('gossip_url', ''))
     requester_height  = int(data.get('block_height', 0))
     requester_caps    = data.get('capabilities', ['mine'])
-    requester_w_fid   = float(data.get('w_fidelity', 0.0))
+    requester_w_fid   = _sf(data.get('w_fidelity'), 0.0)
     remote_ip         = handler.client_address[0] if handler.client_address else ''
 
     # Parse gossip URL for address/port
@@ -8444,7 +8451,7 @@ def _handle_dht_pex(handler, data: dict) -> None:
     requester_gossip  = str(data.get('requester_gossip', ''))
     requester_addr    = str(data.get('requester_addr', ''))
     requester_height  = int(data.get('my_height', 0))
-    requester_fid     = float(data.get('my_fidelity', 0.0))
+    requester_fid     = _sf(data.get('my_fidelity'), 0.0)
 
     # Merge requester into our DHT
     if requester_node_id and requester_gossip:
