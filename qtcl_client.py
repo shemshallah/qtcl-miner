@@ -4769,10 +4769,14 @@ class QtclServer(QtclNode):
         block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
         difficulty = int(self._cfg.get("difficulty", 4))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
+        
+        # ✅ Import _SSE_MUX at function scope to avoid NameError
+        global _SSE_MUX
+        
         while not self._stop_event.wait(block_interval):
             try:
                 latest = self.db.get_latest_block()
-                prev_hash = latest["block_hash"] if latest else "0" * 64
+                prev_hash = latest["hash"] if latest else "0" * 64  # ✅ Use "hash" not "block_hash"
                 height = (latest["height"] + 1) if latest else 0
                 # Collect pending transactions
                 pending_txs = self.db.get_pending_transactions(limit=50)
