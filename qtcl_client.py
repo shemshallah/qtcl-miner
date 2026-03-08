@@ -1048,13 +1048,32 @@ class LocalBlockchainDB:
     All methods from original are preserved and re-implemented using SQLite.
     """
     
-    def __init__(self, name: str, hosts: list = None, min_size: int = 10, max_size: int = 20, 
-                 pool_min: int = 2, pool_max: int = 10):
-        """Initialize SQLite database with same interface as psycopg version"""
+
+    def __init__(self, dsn: str = None, name: str = None, hosts: list = None, 
+                 min_size: int = 10, max_size: int = 20, 
+                 pool_min: int = 2, pool_max: int = 10, **kwargs):
+        """Initialize SQLite database with full parameter compatibility
+        
+        Accepts either dsn (for PostgreSQL compatibility) or name parameter.
+        dsn is parsed to extract database name if provided.
+        """
         import sqlite3
         from pathlib import Path
         
+        # Handle DSN parameter (PostgreSQL compatibility)
+        if dsn:
+            # Extract database name from dsn like: postgresql://user:pass@host/dbname
+            if '/' in dsn:
+                name = dsn.split('/')[-1]
+            else:
+                name = 'qtcl'
+        
+        # Use provided name or default
+        if not name:
+            name = kwargs.get('database', 'qtcl')
+        
         self.name = name
+        self.dsn = dsn  # Store for compatibility
         self.hosts = hosts or []
         self.min_size = min_size
         self.max_size = max_size
@@ -1075,7 +1094,7 @@ class LocalBlockchainDB:
         self.create_tables()
         
         logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
-    
+
     def _init_pool(self):
         """Initialize connection pool (no-op for SQLite, kept for interface compatibility)"""
         pass
