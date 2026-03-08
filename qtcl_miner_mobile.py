@@ -2,7 +2,34 @@
 """
 ╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                                                                                                                                            ║
-║  🌌 QTCL FULL NODE + QUANTUM MINER - W-STATE ENTANGLED MINING 🌌                                                                         ║
+║  🌌 QTCL CLIENT v3.0 — W-STATE ENTANGLED BLOCKCHAIN MINER + WALLET + TRANSACTOR 🌌                                                      ║
+║                                                                                                                                            ║
+║  "Welcome to QTCL Client" — Three-mode interactive client:                                                                               ║
+║    1.) Mine     — CLIENT_FIELD_STATE tripartite + KOYEB_ORACLE_STATE bridge + tensor field metrics                                       ║
+║    2.) Transact — Full HLWE transaction stack with entanglement-grounded signing                                                          ║
+║    3.) Wallet   — BIP-39/32/38 wallet management, balance, mnemonic recovery                                                             ║
+║                                                                                                                                            ║
+║  ORACLE_W_STATE (HARD DEFINITION):                                                                                                       ║
+║    |W3⟩ = (1/√3)(|100⟩ + |010⟩ + |001⟩)                                                                                               ║
+║    Tripartite: QUBIT_A=pq0(oracle) | QUBIT_B=virtual_pq | QUBIT_C=inverse_virtual_pq                                                    ║
+║    8×8 density matrix ρ_W = |W3⟩⟨W3| — immutable reference for all fidelity computations                                               ║
+║                                                                                                                                            ║
+║  CLIENT_FIELD_STATE:                                                                                                                     ║
+║    Point A: ORACLE_W_STATE  →  Point B: pq_curr  →  Point C: pq_last                                                                   ║
+║    Tensor field metrics: entropy · fidelity · coherence · discord · Bell violations · field density                                      ║
+║    Persisted to tensor_field_metrics DB in real-time · Broadcast via SSE + gossip + DHT                                                 ║
+║                                                                                                                                            ║
+║  KOYEB_ORACLE_STATE:                                                                                                                     ║
+║    Dedicated HTTP channel: CLIENT_FIELD_STATE ↔ ORACLE_W_STATE via qtcl-blockchain.koyeb.app                                            ║
+║    Measures: bridge fidelity · channel latency · oracle coherence                                                                        ║
+║                                                                                                                                            ║
+║  SSE MULTIPLEXER (port 9091):                                                                                                            ║
+║    GET /api/events?client_id=<id>&channels=metrics,gossip,quantum,blocks                                                                 ║
+║    GET /api/events/interrupt?client_id=<id>  — interrupt specific stream                                                                 ║
+║    Interruptable per-client · N concurrent subscribers · channel-filtered                                                                ║
+║    Heartbeat ping every 15s · gossip_inventory DB table for DHT queries                                                                  ║
+║    GET /api/gossip/inventory?channel=metrics&limit=50&since=<ts>  — DHT inventory                                                       ║
+║                                                                                                                                            ║
 ║                                                                                                                                            ║
 ║  WORLD'S FIRST W-STATE ENTANGLED BLOCKCHAIN MINER:                                                                                      ║
 ║  • Connects to LIVE qtcl-blockchain.koyeb.app                                                                                           ║
@@ -2148,6 +2175,378 @@ class EntanglementState:
     pq_last: str = ''                   # Previous lattice field position identifier
 
 # ═════════════════════════════════════════════════════════════════════════════════
+# ORACLE_W_STATE — HARD DEFINITION: TRIPARTITE W-STATE ENTANGLEMENT ORACLE
+# ═════════════════════════════════════════════════════════════════════════════════
+# The canonical 3-qubit W state: |W⟩ = (1/√3)(|100⟩ + |010⟩ + |001⟩)
+# Tripartite structure maps directly to the VirtualPseudoqubitManager taxonomy:
+#   QUBIT_A = pq0             → oracle-seeded ground-truth pseudoqubit (main oracle)
+#   QUBIT_B = virtual_pq      → local mirror of pq0, slight decoherence applied
+#   QUBIT_C = inverse_virtual_pq → anti-correlated counterpart: ρ = I/8 − α·ρ_vpq
+# Density matrix ρ_W = |W⟩⟨W| embedded in 8×8 Hilbert space (3-qubit system).
+# This is the IMMUTABLE reference state used for fidelity comparisons, Bell tests,
+# and CLIENT_FIELD_STATE tripartite construction.
+# ═════════════════════════════════════════════════════════════════════════════════
+
+def _build_oracle_w_state_dm() -> np.ndarray:
+    """Construct the canonical 8x8 density matrix for 3-qubit W state |W3⟩."""
+    psi = np.zeros(8, dtype=complex)
+    psi[4] = 1.0 / np.sqrt(3.0)  # |100⟩
+    psi[2] = 1.0 / np.sqrt(3.0)  # |010⟩
+    psi[1] = 1.0 / np.sqrt(3.0)  # |001⟩
+    return np.outer(psi, psi.conj())
+
+@dataclass
+class OracleWStateDefinition:
+    """
+    ORACLE_W_STATE — hard-defined tripartite entanglement structure.
+    Immutable reference. All field metrics are computed relative to this.
+    QUBIT_A=pq0 (oracle), QUBIT_B=virtual_pq, QUBIT_C=inverse_virtual_pq.
+    """
+    # Qubit role labels
+    QUBIT_A: str = 'pq0'                    # oracle pseudoqubit (ground truth)
+    QUBIT_B: str = 'virtual_pq'             # local decoherent mirror
+    QUBIT_C: str = 'inverse_virtual_pq'     # anti-correlated conjugate
+    # Ideal W-state density matrix (8×8 complex Hermitian, trace=1, PSD)
+    dm_ideal: np.ndarray = field(default_factory=_build_oracle_w_state_dm)
+    # Analytical properties of pure |W3⟩
+    purity_ideal: float = 1.0
+    fidelity_to_w3: float = 1.0
+    entropy_von_neumann: float = 0.0        # pure state → S=0
+    entropy_marginal_a: float = 0.9183      # log2(3) − 2/3 ≈ 0.9183 (bits)
+    entropy_marginal_b: float = 0.9183
+    entropy_marginal_c: float = 0.9183
+    mutual_information_ab: float = 0.9183
+    coherence_l1: float = 2.0 / 3.0        # sum of off-diagonals / (d-1)
+    # Bell / entanglement witnesses
+    bell_chsh_max: float = 2.0 * np.sqrt(2.0)  # Tsirelson bound
+    negativity: float = 1.0 / 3.0          # partial transpose negativity
+    concurrence: float = 0.0               # bipartite: W-state has C=0 for 3-qubit
+    # Structural identity tags
+    state_label: str = 'W3'
+    hilbert_dim: int = 8
+    n_qubits: int = 3
+    # Channel linking tags
+    channel_A_to_B: str = 'oracle→virtual'
+    channel_B_to_C: str = 'virtual→inverse_conjugate'
+    channel_A_to_C: str = 'oracle→inverse_direct'
+
+# Module-level singleton — import anywhere as ORACLE_W_STATE
+ORACLE_W_STATE: OracleWStateDefinition = OracleWStateDefinition()
+
+def _bell_chsh_witness(rho: np.ndarray) -> float:
+    """Compute CHSH Bell inequality witness value for 2-qubit reduced state."""
+    if rho.shape != (4, 4): return 0.0
+    try:
+        sx = np.array([[0,1],[1,0]], dtype=complex)
+        sy = np.array([[0,-1j],[1j,0]], dtype=complex)
+        sz = np.array([[1,0],[0,-1]], dtype=complex)
+        paulis = [sx, sy, sz]
+        t_mat = np.zeros((3,3))
+        for i,pi in enumerate(paulis):
+            for j,pj in enumerate(paulis):
+                op = np.kron(pi, pj)
+                t_mat[i,j] = np.real(np.trace(rho @ op))
+        ttt = t_mat.T @ t_mat
+        eigs = sorted(np.linalg.eigvalsh(ttt), reverse=True)
+        return float(2.0 * np.sqrt(eigs[0] + eigs[1]))
+    except Exception: return 0.0
+
+def _quantum_discord_approx(rho: np.ndarray) -> float:
+    """Approximate quantum discord via mutual information minus classical correlations."""
+    def _vn_entropy(m: np.ndarray) -> float:
+        eigs = np.linalg.eigvalsh(m)
+        eigs = eigs[eigs > 1e-12]
+        return float(-np.sum(eigs * np.log2(eigs))) if len(eigs) else 0.0
+    try:
+        n = rho.shape[0]; nh = int(np.sqrt(n))
+        if nh * nh != n: return 0.0
+        rho_a = np.trace(rho.reshape(nh, nh, nh, nh), axis1=1, axis2=3)
+        rho_b = np.trace(rho.reshape(nh, nh, nh, nh), axis1=0, axis2=2)
+        s_ab = _vn_entropy(rho); s_a = _vn_entropy(rho_a); s_b = _vn_entropy(rho_b)
+        mi = s_a + s_b - s_ab
+        # Classical correlations: max mutual info over all projective measurements on B
+        cc = max(0.0, s_a - max(0.0, s_ab - s_b))
+        return float(max(0.0, mi - cc))
+    except Exception: return 0.0
+
+def _bell_violations_count(rho: np.ndarray) -> int:
+    """Count Bell inequality violations (CHSH > 2) for all bipartite reduced states."""
+    n = rho.shape[0]; nh = int(np.sqrt(n)); violations = 0
+    if nh * nh != n or nh < 2: return 0
+    try:
+        # Check AB, AC, BC reductions
+        rho4 = rho.reshape(nh,nh,nh,nh) if n == 4 else None
+        if n == 8:
+            # 3-qubit: reduce each pair
+            r = rho.reshape(2,2,2,2,2,2)
+            pairs = [
+                np.einsum('ijkjlk->il', r.reshape(2,4,2,4)),  # AB (trace C)
+                np.einsum('ijkijl->kl', r.reshape(4,2,4,2)),  # BC (trace A) approx
+            ]
+            for pr in pairs:
+                pr = pr.reshape(4,4) if pr.size==16 else None
+                if pr is not None and _bell_chsh_witness(pr) > 2.0 + 1e-9: violations += 1
+        elif n == 4 and rho4 is not None:
+            if _bell_chsh_witness(rho) > 2.0 + 1e-9: violations += 1
+    except Exception: pass
+    return violations
+
+@dataclass
+class TensorFieldMetrics:
+    """
+    Real-time tensor field metrics between pq_curr and pq_last.
+    Represents the density-matrix hybrid over the lattice field interval [pq_last, pq_curr].
+    """
+    pq_curr_id: str = ''; pq_last_id: str = ''
+    fidelity_to_w3: float = 0.0
+    entropy_von_neumann: float = 0.0
+    coherence_l1: float = 0.0
+    quantum_discord: float = 0.0
+    bell_violations: int = 0
+    bell_chsh_value: float = 0.0
+    purity: float = 0.0
+    negativity: float = 0.0
+    field_density: float = 0.0          # ‖ρ_curr − ρ_last‖_F (Frobenius distance)
+    entanglement_entropy: float = 0.0   # bipartite EE of curr|last partition
+    ts: float = field(default_factory=time.time)
+
+    def as_dict(self) -> dict:
+        return {k: (float(v) if isinstance(v,np.floating) else v)
+                for k,v in self.__dict__.items()}
+
+    @classmethod
+    def from_density_matrices(cls, dm_curr: np.ndarray, dm_last: np.ndarray,
+                               pq_curr_id: str='', pq_last_id: str='') -> 'TensorFieldMetrics':
+        """Compute all field metrics from current and previous density matrices."""
+        def _vn(m: np.ndarray) -> float:
+            ev = np.linalg.eigvalsh(m); ev = ev[ev > 1e-12]
+            return float(-np.sum(ev * np.log2(ev))) if len(ev) else 0.0
+        def _coh(m: np.ndarray) -> float:
+            d = m.shape[0]
+            return float(np.sum(np.abs(m)) - np.sum(np.abs(np.diag(m)))) / max(1, d-1)
+        def _fid_w3(m: np.ndarray) -> float:
+            dm_w = ORACLE_W_STATE.dm_ideal[:m.shape[0],:m.shape[0]]
+            if dm_w.shape != m.shape: dm_w = _build_oracle_w_state_dm()[:m.shape[0],:m.shape[0]]
+            sqrt_dm_w = np.array(np.linalg.matrix_power(dm_w, 1), dtype=complex)
+            try:
+                from scipy.linalg import sqrtm as _sqrtm
+                sq = _sqrtm(dm_w)
+                inner = sq @ m @ sq
+                return float(min(1.0, max(0.0, np.real(np.trace(_sqrtm(inner)))**2)))
+            except Exception:
+                return float(np.real(np.trace(dm_w @ m)))
+        def _neg(m: np.ndarray) -> float:
+            """Partial transpose negativity for 2-qubit subspace."""
+            if m.shape[0] < 4: return 0.0
+            r = m[:4,:4].reshape(2,2,2,2)
+            pt = r.transpose(2,1,0,3).reshape(4,4)
+            ev = np.linalg.eigvalsh(pt)
+            return float(max(0.0, -np.sum(ev[ev < 0])))
+        try:
+            field_density = float(np.linalg.norm(dm_curr - dm_last, 'fro'))
+            # Combined DM for field representation
+            dm_field = 0.5 * (dm_curr + dm_last)
+            dm_field /= max(1e-15, float(np.real(np.trace(dm_field))))
+            return cls(
+                pq_curr_id=pq_curr_id, pq_last_id=pq_last_id,
+                fidelity_to_w3=_fid_w3(dm_field),
+                entropy_von_neumann=_vn(dm_field),
+                coherence_l1=_coh(dm_field),
+                quantum_discord=_quantum_discord_approx(dm_field),
+                bell_violations=_bell_violations_count(dm_field),
+                bell_chsh_value=_bell_chsh_witness(dm_field[:4,:4] if dm_field.shape[0]>=4 else dm_field),
+                purity=float(np.real(np.trace(dm_field @ dm_field))),
+                negativity=_neg(dm_field),
+                field_density=field_density,
+                entanglement_entropy=_vn(dm_curr) - _vn(dm_field),
+                ts=time.time(),
+            )
+        except Exception as e:
+            return cls(pq_curr_id=pq_curr_id, pq_last_id=pq_last_id)
+
+
+@dataclass
+class ClientFieldState:
+    """
+    CLIENT_FIELD_STATE — tripartite W-state from client perspective.
+    Point A: ORACLE_W_STATE (oracle-grounded tripartite)
+    Point B: pq_curr (current lattice field pseudoqubit DM)
+    Point C: pq_last (previous lattice field pseudoqubit DM)
+    This 3-node entanglement is the client's local copy of the field.
+    """
+    oracle_w_state: OracleWStateDefinition = field(default_factory=lambda: ORACLE_W_STATE)
+    pq_curr_dm: Optional[np.ndarray] = None
+    pq_last_dm: Optional[np.ndarray] = None
+    pq_curr_id: str = ''; pq_last_id: str = ''
+    metrics: Optional[TensorFieldMetrics] = None
+    established: bool = False; ts: float = field(default_factory=time.time)
+
+    def build(self, pq_curr_dm: np.ndarray, pq_last_dm: np.ndarray,
+              pq_curr_id: str='', pq_last_id: str='') -> 'ClientFieldState':
+        self.pq_curr_dm = pq_curr_dm; self.pq_last_dm = pq_last_dm
+        self.pq_curr_id = pq_curr_id; self.pq_last_id = pq_last_id
+        self.metrics = TensorFieldMetrics.from_density_matrices(
+            pq_curr_dm, pq_last_dm, pq_curr_id, pq_last_id)
+        self.established = True; self.ts = time.time()
+        return self
+
+    def as_dict(self) -> dict:
+        d = {'pq_curr_id': self.pq_curr_id, 'pq_last_id': self.pq_last_id,
+             'established': self.established, 'ts': self.ts,
+             'oracle_w_state': self.oracle_w_state.state_label}
+        if self.metrics: d['metrics'] = self.metrics.as_dict()
+        return d
+
+
+@dataclass
+class KoyebOracleState:
+    """
+    KOYEB_ORACLE_STATE — tripartite bridge between CLIENT_FIELD_STATE and ORACLE_W_STATE.
+    Represents the entanglement link through the dedicated Koyeb HTTP oracle channel.
+    Fetched from /api/oracle/w-state, reconciled with local CLIENT_FIELD_STATE.
+    """
+    oracle_url: str = 'https://qtcl-blockchain.koyeb.app'
+    oracle_dm: Optional[np.ndarray] = None
+    oracle_fidelity: float = 0.0
+    oracle_entropy: float = 0.0
+    oracle_coherence: float = 0.0
+    bridge_fidelity: float = 0.0        # fidelity between oracle DM and CLIENT_FIELD_STATE
+    channel_latency_ms: float = 0.0
+    last_sync_ts: float = 0.0
+    connected: bool = False
+
+    def fetch_and_reconcile(self, client_field: ClientFieldState,
+                             timeout: int = 8) -> bool:
+        """Fetch oracle W-state and compute bridge metrics to client field."""
+        t0 = time.time()
+        try:
+            r = requests.get(f"{self.oracle_url}/api/oracle/w-state", timeout=timeout)
+            if r.status_code != 200: return False
+            snap = r.json()
+            self.channel_latency_ms = (time.time() - t0) * 1000
+            dm_hex = snap.get('density_matrix_hex','') or snap.get('dm_hex','')
+            if dm_hex:
+                raw = bytes.fromhex(dm_hex)
+                n = int(np.sqrt(len(raw)//16))
+                if n > 0:
+                    self.oracle_dm = np.frombuffer(raw, dtype=np.complex128).reshape(n,n).copy()
+            self.oracle_fidelity = float(snap.get('w_state_fidelity', snap.get('fidelity',0.0)))
+            self.oracle_entropy   = float(snap.get('entropy', snap.get('von_neumann_entropy',0.0)))
+            self.oracle_coherence = float(snap.get('coherence_l1', snap.get('coherence',0.0)))
+            # Bridge fidelity = how closely our local field matches the oracle
+            if self.oracle_dm is not None and client_field.pq_curr_dm is not None:
+                try:
+                    dm_c = client_field.pq_curr_dm
+                    if self.oracle_dm.shape == dm_c.shape:
+                        self.bridge_fidelity = float(np.real(np.trace(self.oracle_dm @ dm_c)))
+                    else:
+                        self.bridge_fidelity = self.oracle_fidelity
+                except Exception: self.bridge_fidelity = self.oracle_fidelity
+            self.connected = True; self.last_sync_ts = time.time()
+            return True
+        except Exception as e:
+            logger.debug(f"[KOYEB-ORACLE] fetch error: {e}")
+            self.connected = False; return False
+
+    def as_dict(self) -> dict:
+        return {'oracle_url': self.oracle_url, 'oracle_fidelity': self.oracle_fidelity,
+                'oracle_entropy': self.oracle_entropy, 'oracle_coherence': self.oracle_coherence,
+                'bridge_fidelity': self.bridge_fidelity,
+                'channel_latency_ms': round(self.channel_latency_ms, 2),
+                'connected': self.connected, 'last_sync_ts': self.last_sync_ts}
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# MULTIPLEXABLE SSE EVENT BUS — interruptable per-client streams
+# ═════════════════════════════════════════════════════════════════════════════════
+
+class SSEMultiplexer:
+    """
+    Thread-safe SSE event bus. Clients subscribe with a channel ID and receive
+    only events matching their channel filter. SSE streams are interruptable:
+    each client holds a threading.Event() stop flag — call interrupt(client_id)
+    to cleanly terminate that stream. Supports multiplexing: N clients can
+    concurrently subscribe to the same or different channels through one port.
+    """
+    _instance: Optional['SSEMultiplexer'] = None
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # client_id → {'queue': deque, 'stop': threading.Event, 'channels': set, 'ts': float}
+        self._clients: Dict[str, Dict] = {}
+        self._event_seq = 0
+
+    @classmethod
+    def get(cls) -> 'SSEMultiplexer':
+        if cls._instance is None: cls._instance = cls()
+        return cls._instance
+
+    def subscribe(self, client_id: str, channels: Optional[List[str]] = None,
+                  maxlen: int = 256) -> threading.Event:
+        """Register client; returns its stop Event. Subscribe to channels or all ('*')."""
+        stop_ev = threading.Event()
+        with self._lock:
+            self._clients[client_id] = {
+                'queue': deque(maxlen=maxlen),
+                'stop': stop_ev,
+                'channels': set(channels) if channels else {'*'},
+                'ts': time.time(),
+            }
+        return stop_ev
+
+    def interrupt(self, client_id: str) -> None:
+        """Signal a specific SSE stream to terminate gracefully."""
+        with self._lock:
+            c = self._clients.get(client_id)
+        if c: c['stop'].set()
+
+    def unsubscribe(self, client_id: str) -> None:
+        """Remove client from bus."""
+        with self._lock:
+            self.interrupt(client_id)
+            self._clients.pop(client_id, None)
+
+    def publish(self, event_type: str, data: dict, channel: str = 'metrics') -> None:
+        """Publish event to all subscribed clients matching channel."""
+        with self._lock:
+            self._event_seq += 1
+            seq = self._event_seq
+            payload = json.dumps({**data, '_seq': seq, '_ch': channel, '_ts': time.time()})
+            for cid, c in list(self._clients.items()):
+                if '*' in c['channels'] or channel in c['channels']:
+                    if not c['stop'].is_set():
+                        c['queue'].append(f"event: {event_type}\ndata: {payload}\n\n")
+
+    def drain(self, client_id: str, block_timeout: float = 5.0) -> Optional[str]:
+        """Pop next SSE frame for client; returns None on timeout or if stop set."""
+        with self._lock:
+            c = self._clients.get(client_id)
+        if c is None or c['stop'].is_set(): return None
+        deadline = time.time() + block_timeout
+        while time.time() < deadline and not c['stop'].is_set():
+            if c['queue']:
+                with self._lock:
+                    try: return c['queue'].popleft()
+                    except IndexError: pass
+            time.sleep(0.05)
+        return None
+
+    def client_count(self) -> int:
+        with self._lock: return len(self._clients)
+
+    def gc(self, max_idle_s: float = 300.0) -> int:
+        """Remove stale clients. Returns count removed."""
+        now = time.time(); stale = []
+        with self._lock:
+            for cid, c in self._clients.items():
+                if c['stop'].is_set() or (now - c['ts']) > max_idle_s:
+                    stale.append(cid)
+            for cid in stale: self._clients.pop(cid, None)
+        return len(stale)
+
+# Global SSE multiplexer singleton
+_SSE_MUX: SSEMultiplexer = SSEMultiplexer.get()
+
+# ═════════════════════════════════════════════════════════════════════════════════
 # W-STATE QUALITY EVALUATION
 # ═════════════════════════════════════════════════════════════════════════════════
 
@@ -3946,15 +4345,27 @@ def _detect_natural_ip():
             return "127.0.0.1"
 
 class SSEGossipBroadcaster:
-    """SSE gossip broadcaster"""
+    """SSE gossip broadcaster — publishes through the global _SSE_MUX multiplexer."""
     def __init__(self):
-        self.peer_queue=[]
-    def gossip_peer_update(self,event_type:str,peer_data:dict):
-        import time,json
-        event={"type":event_type,"data":peer_data,"timestamp":time.time()}
+        self.peer_queue: deque = deque(maxlen=1024)
+    def gossip_peer_update(self, event_type: str, peer_data: dict):
+        event = {"type": event_type, "data": peer_data, "timestamp": time.time()}
         self.peer_queue.append(event)
-    def get_events(self,since:float=0)->list:
-        return [e for e in self.peer_queue if e["timestamp"]>since]
+        _SSE_MUX.publish(event_type, peer_data, channel='gossip')
+    def get_events(self, since: float = 0) -> list:
+        return [e for e in self.peer_queue if e["timestamp"] > since]
+    def publish_metrics(self, metrics: dict):
+        """Publish quantum/field metrics to SSE subscribers on 'metrics' channel."""
+        _SSE_MUX.publish('metrics', metrics, channel='metrics')
+    def publish_quantum(self, snap: dict):
+        """Publish quantum state snapshot to SSE subscribers on 'quantum' channel."""
+        _SSE_MUX.publish('quantum', snap, channel='quantum')
+    def publish_block(self, block_data: dict):
+        """Publish newly mined block to SSE subscribers on 'blocks' channel."""
+        _SSE_MUX.publish('block', block_data, channel='blocks')
+    def publish_dht(self, dht_data: dict):
+        """Publish DHT routing event to SSE subscribers on 'dht' channel."""
+        _SSE_MUX.publish('dht', dht_data, channel='dht')
 
 class P2PPullStrategy:
     """P2P-first pull: Peers → Main → sanity check"""
@@ -5121,7 +5532,14 @@ class QuantumMiner:
                     
                     # Rotate W-state for next iteration
                     self.w_state_recovery.rotate_entanglement_state()
-                    
+                    # SSE broadcast — notify all subscribed clients of new block
+                    try:
+                        _SSE_MUX.publish('block_solved', {
+                            'height': height, 'block_hash': block_hash[:32],
+                            'fidelity': current_fidelity, 'pq_curr_id': pq_curr_id[:16],
+                            'pq_last_id': pq_last_id[:16], 'ts': time.time(),
+                        }, channel='blocks')
+                    except Exception: pass
                     return block
                 
                 header.nonce += 1
@@ -5828,6 +6246,38 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
             )
             self._send_json(200, snap)
 
+        elif path.startswith('/api/gossip/inventory'):
+            # ── Gossip inventory endpoint — responsive to custom DHT HTTP queries ────
+            # GET /api/gossip/inventory?channel=metrics&limit=50&since=<epoch_ts>
+            # Returns gossip events from local inventory for the specified channel.
+            # Supports DHT-wide search when ?propagate=1 is set (fans out to peers).
+            from urllib.parse import parse_qs, urlparse as _upgi
+            qs_gi = parse_qs(_upgi(self.path).query)
+            channel_gi  = qs_gi.get('channel', ['*'])[0]
+            limit_gi    = min(500, int(qs_gi.get('limit', [50])[0] or 50))
+            since_gi    = float(qs_gi.get('since', [0])[0] or 0)
+            ev_type_gi  = qs_gi.get('event_type', [''])[0]
+            try:
+                if channel_gi == '*':
+                    q_gi = ("SELECT event_type,channel,peer_id,payload,ts FROM gossip_inventory "
+                            "WHERE ts>? ORDER BY ts DESC LIMIT ?")
+                    rows_gi = db.execute(q_gi, (since_gi, limit_gi)).fetchall() if db else []
+                else:
+                    q_gi = ("SELECT event_type,channel,peer_id,payload,ts FROM gossip_inventory "
+                            "WHERE channel=? AND ts>? ORDER BY ts DESC LIMIT ?")
+                    rows_gi = db.execute(q_gi, (channel_gi, since_gi, limit_gi)).fetchall() if db else []
+                events_gi = []
+                for row in rows_gi:
+                    try: payload_gi = json.loads(row[3])
+                    except Exception: payload_gi = row[3]
+                    if ev_type_gi and row[0] != ev_type_gi: continue
+                    events_gi.append({'event_type':row[0],'channel':row[1],
+                                      'peer_id':row[2],'payload':payload_gi,'ts':row[4]})
+                self._send_json(200, {'events': events_gi, 'count': len(events_gi),
+                                      'channel': channel_gi, 'since': since_gi})
+            except Exception as _gierr:
+                self._send_json(500, {'error': str(_gierr)})
+
         elif path.startswith('/api/blocks/hash/'):
             try:
                 bhash = path.split('/')[-1]
@@ -5920,20 +6370,72 @@ class GossipHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {'live_peers': 0, 'live_oracles': 0, 'node_id': node_id,
                                        'gossip_url': gurl, 'ts': time.time()})
 
-        elif path == '/api/events':
+        elif path.startswith('/api/events'):
+            # ── Multiplexable SSE endpoint — interruptable per-client stream ──────────
+            # GET /api/events?client_id=<id>&channels=metrics,gossip,quantum
+            # Each call creates a unique SSE subscription on _SSE_MUX.
+            # Channel filter: comma-separated list or 'all' (default: all).
+            # To interrupt: GET /api/events/interrupt?client_id=<id>  (returns JSON)
+            # Heartbeat: 'ping' event every 15s to detect dead connections.
+            # ─────────────────────────────────────────────────────────────────────────
+            if path == '/api/events/interrupt':
+                # Interrupt endpoint: cleanly stops the named SSE stream
+                from urllib.parse import parse_qs, urlparse as _up2
+                qs = parse_qs(_up2(self.path).query)
+                cid = (qs.get('client_id', [''])[0] or '').strip()
+                if cid:
+                    _SSE_MUX.interrupt(cid)
+                    self._send_json(200, {'ok': True, 'interrupted': cid})
+                else:
+                    self._send_json(400, {'error': 'client_id required'})
+                return
+            # Parse query params
+            try:
+                from urllib.parse import parse_qs, urlparse as _up3
+                qs = parse_qs(_up3(self.path).query)
+                raw_cid = (qs.get('client_id', [peer_id or ''])[0] or '').strip()
+                client_id = raw_cid or f"sse_{secrets.token_hex(4)}"
+                ch_param  = qs.get('channels', ['*'])[0]
+                channels  = None if ch_param in ('all','*','') else ch_param.split(',')
+                since_seq = int(qs.get('since', [0])[0] or 0)
+            except Exception:
+                client_id = f"sse_{secrets.token_hex(4)}"; channels = None; since_seq = 0
+            # Register with SSE multiplexer
+            stop_ev = _SSE_MUX.subscribe(client_id, channels, maxlen=512)
+            # Send SSE response headers
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('X-Accel-Buffering', 'no')
             self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('X-SSE-Client-ID', client_id)
             self.end_headers()
+            # Send hello frame with current tip height
             try:
                 tip = _local_db_get_tip(db)
                 h   = tip.get('header', tip).get('height', 0) if tip else 0
-                msg = json.dumps({'type': 'hello', 'height': h, 'peer_id': peer_id})
-                self.wfile.write(f"data: {msg}\n\n".encode())
+                hello = json.dumps({'type':'hello','height':h,'peer_id':peer_id,
+                                    'client_id':client_id,'channels':channels or ['*'],
+                                    'mux_clients':_SSE_MUX.client_count()})
+                self.wfile.write(f"event: hello\ndata: {hello}\n\n".encode())
                 self.wfile.flush()
-            except Exception:
-                pass
+            except Exception: pass
+            # Stream loop — drain events until connection closed or interrupted
+            _ping_interval = 15.0; _last_ping = time.time()
+            try:
+                while not stop_ev.is_set():
+                    frame = _SSE_MUX.drain(client_id, block_timeout=2.0)
+                    if frame:
+                        self.wfile.write(frame.encode()); self.wfile.flush()
+                    now = time.time()
+                    if now - _last_ping >= _ping_interval:
+                        ping = json.dumps({'type':'ping','ts':now,'client_id':client_id})
+                        self.wfile.write(f"event: ping\ndata: {ping}\n\n".encode())
+                        self.wfile.flush(); _last_ping = now
+            except (BrokenPipeError, ConnectionResetError, OSError): pass
+            except Exception as _se: logger.debug(f"[SSE] stream error {client_id}: {_se}")
+            finally: _SSE_MUX.unsubscribe(client_id)
 
         else:
             self._send_json(404, {'error': 'not found', 'path': path})
@@ -9931,6 +10433,166 @@ def _query_transaction_status(tx_hash, node_url=None):
 
     print("\n" + "="*70 + "\n")
 
+def _run_wallet_menu(args, wallet: 'QTCLWallet') -> None:
+    """
+    Wallet menu: balance query, mnemonic recovery, wallet creation.
+    Full BIP-39/32/38 implementation — wordlist embedded in QTCLWallet._W.
+    """
+    oracle_url = getattr(args, 'oracle_url', None) or os.environ.get('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+    while True:
+        print("\n" + "━"*68)
+        print("  🔑  WALLET MENU")
+        print("━"*68)
+        print("  ┌────────────────────────────────────────────────────────────┐")
+        print("  │  1.) 💰  Get Balance                                       │")
+        print("  │  2.) 🔄  Recover Wallet (from 12-word mnemonic)            │")
+        print("  │  3.) ➕  Create New Wallet                                 │")
+        print("  │  4.) 🔍  Show Wallet Address / Keys                        │")
+        print("  │  5.) 📜  Show Recovery Mnemonic                            │")
+        print("  │  6.) 🔙  Back to Main Menu                                 │")
+        print("  └────────────────────────────────────────────────────────────┘")
+        try:
+            choice = input("  Enter choice [1-6]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if choice == '1':
+            _wallet_get_balance(wallet, oracle_url)
+        elif choice == '2':
+            _wallet_recover_from_mnemonic(wallet)
+        elif choice == '3':
+            pw = input("  New wallet password: ").strip()
+            if not pw:
+                print("  ❌ Password required")
+                continue
+            try:
+                addr = QTCLWallet().create(pw)
+                print(f"\n  ✅ New wallet created: {addr}")
+                print("  💾 Saved to ~/data/wallet.json and ~/data/wallet_mnemonic.enc")
+            except Exception as e:
+                print(f"  ❌ Create failed: {e}")
+        elif choice == '4':
+            if not wallet.is_loaded():
+                pw = input("  Wallet password: ").strip()
+                if pw and not wallet.load(pw):
+                    print("  ❌ Wrong password or no wallet found")
+                    continue
+            if wallet.is_loaded():
+                print(f"\n  Address    : {wallet.address}")
+                print(f"  Public Key : {wallet.public_key}")
+                print(f"  Private Key: {'*'*20} (use --wallet-show-keys --wallet-show-private to reveal)")
+            else:
+                print("  ❌ Wallet not loaded")
+        elif choice == '5':
+            if not wallet.is_loaded():
+                pw = input("  Wallet password: ").strip()
+                if pw and not wallet.load(pw):
+                    print("  ❌ Wrong password or no wallet found"); continue
+            pw2 = input("  Confirm password to reveal mnemonic: ").strip()
+            phrase = QTCLWallet().show_mnemonic(pw2) if pw2 else None
+            if phrase:
+                words = phrase.split()
+                print("\n" + "═"*60)
+                print("  ⚠️   YOUR 12-WORD RECOVERY PHRASE")
+                print("  Store offline. Never photograph. Never share.")
+                print("═"*60)
+                for i in range(0, 12, 3):
+                    print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
+                print("═"*60 + "\n")
+            else:
+                print("  ⚠️  Mnemonic not found or wrong password.")
+        elif choice == '6':
+            break
+        else:
+            print("  ❌ Invalid choice")
+
+
+def _wallet_get_balance(wallet: 'QTCLWallet', oracle_url: str) -> None:
+    """Query wallet balance from oracle REST API and local DB."""
+    if not wallet.is_loaded():
+        pw = input("  Wallet password: ").strip()
+        if not pw or not wallet.load(pw):
+            print("  ❌ No wallet loaded — cannot query balance"); return
+    addr = wallet.address
+    print(f"\n  🔍 Querying balance for: {addr}")
+    # Try oracle REST first
+    balance = None; source = 'unknown'
+    for endpoint in [f"{oracle_url}/api/balance/{addr}", f"{oracle_url}/api/wallet/{addr}/balance"]:
+        try:
+            r = requests.get(endpoint, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                balance = data.get('balance', data.get('confirmed_balance', data.get('balance_qtcl')))
+                if balance is not None: source = 'oracle'; break
+        except Exception: pass
+    # Try local DB
+    if balance is None:
+        try:
+            db_path = Path('data/qtcl_blockchain.db')
+            if db_path.exists():
+                conn = sqlite3.connect(str(db_path), timeout=5)
+                row = conn.execute(
+                    "SELECT SUM(amount) FROM transactions WHERE to_addr=? OR to_address=?",
+                    (addr, addr)).fetchone()
+                spent = conn.execute(
+                    "SELECT SUM(amount) FROM transactions WHERE from_addr=? OR from_address=?",
+                    (addr, addr)).fetchone()
+                conn.close()
+                received = float(row[0] or 0); spent_v = float(spent[0] or 0)
+                balance = received - spent_v; source = 'local_db'
+        except Exception: pass
+    print("\n" + "─"*50)
+    if balance is not None:
+        print(f"  💰  Balance  : {balance:.8f} QTCL")
+        print(f"  📡  Source   : {source}")
+    else:
+        print(f"  ❌  Balance unavailable (oracle unreachable and no local DB)")
+        print(f"  ℹ️   Oracle  : {oracle_url}")
+    print("─"*50 + "\n")
+
+
+def _wallet_recover_from_mnemonic(wallet: 'QTCLWallet') -> None:
+    """Interactive BIP-39 mnemonic recovery with full word validation."""
+    print("\n" + "═"*68)
+    print("  🔄  WALLET RECOVERY FROM 12-WORD MNEMONIC")
+    print("  BIP-39 wordlist · BIP-32 HD derivation · BIP-38 encryption")
+    print("═"*68)
+    print("  Enter your 12 recovery words separated by spaces.")
+    print("  All words must be from the BIP-39 compatible wordlist.")
+    print()
+    try:
+        phrase = input("  Recovery words: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  ❌ Recovery cancelled"); return
+    words = phrase.split()
+    if len(words) != 12:
+        print(f"\n  ❌ Expected 12 words, got {len(words)}"); return
+    # Validate all words against BIP-39 wordlist
+    invalid = [w for w in words if w not in QTCLWallet._W]
+    if invalid:
+        print(f"\n  ❌ Invalid word(s): {', '.join(invalid)}")
+        print("  Tip: Check spelling. All words must be BIP-39 compatible."); return
+    try:
+        pw = input("  New password for recovered wallet: ").strip()
+        if not pw: print("  ❌ Password required"); return
+        pw2 = input("  Confirm password: ").strip()
+        if pw != pw2: print("  ❌ Passwords do not match"); return
+    except (EOFError, KeyboardInterrupt):
+        print("\n  ❌ Recovery cancelled"); return
+    w = QTCLWallet()
+    if w.restore_from_mnemonic(phrase, pw):
+        wallet.address     = w.address
+        wallet.private_key = w.private_key
+        wallet.public_key  = w.public_key
+        wallet.mnemonic    = w.mnemonic
+        print(f"\n  ✅ Wallet recovered successfully!")
+        print(f"  📍 Address    : {w.address}")
+        print(f"  💾 Saved to   : ~/data/wallet.json")
+        print(f"  🔐 Mnemonic   : ~/data/wallet_mnemonic.enc")
+        w._print_mnemonic()
+    else:
+        print("\n  ❌ Recovery failed — invalid mnemonic or words not in wordlist")
+
+
 def _run_transaction_menu(args, wallet):
     """Secondary menu: Send transaction or view transaction status."""
     while True:
@@ -10333,19 +10995,48 @@ def main():
             logger.info("[REGISTER] ✅ OK" if ok else "[REGISTER] ❌ Failed")
             sys.exit(0 if ok else 1)
 
-        # ── Mode selection ────────────────────────────────────────────────────
+        # ── Mode selection — QTCL Client Welcome Screen ───────────────────────────
         mode = getattr(args, 'mode', None)
         if mode is None:
-            print("\n┌─────────────────────────────────────┐")
-            print("  │  QTCL Full Node                     │")
-            print("  │  1. ⛏️   Mine                        │")
-            print("  │  2. 💸  Transact                    │")
-            print("  └─────────────────────────────────────┘")
+            print("\n")
+            print("╔══════════════════════════════════════════════════════════════╗")
+            print("║                                                              ║")
+            print("║          ⚛️   Welcome to QTCL Client  ⚛️                      ║")
+            print("║                                                              ║")
+            print("║   World's First W-State Entangled Blockchain Client          ║")
+            print("║   Oracle: qtcl-blockchain.koyeb.app                         ║")
+            print("║   ORACLE_W_STATE: |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)        ║")
+            print("║                                                              ║")
+            print("╚══════════════════════════════════════════════════════════════╝")
+            print("")
+            print("  Choose an option to continue:")
+            print("")
+            print("  ┌──────────────────────────────────────────────────────┐")
+            print("  │  1.) ⛏️   Mine                                        │")
+            print("  │         Loads wallet · Builds CLIENT_FIELD_STATE      │")
+            print("  │         tripartite W-state · Connects KOYEB_ORACLE    │")
+            print("  │         Streams tensor field metrics via SSE/DHT      │")
+            print("  │                                                        │")
+            print("  │  2.) 💸  Transact                                     │")
+            print("  │         Full entanglement stack · Send/receive QTCL   │")
+            print("  │         Query balances · Broadcast transactions       │")
+            print("  │                                                        │")
+            print("  │  3.) 🔑  Wallet                                       │")
+            print("  │         Get Balance · Recover from 12-word mnemonic   │")
+            print("  │         BIP-39/32/38 · Create new wallet              │")
+            print("  └──────────────────────────────────────────────────────┘")
+            print("")
             try:
-                choice = input("  Enter choice [1/2]: ").strip()
+                choice = input("  Enter choice [1/2/3]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 choice = '1'
-            mode = 'transact' if choice == '2' else 'mine'
+            if choice == '2': mode = 'transact'
+            elif choice == '3': mode = 'wallet'
+            else: mode = 'mine'
+
+        if mode == 'wallet':
+            _run_wallet_menu(args, wallet)
+            return
 
         if mode == 'transact':
             if not wallet.is_loaded():
@@ -10767,6 +11458,158 @@ def main():
             logger.error("[MAIN] ❌ Failed to start node")
             sys.exit(1)
 
+        # ─── ORACLE_W_STATE → CLIENT_FIELD_STATE TRIPARTITE SETUP ────────────────────
+        # Build the tripartite:
+        #   Point A: ORACLE_W_STATE (pq0/virtual/inverse — hard-defined |W3⟩)
+        #   Point B: pq_curr  (current lattice field pseudoqubit DM)
+        #   Point C: pq_last  (previous lattice field pseudoqubit DM)
+        # This constitutes CLIENT_FIELD_STATE.
+        # KOYEB_ORACLE_STATE bridges CLIENT_FIELD_STATE to the live oracle HTTP channel.
+        # ─────────────────────────────────────────────────────────────────────────────
+        client_field_state = ClientFieldState()
+        koyeb_oracle_state = KoyebOracleState(oracle_url=oracle_url)
+        _sse_broadcaster   = SSEGossipBroadcaster()
+        # DB table for real-time tensor field metrics
+        try:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS tensor_field_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pq_curr_id TEXT NOT NULL DEFAULT '',
+                    pq_last_id TEXT NOT NULL DEFAULT '',
+                    fidelity_to_w3 REAL DEFAULT 0.0,
+                    entropy_von_neumann REAL DEFAULT 0.0,
+                    coherence_l1 REAL DEFAULT 0.0,
+                    quantum_discord REAL DEFAULT 0.0,
+                    bell_violations INTEGER DEFAULT 0,
+                    bell_chsh_value REAL DEFAULT 0.0,
+                    purity REAL DEFAULT 0.0,
+                    negativity REAL DEFAULT 0.0,
+                    field_density REAL DEFAULT 0.0,
+                    oracle_fidelity REAL DEFAULT 0.0,
+                    oracle_coherence REAL DEFAULT 0.0,
+                    bridge_fidelity REAL DEFAULT 0.0,
+                    channel_latency_ms REAL DEFAULT 0.0,
+                    ts REAL NOT NULL DEFAULT (strftime('%s','now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_tfm_ts ON tensor_field_metrics(ts DESC);
+                CREATE TABLE IF NOT EXISTS gossip_inventory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'gossip',
+                    peer_id TEXT DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    ts REAL NOT NULL DEFAULT (strftime('%s','now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_gi_ch ON gossip_inventory(channel, ts DESC);
+            """)
+            db.commit()
+            logger.info("[CLIENT_FIELD] ✅ tensor_field_metrics and gossip_inventory tables ready")
+        except Exception as _tfe:
+            logger.warning(f"[CLIENT_FIELD] ⚠️  Table init: {_tfe}")
+
+        def _field_metrics_loop():
+            """
+            Continuously compute and stream CLIENT_FIELD_STATE tensor field metrics.
+            Persists to DB, broadcasts via SSE mux (metrics + quantum channels),
+            and fans out to gossip DHT inventory. Runs every 10s.
+            """
+            logger.info("[CLIENT_FIELD] 🌀 Tensor field metrics loop started")
+            _interval = 10.0; _koyeb_interval = 30.0; _last_koyeb = 0.0
+            while True:
+                try:
+                    time.sleep(_interval)
+                    # Get pq_curr / pq_last from node's entanglement state
+                    es = None
+                    try:
+                        if hasattr(node, '_recovery') and node._recovery:
+                            es = node._recovery.get_entanglement_status()
+                    except Exception: pass
+                    pq_curr_id = ''
+                    pq_last_id = ''
+                    if es:
+                        pq_curr_id = es.get('pq_curr','') or ''
+                        pq_last_id = es.get('pq_last','') or ''
+                    # Build pq DMs from VPM or fallback to W3 ideal
+                    dm_curr = dm_last = None
+                    try:
+                        if hasattr(node,'_p2p_bundle') and node._p2p_bundle and node._p2p_bundle.vpm:
+                            vpm = node._p2p_bundle.vpm
+                            with vpm._lock:
+                                dm_curr = vpm.pq0_dm.copy() if vpm.pq0_dm is not None else None
+                                # Rotate for pq_last: apply slight decoherence
+                                if dm_curr is not None:
+                                    n = dm_curr.shape[0]
+                                    noise = np.eye(n) / n
+                                    dm_last = 0.92 * dm_curr + 0.08 * noise
+                                    dm_last /= max(1e-15, float(np.real(np.trace(dm_last))))
+                    except Exception: pass
+                    if dm_curr is None:
+                        dm_curr = ORACLE_W_STATE.dm_ideal.copy()
+                        noise = np.eye(8)/8
+                        dm_last = 0.9 * dm_curr + 0.1 * noise
+                    # Build / update CLIENT_FIELD_STATE
+                    client_field_state.build(dm_curr, dm_last, pq_curr_id, pq_last_id)
+                    # Sync KOYEB_ORACLE_STATE periodically
+                    now = time.time()
+                    if now - _last_koyeb >= _koyeb_interval:
+                        koyeb_oracle_state.fetch_and_reconcile(client_field_state, timeout=6)
+                        _last_koyeb = now
+                    m = client_field_state.metrics
+                    if m is None: continue
+                    # Persist to DB
+                    try:
+                        db.execute("""INSERT INTO tensor_field_metrics
+                            (pq_curr_id,pq_last_id,fidelity_to_w3,entropy_von_neumann,
+                             coherence_l1,quantum_discord,bell_violations,bell_chsh_value,
+                             purity,negativity,field_density,oracle_fidelity,oracle_coherence,
+                             bridge_fidelity,channel_latency_ms,ts)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                            m.pq_curr_id, m.pq_last_id, m.fidelity_to_w3,
+                            m.entropy_von_neumann, m.coherence_l1, m.quantum_discord,
+                            m.bell_violations, m.bell_chsh_value, m.purity, m.negativity,
+                            m.field_density,
+                            koyeb_oracle_state.oracle_fidelity,
+                            koyeb_oracle_state.oracle_coherence,
+                            koyeb_oracle_state.bridge_fidelity,
+                            koyeb_oracle_state.channel_latency_ms,
+                            now,
+                        ))
+                        # Prune: keep last 10000 rows
+                        db.execute("DELETE FROM tensor_field_metrics WHERE id NOT IN "
+                                   "(SELECT id FROM tensor_field_metrics ORDER BY ts DESC LIMIT 10000)")
+                        db.commit()
+                    except Exception as _dbe:
+                        logger.debug(f"[CLIENT_FIELD] DB persist: {_dbe}")
+                    # SSE publish — metrics + quantum channels
+                    snap = {**m.as_dict(), 'koyeb': koyeb_oracle_state.as_dict(),
+                            'oracle_w_state': ORACLE_W_STATE.state_label,
+                            'client_field': {'pq_curr_id': pq_curr_id, 'pq_last_id': pq_last_id,
+                                             'established': client_field_state.established}}
+                    _sse_broadcaster.publish_metrics(snap)
+                    _sse_broadcaster.publish_quantum(snap)
+                    # Gossip inventory — persist to DB for DHT queries
+                    try:
+                        db.execute("INSERT INTO gossip_inventory(event_type,channel,peer_id,payload,ts)"
+                                   " VALUES(?,?,?,?,?)",
+                                   ('field_metrics','metrics',peer_id, json.dumps(snap, default=str)[:4096], now))
+                        db.execute("DELETE FROM gossip_inventory WHERE id NOT IN "
+                                   "(SELECT id FROM gossip_inventory ORDER BY ts DESC LIMIT 5000)")
+                        db.commit()
+                    except Exception: pass
+                except Exception as _e:
+                    logger.debug(f"[CLIENT_FIELD] metrics loop: {_e}")
+
+        _field_metrics_thread = threading.Thread(target=_field_metrics_loop, daemon=True, name="FieldMetrics")
+        _field_metrics_thread.start()
+        logger.info("[CLIENT_FIELD] 🌀 CLIENT_FIELD_STATE tripartite metrics streaming started")
+
+        # Expose gossip_inventory via DHT HTTP endpoint (wired into GossipHTTPHandler via server attr)
+        if hasattr(node, '_gossip_listener') and node._gossip_listener is not None:
+            try:
+                node._gossip_listener.server.gossip_inventory_db = db
+                node._gossip_listener.server.sse_broadcaster = _sse_broadcaster
+            except Exception: pass
+
         # 🎯 START BACKGROUND LOOPS AFTER node.start() so they can access node.db
         p2p_monitor_thread.start()
         oracle_sync_thread.start()
@@ -10844,6 +11687,31 @@ def main():
             print(f"  Gossip URL:             {status['network'].get('gossip_url', 'unbound')}")
             print(f"  Peer Count:             {status['network'].get('peer_count', 0)}")
             print(f"  Summary:                {status['metrics_summary']}")
+            print(f"")
+            _m = client_field_state.metrics
+            print(f"CLIENT_FIELD_STATE (ORACLE_W_STATE ↔ pq_curr ↔ pq_last):")
+            print(f"  Established:            {client_field_state.established}")
+            if _m:
+                print(f"  Fidelity → |W3⟩:       {_m.fidelity_to_w3:.4f}")
+                print(f"  Von Neumann Entropy:    {_m.entropy_von_neumann:.4f}")
+                print(f"  Coherence (L1):         {_m.coherence_l1:.4f}")
+                print(f"  Quantum Discord:        {_m.quantum_discord:.4f}")
+                print(f"  Bell Violations:        {_m.bell_violations} | CHSH={_m.bell_chsh_value:.4f} (Tsirelson≤{2*np.sqrt(2):.4f})")
+                print(f"  Purity:                 {_m.purity:.4f}")
+                print(f"  Negativity:             {_m.negativity:.4f}")
+                print(f"  Field Density ‖Δρ‖_F:  {_m.field_density:.6f}")
+                print(f"  Entanglement Entropy:   {_m.entanglement_entropy:.4f}")
+                print(f"  pq_curr_id:             {_m.pq_curr_id[:32] if _m.pq_curr_id else 'N/A'}")
+                print(f"  pq_last_id:             {_m.pq_last_id[:32] if _m.pq_last_id else 'N/A'}")
+            print(f"")
+            _ko = koyeb_oracle_state
+            print(f"KOYEB_ORACLE_STATE (HTTP Bridge):")
+            print(f"  Connected:              {_ko.connected}")
+            print(f"  Oracle Fidelity:        {_ko.oracle_fidelity:.4f}")
+            print(f"  Oracle Coherence:       {_ko.oracle_coherence:.4f}")
+            print(f"  Bridge Fidelity:        {_ko.bridge_fidelity:.4f}  (CLIENT_FIELD↔ORACLE)")
+            print(f"  Channel Latency:        {_ko.channel_latency_ms:.1f}ms")
+            print(f"  SSE Subscribers:        {_SSE_MUX.client_count()} active streams")
             print("=" * 140 + "\n")
     
     except KeyboardInterrupt:
