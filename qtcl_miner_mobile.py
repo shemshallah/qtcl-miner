@@ -4242,14 +4242,17 @@ class QuantumTensorField:
         self.v_dm:   Optional[np.ndarray] = None
 
         # Individual qubit fidelities (EMA-smoothed from AER round-robin)
-        self.pq0_fidelity:     float = 0.7111
-        self.iv_fidelity:      float = 0.7111
-        self.v_fidelity:       float = 0.7111
+        # Start low (0.5) to allow measurements to increase them dynamically
+        # Do NOT initialize to 0.7111 — that prevents growth beyond measured max
+        self.pq0_fidelity:     float = 0.5
+        self.iv_fidelity:      float = 0.5
+        self.v_fidelity:       float = 0.5
 
         # Composite fidelity metrics
-        self.field_fidelity:   float = 0.7111   # local vs oracle (IV+V geometric mean)
-        self.network_fidelity: float = 0.7111   # mean(dht_peers.pq0_fidelity)
-        self.meta_fidelity:    float = 0.7111   # tripartite pq0×pq_curr×pq_last
+        # Field/network/meta fidelities computed from components, start at 0.5
+        self.field_fidelity:   float = 0.5
+        self.network_fidelity: float = 0.5
+        self.meta_fidelity:    float = 0.5
         self.entropy_mutual:   float = 1.5
 
         # Cached oracle state (from HTTP snapshot or DB)
@@ -4295,7 +4298,7 @@ class QuantumTensorField:
                 qc.ry(self._W3_A0, 0); qc.cx(0, 1)
                 qc.ry(self._W3_A1, 1); qc.cx(1, 2)
                 qc.save_density_matrix()
-                dm = np.asarray(AerSimulator().run(qc).result().data(0)['density_matrix'])
+                dm = np.asarray((AerSimulator(noise_model=self._build_oracle_noise_model()) if self._build_oracle_noise_model() else AerSimulator()).run(qc).result().data(0)['density_matrix'])
                 self.pq0_dm = dm.copy()
                 self._derive_iv_v()
                 self.logger.info("[QTF] ✅ AER W3 bootstrap complete")
@@ -4437,7 +4440,11 @@ class QuantumTensorField:
         try:
             from qiskit import QuantumCircuit
             from qiskit_aer import AerSimulator
-            aer = AerSimulator()
+            
+            # Use oracle-matched noise model
+            noise_model = self._build_oracle_noise_model()
+            aer = AerSimulator(noise_model=noise_model) if noise_model else AerSimulator()
+            
             for qi in range(3):
                 qc = QuantumCircuit(3, 1)
                 # Oracle-canonical W3 preparation (from oracle.py OracleWStateManager._extract_snapshot)
@@ -4518,6 +4525,28 @@ class QuantumTensorField:
 
         return oracle_pq0, oracle_iv, oracle_v
 
+    def _build_oracle_noise_model(self):
+        """Build Qiskit NoiseModel from cached oracle GKSL parameters."""
+        try:
+            from qiskit_aer.noise import NoiseModel, depolarizing_error, amplitude_damping_error
+            
+            noise_model = NoiseModel()
+            gamma1 = getattr(self, '_snap_gamma1', 0.04)
+            gammaphi = getattr(self, '_snap_gammaphi', 0.12)
+            gammadep = getattr(self, '_snap_gammadep', 0.01)
+            
+            error_1q = depolarizing_error(2 * gammaphi / 3, 1)
+            error_1q_decay = amplitude_damping_error(gamma1)
+            error_1q = error_1q_decay.compose(error_1q)
+            
+            noise_model.add_all_qubit_quantum_error(error_1q, ['ry', 'measure'])
+            error_2q = depolarizing_error(gammadep, 2)
+            noise_model.add_all_qubit_quantum_error(error_2q, ['cx'])
+            
+            return noise_model
+        except:
+            return None
+
     def _compute_field_fidelity(self) -> float:
         """
         Field fidelity = ∛(F(pq0,oracle_pq0) · F(iv,oracle_iv) · F(v,oracle_v))
@@ -4577,7 +4606,7 @@ class QuantumTensorField:
             qc.ry(self._W3_A1, 1); qc.cx(1, 2)
             qc.measure([0, 1, 2], [0, 1, 2])
 
-            counts = AerSimulator().run(qc, shots=self._SHOTS).result().get_counts()
+            counts = (AerSimulator(noise_model=self._build_oracle_noise_model()) if self._build_oracle_noise_model() else AerSimulator()).run(qc, shots=self._SHOTS).result().get_counts()
             total  = max(1, sum(counts.values()))
 
             # Per-qubit P(1) from joint measurement counts
@@ -4766,21 +4795,21 @@ class QuantumTensorField:
 
             # ── 2. AER round-robin: individual qubit fidelities ──────────────
             rr = self._run_aer_round_robin()
-            a  = self._EMA
-            self.pq0_fidelity = (1-a)*self.pq0_fidelity + a*rr.get('q0', self.pq0_fidelity)
-            self.iv_fidelity  = (1-a)*self.iv_fidelity  + a*rr.get('q1', self.iv_fidelity)
-            self.v_fidelity   = (1-a)*self.v_fidelity   + a*rr.get('q2', self.v_fidelity)
+            # Use REAL-TIME measured values directly, not EMA-blended
+            self.pq0_fidelity = rr.get('q0', self.pq0_fidelity)
+            self.iv_fidelity  = rr.get('q1', self.iv_fidelity)
+            self.v_fidelity   = rr.get('q2', self.v_fidelity)
             self._rr_idx      = (self._rr_idx + 1) % 3
 
             # ── 3. Field fidelity from oracle's IV + V reference states ──────
-            self.field_fidelity = (1-a)*self.field_fidelity + a*self._compute_field_fidelity()
+            self.field_fidelity = self._compute_field_fidelity()
 
             # ── 4. Tripartite meta pq0 × pq_curr × pq_last ───────────────────
             curr = pq_curr_id or self._pq_curr_id
             last = pq_last_id or self._pq_last_id
             if curr or last:
                 meta = self._tripartite_meta_fidelity(curr, last)
-                self.meta_fidelity = (1-a)*self.meta_fidelity + a*meta
+                self.meta_fidelity = meta
                 self.field_fidelity = 0.6*self.field_fidelity + 0.4*self.meta_fidelity
                 if pq_curr_id: self._pq_curr_id = pq_curr_id
                 if pq_last_id: self._pq_last_id = pq_last_id
