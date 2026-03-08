@@ -362,13 +362,46 @@ class P2POracleClient:
         return 0.0
     
     async def query_chain_state(self) -> Optional[Dict]:
-        """Query current chain state"""
+        """Query current chain state.
+        FIX-C: HTTP fallback via KoyebAPIClient when P2P has no peers.
+        On mobile/Termux there are no TCP peers — avoids constant warning spam.
+        """
         await self._sync_state_from_peers()
-        
+
         with self.state_lock:
-            if self.local_state:
+            if self.local_state and self.local_state.chain_state:
                 return self.local_state.chain_state
-        
+
+        # FIX-C: P2P path empty — try HTTP oracle directly
+        try:
+            import urllib.request as _ur, json as _jj
+            _base = "https://qtcl-blockchain.koyeb.app"
+            _tip_url = f"{_base}/api/blocks/tip"
+            with _ur.urlopen(_tip_url, timeout=6) as _r:
+                tip = _jj.loads(_r.read())
+            _state = {
+                "current_height":  int(tip.get("block_height") or tip.get("height") or 0),
+                "last_block_hash": str(tip.get("block_hash") or tip.get("hash") or "0" * 64),
+                "difficulty_bits": int(tip.get("difficulty") or tip.get("difficulty_bits") or 12),
+                "timestamp":       tip.get("timestamp", 0),
+            }
+            # Cache into local_state so next call is instant
+            if _state["current_height"] > 0:
+                with self.state_lock:
+                    if self.local_state is None:
+                        self.local_state = StateSnapshot(
+                            height=_state["current_height"],
+                            blocks=[], transactions=[], wallets={},
+                            chain_state=_state,
+                            difficulty=_state["difficulty_bits"],
+                            timestamp=float(_state.get("timestamp") or __import__("time").time()),
+                        )
+                    else:
+                        self.local_state.chain_state = _state
+                return _state
+        except Exception as _e:
+            logger.debug(f"[ORACLE] query_chain_state HTTP fallback: {_e}")
+
         return None
     
     async def publish_state_update(self, snapshot: StateSnapshot):
@@ -4765,6 +4798,18 @@ class QtclServer(QtclNode):
         )
         self._block_thread.start()
 
+    # FIX-B: lazy accessor so _block_production_loop is robust against
+    # any future re-ordering of module-level singleton definitions.
+    @staticmethod
+    def _get_sse_mux():
+        global _SSE_MUX
+        try:
+            return _SSE_MUX
+        except NameError:
+            from __main__ import SSEMultiplexer as _SM
+            _SSE_MUX = _SM.get()
+            return _SSE_MUX
+
     def _block_production_loop(self) -> None:
         block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
         difficulty = int(self._cfg.get("difficulty", 4))
@@ -4849,7 +4894,7 @@ class QtclServer(QtclNode):
                 if self.broadcaster:  # Fallback if broadcaster exists
                     self.broadcaster.broadcast_block(block)
                 else:  # Publish to SSE multiplexer
-                    _SSE_MUX.publish("block", {
+                    QtclServer._get_sse_mux().publish("block", {
                         "hash": block.get("hash"),
                         "height": height,
                         "miner": block.get("miner_id"),
@@ -4863,7 +4908,7 @@ class QtclServer(QtclNode):
                         if self.broadcaster:  # Fallback
                             self.broadcaster.broadcast_snapshot(snap)
                         else:  # Publish to SSE multiplexer
-                            _SSE_MUX.publish("snapshot", snap, channel="snapshots")
+                            QtclServer._get_sse_mux().publish("snapshot", snap, channel="snapshots")
                         self.log.info(f"[{self.name}] snapshot broadcast at height {height}")
                     except Exception as exc:
                         self.log.warning(f"[{self.name}] snapshot failed: {exc}")
@@ -5296,8 +5341,10 @@ def main() -> None:
         raise SystemExit(1)
 
 
-if __name__ == "__main__":
-    main()
+# FIX-A: This guard was firing BEFORE _SSE_MUX (line ~8951) was defined,
+# causing NameError in QtclServer._block_production_loop.
+# The θ-SWARM main() at the bottom of this file is the correct entry point.
+# if __name__ == "__main__": main()   ← DISABLED (shadowed by θ-SWARM)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8814,7 +8861,9 @@ class KoyebOracleState:
         # L1 coherence is bounded by (d-1)=7 for d=8; normalize to [0,1]
         # so display is consistent with client-side coherence_l1 (~0.01-0.1).
         _coh_raw = float(coh)
-        self.oracle_coherence = float(_coh_raw / 7.0) if _coh_raw > 1.0 else _coh_raw
+        # FIX-4: server sends raw L1 sum for 8-dim DM; normalize by 2*N=16
+        # (mirrors oracle.py coherence_l1_norm which divides by 2*n)
+        self.oracle_coherence = float(min(1.0, _coh_raw / 16.0))
         self.block_height     = bh
         self.bath_params      = GKSLBathParams.from_snap(snap)
         self.pq_curr_id       = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
