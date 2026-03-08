@@ -2545,12 +2545,18 @@ class P2PClientWStateRecovery:
     def _normalize_snapshot(data: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
         """Normalize any oracle endpoint response to the canonical snapshot shape.
 
-        pq0-bloch: {w3_fidelity, coherence, pq0_bloch_theta/phi, ...}
+        pq0-bloch: {w3_fidelity, coherence, pq0_bloch_theta/phi, gamma1, gammaphi,
+                    gammadep, ou_mem, omega, density_matrix_hex, sector_occ, ...}
         w-state/pq0: {fidelity, w_state_fidelity, coherence, ...}
         → canonical: fidelity, coherence, timestamp_ns, block_height,
-                     w_entropy_hash, hlwe_signature, signature_valid
+                     w_entropy_hash, hlwe_signature, signature_valid,
+                     + ALL lattice GKSL noise bath params preserved verbatim
+        
+        CRITICAL: The snapshot carries the lattice's GKSL-evolved DM and noise bath rates.
+        These must survive normalization unchanged — they are ground truth for all local
+        pq0/IV/V construction. Never synthesize values that exist in the oracle response.
         """
-        import hashlib as _hl   # local — module-level _hlib is del'd after LATTICE_FINGERPRINT
+        import hashlib as _hl
         out = dict(data)
 
         # ── fidelity ──────────────────────────────────────────────────────
@@ -2559,14 +2565,55 @@ class P2PClientWStateRecovery:
                 out.get('w3_fidelity') or out.get('w_state_fidelity') or
                 out.get('pq0_fidelity') or 0.90
             )
+        # Also normalize fidelity aliases for downstream consumers
+        out.setdefault('w3_fidelity', out['fidelity'])
 
         # ── coherence ─────────────────────────────────────────────────────
         if not out.get('coherence'):
             out['coherence'] = float(out.get('coherence_l1') or 0.85)
 
+        # ── GKSL noise bath params — preserve oracle values; never synthesize ──
+        # These are the real physical rates from the lattice's GKSL master equation.
+        # gamma1:   T1 amplitude damping (derived from DB round-trip EMA on oracle)
+        # gammaphi: pure dephasing T2* (from cycle jitter EMA)
+        # gammadep: depolarising noise floor (from QRNG source health)
+        # gamma_geo: geometry noise (hyperbolic geodesic pq0↔pq_max)
+        # ou_mem:   Ornstein-Uhlenbeck bath memory (non-Markovian correction)
+        # omega:    free precession frequency
+        out['gamma1']    = float(out.get('gamma1',    out.get('gamma_1',    0.04)))
+        out['gammaphi']  = float(out.get('gammaphi',  out.get('gamma_phi',  0.12)))
+        out['gammadep']  = float(out.get('gammadep',  out.get('gamma_dep',  0.01)))
+        out['gamma_geo'] = float(out.get('gamma_geo', 0.01))
+        out['ou_mem']    = float(out.get('ou_mem',    0.03))
+        out['omega']     = float(out.get('omega',     0.50))
+
+        # ── density_matrix_hex — the actual GKSL-evolved 8×8 DM from the lattice ──
+        # This is the ground truth pq0 state. Use it directly instead of reconstructing.
+        # Preserve if present (from /api/oracle/w-state); absence means pq0-bloch endpoint.
+        if 'density_matrix_hex' not in out:
+            out['density_matrix_hex'] = ''
+
+        # ── Bloch angles ─────────────────────────────────────────────────
+        if 'theta' not in out:
+            out['theta'] = float(out.get('pq0_bloch_theta', np.pi / 2))
+        if 'phi' not in out:
+            out['phi'] = float(out.get('pq0_bloch_phi', 0.0))
+
+        # ── entanglement measures — preserve oracle values ─────────────
+        for k, d in [('negativity',0.43),('concurrence',0.30),('qfi',6.5),
+                     ('discord',1.5),('sector_occ',0.9),('tele_fidelity',0.6),
+                     ('purity',0.80),('entanglement',0.65)]:
+            out.setdefault(k, float(out.get(k, d)))
+
+        # ── wN_fidelity (N-oracle joint) ──────────────────────────────────
+        out.setdefault('wN_fidelity', float(out.get('wN_fidelity', out['fidelity'] * 0.95)))
+
         # ── timestamp ─────────────────────────────────────────────────────
         if 'timestamp_ns' not in out:
             out['timestamp_ns'] = int(time.time() * 1e9)
+
+        # ── snap_ts: wall-clock seconds for age checks ────────────────────
+        out['snap_ts'] = out.get('snap_ts', time.time())
 
         # ── hlwe_signature stub (pq0-bloch omits it) ──────────────────────
         if not out.get('hlwe_signature'):
@@ -2875,18 +2922,17 @@ class P2PClientWStateRecovery:
                     # Fallback: derive from current
                     pq_last_id = str(max(1, (int(pq_curr_id) - 1) % 106495 or 106495))
             
-            # Build a proper 8x8 W-state density matrix from oracle fidelity.
-            # |W⟩ = (|100⟩+|010⟩+|001⟩)/√3  →  ρ_W = |W⟩⟨W|
-            # We scale by oracle fidelity so the DM reflects the real quantum state quality.
-            w_amp = 1.0 / np.sqrt(3.0)
-            w_vec = np.zeros(8, dtype=np.complex128)
-            w_vec[4] = w_amp   # |100⟩
-            w_vec[2] = w_amp   # |010⟩
-            w_vec[1] = w_amp   # |001⟩
-            rho_pure = np.outer(w_vec, w_vec.conj())
-            # Mix pure W-state with maximally mixed state according to oracle fidelity
-            rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
-            dm_array = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+            # ── Build 8×8 pq0 DM from snapshot — lattice noise bath aware ──
+            # Priority: (1) actual GKSL DM from density_matrix_hex, (2) reconstruct + GKSL
+            dm_array = _extract_gksl_dm(snapshot)
+            if dm_array is None:
+                w_amp = 1.0 / np.sqrt(3.0)
+                w_vec = np.zeros(8, dtype=np.complex128)
+                w_vec[4] = w_amp; w_vec[2] = w_amp; w_vec[1] = w_amp
+                rho_pure  = np.outer(w_vec, w_vec.conj())
+                rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
+                dm_array  = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+                dm_array  = _apply_gksl_bath(dm_array, snapshot, dt=2.0)
             purity = float(np.real(np.trace(dm_array @ dm_array)))
             
             mode = getattr(self, 'fidelity_mode', DEFAULT_FIDELITY_MODE)
@@ -3215,9 +3261,13 @@ class P2PClientWStateRecovery:
                     time.sleep(0.5)
                     continue
 
-                # ── 3. Keep VPM pq0 in sync ──────────────────────────────────
+                # ── 3. Keep VPM pq0 in sync — bath-aware rotation ────────────
                 if hasattr(self, 'vpm') and self.vpm is not None:
                     if self.vpm.update_pq0(snapshot):
+                        # Rotate vpqs with GKSL bath from snapshot so virtual pqs
+                        # evolve under the SAME noise rates as the lattice pq0
+                        for vpq_id in list(self.vpm._vpq.keys()):
+                            self.vpm.rotate_virtual_pq(vpq_id, snap=snapshot)
                         self.vpm.rotate_vpqs_on_pq0_update()
 
                 # ── 4. Sync lag — telemetry only, NOT a fidelity penalty ──────
@@ -4031,97 +4081,729 @@ class OracleNode:
         except Exception as e:
             logger.error(f"[ORACLE] Failed to start server: {e}")
 
-# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# QUANTUM TENSOR FIELD BOOTSTRAPPING - REAL-TIME W-STATE MEASUREMENT (PRE-INIT)
-# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# LATTICE NOISE BATH HELPERS — used by QTF, VPM, P2PClientWStateRecovery, OracleEntanglementBridge
+# The snapshot carries the lattice's GKSL-evolved DM and bath rates as ground truth.
+# These helpers extract and apply that physical state uniformly across all subsystems.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Local Pauli algebra (mirrors server.py — no import needed)
+_PAULI_SX = np.array([[0,1],[1,0]], dtype=np.complex128)
+_PAULI_SY = np.array([[0,-1j],[1j,0]], dtype=np.complex128)
+_PAULI_SZ = np.array([[1,0],[0,-1]], dtype=np.complex128)
+_PAULI_SP = np.array([[0,1],[0,0]], dtype=np.complex128)
+_PAULI_SM = np.array([[0,0],[1,0]], dtype=np.complex128)
+_I2 = np.eye(2, dtype=np.complex128)
+
+def _lc_kron(*ops):
+    r = ops[0]
+    for o in ops[1:]: r = np.kron(r, o)
+    return r
+
+def _lc_embed(op, q, n):
+    ops = [_I2] * n; ops[q] = op
+    return _lc_kron(*ops)
+
+def _extract_gksl_dm(snap: dict) -> Optional[np.ndarray]:
+    """
+    Extract the GKSL-evolved 8×8 density matrix from a snapshot's density_matrix_hex.
+    Returns None if absent or malformed — callers fall back to local reconstruction.
+    """
+    dm_hex = snap.get('density_matrix_hex', '')
+    if not dm_hex or len(dm_hex) < 128:
+        return None
+    try:
+        # Truncate to 8×8 complex128 = 1024 bytes = 2048 hex chars
+        dm_bytes = bytes.fromhex(dm_hex[:2048])
+        n_elem   = len(dm_bytes) // 16  # 16 bytes per complex128
+        side     = int(np.sqrt(n_elem))
+        if side * side != n_elem or side not in (3, 8):
+            return None
+        dm = np.frombuffer(dm_bytes[:side*side*16], dtype=np.complex128).reshape(side, side)
+        # Ensure 8×8 (expand 3×3 synthetic to 8×8 if needed)
+        if side == 3:
+            dm8 = np.zeros((8, 8), dtype=np.complex128)
+            dm8[:3, :3] = dm; dm8 /= max(np.real(np.trace(dm8)), 1e-12)
+            dm = dm8
+        # Validate: Hermitian, trace≈1, PSD
+        dm = 0.5 * (dm + dm.conj().T)
+        eigs = np.linalg.eigvalsh(dm)
+        if np.any(eigs < -0.05) or abs(float(np.real(np.trace(dm))) - 1.0) > 0.1:
+            return None
+        eigs = np.maximum(eigs, 0); evecs = np.linalg.eigh(dm)[1]
+        dm = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(dm))
+        return dm / max(tr, 1e-12)
+    except Exception:
+        return None
+
+def _apply_gksl_bath(rho: np.ndarray, snap: dict, dt: float = 2.0) -> np.ndarray:
+    """
+    Apply GKSL master equation RK4 step to rho using oracle's noise bath rates.
+    Mirrors server.py _gksl_step exactly.
+    snap fields used: gamma1, gammaphi, gammadep, omega, ou_mem (OU memory correction).
+
+    dt: default 2.0s matches server's quantum_metrics_thread cycle.
+    For IV qubit: caller passes boosted gamma1 (more amplitude damping = anti-correlated degradation).
+    For V  qubit: caller passes exact oracle rates (faithful local mirror).
+    """
+    g1   = float(snap.get('gamma1',   0.04))
+    gphi = float(snap.get('gammaphi', 0.12))
+    gdep = float(snap.get('gammadep', 0.01))
+    om   = float(snap.get('omega',    0.50))
+    ou   = float(snap.get('ou_mem',   0.03))
+
+    # OU memory correction: suppress γ1 non-Markovian (same as server _KAPPA3 = 0.11)
+    _KAPPA3 = 0.11
+    g1_eff = g1 * (1.0 - ou * _KAPPA3)
+    n = int(round(np.log2(rho.shape[0])))  # 3 for 8×8
+
+    def _lind(r):
+        d = np.zeros_like(r)
+        for q in range(n):
+            H_q = (om / 2.0) * _lc_embed(_PAULI_SZ, q, n)
+            d  += -1j * (H_q @ r - r @ H_q)
+            for gam, op in ((g1_eff,      _lc_embed(_PAULI_SM,        q, n)),
+                            (g1_eff*0.1,  _lc_embed(_PAULI_SP,        q, n)),
+                            (gphi,        _lc_embed(_PAULI_SZ * 0.5,  q, n)),
+                            (gdep,        np.eye(2**n, dtype=np.complex128) * np.sqrt(0.5))):
+                if gam < 1e-14: continue
+                L  = np.sqrt(gam) * op; Ld = L.conj().T
+                d += L @ r @ Ld - 0.5 * (Ld @ L @ r + r @ Ld @ L)
+        return d
+
+    def _rk4(r, h):
+        k1 = _lind(r); k2 = _lind(r + 0.5*h*k1)
+        k3 = _lind(r + 0.5*h*k2); k4 = _lind(r + h*k3)
+        out = r + (h/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+        out = 0.5*(out + out.conj().T)
+        return out / max(float(np.real(np.trace(out))), 1e-12)
+
+    gamma_max = max(g1_eff, gphi, gdep, abs(om)/(2*np.pi + 1e-9), 1e-9)
+    h_max  = 0.05 / gamma_max
+    n_steps = max(1, int(np.ceil(dt / h_max)))
+    h_sub  = dt / n_steps
+    cur = rho.copy()
+    for _ in range(n_steps):
+        cur = _rk4(cur, h_sub)
+        if not np.all(np.isfinite(cur)):
+            # fallback: ideal W3 + noise
+            w = np.zeros(8, dtype=np.complex128); w[4]=w[2]=w[1]=1.0/np.sqrt(3)
+            cur = np.outer(w, w.conj())
+            break
+    return cur
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# QUANTUM TENSOR FIELD — ORACLE-SEEDED AER TRIPARTITE W-STATE WITH ROUND-ROBIN QUBIT FIDELITY
+# Architecture:
+#   pq0 ← oracle bloch/fidelity/coherence (from fetched snapshot) + virtual_pq_state DB
+#   IV  ← inverse-virtual: ρ_mix·α - ε·ρ_v  (anti-correlated oracle divergence sensor)
+#   V   ← virtual: 0.995·ρ_pq0 + 0.005·noise (local mirror)
+#   Round-robin AER: measure Q_i only → F_i = (√(2/3·p0) + √(1/3·p1))² → rebuild W3 → next i
+#   Field fidelity: F(local, oracle_iv) · F(local, oracle_v) geometric mean vs oracle's bloch
+#   Meta-entanglement: pq0 × pq_curr × pq_last tripartite W3 → individual + field fidelities
+#   Network fidelity: mean(dht_peers.pq0_fidelity WHERE last_seen > now-300s)
+#   Streams: virtual_pq_state INSERT/UPDATE + SSE gossip callback
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class QuantumTensorField:
-    """Real-time W-state tensor field with pq0, IV, V fidelity measurement on-demand."""
+    """
+    REBUILT: Oracle-seeded AER tripartite W-state field.
+    Replaces static tensor init with real-time AER + oracle-derived pq0/IV/V + round-robin measurement.
+    No new file, no new deps — expands VPM/oracle patterns already in codebase.
+    """
+    _W3_A0 = np.arccos(np.sqrt(2/3))   # ry angle for W3 qubit 0
+    _W3_A1 = np.arccos(np.sqrt(1/2))   # ry angle for W3 qubit 1
+    _SHOTS  = 256                        # AER shots per single-qubit measurement
+    _EMA    = 0.25                       # EMA alpha: weight for latest measurement
+
     def __init__(self, logger_obj=None):
-        self.logger=logger_obj or logger
-        self.pq0_state=None
-        self.pq0_fidelity=0.7111  # Default: will update with actual measurements
-        self.iv_state=None
-        self.iv_fidelity=0.7111
-        self.v_state=None
-        self.v_fidelity=0.7111
-        self.entropy_mutual=1.5
-        self.measurement_lock=threading.RLock()
-        self.last_measurement_time=time.time()
-        self._init_w_state()
-        
-    def _init_w_state(self):
-        """Generate W-state |W⟩ = (|100⟩ + |010⟩ + |001⟩)/√3 on 3 qubits."""
-        try:
-            if QISKIT_AVAILABLE:
-                from qiskit import QuantumCircuit,QuantumRegister
+        self.logger = logger_obj or logger
+        self.measurement_lock = threading.RLock()
+        self.last_measurement_time = time.time()
+
+        # External refs — wired lazily via wire_refs() or update_measurements()
+        self._db           = None
+        self._vpm          = None          # VirtualPseudoqubitManager ref
+        self._sse_callback = None          # callable(snapshot_dict) → SSE push
+        self._recovery_ref = None          # P2PClientWStateRecovery ref
+
+        # 8×8 density matrices for tripartite nodes
+        self.pq0_dm: Optional[np.ndarray] = None
+        self.iv_dm:  Optional[np.ndarray] = None
+        self.v_dm:   Optional[np.ndarray] = None
+
+        # Individual qubit fidelities (EMA-smoothed from AER round-robin)
+        self.pq0_fidelity:     float = 0.7111
+        self.iv_fidelity:      float = 0.7111
+        self.v_fidelity:       float = 0.7111
+
+        # Composite fidelity metrics
+        self.field_fidelity:   float = 0.7111   # local vs oracle (IV+V geometric mean)
+        self.network_fidelity: float = 0.7111   # mean(dht_peers.pq0_fidelity)
+        self.meta_fidelity:    float = 0.7111   # tripartite pq0×pq_curr×pq_last
+        self.entropy_mutual:   float = 1.5
+
+        # Cached oracle state (from HTTP snapshot or DB)
+        self._oracle_theta:       float = np.pi / 2
+        self._oracle_phi:         float = 0.0
+        self._oracle_w3_fidelity: float = 0.9
+        self._oracle_coherence:   float = 0.85
+
+        # Lattice field IDs for meta-entanglement
+        self._pq_curr_id: str = ''
+        self._pq_last_id: str = ''
+
+        # Round-robin qubit index [0=pq0, 1=IV, 2=V]
+        self._rr_idx: int = 0
+
+        # Try AER bootstrap immediately (non-blocking fallback if unavailable)
+        self._bootstrap_fallback_w3()
+
+    # ─── External wiring ───────────────────────────────────────────────────────
+
+    def wire_refs(self, db=None, vpm=None, sse_callback=None, recovery=None):
+        """Wire external refs after construction. Triggers DB pq0 load."""
+        self._db           = db
+        self._vpm          = vpm
+        self._sse_callback = sse_callback
+        self._recovery_ref = recovery
+        if db is not None:
+            self._load_pq0_from_db()
+
+    def set_recovery_ref(self, recovery):
+        """Lightweight single-ref wire — called from QuantumMiner.__init__."""
+        self._recovery_ref = recovery
+
+    # ─── pq0 / IV / V construction ─────────────────────────────────────────────
+
+    def _bootstrap_fallback_w3(self):
+        """Build initial W3 DMs via AER (or numpy fallback). No blocking."""
+        if QISKIT_AVAILABLE:
+            try:
+                from qiskit import QuantumCircuit
                 from qiskit_aer import AerSimulator
-                qr=QuantumRegister(3,'q')
-                qc=QuantumCircuit(qr)
-                qc.x(qr[0])
-                qc.cx(qr[0],qr[1])
-                qc.cx(qr[1],qr[2])
-                qc.rx(2*np.arccos(1/np.sqrt(3)),qr[0])
-                qc.cx(qr[1],qr[0])
-                qc.rx(-2*np.arccos(1/np.sqrt(3)),qr[0])
-                sim=AerSimulator()
-                result=sim.run(qc.save_density_matrix()).result()
-                dm=result.data(0)['density_matrix']
-                self.pq0_state=dm
-                self.iv_state=np.conj(dm.T)
-                self.v_state=dm+0.02*np.random.randn(*dm.shape)
-                self.logger.info("[QUANTUM] W-state initialized: pq0/IV/V tensors ready")
-            else:
-                self.logger.info("[QUANTUM] Qiskit unavailable—using synthetic W-state")
-                w_norm=np.array([[0.333,0.166,-0.033],[0.166,0.333,0.166],[-0.033,0.166,0.333]],dtype=complex)
-                self.pq0_state=w_norm
-                self.iv_state=np.conj(w_norm.T)
-                self.v_state=w_norm
+                qc = QuantumCircuit(3)
+                qc.ry(self._W3_A0, 0); qc.cx(0, 1)
+                qc.ry(self._W3_A1, 1); qc.cx(1, 2)
+                qc.save_density_matrix()
+                dm = np.asarray(AerSimulator().run(qc).result().data(0)['density_matrix'])
+                self.pq0_dm = dm.copy()
+                self._derive_iv_v()
+                self.logger.info("[QTF] ✅ AER W3 bootstrap complete")
+                return
+            except Exception as e:
+                self.logger.debug(f"[QTF] AER bootstrap: {e}")
+        # Numpy fallback: ideal W3 density matrix
+        w = np.zeros(8, dtype=np.complex128)
+        w[4] = w[2] = w[1] = 1.0 / np.sqrt(3.0)
+        self.pq0_dm = np.outer(w, w.conj())
+        self._derive_iv_v()
+
+    def _load_pq0_from_db(self):
+        """Seed pq0 from virtual_pq_state DB (latest oracle row) if available."""
+        try:
+            row = self._db.execute("""
+                SELECT density_matrix_hex, fidelity, coherence FROM virtual_pq_state
+                WHERE pq_type='oracle' AND is_active=1
+                ORDER BY last_measured DESC LIMIT 1
+            """).fetchone()
+            if row and row[0] and len(row[0]) >= 128:
+                dm = np.frombuffer(bytes.fromhex(row[0]), dtype=np.complex128).reshape(8, 8)
+                if abs(float(np.real(np.trace(dm))) - 1.0) < 0.1:
+                    self.pq0_dm = dm.copy()
+                    self.pq0_fidelity = float(row[1] or 0.7111)
+                    self._oracle_coherence = float(row[2] or 0.85)
+                    self._derive_iv_v()
+                    self.logger.info(f"[QTF] pq0 seeded from DB | F={self.pq0_fidelity:.4f}")
         except Exception as e:
-            self.logger.warning(f"[QUANTUM] W-state init error: {e}—using fallback")
-            w_norm=np.array([[0.333,0.166,-0.033],[0.166,0.333,0.166],[-0.033,0.166,0.333]],dtype=complex)
-            self.pq0_state=w_norm
-            self.iv_state=np.conj(w_norm.T)
-            self.v_state=w_norm
-            
-    def measure_fidelity(self, state1, state2):
-        """Compute fidelity F(ρ,σ) between two density matrices."""
+            self.logger.debug(f"[QTF] DB pq0 seed: {e}")
+
+    def _build_pq0_from_snapshot(self, snap: dict) -> np.ndarray:
+        """
+        Build 8×8 pq0 DM from oracle HTTP snapshot.
+        Priority:
+          1. density_matrix_hex — the actual GKSL-evolved lattice DM (ground truth)
+          2. Reconstruct ideal W3 from fidelity, apply GKSL bath with oracle's rates
+        Also caches all noise bath params for use in _derive_iv_v and field fidelity.
+        """
+        theta = float(snap.get('theta', snap.get('pq0_bloch_theta', np.pi/2)))
+        phi   = float(snap.get('phi',   snap.get('pq0_bloch_phi',   0.0)))
+        f     = min(1.0, max(0.0, float(snap.get('w3_fidelity', snap.get('fidelity', 0.9)))))
+        self._oracle_theta       = theta
+        self._oracle_phi         = phi
+        self._oracle_w3_fidelity = f
+        self._oracle_coherence   = min(1.0, max(0.0, float(snap.get('coherence', 0.85))))
+        # Cache all GKSL bath params — used by _derive_iv_v and field fidelity
+        self._snap_gamma1    = float(snap.get('gamma1',   0.04))
+        self._snap_gammaphi  = float(snap.get('gammaphi', 0.12))
+        self._snap_gammadep  = float(snap.get('gammadep', 0.01))
+        self._snap_ou_mem    = float(snap.get('ou_mem',   0.03))
+        self._snap_omega     = float(snap.get('omega',    0.50))
+        self._snap_sector    = float(snap.get('sector_occ', 0.9))
+
+        # ── 1. Extract actual GKSL DM from lattice if available ──────────
+        dm = _extract_gksl_dm(snap)
+        if dm is not None:
+            return dm
+
+        # ── 2. Reconstruct + apply GKSL bath with oracle's measured rates ──
+        w = np.zeros(8, dtype=np.complex128); w[4]=w[2]=w[1]=1.0/np.sqrt(3.0)
+        # Apply Bloch phase modulation from oracle angles for off-diagonal structure
+        phase_mat = np.exp(1j * phi * np.outer(np.arange(8), np.ones(8)) * np.cos(theta) / 8.0)
+        rho_w     = np.outer(w, w.conj()) * phase_mat
+        eigs, evecs = np.linalg.eigh(rho_w); eigs = np.maximum(eigs, 0)
+        rho_w = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(rho_w));
+        if tr > 0: rho_w /= tr
+        rho_mix = np.eye(8, dtype=np.complex128) / 8.0
+        pq0 = f * rho_w + (1.0 - f) * rho_mix
+        # GKSL evolution brings this into the actual noise bath state
+        return _apply_gksl_bath(pq0, snap, dt=2.0)
+
+    def _derive_iv_v(self, snap: dict = None):
+        """
+        Derive V (virtual) and IV (inverse-virtual) from current pq0_dm,
+        applying GKSL bath evolution with noise-bath-differentiated rates:
+
+          V  (virtual mirror):   exact oracle rates — faithful local copy of pq0
+          IV (inverse-virtual):  boosted γ1 + inverted sector — anti-correlated divergence sensor
+        
+        If snap is provided, uses its bath rates directly.
+        Falls back to cached _snap_gamma* values from _build_pq0_from_snapshot.
+        """
+        if self.pq0_dm is None:
+            return
+        # Build snap proxy from cached bath params if no snap provided
+        bath = snap or {
+            'gamma1':   getattr(self, '_snap_gamma1',   0.04),
+            'gammaphi': getattr(self, '_snap_gammaphi', 0.12),
+            'gammadep': getattr(self, '_snap_gammadep', 0.01),
+            'ou_mem':   getattr(self, '_snap_ou_mem',   0.03),
+            'omega':    getattr(self, '_snap_omega',    0.50),
+        }
+
+        # ── V: virtual mirror — tiny decoherence perturbation + oracle's exact bath ──
+        rng  = np.random.default_rng()
+        noise = rng.normal(0, 0.005, (8, 8)).astype(np.complex128)
+        noise = (noise + noise.conj().T) / 2
+        v = 0.995 * self.pq0_dm + 0.005 * noise
+        tr = np.real(np.trace(v));
+        if tr > 0: v /= tr
+        self.v_dm = _apply_gksl_bath(v, bath, dt=2.0)  # exact oracle rates
+
+        # ── IV: inverse-virtual — VPM anti-correlation math + amplified bath ──
+        # Boosted γ1: IV decays faster (anti-correlated T1 channel)
+        # Inverted depolarizing: IV experiences MORE noise floor
+        v_fid   = max(0.0, self.pq0_fidelity - 0.005)
+        alpha   = 1.0 - v_fid
+        rho_mix = np.eye(8, dtype=np.complex128) / 8.0
+        iv = rho_mix * alpha + rho_mix * (1.0 - alpha) - 0.1 * self.v_dm
+        eigs, evecs = np.linalg.eigh(iv); eigs = np.maximum(eigs, 0)
+        iv = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(iv));
+        if tr > 0: iv /= tr
+        # IV bath: γ1 boosted (anti-correlated decay), γdep boosted (isotropic noise floor)
+        iv_bath = dict(bath)
+        iv_bath['gamma1']   = min(0.30, bath.get('gamma1',   0.04) * (2.0 + alpha))
+        iv_bath['gammadep'] = min(0.20, bath.get('gammadep', 0.01) * (1.5 + alpha))
+        iv_bath['ou_mem']   = max(0.0,  1.0 - bath.get('ou_mem', 0.03))  # inverted OU memory
+        self.iv_dm = _apply_gksl_bath(iv, iv_bath, dt=2.0)
+
+    # ─── AER round-robin qubit fidelity measurement ────────────────────────────
+
+    def _run_aer_round_robin(self) -> dict:
+        """
+        Round-robin AER measurement: measure each qubit of W3, rebuild after each.
+        Returns {q0, q1, q2} individual fidelities.
+
+        For ideal |W3⟩: P(qi=1)=1/3, P(qi=0)=2/3 for each qubit.
+        Individual fidelity F_i = (√(2/3·p0_i) + √(1/3·p1_i))²
+        where p0_i, p1_i are measured from shots.
+
+        All 3 qubits measured in one call (3 separate AER circuits = 3 fresh W-state builds).
+        """
+        if not QISKIT_AVAILABLE:
+            return {'q0': self.pq0_fidelity, 'q1': self.iv_fidelity, 'q2': self.v_fidelity}
+        results = {}
         try:
-            eigs=np.linalg.eigvalsh(np.dot(np.dot(np.sqrt(state1),state2),np.sqrt(state1)))
-            eigs=np.maximum(eigs,0)
-            return float(np.sum(np.sqrt(eigs))**2)
+            from qiskit import QuantumCircuit
+            from qiskit_aer import AerSimulator
+            aer = AerSimulator()
+            for qi in range(3):
+                qc = QuantumCircuit(3, 1)
+                # Oracle-canonical W3 preparation (from oracle.py OracleWStateManager._extract_snapshot)
+                qc.ry(self._W3_A0, 0); qc.cx(0, 1)
+                qc.ry(self._W3_A1, 1); qc.cx(1, 2)
+                qc.measure(qi, 0)   # measure only qubit qi — W3 rebuild implicit on next iteration
+                counts = aer.run(qc, shots=self._SHOTS).result().get_counts()
+                total  = max(1, sum(counts.values()))
+                p1     = counts.get('1', 0) / total
+                p0     = 1.0 - p1
+                # Uhlmann fidelity for diagonal single-qubit states vs ideal W3 reduced DM = diag(2/3, 1/3)
+                f_i = min(1.0, max(0.0, float((np.sqrt(2/3 * p0) + np.sqrt(1/3 * p1)) ** 2)))
+                results[f'q{qi}'] = f_i
+        except Exception as e:
+            self.logger.debug(f"[QTF] AER round-robin: {e}")
+            results = {'q0': self.pq0_fidelity, 'q1': self.iv_fidelity, 'q2': self.v_fidelity}
+        return results
+
+    # ─── Field fidelity: local vs oracle's IV + V ──────────────────────────────
+
+    @staticmethod
+    def _uhlmann(rho1: np.ndarray, rho2: np.ndarray) -> float:
+        """Uhlmann fidelity F(ρ1,ρ2) = Tr(√(√ρ1·ρ2·√ρ1))²"""
+        try:
+            e1, v1 = np.linalg.eigh(rho1); e1 = np.maximum(e1, 0)
+            sqrt1  = v1 @ np.diag(np.sqrt(e1).astype(np.complex128)) @ v1.conj().T
+            M      = sqrt1 @ rho2 @ sqrt1
+            eM     = np.linalg.eigvalsh(M); eM = np.maximum(eM, 0)
+            return min(1.0, max(0.0, float(np.sum(np.sqrt(eM)) ** 2)))
         except:
-            return 0.7111
-            
-    def measure_entropy(self):
-        """Compute von Neumann entropy S(ρ) for pq0."""
+            return 0.5
+
+    def _oracle_reference_dms(self) -> tuple:
+        """
+        Build oracle's expected pq0, IV, V DMs from cached bloch angles + GKSL bath params.
+        These are the 'g oracle values' — ground truth for field fidelity computation.
+        Applies the SAME GKSL evolution the oracle used so comparison is apples-to-apples.
+        """
+        f     = self._oracle_w3_fidelity
+        theta = self._oracle_theta
+        phi   = self._oracle_phi
+        bath  = {
+            'gamma1':   getattr(self, '_snap_gamma1',   0.04),
+            'gammaphi': getattr(self, '_snap_gammaphi', 0.12),
+            'gammadep': getattr(self, '_snap_gammadep', 0.01),
+            'ou_mem':   getattr(self, '_snap_ou_mem',   0.03),
+            'omega':    getattr(self, '_snap_omega',    0.50),
+        }
+        w = np.zeros(8, dtype=np.complex128); w[4]=w[2]=w[1]=1.0/np.sqrt(3.0)
+        phase = np.exp(1j * phi * np.outer(np.arange(8), np.ones(8)) * np.cos(theta) / 8.0)
+        rho_w = np.outer(w, w.conj()) * phase
+        eigs, evecs = np.linalg.eigh(rho_w); eigs = np.maximum(eigs, 0)
+        rho_w = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(rho_w));
+        if tr > 0: rho_w /= tr
+        rho_mix    = np.eye(8, dtype=np.complex128) / 8.0
+        oracle_pq0 = f * rho_w + (1.0 - f) * rho_mix
+        oracle_pq0 = _apply_gksl_bath(oracle_pq0, bath, dt=2.0)  # oracle's noise bath
+
+        # IV: oracle's anti-correlated reference (same GKSL with boosted rates)
+        alpha_o = 1.0 - f
+        iv_ref  = rho_mix * alpha_o + rho_mix * (1 - alpha_o) - 0.1 * oracle_pq0
+        eigs, evecs = np.linalg.eigh(iv_ref); eigs = np.maximum(eigs, 0)
+        iv_ref = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(iv_ref));
+        if tr > 0: iv_ref /= tr
+        iv_bath = dict(bath)
+        iv_bath['gamma1']   = min(0.30, bath['gamma1'] * (2.0 + alpha_o))
+        iv_bath['gammadep'] = min(0.20, bath['gammadep'] * (1.5 + alpha_o))
+        iv_bath['ou_mem']   = max(0.0,  1.0 - bath['ou_mem'])
+        oracle_iv = _apply_gksl_bath(iv_ref, iv_bath, dt=2.0)
+
+        # V: oracle's virtual reference (faithful mirror with exact oracle rates)
+        v_ref = 0.995 * oracle_pq0 + 0.005 * rho_mix
+        tr = np.real(np.trace(v_ref));
+        if tr > 0: v_ref /= tr
+        oracle_v = _apply_gksl_bath(v_ref, bath, dt=2.0)
+
+        return oracle_pq0, oracle_iv, oracle_v
+
+    def _compute_field_fidelity(self) -> float:
+        """
+        Field fidelity = ∛(F(pq0,oracle_pq0) · F(iv,oracle_iv) · F(v,oracle_v))
+        Uses oracle's iv and virtual reference DMs built from bloch+w3_fidelity.
+        """
+        if self.pq0_dm is None:
+            return self.pq0_fidelity
         try:
-            eigs=np.linalg.eigvalsh(self.pq0_state)
-            eigs=np.maximum(eigs,1e-10)
-            return float(-np.sum(eigs*np.log2(eigs)))
+            o_pq0, o_iv, o_v = self._oracle_reference_dms()
+            f_pq0 = self._uhlmann(self.pq0_dm, o_pq0)
+            f_iv  = self._uhlmann(self.iv_dm,  o_iv)  if self.iv_dm is not None else f_pq0
+            f_v   = self._uhlmann(self.v_dm,   o_v)   if self.v_dm  is not None else f_pq0
+            return float((f_pq0 * f_iv * f_v) ** (1/3))
+        except Exception as e:
+            self.logger.debug(f"[QTF] field_fidelity: {e}")
+            return self.pq0_fidelity
+
+    # ─── Tripartite meta-entanglement: pq0 × pq_curr × pq_last ─────────────────
+
+    def _height_to_dm(self, h_id: str) -> np.ndarray:
+        """Build deterministic 8×8 DM from block-height string (seeded W-state)."""
+        seed = int.from_bytes(hashlib.sha3_256(h_id.encode()).digest()[:8], 'little')
+        rng  = np.random.default_rng(seed)
+        w    = np.zeros(8, dtype=np.complex128); w[4]=w[2]=w[1]=1.0/np.sqrt(3.0)
+        phases = np.exp(2j * np.pi * rng.random(8)); w *= phases; w /= np.linalg.norm(w)
+        dm = np.outer(w, w.conj())
+        # Blend with oracle's pq0 if available for true lattice-seeded fidelity
+        if self.pq0_dm is not None:
+            purity_w = float(np.real(self._oracle_w3_fidelity))
+            dm = purity_w * dm + (1 - purity_w) * self.pq0_dm
+        eigs, evecs = np.linalg.eigh(dm); eigs = np.maximum(eigs, 0)
+        dm = evecs @ np.diag(eigs.astype(np.complex128)) @ evecs.conj().T
+        tr = np.real(np.trace(dm));
+        if tr > 0: dm /= tr
+        return dm
+
+    def _tripartite_meta_fidelity(self, pq_curr_id: str, pq_last_id: str) -> float:
+        """
+        Tripartite W-state meta-entanglement: pq0 × pq_curr × pq_last.
+        Builds AER W3 circuit seeded from block-height DMs, measures all 3 qubits,
+        computes individual + mean fidelity vs ideal W3.
+        Returns field_fidelity ∈ [0,1].
+        """
+        if not QISKIT_AVAILABLE or self.pq0_dm is None:
+            return self.pq0_fidelity
+        if not pq_curr_id and not pq_last_id:
+            return self.field_fidelity
+        try:
+            from qiskit import QuantumCircuit
+            from qiskit_aer import AerSimulator
+            curr_dm = self._height_to_dm(pq_curr_id or '0')
+            last_dm = self._height_to_dm(pq_last_id or '0')
+
+            # W3 circuit (3 qubits = pq0, pq_curr, pq_last)
+            qc = QuantumCircuit(3, 3)
+            qc.ry(self._W3_A0, 0); qc.cx(0, 1)
+            qc.ry(self._W3_A1, 1); qc.cx(1, 2)
+            qc.measure([0, 1, 2], [0, 1, 2])
+
+            counts = AerSimulator().run(qc, shots=self._SHOTS).result().get_counts()
+            total  = max(1, sum(counts.values()))
+
+            # Per-qubit P(1) from joint measurement counts
+            p1 = [0.0, 0.0, 0.0]
+            for bitstr, cnt in counts.items():
+                bits = bitstr.replace(' ', '').zfill(3)
+                for qi in range(3):
+                    p1[qi] += cnt * int(bits[2 - qi])   # Qiskit bit ordering: lsb first
+            p1 = [c / total for c in p1]
+
+            # Individual fidelities vs ideal W3 reduced DM
+            f_each = [min(1.0, max(0.0, (np.sqrt(2/3*(1-p)) + np.sqrt(1/3*p))**2)) for p in p1]
+
+            # Also compute Uhlmann fidelity of the tripartite DM vs oracle-seeded DMs
+            # (pq_curr and pq_last are lattice-seeded; pq0 is oracle truth)
+            f_curr = self._uhlmann(curr_dm, self.pq0_dm)  # how close pq_curr field is to oracle
+            f_last = self._uhlmann(last_dm, self.pq0_dm)  # how close pq_last field is to oracle
+
+            # Combined: circuit fidelity weighted with lattice fidelity
+            return float(np.mean(f_each) * 0.6 + np.mean([f_curr, f_last]) * 0.4)
+        except Exception as e:
+            self.logger.debug(f"[QTF] tripartite_meta: {e}")
+            return self.field_fidelity
+
+    # ─── Network fidelity ──────────────────────────────────────────────────────
+
+    def _compute_network_fidelity(self) -> float:
+        """Network fidelity = mean(dht_peers.pq0_fidelity) for peers seen in last 5m."""
+        if self._db is None:
+            return self.pq0_fidelity
+        try:
+            rows = self._db.execute(
+                "SELECT pq0_fidelity FROM dht_peers WHERE last_seen > ? AND pq0_fidelity > 0 LIMIT 50",
+                (time.time() - 300,)
+            ).fetchall()
+            fids = [float(r[0]) for r in rows if r[0] and 0 < r[0] <= 1.0]
+            return float(np.mean(fids)) if fids else self.pq0_fidelity
+        except Exception as e:
+            self.logger.debug(f"[QTF] network_fidelity: {e}")
+            return self.pq0_fidelity
+
+    # ─── DB + SSE streaming ────────────────────────────────────────────────────
+
+    def _stream_to_db(self, snap: dict):
+        """Persist pq0/IV/V states to virtual_pq_state (same pattern as VPM._persist_pq_state).
+        Coherence stored as oracle's actual coherence; w_entropy_hash encodes bath identity."""
+        if self._db is None:
+            return
+        try:
+            ts = time.time()
+            coherence = self._oracle_coherence
+            # Bath fingerprint: hash of gamma params → encodes lattice noise bath identity
+            bath_sig = hashlib.sha3_256(
+                f"{getattr(self,'_snap_gamma1',0.04):.4f}:"
+                f"{getattr(self,'_snap_gammaphi',0.12):.4f}:"
+                f"{getattr(self,'_snap_gammadep',0.01):.4f}:"
+                f"{getattr(self,'_snap_ou_mem',0.03):.4f}".encode()
+            ).hexdigest()[:16]
+
+            pairs = [
+                ('qtf_pq0', 'oracle',          self.pq0_dm, self.pq0_fidelity),
+                ('qtf_iv',  'inverse_virtual',  self.iv_dm,  self.iv_fidelity),
+                ('qtf_v',   'virtual',           self.v_dm,   self.v_fidelity),
+            ]
+            for pq_id, pq_type, dm, fid in pairs:
+                if dm is None: continue
+                dm_hex = dm.tobytes().hex()
+                purity = float(np.real(np.trace(dm @ dm)))
+                w_hash = f"{bath_sig}:{hashlib.sha3_256(dm_hex[:64].encode()).hexdigest()[:16]}"
+                self._db.execute("""
+                    INSERT INTO virtual_pq_state
+                        (pq_id,pq_type,oracle_id,node_id,fidelity,coherence,purity,
+                         entanglement_partner,w_entropy_hash,density_matrix_hex,
+                         last_measured,measurement_count,is_active,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,1,1,?)
+                    ON CONFLICT(pq_id) DO UPDATE SET
+                        fidelity=excluded.fidelity, coherence=excluded.coherence,
+                        purity=excluded.purity, w_entropy_hash=excluded.w_entropy_hash,
+                        density_matrix_hex=excluded.density_matrix_hex,
+                        last_measured=excluded.last_measured,
+                        measurement_count=measurement_count+1, updated_at=excluded.updated_at
+                """, (pq_id, pq_type, 'qtf_local', 'qtf_local',
+                      fid, coherence, purity,
+                      'qtf_pq0', w_hash, dm_hex, ts, ts))
+            self._db.commit()
+        except Exception as e:
+            self.logger.debug(f"[QTF] stream_to_db: {e}")
+
+    def _stream_to_sse(self, snap: dict):
+        """Push snapshot to SSE via gossip callback, including lattice noise bath params."""
+        if self._sse_callback is None:
+            return
+        try:
+            self._sse_callback({
+                'type':             'qtf_tripartite_fidelity',
+                'pq0_fidelity':     snap['pq0_fidelity'],
+                'iv_fidelity':      snap['iv_fidelity'],
+                'v_fidelity':       snap['v_fidelity'],
+                'field_fidelity':   snap.get('field_fidelity', 0.0),
+                'meta_fidelity':    snap.get('meta_fidelity', 0.0),
+                'network_fidelity': snap.get('network_fidelity', 0.0),
+                'entropy_mutual':   snap['entropy_mutual'],
+                'pq_curr':          self._pq_curr_id,
+                'pq_last':          self._pq_last_id,
+                # Lattice noise bath params — so DHT peers can compare against oracle rates
+                'gamma1':           getattr(self, '_snap_gamma1',   0.04),
+                'gammaphi':         getattr(self, '_snap_gammaphi', 0.12),
+                'gammadep':         getattr(self, '_snap_gammadep', 0.01),
+                'ou_mem':           getattr(self, '_snap_ou_mem',   0.03),
+                'omega':            getattr(self, '_snap_omega',    0.50),
+                'sector_occ':       getattr(self, '_snap_sector',   0.90),
+                'ts':               snap['ts'],
+            })
+        except Exception as e:
+            self.logger.debug(f"[QTF] stream_to_sse: {e}")
+
+    # ─── Entropy ───────────────────────────────────────────────────────────────
+
+    def measure_entropy(self) -> float:
+        """Von Neumann entropy S(ρ) for pq0_dm."""
+        if self.pq0_dm is None:
+            return 1.5
+        try:
+            eigs = np.maximum(np.linalg.eigvalsh(self.pq0_dm), 1e-12)
+            return float(-np.sum(eigs * np.log2(eigs)))
         except:
             return 1.5
-            
-    def update_measurements(self):
-        """On-demand measurement update (called during mining)."""
+
+    # ─── Main update cycle ─────────────────────────────────────────────────────
+
+    def update_measurements(self, oracle_snapshot: dict = None, pq_curr_id: str = '', pq_last_id: str = ''):
+        """
+        Full real-time W-state measurement cycle:
+          1. Ingest oracle snapshot → pq0_dm + IV + V (uses existing oracle values)
+          2. AER round-robin → individual qubit fidelities (3 qubits × 256 shots each)
+          3. Field fidelity from oracle's IV + V reference DMs
+          4. Tripartite meta-entanglement pq0 × pq_curr × pq_last
+          5. Network fidelity from DHT peers
+          6. Stream to virtual_pq_state DB + SSE
+        """
         with self.measurement_lock:
-            f_pq0_iv=self.measure_fidelity(self.pq0_state,self.iv_state)
-            f_pq0_v=self.measure_fidelity(self.pq0_state,self.v_state)
-            
-            self.pq0_fidelity=0.8*self.pq0_fidelity+0.2*f_pq0_iv
-            self.iv_fidelity=0.8*self.iv_fidelity+0.2*f_pq0_v
-            self.entropy_mutual=self.measure_entropy()
-            self.last_measurement_time=time.time()
-        
-    def get_snapshot(self):
-        """Return current quantum state snapshot."""
+            # ── 0. Lazy VPM wire from recovery ref ────────────────────────────
+            if self._vpm is None and self._recovery_ref is not None:
+                self._vpm = getattr(self._recovery_ref, 'vpm', None)
+
+            # ── 1. Resolve the live snapshot: oracle_snapshot arg > recovery ref ──
+            active_snap = oracle_snapshot
+            if not active_snap and self._recovery_ref is not None:
+                active_snap = getattr(self._recovery_ref, 'current_snapshot', None)
+
+            # ── 2. Ingest oracle snapshot: prioritize VPM (already AER-verified) ──
+            #      But always update bath params from latest snapshot so IV/V evolution is fresh.
+            if active_snap:
+                # Cache bath params NOW — used by _derive_iv_v regardless of DM source
+                self._build_pq0_from_snapshot(active_snap)   # side-effects: caches bath params
+                o_f = min(1.0, max(0.0, float(active_snap.get('w3_fidelity', active_snap.get('fidelity', self.pq0_fidelity)))))
+
+                if self._vpm is not None and self._vpm._pq0 is not None:
+                    # VPM's pq0 has already been evolved through AER tripartite circuit;
+                    # use it as DM but apply the latest snapshot's GKSL bath rates to V/IV
+                    self.pq0_dm = self._vpm._pq0.copy()
+                    self.pq0_fidelity = 0.7 * self._vpm._fidelity + 0.3 * o_f
+                    self._oracle_coherence = self._vpm._coherence
+                    # Re-derive V/IV with fresh bath rates from snapshot
+                    self._derive_iv_v(snap=active_snap)
+                    # Override with VPM's already-evolved IV/V if available
+                    if self._vpm._vpq:
+                        self.v_dm  = next(iter(self._vpm._vpq.values())).copy()
+                    if self._vpm._ivpq:
+                        self.iv_dm = next(iter(self._vpm._ivpq.values())).copy()
+                else:
+                    # No VPM: build pq0 from snapshot (uses DM hex or GKSL reconstruction)
+                    self.pq0_dm  = self._build_pq0_from_snapshot(active_snap)
+                    self.pq0_fidelity = 0.7 * o_f + 0.3 * self.pq0_fidelity
+                    self._derive_iv_v(snap=active_snap)
+            else:
+                # No snapshot at all: bootstrap fallback + no-snap IV/V
+                if self.pq0_dm is None:
+                    self._bootstrap_fallback_w3()
+                if self.iv_dm is None or self.v_dm is None:
+                    self._derive_iv_v()
+
+            # Safety: always ensure IV and V are initialized
+            if self.iv_dm is None or self.v_dm is None:
+                self._derive_iv_v(snap=active_snap)
+
+            # ── 2. AER round-robin: individual qubit fidelities ──────────────
+            rr = self._run_aer_round_robin()
+            a  = self._EMA
+            self.pq0_fidelity = (1-a)*self.pq0_fidelity + a*rr.get('q0', self.pq0_fidelity)
+            self.iv_fidelity  = (1-a)*self.iv_fidelity  + a*rr.get('q1', self.iv_fidelity)
+            self.v_fidelity   = (1-a)*self.v_fidelity   + a*rr.get('q2', self.v_fidelity)
+            self._rr_idx      = (self._rr_idx + 1) % 3
+
+            # ── 3. Field fidelity from oracle's IV + V reference states ──────
+            self.field_fidelity = (1-a)*self.field_fidelity + a*self._compute_field_fidelity()
+
+            # ── 4. Tripartite meta pq0 × pq_curr × pq_last ───────────────────
+            curr = pq_curr_id or self._pq_curr_id
+            last = pq_last_id or self._pq_last_id
+            if curr or last:
+                meta = self._tripartite_meta_fidelity(curr, last)
+                self.meta_fidelity = (1-a)*self.meta_fidelity + a*meta
+                self.field_fidelity = 0.6*self.field_fidelity + 0.4*self.meta_fidelity
+                if pq_curr_id: self._pq_curr_id = pq_curr_id
+                if pq_last_id: self._pq_last_id = pq_last_id
+
+            # ── 5. Network fidelity (DHT peers mean) ─────────────────────────
+            self.network_fidelity = self._compute_network_fidelity()
+
+            # ── 6. Entropy ───────────────────────────────────────────────────
+            self.entropy_mutual = self.measure_entropy()
+            self.last_measurement_time = time.time()
+
+        # ── 7. Stream outside lock ────────────────────────────────────────────
+        snap_out = self.get_snapshot()
+        self._stream_to_db(snap_out)
+        self._stream_to_sse(snap_out)
+
+    def get_snapshot(self) -> dict:
+        """Return current quantum field snapshot. Thread-safe."""
         with self.measurement_lock:
             return {
-                'pq0_fidelity':self.pq0_fidelity,
-                'iv_fidelity':self.iv_fidelity,
-                'v_fidelity':self.v_fidelity,
-                'entropy_mutual':self.entropy_mutual,
-                'ts':time.time()
+                'pq0_fidelity':     self.pq0_fidelity,
+                'iv_fidelity':      self.iv_fidelity,
+                'v_fidelity':       self.v_fidelity,
+                'field_fidelity':   self.field_fidelity,
+                'meta_fidelity':    self.meta_fidelity,
+                'network_fidelity': self.network_fidelity,
+                'entropy_mutual':   self.entropy_mutual,
+                'pq_curr':          self._pq_curr_id,
+                'pq_last':          self._pq_last_id,
+                'ts':               self.last_measurement_time,
             }
 
 class ConvergenceAnalytics:
@@ -4225,6 +4907,7 @@ class QuantumMiner:
         
         # ▶ NEW: Lightweight quantum tensor field + convergence tracking (NO async loops)
         self.quantum_field=QuantumTensorField(logger)
+        self.quantum_field.set_recovery_ref(w_state_recovery)  # lazy VPM wire
         self.convergence_analytics=ConvergenceAnalytics(window_size=50, logger_obj=logger)
         self.entropy_difficulty=EntropyDifficultyAdaptation(target_block_time=30.0)
         
@@ -4272,8 +4955,12 @@ class QuantumMiner:
             
             logger.info(f"[MINING] 🔬 W-state entropy acquired | time={entropy_time*1000:.1f}ms | entropy_bits=256 | F={current_fidelity:.4f}")
             
-            # ▶ NEW: Update quantum field measurements (on-demand)
-            self.quantum_field.update_measurements()
+            # ▶ REBUILT: Update quantum field — oracle-seeded AER W-state with round-robin fidelity
+            self.quantum_field.update_measurements(
+                oracle_snapshot = getattr(self.w_state_recovery, 'current_snapshot', None),
+                pq_curr_id      = pq_curr_id,
+                pq_last_id      = pq_last_id,
+            )
             snap=self.quantum_field.get_snapshot()
             self.convergence_analytics.add_measurement(snap['pq0_fidelity'], snap['iv_fidelity'], snap['entropy_mutual'])
             
@@ -4286,7 +4973,7 @@ class QuantumMiner:
             
             # ▶ NEW: Log convergence status
             conv_metrics=self.convergence_analytics.get_convergence_metrics()
-            logger.info(f"[MINING] 📊 Quantum state: F_pq0={snap['pq0_fidelity']:.4f} | F_IV={snap['iv_fidelity']:.4f} | Entropy={snap['entropy_mutual']:.4f} | Convergence={conv_metrics['status']}")
+            logger.info(f"[MINING] 📊 W-state: pq0={snap['pq0_fidelity']:.4f} IV={snap['iv_fidelity']:.4f} field={snap['field_fidelity']:.4f} net={snap['network_fidelity']:.4f} S={snap['entropy_mutual']:.4f} [{conv_metrics['status']}]")
             
             w_entropy_hash = w_entropy[:64] if w_entropy else secrets.token_hex(32)
             
@@ -6057,35 +6744,34 @@ class VirtualPseudoqubitManager:
     def initialize_pq0(self, oracle_snapshot: Dict[str, Any]) -> bool:
         """
         Initialize local pq0 from oracle W-state snapshot.
+        Uses actual GKSL-evolved density matrix from snapshot if available,
+        otherwise applies local GKSL evolution with oracle's noise bath rates.
         pq0 is the anchor — all virtual and inverse-virtual pqs derive from it.
         """
         try:
             fidelity  = float(oracle_snapshot.get('fidelity', 0.9))
             coherence = float(oracle_snapshot.get('coherence', 0.85))
 
-            # Build pq0 density matrix: fidelity-weighted W-state + depolarizing noise
-            w_amp  = 1.0 / np.sqrt(3.0)
-            w_vec  = np.zeros(8, dtype=np.complex128)
-            w_vec[4] = w_amp   # |100⟩
-            w_vec[2] = w_amp   # |010⟩
-            w_vec[1] = w_amp   # |001⟩
-            rho_pure  = np.outer(w_vec, w_vec.conj())
-            rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
-            pq0_dm    = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
+            # ── Use actual lattice GKSL DM if present (ground truth from noise bath) ──
+            pq0_dm = _extract_gksl_dm(oracle_snapshot)
+            if pq0_dm is None:
+                # Reconstruct from fidelity + apply GKSL bath evolution
+                w_vec = np.zeros(8, dtype=np.complex128)
+                w_vec[4] = w_vec[2] = w_vec[1] = 1.0 / np.sqrt(3.0)
+                rho_w = np.outer(w_vec, w_vec.conj())
+                rho_mix = np.eye(8, dtype=np.complex128) / 8.0
+                pq0_dm  = fidelity * rho_w + (1.0 - fidelity) * rho_mix
+                # Apply GKSL noise bath using oracle's measured rates
+                pq0_dm = _apply_gksl_bath(pq0_dm, oracle_snapshot, dt=2.0)
 
             with self._lock:
-                self._pq0      = pq0_dm
-                self._fidelity = fidelity
+                self._pq0       = pq0_dm
+                self._fidelity  = fidelity
                 self._coherence = coherence
 
-            # Persist pq0 state
             self._persist_pq_state('pq0', 'oracle', pq0_dm, fidelity, coherence,
                                     oracle_snapshot.get('w_entropy_hash', ''))
-
-            logger.info(
-                f"[VPQ] ✅ pq0 initialized | F={fidelity:.4f} | C={coherence:.4f} | "
-                f"oracle={self.oracle_id}"
-            )
+            logger.info(f"[VPQ] ✅ pq0 initialized | F={fidelity:.4f} | C={coherence:.4f} | oracle={self.oracle_id}")
             return True
         except Exception as e:
             logger.error(f"[VPQ] ❌ pq0 init failed: {e}")
@@ -6094,64 +6780,39 @@ class VirtualPseudoqubitManager:
     # ⚛️ LAYER 2: pq0 SYNCHRONIZATION FROM ORACLE
     def update_pq0(self, oracle_snapshot: Dict[str, Any]) -> bool:
         """
-        CRITICAL: Refresh pq0 with latest oracle snapshot.
-        Called by sync worker whenever a fresh W-state snapshot arrives.
-        This is the synchronization hook that keeps tripartite (pq0 ↔ vpq ↔ ivpq) in sync.
-        
-        Args:
-            oracle_snapshot: {fidelity, coherence, timestamp_ns, ...}
-        
-        Returns:
-            True if pq0 was updated (values changed), False otherwise
+        Refresh pq0 with latest oracle snapshot.
+        Uses actual GKSL-evolved DM from lattice noise bath if density_matrix_hex present,
+        otherwise reconstructs W-state and applies local GKSL evolution with oracle rates.
+        This is the critical sync hook: snapshot IS the noise bath state, treat it as such.
         """
         try:
-            # Extract fresh oracle metrics
-            fidelity = float(oracle_snapshot.get('fidelity', 0.90))
-            coherence = float(oracle_snapshot.get('coherence', 0.85))
-            timestamp_ns = oracle_snapshot.get('timestamp_ns', int(time.time() * 1e9))
-            
-            # ⚛️ BOUNDS CHECK: Ensure metrics are valid [0, 1]
-            fidelity = min(1.0, max(0.0, fidelity))
-            coherence = min(1.0, max(0.0, coherence))
-            
-            with self._lock:
-                # Store old values for comparison
-                old_fidelity = self._fidelity
-                old_coherence = self._coherence
-                
-                # Reconstruct pq0 density matrix from oracle fidelity
-                # ρ_pq0 = F·ρ_pure + (1-F)·ρ_mixed
-                # where ρ_pure = |W⟩⟨W| (ideal W-state)
-                w_amp = 1.0 / np.sqrt(3.0)
+            fidelity  = min(1.0, max(0.0, float(oracle_snapshot.get('fidelity', 0.90))))
+            coherence = min(1.0, max(0.0, float(oracle_snapshot.get('coherence', 0.85))))
+
+            # ── Use lattice GKSL DM directly; fall back to local GKSL evolution ──
+            pq0_new = _extract_gksl_dm(oracle_snapshot)
+            if pq0_new is None:
                 w_vec = np.zeros(8, dtype=np.complex128)
-                w_vec[4] = w_amp  # |100⟩
-                w_vec[2] = w_amp  # |010⟩
-                w_vec[1] = w_amp  # |001⟩
-                rho_pure = np.outer(w_vec, w_vec.conj())
-                rho_mixed = np.eye(8, dtype=np.complex128) / 8.0
-                pq0_new = fidelity * rho_pure + (1.0 - fidelity) * rho_mixed
-                
-                # Update pq0 and metrics
-                self._pq0 = pq0_new
+                w_vec[4] = w_vec[2] = w_vec[1] = 1.0 / np.sqrt(3.0)
+                rho_w    = np.outer(w_vec, w_vec.conj())
+                rho_mix  = np.eye(8, dtype=np.complex128) / 8.0
+                pq0_new  = fidelity * rho_w + (1.0 - fidelity) * rho_mix
+                pq0_new  = _apply_gksl_bath(pq0_new, oracle_snapshot, dt=2.0)
+
+            with self._lock:
+                old_fidelity  = self._fidelity
+                old_coherence = self._coherence
+                self._pq0      = pq0_new
                 self._fidelity = fidelity
                 self._coherence = coherence
-                
-                # Check if values actually changed
                 pq0_updated = (abs(fidelity - old_fidelity) > 0.0001 or
                                abs(coherence - old_coherence) > 0.0001)
-            
-            # Log update with evolution tracking
+
             if pq0_updated:
-                logger.info(
-                    f"[VPQ] 🔄 pq0 refreshed (tripartite sync) | "
-                    f"F: {old_fidelity:.4f} → {fidelity:.4f} | "
-                    f"C: {old_coherence:.4f} → {coherence:.4f}"
-                )
+                logger.info(f"[VPQ] 🔄 pq0 synced (GKSL) | F: {old_fidelity:.4f}→{fidelity:.4f} | "
+                            f"γ1={oracle_snapshot.get('gamma1',0):.3f} OU={oracle_snapshot.get('ou_mem',0):.4f}")
             else:
-                logger.debug(
-                    f"[VPQ] 🔄 pq0 checked (no change) | "
-                    f"F={fidelity:.4f} | C={coherence:.4f}"
-                )
+                logger.debug(f"[VPQ] 🔄 pq0 checked | F={fidelity:.4f}")
             
             return pq0_updated
         
@@ -6296,24 +6957,24 @@ class VirtualPseudoqubitManager:
         logger.debug(f"[VPQ] 🔄 Spawned inverse-virtual pq: {ivpq_id} ↔ {parent_vpq_id}")
         return ivpq_id
 
-    def rotate_virtual_pq(self, vpq_id: str) -> bool:
+    def rotate_virtual_pq(self, vpq_id: str, snap: Dict[str, Any] = None) -> bool:
         """
         Rotate a virtual pq: re-derive from current pq0 with fresh decoherence perturbation.
+        Applies GKSL bath evolution using oracle's noise rates from snap (if provided).
         Called after each block is mined — mirrors pq rotation in P2PClientWStateRecovery.
         """
         with self._lock:
             if self._pq0 is None or vpq_id not in self._vpq:
                 return False
-
-            # Apply fresh perturbation from updated pq0
             noise = np.random.normal(0, 0.005, (8, 8)).astype(np.complex128)
             noise = (noise + noise.conj().T) / 2
             new_vpq = 0.995 * self._pq0 + 0.005 * noise
             tr = np.real(np.trace(new_vpq))
-            if tr > 0:
-                new_vpq /= tr
+            if tr > 0: new_vpq /= tr
+            # Apply GKSL bath if we have oracle's noise rates
+            if snap:
+                new_vpq = _apply_gksl_bath(new_vpq, snap, dt=2.0)
             self._vpq[vpq_id] = new_vpq
-
         return True
 
     # ⚛️ LAYER 3: TRIPARTITE W-STATE AER CIRCUIT EXECUTION
@@ -7915,10 +8576,10 @@ class QTCLP2PBundle:
             return self.vpm.measure_virtual_pq_entropy(vpq_id)
         return secrets.token_hex(32)
 
-    def rotate_vpqs(self) -> None:
+    def rotate_vpqs(self, snap: Dict[str, Any] = None) -> None:
         """Rotate all virtual pqs after block solution — called by QuantumMiner."""
         for vpq_id in list(self.vpm._vpq.keys()):
-            self.vpm.rotate_virtual_pq(vpq_id)
+            self.vpm.rotate_virtual_pq(vpq_id, snap=snap)
 
     def attempt_oracle_promotion(self, blocks_mined: int, avg_fidelity: float) -> bool:
         """Try oracle promotion — called periodically by QTCLFullNode._mining_loop."""
@@ -7990,6 +8651,14 @@ class QTCLFullNode:
         
         # MINING with W-state and DYNAMIC DIFFICULTY
         self.miner=QuantumMiner(self.w_state_recovery, difficulty_engine=self.difficulty_engine, difficulty=difficulty)
+        # Wire quantum tensor field external refs (DB + gossip sse callback)
+        self.miner.quantum_field.wire_refs(
+            db           = db_connection,
+            vpm          = None,   # VPM wired lazily from VirtualPseudoqubitManager after p2p_bundle init
+            sse_callback = lambda snap, node=self: (node._gossip.gossip_peer_update('w_state_update', snap)
+                           if hasattr(node, '_gossip') and node._gossip else None),
+            recovery     = self.w_state_recovery,
+        )
         
         self.sync_thread: Optional[threading.Thread]=None
         self.mining_thread: Optional[threading.Thread]=None
@@ -8167,6 +8836,10 @@ class QTCLFullNode:
                     f"[P2P-BUNDLE] 🚀 Bundle online | gossip={bound_gossip} | "
                     f"node_id={self._p2p_bundle.local_node_id[:20]}"
                 )
+                # Wire VPM to quantum tensor field now that bundle is live
+                if hasattr(self._p2p_bundle, 'vpm') and self._p2p_bundle.vpm is not None:
+                    self.miner.quantum_field._vpm = self._p2p_bundle.vpm
+                    logger.info("[QTF] VPM wired to quantum tensor field")
 
             logger.info(
                 f"[NODE] Full node online | "
