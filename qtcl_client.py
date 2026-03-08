@@ -34,6 +34,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import copy
+import urllib.request
+import sqlite3
+import subprocess
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -94,6 +97,107 @@ from collections import defaultdict
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORT CONFIGURATION INITIALIZATION (Module-level)
+# ═══════════════════════════════════════════════════════════════════════════════
+_SYNC_CONFIG=None;_SYNC_CONFIG_LOCK=threading.Lock()
+def get_sync_config()->Optional['SynchronizedPortConfig']:
+ """Get or initialize synchronized port configuration"""
+ global _SYNC_CONFIG
+ if _SYNC_CONFIG is None:
+  with _SYNC_CONFIG_LOCK:
+   if _SYNC_CONFIG is None:
+    try:_SYNC_CONFIG=SynchronizedPortConfig();_SYNC_CONFIG.initialize(node_id=f"qtcl_miner_{os.getenv('NODE_ID','001')}",node_type='miner');logger.info(f"[SYNC_CONFIG] Initialized: local_ip={_SYNC_CONFIG.net_config.local_ip}, external_ip={_SYNC_CONFIG.net_config.external_ip}")
+    except Exception as e:logger.warning(f"[SYNC_CONFIG] Failed to initialize: {e}");_SYNC_CONFIG=None
+ return _SYNC_CONFIG
+def get_oracle_url(oracle_host:str='qtcl-blockchain.koyeb.app')->str:
+ """Get oracle URL using dynamic IP if available"""
+ sync=get_sync_config()
+ if sync:oracle_ip=sync.net_config.external_ip;return f"wss://{oracle_ip}:9091/socket.io" if oracle_ip!='127.0.0.1' else f"wss://{oracle_host}/socket.io"
+ return f"wss://{oracle_host}/socket.io"
+def get_local_binding_address()->Tuple[str,int]:
+ """Get local address to bind to"""
+ sync=get_sync_config()
+ if sync:return sync.get_bind_address('dht')
+ return ('0.0.0.0',7776)
+def get_announce_address()->Tuple[str,int]:
+ """Get address to announce to peers"""
+ sync=get_sync_config()
+ if sync:return sync.get_announce_address('dht')
+ return ('127.0.0.1',7776)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC PORT CONFIGURATION - INTEGRATED (No external file needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+from enum import Enum
+class NetworkInterface(Enum):
+ LOOPBACK='127.0.0.1';ANY_ADDR='0.0.0.0'
+@dataclass
+class PeerConfig:
+ node_id:str;external_ip:str;internal_ip:str;port:int;node_type:str;last_updated:float
+class DynamicNetworkConfig:
+ """PART 1/3: Network configuration handler with dynamic IP detection"""
+ def __init__(self,config_dir:str=None):
+  self.config_dir=Path(config_dir or Path.home()/'.qtcl'/'config');self.config_dir.mkdir(parents=True,exist_ok=True);self.db_path=self.config_dir/'peers.db';self._init_peer_db();self.local_ip=self._detect_local_ip();self.external_ip=self._detect_external_ip()
+ def _init_peer_db(self)->None:
+  conn=sqlite3.connect(str(self.db_path));c=conn.cursor();c.execute("""CREATE TABLE IF NOT EXISTS peers (id INTEGER PRIMARY KEY AUTOINCREMENT,node_id TEXT UNIQUE NOT NULL,external_ip TEXT NOT NULL,internal_ip TEXT NOT NULL,port INTEGER NOT NULL,node_type TEXT,last_heartbeat INTEGER,last_updated INTEGER,status TEXT DEFAULT 'active')""");conn.commit();conn.close()
+ def _detect_local_ip(self)->str:
+  try:s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("8.8.8.8",80));ip=s.getsockname()[0];s.close();return ip
+  except Exception:return '127.0.0.1'
+ def _detect_external_ip(self)->str:
+  methods=[self._external_ip_socket,self._external_ip_dns,self._external_ip_http];ip=None
+  for method in methods:
+   try:ip=method();logger.info(f"Detected external IP: {ip} via {method.__name__}");return ip
+   except Exception as e:logger.debug(f"IP detection method {method.__name__} failed: {e}");continue
+  logger.warning("All IP detection methods failed, falling back to local IP");return self.local_ip
+ def _external_ip_socket(self)->str:
+  s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("1.1.1.1",80));ip=s.getsockname()[0];s.close();return ip
+ def _external_ip_dns(self)->str:
+  s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("ns1.google.com",53));ip=s.getsockname()[0];s.close();return ip
+ def _external_ip_http(self)->str:
+  url='https://checkip.amazonaws.com';response=urllib.request.urlopen(url,timeout=3);return response.read().decode('utf-8').strip()
+ def register_peer(self,node_id:str,port:int,node_type:str='miner')->PeerConfig:
+  config=PeerConfig(node_id=node_id,external_ip=self.external_ip,internal_ip=self.local_ip,port=port,node_type=node_type,last_updated=time.time());conn=sqlite3.connect(str(self.db_path));c=conn.cursor();c.execute("""INSERT OR REPLACE INTO peers (node_id,external_ip,internal_ip,port,node_type,last_updated,status) VALUES (?,?,?,?,?,?,?)""",(node_id,self.external_ip,self.local_ip,port,node_type,int(config.last_updated),'active'));conn.commit();conn.close();logger.info(f"Registered peer {node_id}: {self.external_ip}:{port}");return config
+ def get_peer(self,node_id:str)->Optional[PeerConfig]:
+  conn=sqlite3.connect(str(self.db_path));c=conn.cursor();row=c.execute("SELECT node_id,external_ip,internal_ip,port,node_type,last_updated FROM peers WHERE node_id=?",(node_id,)).fetchone();conn.close();return PeerConfig(*row) if row else None
+ def list_peers(self,node_type:str=None)->List[PeerConfig]:
+  conn=sqlite3.connect(str(self.db_path));c=conn.cursor();query="SELECT node_id,external_ip,internal_ip,port,node_type,last_updated FROM peers WHERE status='active'";params=();query+=" AND node_type=?" if node_type else "";params+=(node_type,) if node_type else ();rows=c.execute(query,params).fetchall();conn.close();return [PeerConfig(*row) for row in rows]
+ def heartbeat_peer(self,node_id:str)->bool:
+  try:conn=sqlite3.connect(str(self.db_path));c=conn.cursor();c.execute("UPDATE peers SET last_heartbeat=? WHERE node_id=?",(int(time.time()),node_id));conn.commit();conn.close();return True
+  except Exception as e:logger.error(f"Heartbeat failed for {node_id}: {e}");return False
+ def get_bootstrap_peers(self)->List[Tuple[str,int]]:
+  return [(p.external_ip,p.port) for p in self.list_peers() if p.node_type in ['oracle','bootstrap']]
+class PortAllocator:
+ """PART 2/3: Intelligent port allocation with conflict detection"""
+ RESERVED_RANGES=[(1,1023),(32768,65535)];QTCL_RANGE=(7000,8999);DHT_PORT=7776;ORACLE_PORT=9091;SSE_PORT=9091;POOL_API_PORT=8888
+ def __init__(self):self.allocated={}
+ def is_port_available(self,port:int)->bool:
+  try:s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.bind(('127.0.0.1',port));s.close();return True
+  except OSError:return False
+ def allocate_port(self,service_name:str,preferred_port:int=None,start_range:int=7000,end_range:int=9000)->int:
+  if preferred_port and self.is_port_available(preferred_port):self.allocated[service_name]=preferred_port;logger.info(f"Allocated {service_name} to preferred port {preferred_port}");return preferred_port
+  for port in range(start_range,end_range+1):
+   if port not in self.allocated.values() and self.is_port_available(port):self.allocated[service_name]=port;logger.info(f"Allocated {service_name} to port {port}");return port
+  raise RuntimeError(f"No available ports for {service_name} in range {start_range}-{end_range}")
+ def get_service_port(self,service_name:str)->Optional[int]:return self.allocated.get(service_name)
+class SynchronizedPortConfig:
+ """PART 3/3: Synchronized configuration across all QTCL services"""
+ def __init__(self,config_file:str=None):
+  self.config_file=Path(config_file or Path.home()/'.qtcl'/'config'/'ports.json');self.net_config=DynamicNetworkConfig();self.port_allocator=PortAllocator();self.config={}
+ def initialize(self,node_id:str,node_type:str='miner')->Dict:
+  logger.info(f"Initializing synchronized port config for {node_id} ({node_type})");dht_port=self.port_allocator.allocate_port('dht',PortAllocator.DHT_PORT);oracle_port=self.port_allocator.allocate_port('oracle',PortAllocator.ORACLE_PORT);sse_port=self.port_allocator.allocate_port('sse',PortAllocator.SSE_PORT);pool_api_port=self.port_allocator.allocate_port('pool_api',PortAllocator.POOL_API_PORT)
+  self.config={'node_id':node_id,'node_type':node_type,'internal':{'ip':self.net_config.local_ip,'dht_port':dht_port,'oracle_port':oracle_port,'sse_port':sse_port,'pool_api_port':pool_api_port},'external':{'ip':self.net_config.external_ip,'dht_port':dht_port,'oracle_port':oracle_port,'sse_port':sse_port,'pool_api_port':pool_api_port},'created_at':time.time()};self._save_config();peer_cfg=self.net_config.register_peer(node_id,dht_port,node_type);logger.info(f"Synced config: internal={self.config['internal']['ip']}:{oracle_port}, external={self.net_config.external_ip}:{oracle_port}");return self.config
+ def _save_config(self)->None:
+  self.config_file.parent.mkdir(parents=True,exist_ok=True);self.config_file.write_text(json.dumps(self.config,indent=2))
+ def load_config(self)->Dict:
+  if self.config_file.exists():self.config=json.loads(self.config_file.read_text());return self.config
+  return {}
+ def get_bind_address(self,service:str='oracle')->Tuple[str,int]:
+  if 'internal' in self.config:port=self.config['internal'].get(f'{service}_port',9091);return (self.net_config.local_ip,port)
+  return ('0.0.0.0',9091)
+ def get_announce_address(self,service:str='oracle')->Tuple[str,int]:
+  if 'external' in self.config:port=self.config['external'].get(f'{service}_port',9091);return (self.net_config.external_ip,port)
+  return (self.net_config.external_ip,9091)
 
 @dataclass
 class StateSnapshot:
@@ -1352,9 +1456,11 @@ class LocalBlockchainDB:
         """Confirm transaction"""
         self.execute("UPDATE transactions SET status = ? WHERE txid = ?", ('confirmed', txid))
     
-    def get_pending_transactions(self):
-        """Get pending transactions"""
-        rows = self.fetchall("SELECT * FROM transactions WHERE status = ?", ('pending',))
+    def get_pending_transactions(self, limit: int = None):
+        query = "SELECT * FROM transactions WHERE status = 'pending'"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        rows = self.fetchall(query, ())
         return [dict(row) for row in rows] if rows else []
     
     # ========= Wallet operations =========
@@ -1480,6 +1586,15 @@ class LocalBlockchainDB:
         """Called on component start"""
         self._init_pool()
     
+    def is_running(self) -> bool:
+        """Check if database connection is active"""
+        try:
+            if hasattr(self, "conn") and self.conn is not None:
+                self.conn.execute("SELECT 1")
+                return True
+        except Exception:
+            return False
+        return False
     def on_stop(self):
         """Called on component stop"""
         self._teardown_pool()
