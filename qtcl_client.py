@@ -224,7 +224,7 @@ class P2POracleClient:
     CACHE_TTL = 30  # seconds
     PEER_TIMEOUT = 5  # seconds
     
-    def __init__(self, node_id: str, listen_addr: str = "127.0.0.1", listen_port: int = 9091):
+    def __init__(self, node_id: str, listen_addr: str = "0.0.0.0", listen_port: int = 9091):
         self.node_id = node_id
         self.listen_addr = listen_addr
         self.listen_port = listen_port
@@ -4757,14 +4757,17 @@ class QtclServer(QtclNode):
                 if self.quantum_evo and HAS_NUMPY:
                     sv = self.quantum_evo.get_state()
                     if sv is not None:
-                        self.db.insert_qubit_state({
-                            "block_height": height,
-                            "block_hash": block_hash,
-                            "state_vector": sv.tobytes(),
-                            "metrics": evo_metrics,
-                            "evolution_seed": block_hash[:16],
-                            "timestamp": time.time(),
-                        })
+                        self.db.insert_qubit_state(
+                            block_height=height,
+                            qubit_id=hash(block_hash)%65536,
+                            state_data={
+                                "block_hash": block_hash,
+                                "state_vector": sv.tobytes(),
+                                "metrics": evo_metrics,
+                                "evolution_seed": block_hash[:16],
+                                "timestamp": time.time(),
+                            }
+                        )
                 # Insert block
                 self.db.insert_block(block)
                 # Confirm transactions
@@ -5007,14 +5010,17 @@ class QtclMiner(QtclNode):
                 if self.quantum_evo and HAS_NUMPY:
                     sv = self.quantum_evo.get_state()
                     if sv is not None:
-                        self.db.insert_qubit_state({
-                            "block_height": height,
-                            "block_hash": block_hash,
-                            "state_vector": sv.tobytes(),
-                            "metrics": evo_metrics,
-                            "evolution_seed": block_hash[:16],
-                            "timestamp": time.time(),
-                        })
+                        self.db.insert_qubit_state(
+                            block_height=height,
+                            qubit_id=hash(block_hash)%65536,
+                            state_data={
+                                "block_hash": block_hash,
+                                "state_vector": sv.tobytes(),
+                                "metrics": evo_metrics,
+                                "evolution_seed": block_hash[:16],
+                                "timestamp": time.time(),
+                            }
+                        )
                 # Submit to server
                 payload = json.dumps({"block": block}).encode()
                 req = urllib.request.Request(
@@ -5190,11 +5196,6 @@ def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) ->
 def main() -> None:
     parser = build_argparser()
     args = parser.parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
     logger = get_logger("qtcl.main", level=getattr(logging, args.log_level))
     node_classes = {
         "server": QtclServer,
