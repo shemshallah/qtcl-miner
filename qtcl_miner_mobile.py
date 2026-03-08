@@ -9089,6 +9089,12 @@ class QTCLFullNode:
                         submit_start = time.time()
                         
                         try:
+                            # ✅ ENTERPRISE FIX: pq_curr = height + 1, pq_last = height
+                            # Genesis (height=0): pq_curr=1, pq_last=0
+                            # Block 1 (height=1): pq_curr=2, pq_last=1
+                            pq_curr_int = int(block.header.height) + 1
+                            pq_last_int = int(block.header.height)
+                            
                             header_dict = {
                                 'height': int(block.header.height),
                                 'block_hash': str(block.header.block_hash),
@@ -9100,6 +9106,8 @@ class QTCLFullNode:
                                 'miner_address': str(block.header.miner_address),
                                 'w_state_fidelity': float(block.header.w_state_fidelity),
                                 'w_entropy_hash': str(block.header.w_entropy_hash),
+                                'pq_curr': pq_curr_int,
+                                'pq_last': pq_last_int,
                             }
                             
                             # Serialize transactions — coinbase (tx[0]) uses its own
@@ -9128,7 +9136,7 @@ class QTCLFullNode:
                                 'timestamp': int(time.time()),
                             }
                             
-                            logger.info(f"[MINING] 📤 Submitting block #{block.header.height} | hash={block.header.block_hash[:16]}… | txs={len(tx_list)}")
+                            logger.info(f"[MINING] 📤 Submitting block #{block.header.height} | hash={block.header.block_hash[:16]}… | pq_curr={pq_curr_int} pq_last={pq_last_int} | txs={len(tx_list)}")
                             
                             # Submit block to server
                             success, msg = self.client.submit_block(block_payload)
