@@ -75,10 +75,6 @@ import copy
 from typing import Dict as TypeDict  # Avoid conflict with Dict class
 import asyncio
 import socket
-def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-
-
-# Oracle implementation
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -462,7 +458,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class DHEvent Enum:
+class DHEvent(Enum):
     """DHT event types"""
     BLOCK_MINED = "block_mined"
     TX_MEMPOOL = "tx_mempool"
