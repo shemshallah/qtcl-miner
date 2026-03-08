@@ -9740,13 +9740,20 @@ class QtclClientApp:
         bh      = int(snap.get("block_height") or snap.get("height") or 0)
         pq_curr = str(bh) if bh > 0 else "?"
         pq_last = str(bh - 1) if bh > 0 else "?"
-        dm_curr = _decode_dm_8x8(snap) or _reconstruct_dm_from_bloch(snap) or _build_w3_dm()
+        # ✅ FIXED: Proper None checks instead of 'or' with numpy arrays
+        # (numpy arrays have ambiguous truth values)
+        dm_curr = _decode_dm_8x8(snap)
+        if dm_curr is None:
+            dm_curr = _reconstruct_dm_from_bloch(snap)
+        if dm_curr is None:
+            dm_curr = _build_w3_dm()
+        
         dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
         self.client_field.build(dm_curr, dm_last, pq_curr, pq_last, bh)
         self.koyeb_state.sync(self.client_field)
         self._start_threads()
-        print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_last}  "
-              f"bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
+        print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_last}  bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
+        
         while True:
             print("\n" + "━" * 62)
             print("  💸  TRANSACTION MENU")
@@ -9922,29 +9929,22 @@ class QtclClientApp:
         
         ✅ DISPLAYS MENU IMMEDIATELY (lazy loads oracle data)
         """
-        # SHOW MENU IMMEDIATELY (don't wait for oracle)
+        # ✅ SHOW MENU IMMEDIATELY (don't wait for oracle)
         print()
         print("╔══════════════════════════════════════════════════════════════╗")
         print("║                                                              ║")
         print("║          ⚛️   Welcome to QTCL Client  ⚛️                      ║")
         print("║                                                              ║")
         print("║  W-State : |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)               ║")
-        print("║  Oracle  : Loading...                                       ║")
-        print("║  Height  : ?                                                ║")
+        print("║  Ready to mine, transact, or manage wallet                   ║")
         print("║  Port    : 9091  (GossipListener — all API routes)          ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
         print("  ┌──────────────────────────────────────────────────────────┐")
         print("  │  1.) ⛏️   Mine                                            │")
-        print("  │          Wallet · CLIENT_FIELD_STATE · KOYEB_ORACLE      │")
-        print("  │          8×8 DM · Bell CHSH (all 4) · SSE/gossip/DHT    │")
-        print("  │                                                          │")
         print("  │  2.) 💸  Transact                                         │")
-        print("  │          Entanglement stack · Send/receive QTCL           │")
-        print("  │                                                          │")
         print("  │  3.) 🔑  Wallet                                           │")
-        print("  │          Balance · BIP-39 recover · BIP-32/38 create     │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
         
@@ -9953,14 +9953,7 @@ class QtclClientApp:
         except (EOFError, KeyboardInterrupt):
             choice = "1"
         
-        # NOW fetch oracle data (lazy loading in background)
-        try:
-            bh = self.api.get_block_height()
-            bh_str = str(bh) if bh else "?"
-        except Exception:
-            bh_str = "?"
-        
-        # Dispatch to selected mode
+        # ✅ Dispatch to selected mode (initialize only after mode selection)
         if   choice == "2": self.run_transact_mode()
         elif choice == "3": self.run_wallet_mode()
         else:               self.run_mine_mode()
@@ -10005,8 +9998,17 @@ def main() -> None:  # noqa: F811
             except Exception: pass
         return
 
-    url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
-    app = QtclClientApp(oracle_url=url)
+    # ✅ Initialize QtclClientApp with timeout protection
+    try:
+        print("⚛️  QTCL Client initializing...", flush=True)
+        url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
+        app = QtclClientApp(oracle_url=url)
+        print("✅ Ready for input", flush=True)  # DEBUG: Verify we reach here
+    except Exception as e:
+        print(f"❌ Initialization error: {e}")
+        return
+
+    # ✅ Dispatch modes (only initialize resources for selected mode)
     if   args.mine:     app.run_mine_mode()
     elif args.transact: app.run_transact_mode()
     elif args.wallet:   app.run_wallet_mode()
