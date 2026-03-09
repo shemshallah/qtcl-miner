@@ -10456,6 +10456,9 @@ class QtclClientApp:
         tx_id = _hashlib.sha3_256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
         tx["tx_id"] = tx_id
         
+        # AGENT-β FIX: Import time module for timestamp
+        import time as _tw
+        
         # ── SIGNATURE GENERATION (COMPREHENSIVE FORMAT) ──────────────────
         # Generate signature and wrap in JSON for maximum compatibility
         if self.wallet.private_key:
@@ -10473,8 +10476,7 @@ class QtclClientApp:
                 "format": "hlwe_json"
             })
         
-        # AGENT-β FIX: add timestamp_ns for canonical server hash
-        import time as _tw
+        # Add timestamp_ns for canonical server hash
         tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
