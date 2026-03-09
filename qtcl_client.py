@@ -35,6 +35,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import copy
 import urllib.request
+import urllib.error as _urllib_error
+import socket as _socket
 import sqlite3
 import subprocess
 
@@ -8320,6 +8322,8 @@ class KoyebAPIClient:
         self.timeout  = timeout
         self._session = None
         self._lock    = _threading.Lock()
+        self._last_error = None
+        self._health_check_cache = {"timestamp": 0, "status": False}
 
     def _get_session(self):
         if self._session is None and _HAS_REQUESTS:
@@ -8336,50 +8340,108 @@ class KoyebAPIClient:
         return self._session
 
     def _get(self, path: str, params: dict = None,
-             timeout: int = None) -> Optional[dict]:
+             timeout: int = None, retries: int = 2) -> Optional[dict]:
         t   = timeout or self.timeout
         url = f"{self.base_url}{path}"
-        if _HAS_REQUESTS:
-            try:
-                r = self._get_session().get(url, params=params, timeout=t)
-                if r.status_code == 200:
-                    return r.json()
-                _EXP_LOG.debug(f"[API] GET {path} → {r.status_code}")
-            except Exception as e:
-                _EXP_LOG.debug(f"[API] GET {path}: {e}")
-        else:
-            try:
-                import urllib.request, urllib.parse
-                full = url + ("?" + urllib.parse.urlencode(params) if params else "")
-                with urllib.request.urlopen(full, timeout=t) as resp:
-                    return _json.loads(resp.read())
-            except Exception as e:
-                _EXP_LOG.debug(f"[API] urllib GET {path}: {e}")
+        last_error = None
+        
+        # Retry loop for network errors
+        for attempt in range(retries):
+            if _HAS_REQUESTS:
+                try:
+                    r = self._get_session().get(url, params=params, timeout=t)
+                    if r.status_code == 200:
+                        return r.json()
+                    _EXP_LOG.debug(f"[API] GET {path} → {r.status_code}")
+                    last_error = f"HTTP {r.status_code}"
+                    break  # Don't retry on HTTP errors
+                except (_requests.ConnectionError, _requests.Timeout, _requests.RequestException) as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        backoff = 2 ** attempt
+                        _EXP_LOG.debug(f"[API] GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
+                        _time.sleep(backoff)
+                    else:
+                        _EXP_LOG.debug(f"[API] GET {path}: {e} (final attempt)")
+                except Exception as e:
+                    _EXP_LOG.debug(f"[API] GET {path}: {e}")
+                    last_error = str(e)
+                    break
+            else:
+                try:
+                    import urllib.parse
+                    full = url + ("?" + urllib.parse.urlencode(params) if params else "")
+                    with urllib.request.urlopen(full, timeout=t) as resp:
+                        return _json.loads(resp.read())
+                except (_urllib_error.URLError, _socket.timeout) as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        backoff = 2 ** attempt
+                        _EXP_LOG.debug(f"[API] urllib GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
+                        _time.sleep(backoff)
+                    else:
+                        _EXP_LOG.debug(f"[API] urllib GET {path}: {e} (final attempt)")
+                except Exception as e:
+                    _EXP_LOG.debug(f"[API] urllib GET {path}: {e}")
+                    last_error = str(e)
+                    break
+        
+        self._last_error = last_error
         return None
 
     def _post(self, path: str, payload: dict,
-              timeout: int = None) -> Optional[dict]:
+              timeout: int = None, retries: int = 3) -> Optional[dict]:
         t   = timeout or self.timeout
         url = f"{self.base_url}{path}"
-        if _HAS_REQUESTS:
-            try:
-                r = self._get_session().post(url, json=payload, timeout=t)
-                if r.status_code in (200, 201, 202):
-                    return r.json()
-                _EXP_LOG.debug(f"[API] POST {path} → {r.status_code}: {r.text[:80]}")
-            except Exception as e:
-                _EXP_LOG.debug(f"[API] POST {path}: {e}")
-        else:
-            try:
-                import urllib.request
-                data = _json.dumps(payload).encode()
-                req  = urllib.request.Request(
-                    url, data=data,
-                    headers={"Content-Type": "application/json"}, method="POST")
-                with urllib.request.urlopen(req, timeout=t) as resp:
-                    return _json.loads(resp.read())
-            except Exception as e:
-                _EXP_LOG.debug(f"[API] urllib POST {path}: {e}")
+        last_error = None
+        
+        # Exponential backoff retry loop
+        for attempt in range(retries):
+            if _HAS_REQUESTS:
+                try:
+                    r = self._get_session().post(url, json=payload, timeout=t)
+                    if r.status_code in (200, 201, 202):
+                        return r.json()
+                    # HTTP error — log but don't retry
+                    _EXP_LOG.debug(f"[API] POST {path} → {r.status_code}: {r.text[:80]}")
+                    last_error = f"HTTP {r.status_code}: {r.text[:100]}"
+                    break  # Don't retry on HTTP errors, only network errors
+                except (_requests.ConnectionError, _requests.Timeout, _requests.RequestException) as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        backoff = 2 ** attempt  # 1s, 2s, 4s
+                        _EXP_LOG.debug(f"[API] POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
+                        _time.sleep(backoff)
+                    else:
+                        _EXP_LOG.debug(f"[API] POST {path}: {e} (final attempt)")
+                except Exception as e:
+                    _EXP_LOG.debug(f"[API] POST {path}: {e}")
+                    last_error = str(e)
+                    break
+            else:
+                try:
+                    import urllib.request
+                    data = _json.dumps(payload).encode()
+                    req  = urllib.request.Request(
+                        url, data=data,
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=t) as resp:
+                        return _json.loads(resp.read())
+                except (_urllib_error.URLError, _socket.timeout) as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        backoff = 2 ** attempt
+                        _EXP_LOG.debug(f"[API] urllib POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
+                        _time.sleep(backoff)
+                    else:
+                        _EXP_LOG.debug(f"[API] urllib POST {path}: {e} (final attempt)")
+                except Exception as e:
+                    _EXP_LOG.debug(f"[API] urllib POST {path}: {e}")
+                    last_error = str(e)
+                    break
+        
+        # Store last error for diagnostics
+        self._last_error = last_error
         return None
 
     def get_chain_tip(self) -> Optional[dict]:
@@ -8568,6 +8630,8 @@ class KoyebAPIClient:
         /api/transactions (no trailing path) doesn't exist → 404 → None.
         Also normalises amount/fee to base units (×100) which the mempool
         requires, and ensures timestamp_ns is present.
+        
+        ENHANCED: Added pre-submission health check and multi-fallback strategy.
         """
         import time as _t2
         # Normalise payload to what server mempool.accept() expects
@@ -8587,16 +8651,24 @@ class KoyebAPIClient:
         payload.setdefault("from_addr", payload.get("from_address", ""))
         payload.setdefault("to_addr",   payload.get("to_address", ""))
 
-        # ── Primary: canonical endpoint ───────────────────────────────────
-        r = self._post("/api/submit_transaction", payload)
-        if r is not None:
-            return r
-        # ── Fallback: alias endpoint ──────────────────────────────────────
-        r = self._post("/api/transactions/submit", payload)
-        if r is not None:
-            return r
-        # ── Last resort: gossip ingest (broadcast, no mempool validation) ─
-        return self._post("/gossip/ingest", {"tx": payload, "origin": "client_wallet"})
+        # ── Endpoint priority list (fallback chain) ────────────────────────────────
+        endpoints = [
+            ("/api/submit_transaction", 3),        # Primary: canonical, 3 retries
+            ("/api/transactions/submit", 2),       # Fallback: alias, 2 retries
+            ("/gossip/ingest", 1),                 # Last resort: broadcast, 1 retry
+        ]
+        
+        for path, max_retries in endpoints:
+            if path == "/gossip/ingest":
+                payload_to_send = {"tx": payload, "origin": "client_wallet"}
+            else:
+                payload_to_send = payload
+            
+            r = self._post(path, payload_to_send, retries=max_retries)
+            if r is not None:
+                return r
+        
+        return None
 
     def get_peers(self) -> list:
         return (self._get("/api/peers/list") or {}).get("peers", [])
@@ -8622,8 +8694,42 @@ class KoyebAPIClient:
         return self._post("/api/oracle/register",
                           {"miner_id": miner_id, "address": miner_address})
 
-    def health_check(self, timeout: int = 5) -> bool:
-        return self._get("/api/dht/hello", timeout=timeout) is not None
+    def health_check(self, timeout: int = 5, force: bool = False) -> bool:
+        """Check if oracle is reachable. Caches result for 10 seconds."""
+        now = _time.time()
+        if not force and (now - self._health_check_cache["timestamp"]) < 10:
+            return self._health_check_cache["status"]
+        
+        result = self._get("/api/dht/hello", timeout=timeout) is not None
+        self._health_check_cache = {"timestamp": now, "status": result}
+        return result
+    
+    def get_diagnostics(self) -> str:
+        """Return a human-readable diagnostic report."""
+        lines = []
+        lines.append("  🔍 ORACLE DIAGNOSTICS")
+        lines.append(f"     Oracle URL: {self.base_url}")
+        lines.append(f"     Timeout:    {self.timeout}s")
+        
+        # Check connectivity
+        try:
+            import socket
+            host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
+            sock = socket.create_connection((host, 443 if "https" in self.base_url else 80), timeout=3)
+            sock.close()
+            lines.append(f"     Network:    ✅ Reachable ({host})")
+        except Exception as e:
+            lines.append(f"     Network:    ❌ Unreachable ({e})")
+        
+        # Check health endpoint
+        if self.health_check(timeout=3, force=True):
+            lines.append(f"     Health:     ✅ API responding")
+        else:
+            lines.append(f"     Health:     ❌ API not responding")
+            if self._last_error:
+                lines.append(f"     Last Error: {self._last_error}")
+        
+        return "\n".join(lines)
 
 
 _KOYEB: "KoyebAPIClient" = KoyebAPIClient()
@@ -10359,8 +10465,20 @@ class QtclClientApp:
         else:
             # No response at all — connectivity issue
             print("  ❌ Submission failed — no response from oracle")
-            print(f"  Tip: check {self.oracle_url} is reachable")
-            print(f"  TX would be: {tx_id[:32]}…")
+            print("")
+            print(self.api.get_diagnostics())
+            print("")
+            print(f"  📋 TX details (not submitted):")
+            print(f"     Hash:  {tx_id[:32]}…")
+            print(f"     From:  {from_addr}")
+            print(f"     To:    {to_addr}")
+            print(f"     Amt:   {amount} QTCL")
+            print("")
+            print(f"  💡 Troubleshooting:")
+            print(f"     1. Verify {self.oracle_url} is online")
+            print(f"     2. Check your internet connection")
+            print(f"     3. Try again in a few moments (server may be restarting)")
+            print(f"     4. If persistent, the oracle node may be down")
 
     def _query_tx(self) -> None:
         try:
