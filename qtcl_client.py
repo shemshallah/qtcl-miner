@@ -9699,6 +9699,112 @@ class KoyebOracleState:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ε-SWARM  MetricsStreamListener  ─  Real-time oracle metrics via SSE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MetricsStreamListener:
+    """
+    Real-time metrics subscriber: listens to oracle_metrics SSE channel.
+    Prevents metric staleness by continuously updating from oracle daemon.
+    """
+    
+    def __init__(self, sse_mux: "SSEMultiplexer", update_interval: float = 0.2):
+        self.sse_mux = sse_mux
+        self.update_interval = update_interval
+        self.last_metrics = {}
+        self.running = False
+        self._lock = _threading.RLock()
+        self.listener_thread: _Optional[_threading.Thread] = None
+        self.channel = "oracle_metrics"
+        self.cid = None
+    
+    def start(self):
+        """Start listening to oracle metrics via SSE."""
+        if self.running:
+            return
+        
+        self.running = True
+        self.cid = f"metrics_listener_{id(self)}"
+        
+        # Subscribe to oracle metrics channel
+        self.stop_event = self.sse_mux.subscribe(
+            self.cid,
+            channels=[self.channel],
+            maxlen=100
+        )
+        
+        self.listener_thread = _threading.Thread(
+            target=self._listen_loop,
+            daemon=True,
+            name="MetricsStreamListener"
+        )
+        self.listener_thread.start()
+        _logging.info(f"[METRICS] Listener started on channel={self.channel}")
+    
+    def stop(self):
+        """Stop listening and cleanup."""
+        if not self.running:
+            return
+        self.running = False
+        if self.cid:
+            self.sse_mux.unsubscribe(self.cid)
+        if self.listener_thread:
+            self.listener_thread.join(timeout=2)
+        _logging.info("[METRICS] Listener stopped")
+    
+    def _listen_loop(self):
+        """Continuously drain SSE events from oracle_metrics channel."""
+        while self.running:
+            try:
+                frame = self.sse_mux.drain(self.cid, block_s=5.0)
+                if frame is None:
+                    continue
+                
+                try:
+                    lines = frame.strip().split('\n')
+                    for line in lines:
+                        if line.startswith('data: '):
+                            data_str = line[6:]
+                            data = _json.loads(data_str)
+                            self._update_metrics(data)
+                except _json.JSONDecodeError:
+                    _logging.debug(f"[METRICS] Parse error: {frame[:100]}")
+                except Exception as e:
+                    _logging.debug(f"[METRICS] Frame error: {e}")
+                
+                _time.sleep(self.update_interval)
+            
+            except Exception as e:
+                _logging.debug(f"[METRICS] Listen loop error: {e}")
+                _time.sleep(0.5)
+    
+    def _update_metrics(self, data: _Dict[str, _Any]):
+        """Update internal metrics state from SSE event."""
+        with self._lock:
+            if 'oracle' in data:
+                self.last_metrics['oracle'] = data['oracle']
+            if 'block_field' in data:
+                self.last_metrics['block_field'] = data['block_field']
+            if 'nodes' in data:
+                self.last_metrics['nodes'] = data['nodes']
+    
+    def get_metrics(self) -> _Dict[str, _Any]:
+        """Get latest metrics snapshot."""
+        with self._lock:
+            return _copy.deepcopy(self.last_metrics)
+    
+    def get_oracle_metrics(self) -> _Dict[str, _Any]:
+        """Get latest oracle metrics only."""
+        with self._lock:
+            return _copy.deepcopy(self.last_metrics.get('oracle', {}))
+    
+    def get_block_field_metrics(self) -> _Dict[str, _Any]:
+        """Get latest block field metrics only."""
+        with self._lock:
+            return _copy.deepcopy(self.last_metrics.get('block_field', {}))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ε-SWARM  SSEMultiplexer  ─  per-client interruptable streams (9091-compatible)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -9783,6 +9889,9 @@ class SSEMultiplexer:
 
 
 _SSE_MUX: SSEMultiplexer = SSEMultiplexer.get()
+
+# Global metrics listener (connects oracle metrics stream to client)
+_METRICS_LISTENER: MetricsStreamListener = MetricsStreamListener(_SSE_MUX)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10776,7 +10885,13 @@ class QtclClientApp:
                                 self.wallet.address, bh)
 
         self._start_threads()
+        
+        # NEW: Start metrics streaming listener (prevents metric staleness)
+        global _METRICS_LISTENER
+        _METRICS_LISTENER.start()
+        
         print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
+        print(f"  📡 Metrics SSE  : oracle_metrics channel (5 Hz)")
         print(f"  📡 SSE clients  : {_SSE_MUX.client_count()}")
         print(f"  🗄️  DB           : {self._db_path}")
         print(f"\n  ⛏️  Mining active — menu below (no Ctrl+C needed)\n")
@@ -10866,12 +10981,23 @@ class QtclClientApp:
 
             print(sep)
 
-            # ── Oracle / chain state ──────────────────────────────────────
-            print(f"  Oracle: h={ks2.block_height}  "
-                  f"fid={ks2.pq0_fidelity:.4f}  "
-                  f"bridge={ks2.bridge_fidelity:.4f}  "
-                  f"lat={ks2.channel_latency_ms:.0f}ms  "
-                  f"{'✅' if ks2.connected else '❌'}")
+            # ── Oracle / chain state (FROM SSE STREAMING) ──────────────────────────────────────
+            # Try to get live metrics from oracle SSE stream
+            metrics = _METRICS_LISTENER.get_oracle_metrics()
+            if metrics:
+                # Live streamed metrics from oracle daemon (5 Hz)
+                print(f"  Oracle: h={metrics.get('h')}  "
+                      f"fid={metrics.get('fid')}  "
+                      f"bridge={metrics.get('bridge')}  "
+                      f"lat={metrics.get('lat_ms')}ms  "
+                      f"✅ (SSE streaming)")
+            else:
+                # Fallback to koyeb_state if SSE not yet available
+                print(f"  Oracle: h={ks2.block_height}  "
+                      f"fid={ks2.pq0_fidelity:.4f}  "
+                      f"bridge={ks2.bridge_fidelity:.4f}  "
+                      f"lat={ks2.channel_latency_ms:.0f}ms  "
+                      f"{'✅' if ks2.connected else '❌'}")
             # SUB-AGENT δ: live balance in dashboard
             try:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
@@ -10881,7 +11007,15 @@ class QtclClientApp:
                     print(f"  Balance : {_bal_s}  ({_addr2[:24]}…)")
             except Exception:
                 pass
-            if m2:
+            
+            # Print field metrics with SSE data
+            if metrics:
+                bf = metrics.get('block_field', {})
+                if bf:
+                    print(f"  Field : Fid→|W3⟩={metrics.get('fid')}  "
+                          f"S={metrics.get('S')}  purity={metrics.get('purity')}  "
+                          f"‖Δρ‖={metrics.get('discord')}")
+            elif m2:
                 print(f"  Field : Fid→|W3⟩={m2.fidelity_to_w3:.4f}  "
                       f"S={m2.entropy_vn:.4f}  "
                       f"purity={m2.purity:.4f}  "
