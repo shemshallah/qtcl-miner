@@ -9351,6 +9351,81 @@ class QTCLWallet:
 # the P2P sockets don't reach the server directly).
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MINING TELEMETRY — live stats shared between miner thread and display thread
+# Written by _patch_async_miner(); read by QtclClientApp.run_mine_mode()
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _MiningTelemetry:
+    """Thread-safe mining statistics. One singleton per process."""
+    def __init__(self):
+        self._lock          = _threading.Lock()
+        self.height         = 0          # target block height
+        self.difficulty     = 0          # current PoW difficulty
+        self.parent_hash    = "0" * 64   # parent block hash
+        self.nonce          = 0          # current nonce being tried
+        self.hash_rate      = 0.0        # hashes/second (rolling 5 s window)
+        self.blocks_found   = 0          # blocks solved this session
+        self.last_block     = None       # dict of last solved block (full)
+        self.last_block_ts  = 0.0        # time of last block solve
+        self.session_start  = _time.time()
+        self._nonce_samples: "_deque" = _deque(maxlen=50)  # (ts, nonce) for rate calc
+        self.state          = "IDLE"     # IDLE | MINING | SOLVED | SUBMITTING
+
+    def update_progress(self, height: int, difficulty: int,
+                        nonce: int, parent_hash: str = "") -> None:
+        with self._lock:
+            self.height     = height
+            self.difficulty = difficulty
+            self.nonce      = nonce
+            if parent_hash:
+                self.parent_hash = parent_hash
+            self.state      = "MINING"
+            now = _time.time()
+            self._nonce_samples.append((now, nonce))
+            # Rolling hash-rate over last ≤50 samples
+            if len(self._nonce_samples) >= 2:
+                t0, n0 = self._nonce_samples[0]
+                t1, n1 = self._nonce_samples[-1]
+                dt = t1 - t0
+                if dt > 0:
+                    self.hash_rate = (n1 - n0) / dt
+
+    def record_block(self, block: dict) -> None:
+        with self._lock:
+            self.blocks_found  += 1
+            self.last_block     = dict(block)
+            self.last_block_ts  = _time.time()
+            self.state          = "SOLVED"
+
+    def mark_submitting(self) -> None:
+        with self._lock:
+            self.state = "SUBMITTING"
+
+    def mark_idle(self) -> None:
+        with self._lock:
+            self.state = "IDLE"
+
+    def snapshot(self) -> dict:
+        """Lock-free snapshot for display."""
+        with self._lock:
+            return {
+                "height":       self.height,
+                "difficulty":   self.difficulty,
+                "parent_hash":  self.parent_hash,
+                "nonce":        self.nonce,
+                "hash_rate":    self.hash_rate,
+                "blocks_found": self.blocks_found,
+                "last_block":   dict(self.last_block) if self.last_block else None,
+                "last_block_ts":self.last_block_ts,
+                "session_start":self.session_start,
+                "state":        self.state,
+            }
+
+
+_MINE_TELEM = _MiningTelemetry()
+
 def _patch_async_miner():
     """Inject HTTP oracle fallback into AsyncOracleMiner.mine_block()."""
     try:
@@ -9380,15 +9455,22 @@ def _patch_async_miner():
                 _EXP_LOG.info(
                     f"[MINER] ⛏️  HTTP fallback h={block['height']} "
                     f"diff={diff} parent={phash[:12]}… ❤️")
+                _MINE_TELEM.update_progress(block["height"], diff, 0, phash)
+                _mine_start_ts = _t.time()
                 while self.mining:
                     bstr = _j.dumps(block, sort_keys=True).encode()
                     bhash = _hl.sha256(bstr).hexdigest()
                     if bin(int(bhash, 16)).count("0") >= diff:
                         block["hash"] = bhash
+                        _MINE_TELEM.record_block(block)
                         _EXP_LOG.info(f"[MINER] ✅ block found h={block['height']} "
                                       f"nonce={block['nonce']} hash={bhash[:16]}… ❤️")
                         return block
                     block["nonce"] += 1
+                    # Instrument telemetry every 200 nonces (cheap)
+                    if block["nonce"] % 200 == 0:
+                        _MINE_TELEM.update_progress(
+                            block["height"], diff, block["nonce"], phash)
                     if block["nonce"] % 5000 == 0:
                         await _asyncio.sleep(0)
                         # Refresh chain tip every 10 k nonces
@@ -9399,6 +9481,7 @@ def _patch_async_miner():
                             if h2 > height:
                                 _EXP_LOG.info(
                                     f"[MINER] chain moved h={h2} restart block")
+                                _MINE_TELEM.mark_idle()
                                 return None   # restart with new tip
             except Exception as _e:
                 _EXP_LOG.debug(f"[MINER] HTTP fallback: {_e}")
@@ -9412,17 +9495,46 @@ def _patch_async_miner():
         async def _start_with_http_submit(self, miner_address: str):
             self.mining = True
             kapi        = KoyebAPIClient()
+            _MINE_TELEM.mark_idle()
             while self.mining:
                 block = await self.mine_block(miner_address)
                 if block:
+                    _MINE_TELEM.mark_submitting()
+                    # ── Assemble full consensus payload ───────────────────
+                    ks   = getattr(self, "_koyeb_state", None)
+                    cf   = getattr(self, "_client_field", None)
+                    m    = cf.metrics if cf else None
+                    consensus_payload = {
+                        "block":            block,
+                        "origin":           "client_miner",
+                        "peer_id":          "qtcl_client",
+                        # W-state quantum attestation
+                        "w_state_fidelity": (ks.pq0_fidelity      if ks else 0.0),
+                        "oracle_coherence": (ks.oracle_coherence   if ks else 0.0),
+                        "bridge_fidelity":  (ks.bridge_fidelity    if ks else 0.0),
+                        "pq_curr":          (ks.pq_curr_id         if ks else str(block.get("height","?"))),
+                        "pq_last":          (ks.pq_last_id         if ks else "?"),
+                        "block_height":     block.get("height", 0),
+                        # Tensor field metrics
+                        "fidelity_to_w3":   (m.fidelity_to_w3   if m else 0.0),
+                        "entropy_vn":       (m.entropy_vn        if m else 0.0),
+                        "quantum_discord":  (m.quantum_discord   if m else 0.0),
+                        "negativity_AB":    (m.negativity_AB     if m else 0.0),
+                        "negativity_BC":    (m.negativity_BC     if m else 0.0),
+                        "bell_chsh_AB":     (m.bell_chsh_AB      if m else 0.0),
+                        "bell_chsh_BC":     (m.bell_chsh_BC      if m else 0.0),
+                        "purity":           (m.purity            if m else 0.0),
+                        "field_density":    (m.field_density     if m else 0.0),
+                    }
                     # Submit via HTTP gossip/ingest
                     try:
-                        r = kapi.gossip_ingest({"block": block,
-                                                "origin": "client_miner",
-                                                "peer_id": "qtcl_client"})
+                        r = kapi.gossip_ingest(consensus_payload)
                         if r:
                             _EXP_LOG.info(
                                 f"[MINER] 📡 block {block['height']} submitted ❤️")
+                        else:
+                            _EXP_LOG.warning(
+                                f"[MINER] ⚠️  block {block['height']} submit returned null")
                     except Exception as _e:
                         _EXP_LOG.debug(f"[MINER] submit: {_e}")
                     # Also try legacy publish_state_update
@@ -9430,6 +9542,7 @@ def _patch_async_miner():
                         await _orig_start.__func__(self, miner_address)   # noqa
                     except Exception:
                         pass
+                    _MINE_TELEM.mark_idle()
                 await _asyncio.sleep(0.5)
 
         AsyncOracleMiner.start_mining = _start_with_http_submit  # type: ignore[name-defined]
@@ -9804,38 +9917,127 @@ class QtclClientApp:
         )
         _mine_thread.start()
 
-        # ── Interactive mining menu (foreground) ──────────────────────────────
-        def _show_mine_status():
-            ks2 = self.koyeb_state
-            m2  = self.client_field.metrics
-            bh2 = ks2.block_height
-            print("\n" + "─" * 72)
-            print("  ⛏️  MINING STATUS")
-            print(f"    block_height : {bh2}   pq: {ks2.pq_curr_id} → {ks2.pq_last_id}")
-            print(f"    Oracle fid   : {ks2.pq0_fidelity:.4f}   "
-                  f"coherence: {ks2.oracle_coherence:.4f}   "
-                  f"latency: {ks2.channel_latency_ms:.0f}ms")
-            if m2:
-                print(f"    Fid→|W3⟩    : {m2.fidelity_to_w3:.4f}   "
-                      f"VN entropy: {m2.entropy_vn:.4f}   "
-                      f"purity: {m2.purity:.4f}")
-            print(f"    Thread alive : {_mine_thread.is_alive()}")
-            print("─" * 72)
+        # Inject koyeb_state + client_field into miner so submit payload is rich
+        miner._koyeb_state  = self.koyeb_state   # type: ignore[attr-defined]
+        miner._client_field = self.client_field  # type: ignore[attr-defined]
 
+        # ── Live mining dashboard (foreground, auto-refresh) ──────────────────
+        _LAST_BLOCK_REPORTED = [None]   # mutable cell so inner closure can write
+
+        def _fmt_duration(secs: float) -> str:
+            h, r = divmod(int(secs), 3600)
+            m, s = divmod(r, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+        def _print_dashboard(force_full: bool = False) -> None:
+            ks2  = self.koyeb_state
+            m2   = self.client_field.metrics
+            tel  = _MINE_TELEM.snapshot()
+            now  = _time.time()
+            sep  = "─" * 72
+
+            # ── state badge ───────────────────────────────────────────────
+            state_badge = {
+                "IDLE":        "💤 IDLE",
+                "MINING":      "⛏️  MINING",
+                "SOLVED":      "✅ BLOCK SOLVED",
+                "SUBMITTING":  "📡 SUBMITTING",
+            }.get(tel["state"], tel["state"])
+
+            hr_str = (f"{tel['hash_rate']:.0f} H/s"
+                      if tel["hash_rate"] > 0 else "warming up…")
+            session = _fmt_duration(now - tel["session_start"])
+
+            print("\n" + sep)
+            print(f"  {state_badge}   │   session: {session}   │   blocks found: {tel['blocks_found']}")
+            print(sep)
+
+            # ── PoW live progress ─────────────────────────────────────────
+            if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
+                target_zeros = tel["difficulty"]
+                nonce_str    = f"{tel['nonce']:,}"
+                print(f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
+                      f"nonce={nonce_str}  │  {hr_str}")
+                print(f"  Parent: {tel['parent_hash'][:32]}…")
+            else:
+                print(f"  {hr_str}   │   waiting for chain tip…")
+
+            # ── Last solved block ─────────────────────────────────────────
+            lb = tel["last_block"]
+            if lb and (_LAST_BLOCK_REPORTED[0] != lb.get("hash")):
+                _LAST_BLOCK_REPORTED[0] = lb.get("hash")
+                age = _fmt_duration(now - tel["last_block_ts"])
+                print(sep)
+                print(f"  ✅ BLOCK SOLVED  ({age} ago)")
+                print(f"     height  : {lb.get('height', '?')}   nonce: {lb.get('nonce', '?'):,}")
+                print(f"     hash    : {str(lb.get('hash', '??'))[:48]}…")
+                print(f"     diff    : {lb.get('difficulty', '?')}   "
+                      f"ts: {_time.strftime('%H:%M:%S', _time.localtime(lb.get('timestamp', now)))}")
+                print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
+                # Quantum attestation on submission
+                print(f"  ── Quantum Attestation ──────────────────────────────────────")
+                print(f"     pq_curr : {ks2.pq_curr_id}   pq_last: {ks2.pq_last_id}")
+                print(f"     W-fid   : {ks2.pq0_fidelity:.4f}   bridge: {ks2.bridge_fidelity:.4f}   "
+                      f"coherence: {ks2.oracle_coherence:.4f}")
+                if m2:
+                    print(f"     VN-S    : {m2.entropy_vn:.4f}   discord: {m2.quantum_discord:.4f}   "
+                          f"purity: {m2.purity:.4f}")
+                    print(f"     neg A-B : {m2.negativity_AB:.4f}   neg B-C: {m2.negativity_BC:.4f}")
+                    print(f"     CHSH AB : {m2.bell_chsh_AB:.4f}   CHSH BC: {m2.bell_chsh_BC:.4f}")
+
+            print(sep)
+
+            # ── Oracle / chain state ──────────────────────────────────────
+            print(f"  Oracle: h={ks2.block_height}  "
+                  f"fid={ks2.pq0_fidelity:.4f}  "
+                  f"bridge={ks2.bridge_fidelity:.4f}  "
+                  f"lat={ks2.channel_latency_ms:.0f}ms  "
+                  f"{'✅' if ks2.connected else '❌'}")
+            if m2:
+                print(f"  Field : Fid→|W3⟩={m2.fidelity_to_w3:.4f}  "
+                      f"S={m2.entropy_vn:.4f}  "
+                      f"purity={m2.purity:.4f}  "
+                      f"‖Δρ‖={m2.field_density:.4f}")
+            print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
+            print(sep)
+
+        # ── Auto-refresh ticker thread ────────────────────────────────────────
+        _REFRESH_INTERVAL = 15.0   # seconds between auto-refreshes
+        _last_auto         = [_time.time()]
+
+        def _auto_refresh_loop():
+            while not self._stop.is_set() and _mine_thread.is_alive():
+                _time.sleep(1.0)
+                if _time.time() - _last_auto[0] >= _REFRESH_INTERVAL:
+                    _last_auto[0] = _time.time()
+                    # Only print if no input prompt is active (crude but effective)
+                    # Print blank line first so display doesn't corrupt input prompt
+                    print()
+                    _print_dashboard()
+                    print("  Choice [Enter=status | q=quit | r=refresh]: ", end="", flush=True)
+
+        _auto_th = _threading.Thread(target=_auto_refresh_loop,
+                                     daemon=True, name="MineDisplay")
+        _auto_th.start()
+
+        # ── Foreground interactive loop ────────────────────────────────────────
+        _print_dashboard(force_full=True)
         try:
             while not self._stop.is_set() and _mine_thread.is_alive():
-                print("\n" + "━" * 52)
-                print("  ⛏️   MINING MENU")
-                print("━" * 52)
-                print("  1.) 📊  Refresh status")
-                print("  2.) 🛑  Stop mining & return to main menu")
+                print()
+                print("  ╔══ MINING MENU ═══════════════════════════════════╗")
+                print("  ║  Enter = refresh status                          ║")
+                print("  ║  r     = refresh status                          ║")
+                print("  ║  q     = stop mining & return to main menu       ║")
+                print("  ╚══════════════════════════════════════════════════╝")
                 try:
-                    ch = input("  Choice [1-2, Enter=status]: ").strip()
+                    ch = input("  Choice: ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     break
-                if ch == "2" or ch.lower() in ("q", "stop", "quit"):
+                _last_auto[0] = _time.time()  # reset auto-refresh timer
+                if ch in ("q", "quit", "stop", "2"):
                     break
-                _show_mine_status()
+                _print_dashboard()
         except KeyboardInterrupt:
             pass
         finally:
