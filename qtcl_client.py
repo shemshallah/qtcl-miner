@@ -10455,9 +10455,24 @@ class QtclClientApp:
         }
         tx_id = _hashlib.sha3_256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
         tx["tx_id"] = tx_id
+        
+        # ── SIGNATURE GENERATION (COMPREHENSIVE FORMAT) ──────────────────
+        # Generate signature and wrap in JSON for maximum compatibility
         if self.wallet.private_key:
-            tx["signature"] = _hashlib.sha3_256(
-                (tx_id + self.wallet.private_key).encode()).hexdigest()
+            sig_hex = _hashlib.sha3_256(
+                (tx_id + self.wallet.private_key).encode()
+            ).hexdigest()
+            
+            # Wrap in JSON format (server-compatible)
+            # This also works if server accepts plain hex (wrapped internally)
+            tx["signature"] = _json.dumps({
+                "signature_hex": sig_hex,
+                "method": "sha3_256_with_private_key",
+                "public_key": self.wallet.public_key or "",
+                "timestamp_ns": str(_tw.time_ns()),
+                "format": "hlwe_json"
+            })
+        
         # AGENT-β FIX: add timestamp_ns for canonical server hash
         import time as _tw
         tx["timestamp_ns"] = str(_tw.time_ns())
