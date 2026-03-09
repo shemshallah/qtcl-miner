@@ -9707,45 +9707,84 @@ def _patch_async_miner():
             result = await _orig_mine(self, miner_address)
             if result is not None:
                 return result
-            # ── FIX-8: HTTP fallback via KoyebAPIClient ───────────────────
-            try:
-                kapi   = KoyebAPIClient()
-                tip    = kapi.get_chain_tip() or {}
-                height = int(tip.get("block_height") or tip.get("height") or 0)
-                diff   = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)
-                phash  = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                block  = {
-                    "height":       height + 1,
-                    "timestamp":    int(_t.time()),
-                    "miner_address": miner_address,
-                    "difficulty":   diff,
-                    "nonce":        0,
-                    "parent_hash":  phash,
-                }
-                _EXP_LOG.info(
-                    f"[MINER] ⛏️  HTTP fallback h={block['height']} "
-                    f"diff={diff} parent={phash[:12]}… ❤️")
-                _MINE_TELEM.update_progress(block["height"], diff, 0, phash)
-                _mine_start_ts = _t.time()
-                while self.mining:
-                    bstr = _j.dumps(block, sort_keys=True).encode()
-                    bhash = _hl.sha256(bstr).hexdigest()
-                    # Standard leading-zero PoW: hash must start with `diff` hex zeros
-                    if bhash.startswith("0" * diff):
-                        block["hash"] = bhash
-                        _MINE_TELEM.record_block(block)
-                        _EXP_LOG.info(f"[MINER] ✅ block found h={block['height']} "
-                                      f"nonce={block['nonce']} hash={bhash[:16]}… ❤️")
-                        return block
-                    block["nonce"] += 1
-                    # Instrument telemetry every 200 nonces (cheap)
-                    if block["nonce"] % 200 == 0:
-                        _MINE_TELEM.update_progress(
-                            block["height"], diff, block["nonce"], phash)
-                    if block["nonce"] % 5000 == 0:
-                        await _asyncio.sleep(0)
-                        # Refresh chain tip every 10 k nonces
-                        if block["nonce"] % 10_000 == 0:
+            # ── FIX-9: HTTP fallback via KoyebAPIClient with AGGRESSIVE RETRY ────
+            kapi = KoyebAPIClient()
+            tip = None
+            _retries = 0
+            _max_retries = 4
+            _backoff_base = 0.3
+            
+            # FIX-9: Aggressive retry with exponential backoff (don't silent-fail)
+            while tip is None and _retries < _max_retries:
+                try:
+                    tip = kapi.get_chain_tip()
+                    if tip and (tip.get("block_height") or tip.get("height")):
+                        # Valid tip received
+                        break
+                    # Empty/null tip response — retry
+                    _retries += 1
+                    if _retries < _max_retries:
+                        _backoff = _backoff_base * (2 ** (_retries - 1))
+                        _EXP_LOG.warning(
+                            f"[MINER] chain_tip empty, retry {_retries}/{_max_retries} "
+                            f"(backoff {_backoff:.1f}s)")
+                        await _asyncio.sleep(_backoff)
+                except Exception as _e:
+                    _retries += 1
+                    _backoff = _backoff_base * (2 ** (_retries - 1))
+                    _EXP_LOG.warning(
+                        f"[MINER] chain_tip error: {type(_e).__name__}: {_e} "
+                        f"(retry {_retries}/{_max_retries}, backoff {_backoff:.1f}s)")
+                    if _retries < _max_retries:
+                        await _asyncio.sleep(_backoff)
+            
+            # FIX-9: Return None if all retries exhausted (no synthetic data)
+            if tip is None or not (tip.get("block_height") or tip.get("height")):
+                _EXP_LOG.warning(
+                    f"[MINER] chain_tip acquisition failed after {_max_retries} retries")
+                return None
+            
+            # FIX-9: Extract real chain state from verified tip
+            height = int(tip.get("block_height") or tip.get("height") or 0)
+            diff   = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)
+            phash  = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
+            
+            block  = {
+                "height":       height + 1,
+                "timestamp":    int(_t.time()),
+                "miner_address": miner_address,
+                "difficulty":   diff,
+                "nonce":        0,
+                "parent_hash":  phash,
+            }
+            _EXP_LOG.info(
+                f"[MINER] ⛏️  mining h={block['height']} "
+                f"diff={diff} parent={phash[:12]}… ❤️")
+            
+            # FIX-9: Update telemetry so state transitions to MINING immediately
+            _MINE_TELEM.update_progress(block["height"], diff, 0, phash)
+            
+            _mine_start_ts = _t.time()
+            while self.mining:
+                bstr = _j.dumps(block, sort_keys=True).encode()
+                bhash = _hl.sha256(bstr).hexdigest()
+                # Standard leading-zero PoW: hash must start with `diff` hex zeros
+                if bhash.startswith("0" * diff):
+                    block["hash"] = bhash
+                    _MINE_TELEM.record_block(block)
+                    _EXP_LOG.info(f"[MINER] ✅ block found h={block['height']} "
+                                  f"nonce={block['nonce']} hash={bhash[:16]}… ❤️")
+                    return block
+                block["nonce"] += 1
+                # Instrument telemetry every 200 nonces (cheap)
+                if block["nonce"] % 200 == 0:
+                    _MINE_TELEM.update_progress(
+                        block["height"], diff, block["nonce"], phash)
+                if block["nonce"] % 5000 == 0:
+                    await _asyncio.sleep(0)
+                    # Refresh chain tip every 10 k nonces
+                    if block["nonce"] % 10_000 == 0:
+                        try:
                             tip2 = kapi.get_chain_tip() or {}
                             h2   = int(tip2.get("block_height") or
                                        tip2.get("height") or height)
@@ -9754,8 +9793,8 @@ def _patch_async_miner():
                                     f"[MINER] chain moved h={h2} restart block")
                                 _MINE_TELEM.mark_idle()
                                 return None   # restart with new tip
-            except Exception as _e:
-                _EXP_LOG.debug(f"[MINER] HTTP fallback: {_e}")
+                        except Exception as _tip_err:
+                            _EXP_LOG.debug(f"[MINER] chain refresh error: {_tip_err}")
             return None
 
         AsyncOracleMiner.mine_block = _mine_with_fallback  # type: ignore[name-defined]
