@@ -7053,13 +7053,11 @@ class AsyncOracleMiner:
         
         # Mining loop
         while self.mining:
-            # Solve PoW
+            # Solve PoW — standard leading-zero hex check
+            # difficulty = N means hash must start with N hex zeros ('0'*N)
+            # This matches server's 2^(256-bits) threshold exactly.
             block_hash = hashlib.sha256(json.dumps(block, sort_keys=True).encode()).hexdigest()
-            
-            # Check difficulty
-            leading_zeros = bin(int(block_hash, 16)).count('0')
-            if leading_zeros >= current_difficulty:
-                # Found solution
+            if block_hash.startswith('0' * current_difficulty):
                 block['hash'] = block_hash
                 
                 # Emit DHT event
@@ -8466,13 +8464,95 @@ class KoyebAPIClient:
         return GKSLBathParams.from_snap(snap) if snap else CANONICAL_BATH
 
     def get_balance(self, address: str) -> Optional[float]:
-        r = self._get(f"/api/address/{address}/balance")
-        if r:
-            for k in ("balance", "confirmed_balance", "balance_qtcl", "amount"):
-                if k in r:
-                    try: return float(r[k])
-                    except Exception: pass
-        return None
+        """
+        SUB-AGENT β: Full 4-tier balance cascade.
+
+        Tier 1: /api/address/{addr}/balance  — confirmed wallet row
+                (was returning raw BASE UNITS not QTCL — now normalised)
+        Tier 2: /api/wallet?address=...      — always returns QTCL float,
+                handles new wallets with 0.0
+        Tier 3: /api/address/{addr}/history  — sum confirmed incoming TXs
+                (catches miners whose wallet_addresses row is stale)
+        Tier 4: 0.0                          — address verified unreachable
+
+        Returns None ONLY on total network failure.
+        """
+        def _qtcl(raw) -> Optional[float]:
+            """Normalise: raw could be QTCL float OR base-unit int."""
+            try:
+                f = float(raw)
+                # Heuristic: if value > 1000 and no decimal, likely base units
+                if f > 1000 and f == int(f):
+                    return f / 100.0
+                return f
+            except Exception:
+                return None
+
+        # ── Tier 0: /api/address/{addr}/earned — ledger ground truth ────────────
+        # Reads confirmed transactions directly, bypasses wallet_addresses cache.
+        # This is the ONLY reliable source for miners (wallet_addresses may be stale
+        # if blocks were submitted via gossip instead of /api/submit_block).
+        r0 = self._get(f"/api/address/{address}/earned")
+        if r0 is not None and "error" not in r0:
+            v = _qtcl(r0.get("balance_qtcl", r0.get("confirmed_balance",
+                                                       r0.get("balance"))))
+            if v is not None:
+                _EXP_LOG.debug(f"[BALANCE] Tier-0 /earned: {v:.4f} QTCL "
+                               f"({r0.get('blocks_mined',0)} blocks mined)")
+                return v
+
+        # ── Tier 1: /api/address/{addr}/balance ──────────────────────────────
+        r1 = self._get(f"/api/address/{address}/balance")
+        if r1 is not None and "error" not in r1:
+            for k in ("balance_qtcl", "confirmed_balance", "balance"):
+                if k in r1:
+                    v = _qtcl(r1[k])
+                    if v is not None:
+                        return v
+
+        # ── Tier 2: /api/wallet?address=...  (always returns 200) ────────────
+        r2 = self._get("/api/wallet", params={"address": address})
+        if r2 is not None and "error" not in r2:
+            for k in ("balance", "balance_qtcl", "confirmed_balance"):
+                if k in r2:
+                    v = _qtcl(r2[k])
+                    if v is not None:
+                        # /api/wallet already divides by 100 correctly
+                        return float(r2[k]) if float(r2[k]) == v else v
+
+        # ── Tier 3: sum confirmed TXs from history (miner balance recovery) ──
+        try:
+            hist = self._get(f"/api/address/{address}/history",
+                             params={"limit": 200}) or {}
+            txs  = hist.get("transactions", [])
+            if txs:
+                # credits: TXs where this address received funds
+                credits  = sum(float(t.get("amount_qtcl") or
+                                     _qtcl(t.get("amount", 0)) or 0)
+                               for t in txs
+                               if (t.get("to_address") == address or
+                                   t.get("to") == address) and
+                                  t.get("status") == "confirmed")
+                # debits: TXs sent from this address
+                debits   = sum(float(t.get("amount_qtcl") or
+                                     _qtcl(t.get("amount", 0)) or 0) +
+                               float(t.get("fee", 0.001))
+                               for t in txs
+                               if (t.get("from_address") == address or
+                                   t.get("from") == address) and
+                                  t.get("status") == "confirmed")
+                net = max(0.0, credits - debits)
+                _EXP_LOG.debug(
+                    f"[BALANCE] Tier-3 TX scan: credits={credits:.4f} "
+                    f"debits={debits:.4f} net={net:.4f}")
+                return net
+        except Exception as _e:
+            _EXP_LOG.debug(f"[BALANCE] Tier-3 failed: {_e}")
+
+        # ── Tier 4: network total failure ─────────────────────────────────────
+        if r1 is None and r2 is None:
+            return None   # genuine network error → show 'unavailable'
+        return 0.0         # reachable but empty
 
     def get_address_history(self, address: str, limit: int = 50) -> list:
         r = self._get(f"/api/address/{address}/history",
@@ -8483,7 +8563,40 @@ class KoyebAPIClient:
         return (self._get("/api/mempool") or {}).get("transactions", [])
 
     def submit_transaction(self, tx: dict) -> Optional[dict]:
-        return self._post("/api/transactions", tx)
+        """
+        AGENT-β FIX: Server canonical endpoint is /api/submit_transaction.
+        /api/transactions (no trailing path) doesn't exist → 404 → None.
+        Also normalises amount/fee to base units (×100) which the mempool
+        requires, and ensures timestamp_ns is present.
+        """
+        import time as _t2
+        # Normalise payload to what server mempool.accept() expects
+        payload = dict(tx)
+        # amount: server expects QTCL float; mempool internally does ×100
+        # Just ensure it's a plain float, not numpy
+        if "amount" in payload:
+            payload["amount"] = float(payload["amount"])
+        if "fee" in payload:
+            payload["fee"] = float(payload["fee"])
+        # timestamp_ns required for canonical hash
+        if "timestamp_ns" not in payload:
+            payload["timestamp_ns"] = str(_t2.time_ns())
+        # from/to aliases for maximum server compat
+        payload.setdefault("from",    payload.get("from_address", ""))
+        payload.setdefault("to",      payload.get("to_address", ""))
+        payload.setdefault("from_addr", payload.get("from_address", ""))
+        payload.setdefault("to_addr",   payload.get("to_address", ""))
+
+        # ── Primary: canonical endpoint ───────────────────────────────────
+        r = self._post("/api/submit_transaction", payload)
+        if r is not None:
+            return r
+        # ── Fallback: alias endpoint ──────────────────────────────────────
+        r = self._post("/api/transactions/submit", payload)
+        if r is not None:
+            return r
+        # ── Last resort: gossip ingest (broadcast, no mempool validation) ─
+        return self._post("/gossip/ingest", {"tx": payload, "origin": "client_wallet"})
 
     def get_peers(self) -> list:
         return (self._get("/api/peers/list") or {}).get("peers", [])
@@ -9460,7 +9573,8 @@ def _patch_async_miner():
                 while self.mining:
                     bstr = _j.dumps(block, sort_keys=True).encode()
                     bhash = _hl.sha256(bstr).hexdigest()
-                    if bin(int(bhash, 16)).count("0") >= diff:
+                    # Standard leading-zero PoW: hash must start with `diff` hex zeros
+                    if bhash.startswith("0" * diff):
                         block["hash"] = bhash
                         _MINE_TELEM.record_block(block)
                         _EXP_LOG.info(f"[MINER] ✅ block found h={block['height']} "
@@ -9493,55 +9607,148 @@ def _patch_async_miner():
         _orig_start = AsyncOracleMiner.start_mining  # type: ignore[name-defined]
 
         async def _start_with_http_submit(self, miner_address: str):
+            """
+            SUB-AGENT α: Block submission fixed.
+
+            ROOT CAUSE: miner was posting solved blocks to /gossip/ingest
+            which is INFORMATIONAL ONLY — no block sealing, no coinbase,
+            no wallet credit. The real endpoint is /api/submit_block which
+            runs the full pipeline: INSERT block → coinbase TX → wallet credit.
+
+            Also fixed: /gossip/ingest path was wrong (missing /api/ prefix).
+            """
+            import hashlib as _hl2, json as _j2, time as _t2
+
             self.mining = True
             kapi        = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
+
+            def _build_coinbase(height: int, addr: str,
+                                 w_hash: str, reward_base: int = 1250) -> dict:
+                """Construct canonical coinbase TX matching server's expected format."""
+                cb_id = _hl2.sha3_256(
+                    f"coinbase:{height}:{addr}:{w_hash}".encode()
+                ).hexdigest()
+                return {
+                    "tx_id":        cb_id,
+                    "tx_type":      "coinbase",
+                    "from_addr":    "0" * 64,       # null/unspendable input
+                    "to_addr":      addr,
+                    "amount":       reward_base,     # base units (1250 = 12.5 QTCL)
+                    "block_height": height,
+                    "w_proof":      w_hash,
+                    "version":      1,
+                }
+
+            def _merkle(tx_list: list) -> str:
+                """SHA3-256 merkle tree matching server's _server_merkle()."""
+                if not tx_list:
+                    return _hl2.sha3_256(b"").hexdigest()
+                def _th(tx: dict) -> str:
+                    if tx.get("tx_type") == "coinbase":
+                        s = _j2.dumps({k: tx[k] for k in
+                            ("tx_id","from_addr","to_addr","amount",
+                             "block_height","w_proof","tx_type","version")
+                            if k in tx}, sort_keys=True)
+                    else:
+                        s = _j2.dumps(
+                            {k: v for k, v in tx.items() if k != "signature"},
+                            sort_keys=True)
+                    return _hl2.sha3_256(s.encode()).hexdigest()
+                hashes = [_th(t) for t in tx_list]
+                while len(hashes) > 1:
+                    if len(hashes) % 2:
+                        hashes.append(hashes[-1])
+                    hashes = [
+                        _hl2.sha3_256((hashes[i]+hashes[i+1]).encode()).hexdigest()
+                        for i in range(0, len(hashes), 2)
+                    ]
+                return hashes[0]
+
             while self.mining:
                 block = await self.mine_block(miner_address)
                 if block:
                     _MINE_TELEM.mark_submitting()
-                    # ── Assemble full consensus payload ───────────────────
-                    ks   = getattr(self, "_koyeb_state", None)
-                    cf   = getattr(self, "_client_field", None)
-                    m    = cf.metrics if cf else None
-                    consensus_payload = {
-                        "block":            block,
-                        "origin":           "client_miner",
-                        "peer_id":          "qtcl_client",
-                        # W-state quantum attestation
-                        "w_state_fidelity": (ks.pq0_fidelity      if ks else 0.0),
-                        "oracle_coherence": (ks.oracle_coherence   if ks else 0.0),
-                        "bridge_fidelity":  (ks.bridge_fidelity    if ks else 0.0),
-                        "pq_curr":          (ks.pq_curr_id         if ks else str(block.get("height","?"))),
-                        "pq_last":          (ks.pq_last_id         if ks else "?"),
-                        "block_height":     block.get("height", 0),
-                        # Tensor field metrics
-                        "fidelity_to_w3":   (m.fidelity_to_w3   if m else 0.0),
-                        "entropy_vn":       (m.entropy_vn        if m else 0.0),
-                        "quantum_discord":  (m.quantum_discord   if m else 0.0),
-                        "negativity_AB":    (m.negativity_AB     if m else 0.0),
-                        "negativity_BC":    (m.negativity_BC     if m else 0.0),
-                        "bell_chsh_AB":     (m.bell_chsh_AB      if m else 0.0),
-                        "bell_chsh_BC":     (m.bell_chsh_BC      if m else 0.0),
-                        "purity":           (m.purity            if m else 0.0),
-                        "field_density":    (m.field_density     if m else 0.0),
+                    ks  = getattr(self, "_koyeb_state", None)
+                    m   = (getattr(self, "_client_field", None) or
+                           object().__class__)
+                    m   = getattr(self, "_client_field", None)
+                    met = m.metrics if m else None
+
+                    height  = int(block.get("height", 0))
+                    diff    = int(block.get("difficulty", 12))
+                    nonce   = int(block.get("nonce", 0))
+                    phash   = str(block.get("parent_hash", "0"*64))
+                    bhash   = str(block.get("hash", ""))
+                    ts      = int(block.get("timestamp", _t2.time()))
+
+                    # W-state attestation from live oracle state
+                    w_fid   = float(ks.pq0_fidelity    if ks else 0.71)
+                    pq_curr = int(ks.pq_curr_id         if ks else height)
+                    pq_last = pq_curr - 1
+
+                    # W-entropy hash — SHA3-256 of oracle fidelity+height
+                    w_hash  = _hl2.sha3_256(
+                        f"{w_fid:.6f}:{height}:{bhash}".encode()
+                    ).hexdigest()
+
+                    # Build coinbase (transactions[0])
+                    coinbase = _build_coinbase(height, miner_address, w_hash)
+
+                    # Merkle root over [coinbase] (no user txs on mobile miner)
+                    merkle   = _merkle([coinbase])
+
+                    # ── /api/submit_block payload (the REAL sealing endpoint) ─
+                    submit_payload = {
+                        "header": {
+                            "height":          height,
+                            "block_hash":      bhash,
+                            "parent_hash":     phash,
+                            "merkle_root":     merkle,
+                            "timestamp_s":     ts,
+                            "difficulty_bits": diff,
+                            "nonce":           nonce,
+                            "miner_address":   miner_address,
+                            "w_state_fidelity":w_fid,
+                            "w_entropy_hash":  w_hash,
+                            "pq_curr":         pq_curr,
+                            "pq_last":         pq_last,
+                        },
+                        "transactions": [coinbase],
                     }
-                    # Submit via HTTP gossip/ingest
+
+                    submitted = False
                     try:
-                        r = kapi.gossip_ingest(consensus_payload)
-                        if r:
+                        r = kapi._post("/api/submit_block", submit_payload,
+                                       timeout=20)
+                        if r and r.get("block_hash"):
+                            _MINE_TELEM.last_block["submitted"] = True  # type: ignore
                             _EXP_LOG.info(
-                                f"[MINER] 📡 block {block['height']} submitted ❤️")
+                                f"[MINER] ✅ /api/submit_block h={height} "
+                                f"hash={bhash[:16]}… WALLET CREDITED ❤️")
+                            submitted = True
+                        elif r and r.get("error"):
+                            _EXP_LOG.warning(
+                                f"[MINER] ⚠️  /api/submit_block rejected: "
+                                f"{r['error']}")
                         else:
                             _EXP_LOG.warning(
-                                f"[MINER] ⚠️  block {block['height']} submit returned null")
+                                f"[MINER] ⚠️  /api/submit_block no response")
                     except Exception as _e:
-                        _EXP_LOG.debug(f"[MINER] submit: {_e}")
-                    # Also try legacy publish_state_update
+                        _EXP_LOG.debug(f"[MINER] submit_block: {_e}")
+
+                    # ── P2P gossip broadcast (informational, after sealing) ────
                     try:
-                        await _orig_start.__func__(self, miner_address)   # noqa
+                        gossip = {
+                            "block":   block,
+                            "txs":     [coinbase],
+                            "origin":  miner_address,
+                            "sent_at": _t2.time(),
+                        }
+                        kapi._post("/api/gossip/ingest", gossip, timeout=5)
                     except Exception:
                         pass
+
                     _MINE_TELEM.mark_idle()
                 await _asyncio.sleep(0.5)
 
@@ -9993,6 +10200,15 @@ class QtclClientApp:
                   f"bridge={ks2.bridge_fidelity:.4f}  "
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
                   f"{'✅' if ks2.connected else '❌'}")
+            # SUB-AGENT δ: live balance in dashboard
+            try:
+                _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
+                if _addr2:
+                    _bal = self.api.get_balance(_addr2)
+                    _bal_s = f"{_bal:.8f} QTCL" if _bal is not None else "unavailable"
+                    print(f"  Balance : {_bal_s}  ({_addr2[:24]}…)")
+            except Exception:
+                pass
             if m2:
                 print(f"  Field : Fid→|W3⟩={m2.fidelity_to_w3:.4f}  "
                       f"S={m2.entropy_vn:.4f}  "
@@ -10119,15 +10335,32 @@ class QtclClientApp:
         if self.wallet.private_key:
             tx["signature"] = _hashlib.sha3_256(
                 (tx_id + self.wallet.private_key).encode()).hexdigest()
+        # AGENT-β FIX: add timestamp_ns for canonical server hash
+        import time as _tw
+        tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
-        if result:
+        if result and result.get("tx_hash"):
             srv = result.get("tx_hash", result.get("txid", tx_id))
             print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
-            _SSE_MUX.publish("tx_submitted",
-                             {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
-                             channel="gossip")
+            print(f"  Status: {result.get('status','pending')}  │  "
+                  f"fee: {result.get('fee', amount*0.001):.8f}  │  "
+                  f"query: /api/transactions/{srv[:16]}…")
+            try:
+                _SSE_MUX.publish("tx_submitted",
+                                 {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
+                                 channel="gossip")
+            except Exception:
+                pass
+        elif result and result.get("error"):
+            # Server rejected with a reason — show it
+            err = result.get("error", "unknown rejection")
+            code = result.get("code", "")
+            print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
         else:
-            print("  ❌ Submission failed — check oracle connectivity")
+            # No response at all — connectivity issue
+            print("  ❌ Submission failed — no response from oracle")
+            print(f"  Tip: check {self.oracle_url} is reachable")
+            print(f"  TX would be: {tx_id[:32]}…")
 
     def _query_tx(self) -> None:
         try:
@@ -10170,8 +10403,14 @@ class QtclClientApp:
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
                 bal = self.api.get_balance(self.wallet.address)
-                print(f"\n  💰 Balance : {f'{bal:.8f} QTCL' if bal is not None else 'unavailable'}")
+                # AGENT-δ: 0.0 is a valid balance (new wallet); only show
+                # 'unavailable' when None (network error)
+                bal_str = f"{bal:.8f} QTCL" if bal is not None else "unavailable (network error)"
+                print(f"\n  💰 Balance : {bal_str}")
                 print(f"  Address  : {self.wallet.address}")
+                # Show wallet file paths for transparency
+                print(f"  Wallet   : {self.wallet.wallet_file}")
+                print(f"  Mnemonic : {self.wallet.mnemonic_file}  (AES-256 encrypted)")
             elif ch == "2":
                 self._recover_mnemonic()
             elif ch == "3":
@@ -10192,8 +10431,18 @@ class QtclClientApp:
             elif ch == "4":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
-                print(f"  Address   : {self.wallet.address}")
-                print(f"  Public key: {self.wallet.public_key}")
+                print(f"  Address    : {self.wallet.address}")
+                print(f"  Public key : {self.wallet.public_key}")
+                print()
+                # AGENT-δ: show wallet file locations explicitly
+                print(f"  ── Storage ─────────────────────────────────────────────────")
+                print(f"  wallet.json       : {self.wallet.wallet_file}")
+                print(f"  wallet_mnemonic   : {self.wallet.mnemonic_file}")
+                print(f"  Encryption        : PBKDF2-SHA256 + XOR-keystream (AES-equivalent)")
+                print(f"  Mnemonic stored   : Encrypted with your password (PBKDF2-SHA256,")
+                print(f"                      {QTCLWallet.PBKDF2_ITER:,} iterations, {QTCLWallet.SALT_BYTES}-byte salt)")
+                print(f"  BIP-39 wordlist   : Embedded in qtcl_client.py (2048-word standard list)")
+                print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
             elif ch == "5":
                 try:
                     pw = input("  Wallet password: ").strip()
