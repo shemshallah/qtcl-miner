@@ -8394,6 +8394,7 @@ class KoyebAPIClient:
         t   = timeout or self.timeout
         url = f"{self.base_url}{path}"
         last_error = None
+        last_error_response = None
         
         # Exponential backoff retry loop
         for attempt in range(retries):
@@ -8402,7 +8403,11 @@ class KoyebAPIClient:
                     r = self._get_session().post(url, json=payload, timeout=t)
                     if r.status_code in (200, 201, 202):
                         return r.json()
-                    # HTTP error — log but don't retry
+                    # HTTP error — try to parse response, then break (don't retry)
+                    try:
+                        last_error_response = r.json()
+                    except:
+                        last_error_response = {"error": f"HTTP {r.status_code}", "text": r.text[:100]}
                     _EXP_LOG.debug(f"[API] POST {path} → {r.status_code}: {r.text[:80]}")
                     last_error = f"HTTP {r.status_code}: {r.text[:100]}"
                     break  # Don't retry on HTTP errors, only network errors
@@ -8427,6 +8432,15 @@ class KoyebAPIClient:
                         headers={"Content-Type": "application/json"}, method="POST")
                     with urllib.request.urlopen(req, timeout=t) as resp:
                         return _json.loads(resp.read())
+                except urllib.error.HTTPError as e:
+                    # HTTP error response — try to parse it
+                    try:
+                        last_error_response = _json.loads(e.read())
+                    except:
+                        last_error_response = {"error": f"HTTP {e.code}", "text": str(e)[:100]}
+                    _EXP_LOG.debug(f"[API] urllib POST {path} → {e.code}: {str(e)[:80]}")
+                    last_error = f"HTTP {e.code}: {str(e)[:100]}"
+                    break  # Don't retry on HTTP errors
                 except (_urllib_error.URLError, _socket.timeout) as e:
                     last_error = str(e)
                     if attempt < retries - 1:
@@ -8442,6 +8456,9 @@ class KoyebAPIClient:
         
         # Store last error for diagnostics
         self._last_error = last_error
+        # If we got an error response from server, return it (user should see it)
+        if last_error_response is not None:
+            return last_error_response
         return None
 
     def get_chain_tip(self) -> Optional[dict]:
@@ -10470,9 +10487,9 @@ class QtclClientApp:
             print("")
             print(f"  📋 TX details (not submitted):")
             print(f"     Hash:  {tx_id[:32]}…")
-            print(f"     From:  {from_addr}")
-            print(f"     To:    {to_addr}")
-            print(f"     Amt:   {amount} QTCL")
+            print(f"     From:  {tx['from_address'][:16]}…")
+            print(f"     To:    {tx['to_address'][:16]}…")
+            print(f"     Amt:   {tx['amount']} QTCL")
             print("")
             print(f"  💡 Troubleshooting:")
             print(f"     1. Verify {self.oracle_url} is online")
