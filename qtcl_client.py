@@ -39,6 +39,111 @@ import urllib.error as _urllib_error
 import socket as _socket
 import sqlite3
 import subprocess
+import math
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 1: HYPERBOLIC FIELD GEOMETRY (Paradigm: Blocks as Spaces, not Points)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HyperbolicMetrics:
+    """Hyperbolic space (Poincaré disk) distance metrics."""
+    
+    @staticmethod
+    def poincare_dist(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+        """Distance between two points in Poincaré disk model."""
+        x1, y1 = p1
+        x2, y2 = p2
+        num = math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+        d1_sq = 1 - (x1**2 + y1**2)
+        d2_sq = 1 - (x2**2 + y2**2)
+        if d1_sq <= 0 or d2_sq <= 0:
+            return float('inf')
+        denom = 2 * math.sqrt(d1_sq * d2_sq)
+        if denom == 0:
+            return float('inf')
+        arg = 1 + 2 * (num / denom)**2
+        return math.acosh(max(1.0, arg))
+    
+    @staticmethod
+    def encode_pq_to_coords(pq_val: int, scale: float = 0.99) -> Tuple[float, float]:
+        """Map pseudoqubit state pq_val to Poincaré disk point."""
+        theta = (pq_val % 256) * (2 * math.pi / 256)
+        r = min(scale * (pq_val / 256), 0.999)
+        x = r * math.cos(theta)
+        y = r * math.sin(theta)
+        return (x, y)
+
+
+class FieldTopology:
+    """Route enumeration and path tracking through field space."""
+    
+    def __init__(self, pq_last: int, pq_curr: int, entropy_seed: bytes):
+        self.pq_last = pq_last
+        self.pq_curr = pq_curr
+        self.entropy_seed = entropy_seed
+        self.route_hash = hashlib.sha256(
+            entropy_seed + bytes([pq_last, pq_curr])
+        ).hexdigest()
+        self.intermediate_points = self._enumerate_route()
+    
+    def _enumerate_route(self) -> List[int]:
+        """Deterministic intermediate points (geodesic-like path)."""
+        if self.pq_last == self.pq_curr:
+            return [self.pq_last]
+        delta = self.pq_curr - self.pq_last
+        direction = 1 if delta > 0 else -1
+        steps = min(abs(delta), 16)
+        route = [self.pq_last]
+        for i in range(1, steps):
+            pt = self.pq_last + direction * (i * abs(delta) // steps)
+            route.append(pt % 256)
+        route.append(self.pq_curr % 256)
+        return route
+    
+    def path_length(self) -> int:
+        return len(self.intermediate_points)
+    
+    def topology_fingerprint(self) -> str:
+        return self.route_hash[:16]
+
+
+class HyperbolicField:
+    """Block-as-field: Space between pq_last (entry) and pq_curr (exit)."""
+    
+    def __init__(self, pq_last: int, pq_curr: int, entropy_seed: bytes, difficulty: int = 0):
+        self.pq_last = pq_last
+        self.pq_curr = pq_curr
+        self.entropy_seed = entropy_seed
+        self.difficulty = difficulty
+        self.topology = FieldTopology(pq_last, pq_curr, entropy_seed)
+        self.entry_coord = HyperbolicMetrics.encode_pq_to_coords(pq_last)
+        self.exit_coord = HyperbolicMetrics.encode_pq_to_coords(pq_curr)
+        self.field_id = hashlib.sha256(
+            entropy_seed + bytes([pq_last, pq_curr]) + difficulty.to_bytes(4, 'big')
+        ).hexdigest()[:16]
+    
+    def hyperbolic_distance(self) -> float:
+        """Distance from entry to exit in hyperbolic space."""
+        return HyperbolicMetrics.poincare_dist(self.entry_coord, self.exit_coord)
+    
+    def route_complexity(self) -> float:
+        """Field complexity: path length / hyperbolic distance."""
+        hd = self.hyperbolic_distance()
+        if hd == 0:
+            return 1.0
+        return self.topology.path_length() / (hd + 1e-6)
+    
+    def boundary_geometry(self) -> Dict[str, Any]:
+        """Entry/exit boundary metadata."""
+        return {
+            'entry_pq': self.pq_last,
+            'exit_pq': self.pq_curr,
+            'entry_coord': self.entry_coord,
+            'exit_coord': self.exit_coord,
+            'hyperbolic_dist': self.hyperbolic_distance(),
+            'route_length': self.topology.path_length()
+        }
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -100,9 +205,168 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# PORT CONFIGURATION INITIALIZATION (Module-level)
+# LAYER 6: GOSSIP PROTOCOL & DHT SYNC (Advanced P2P Inventory Management)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class GossipMessage:
+    """Message types for gossip protocol."""
+    HELLOACK = "HELLOACK"
+    COMPARE = "COMPARE"
+    REQUEST = "REQUEST"
+    LIST = "LIST"
+    RECEIVE = "RECEIVE"
+    CLOSEACK = "CLOSEACK"
+
+
+class InventorySyncManager:
+    """
+    Advanced P2P inventory sync: HELLOACK→COMPARE→REQUEST→LIST→RECEIVE→CLOSEACK
+    Supports single-item requests + req:ALL bulk sync.
+    """
+    
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.local_inventory: Dict[str, FieldSnapshot] = {}  # field_id → snapshot
+        self.peer_inventories: Dict[str, Dict[str, str]] = {}  # peer_id → {field_id → hash}
+        self._lock = threading.RLock()
+    
+    def add_to_inventory(self, field_id: str, snapshot: FieldSnapshot):
+        """Add field snapshot to local inventory."""
+        with self._lock:
+            self.local_inventory[field_id] = snapshot
+    
+    def get_inventory_hash(self) -> str:
+        """Hash of all field_ids in local inventory."""
+        with self._lock:
+            field_ids = sorted(self.local_inventory.keys())
+        return hashlib.sha256(
+            ''.join(field_ids).encode()
+        ).hexdigest()
+    
+    def inventory_to_list(self) -> Dict[str, Dict[str, Any]]:
+        """Export inventory as {field_id: {hash, metadata}}."""
+        with self._lock:
+            return {
+                fid: {
+                    'hash': hashlib.sha256(fid.encode()).hexdigest()[:16],
+                    'pq_last': snap.pq_last,
+                    'pq_curr': snap.pq_curr
+                }
+                for fid, snap in self.local_inventory.items()
+            }
+    
+    def missing_items(self, peer_inventory: Dict[str, Any]) -> List[str]:
+        """Identify field_ids that peer has but we don't."""
+        with self._lock:
+            local_ids = set(self.local_inventory.keys())
+        peer_ids = set(peer_inventory.keys())
+        return list(peer_ids - local_ids)
+    
+    def handshake_helloack(self) -> Dict[str, Any]:
+        """HELLOACK: Initial greeting with inventory hash."""
+        return {
+            'type': GossipMessage.HELLOACK,
+            'node_id': self.node_id,
+            'inventory_hash': self.get_inventory_hash(),
+            'inventory_count': len(self.local_inventory)
+        }
+    
+    def handle_compare_request(self, peer_inventory_hash: str, peer_inventory_count: int) -> Dict[str, Any]:
+        """COMPARE: Compare inventory hashes. Return difference."""
+        return {
+            'type': GossipMessage.COMPARE,
+            'my_inventory_hash': self.get_inventory_hash(),
+            'my_count': len(self.local_inventory),
+            'peer_hash_match': peer_inventory_hash == self.get_inventory_hash(),
+            'action': 'REQUEST' if peer_inventory_hash != self.get_inventory_hash() else 'SYNC'
+        }
+    
+    def handle_request(self, request_spec: Union[str, List[str]]) -> Dict[str, Any]:
+        """REQUEST: Handle req:ALL or specific field_ids. Return LIST."""
+        if request_spec == 'ALL':
+            items = self.inventory_to_list()
+        elif isinstance(request_spec, list):
+            with self._lock:
+                items = {fid: {
+                    'hash': hashlib.sha256(fid.encode()).hexdigest()[:16],
+                    'pq_last': self.local_inventory[fid].pq_last if fid in self.local_inventory else 0,
+                    'pq_curr': self.local_inventory[fid].pq_curr if fid in self.local_inventory else 0
+                } for fid in request_spec if fid in self.local_inventory}
+        else:
+            items = {}
+        
+        return {
+            'type': GossipMessage.LIST,
+            'items_available': len(items),
+            'items': items
+        }
+    
+    def send_receive(self, items: Dict[str, FieldSnapshot]) -> Dict[str, Any]:
+        """RECEIVE: Accept and store incoming field snapshots."""
+        count = 0
+        with self._lock:
+            for fid, snap in items.items():
+                if fid not in self.local_inventory:
+                    self.local_inventory[fid] = snap
+                    count += 1
+        
+        return {
+            'type': GossipMessage.RECEIVE,
+            'accepted': count,
+            'total': len(items)
+        }
+    
+    def closeack(self) -> Dict[str, Any]:
+        """CLOSEACK: Sync complete."""
+        return {
+            'type': GossipMessage.CLOSEACK,
+            'final_inventory_count': len(self.local_inventory),
+            'final_hash': self.get_inventory_hash()
+        }
+
+
+class DHTPeerBroadcaster:
+    """Broadcast consensus snapshots via gossip to all peers (SSE/HTTP 9091)."""
+    
+    def __init__(self, local_peer_id: str, dht_port: int = 9091):
+        self.local_peer_id = local_peer_id
+        self.dht_port = dht_port
+        self.connected_peers: Dict[str, str] = {}  # peer_id → address:port
+        self._lock = threading.RLock()
+    
+    def register_peer(self, peer_id: str, address: str):
+        """Register a peer for broadcasting."""
+        with self._lock:
+            self.connected_peers[peer_id] = address
+    
+    def broadcast_consensus(self, consensus: ConsensusSnapshot) -> int:
+        """Broadcast consensus snapshot to all registered peers (HTTP POST)."""
+        success_count = 0
+        payload = json.dumps(consensus.to_dict())
+        
+        with self._lock:
+            peers = dict(self.connected_peers)
+        
+        for peer_id, address in peers.items():
+            try:
+                url = f"http://{address}/consensus"
+                req = urllib.request.Request(
+                    url,
+                    data=payload.encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}
+                )
+                response = urllib.request.urlopen(req, timeout=2)
+                if response.status == 200:
+                    success_count += 1
+            except Exception as e:
+                logging.debug(f"Broadcast to {peer_id} failed: {e}")
+        
+        return success_count
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 _SYNC_CONFIG=None;_SYNC_CONFIG_LOCK=threading.Lock()
 def get_sync_config()->Optional['SynchronizedPortConfig']:
  """Get or initialize synchronized port configuration"""
@@ -1039,16 +1303,50 @@ class HashEngine:
         return repr(data).encode("utf-8")
 
     def proof_of_work(self, block_data: dict, difficulty: int) -> Tuple[int, str]:
-        """Find nonce such that hash starts with `difficulty` zeros."""
+        """
+        LAYER 3: Field-based mining (blocks as hyperbolic spaces, not points).
+        Find nonce that satisfies both field topology and entropy-driven difficulty.
+        
+        Returns: (nonce, hash, field_metadata)
+        """
         prefix = "0" * difficulty
         nonce = 0
         candidate = dict(block_data)
+        
+        # Extract or generate entropy seed for field selection
+        entropy_seed = candidate.get('entropy_seed', b'').encode() if isinstance(candidate.get('entropy_seed', b''), str) else candidate.get('entropy_seed', b'')
+        if not entropy_seed or entropy_seed == b'':
+            entropy_seed = hashlib.sha256(str(nonce).encode()).digest()
+        
+        # Pseudoqubit state boundary (pq_last → pq_curr)
+        pq_last = candidate.get('pq_last', nonce % 256)
+        pq_curr = candidate.get('pq_curr', (nonce + 1) % 256)
+        
         while True:
-            candidate["nonce"] = nonce
+            candidate['nonce'] = nonce
+            
+            # Field topology for this nonce
+            field = HyperbolicField(pq_last, pq_curr, entropy_seed, difficulty)
+            
+            # Mining within field space: solve for route through topology
+            route_complexity = field.route_complexity()
+            adjusted_difficulty = max(difficulty, int(difficulty * route_complexity / 10))
+            adjusted_prefix = "0" * adjusted_difficulty
+            
             h = self.compute_block_hash(candidate)
-            if h.startswith(prefix):
+            
+            # Acceptance: hash matches field-adjusted difficulty + route complexity bonus
+            if h.startswith(adjusted_prefix):
+                candidate['field_id'] = field.field_id
+                candidate['route_hash'] = field.topology.route_hash
+                candidate['route_complexity'] = route_complexity
                 return nonce, h
+            
             nonce += 1
+            # Update pq state every N iterations (field boundary crossing)
+            if nonce % 256 == 0:
+                pq_last = pq_curr
+                pq_curr = (pq_curr + 1) % 256
 
     def verify_pow(self, block_data: dict, difficulty: int) -> bool:
         prefix = "0" * difficulty
@@ -1057,6 +1355,77 @@ class HashEngine:
 
 
 HASH_ENGINE = HashEngine()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 2: QUANTUM METRICS & W-STATE VALIDATION (Custom, not Bell Test)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class WStateValidator:
+    """Custom W-state fidelity and entanglement metrics (not Bell)."""
+    
+    fidelity_threshold: float = 0.85
+    coherence_threshold: float = 0.75
+    entropy_threshold: float = 2.0
+    
+    def validate_boundary_crossing(self, pq_last_fidelity: float, pq_curr_fidelity: float) -> Tuple[bool, str]:
+        """Custom W-state validation on field boundary crossing."""
+        if pq_last_fidelity < self.fidelity_threshold:
+            return False, f"entry_fidelity={pq_last_fidelity:.3f} < {self.fidelity_threshold}"
+        if pq_curr_fidelity < self.fidelity_threshold:
+            return False, f"exit_fidelity={pq_curr_fidelity:.3f} < {self.fidelity_threshold}"
+        return True, "boundary_valid"
+    
+    def compute_w_witness(self, coherence: float, discord: float) -> float:
+        """Modified entanglement witness (W-state specific, not Bell)."""
+        return max(0.0, coherence - discord * 0.5)
+    
+    def validate_coherence(self, coherence_l1: float) -> Tuple[bool, str]:
+        """L1 coherence validation."""
+        if coherence_l1 < self.coherence_threshold:
+            return False, f"coherence={coherence_l1:.3f} < {self.coherence_threshold}"
+        return True, "coherence_valid"
+
+
+@dataclass
+class CoherenceSampler:
+    """Track fidelity trajectory and entropy measures throughout field traversal."""
+    
+    fidelity_samples: List[float] = field(default_factory=list)
+    coherence_samples: List[float] = field(default_factory=list)
+    entropy_vn_samples: List[float] = field(default_factory=list)
+    purity_samples: List[float] = field(default_factory=list)
+    
+    def sample_at_boundary(self, fidelity: float, coherence: float, entropy_vn: float = 0.0, purity: float = 1.0):
+        """Record metrics at boundary crossing."""
+        self.fidelity_samples.append(fidelity)
+        self.coherence_samples.append(coherence)
+        self.entropy_vn_samples.append(entropy_vn)
+        self.purity_samples.append(purity)
+    
+    def avg_fidelity(self) -> float:
+        if not self.fidelity_samples:
+            return 0.0
+        return sum(self.fidelity_samples) / len(self.fidelity_samples)
+    
+    def avg_coherence(self) -> float:
+        if not self.coherence_samples:
+            return 0.0
+        return sum(self.coherence_samples) / len(self.coherence_samples)
+    
+    def trajectory_dict(self) -> Dict[str, Any]:
+        return {
+            'fidelity_trajectory': self.fidelity_samples,
+            'coherence_samples': self.coherence_samples,
+            'entropy_vn_samples': self.entropy_vn_samples,
+            'purity_samples': self.purity_samples,
+            'avg_fidelity': self.avg_fidelity(),
+            'avg_coherence': self.avg_coherence()
+        }
+
+
+W_STATE_VALIDATOR = WStateValidator()
 
 
 # ── ConfigManager ─────────────────────────────────────────────────────────────
@@ -1178,6 +1547,186 @@ except ImportError:
     HAS_PSYCOPG = False
     psycopg = None  # type: ignore
     ConnectionPool = None  # type: ignore
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 4: ATOMIC DB SNAPSHOTS & COHERENCE TRACKING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class FieldSnapshot:
+    """Atomic snapshot of field state with quantum metrics."""
+    
+    field_id: str
+    pq_last: int
+    pq_curr: int
+    route_hash: str
+    entropy_seed: str
+    difficulty_bits: int
+    fidelity_trajectory: List[float]
+    coherence_samples: List[float]
+    entropy_vn: float
+    purity: float
+    witness: float
+    hyperbolic_dist: float
+    route_length: int
+    mining_time: float
+    mining_attempts: int
+    timestamp: str
+    peer_id: str
+    block_height: Optional[int] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class AtomicFieldWriter:
+    """Transactional field snapshot writer (no partial updates)."""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.RLock()
+    
+    def write_snapshot(self, snapshot: FieldSnapshot) -> bool:
+        """Atomic write to local SQLite (transactional)."""
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute("BEGIN TRANSACTION")
+                try:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO field_snapshots 
+                        (field_id, pq_last, pq_curr, route_hash, entropy_seed, difficulty_bits,
+                         fidelity_trajectory, coherence_samples, entropy_vn, purity, witness,
+                         hyperbolic_dist, route_length, mining_time, mining_attempts, timestamp, peer_id, block_height)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        snapshot.field_id, snapshot.pq_last, snapshot.pq_curr, snapshot.route_hash,
+                        snapshot.entropy_seed, snapshot.difficulty_bits,
+                        json.dumps(snapshot.fidelity_trajectory), json.dumps(snapshot.coherence_samples),
+                        snapshot.entropy_vn, snapshot.purity, snapshot.witness,
+                        snapshot.hyperbolic_dist, snapshot.route_length,
+                        snapshot.mining_time, snapshot.mining_attempts,
+                        snapshot.timestamp, snapshot.peer_id, snapshot.block_height
+                    ))
+                    conn.commit()
+                    conn.close()
+                    return True
+                except Exception as e:
+                    conn.rollback()
+                    conn.close()
+                    logging.error(f"FieldSnapshot write failed: {e}")
+                    return False
+        except Exception as e:
+            logging.error(f"AtomicFieldWriter error: {e}")
+            return False
+    
+    def read_snapshot(self, field_id: str) -> Optional[FieldSnapshot]:
+        """Read snapshot from local DB."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute(
+                "SELECT * FROM field_snapshots WHERE field_id = ?",
+                (field_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                return FieldSnapshot(*row)
+            return None
+        except Exception as e:
+            logging.error(f"FieldSnapshot read failed: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 5: P2P CONSENSUS AGGREGATION (MEAN of peer snapshots)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ConsensusSnapshot:
+    """Aggregated consensus state across all accessible peers."""
+    
+    field_id: str
+    consensus_pq_last: float
+    consensus_pq_curr: float
+    consensus_fidelity: float
+    consensus_coherence: float
+    consensus_entropy_vn: float
+    contributing_peers: int
+    aggregation_timestamp: str
+    weights_applied: Dict[str, float]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class ConsensusAggregator:
+    """Aggregate field snapshots from all accessible peers (weighted mean)."""
+    
+    def __init__(self, local_peer_id: str):
+        self.local_peer_id = local_peer_id
+        self.peer_snapshots: Dict[str, FieldSnapshot] = {}
+        self._lock = threading.RLock()
+    
+    def register_peer_snapshot(self, peer_id: str, snapshot: FieldSnapshot):
+        """Store peer snapshot for aggregation."""
+        with self._lock:
+            self.peer_snapshots[peer_id] = snapshot
+    
+    def compute_consensus(self, field_id: str) -> Optional[ConsensusSnapshot]:
+        """Weighted mean aggregation across all peer snapshots for a field."""
+        with self._lock:
+            matching_snapshots = {
+                pid: snap for pid, snap in self.peer_snapshots.items()
+                if snap.field_id == field_id
+            }
+        
+        if not matching_snapshots:
+            return None
+        
+        # Weight by fidelity
+        total_weight = sum(snap.purity for snap in matching_snapshots.values())
+        if total_weight == 0:
+            total_weight = len(matching_snapshots)
+        
+        weights = {
+            pid: snap.purity / total_weight
+            for pid, snap in matching_snapshots.items()
+        }
+        
+        consensus_pq_last = sum(
+            snap.pq_last * weights[pid]
+            for pid, snap in matching_snapshots.items()
+        )
+        consensus_pq_curr = sum(
+            snap.pq_curr * weights[pid]
+            for pid, snap in matching_snapshots.items()
+        )
+        consensus_fidelity = sum(
+            (max(snap.fidelity_trajectory) if snap.fidelity_trajectory else 0) * weights[pid]
+            for pid, snap in matching_snapshots.items()
+        )
+        consensus_coherence = sum(
+            (max(snap.coherence_samples) if snap.coherence_samples else 0) * weights[pid]
+            for pid, snap in matching_snapshots.items()
+        )
+        consensus_entropy_vn = sum(
+            snap.entropy_vn * weights[pid]
+            for pid, snap in matching_snapshots.items()
+        )
+        
+        return ConsensusSnapshot(
+            field_id=field_id,
+            consensus_pq_last=consensus_pq_last,
+            consensus_pq_curr=consensus_pq_curr,
+            consensus_fidelity=consensus_fidelity,
+            consensus_coherence=consensus_coherence,
+            consensus_entropy_vn=consensus_entropy_vn,
+            contributing_peers=len(matching_snapshots),
+            aggregation_timestamp=time.strftime('%Y-%m-%d %H:%M:%S'),
+            weights_applied=weights
+        )
 
 
 class LocalBlockchainDB:
