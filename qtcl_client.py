@@ -9792,7 +9792,7 @@ class QtclClientApp:
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
         self._stop         = _threading.Event()
         self._metric_th: Optional[_threading.Thread] = None
-        self._db_path      = _Path("data/qtcl_client.db")
+        self._db_path      = _Path("qtcl_blockchain.db")  # FIX: Use main blockchain DB, not isolated client DB
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
             f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
