@@ -10207,7 +10207,9 @@ class QtclClientApp:
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                 
                 # Mining loop: SHA3-256 PoW with JSON block data (like working mobile version)
-                target = (1 << (256 - difficulty_bits)) - 1  # Bit-based target
+                # ⚠️ CRITICAL: Server validates with hex zeros: block_hash.startswith("0" * difficulty_bits)
+                # So difficulty_bits=13 means need 13 leading hex zeros (0000000000000...)
+                hex_zeros_required = "0" * difficulty_bits
                 while True:
                     # Calculate block hash using SHA3-256 with JSON
                     block_hash = _hash_block(target_height, parent_hash, timestamp, nonce, 
@@ -10215,9 +10217,8 @@ class QtclClientApp:
                                            getattr(getattr(self, 'wallet', None), 'address', "0"*64),
                                            w_entropy)
                     
-                    # Check if hash meets difficulty target (bit-based, like mobile version)
-                    hash_int = int(block_hash, 16)
-                    if hash_int <= target:
+                    # Check if hash meets difficulty (hex zeros, matches server validation at line 7400)
+                    if block_hash.startswith(hex_zeros_required):
                         # FOUND BLOCK!
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
                         
