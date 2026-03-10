@@ -7030,9 +7030,15 @@ class AsyncOracleMiner:
         self.dht = dht
         self.mining = False
         self.current_block = None
+        
+        # FIX: Track locally-mined blocks to prevent height orphaning race
+        self._last_mined_height = 0        # Height of last block we successfully mined
+        self._last_mined_hash = "0" * 64   # Hash of last block we mined
+        self._consensus_height = 0         # Last height oracle confirmed
+        self._mining_lock = threading.Lock()  # Protect shared state
     
     async def mine_block(self, miner_address: str) -> Optional[Dict]:
-        """Mine block with oracle consensus"""
+        """Mine block with oracle consensus (FIXED: prevents height orphaning)"""
         
         # Get consensus state from oracle
         chain_state = await self.oracle.query_chain_state()
@@ -7040,27 +7046,50 @@ class AsyncOracleMiner:
             logger.warning("[MINER] No consensus state from oracle")
             return None
         
-        current_height = chain_state.get('current_height', 0)
+        oracle_height = chain_state.get('current_height', 0)
         current_difficulty = chain_state.get('difficulty_bits', 12)
+        oracle_hash = chain_state.get('last_block_hash', '0' * 64)
         
-        # Build block
+        # FIX: Determine target height using local state tracking
+        # This prevents mining the same height twice due to HTTP API lag
+        with self._mining_lock:
+            self._consensus_height = oracle_height
+            
+            # Use max of oracle height and last mined height
+            # If we mined ahead, use our height; otherwise trust oracle
+            if self._last_mined_height > oracle_height:
+                # We're ahead of oracle — build on our last mined block
+                target_height = self._last_mined_height + 1
+                parent_hash = self._last_mined_hash
+                logger.debug(f"[MINER] Mining ahead: h={target_height} (oracle={oracle_height})")
+            else:
+                # Oracle is current or ahead — build on oracle's tip
+                target_height = oracle_height + 1
+                parent_hash = oracle_hash
+                logger.debug(f"[MINER] Mining at consensus: h={target_height}")
+        
+        # Build block with guaranteed-unique height
         block = {
-            'height': current_height + 1,
+            'height': target_height,
             'timestamp': int(time.time()),
             'miner_address': miner_address,
             'difficulty': current_difficulty,
             'nonce': 0,
-            'parent_hash': chain_state.get('last_block_hash', '0' * 64),
+            'parent_hash': parent_hash,
         }
         
         # Mining loop
         while self.mining:
             # Solve PoW — standard leading-zero hex check
-            # difficulty = N means hash must start with N hex zeros ('0'*N)
-            # This matches server's 2^(256-bits) threshold exactly.
             block_hash = hashlib.sha256(json.dumps(block, sort_keys=True).encode()).hexdigest()
             if block_hash.startswith('0' * current_difficulty):
                 block['hash'] = block_hash
+                
+                # FIX: Update local state IMMEDIATELY upon solution
+                # Don't wait for HTTP API to confirm block persistence
+                with self._mining_lock:
+                    self._last_mined_height = block['height']
+                    self._last_mined_hash = block_hash
                 
                 # Emit DHT event
                 await self.dht.emit_event(DHTEvent(
@@ -7068,34 +7097,76 @@ class AsyncOracleMiner:
                     data=block,
                 ))
                 
+                logger.info(f"[MINER] ✅ Block #{block['height']} mined | parent={parent_hash[:16]}… | hash={block_hash[:16]}…")
                 return block
             
             # Next nonce
             block['nonce'] += 1
             
-            # Check for timeout
-            if block['nonce'] % 1000 == 0:
+            # Check for timeout / yield periodically
+            if block['nonce'] % 10000 == 0:
                 await asyncio.sleep(0)
+                
+                # FIX: Every 10k nonces, check if oracle advanced
+                # If it did, restart mining from new height
+                new_state = await self.oracle.query_chain_state()
+                if new_state:
+                    new_height = new_state.get('current_height', 0)
+                    with self._mining_lock:
+                        if new_height > self._consensus_height:
+                            logger.info(f"[MINER] Oracle advanced to h={new_height} during mining — restarting")
+                            return None  # Restart mining loop
     
     async def start_mining(self, miner_address: str):
-        """Start mining loop"""
+        """Start mining loop with proper failure handling"""
         self.mining = True
+        consecutive_failures = 0
+        max_failures_before_reset = 3
+        
         while self.mining:
-            block = await self.mine_block(miner_address)
-            if block:
-                # Broadcast to oracle
-                snapshot = StateSnapshot(
-                    height=block['height'],
-                    blocks=[block],
-                    transactions=[],
-                    wallets={},
-                    chain_state={},
-                    difficulty=block['difficulty'],
-                    timestamp=time.time(),
-                )
-                await self.oracle.publish_state_update(snapshot)
-            
-            await asyncio.sleep(1)
+            try:
+                block = await self.mine_block(miner_address)
+                if block:
+                    # Broadcast to oracle for consensus aggregation
+                    snapshot = StateSnapshot(
+                        height=block['height'],
+                        blocks=[block],
+                        transactions=[],
+                        wallets={},
+                        chain_state={},
+                        difficulty=block['difficulty'],
+                        timestamp=time.time(),
+                    )
+                    await self.oracle.publish_state_update(snapshot)
+                    consecutive_failures = 0
+                    
+                    logger.info(f"[MINER] Block #{block['height']} broadcast to oracle for consensus")
+                else:
+                    # mine_block returned None (oracle advanced, no consensus, etc)
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures_before_reset:
+                        # Too many failures — reset and query fresh oracle state
+                        logger.warning(f"[MINER] {consecutive_failures} consecutive failures — resetting local state and querying oracle")
+                        with self._mining_lock:
+                            # Reset only if oracle is ahead, don't lose progress
+                            fresh_state = await self.oracle.query_chain_state()
+                            if fresh_state:
+                                fresh_height = fresh_state.get('current_height', 0)
+                                if fresh_height > self._last_mined_height:
+                                    self._consensus_height = fresh_height
+                        consecutive_failures = 0
+                        await asyncio.sleep(1)
+                    else:
+                        # Quick retry
+                        await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                self.mining = False
+                logger.info("[MINER] Mining cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[MINER] Unexpected error in start_mining: {e}", exc_info=True)
+                consecutive_failures += 1
+                await asyncio.sleep(2)
     
     def stop_mining(self):
         """Stop mining"""
