@@ -10187,7 +10187,9 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                difficulty_bits = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)  # Read from API
+                # TEMP: Hardcoded to 5 leading hex zeros (reasonable for 50k H/s = ~1-2 sec blocks)
+                # TODO: Change back to: difficulty_bits = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)
+                difficulty_bits = 5
                 
                 # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
                 with _mining_lock:
