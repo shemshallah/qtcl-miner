@@ -8830,7 +8830,7 @@ class KoyebAPIClient:
 
     def get_balance(self, address: str) -> Optional[float]:
         """
-        SUB-AGENT β: Full 4-tier balance cascade.
+        SUB-AGENT β: Full 4-tier balance cascade (OPUS-FIXED).
 
         Tier 1: /api/address/{addr}/balance  — confirmed wallet row
                 (was returning raw BASE UNITS not QTCL — now normalised)
@@ -8840,15 +8840,24 @@ class KoyebAPIClient:
                 (catches miners whose wallet_addresses row is stale)
         Tier 4: 0.0                          — address verified unreachable
 
+        HOTFIX (Opus Agent ζ): Removed broken _qtcl() heuristic at line 8850
+        that assumed value > 1000 = base units. This caused 1164 → 11.64 bug.
+        Now trusts each endpoint to return correct format.
+
         Returns None ONLY on total network failure.
         """
         def _qtcl(raw) -> Optional[float]:
-            """Normalise: raw could be QTCL float OR base-unit int."""
+            """Normalise: trust the endpoint format, don't assume base units."""
             try:
                 f = float(raw)
-                # Heuristic: if value > 1000 and no decimal, likely base units
-                if f > 1000 and f == int(f):
-                    return f / 100.0
+                # ✅ HOTFIX: Removed the broken heuristic below
+                # OLD CODE (BROKEN):
+                #   if f > 1000 and f == int(f):
+                #       return f / 100.0  ← Caused 1164/100 = 11.64 BUG!
+                # 
+                # NEW CODE (FIXED):
+                # Each endpoint is responsible for returning correct format.
+                # Trust the endpoint, don't try to auto-detect base units vs QTCL.
                 return f
             except Exception:
                 return None
