@@ -10124,7 +10124,7 @@ class QtclClientApp:
 
         async def _mine_inline():
             """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
-            import hashlib as _hl, time as _t
+            import hashlib as _hl, json as _j, time as _t
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
@@ -10134,37 +10134,21 @@ class QtclClientApp:
             _last_mined_hash = "0" * 64
             _mining_lock = _threading.Lock()
             
-            def _make_target(difficulty_bits: int) -> int:
-                """Convert difficulty bits to target value (Bitcoin style)
-                
-                difficulty_bits = number of leading zero BITS required
-                target = 2^(256 - difficulty_bits)
-                
-                Example: difficulty_bits=5 means hash must be < 2^251
-                """
-                if difficulty_bits >= 256:
-                    return 0
-                if difficulty_bits <= 0:
-                    return (1 << 256) - 1
-                return 1 << (256 - difficulty_bits)
-            
-            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int) -> str:
-                """SHA256(SHA256(height || parent || timestamp || nonce))
-                
-                Pure Bitcoin-style block hashing. No entropy, no W-states, no JSON.
-                Just deterministic binary data.
-                """
-                # Concatenate block fields (pure binary, no JSON nonsense)
-                block_data = (
-                    height.to_bytes(8, 'big') +           # 8 bytes: block height
-                    bytes.fromhex(parent_hash) +          # 32 bytes: parent hash
-                    timestamp.to_bytes(8, 'big') +        # 8 bytes: timestamp
-                    nonce.to_bytes(8, 'big')              # 8 bytes: nonce
-                )
-                # Bitcoin double-SHA256
-                hash1 = _hl.sha256(block_data).digest()
-                hash2 = _hl.sha256(hash1).digest()
-                return hash2.hex()
+            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int, 
+                           difficulty_bits: int, merkle_root: str, miner_addr: str, w_entropy: str) -> str:
+                """SHA3-256 of JSON block data (matches working mobile version)"""
+                block_data = {
+                    'height': height,
+                    'parent_hash': parent_hash,
+                    'merkle_root': merkle_root,
+                    'timestamp_s': timestamp,
+                    'difficulty_bits': difficulty_bits,
+                    'nonce': nonce,
+                    'miner_address': miner_addr,
+                    'w_entropy_hash': w_entropy,
+                }
+                block_json = _j.dumps(block_data, sort_keys=True)
+                return _hl.sha3_256(block_json.encode()).hexdigest()
             
             async def _get_chain_tip_with_retry():
                 """Get chain tip with exponential backoff"""
@@ -10203,8 +10187,7 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                difficulty_bits = 5  # HARDCODED FOR TESTING: 5 bits = very easy
-                target = _make_target(difficulty_bits)
+                difficulty_bits = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)  # Read from API
                 
                 # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
                 with _mining_lock:
@@ -10217,21 +10200,24 @@ class QtclClientApp:
                 
                 timestamp = int(_t.time())
                 nonce = 0
+                merkle_root = _hl.sha3_256(b"").hexdigest()  # Simple empty merkle for now
+                w_entropy = _hl.sha3_256(str(_t.time()).encode()).hexdigest()[:64]  # Simple entropy
                 
                 _EXP_LOG.info(f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} parent={parent_hash[:16]}…")
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                 
-                # Mining loop: pure SHA256 PoW
+                # Mining loop: SHA3-256 PoW with JSON block data (like working mobile version)
+                target = (1 << (256 - difficulty_bits)) - 1  # Bit-based target
                 while True:
-                    # Calculate block hash
-                    block_hash = _hash_block(target_height, parent_hash, timestamp, nonce)
+                    # Calculate block hash using SHA3-256 with JSON
+                    block_hash = _hash_block(target_height, parent_hash, timestamp, nonce, 
+                                           difficulty_bits, merkle_root, 
+                                           getattr(getattr(self, 'wallet', None), 'address', "0"*64),
+                                           w_entropy)
                     
-                    # Check if hash meets difficulty target
-                    # ⚠️ SERVER COMPATIBILITY: Server checks hex zeros, not bits!
-                    # Line 7400 in server.py: if not block_hash.startswith("0" * difficulty_bits)
-                    # So difficulty_bits = N hex zeros required
-                    # Example: difficulty_bits=5 means hash must start with "00000"
-                    if block_hash.startswith("0" * difficulty_bits):
+                    # Check if hash meets difficulty target (bit-based, like mobile version)
+                    hash_int = int(block_hash, 16)
+                    if hash_int <= target:
                         # FOUND BLOCK!
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
                         
