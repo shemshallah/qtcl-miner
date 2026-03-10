@@ -8862,18 +8862,19 @@ class KoyebAPIClient:
             except Exception:
                 return None
 
-        # ── Tier 0: /api/address/{addr}/earned — ledger ground truth ────────────
-        # Reads confirmed transactions directly, bypasses wallet_addresses cache.
-        # This is the ONLY reliable source for miners (wallet_addresses may be stale
-        # if blocks were submitted via gossip instead of /api/submit_block).
-        r0 = self._get(f"/api/address/{address}/earned")
+        # ── Tier 0: /api/wallet?address=... — live wallet_addresses row ─────────
+        # Same endpoint the mobile client uses; reads directly from wallet_addresses
+        # which is updated synchronously on every block reward.  The old /earned
+        # aggregate could return a stale cached value and short-circuit the cascade
+        # before fresher tiers were reached, causing balance to appear frozen.
+        r0 = self._get("/api/wallet", params={"address": address})
         if r0 is not None and "error" not in r0:
-            v = _qtcl(r0.get("balance_qtcl", r0.get("confirmed_balance",
-                                                       r0.get("balance"))))
-            if v is not None:
-                _EXP_LOG.debug(f"[BALANCE] Tier-0 /earned: {v:.4f} QTCL "
-                               f"({r0.get('blocks_mined',0)} blocks mined)")
-                return v
+            for k in ("balance", "balance_qtcl", "confirmed_balance"):
+                if k in r0:
+                    v = _qtcl(r0[k])
+                    if v is not None:
+                        _EXP_LOG.debug(f"[BALANCE] Tier-0 /wallet: {v:.4f} QTCL")
+                        return v
 
         # ── Tier 1: /api/address/{addr}/balance ──────────────────────────────
         r1 = self._get(f"/api/address/{address}/balance")
