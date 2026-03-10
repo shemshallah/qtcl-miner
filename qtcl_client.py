@@ -10227,8 +10227,11 @@ class QtclClientApp:
                     block_hash = _hash_block(target_height, parent_hash, timestamp, nonce)
                     
                     # Check if hash meets difficulty target
-                    hash_as_int = int(block_hash, 16)
-                    if hash_as_int < target:
+                    # ⚠️ SERVER COMPATIBILITY: Server checks hex zeros, not bits!
+                    # Line 7400 in server.py: if not block_hash.startswith("0" * difficulty_bits)
+                    # So difficulty_bits = N hex zeros required
+                    # Example: difficulty_bits=5 means hash must start with "00000"
+                    if block_hash.startswith("0" * difficulty_bits):
                         # FOUND BLOCK!
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
                         
@@ -10250,25 +10253,48 @@ class QtclClientApp:
                         
                         # Submit to oracle/server
                         try:
+                            # Get miner address
+                            miner_addr = getattr(getattr(self, 'wallet', None), 'address', None)
+                            if not miner_addr:
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No wallet address, using default")
+                                miner_addr = "0" * 64
+                            
+                            # Server expects: header{block_hash, miner_address, ...} + transactions[]
+                            # PoW validation: server checks block_hash.startswith("0" * difficulty_bits)
+                            # So difficulty_bits is HEX zeros, not BITS!
+                            # If diff=5, need 5 hex zeros = "00000..."
+                            
                             submit_payload = {
-                                "height": target_height,
-                                "block_hash": block_hash,
-                                "parent_hash": parent_hash,
-                                "nonce": nonce,
-                                "timestamp": timestamp,
-                                "miner_address": self.wallet.address,
-                                "difficulty_bits": difficulty_bits,
+                                "header": {
+                                    "height": target_height,
+                                    "block_hash": block_hash,
+                                    "parent_hash": parent_hash,
+                                    "timestamp_s": timestamp,
+                                    "nonce": nonce,
+                                    "miner_address": miner_addr,
+                                    "difficulty_bits": difficulty_bits,
+                                    "merkle_root": "0" * 64,  # For now, simple root
+                                    "w_state_fidelity": 0.75,  # Dummy value
+                                    "w_entropy_hash": "0" * 64,
+                                    "pq_curr": target_height,
+                                    "pq_last": target_height - 1,
+                                },
+                                "transactions": [],
                             }
+                            
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
                             
                             _MINE_TELEM.mark_submitting()
                             r = kapi._post("/api/submit_block", submit_payload, timeout=20)
                             
                             if r and r.get("success"):
                                 _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
+                            elif r and r.get("block_hash"):
+                                _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
                             else:
                                 _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Submit failed: {r}")
                         except Exception as _e:
-                            _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}")
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}", exc_info=True)
                         
                         _MINE_TELEM.mark_idle()
                         break  # Restart with new chain tip
