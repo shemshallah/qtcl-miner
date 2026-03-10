@@ -8862,19 +8862,18 @@ class KoyebAPIClient:
             except Exception:
                 return None
 
-        # ── Tier 0: /api/wallet?address=... — live wallet_addresses row ─────────
-        # Same endpoint the mobile client uses; reads directly from wallet_addresses
-        # which is updated synchronously on every block reward.  The old /earned
-        # aggregate could return a stale cached value and short-circuit the cascade
-        # before fresher tiers were reached, causing balance to appear frozen.
-        r0 = self._get("/api/wallet", params={"address": address})
+        # ── Tier 0: /api/address/{addr}/earned — ledger ground truth ────────────
+        # Reads confirmed transactions directly, bypasses wallet_addresses cache.
+        # This is the ONLY reliable source for miners (wallet_addresses may be stale
+        # if blocks were submitted via gossip instead of /api/submit_block).
+        r0 = self._get(f"/api/address/{address}/earned")
         if r0 is not None and "error" not in r0:
-            for k in ("balance", "balance_qtcl", "confirmed_balance"):
-                if k in r0:
-                    v = _qtcl(r0[k])
-                    if v is not None:
-                        _EXP_LOG.debug(f"[BALANCE] Tier-0 /wallet: {v:.4f} QTCL")
-                        return v
+            v = _qtcl(r0.get("balance_qtcl", r0.get("confirmed_balance",
+                                                       r0.get("balance"))))
+            if v is not None:
+                _EXP_LOG.debug(f"[BALANCE] Tier-0 /earned: {v:.4f} QTCL "
+                               f"({r0.get('blocks_mined',0)} blocks mined)")
+                return v
 
         # ── Tier 1: /api/address/{addr}/balance ──────────────────────────────
         r1 = self._get(f"/api/address/{address}/balance")
@@ -10826,10 +10825,10 @@ class QtclClientApp:
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
             srv = result.get("tx_hash", result.get("txid", tx_id))
-            print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
+            print(f"\n  ✅ Submitted  │  hash: {srv}")
             print(f"  Status: {result.get('status','pending')}  │  "
                   f"fee: {result.get('fee', amount*0.001):.8f}  │  "
-                  f"query: /api/transactions/{srv[:16]}…")
+                  f"query: /api/transactions/{srv[:32]}…")
             try:
                 _SSE_MUX.publish("tx_submitted",
                                  {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
@@ -10870,7 +10869,7 @@ class QtclClientApp:
         print("\n" + "─" * 58)
         if r:
             print(f"  Status  : {r.get('status','?').upper()}")
-            print(f"  Hash    : {r.get('tx_hash', tx_hash)[:42]}")
+            print(f"  Hash    : {r.get('tx_hash', tx_hash)}")
             print(f"  Amount  : {r.get('amount', '?')} QTCL")
             print(f"  From    : {r.get('from_address', '?')}")
             print(f"  To      : {r.get('to_address', '?')}")
