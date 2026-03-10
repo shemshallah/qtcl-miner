@@ -7036,11 +7036,169 @@ class AsyncOracleMiner:
         self._last_mined_hash = "0" * 64   # Hash of last block we mined
         self._consensus_height = 0         # Last height oracle confirmed
         self._mining_lock = threading.Lock()  # Protect shared state
+        self._last_height_change_time = time.time()  # Track when local height last changed
+        self.peer_registry = {}  # Populated by P2P system
+    
+    
+    async def _check_oracle_consensus_gate(self, timeout_sec=5):
+        """Query all 5 oracles in parallel, return consensus height or None"""
+        import asyncio
+        
+        oracle_endpoints = [
+            'https://qtcl-blockchain.koyeb.app/api/oracle/1',
+            'https://qtcl-blockchain.koyeb.app/api/oracle/2',
+            'https://qtcl-blockchain.koyeb.app/api/oracle/3',
+            'https://qtcl-blockchain.koyeb.app/api/oracle/4',
+            'https://qtcl-blockchain.koyeb.app/api/oracle/5',
+        ]
+        
+        heights = []
+        
+        async def query_single_oracle(url, idx):
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1.5)) as session:
+                    async with session.get(f"{url}/status", json={'query': 'height'}) as resp:
+                        data = await resp.json()
+                        return (idx+1, data.get('block_height', 0))
+            except Exception as e:
+                logger.debug(f"[GATE] Oracle {idx+1} query failed: {e}")
+                return None
+        
+        try:
+            tasks = [query_single_oracle(url, i) for i, url in enumerate(oracle_endpoints)]
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout_sec)
+            heights = [r for r in results if r is not None]
+        except asyncio.TimeoutError:
+            logger.warning(f"[GATE] Oracle consensus timeout after {timeout_sec}s")
+            return None, False, True
+        
+        if len(heights) < 3:
+            logger.warning(f"[GATE] Insufficient oracle responses: {len(heights)}/5")
+            return None, False, True
+        
+        from collections import Counter
+        votes = Counter([h for _, h in heights])
+        most_common_h, vote_count = votes.most_common(1)[0]
+        
+        all_heights = set(h for _, h in heights)
+        divergence = len(all_heights) > 1
+        
+        if vote_count >= 3:
+            if divergence:
+                logger.warning(f"[GATE] Oracle divergence detected: {all_heights}, using consensus {most_common_h}")
+            return most_common_h, True, divergence
+        
+        logger.error(f"[GATE] No 3-of-5 consensus: {dict(votes)}")
+        return None, False, True
+    
+    async def _check_peer_consensus_fallback(self, min_peers=5, timeout_sec=5):
+        """Query 5+ peers for consensus, fallback if oracles fail"""
+        import asyncio
+        
+        if not hasattr(self, 'peer_registry') or not self.peer_registry:
+            return None, []
+        
+        try:
+            active_peers = list(self.peer_registry.items())[:10]
+        except:
+            return None, []
+        
+        if len(active_peers) < min_peers:
+            logger.warning(f"[GATE] Not enough peers: {len(active_peers)}/{min_peers}")
+            return None, []
+        
+        peer_heights = []
+        
+        async def query_peer(peer_id, peer_info):
+            try:
+                h = peer_info.get('last_known_height', 0)
+                if h > 0:
+                    return (peer_id, h)
+            except Exception as e:
+                logger.debug(f"[GATE] Peer {peer_id} query failed: {e}")
+            return None
+        
+        try:
+            tasks = [query_peer(pid, info) for pid, info in active_peers]
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout_sec)
+            peer_heights = [r for r in results if r is not None]
+        except asyncio.TimeoutError:
+            logger.warning(f"[GATE] Peer consensus timeout after {timeout_sec}s")
+            return None, peer_heights
+        
+        if len(peer_heights) < min_peers:
+            logger.warning(f"[GATE] Insufficient peer responses: {len(peer_heights)}/{min_peers}")
+            return None, peer_heights
+        
+        from collections import Counter
+        votes = Counter([h for _, h in peer_heights])
+        most_common_h, vote_count = votes.most_common(1)[0]
+        
+        if vote_count / len(peer_heights) >= 0.6:
+            return most_common_h, peer_heights
+        
+        logger.warning(f"[GATE] No peer consensus (60% needed): {dict(votes)}")
+        return None, peer_heights
+    
+    async def _check_local_chain_state(self):
+        """Fallback: allow mining on local chain only if stable (RISKY)"""
+        local_height = self._last_mined_height
+        
+        if not hasattr(self, '_last_height_change_time'):
+            self._last_height_change_time = time.time()
+        
+        time_stable = time.time() - self._last_height_change_time > 5.0
+        
+        if local_height > 0 and time_stable:
+            logger.warning(f"[GATE] ⚠️ RISKY: Allowing mining on local chain only (height={local_height})")
+            return local_height
+        
+        return None
     
     async def mine_block(self, miner_address: str) -> Optional[Dict]:
-        """Mine block with oracle consensus (FIXED: prevents height orphaning)"""
+        """Mine block with oracle consensus GATE — prevents forks before they start"""
         
-        # Get consensus state from oracle
+        # ════════════════════════════════════════════════════════════════════════════
+        # STEP 1: CONSENSUS GATE CHECK (NEW)
+        # ════════════════════════════════════════════════════════════════════════════
+        
+        consensus_height = None
+        divergence_detected = False
+        
+        # Try oracle consensus (Priority 1)
+        oracle_h, oracle_ok, divergence = await self._check_oracle_consensus_gate(timeout_sec=5)
+        if oracle_ok:
+            consensus_height = oracle_h
+            divergence_detected = divergence
+            logger.info(f"[GATE] ✅ Oracle consensus: height={consensus_height}")
+        else:
+            # Fallback to peer consensus (Priority 2)
+            peer_h, peer_results = await self._check_peer_consensus_fallback(min_peers=5, timeout_sec=5)
+            if peer_h is not None:
+                consensus_height = peer_h
+                logger.info(f"[GATE] ✅ Peer consensus fallback: height={consensus_height}")
+            else:
+                # Fallback to local state (Priority 3 — RISKY)
+                local_h = await self._check_local_chain_state()
+                if local_h is not None:
+                    consensus_height = local_h
+                else:
+                    # NO CONSENSUS — BLOCK MINING
+                    logger.error("[GATE] ❌ BLOCKED: No consensus (oracle, peer, or local). Aborting mining.")
+                    return None
+        
+        # Verify local height matches consensus
+        if self._last_mined_height != 0 and self._last_mined_height != consensus_height - 1:
+            if consensus_height != self._last_mined_height + 1:
+                logger.error(f"[GATE] Height mismatch: local={self._last_mined_height}, consensus={consensus_height}")
+                return None
+        
+        # ════════════════════════════════════════════════════════════════════════════
+        # STEP 2: ORIGINAL MINING LOGIC (UNCHANGED)
+        # ════════════════════════════════════════════════════════════════════════════
+        
+        # Get consensus state from oracle (already validated above)
         chain_state = await self.oracle.query_chain_state()
         if not chain_state:
             logger.warning("[MINER] No consensus state from oracle")
@@ -7049,6 +7207,11 @@ class AsyncOracleMiner:
         oracle_height = chain_state.get('current_height', 0)
         current_difficulty = chain_state.get('difficulty_bits', 12)
         oracle_hash = chain_state.get('last_block_hash', '0' * 64)
+        
+        # Verify consensus height matches oracle query
+        if oracle_height != consensus_height and oracle_height != consensus_height - 1:
+            logger.warning(f"[MINER] Oracle height mismatch after gate check: {oracle_height} vs {consensus_height}")
+            return None
         
         # FIX: Determine target height using local state tracking
         # This prevents mining the same height twice due to HTTP API lag
@@ -7090,6 +7253,7 @@ class AsyncOracleMiner:
                 with self._mining_lock:
                     self._last_mined_height = block['height']
                     self._last_mined_hash = block_hash
+                    self._last_height_change_time = time.time()  # Track time for local stability check
                 
                 # Emit DHT event
                 await self.dht.emit_event(DHTEvent(
@@ -7118,16 +7282,71 @@ class AsyncOracleMiner:
                             return None  # Restart mining loop
     
     async def start_mining(self, miner_address: str):
-        """Start mining loop with proper failure handling"""
+        """Start mining loop with fork detection and consensus validation"""
         self.mining = True
         consecutive_failures = 0
         max_failures_before_reset = 3
         
+        # Fork detection state
+        last_oracle_height = 0
+        last_check_time = time.time()
+        divergence_start_time = None
+        anomaly_score = 0
+        
         while self.mining:
             try:
+                # ═══════════════════════════════════════════════════════════════════
+                # FORK DETECTION HEALTH CHECK (every 5 seconds)
+                # ═══════════════════════════════════════════════════════════════════
+                
+                if time.time() - last_check_time > 5.0:
+                    try:
+                        oracle_state = await self.oracle.query_chain_state()
+                        oracle_h = oracle_state.get('current_height', 0) if oracle_state else 0
+                        local_h = self._last_mined_height
+                        
+                        # Check for height mismatch (fork indicator)
+                        if oracle_h > 0 and local_h > 0 and oracle_h != local_h and oracle_h != local_h - 1:
+                            # Divergence detected
+                            anomaly_score += 1
+                            
+                            if divergence_start_time is None:
+                                divergence_start_time = time.time()
+                                logger.warning(f"[FORK-DETECT] Divergence detected: local={local_h}, oracle={oracle_h}")
+                            
+                            elapsed = time.time() - divergence_start_time
+                            
+                            # Trigger resync if divergence persists > 3 seconds
+                            if elapsed > 3.0:
+                                logger.error(f"[FORK-DETECT] ❌ Fork detected! Divergence > 3s (local={local_h}, oracle={oracle_h})")
+                                logger.warning("[RESYNC] Stopping mining and resyncing...")
+                                
+                                self.mining = False
+                                # Rollback: Reset to oracle height
+                                with self._mining_lock:
+                                    self._last_mined_height = oracle_h
+                                    self._last_mined_hash = oracle_state.get('last_block_hash', '0'*64)
+                                
+                                await asyncio.sleep(2)
+                                self.mining = True
+                                divergence_start_time = None
+                                anomaly_score = 0
+                        else:
+                            # No divergence
+                            divergence_start_time = None
+                            anomaly_score = max(0, anomaly_score - 1)
+                        
+                        last_oracle_height = oracle_h
+                        last_check_time = time.time()
+                    except Exception as e:
+                        logger.debug(f"[FORK-DETECT] Health check error: {e}")
+                
+                # ═══════════════════════════════════════════════════════════════════
+                # ORIGINAL MINING LOGIC (with gate checks)
+                # ═══════════════════════════════════════════════════════════════════
+                
                 block = await self.mine_block(miner_address)
                 if block:
-                    # Broadcast to oracle for consensus aggregation
                     snapshot = StateSnapshot(
                         height=block['height'],
                         blocks=[block],
@@ -7142,13 +7361,10 @@ class AsyncOracleMiner:
                     
                     logger.info(f"[MINER] Block #{block['height']} broadcast to oracle for consensus")
                 else:
-                    # mine_block returned None (oracle advanced, no consensus, etc)
                     consecutive_failures += 1
                     if consecutive_failures >= max_failures_before_reset:
-                        # Too many failures — reset and query fresh oracle state
                         logger.warning(f"[MINER] {consecutive_failures} consecutive failures — resetting local state and querying oracle")
                         with self._mining_lock:
-                            # Reset only if oracle is ahead, don't lose progress
                             fresh_state = await self.oracle.query_chain_state()
                             if fresh_state:
                                 fresh_height = fresh_state.get('current_height', 0)
@@ -7157,7 +7373,6 @@ class AsyncOracleMiner:
                         consecutive_failures = 0
                         await asyncio.sleep(1)
                     else:
-                        # Quick retry
                         await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 self.mining = False
