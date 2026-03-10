@@ -10123,8 +10123,8 @@ class QtclClientApp:
         miner         = AsyncOracleMiner(oracle=oracle_client, dht=dht_bus)  # type: ignore
 
         async def _mine_inline():
-            """SWARM REWRITE: Direct inline mining logic (no patches/layers)"""
-            import hashlib as _hl, json as _j, time as _t
+            """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
+            import hashlib as _hl, time as _t
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
@@ -10134,8 +10134,40 @@ class QtclClientApp:
             _last_mined_hash = "0" * 64
             _mining_lock = _threading.Lock()
             
+            def _make_target(difficulty_bits: int) -> int:
+                """Convert difficulty bits to target value (Bitcoin style)
+                
+                difficulty_bits = number of leading zero BITS required
+                target = 2^(256 - difficulty_bits)
+                
+                Example: difficulty_bits=5 means hash must be < 2^251
+                """
+                if difficulty_bits >= 256:
+                    return 0
+                if difficulty_bits <= 0:
+                    return (1 << 256) - 1
+                return 1 << (256 - difficulty_bits)
+            
+            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int) -> str:
+                """SHA256(SHA256(height || parent || timestamp || nonce))
+                
+                Pure Bitcoin-style block hashing. No entropy, no W-states, no JSON.
+                Just deterministic binary data.
+                """
+                # Concatenate block fields (pure binary, no JSON nonsense)
+                block_data = (
+                    height.to_bytes(8, 'big') +           # 8 bytes: block height
+                    bytes.fromhex(parent_hash) +          # 32 bytes: parent hash
+                    timestamp.to_bytes(8, 'big') +        # 8 bytes: timestamp
+                    nonce.to_bytes(8, 'big')              # 8 bytes: nonce
+                )
+                # Bitcoin double-SHA256
+                hash1 = _hl.sha256(block_data).digest()
+                hash2 = _hl.sha256(hash1).digest()
+                return hash2.hex()
+            
             async def _get_chain_tip_with_retry():
-                """Exponential backoff retry for chain tip acquisition"""
+                """Get chain tip with exponential backoff"""
                 tip = None
                 _retries = 0
                 _max_retries = 4
@@ -10149,152 +10181,117 @@ class QtclClientApp:
                         _retries += 1
                         if _retries < _max_retries:
                             _backoff = _backoff_base * (2 ** (_retries - 1))
-                            _EXP_LOG.warning(f"[MINER-SWARM] chain_tip empty, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
+                            _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip empty, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
                             await _asyncio.sleep(_backoff)
                     except Exception as _e:
                         _retries += 1
                         _backoff = _backoff_base * (2 ** (_retries - 1)) if _retries < _max_retries else 0
-                        _EXP_LOG.warning(f"[MINER-SWARM] chain_tip error: {type(_e).__name__}: {_e}, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
+                        _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip error: {type(_e).__name__}: {_e}, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
                         if _retries < _max_retries:
                             await _asyncio.sleep(_backoff)
                 
                 return None
             
             while True:
-                # Get real chain tip (with retry)
+                # Get chain tip
                 tip = await _get_chain_tip_with_retry()
                 if tip is None:
-                    _EXP_LOG.warning("[MINER-SWARM] Chain tip acquisition failed, retrying in 0.5s")
+                    _EXP_LOG.warning("[MINER-SIMPLE] Chain tip failed, retrying in 0.5s")
                     _MINE_TELEM.mark_idle()
                     await _asyncio.sleep(0.5)
                     continue
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
-                diff = 5  # HARDCODED: 5 bits for testing (can solve in seconds)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
+                difficulty_bits = 5  # HARDCODED FOR TESTING: 5 bits = very easy
+                target = _make_target(difficulty_bits)
                 
                 # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
                 with _mining_lock:
                     if _last_mined_height > oracle_height:
-                        # We're ahead of oracle
                         target_height = _last_mined_height + 1
                         parent_hash = _last_mined_hash
                     else:
-                        # Oracle is current or ahead
                         target_height = oracle_height + 1
                         parent_hash = oracle_hash
                 
-                block = {
-                    "height": target_height,
-                    "timestamp": int(_t.time()),
-                    "miner_address": self.wallet.address,
-                    "difficulty": diff,
-                    "nonce": 0,
-                    "parent_hash": parent_hash,
-                }
+                timestamp = int(_t.time())
+                nonce = 0
                 
-                _EXP_LOG.info(f"[MINER-SWARM] Mining h={block['height']} diff={diff} parent={parent_hash[:12]}…")
-                _MINE_TELEM.update_progress(block["height"], diff, 0, parent_hash)
+                _EXP_LOG.info(f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} parent={parent_hash[:16]}…")
+                _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                 
-                # Mining loop
+                # Mining loop: pure SHA256 PoW
                 while True:
-                    bstr = _j.dumps(block, sort_keys=True).encode()
-                    bhash = _hl.sha256(bstr).hexdigest()
+                    # Calculate block hash
+                    block_hash = _hash_block(target_height, parent_hash, timestamp, nonce)
                     
-                    if bhash.startswith("0" * diff):
-                        # Block found — FIX: Update local state IMMEDIATELY
-                        block["hash"] = bhash
+                    # Check if hash meets difficulty target
+                    hash_as_int = int(block_hash, 16)
+                    if hash_as_int < target:
+                        # FOUND BLOCK!
+                        _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
+                        
+                        # FIX: Update local state IMMEDIATELY
                         with _mining_lock:
-                            _last_mined_height = block["height"]
-                            _last_mined_hash = bhash
+                            _last_mined_height = target_height
+                            _last_mined_hash = block_hash
                         
-                        _MINE_TELEM.record_block(block)
-                        _EXP_LOG.info(f"[MINER-SWARM] ✅ Block h={block['height']} nonce={block['nonce']} hash={bhash[:16]}…")
+                        # Record in telemetry
+                        solved_block = {
+                            "height": target_height,
+                            "hash": block_hash,
+                            "parent_hash": parent_hash,
+                            "nonce": nonce,
+                            "timestamp": timestamp,
+                            "difficulty": difficulty_bits,
+                        }
+                        _MINE_TELEM.record_block(solved_block)
                         
-                        # Submit to oracle
+                        # Submit to oracle/server
                         try:
-                            def _build_coinbase(height: int, addr: str, w_hash: str, reward_base: int = 1250) -> dict:
-                                cb_id = _hl.sha3_256(f"coinbase:{height}:{addr}:{w_hash}".encode()).hexdigest()
-                                return {
-                                    "tx_id": cb_id, "tx_type": "coinbase",
-                                    "from_addr": "0" * 64, "to_addr": addr,
-                                    "amount": reward_base, "block_height": height,
-                                    "w_proof": w_hash, "version": 1,
-                                }
-                            
-                            def _merkle(tx_list: list) -> str:
-                                if not tx_list:
-                                    return _hl.sha3_256(b"").hexdigest()
-                                def _th(tx: dict) -> str:
-                                    if tx.get("tx_type") == "coinbase":
-                                        s = _j.dumps({k: tx[k] for k in ("tx_id","from_addr","to_addr","amount","block_height","w_proof","tx_type","version") if k in tx}, sort_keys=True)
-                                    else:
-                                        s = _j.dumps({k: v for k, v in tx.items() if k != "signature"}, sort_keys=True)
-                                    return _hl.sha3_256(s.encode()).hexdigest()
-                                hashes = [_th(t) for t in tx_list]
-                                while len(hashes) > 1:
-                                    if len(hashes) % 2:
-                                        hashes.append(hashes[-1])
-                                    hashes = [_hl.sha3_256((hashes[i]+hashes[i+1]).encode()).hexdigest() for i in range(0, len(hashes), 2)]
-                                return hashes[0]
-                            
-                            ks = self.koyeb_state
-                            w_fid = float(ks.pq0_fidelity if ks else 0.71)
-                            pq_curr = int(ks.pq_curr_id if ks else block["height"])
-                            pq_last = pq_curr - 1
-                            
-                            w_hash = _hl.sha3_256(f"{w_fid:.6f}:{block['height']}:{bhash}".encode()).hexdigest()
-                            coinbase = _build_coinbase(block["height"], self.wallet.address, w_hash)
-                            merkle = _merkle([coinbase])
-                            
                             submit_payload = {
-                                "header": {
-                                    "height": block["height"],
-                                    "block_hash": bhash,
-                                    "parent_hash": parent_hash,
-                                    "merkle_root": merkle,
-                                    "timestamp_s": int(_t.time()),
-                                    "difficulty_bits": diff,
-                                    "nonce": block["nonce"],
-                                    "miner_address": self.wallet.address,
-                                    "w_state_fidelity": w_fid,
-                                    "w_entropy_hash": w_hash,
-                                    "pq_curr": pq_curr,
-                                    "pq_last": pq_last,
-                                },
-                                "transactions": [coinbase],
+                                "height": target_height,
+                                "block_hash": block_hash,
+                                "parent_hash": parent_hash,
+                                "nonce": nonce,
+                                "timestamp": timestamp,
+                                "miner_address": self.wallet.address,
+                                "difficulty_bits": difficulty_bits,
                             }
                             
                             _MINE_TELEM.mark_submitting()
                             r = kapi._post("/api/submit_block", submit_payload, timeout=20)
-                            if r and r.get("block_hash"):
-                                _MINE_TELEM.last_block["submitted"] = True
-                                _EXP_LOG.info(f"[MINER-SWARM] ✅ Submitted h={block['height']} WALLET CREDITED")
+                            
+                            if r and r.get("success"):
+                                _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
                             else:
-                                _EXP_LOG.warning(f"[MINER-SWARM] ⚠️  Submit rejected: {r}")
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Submit failed: {r}")
                         except Exception as _e:
-                            _EXP_LOG.debug(f"[MINER-SWARM] Submit error: {_e}")
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}")
                         
                         _MINE_TELEM.mark_idle()
-                        break  # Restart with new tip
+                        break  # Restart with new chain tip
                     
-                    block["nonce"] += 1
+                    # Next nonce
+                    nonce += 1
                     
-                    # Telemetry + chain refresh
-                    if block["nonce"] % 200 == 0:
-                        _MINE_TELEM.update_progress(block["height"], diff, block["nonce"], parent_hash)
+                    # Telemetry every 100k hashes
+                    if nonce % 100_000 == 0:
+                        _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                     
-                    if block["nonce"] % 10_000 == 0:
+                    # Check if chain advanced every 100k hashes
+                    if nonce % 100_000 == 0:
                         await _asyncio.sleep(0)
                         try:
                             tip2 = kapi.get_chain_tip() or {}
                             h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
                             if h2 > oracle_height:
-                                _EXP_LOG.info(f"[MINER-SWARM] Chain moved h={h2}, restarting")
+                                _EXP_LOG.info(f"[MINER-SIMPLE] Chain advanced h={h2}, restarting")
                                 _MINE_TELEM.mark_idle()
-                                break  # Restart mining loop
+                                break
                         except Exception as _e:
-                            _EXP_LOG.debug(f"[MINER-SWARM] Chain refresh error: {_e}")
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Chain check error: {_e}")
 
         async def _mine():
             await _mine_inline()
