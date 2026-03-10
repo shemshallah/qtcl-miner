@@ -9914,7 +9914,7 @@ class QTCLWallet:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _MiningTelemetry:
-    """Thread-safe mining statistics. One singleton per process."""
+    """Thread-safe mining statistics with reward tracking."""
     def __init__(self):
         self._lock          = _threading.Lock()
         self.height         = 0          # target block height
@@ -9923,6 +9923,9 @@ class _MiningTelemetry:
         self.nonce          = 0          # current nonce being tried
         self.hash_rate      = 0.0        # hashes/second (rolling 5 s window)
         self.blocks_found   = 0          # blocks solved this session
+        self.blocks_accepted = 0         # ✅ blocks accepted by server
+        self.total_earned_qtcl = 0.0     # ✅ cumulative QTCL earned
+        self.last_reward_qtcl = 0.0      # ✅ reward from last accepted block
         self.last_block     = None       # dict of last solved block (full)
         self.last_block_ts  = 0.0        # time of last block solve
         self.session_start  = _time.time()
@@ -9959,12 +9962,20 @@ class _MiningTelemetry:
         with self._lock:
             self.state = "SUBMITTING"
 
+    def record_submission(self, block_height: int, reward_qtcl: float) -> None:
+        """Record successful block submission with reward."""
+        with self._lock:
+            self.blocks_accepted += 1
+            self.total_earned_qtcl += reward_qtcl
+            self.last_reward_qtcl = reward_qtcl
+            self.state = "IDLE"
+
     def mark_idle(self) -> None:
         with self._lock:
             self.state = "IDLE"
 
     def snapshot(self) -> dict:
-        """Lock-free snapshot for display."""
+        """Lock-free snapshot for display with rewards."""
         with self._lock:
             return {
                 "height":       self.height,
@@ -9973,6 +9984,9 @@ class _MiningTelemetry:
                 "nonce":        self.nonce,
                 "hash_rate":    self.hash_rate,
                 "blocks_found": self.blocks_found,
+                "blocks_accepted": self.blocks_accepted,
+                "total_earned_qtcl": self.total_earned_qtcl,
+                "last_reward_qtcl": self.last_reward_qtcl,
                 "last_block":   dict(self.last_block) if self.last_block else None,
                 "last_block_ts":self.last_block_ts,
                 "session_start":self.session_start,
@@ -10491,16 +10505,43 @@ class QtclClientApp:
                             _MINE_TELEM.mark_submitting()
                             r = kapi._post("/api/submit_block", submit_payload, timeout=20)
                             
-                            if r and r.get("success"):
+                            # ✅ FIXED: Properly extract and record reward
+                            if r is None:
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
+                                _MINE_TELEM.mark_idle()
+                            elif r.get("error"):
+                                # Submission rejected
+                                error = r.get("error", "unknown error")
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
+                                if r.get("details"):
+                                    _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
+                                _MINE_TELEM.mark_idle()
+                            elif r.get("status") == "accepted" or r.get("success"):
+                                # Submission accepted - extract reward
+                                reward_str = r.get("miner_reward", "0")
+                                try:
+                                    if isinstance(reward_str, str):
+                                        reward_qtcl = float(reward_str.replace(" QTCL", "").strip())
+                                    else:
+                                        reward_qtcl = float(reward_str)
+                                except:
+                                    reward_qtcl = 0.0
+                                
+                                _MINE_TELEM.record_submission(target_height, reward_qtcl)
+                                _EXP_LOG.info(f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height}")
+                                _EXP_LOG.info(f"[MINER-SIMPLE]    🪙 Reward: +{reward_qtcl:.2f} QTCL | Session Total: {_MINE_TELEM.total_earned_qtcl:.2f} QTCL")
+                            elif r.get("block_hash"):
+                                # Ambiguous response - probably accepted
                                 _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
-                            elif r and r.get("block_hash"):
-                                _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
+                                _MINE_TELEM.mark_idle()
                             else:
-                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Submit failed: {r}")
+                                # Unknown response format
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Unexpected response: {r}")
+                                _MINE_TELEM.mark_idle()
                         except Exception as _e:
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}", exc_info=True)
+                            _MINE_TELEM.mark_idle()
                         
-                        _MINE_TELEM.mark_idle()
                         break  # Restart with new chain tip
                     
                     # Next nonce
@@ -10613,6 +10654,10 @@ class QtclClientApp:
                   f"bridge={ks2.bridge_fidelity:.4f}  "
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
                   f"{'✅' if ks2.connected else '❌'}")
+            # ✅ NEW: Display mining rewards
+            print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
+            if tel['total_earned_qtcl'] > 0:
+                print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)")
             # SUB-AGENT δ: live balance in dashboard
             try:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
