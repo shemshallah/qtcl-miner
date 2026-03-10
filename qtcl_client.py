@@ -10129,6 +10129,11 @@ class QtclClientApp:
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
             
+            # FIX: Track locally-mined heights to prevent orphaning race
+            _last_mined_height = 0
+            _last_mined_hash = "0" * 64
+            _mining_lock = _threading.Lock()
+            
             async def _get_chain_tip_with_retry():
                 """Exponential backoff retry for chain tip acquisition"""
                 tip = None
@@ -10164,21 +10169,32 @@ class QtclClientApp:
                     await _asyncio.sleep(0.5)
                     continue
                 
-                height = int(tip.get("block_height") or tip.get("height") or 0)
-                diff = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)
-                phash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
+                oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
+                diff = 5  # HARDCODED: 5 bits for testing (can solve in seconds)
+                oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
+                
+                # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
+                with _mining_lock:
+                    if _last_mined_height > oracle_height:
+                        # We're ahead of oracle
+                        target_height = _last_mined_height + 1
+                        parent_hash = _last_mined_hash
+                    else:
+                        # Oracle is current or ahead
+                        target_height = oracle_height + 1
+                        parent_hash = oracle_hash
                 
                 block = {
-                    "height": height + 1,
+                    "height": target_height,
                     "timestamp": int(_t.time()),
                     "miner_address": self.wallet.address,
                     "difficulty": diff,
                     "nonce": 0,
-                    "parent_hash": phash,
+                    "parent_hash": parent_hash,
                 }
                 
-                _EXP_LOG.info(f"[MINER-SWARM] Mining h={block['height']} diff={diff} parent={phash[:12]}…")
-                _MINE_TELEM.update_progress(block["height"], diff, 0, phash)
+                _EXP_LOG.info(f"[MINER-SWARM] Mining h={block['height']} diff={diff} parent={parent_hash[:12]}…")
+                _MINE_TELEM.update_progress(block["height"], diff, 0, parent_hash)
                 
                 # Mining loop
                 while True:
@@ -10186,8 +10202,12 @@ class QtclClientApp:
                     bhash = _hl.sha256(bstr).hexdigest()
                     
                     if bhash.startswith("0" * diff):
-                        # Block found
+                        # Block found — FIX: Update local state IMMEDIATELY
                         block["hash"] = bhash
+                        with _mining_lock:
+                            _last_mined_height = block["height"]
+                            _last_mined_hash = bhash
+                        
                         _MINE_TELEM.record_block(block)
                         _EXP_LOG.info(f"[MINER-SWARM] ✅ Block h={block['height']} nonce={block['nonce']} hash={bhash[:16]}…")
                         
@@ -10220,18 +10240,18 @@ class QtclClientApp:
                             
                             ks = self.koyeb_state
                             w_fid = float(ks.pq0_fidelity if ks else 0.71)
-                            pq_curr = int(ks.pq_curr_id if ks else height)
+                            pq_curr = int(ks.pq_curr_id if ks else block["height"])
                             pq_last = pq_curr - 1
                             
-                            w_hash = _hl.sha3_256(f"{w_fid:.6f}:{height}:{bhash}".encode()).hexdigest()
-                            coinbase = _build_coinbase(height, self.wallet.address, w_hash)
+                            w_hash = _hl.sha3_256(f"{w_fid:.6f}:{block['height']}:{bhash}".encode()).hexdigest()
+                            coinbase = _build_coinbase(block["height"], self.wallet.address, w_hash)
                             merkle = _merkle([coinbase])
                             
                             submit_payload = {
                                 "header": {
-                                    "height": height,
+                                    "height": block["height"],
                                     "block_hash": bhash,
-                                    "parent_hash": phash,
+                                    "parent_hash": parent_hash,
                                     "merkle_root": merkle,
                                     "timestamp_s": int(_t.time()),
                                     "difficulty_bits": diff,
@@ -10249,7 +10269,7 @@ class QtclClientApp:
                             r = kapi._post("/api/submit_block", submit_payload, timeout=20)
                             if r and r.get("block_hash"):
                                 _MINE_TELEM.last_block["submitted"] = True
-                                _EXP_LOG.info(f"[MINER-SWARM] ✅ Submitted h={height} WALLET CREDITED")
+                                _EXP_LOG.info(f"[MINER-SWARM] ✅ Submitted h={block['height']} WALLET CREDITED")
                             else:
                                 _EXP_LOG.warning(f"[MINER-SWARM] ⚠️  Submit rejected: {r}")
                         except Exception as _e:
@@ -10262,14 +10282,14 @@ class QtclClientApp:
                     
                     # Telemetry + chain refresh
                     if block["nonce"] % 200 == 0:
-                        _MINE_TELEM.update_progress(block["height"], diff, block["nonce"], phash)
+                        _MINE_TELEM.update_progress(block["height"], diff, block["nonce"], parent_hash)
                     
                     if block["nonce"] % 10_000 == 0:
                         await _asyncio.sleep(0)
                         try:
                             tip2 = kapi.get_chain_tip() or {}
-                            h2 = int(tip2.get("block_height") or tip2.get("height") or height)
-                            if h2 > height:
+                            h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
+                            if h2 > oracle_height:
                                 _EXP_LOG.info(f"[MINER-SWARM] Chain moved h={h2}, restarting")
                                 _MINE_TELEM.mark_idle()
                                 break  # Restart mining loop
