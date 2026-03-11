@@ -10491,6 +10491,14 @@ class QtclClientApp:
                             # So difficulty_bits is HEX zeros, not BITS!
                             # If diff=5, need 5 hex zeros = "00000..."
                             
+                            # Fetch pending TXs from server mempool before sealing block
+                            try:
+                                _pending = kapi.get_mempool()
+                                _EXP_LOG.info(f"[MINER-SIMPLE] ✉️ mempool: {len(_pending)} pending TX(s) to include")
+                            except Exception as _me:
+                                _pending = []
+                                _EXP_LOG.warning(f"[MINER-SIMPLE] mempool fetch failed: {_me}")
+
                             submit_payload = {
                                 "header": {
                                     "height": target_height,
@@ -10506,7 +10514,7 @@ class QtclClientApp:
                                     "pq_curr": target_height,
                                     "pq_last": target_height - 1,
                                 },
-                                "transactions": [],
+                                "transactions": _pending,
                             }
                             
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
@@ -10825,10 +10833,10 @@ class QtclClientApp:
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
             srv = result.get("tx_hash", result.get("txid", tx_id))
-            print(f"\n  ✅ Submitted  │  hash: {srv}")
+            print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
             print(f"  Status: {result.get('status','pending')}  │  "
                   f"fee: {result.get('fee', amount*0.001):.8f}  │  "
-                  f"query: /api/transactions/{srv[:32]}…")
+                  f"query: /api/transactions/{srv[:16]}…")
             try:
                 _SSE_MUX.publish("tx_submitted",
                                  {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
@@ -10869,8 +10877,8 @@ class QtclClientApp:
         print("\n" + "─" * 58)
         if r:
             print(f"  Status  : {r.get('status','?').upper()}")
-            print(f"  Hash    : {r.get('tx_hash', tx_hash)}")
-            print(f"  Amount  : {r.get('amount', '?')} QTCL")
+            print(f"  Hash    : {r.get('tx_hash', tx_hash)[:42]}")
+            print(f"  Amount  : {r.get('amount_qtcl', r.get('amount', '?'))} QTCL")
             print(f"  From    : {r.get('from_address', '?')}")
             print(f"  To      : {r.get('to_address', '?')}")
             print(f"  Block   : {r.get('block_height', 'pending')}")
