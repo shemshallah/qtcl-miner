@@ -54,6 +54,7 @@ import json
 import secrets
 import threading
 import logging
+import enum
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
