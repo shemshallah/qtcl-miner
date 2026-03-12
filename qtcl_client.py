@@ -78,20 +78,79 @@ if not logging.getLogger().hasHandlers():
 logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# ENTROPY SOURCE (Block Field from globals if available)
+# ENTROPY SOURCES
+#   - MINING: Local (os.urandom) — never API-dependent
+#   - SYSTEM (HLWE keygen, mnemonics): API-backed from /api/entropy/stream (optional, fallback to local)
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-try:
-    from globals import get_block_field_entropy
-    ENTROPY_AVAILABLE = True
-except ImportError:
-    ENTROPY_AVAILABLE = False
-    def get_block_field_entropy():
-        """Fallback to os.urandom if globals unavailable"""
-        return os.urandom(32)
+ENTROPY_SERVER_URL = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app')
+SYSTEM_ENTROPY_CACHE = {'data': None, 'timestamp': 0, 'ttl_seconds': 30}
+ENTROPY_LOCK = threading.Lock()
 
-logger.info("[HLWE] Block field entropy available: {}".format(
-    "✅ YES" if ENTROPY_AVAILABLE else "⚠️  FALLBACK (os.urandom)"))
+
+def get_mining_entropy(size: int = 32) -> bytes:
+    """Get entropy for mining — local only, never API-dependent (always available)"""
+    return os.urandom(size)
+
+
+def _fetch_system_entropy_from_server(height: int = 0, pq_curr: str = '') -> bytes:
+    """Fetch entropy from /api/entropy/stream for HLWE keygen/mnemonics (optional)"""
+    try:
+        endpoint = f"{ENTROPY_SERVER_URL}/api/entropy/stream"
+        params = []
+        if height > 0:
+            params.append(f"height={height}")
+        if pq_curr:
+            params.append(f"pq_curr={quote(pq_curr)}")
+        
+        if params:
+            endpoint += "?" + "&".join(params)
+        
+        req = Request(endpoint, method='GET')
+        req.add_header('User-Agent', 'QTCL-Client/3.0')
+        
+        with urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            entropy_b64 = data.get('entropy', '')
+            entropy_bytes = base64.b64decode(entropy_b64.encode('utf-8'))
+            
+            logger.info(f"[ENTROPY-SYSTEM] Fetched from {ENTROPY_SERVER_URL} (size={len(entropy_bytes)})")
+            return entropy_bytes
+    
+    except (URLError, HTTPError, Exception) as e:
+        logger.debug(f"[ENTROPY-SYSTEM] Endpoint unavailable, falling back to local: {e}")
+        return None
+
+
+def get_system_entropy(height: int = 0, pq_curr: str = '') -> bytes:
+    """Get entropy for HLWE keygen and system init (API-backed with local fallback)"""
+    global SYSTEM_ENTROPY_CACHE
+    
+    with ENTROPY_LOCK:
+        now = time.time()
+        
+        # Cache hit
+        if SYSTEM_ENTROPY_CACHE['data'] and (now - SYSTEM_ENTROPY_CACHE['timestamp']) < SYSTEM_ENTROPY_CACHE['ttl_seconds']:
+            return SYSTEM_ENTROPY_CACHE['data']
+        
+        # Try API first
+        try:
+            entropy = _fetch_system_entropy_from_server(height=height, pq_curr=pq_curr)
+            if entropy:
+                SYSTEM_ENTROPY_CACHE['data'] = entropy
+                SYSTEM_ENTROPY_CACHE['timestamp'] = now
+                return entropy
+        except Exception as e:
+            logger.debug(f"[ENTROPY-SYSTEM] API fetch failed: {e}")
+        
+        # Fallback to local
+        entropy = os.urandom(32)
+        SYSTEM_ENTROPY_CACHE['data'] = entropy
+        SYSTEM_ENTROPY_CACHE['timestamp'] = now
+        return entropy
+
+
+logger.info(f"[ENTROPY] Mining: local os.urandom | System: {ENTROPY_SERVER_URL}/api/entropy/stream (optional)")
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # BIP39 WORDLIST — 2048 STANDARDIZED MNEMONIC WORDS (EMBEDDED)
@@ -389,10 +448,10 @@ class HLWEEngine:
             self.params.DIMENSION, self.params.MODULUS))
     
     def generate_keypair_from_entropy(self) -> HLWEKeyPair:
-        """Generate HLWE keypair seeded from block field entropy"""
+        """Generate HLWE keypair seeded from system entropy (API-backed)"""
         with self.lock:
             try:
-                entropy = get_block_field_entropy()
+                entropy = get_system_entropy()
                 A = self._derive_lattice_basis_from_entropy(entropy)
                 s = self._derive_secret_vector(entropy, self.params.DIMENSION)
                 e = self._sample_error_vector(self.params.DIMENSION)
@@ -676,7 +735,7 @@ class BIP39Mnemonics:
             word_count, entropy_bits = strength.value
             entropy_bytes = entropy_bits // 8
             
-            entropy = get_block_field_entropy()
+            entropy = get_system_entropy()
             if len(entropy) < entropy_bytes:
                 entropy = entropy + secrets.token_bytes(entropy_bytes - len(entropy))
             
