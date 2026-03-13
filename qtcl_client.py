@@ -11640,13 +11640,13 @@ class QtclClientApp:
                 return _hl.sha3_256(block_json.encode()).hexdigest()
             
             async def _get_chain_tip_with_retry():
-                """Get chain tip with exponential backoff"""
+                """Get chain tip with exponential backoff, fallback to genesis"""
                 tip = None
                 _retries = 0
                 _max_retries = 4
                 _backoff_base = 0.3
                 
-                while tip is None and _retries < _max_retries:
+                while _retries < _max_retries:
                     try:
                         tip = kapi.get_chain_tip()
                         if tip and (tip.get("block_height") or tip.get("height")):
@@ -11663,7 +11663,15 @@ class QtclClientApp:
                         if _retries < _max_retries:
                             await _asyncio.sleep(_backoff)
                 
-                return None
+                # Fallback to genesis if all retries exhausted
+                _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip retries exhausted, falling back to genesis h=0")
+                return {
+                    "block_height": 0,
+                    "height": 0,
+                    "block_hash": "0" * 64,
+                    "hash": "0" * 64,
+                    "parent_hash": "0" * 64,
+                }
             
             while True:
                 # Get chain tip
