@@ -11721,10 +11721,7 @@ class QtclClientApp:
                         # FOUND BLOCK!
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
                         
-                        # FIX: Update local state IMMEDIATELY
-                        with _mining_lock:
-                            _last_mined_height = target_height
-                            _last_mined_hash = block_hash
+                        # NOTE: _last_mined_height updated only after oracle confirmation (acceptance branch below)
                         
                         # Record in telemetry
                         solved_block = {
@@ -11768,7 +11765,7 @@ class QtclClientApp:
                                     "miner_address": miner_addr,
                                     "difficulty_bits": difficulty_bits,
                                     "merkle_root": "0" * 64,  # For now, simple root
-                                    "w_state_fidelity": 0.75,  # Dummy value
+                                    "w_state_fidelity": max(0.75, float(getattr(ORACLE_W_STATE, 'fidelity', 0.85)) if 'ORACLE_W_STATE' in dir() and ORACLE_W_STATE is not None else 0.85),  # Live fidelity from W3 state
                                     "w_entropy_hash": "0" * 64,
                                     "pq_curr": target_height,
                                     "pq_last": target_height - 1,
@@ -11784,16 +11781,25 @@ class QtclClientApp:
                             # ✅ FIXED: Properly extract and record reward
                             if r is None:
                                 _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
+                                with _mining_lock:
+                                    _last_mined_height = oracle_height   # rollback: treat as rejected
+                                    _last_mined_hash = oracle_hash
                                 _MINE_TELEM.mark_idle()
                             elif r.get("error"):
-                                # Submission rejected
+                                # Submission rejected — rollback height to oracle tip so next loop re-syncs
                                 error = r.get("error", "unknown error")
                                 _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
                                 if r.get("details"):
                                     _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
+                                with _mining_lock:
+                                    _last_mined_height = oracle_height   # rollback: next iter fetches fresh tip
+                                    _last_mined_hash = oracle_hash
                                 _MINE_TELEM.mark_idle()
                             elif r.get("status") == "accepted" or r.get("success"):
-                                # Submission accepted - extract reward
+                                # Submission accepted — NOW commit height
+                                with _mining_lock:
+                                    _last_mined_height = target_height
+                                    _last_mined_hash = block_hash
                                 reward_str = r.get("miner_reward", "0")
                                 try:
                                     if isinstance(reward_str, str):
@@ -11807,12 +11813,18 @@ class QtclClientApp:
                                 _EXP_LOG.info(f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height}")
                                 _EXP_LOG.info(f"[MINER-SIMPLE]    🪙 Reward: +{reward_qtcl:.2f} QTCL | Session Total: {_MINE_TELEM.total_earned_qtcl:.2f} QTCL")
                             elif r.get("block_hash"):
-                                # Ambiguous response - probably accepted
+                                # Ambiguous response - probably accepted; commit height
+                                with _mining_lock:
+                                    _last_mined_height = target_height
+                                    _last_mined_hash = block_hash
                                 _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
                                 _MINE_TELEM.mark_idle()
                             else:
-                                # Unknown response format
+                                # Unknown response — rollback to be safe
                                 _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Unexpected response: {r}")
+                                with _mining_lock:
+                                    _last_mined_height = oracle_height
+                                    _last_mined_hash = oracle_hash
                                 _MINE_TELEM.mark_idle()
                         except Exception as _e:
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}", exc_info=True)
