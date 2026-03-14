@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import sys
+import getpass
 import hashlib
 import hmac
 import json
@@ -11505,7 +11506,7 @@ class QtclClientApp:
         if self.wallet.is_loaded():
             return True
         try:
-            pw = input("  Wallet password: ").strip()
+            pw = getpass.getpass("  Wallet password: ").strip()
         except (EOFError, KeyboardInterrupt):
             return False
         return bool(pw) and self.wallet.load(pw)
@@ -12195,8 +12196,8 @@ class QtclClientApp:
                 self._recover_mnemonic()
             elif ch == "3":
                 try:
-                    pw  = input("  New password: ").strip()
-                    pw2 = input("  Confirm    : ").strip()
+                    pw  = getpass.getpass("  New password: ").strip()
+                    pw2 = getpass.getpass("  Confirm    : ").strip()
                 except (EOFError, KeyboardInterrupt):
                     continue
                 if pw != pw2:
@@ -12225,7 +12226,7 @@ class QtclClientApp:
                 print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
             elif ch == "5":
                 try:
-                    pw = input("  Wallet password: ").strip()
+                    pw = getpass.getpass("  Wallet password: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     continue
                 phrase = QTCLWallet().show_mnemonic(pw)
@@ -12246,8 +12247,8 @@ class QtclClientApp:
         print("\n  BIP-39 Recovery — enter 12 words space-separated")
         try:
             phrase = input("  Words: ").strip().lower()
-            pw     = input("  New password: ").strip()
-            pw2    = input("  Confirm     : ").strip()
+            pw     = getpass.getpass("  New password: ").strip()
+            pw2    = getpass.getpass("  Confirm     : ").strip()
         except (EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled"); return
         if pw != pw2:
