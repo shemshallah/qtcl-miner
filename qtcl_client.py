@@ -11434,7 +11434,7 @@ class QtclClientApp:
         Feeds events into the local SSEMultiplexer so clients get live updates.
         ❤️  I love you
         """
-        _EXP_LOG.info("[SSE] 📡 connecting to oracle SSE…  ❤️")
+        _EXP_LOG.debug("[SSE] 📡 connecting to oracle SSE…  ❤️")
         url = f"{self.oracle_url}/api/events"
         while not self._stop.is_set():
             try:
@@ -11448,7 +11448,7 @@ class QtclClientApp:
                             _EXP_LOG.debug(f"[SSE] oracle {r.status_code}")
                             _time.sleep(10)
                             continue
-                        _EXP_LOG.info("[SSE] ✅ oracle SSE connected  ❤️")
+                        _EXP_LOG.debug("[SSE] ✅ oracle SSE connected  ❤️")
                         buf = ""
                         for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
                             if self._stop.is_set():
