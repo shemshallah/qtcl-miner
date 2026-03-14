@@ -11964,19 +11964,18 @@ class QtclClientApp:
             print(sep)
 
         # ── Auto-refresh ticker thread ────────────────────────────────────────
-        _REFRESH_INTERVAL = 15.0   # seconds between auto-refreshes
+        # Prints only the dashboard — never injects a prompt string.
+        # The foreground loop owns the prompt; auto-refresh just updates metrics.
+        _REFRESH_INTERVAL = 30.0   # seconds between auto-refreshes
         _last_auto         = [_time.time()]
+        _refresh_pending   = [False]  # signal foreground to redraw after next Enter
 
         def _auto_refresh_loop():
             while not self._stop.is_set() and _mine_thread.is_alive():
                 _time.sleep(1.0)
                 if _time.time() - _last_auto[0] >= _REFRESH_INTERVAL:
                     _last_auto[0] = _time.time()
-                    # Only print if no input prompt is active (crude but effective)
-                    # Print blank line first so display doesn't corrupt input prompt
-                    print()
-                    _print_dashboard()
-                    print("  Choice [Enter=status | q=quit | r=refresh]: ", end="", flush=True)
+                    _refresh_pending[0] = True
 
         _auto_th = _threading.Thread(target=_auto_refresh_loop,
                                      daemon=True, name="MineDisplay")
@@ -11986,6 +11985,11 @@ class QtclClientApp:
         _print_dashboard(force_full=True)
         try:
             while not self._stop.is_set() and _mine_thread.is_alive():
+                # If auto-refresh flagged a pending update, show it before the menu
+                if _refresh_pending[0]:
+                    _refresh_pending[0] = False
+                    print()
+                    _print_dashboard()
                 print()
                 print("  ╔══ MINING MENU ═══════════════════════════════════╗")
                 print("  ║  Enter = refresh status                          ║")
@@ -11997,6 +12001,7 @@ class QtclClientApp:
                 except (EOFError, KeyboardInterrupt):
                     break
                 _last_auto[0] = _time.time()  # reset auto-refresh timer
+                _refresh_pending[0] = False    # clear any pending refresh on explicit input
                 if ch in ("q", "quit", "stop", "2"):
                     break
                 _print_dashboard()
