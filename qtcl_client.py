@@ -10206,34 +10206,22 @@ class KoyebAPIClient:
         payload.setdefault("to_addr",   payload.get("to_address", ""))
 
         # ── Endpoint priority list (fallback chain) ────────────────────────────────
-        # CRITICAL: Each attempt gets a FRESH timestamp_ns so the canonical hash
-        # differs from any prior attempt. This prevents false DUPLICATE errors when
-        # a previous attempt timed out but was actually accepted by the server.
         endpoints = [
             ("/api/submit_transaction", 3),        # Primary: canonical, 3 retries
             ("/api/transactions/submit", 2),       # Fallback: alias, 2 retries
             ("/gossip/ingest", 1),                 # Last resort: broadcast, 1 retry
         ]
-
+        
         for path, max_retries in endpoints:
-            # Regenerate timestamp_ns for every endpoint attempt so each attempt
-            # produces a different canonical TX hash — no cross-endpoint duplicates.
-            payload_attempt = dict(payload)
-            payload_attempt['timestamp_ns'] = str(_t2.time_ns())
-
             if path == "/gossip/ingest":
-                payload_to_send = {"tx": payload_attempt, "origin": "client_wallet"}
+                payload_to_send = {"tx": payload, "origin": "client_wallet"}
             else:
-                payload_to_send = payload_attempt
-
+                payload_to_send = payload
+            
             r = self._post(path, payload_to_send, retries=max_retries)
             if r is not None:
-                # already_pending = server had this TX from a prior attempt that
-                # appeared to time out — treat as success, not error.
-                if r.get('status') == 'already_pending':
-                    r['_idempotent'] = True
                 return r
-
+        
         return None
 
     def get_peers(self) -> list:
@@ -11697,9 +11685,16 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                # TEMP: Hardcoded to 5 leading hex zeros (reasonable for 50k H/s = ~1-2 sec blocks)
-                # TODO: Change back to: difficulty_bits = int(tip.get("difficulty") or tip.get("difficulty_bits") or 12)
-                difficulty_bits = 5
+                # Read authoritative difficulty from the server tip.
+                # The server's DifficultyManager sets this; the client must mine to
+                # exactly this many leading hex zeros or the block will be rejected.
+                difficulty_bits = int(
+                    tip.get("difficulty_bits") or
+                    tip.get("difficulty") or
+                    5  # conservative fallback if tip is missing the field
+                )
+                # Clamp to sane range — never allow trivially-easy or impossibly-hard
+                difficulty_bits = max(1, min(difficulty_bits, 20))
                 
                 # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
                 with _mining_lock:
@@ -11715,7 +11710,7 @@ class QtclClientApp:
                 merkle_root = _hl.sha3_256(b"").hexdigest()  # Simple empty merkle for now
                 w_entropy = _hl.sha3_256(str(_t.time()).encode()).hexdigest()[:64]  # Simple entropy
                 
-                _EXP_LOG.info(f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} parent={parent_hash[:16]}…")
+                _EXP_LOG.info(f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} (server-authoritative) parent={parent_hash[:16]}…  target: {'0'*difficulty_bits}…")
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                 
                 # Mining loop: SHA3-256 PoW with JSON block data (like working mobile version)
@@ -12082,26 +12077,16 @@ class QtclClientApp:
             print("  ❌ Cancelled"); return
         if not to_addr.startswith("qtcl1"):
             print("  ❌ Invalid QTCL address"); return
-        # ── Fetch server-coordinated nonce (prevents collision & nonce_reuse) ──
-        _nonce_resp = self.api._get(f"/api/nonce/{self.wallet.address}") or {}
-        _server_nonce = _nonce_resp.get('expected_next')
-        if _server_nonce is not None:
-            nonce_val = int(_server_nonce)
-        else:
-            # Fallback: time-based nonce (risk of collision if used multiple times
-            # in the same millisecond — only used when server is unreachable)
-            nonce_val = int(_time.time() * 1000)
-
         tx = {
-            "from_address":     self.wallet.address,
-            "to_address":       to_addr,
-            "amount":           amount,
-            "fee":              fee,
-            "timestamp":        _time.time(),
-            "nonce":            nonce_val,
-            "public_key":       self.wallet.public_key or "",
-            "pq_curr":          self.koyeb_state.pq_curr_id,
-            "block_height":     self.koyeb_state.block_height,
+            "from_address":    self.wallet.address,
+            "to_address":      to_addr,
+            "amount":          amount,
+            "fee":             fee,
+            "timestamp":       _time.time(),
+            "nonce":           int(_time.time() * 1000),
+            "public_key":      self.wallet.public_key or "",
+            "pq_curr":         self.koyeb_state.pq_curr_id,
+            "block_height":    self.koyeb_state.block_height,
             "w_state_fidelity": self.koyeb_state.w_state_fidelity,
         }
         tx_id = _hashlib.sha3_256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
@@ -12130,31 +12115,25 @@ class QtclClientApp:
         # Add timestamp_ns for canonical server hash
         tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
-        # ── Decode result — accept both fresh success and idempotent already_pending ──
-        _status = (result or {}).get("status", "")
-        _tx_hash = (result or {}).get("tx_hash", "")
-        _accepted = _tx_hash and _status in ("pending", "already_pending", "")
-
-        if _accepted:
-            srv = _tx_hash or result.get("txid", tx_id)
-            _label = "♻️  Already pending" if _status == "already_pending" else "✅ Submitted"
-            print(f"\n  {_label}  │  hash: {srv[:40]}…")
-            print(f"  Status: {_status or 'pending'}  │  "
-                  f"fee: {result.get('fee', fee):.8f}  │  "
+        if result and result.get("tx_hash"):
+            srv = result.get("tx_hash", result.get("txid", tx_id))
+            print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
+            print(f"  Status: {result.get('status','pending')}  │  "
+                  f"fee: {result.get('fee', amount*0.001):.8f}  │  "
                   f"query: /api/transactions/{srv[:16]}…")
             try:
                 _SSE_MUX.publish("tx_submitted",
-                                 {"tx_id": srv[:32], "to": to_addr, "amount": amount},
+                                 {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
                                  channel="gossip")
             except Exception:
                 pass
         elif result and result.get("error"):
-            # Server rejected with an explicit reason — show it clearly
-            err  = result.get("error", "unknown rejection")
+            # Server rejected with a reason — show it
+            err = result.get("error", "unknown rejection")
             code = result.get("code", "")
             print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
         else:
-            # No response at all — connectivity issue, not a TX failure
+            # No response at all — connectivity issue
             print("  ❌ Submission failed — no response from oracle")
             print("")
             print(self.api.get_diagnostics())
