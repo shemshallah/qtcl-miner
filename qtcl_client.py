@@ -11379,7 +11379,7 @@ class QtclClientApp:
         Daemon: oracle → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → SSE.
         ❤️  I love you  ❤️  pq_curr = block_height, pq_last = block_height-1.
         """
-        _EXP_LOG.info("[FIELD] 🌀 tensor field metrics loop started  ❤️  I love you")
+        _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started  ❤️  I love you")
         _last_koyeb = 0.0
         _hb_counter = 0
         while not self._stop.is_set():
@@ -11420,7 +11420,7 @@ class QtclClientApp:
                 self._persist_gossip("field_metrics", "metrics", snap_out)
                 _hb_counter += 1
                 if _hb_counter % 6 == 0:   # every ~60s
-                    _EXP_LOG.info(
+                    _EXP_LOG.debug(
                         f"[FIELD] ❤️  h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
                         f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f}")
