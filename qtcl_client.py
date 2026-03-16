@@ -11783,6 +11783,90 @@ class QtclClientApp:
                 # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
                 _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
                 scratchpad = _build_scratchpad(_w_entropy_seed)
+                
+                # ✅ FIX: FETCH MEMPOOL BEFORE MINING + BUILD DETERMINISTIC COINBASE
+                # This ensures merkle_root is committed before nonce loop, preventing
+                # the merkle root / transaction list mismatch that breaks block submission.
+                # Fetch pending user transactions
+                try:
+                    _pending_user_txs = kapi.get_mempool() or []
+                    _EXP_LOG.info(f"[MINER-SIMPLE] Pre-mining mempool: {len(_pending_user_txs)} pending TX(s)")
+                except Exception as _me:
+                    _pending_user_txs = []
+                    _EXP_LOG.warning(f"[MINER-SIMPLE] Pre-mining mempool fetch failed: {_me}")
+                
+                # Build deterministic coinbase transaction
+                # Uses same formula as server._server_merkle() to ensure hash matches
+                _coinbase_tx_id = _hl.sha3_256(
+                    json.dumps({
+                        "block_height": target_height,
+                        "miner_address": miner_addr,
+                        "amount": 1250,  # BLOCK_REWARD_BASE in base units
+                        "w_proof": _w_entropy_seed.hex(),
+                        "version": 1,
+                    }, sort_keys=True).encode()
+                ).hexdigest()
+                
+                _coinbase_tx = {
+                    "tx_id": _coinbase_tx_id,
+                    "from_addr": "0" * 64,  # COINBASE_ADDRESS — null input
+                    "to_addr": miner_addr,
+                    "amount": 1250,
+                    "block_height": target_height,
+                    "w_proof": _w_entropy_hash,
+                    "tx_type": "coinbase",
+                    "version": 1,
+                }
+                
+                # Compute merkle root: SHA3-256 binary tree of [coinbase] + user TXs
+                # This EXACTLY mirrors server._server_merkle() computation
+                def _compute_merkle_for_mining(tx_list: list) -> str:
+                    """Compute merkle root using server's algorithm."""
+                    if not tx_list:
+                        return _hl.sha3_256(b"").hexdigest()
+                    
+                    def _tx_hash_for_merkle(tx: dict) -> str:
+                        """Hash transaction exactly as server does."""
+                        tx_type = tx.get("tx_type", "transfer")
+                        if tx_type == "coinbase":
+                            canonical = json.dumps({
+                                "tx_id": tx.get("tx_id", ""),
+                                "from_addr": tx.get("from_addr", ""),
+                                "to_addr": tx.get("to_addr", ""),
+                                "amount": tx.get("amount", 0),
+                                "block_height": tx.get("block_height", 0),
+                                "w_proof": tx.get("w_proof", ""),
+                                "tx_type": "coinbase",
+                                "version": tx.get("version", 1),
+                            }, sort_keys=True)
+                        else:
+                            # Regular TX: exclude signature
+                            canonical = json.dumps({
+                                k: v for k, v in tx.items()
+                                if k not in ("signature",)
+                            }, sort_keys=True)
+                        return _hl.sha3_256(canonical.encode()).hexdigest()
+                    
+                    hashes = [_tx_hash_for_merkle(tx) for tx in tx_list]
+                    while len(hashes) > 1:
+                        if len(hashes) % 2:
+                            hashes.append(hashes[-1])
+                        hashes = [
+                            _hl.sha3_256((hashes[i] + hashes[i+1]).encode()).hexdigest()
+                            for i in range(0, len(hashes), 2)
+                        ]
+                    return hashes[0]
+                
+                # Commit: merkle_root = hash([coinbase] + pending_user_txs)
+                # This merkle_root will be used throughout all nonces
+                merkle_root = _compute_merkle_for_mining([_coinbase_tx] + _pending_user_txs)
+                _block_txs = [_coinbase_tx] + _pending_user_txs  # Full transaction list to submit
+                
+                _EXP_LOG.info(
+                    f"[MINER-SIMPLE] Pre-computed merkle_root={merkle_root[:16]}… "
+                    f"from {len(_block_txs)} transactions (coinbase + {len(_pending_user_txs)} user)"
+                )
+                
                 _EXP_LOG.info(
                     f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} "
                     f"(server-authoritative) parent={parent_hash[:16]}…  "
@@ -11849,19 +11933,11 @@ class QtclClientApp:
                                 _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No wallet address, using default")
                                 miner_addr = "0" * 64
                             
-                            # Server expects: header{block_hash, miner_address, ...} + transactions[]
-                            # PoW validation: server checks block_hash.startswith("0" * difficulty_bits)
-                            # So difficulty_bits is HEX zeros, not BITS!
-                            # If diff=5, need 5 hex zeros = "00000..."
+                            # ✅ FIX: Use pre-committed _block_txs (coinbase + mempool from before mining)
+                            # Do NOT re-fetch mempool here — that creates the mismatch bug.
+                            # The merkle_root was computed from _block_txs before mining started.
+                            # Server will recompute merkle and verify it matches the header.
                             
-                            # Fetch pending TXs from server mempool before sealing block
-                            try:
-                                _pending = kapi.get_mempool()
-                                _EXP_LOG.info(f"[MINER-SIMPLE] ✉️ mempool: {len(_pending)} pending TX(s) to include")
-                            except Exception as _me:
-                                _pending = []
-                                _EXP_LOG.warning(f"[MINER-SIMPLE] mempool fetch failed: {_me}")
-
                             submit_payload = {
                                 "header": {
                                     "height":          target_height,
@@ -11883,7 +11959,7 @@ class QtclClientApp:
                                     "pq_curr": target_height,
                                     "pq_last": target_height - 1,
                                 },
-                                "transactions": _pending,
+                                "transactions": _block_txs,
                             }
                             
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
