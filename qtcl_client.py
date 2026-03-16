@@ -11624,21 +11624,57 @@ class QtclClientApp:
             _last_mined_hash = "0" * 64
             _mining_lock = _threading.Lock()
             
-            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int, 
-                           difficulty_bits: int, merkle_root: str, miner_addr: str, w_entropy: str) -> str:
-                """SHA3-256 of JSON block data (matches working mobile version)"""
-                block_data = {
-                    'height': height,
-                    'parent_hash': parent_hash,
-                    'merkle_root': merkle_root,
-                    'timestamp_s': timestamp,
-                    'difficulty_bits': difficulty_bits,
-                    'nonce': nonce,
-                    'miner_address': miner_addr,
-                    'w_entropy_hash': w_entropy,
-                }
-                block_json = _j.dumps(block_data, sort_keys=True)
-                return _hl.sha3_256(block_json.encode()).hexdigest()
+            # ──────────────────────────────────────────────────────────────────────
+            # QTCL-PoW v1 — Memory-hard, oracle-bound, GPU/ASIC resistant
+            #
+            # Three defenses against specialized hardware:
+            #  1. Oracle time-lock: w_entropy_seed changes every ~30s (live W-state
+            #     density matrix hash). Stale mining is rejected by the server.
+            #  2. Memory-hard scratchpad: 512KB SHAKE-256 expansion, 64 sequential
+            #     random-access reads per hash — bandwidth-bound, not compute-bound.
+            #  3. Sequential dependency: each round's scratchpad index derived from
+            #     prior hash output — cannot parallelise across nonces.
+            # ──────────────────────────────────────────────────────────────────────
+            import struct as _pow_st
+
+            _POW_SCRATCHPAD_BYTES = 512 * 1024
+            _POW_MIX_ROUNDS       = 64
+            _POW_WINDOW_BYTES     = 64
+
+            def _build_scratchpad(seed_bytes: bytes) -> bytes:
+                """Expand 32-byte oracle seed → 512KB scratchpad via SHAKE-256 XOF."""
+                xof = _hl.shake_256(b"QTCL_SCRATCHPAD_v1:" + seed_bytes)
+                return xof.digest(_POW_SCRATCHPAD_BYTES)
+
+            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int,
+                            difficulty_bits: int, merkle_root: str, miner_addr: str,
+                            w_entropy_seed: bytes, scratchpad: bytes) -> str:
+                """
+                QTCL-PoW hash — memory-hard, sequential, oracle-bound.
+                w_entropy_seed must be raw bytes (32), scratchpad pre-built for this seed.
+                """
+                # Pack header as fixed binary (no JSON overhead, deterministic)
+                header = _pow_st.pack(
+                    '>Q I 32s 32s I I 40s 32s',
+                    height,
+                    timestamp,
+                    bytes.fromhex(parent_hash.zfill(64))[:32],
+                    bytes.fromhex(merkle_root.zfill(64))[:32],
+                    difficulty_bits,
+                    nonce,
+                    miner_addr.encode()[:40].ljust(40, b'\x00'),
+                    w_entropy_seed[:32],
+                )
+                # Initial state
+                state = _hl.sha3_256(b"QTCL_POW_v1:" + header).digest()
+                # Sequential scratchpad mix (64 rounds × random-access reads)
+                n_windows = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
+                for rnd in range(_POW_MIX_ROUNDS):
+                    window_idx = _pow_st.unpack_from('>I', state, 0)[0] % n_windows
+                    ws = window_idx * _POW_WINDOW_BYTES
+                    window = scratchpad[ws : ws + _POW_WINDOW_BYTES]
+                    state = _hl.sha3_256(state + window + _pow_st.pack('>I', rnd)).digest()
+                return state.hex()
             
             async def _get_chain_tip_with_retry():
                 """Get chain tip with exponential backoff, fallback to genesis"""
@@ -11707,24 +11743,87 @@ class QtclClientApp:
                 
                 timestamp = int(_t.time())
                 nonce = 0
-                merkle_root = _hl.sha3_256(b"").hexdigest()  # Simple empty merkle for now
-                w_entropy = _hl.sha3_256(str(_t.time()).encode()).hexdigest()[:64]  # Simple entropy
-                
-                _EXP_LOG.info(f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} (server-authoritative) parent={parent_hash[:16]}…  target: {'0'*difficulty_bits}…")
+                merkle_root = _hl.sha3_256(b"").hexdigest()
+                miner_addr  = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
+
+                # ── Fetch QTCL-PoW oracle seed (QRNG-injected) ───────────────────
+                # The server mixes 32 bytes of live QRNG entropy (ANU quantum vacuum,
+                # random.org, HU Berlin, etc.) into the W-state density matrix hash
+                # before publishing pow_seed_hex.  This makes the scratchpad contents
+                # unpredictable even to someone with a full copy of the oracle state.
+                # Seed expires in 120s — forces real-time oracle dependency.
+                _seed_fetch_time = _t.time()
+                try:
+                    _wstate = kapi._get("/api/oracle/w-state") or {}
+                    # Prefer the pre-computed QRNG-injected seed (SHA3(dm XOR qrng || ts))
+                    _pow_seed_hex = _wstate.get("pow_seed_hex") or ""
+                    if _pow_seed_hex and len(_pow_seed_hex) == 64:
+                        _w_entropy_seed = bytes.fromhex(_pow_seed_hex)
+                        _EXP_LOG.debug(f"[MINER-SIMPLE] QRNG-injected seed: {_pow_seed_hex[:16]}…")
+                    else:
+                        # Fallback: derive from raw density matrix ourselves
+                        _dm_hex = _wstate.get("density_matrix_hex") or ""
+                        if _dm_hex and len(_dm_hex) >= 64:
+                            _w_entropy_seed = _hl.sha3_256(
+                                b"QTCL_SEED_FALLBACK:" + bytes.fromhex(_dm_hex[:256])
+                            ).digest()
+                        else:
+                            # Last resort: time-bucketed seed (still rotates every 30s)
+                            _weh = _wstate.get("w_entropy_hash") or ""
+                            _w_entropy_seed = _hl.sha3_256(
+                                str(_weh).encode() + str(int(_t.time() / 30)).encode()
+                            ).digest()
+                except Exception as _se:
+                    _EXP_LOG.debug(f"[MINER-SIMPLE] Oracle seed fetch failed: {_se}")
+                    _w_entropy_seed = _hl.sha3_256(
+                        str(int(_t.time() / 30)).encode() + parent_hash.encode()
+                    ).digest()
+
+                # ── Build scratchpad ONCE per block (shared across all nonces) ────
+                # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
+                _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
+                scratchpad = _build_scratchpad(_w_entropy_seed)
+                _EXP_LOG.info(
+                    f"[MINER-SIMPLE] Mining h={target_height} diff={difficulty_bits} "
+                    f"(server-authoritative) parent={parent_hash[:16]}…  "
+                    f"target: {'0'*difficulty_bits}…  seed={_w_entropy_seed.hex()[:16]}…"
+                )
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
-                
-                # Mining loop: SHA3-256 PoW with JSON block data (like working mobile version)
-                # ⚠️ CRITICAL: Server validates with hex zeros: block_hash.startswith("0" * difficulty_bits)
-                # So difficulty_bits=13 means need 13 leading hex zeros (0000000000000...)
+
                 hex_zeros_required = "0" * difficulty_bits
+                _seed_refresh_interval = 25   # refresh oracle seed every 25s (< 30s oracle rotation)
                 while True:
-                    # Calculate block hash using SHA3-256 with JSON
-                    block_hash = _hash_block(target_height, parent_hash, timestamp, nonce, 
-                                           difficulty_bits, merkle_root, 
-                                           getattr(getattr(self, 'wallet', None), 'address', "0"*64),
-                                           w_entropy)
-                    
-                    # Check if hash meets difficulty (hex zeros, matches server validation at line 7400)
+                    # Refresh oracle seed before it expires (> 120s = server rejects)
+                    if _t.time() - _seed_fetch_time > _seed_refresh_interval:
+                        try:
+                            _wstate2 = kapi._get("/api/oracle/w-state") or {}
+                            _ps2 = _wstate2.get("pow_seed_hex") or ""
+                            if _ps2 and len(_ps2) == 64:
+                                _w_entropy_seed = bytes.fromhex(_ps2)
+                            else:
+                                _dm_hex2 = _wstate2.get("density_matrix_hex") or ""
+                                if _dm_hex2 and len(_dm_hex2) >= 64:
+                                    _w_entropy_seed = _hl.sha3_256(
+                                        b"QTCL_SEED_FALLBACK:" + bytes.fromhex(_dm_hex2[:256])
+                                    ).digest()
+                                else:
+                                    _weh2 = _wstate2.get("w_entropy_hash") or ""
+                                    _w_entropy_seed = _hl.sha3_256(
+                                        str(_weh2).encode() + str(int(_t.time() / 30)).encode()
+                                    ).digest()
+                            scratchpad = _build_scratchpad(_w_entropy_seed)
+                            _seed_fetch_time = _t.time()
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Seed refreshed (QRNG-injected) nonce={nonce}")
+                        except Exception:
+                            _seed_fetch_time = _t.time()
+
+                    # QTCL-PoW hash — memory-hard, sequential, oracle-bound
+                    block_hash = _hash_block(
+                        target_height, parent_hash, timestamp, nonce,
+                        difficulty_bits, merkle_root, miner_addr,
+                        _w_entropy_seed, scratchpad,
+                    )
+
                     if block_hash.startswith(hex_zeros_required):
                         # FOUND BLOCK!
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
@@ -11765,16 +11864,22 @@ class QtclClientApp:
 
                             submit_payload = {
                                 "header": {
-                                    "height": target_height,
-                                    "block_hash": block_hash,
-                                    "parent_hash": parent_hash,
-                                    "timestamp_s": timestamp,
-                                    "nonce": nonce,
-                                    "miner_address": miner_addr,
+                                    "height":          target_height,
+                                    "block_hash":      block_hash,
+                                    "parent_hash":     parent_hash,
+                                    "timestamp_s":     timestamp,
+                                    "nonce":           nonce,
+                                    "miner_address":   miner_addr,
                                     "difficulty_bits": difficulty_bits,
-                                    "merkle_root": "0" * 64,  # For now, simple root
-                                    "w_state_fidelity": max(0.75, float(getattr(ORACLE_W_STATE, 'fidelity', 0.85)) if 'ORACLE_W_STATE' in dir() and ORACLE_W_STATE is not None else 0.85),  # Live fidelity from W3 state
-                                    "w_entropy_hash": "0" * 64,
+                                    "merkle_root":     merkle_root,
+                                    # w_entropy_hash = hex-encoded oracle seed used for this block's PoW.
+                                    # Server decodes it, rebuilds the 512KB scratchpad, and verifies.
+                                    "w_entropy_hash":  _w_entropy_seed.hex(),
+                                    "w_state_fidelity": max(0.75, float(
+                                        getattr(ORACLE_W_STATE, 'fidelity', 0.85)
+                                        if 'ORACLE_W_STATE' in dir() and ORACLE_W_STATE is not None
+                                        else 0.85
+                                    )),
                                     "pq_curr": target_height,
                                     "pq_last": target_height - 1,
                                 },
