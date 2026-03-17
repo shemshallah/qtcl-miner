@@ -11615,47 +11615,9 @@ class QtclClientApp:
         async def _mine_inline():
             """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
             import hashlib as _hl, json as _j, time as _t
-            import concurrent.futures as _cf
-            import os as _os
 
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
-
-            # ── Thread-pool nonce worker ─────────────────────────────────────
-            # ThreadPoolExecutor (not ProcessPool) because:
-            #   1. Local nested functions can't be pickled for ProcessPool
-            #   2. Termux/Android blocks fork() required by ProcessPool
-            #   3. hashlib's SHA3 releases the GIL during C-extension calls
-            #      so threads genuinely run in parallel for hash-heavy work
-            def _pow_chunk(height, parent_hash, timestamp, start_nonce, chunk_size,
-                           difficulty_bits, merkle_root, miner_addr,
-                           seed_bytes, scratchpad_bytes):
-                import hashlib as _h, struct as _s
-                _pref = '0' * difficulty_bits
-                _sp   = scratchpad_bytes
-                _wsz  = 64
-                _nw   = len(_sp) // _wsz
-                _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
-                _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
-                _ma40 = miner_addr.encode()[:40].ljust(40, b'\x00')
-                _nb32 = seed_bytes[:32]
-                for nonce in range(start_nonce, start_nonce + chunk_size):
-                    hdr = _s.pack('>Q I 32s 32s I I 40s 32s',
-                                  height, timestamp, _ph32, _mr32,
-                                  difficulty_bits, nonce, _ma40, _nb32)
-                    state = _h.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
-                    for rnd in range(64):
-                        wi    = _s.unpack_from('>I', state, 0)[0] % _nw
-                        ws    = wi * _wsz
-                        state = _h.sha3_256(state + _sp[ws:ws+_wsz] + _s.pack('>I', rnd)).digest()
-                    if state.hex().startswith(_pref):
-                        return (nonce, state.hex())
-                return None
-
-            # 4 threads on mobile; hashlib releases GIL so these run truly parallel
-            _ncpu     = min(4, max(1, _os.cpu_count() or 2))
-            _executor = _cf.ThreadPoolExecutor(max_workers=_ncpu)
-            _EXP_LOG.info(f"[MINER-SIMPLE] ThreadPoolExecutor: {_ncpu} workers (GIL-free SHA3)")
 
             # FIX: Track locally-mined heights to prevent orphaning race
             _last_mined_height = 0
@@ -11923,20 +11885,57 @@ class QtclClientApp:
                 )
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
 
-                # ── Parallel nonce search: dispatch CHUNK_SIZE nonces per worker ──
-                # Each worker subprocess runs _pow_chunk() — pure C-level hashlib,
-                # no GIL, no Python overhead per nonce.
-                # Throughput: ~50-200x vs single-threaded async loop.
-                _CHUNK      = 50_000          # nonces per subprocess call
-                _loop       = _asyncio.get_event_loop()
-                nonce       = 0
-                _found      = False
+                # ── Tight inline nonce loop ──────────────────────────────────
+                # SHA3 on 224-byte inputs does NOT release the GIL — threading
+                # provides zero benefit (benchmarked: 12k single vs 11k threaded).
+                # Simple inline loop is fastest on Termux/mobile.
+                # Yields to event loop every 2000 nonces → display updates ~5× /s.
+                import struct as _pow_st
+                _YIELD_EVERY  = 2000   # yield to event loop every N nonces
+                _REFR_EVERY   = 25     # oracle seed refresh interval (seconds)
+                nonce         = 0
                 _winning_seed = _w_entropy_seed
-                _seed_refresh_interval = 25   # refresh oracle seed every 25s (< 120s TTL)
+                hex_zeros     = "0" * difficulty_bits
+                _found        = False
+
+                # Pre-compute fixed header parts that don't change per nonce
+                _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
+                _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
+                _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
+                _wsz  = 64
+                _nw   = len(scratchpad) // _wsz
 
                 while not _found:
-                    # Seed refresh check (same logic as before)
-                    if _t.time() - _seed_fetch_time > _seed_refresh_interval:
+                    # Inner burst: _YIELD_EVERY hashes before yielding
+                    _nb32 = _w_entropy_seed[:32]
+                    _sp   = scratchpad
+                    for _i in range(_YIELD_EVERY):
+                        hdr   = _pow_st.pack(">Q I 32s 32s I I 40s 32s",
+                                             target_height, timestamp,
+                                             _ph32, _mr32,
+                                             difficulty_bits, nonce,
+                                             _ma40, _nb32)
+                        state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
+                        for _r in range(64):
+                            _wi   = _pow_st.unpack_from(">I", state, 0)[0] % _nw
+                            _ws   = _wi * _wsz
+                            state = _hl.sha3_256(state + _sp[_ws:_ws+_wsz] + _pow_st.pack(">I", _r)).digest()
+                        if state.hex().startswith(hex_zeros):
+                            block_hash    = state.hex()
+                            _winning_seed = _w_entropy_seed
+                            _found        = True
+                            break
+                        nonce += 1
+
+                    if _found:
+                        break
+
+                    # Yield to event loop so display/UI stays responsive
+                    _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
+                    await _asyncio.sleep(0)
+
+                    # Oracle seed refresh
+                    if _t.time() - _seed_fetch_time > _REFR_EVERY:
                         try:
                             _wstate2 = kapi._get("/api/oracle/w-state") or {}
                             _ps2 = _wstate2.get("pow_seed_hex") or ""
@@ -11951,52 +11950,27 @@ class QtclClientApp:
                                 else:
                                     _weh2 = _wstate2.get("w_entropy_hash") or ""
                                     _w_entropy_seed = _hl.sha3_256(
-                                        str(_weh2).encode() + str(int(_t.time() / 30)).encode()
+                                        str(_weh2).encode() + str(int(_t.time()/30)).encode()
                                     ).digest()
                             scratchpad = _build_scratchpad(_w_entropy_seed)
+                            _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
+                            _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
+                            _nw   = len(scratchpad) // _wsz
                             _seed_fetch_time = _t.time()
-                            _EXP_LOG.debug(f"[MINER-SIMPLE] Seed refreshed nonce={nonce}")
                         except Exception:
                             _seed_fetch_time = _t.time()
 
-                    # Dispatch _ncpu chunks in parallel, await all futures
-                    _snap_seed  = _w_entropy_seed   # consistent across this batch
-                    _snap_sp    = scratchpad
-                    futures = [
-                        _loop.run_in_executor(
-                            _executor, _pow_chunk,
-                            target_height, parent_hash, timestamp,
-                            nonce + w * _CHUNK, _CHUNK,
-                            difficulty_bits, merkle_root, miner_addr,
-                            _snap_seed, _snap_sp,
-                        )
-                        for w in range(_ncpu)
-                    ]
-                    results = await _asyncio.gather(*futures)
-
-                    for res in results:
-                        if res is not None:
-                            nonce, block_hash = res
-                            _found = True
-                            _winning_seed = _snap_seed
-                            break
-
-                    if _found:
-                        break
-
-                    nonce += _ncpu * _CHUNK
-
-                    # Telemetry and chain-advance check every ~500k nonces
-                    _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
-                    try:
-                        tip2 = kapi.get_chain_tip() or {}
-                        h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
-                        if h2 > oracle_height:
-                            _EXP_LOG.info(f"[MINER-SIMPLE] Chain advanced h={h2}, restarting")
-                            _MINE_TELEM.mark_idle()
-                            break
-                    except Exception:
-                        pass
+                    # Chain advance check every 50k nonces
+                    if nonce % 50_000 == 0 and nonce > 0:
+                        try:
+                            tip2 = kapi.get_chain_tip() or {}
+                            h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
+                            if h2 > oracle_height:
+                                _EXP_LOG.info(f"[MINER-SIMPLE] Chain advanced h={h2}, restarting")
+                                _MINE_TELEM.mark_idle()
+                                break
+                        except Exception:
+                            pass
 
                 if not _found:
                     continue  # chain advanced, restart outer loop
