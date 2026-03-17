@@ -11932,6 +11932,7 @@ class QtclClientApp:
                 nonce       = 0
                 _found      = False
                 _winning_seed = _w_entropy_seed
+                _seed_refresh_interval = 25   # refresh oracle seed every 25s (< 120s TTL)
 
                 while not _found:
                     # Seed refresh check (same logic as before)
