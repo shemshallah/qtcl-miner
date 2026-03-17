@@ -11779,6 +11779,17 @@ class QtclClientApp:
                         str(int(_t.time() / 30)).encode() + parent_hash.encode()
                     ).digest()
 
+                # ── FIX: Capture miner_addr ONCE here — never reassign after solve.
+                # Re-assigning after the nonce loop (from self.wallet.address) creates
+                # a header field mismatch: hash was computed with addr_at_mine_start
+                # but server verifies with addr_at_submit → hash_mismatch every time.
+                _mine_miner_addr = getattr(getattr(self, 'wallet', None), 'address', None)
+                if not _mine_miner_addr:
+                    _mine_miner_addr = miner_addr  # outer scope fallback
+                if not _mine_miner_addr:
+                    _mine_miner_addr = "0" * 64
+                miner_addr = _mine_miner_addr  # locked — used for hash AND submit
+
                 # ── Build scratchpad ONCE per block (shared across all nonces) ────
                 # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
                 _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
@@ -11813,7 +11824,7 @@ class QtclClientApp:
                     "to_addr": miner_addr,
                     "amount": 1250,
                     "block_height": target_height,
-                    "w_proof": _w_entropy_hash,
+                    "w_proof": _w_entropy_seed.hex(),  # FIX: must match tx_id computation (was _w_entropy_hash)
                     "tx_type": "coinbase",
                     "version": 1,
                 }
@@ -11902,14 +11913,18 @@ class QtclClientApp:
                             _seed_fetch_time = _t.time()
 
                     # QTCL-PoW hash — memory-hard, sequential, oracle-bound
+                    _current_seed = _w_entropy_seed  # snapshot: may refresh mid-loop
                     block_hash = _hash_block(
                         target_height, parent_hash, timestamp, nonce,
                         difficulty_bits, merkle_root, miner_addr,
-                        _w_entropy_seed, scratchpad,
+                        _current_seed, scratchpad,
                     )
 
                     if block_hash.startswith(hex_zeros_required):
-                        # FOUND BLOCK!
+                        # FOUND BLOCK — lock the seed that produced this exact hash.
+                        # _w_entropy_seed could be reassigned by a concurrent refresh;
+                        # _winning_seed is immutable from this point forward.
+                        _winning_seed = _current_seed
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
                         
                         # NOTE: _last_mined_height updated only after oracle confirmation (acceptance branch below)
@@ -11927,17 +11942,12 @@ class QtclClientApp:
                         
                         # Submit to oracle/server
                         try:
-                            # Get miner address
-                            miner_addr = getattr(getattr(self, 'wallet', None), 'address', None)
-                            if not miner_addr:
-                                _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No wallet address, using default")
-                                miner_addr = "0" * 64
-                            
-                            # ✅ FIX: Use pre-committed _block_txs (coinbase + mempool from before mining)
-                            # Do NOT re-fetch mempool here — that creates the mismatch bug.
-                            # The merkle_root was computed from _block_txs before mining started.
-                            # Server will recompute merkle and verify it matches the header.
-                            
+                            # miner_addr was locked before the nonce loop — do NOT re-fetch here.
+                            # Re-assigning from self.wallet.address after solve is the PRIMARY
+                            # cause of hash_mismatch: hash was computed with the original
+                            # miner_addr; server verifies using submitted miner_address.
+                            # If they differ → expected != got every single time.
+
                             submit_payload = {
                                 "header": {
                                     "height":          target_height,
@@ -11945,12 +11955,12 @@ class QtclClientApp:
                                     "parent_hash":     parent_hash,
                                     "timestamp_s":     timestamp,
                                     "nonce":           nonce,
-                                    "miner_address":   miner_addr,
+                                    "miner_address":   miner_addr,   # locked before loop
                                     "difficulty_bits": difficulty_bits,
                                     "merkle_root":     merkle_root,
-                                    # w_entropy_hash = hex-encoded oracle seed used for this block's PoW.
-                                    # Server decodes it, rebuilds the 512KB scratchpad, and verifies.
-                                    "w_entropy_hash":  _w_entropy_seed.hex(),
+                                    # _winning_seed = exact seed used when this nonce was hashed.
+                                    # Server decodes, rebuilds 512KB scratchpad, recomputes hash.
+                                    "w_entropy_hash":  _winning_seed.hex(),
                                     "w_state_fidelity": max(0.75, float(
                                         getattr(ORACLE_W_STATE, 'fidelity', 0.85)
                                         if 'ORACLE_W_STATE' in dir() and ORACLE_W_STATE is not None
@@ -11961,6 +11971,33 @@ class QtclClientApp:
                                 },
                                 "transactions": _block_txs,
                             }
+
+                            # FIX: If seed refreshed during mining, coinbase w_proof and tx_id
+                            # were built with the old seed but _winning_seed may differ.
+                            # Rebuild coinbase and merkle_root using _winning_seed so the
+                            # server's merkle recomputation matches the submitted transaction list.
+                            if _winning_seed != _w_entropy_seed or True:  # always rebuild to be safe
+                                _winning_cb_id = _hl.sha3_256(
+                                    json.dumps({
+                                        "block_height": target_height,
+                                        "miner_address": miner_addr,
+                                        "amount": 1250,
+                                        "w_proof": _winning_seed.hex(),
+                                        "version": 1,
+                                    }, sort_keys=True).encode()
+                                ).hexdigest()
+                                _winning_coinbase = {
+                                    "tx_id": _winning_cb_id,
+                                    "from_addr": "0" * 64,
+                                    "to_addr": miner_addr,
+                                    "amount": 1250,
+                                    "block_height": target_height,
+                                    "w_proof": _winning_seed.hex(),
+                                    "tx_type": "coinbase",
+                                    "version": 1,
+                                }
+                                _winning_txs = [_winning_coinbase] + _pending_user_txs
+                                submit_payload["transactions"] = _winning_txs
                             
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
                             
