@@ -11616,46 +11616,46 @@ class QtclClientApp:
             """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
             import hashlib as _hl, json as _j, time as _t
             import concurrent.futures as _cf
-            import multiprocessing as _mp
             import os as _os
 
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
 
-            # ── Process-pool nonce worker ────────────────────────────────────
-            # Runs in a subprocess (no GIL), returns (nonce, hash) or None.
-            # All pure-Python SHA3 → gets ~50-200x throughput vs single async loop.
+            # ── Thread-pool nonce worker ─────────────────────────────────────
+            # ThreadPoolExecutor (not ProcessPool) because:
+            #   1. Local nested functions can't be pickled for ProcessPool
+            #   2. Termux/Android blocks fork() required by ProcessPool
+            #   3. hashlib's SHA3 releases the GIL during C-extension calls
+            #      so threads genuinely run in parallel for hash-heavy work
             def _pow_chunk(height, parent_hash, timestamp, start_nonce, chunk_size,
                            difficulty_bits, merkle_root, miner_addr,
                            seed_bytes, scratchpad_bytes):
                 import hashlib as _h, struct as _s
                 _pref = '0' * difficulty_bits
-                _nb   = seed_bytes  # already bytes
                 _sp   = scratchpad_bytes
                 _wsz  = 64
                 _nw   = len(_sp) // _wsz
-                _rounds = 64
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b'\x00')
-                _nb32 = _nb[:32]
+                _nb32 = seed_bytes[:32]
                 for nonce in range(start_nonce, start_nonce + chunk_size):
                     hdr = _s.pack('>Q I 32s 32s I I 40s 32s',
                                   height, timestamp, _ph32, _mr32,
                                   difficulty_bits, nonce, _ma40, _nb32)
                     state = _h.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
-                    for rnd in range(_rounds):
-                        wi  = _s.unpack_from('>I', state, 0)[0] % _nw
-                        ws  = wi * _wsz
+                    for rnd in range(64):
+                        wi    = _s.unpack_from('>I', state, 0)[0] % _nw
+                        ws    = wi * _wsz
                         state = _h.sha3_256(state + _sp[ws:ws+_wsz] + _s.pack('>I', rnd)).digest()
                     if state.hex().startswith(_pref):
                         return (nonce, state.hex())
                 return None
 
-            # Number of worker processes — use all physical cores
-            _ncpu   = max(1, _os.cpu_count() or 1)
-            _executor = _cf.ProcessPoolExecutor(max_workers=_ncpu)
-            _EXP_LOG.info(f"[MINER-SIMPLE] ProcessPoolExecutor: {_ncpu} workers (bypasses GIL)")
+            # 4 threads on mobile; hashlib releases GIL so these run truly parallel
+            _ncpu     = min(4, max(1, _os.cpu_count() or 2))
+            _executor = _cf.ThreadPoolExecutor(max_workers=_ncpu)
+            _EXP_LOG.info(f"[MINER-SIMPLE] ThreadPoolExecutor: {_ncpu} workers (GIL-free SHA3)")
 
             # FIX: Track locally-mined heights to prevent orphaning race
             _last_mined_height = 0
