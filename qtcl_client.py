@@ -9448,14 +9448,24 @@ typedef struct {
     uint8_t  version;
     uint8_t  flags;
     uint8_t  reserved[2];
-} QtclMsgHeader;
+} QtclMsgHeader; /* last struct that needs byte-perfect wire packing */
+#pragma pack(pop)
 
+/* QtclPeer is NOT packed — natural alignment lets the C compiler produce
+   the same 112-byte layout that CFFI computes from the cdef.
+   The 4-byte _pad4 field explicitly fills the gap the compiler would insert
+   before int64_t last_seen_ns (after the 84-byte prefix), making the layout
+   self-documenting and portable.
+   Layout:  node_id[16] host[64] port[2] services[1] version[1] _pad4[4]
+            last_seen_ns[8] chain_height[4] last_fidelity[4] latency_ms[4]
+            ban_score[2] connected[1] _pad[1]  → total = 112 bytes */
 typedef struct {
     uint8_t  node_id[16];
     char     host[64];
     uint16_t port;
     uint8_t  services;
     uint8_t  version;
+    uint8_t  _pad4[4];      /* explicit alignment pad before int64_t */
     int64_t  last_seen_ns;
     int32_t  chain_height;
     float    last_fidelity;
@@ -9464,7 +9474,6 @@ typedef struct {
     uint8_t  connected;
     uint8_t  _pad;
 } QtclPeer;
-#pragma pack(pop)
 
 static uint64_t _clock_ns(void) {
     struct timespec ts;
@@ -10387,6 +10396,7 @@ _QTCL_C_DEFS: str = """
         uint16_t port;
         uint8_t  services;
         uint8_t  version;
+        uint8_t  _pad4[4];
         int64_t  last_seen_ns;
         int32_t  chain_height;
         float    last_fidelity;
