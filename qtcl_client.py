@@ -84,6 +84,8 @@ if not logging.getLogger().hasHandlers():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 logger = logging.getLogger(__name__)
+# Expansion-section logger — defined early so all pre-expansion code can reference it
+_EXP_LOG = logging.getLogger("qtcl.client.expansion")
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # ENTROPY SOURCES
