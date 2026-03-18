@@ -13198,12 +13198,6 @@ class QtclClientApp:
 
                 # ── Build scratchpad ONCE per block (shared across all nonces) ────
                 # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
-                # ── Acceleration status banner (printed once per block attempt) ──
-                if _C_AVAIL:
-                    print(f"\n  ⚡ C/OpenSSL PoW ACTIVE  │  chunk={_C_CHUNK:,}  │  expected ~500k–2M H/s")
-                else:
-                    print(f"\n  🐢 Python PoW fallback   │  chunk={_YIELD_EVERY:,}  │  expected ~1–3k H/s")
-                    print(f"     → For full speed: pkg install clang openssl libffi")
                 _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
                 scratchpad = _build_scratchpad(_w_entropy_seed)
                 
@@ -13311,6 +13305,12 @@ class QtclClientApp:
                 hex_zeros     = "0" * difficulty_bits
                 _found        = False
 
+                # ── Acceleration status banner (variables now in scope) ────────
+                if _C_AVAIL:
+                    print(f"\n  ⚡ C/OpenSSL PoW ACTIVE  │  chunk={_C_CHUNK:,}  │  expected ~500k–2M H/s")
+                else:
+                    print(f"\n  🐢 Python PoW fallback   │  chunk={_YIELD_EVERY:,}  │  ~1–3k H/s")
+                    print(f"     → For full speed: pkg install clang openssl libffi")
                 # Pre-computed fixed header parts (C path recomputes internally)
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
