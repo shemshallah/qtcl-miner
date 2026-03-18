@@ -10563,6 +10563,7 @@ def _compile_c_layer() -> None:
                 '-O3', '-march=native', '-ffast-math', '-funroll-loops',
                 '-DOPENSSL_NO_DEPRECATED',
                 '-Wno-unused-function', '-Wno-unused-variable',
+                '-Wno-unreachable-code',   # CFFI check stubs are intentionally dead
             ],
             include_dirs=_inc,
             library_dirs=_lib,
