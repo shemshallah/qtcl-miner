@@ -1484,7 +1484,7 @@ import queue as _queue_mod
 import struct as _struct
 
 # Module-level P2P event queue — C callback pushes here, Python thread drains
-_P2P_EVENT_QUEUE: _queue_mod.Queue = _queue_mod.Queue(maxsize=4096)
+_P2P_EVENT_QUEUE: queue.Queue = queue.Queue(maxsize=4096)
 
 # ── cffi callback  (kept alive at module level so GC doesn't collect it) ──────
 _C_P2P_CALLBACK = None  # set by QtclP2PNode.start()
@@ -1621,14 +1621,14 @@ class LocalOracleEngine:
     def __init__(self):
         self._dm_re:    list = [0.0] * 64
         self._dm_im:    list = [0.0] * 64
-        self._dm_lock              = _threading.Lock()
+        self._dm_lock              = threading.Lock()
         self._oracle_connected     = False
         self._last_oracle_dm_ts:  float = 0.0
-        self._stop                 = _threading.Event()
-        self._poll_thread:   Optional[_threading.Thread] = None
+        self._stop                 = threading.Event()
+        self._poll_thread:   Optional[threading.Thread] = None
         self._snapshot_count:      int = 0
         self._latest_measurement:  Optional[QtclOracleMeasurement] = None
-        self._meas_lock            = _threading.Lock()
+        self._meas_lock            = threading.Lock()
 
     def start(self) -> None:
         """Start SSE listener + poll thread."""
@@ -1640,7 +1640,7 @@ class LocalOracleEngine:
             if rc == 0:
                 _EXP_LOG.info("[LOCAL-ORACLE] C SSE client started → "
                               f"wss://{self.ORACLE_HOST}{self.SSE_PATH}")
-        self._poll_thread = _threading.Thread(
+        self._poll_thread = threading.Thread(
             target=self._poll_loop, daemon=True, name='OracleSSE-C')
         self._poll_thread.start()
 
@@ -1668,14 +1668,14 @@ class LocalOracleEngine:
                             self._ingest_oracle_frame(frame_bytes.decode('utf-8'))
                         except Exception as _e:
                             _EXP_LOG.debug(f"[LOCAL-ORACLE] frame parse: {_e}")
-                    _time.sleep(0.05)
+                    time.sleep(0.05)
                     continue
             # Python fallback: if C SSE unavailable or no frames, poll HTTP
             try:
                 self._http_fallback_poll()
             except Exception as _e:
                 _EXP_LOG.debug(f"[LOCAL-ORACLE] HTTP fallback: {_e}")
-            _time.sleep(2.0)
+            time.sleep(2.0)
 
     def _ingest_oracle_frame(self, json_str: str) -> None:
         """Parse SSE JSON frame → update internal oracle DM."""
@@ -1710,7 +1710,7 @@ class LocalOracleEngine:
         with self._dm_lock:
             self._dm_re = dm_re_new
             self._dm_im = dm_im_new
-            self._last_oracle_dm_ts = _time.time()
+            self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
 
@@ -1739,7 +1739,7 @@ class LocalOracleEngine:
     def get_oracle_dm(self) -> tuple:
         """Thread-safe snapshot of latest oracle DM. Returns (dm_re, dm_im, age_s)."""
         with self._dm_lock:
-            age = _time.time() - self._last_oracle_dm_ts
+            age = time.time() - self._last_oracle_dm_ts
             return list(self._dm_re), list(self._dm_im), age
 
     def measure(
@@ -1838,10 +1838,10 @@ class LocalOracleEngine:
             # sign using the P2P HMAC secret derived inside qtcl_p2p_init
             # For standalone (no P2P): use local node secret from HLWE wallet hash
             import hashlib
-            secret_src = b'QTCL_LOCAL_MEAS_v2:' + _hashlib.sha3_256(
+            secret_src = b'QTCL_LOCAL_MEAS_v2:' + hashlib.sha3_256(
                 str(pq0).encode() + str(chain_height).encode()).digest()
             secret32 = _accel_ffi.new('uint8_t[32]',
-                                       list(_hashlib.sha3_256(secret_src).digest()))
+                                       list(hashlib.sha3_256(secret_src).digest()))
             _accel_lib.qtcl_measurement_sign(m_c, secret32)
             auth_tag_hex = bytes(m_c.auth_tag).hex()
 
@@ -1886,7 +1886,7 @@ class LocalOracleEngine:
             ).digest()
         # Last resort: time-bucketed
         return _hl.sha3_256(
-            b'QTCL_SEED_TIME_v2:' + str(int(_time.time()/30)).encode()
+            b'QTCL_SEED_TIME_v2:' + str(int(time.time()/30)).encode()
             + parent_hash.encode()
         ).digest()
 
@@ -1905,7 +1905,7 @@ class LocalOracleEngine:
         return {
             'sse_connected':   self.is_connected,
             'snapshot_count':  self._snapshot_count,
-            'oracle_age_s':    round(_time.time() - self._last_oracle_dm_ts, 1),
+            'oracle_age_s':    round(time.time() - self._last_oracle_dm_ts, 1),
             'latest_fidelity': m.fidelity_to_w3 if m else None,
             'latest_height':   m.chain_height    if m else None,
         }
@@ -1925,16 +1925,16 @@ class WStateConsensus:
 
     def __init__(self):
         self._measurements: list = []   # list of (timestamp, QtclOracleMeasurement)
-        self._lock = _threading.Lock()
+        self._lock = threading.Lock()
 
     def ingest_peer_measurement(self, m: QtclOracleMeasurement) -> None:
         with self._lock:
-            now = _time.time()
+            now = time.time()
             self._measurements = [
                 (ts, mm) for ts, mm in self._measurements
                 if now - ts < self.MEASUREMENT_TTL
             ][-self.MAX_MEASUREMENTS:]
-            self._measurements.append((_time.time(), m))
+            self._measurements.append((time.time(), m))
 
     def ingest_c_measurement_bytes(self, raw: bytes) -> None:
         """Ingest raw QtclWStateMeasurement bytes from C callback."""
@@ -2067,8 +2067,8 @@ class QtclP2PNode:
         self._oracle:    Optional[LocalOracleEngine]  = None
         self._consensus: Optional[WStateConsensus]   = None
         self._started    = False
-        self._drain_thread: Optional[_threading.Thread] = None
-        self._stop       = _threading.Event()
+        self._drain_thread: Optional[threading.Thread] = None
+        self._stop       = threading.Event()
 
     def start(
             self,
@@ -2107,12 +2107,12 @@ class QtclP2PNode:
 
         # Drain event queue in background thread
         self._stop.clear()
-        self._drain_thread = _threading.Thread(
+        self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True, name='P2P-Drain')
         self._drain_thread.start()
 
         # Discover more peers via /api/p2p/peer_exchange
-        _threading.Thread(
+        threading.Thread(
             target=self._peer_exchange, daemon=True, name='P2P-Bootstrap').start()
 
         self._started = True
@@ -2124,7 +2124,7 @@ class QtclP2PNode:
         try:
             raw = bytes(_accel_ffi.buffer(data, data_len))
             _P2P_EVENT_QUEUE.put_nowait((event_type, raw))
-        except _queue_mod.Full:
+        except queue.Full:
             pass
 
     def _drain_loop(self) -> None:
@@ -2139,7 +2139,7 @@ class QtclP2PNode:
                     _EXP_LOG.info(f"[P2P] Peer connected ({len(raw)} bytes)")
                 elif event_type == 2: # PEER_DISCONNECTED
                     _EXP_LOG.debug("[P2P] Peer disconnected")
-            except _queue_mod.Empty:
+            except queue.Empty:
                 continue
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] drain_loop: {_e}")
