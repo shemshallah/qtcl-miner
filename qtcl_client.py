@@ -11627,55 +11627,203 @@ class QtclClientApp:
             # ──────────────────────────────────────────────────────────────────────
             # QTCL-PoW v1 — Memory-hard, oracle-bound, GPU/ASIC resistant
             #
-            # Three defenses against specialized hardware:
-            #  1. Oracle time-lock: w_entropy_seed changes every ~30s (live W-state
-            #     density matrix hash). Stale mining is rejected by the server.
-            #  2. Memory-hard scratchpad: 512KB SHAKE-256 expansion, 64 sequential
-            #     random-access reads per hash — bandwidth-bound, not compute-bound.
-            #  3. Sequential dependency: each round's scratchpad index derived from
-            #     prior hash output — cannot parallelise across nonces.
-            # ──────────────────────────────────────────────────────────────────────
+            # ═══════════════════════════════════════════════════════════════════
+            # CFFI + OPENSSL ACCELERATION
+            # Tries to compile a C extension at startup via cffi.verify().
+            # If clang/openssl unavailable, falls back to pure Python seamlessly.
+            # pkg install clang openssl libffi  (Termux one-time setup)
+            # ═══════════════════════════════════════════════════════════════════
             import struct as _pow_st
 
             _POW_SCRATCHPAD_BYTES = 512 * 1024
             _POW_MIX_ROUNDS       = 64
             _POW_WINDOW_BYTES     = 64
 
+            # ── C source: SHA3-256 via OpenSSL EVP + scratchpad builder + PoW search ──
+            _C_SOURCE = r"""
+#include <stdint.h>
+#include <string.h>
+#include <openssl/evp.h>
+
+/* SHA3-256 single call, reusing caller-provided context for speed */
+static void sha3c(EVP_MD_CTX *ctx, const EVP_MD *md,
+                  const void *in, size_t inlen, uint8_t *out) {
+    unsigned int dlen = 32;
+    EVP_DigestInit_ex(ctx, md, NULL);
+    EVP_DigestUpdate(ctx, in, inlen);
+    EVP_DigestFinal_ex(ctx, out, &dlen);
+}
+
+/* SHAKE-256 XOF for scratchpad expansion */
+void qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    uint8_t inp[51];
+    memcpy(inp, "QTCL_SCRATCHPAD_v1:", 19);
+    memcpy(inp + 19, seed, 32);
+    EVP_DigestInit_ex(ctx, EVP_shake256(), NULL);
+    EVP_DigestUpdate(ctx, inp, 51);
+    EVP_DigestFinalXOF(ctx, out, outlen);
+    EVP_MD_CTX_free(ctx);
+}
+
+static void w32be(uint8_t *p, uint32_t v) {
+    p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v;
+}
+static void w64be(uint8_t *p, uint64_t v) {
+    p[0]=v>>56; p[1]=v>>48; p[2]=v>>40; p[3]=v>>32;
+    p[4]=v>>24; p[5]=v>>16; p[6]=v>>8; p[7]=v;
+}
+static uint32_t r32be(const uint8_t *p) {
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+
+/*
+ * qtcl_pow_search: search nonces [start, start+chunk) for difficulty_bits
+ * leading zero bits. Returns winning nonce or -1. Writes 32B hash to out.
+ *
+ * Header layout (168 bytes total):
+ *   "QTCL_POW_v1:"(12) + BE64(height) + BE32(ts) + parent[32] + merkle[32]
+ *   + BE32(diff) + BE32(nonce) + addr[40] + seed[32]
+ */
+int64_t qtcl_pow_search(
+    uint64_t height, uint32_t ts,
+    const uint8_t *ph, const uint8_t *mr,
+    uint32_t diff, uint32_t start, uint32_t chunk,
+    const uint8_t *ma, const uint8_t *seed,
+    const uint8_t *sp, uint8_t *out_hash)
+{
+    uint8_t hdr[168];
+    memcpy(hdr, "QTCL_POW_v1:", 12);
+    w64be(hdr+12, height);
+    w32be(hdr+20, ts);
+    memcpy(hdr+24, ph, 32);
+    memcpy(hdr+56, mr, 32);
+    w32be(hdr+88, diff);
+    /* hdr+92: nonce slot, written per nonce */
+    memcpy(hdr+96, ma, 40);
+    memcpy(hdr+136, seed, 32);
+
+    uint32_t nw  = (512 * 1024) / 64;
+    uint32_t fb  = diff / 8;
+    uint32_t rb  = diff % 8;
+    uint8_t  rm  = rb ? (uint8_t)(0xffu << (8u - rb)) : 0u;
+
+    /* round_in: state(32) + window(64) + round_be32(4) = 100 bytes */
+    uint8_t  st[32], ri[100];
+
+    /* Single EVP context reused across all nonces and all 64 rounds.
+     * EVP_DigestInit_ex() reinit is far cheaper than alloc+free.     */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    const EVP_MD *md = EVP_sha3_256();
+
+    for (uint32_t n = 0; n < chunk; n++) {
+        w32be(hdr + 92, start + n);
+
+        /* Initial hash over 168-byte header */
+        sha3c(ctx, md, hdr, 168, st);
+
+        /* 64 sequential scratchpad rounds */
+        for (int r = 0; r < 64; r++) {
+            uint32_t wi = r32be(st) % nw;
+            memcpy(ri,      st,           32);
+            memcpy(ri + 32, sp + wi * 64, 64);
+            w32be(ri + 96, (uint32_t)r);
+            sha3c(ctx, md, ri, 100, st);
+        }
+
+        /* Check difficulty: full_bytes zero bytes + optional partial byte */
+        int ok = 1;
+        for (uint32_t i = 0; i < fb && ok; i++)
+            if (st[i]) ok = 0;
+        if (ok && rb && (st[fb] & rm)) ok = 0;
+
+        if (ok) {
+            memcpy(out_hash, st, 32);
+            EVP_MD_CTX_free(ctx);
+            return (int64_t)(start + n);
+        }
+    }
+
+    EVP_MD_CTX_free(ctx);
+    return -1;
+}
+
+/* qtcl_sha3_256: standalone hash for merkle root computation */
+void qtcl_sha3_256(const uint8_t *in, size_t inlen, uint8_t *out) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned int dlen = 32;
+    EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
+    EVP_DigestUpdate(ctx, in, inlen);
+    EVP_DigestFinal_ex(ctx, out, &dlen);
+    EVP_MD_CTX_free(ctx);
+}
+"""
+
+            # ── Try to compile cffi extension; fall back to Python if unavailable ──
+            _C_LIB   = None
+            _C_AVAIL = False
+            try:
+                import cffi as _cffi_mod
+                _ffi = _cffi_mod.FFI()
+                _ffi.cdef("""
+                    void   qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t out_len);
+                    int64_t qtcl_pow_search(
+                        uint64_t height, uint32_t ts,
+                        const uint8_t *ph, const uint8_t *mr,
+                        uint32_t diff, uint32_t start, uint32_t chunk,
+                        const uint8_t *ma, const uint8_t *seed,
+                        const uint8_t *sp, uint8_t *out_hash);
+                    void qtcl_sha3_256(const uint8_t *in, size_t inlen, uint8_t *out);
+                """)
+                import os as _os
+                _TERMUX = '/data/data/com.termux/files/usr'
+                _inc    = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
+                _libs   = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
+                _C_LIB = _ffi.verify(
+                    _C_SOURCE,
+                    libraries=["ssl", "crypto"],
+                    extra_compile_args=["-O3", "-march=native", "-ffast-math"],
+                    include_dirs=_inc,
+                    library_dirs=_libs,
+                )
+                _C_AVAIL = True
+                _EXP_LOG.info("[MINER-SIMPLE] ✅ C/OpenSSL PoW acceleration active")
+            except Exception as _cffi_err:
+                _EXP_LOG.warning(f"[MINER-SIMPLE] C acceleration unavailable ({_cffi_err}), "
+                                 f"using Python fallback. Run: pkg install clang openssl")
+
             def _build_scratchpad(seed_bytes: bytes) -> bytes:
-                """Expand 32-byte oracle seed → 512KB scratchpad via SHAKE-256 XOF."""
-                xof = _hl.shake_256(b"QTCL_SCRATCHPAD_v1:" + seed_bytes)
+                """512KB SHAKE-256 scratchpad — C (OpenSSL) or Python fallback."""
+                if _C_AVAIL:
+                    _s  = _ffi.new("uint8_t[]", seed_bytes[:32])
+                    _out= _ffi.new("uint8_t[]", _POW_SCRATCHPAD_BYTES)
+                    _C_LIB.qtcl_build_scratchpad(_s, _out, _POW_SCRATCHPAD_BYTES)
+                    return bytes(_out)
+                xof = _hl.shake_256(b"QTCL_SCRATCHPAD_v1:" + seed_bytes[:32])
                 return xof.digest(_POW_SCRATCHPAD_BYTES)
 
-            def _hash_block(height: int, parent_hash: str, timestamp: int, nonce: int,
-                            difficulty_bits: int, merkle_root: str, miner_addr: str,
-                            w_entropy_seed: bytes, scratchpad: bytes) -> str:
-                """
-                QTCL-PoW hash — memory-hard, sequential, oracle-bound.
-                w_entropy_seed must be raw bytes (32), scratchpad pre-built for this seed.
-                """
-                # Pack header as fixed binary (no JSON overhead, deterministic)
+            def _hash_block(height, parent_hash, timestamp, nonce,
+                            difficulty_bits, merkle_root, miner_addr,
+                            w_entropy_seed, scratchpad):
+                """Single QTCL-PoW hash — used for validation only; mining uses _pow_search_chunk."""
                 header = _pow_st.pack(
                     '>Q I 32s 32s I I 40s 32s',
-                    height,
-                    timestamp,
+                    height, timestamp,
                     bytes.fromhex(parent_hash.zfill(64))[:32],
                     bytes.fromhex(merkle_root.zfill(64))[:32],
-                    difficulty_bits,
-                    nonce,
+                    difficulty_bits, nonce,
                     miner_addr.encode()[:40].ljust(40, b'\x00'),
                     w_entropy_seed[:32],
                 )
-                # Initial state
                 state = _hl.sha3_256(b"QTCL_POW_v1:" + header).digest()
-                # Sequential scratchpad mix (64 rounds × random-access reads)
                 n_windows = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
                 for rnd in range(_POW_MIX_ROUNDS):
-                    window_idx = _pow_st.unpack_from('>I', state, 0)[0] % n_windows
-                    ws = window_idx * _POW_WINDOW_BYTES
-                    window = scratchpad[ws : ws + _POW_WINDOW_BYTES]
-                    state = _hl.sha3_256(state + window + _pow_st.pack('>I', rnd)).digest()
+                    wi  = _pow_st.unpack_from('>I', state, 0)[0] % n_windows
+                    ws  = wi * _POW_WINDOW_BYTES
+                    state = _hl.sha3_256(state + scratchpad[ws:ws+_POW_WINDOW_BYTES] +
+                                         _pow_st.pack('>I', rnd)).digest()
                 return state.hex()
-            
+
             async def _get_chain_tip_with_retry():
                 """Get chain tip with exponential backoff, fallback to genesis"""
                 tip = None
@@ -11885,77 +12033,94 @@ class QtclClientApp:
                 )
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
 
-                # ── Tight inline nonce loop ──────────────────────────────────
-                # SHA3 has no ARM hardware accel — 3-4k H/s on mobile is the
-                # physical ceiling. Optimizations applied:
-                #   • Struct object (pre-compiled pack/unpack, faster than module fn)
-                #   • Static header prefix (pack everything except nonce once)
-                #   • memoryview scratchpad (zero-copy 64-byte window reads)
-                #   • h.update() (avoids 128 byte-concat mallocs per nonce)
-                #   • All hot names localized to avoid dict lookups in inner loop
+                # ── PoW nonce search: C/OpenSSL if available, Python fallback ───────
+                # C path: ~15-40k H/s (OpenSSL Keccak + zero-alloc EVP context reuse)
+                # Python path: ~3-5k H/s (optimized struct + memoryview)
                 import struct as _pow_st
-                _YIELD_EVERY  = 2000
-                _REFR_EVERY   = 25
+                _YIELD_EVERY  = 5000   # Python burst size before yielding to event loop
+                _C_CHUNK      = 50_000 # C burst size (50k nonces in pure C, ~1-3s)
+                _REFR_EVERY   = 25     # seed refresh interval (seconds)
                 nonce         = 0
                 _winning_seed = _w_entropy_seed
                 hex_zeros     = "0" * difficulty_bits
                 _found        = False
 
-                # Pre-compute all fixed header parts
+                # Pre-computed fixed header parts (C path recomputes internally)
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
                 _wsz  = 64
                 _nw   = len(scratchpad) // _wsz
-                # Struct object: pre-compiled, faster than module-level pack/unpack
                 _SI   = _pow_st.Struct(">I")
                 _SI_pack   = _SI.pack
                 _SI_unpack = _SI.unpack_from
-                # Static header prefix: Q(height) I(ts) 32s 32s I = 80 bytes
                 _pfx  = _pow_st.pack(">Q I 32s 32s I",
                                      target_height, timestamp, _ph32, _mr32, difficulty_bits)
-                # Round bytes pre-computed: 64 × 4 bytes, avoids pack() in inner loop
                 _RNDS = [_SI_pack(r) for r in range(64)]
-                # PoW prefix bytes (constant)
                 _POW_PFX = b"QTCL_POW_v1:"
-                # Localize sha3_256 constructor
                 _sha3 = _hl.sha3_256
 
-                while not _found:
-                    _nb32 = _w_entropy_seed[:32]
-                    _sfx  = _ma40 + _nb32           # 72 bytes suffix (changes on seed refresh)
-                    _spv  = memoryview(scratchpad)   # zero-copy slicing
+                # C FFI buffers (allocated once, reused every chunk)
+                if _C_AVAIL:
+                    _c_ph   = _ffi.new("uint8_t[]", _ph32)
+                    _c_mr   = _ffi.new("uint8_t[]", _mr32)
+                    _c_ma   = _ffi.new("uint8_t[]", _ma40)
+                    _c_seed = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
+                    _c_sp   = _ffi.new("uint8_t[]", scratchpad)
+                    _c_out  = _ffi.new("uint8_t[32]")
 
-                    for _i in range(_YIELD_EVERY):
-                        # Header = prefix(80) + nonce(4) + suffix(72) = 156 bytes
-                        hdr   = _pfx + _SI_pack(nonce) + _sfx
-                        state = _sha3(_POW_PFX + hdr).digest()
-                        # 64 sequential scratchpad rounds — inner loop is the bottleneck
-                        for _rnd_b in _RNDS:
-                            _ws = _SI_unpack(state)[0] % _nw * _wsz
-                            _h  = _sha3()
-                            _h.update(state)
-                            _h.update(_spv[_ws:_ws + _wsz])
-                            _h.update(_rnd_b)
-                            state = _h.digest()
-                        if state.hex().startswith(hex_zeros):
-                            block_hash    = state.hex()
-                            _winning_seed = _w_entropy_seed
+                while not _found:
+                    if _C_AVAIL:
+                        # ── C path: dispatch chunk to OpenSSL SHA3 ───────────
+                        # Update seed buffer if it changed since last refresh
+                        _c_seed = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
+                        _c_sp   = _ffi.new("uint8_t[]", scratchpad)
+                        _snap_seed = _w_entropy_seed
+
+                        result = _C_LIB.qtcl_pow_search(
+                            target_height, timestamp,
+                            _c_ph, _c_mr,
+                            difficulty_bits,
+                            nonce, _C_CHUNK,
+                            _c_ma, _c_seed,
+                            _c_sp, _c_out,
+                        )
+                        if result >= 0:
+                            nonce         = int(result)
+                            block_hash    = bytes(_c_out).hex()
+                            _winning_seed = _snap_seed
                             _found        = True
                             break
-                        nonce += 1
+                        nonce += _C_CHUNK
+                    else:
+                        # ── Python path: burst then yield ────────────────────
+                        _nb32 = _w_entropy_seed[:32]
+                        _sfx  = _ma40 + _nb32
+                        _spv  = memoryview(scratchpad)
+                        for _i in range(_YIELD_EVERY):
+                            hdr   = _pfx + _SI_pack(nonce) + _sfx
+                            state = _sha3(_POW_PFX + hdr).digest()
+                            for _rnd_b in _RNDS:
+                                _ws = _SI_unpack(state)[0] % _nw * _wsz
+                                _h  = _sha3()
+                                _h.update(state)
+                                _h.update(_spv[_ws:_ws + _wsz])
+                                _h.update(_rnd_b)
+                                state = _h.digest()
+                            if state.hex().startswith(hex_zeros):
+                                block_hash    = state.hex()
+                                _winning_seed = _w_entropy_seed
+                                _found        = True
+                                break
+                            nonce += 1
+                        if _found:
+                            break
 
-                    if _found:
-                        break
-
-                    # Yield to event loop so display/UI stays responsive
+                    # Yield to event loop — keeps UI/display alive
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                     await _asyncio.sleep(0)
 
-                    # Oracle seed refresh — also updates block timestamp to keep
-                    # seed_age = current_time - timestamp_s within TTL on server.
-                    # Server checks: seed_age = now - block_timestamp_s ≤ 120s.
-                    # Without this, a long mining run (diff≥19) always expires.
+                    # Seed + timestamp refresh
                     if _t.time() - _seed_fetch_time > _REFR_EVERY:
                         try:
                             _wstate2 = kapi._get("/api/oracle/w-state") or {}
@@ -11974,14 +12139,13 @@ class QtclClientApp:
                                         str(_weh2).encode() + str(int(_t.time()/30)).encode()
                                     ).digest()
                             scratchpad = _build_scratchpad(_w_entropy_seed)
-                            # ── Critical: refresh timestamp so server seed_age check passes ──
-                            timestamp = int(_t.time())
+                            timestamp  = int(_t.time())
                             _pfx  = _pow_st.pack(">Q I 32s 32s I",
                                                  target_height, timestamp,
                                                  _ph32, _mr32, difficulty_bits)
                             _nw   = len(scratchpad) // _wsz
                             _seed_fetch_time = _t.time()
-                            _EXP_LOG.debug(f"[MINER-SIMPLE] Seed+timestamp refreshed nonce={nonce}")
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Seed+ts refreshed nonce={nonce}")
                         except Exception:
                             _seed_fetch_time = _t.time()
 
