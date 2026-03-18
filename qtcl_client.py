@@ -13305,12 +13305,14 @@ class QtclClientApp:
                 hex_zeros     = "0" * difficulty_bits
                 _found        = False
 
-                # ── Acceleration status banner (variables now in scope) ────────
-                if _C_AVAIL:
-                    print(f"\n  ⚡ C/OpenSSL PoW ACTIVE  │  chunk={_C_CHUNK:,}  │  expected ~500k–2M H/s")
-                else:
-                    print(f"\n  🐢 Python PoW fallback   │  chunk={_YIELD_EVERY:,}  │  ~1–3k H/s")
-                    print(f"     → For full speed: pkg install clang openssl libffi")                # Pre-computed fixed header parts (C path recomputes internally)
+                # Acceleration status goes to log buffer (not stdout) — no bleed into UI
+                _EXP_LOG.info(
+                    f"[MINER] {'C/OpenSSL' if _C_AVAIL else 'Python'} PoW  "
+                    f"chunk={'%d' % _C_CHUNK if _C_AVAIL else '%d' % _YIELD_EVERY}  "
+                    f"h={target_height} diff={difficulty_bits}"
+                )
+
+                # Pre-computed fixed header parts (C path recomputes internally)
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
@@ -13712,47 +13714,33 @@ class QtclClientApp:
                     print(f"  {_line}")
                 print(sep)
 
-        # ── Auto-refresh ticker thread ────────────────────────────────────────
-        # Prints only the dashboard — never injects a prompt string.
-        # The foreground loop owns the prompt; auto-refresh just updates metrics.
-        _REFRESH_INTERVAL = 30.0   # seconds between auto-refreshes
-        _last_auto         = [_time.time()]
-        _refresh_pending   = [False]  # signal foreground to redraw after next Enter
+        # ── Foreground interactive loop — non-blocking auto-refresh ──────────
+        # Redraws every _REFRESH_INTERVAL seconds automatically.
+        # 'q' / Ctrl-C quits. Any other key just refreshes immediately.
+        # No blocking input() call — nothing can bleed into the prompt.
+        _REFRESH_INTERVAL = 5.0   # seconds between auto-redraws
+        import select as _select
 
-        def _auto_refresh_loop():
-            while not self._stop.is_set() and _mine_thread.is_alive():
-                _time.sleep(1.0)
-                if _time.time() - _last_auto[0] >= _REFRESH_INTERVAL:
-                    _last_auto[0] = _time.time()
-                    _refresh_pending[0] = True
+        def _kbhit(timeout: float = 0.0):
+            """Return True if a keypress is waiting on stdin."""
+            try:
+                return bool(_select.select([sys.stdin], [], [], timeout)[0])
+            except Exception:
+                return False
 
-        _auto_th = _threading.Thread(target=_auto_refresh_loop,
-                                     daemon=True, name="MineDisplay")
-        _auto_th.start()
-
-        # ── Foreground interactive loop ────────────────────────────────────────
         _print_dashboard(force_full=True)
+        print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
             while not self._stop.is_set() and _mine_thread.is_alive():
-                # If auto-refresh flagged a pending update, show it before the menu
-                if _refresh_pending[0]:
-                    _refresh_pending[0] = False
-                    print()
-                    _print_dashboard()
-                print()
-                print("  ╔══ MINING MENU ═══════════════════════════════════╗")
-                print("  ║  Enter = refresh status                          ║")
-                print("  ║  r     = refresh status                          ║")
-                print("  ║  q     = stop mining & return to main menu       ║")
-                print("  ╚══════════════════════════════════════════════════╝")
-                try:
-                    ch = input("  Choice: ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    break
-                _last_auto[0] = _time.time()  # reset auto-refresh timer
-                _refresh_pending[0] = False    # clear any pending refresh on explicit input
-                if ch in ("q", "quit", "stop", "2"):
-                    break
+                # Wait up to _REFRESH_INTERVAL for a keypress
+                if _kbhit(_REFRESH_INTERVAL):
+                    try:
+                        ch = sys.stdin.readline().strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if ch in ("q", "quit", "stop"):
+                        break
+                # Auto-redraw (or immediately after a non-quit keypress)
                 _print_dashboard()
         except KeyboardInterrupt:
             pass
