@@ -13298,7 +13298,7 @@ class QtclClientApp:
                 # KEY: scratchpad (512KB) is pinned ONCE via from_buffer — never copied.
                 import struct as _pow_st
                 _YIELD_EVERY  = 2000     # Python burst before async yield
-                _C_CHUNK      = 500_000  # C burst: 500k nonces ≈ 0.25–1s on ARM64
+                _C_CHUNK      = 200_000  # C burst: 200k nonces ≈ 0.1–0.4s — keeps display alive
                 _REFR_EVERY   = 25       # seed refresh interval (seconds)
                 nonce         = 0
                 _winning_seed = _w_entropy_seed
@@ -13310,8 +13310,7 @@ class QtclClientApp:
                     print(f"\n  ⚡ C/OpenSSL PoW ACTIVE  │  chunk={_C_CHUNK:,}  │  expected ~500k–2M H/s")
                 else:
                     print(f"\n  🐢 Python PoW fallback   │  chunk={_YIELD_EVERY:,}  │  ~1–3k H/s")
-                    print(f"     → For full speed: pkg install clang openssl libffi")
-                # Pre-computed fixed header parts (C path recomputes internally)
+                    print(f"     → For full speed: pkg install clang openssl libffi")                # Pre-computed fixed header parts (C path recomputes internally)
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
@@ -13592,7 +13591,26 @@ class QtclClientApp:
         miner._koyeb_state  = self.koyeb_state   # type: ignore[attr-defined]
         miner._client_field = self.client_field  # type: ignore[attr-defined]
 
-        # ── Live mining dashboard (foreground, auto-refresh) ──────────────────
+        # ── Silence stdout logging during mining — route to ring buffer ───────
+        # Without this, log lines bleed into the input() prompt mid-character.
+        # All INFO/DEBUG from the mining thread is captured and shown in the
+        # dashboard instead of polluting the terminal UI.
+        _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
+
+        class _BufHandler(_logging.Handler):
+            def emit(self, record):
+                _LOG_BUF.append(self.format(record))
+
+        _buf_handler = _BufHandler()
+        _buf_handler.setFormatter(_logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
+                                                      datefmt="%H:%M:%S"))
+        _buf_handler.setLevel(_logging.DEBUG)
+
+        # Redirect root logger — restore on exit
+        _root_log    = _logging.getLogger()
+        _old_handlers = _root_log.handlers[:]
+        _root_log.handlers = [_buf_handler]
+
         _LAST_BLOCK_REPORTED = [None]   # mutable cell so inner closure can write
 
         def _fmt_duration(secs: float) -> str:
@@ -13687,6 +13705,12 @@ class QtclClientApp:
                       f"‖Δρ‖={m2.field_density:.4f}")
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
+            # ── Buffered log tail (replaces stdout bleed) ─────────────────────
+            if _LOG_BUF:
+                print("  ── Recent log ──────────────────────────────────────────────")
+                for _line in list(_LOG_BUF):
+                    print(f"  {_line}")
+                print(sep)
 
         # ── Auto-refresh ticker thread ────────────────────────────────────────
         # Prints only the dashboard — never injects a prompt string.
@@ -13735,6 +13759,8 @@ class QtclClientApp:
         finally:
             miner.stop_mining()
             self._stop.set()
+            # Restore stdout logging handlers
+            _root_log.handlers = _old_handlers
             print("\n  🛑 Mining stopped  ❤️")
 
     # ── Transact mode ─────────────────────────────────────────────────────────
