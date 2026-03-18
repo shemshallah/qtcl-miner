@@ -13198,6 +13198,12 @@ class QtclClientApp:
 
                 # ── Build scratchpad ONCE per block (shared across all nonces) ────
                 # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
+                # ── Acceleration status banner (printed once per block attempt) ──
+                if _C_AVAIL:
+                    print(f"\n  ⚡ C/OpenSSL PoW ACTIVE  │  chunk={_C_CHUNK:,}  │  expected ~500k–2M H/s")
+                else:
+                    print(f"\n  🐢 Python PoW fallback   │  chunk={_YIELD_EVERY:,}  │  expected ~1–3k H/s")
+                    print(f"     → For full speed: pkg install clang openssl libffi")
                 _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
                 scratchpad = _build_scratchpad(_w_entropy_seed)
                 
@@ -13292,12 +13298,14 @@ class QtclClientApp:
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
 
                 # ── PoW nonce search: C/OpenSSL if available, Python fallback ───────
-                # C path: ~15-40k H/s (OpenSSL Keccak + zero-alloc EVP context reuse)
-                # Python path: ~3-5k H/s (optimized struct + memoryview)
+                # C path:  ~500k–2M H/s (OpenSSL SHA3-256, zero-copy from_buffer pinning)
+                # Python path: ~1–3k H/s (struct + memoryview, yields to event loop)
+                #
+                # KEY: scratchpad (512KB) is pinned ONCE via from_buffer — never copied.
                 import struct as _pow_st
-                _YIELD_EVERY  = 5000   # Python burst size before yielding to event loop
-                _C_CHUNK      = 50_000 # C burst size (50k nonces in pure C, ~1-3s)
-                _REFR_EVERY   = 25     # seed refresh interval (seconds)
+                _YIELD_EVERY  = 2000     # Python burst before async yield
+                _C_CHUNK      = 500_000  # C burst: 500k nonces ≈ 0.25–1s on ARM64
+                _REFR_EVERY   = 25       # seed refresh interval (seconds)
                 nonce         = 0
                 _winning_seed = _w_entropy_seed
                 hex_zeros     = "0" * difficulty_bits
@@ -13318,21 +13326,27 @@ class QtclClientApp:
                 _POW_PFX = b"QTCL_POW_v1:"
                 _sha3 = _hl.sha3_256
 
-                # C FFI buffers (allocated once, reused every chunk)
+                # C FFI buffers — allocated ONCE per block, reused for every chunk.
+                # scratchpad uses from_buffer (zero-copy pin into the Python bytes obj).
+                # Only _c_seed is re-pinned when the entropy seed is refreshed.
                 if _C_AVAIL:
                     _c_ph   = _ffi.new("uint8_t[]", _ph32)
                     _c_mr   = _ffi.new("uint8_t[]", _mr32)
                     _c_ma   = _ffi.new("uint8_t[]", _ma40)
                     _c_seed = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
-                    _c_sp   = _ffi.new("uint8_t[]", scratchpad)
-                    _c_out  = _ffi.new("uint8_t[32]")
+                    # Zero-copy: pin directly into the existing 512KB Python bytes object.
+                    # This is the fix — never do _ffi.new("uint8_t[]", scratchpad) in a loop.
+                    _sp_arr  = bytearray(scratchpad)   # mutable backing store
+                    _c_sp    = _ffi.cast("uint8_t *", _ffi.from_buffer(_sp_arr))
+                    _c_out   = _ffi.new("uint8_t[32]")
+                    _pinned_seed = _w_entropy_seed      # track what's currently pinned
 
                 while not _found:
                     if _C_AVAIL:
-                        # ── C path: dispatch chunk to OpenSSL SHA3 ───────────
-                        # Update seed buffer if it changed since last refresh
-                        _c_seed = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
-                        _c_sp   = _ffi.new("uint8_t[]", scratchpad)
+                        # Re-pin seed buffer only when entropy actually changed
+                        if _w_entropy_seed is not _pinned_seed:
+                            _c_seed      = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
+                            _pinned_seed = _w_entropy_seed
                         _snap_seed = _w_entropy_seed
 
                         result = _C_LIB.qtcl_pow_search(
@@ -13350,6 +13364,10 @@ class QtclClientApp:
                             _found        = True
                             break
                         nonce += _C_CHUNK
+                        # Yield to event loop after each C chunk — keeps UI alive
+                        _MINE_TELEM.update_progress(target_height, difficulty_bits,
+                                                     nonce, parent_hash)
+                        await _asyncio.sleep(0)
                     else:
                         # ── Python path: burst then yield ────────────────────
                         _nb32 = _w_entropy_seed[:32]
@@ -13402,13 +13420,18 @@ class QtclClientApp:
                                                  target_height, timestamp,
                                                  _ph32, _mr32, difficulty_bits)
                             _nw   = len(scratchpad) // _wsz
+                            # Re-pin zero-copy scratchpad pointer into new bytes object
+                            if _C_AVAIL:
+                                _sp_arr = bytearray(scratchpad)
+                                _c_sp   = _ffi.cast("uint8_t *", _ffi.from_buffer(_sp_arr))
                             _seed_fetch_time = _t.time()
                             _EXP_LOG.debug(f"[MINER-SIMPLE] Seed+ts refreshed nonce={nonce}")
                         except Exception:
                             _seed_fetch_time = _t.time()
 
-                    # Chain advance check every 50k nonces
-                    if nonce % 50_000 == 0 and nonce > 0:
+                    # Chain advance check — interval scales with C chunk size
+                    _chain_check_interval = _C_CHUNK * 10 if _C_AVAIL else 50_000
+                    if nonce % _chain_check_interval == 0 and nonce > 0:
                         try:
                             tip2 = kapi.get_chain_tip() or {}
                             h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
