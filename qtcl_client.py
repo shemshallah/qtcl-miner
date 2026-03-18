@@ -9584,11 +9584,18 @@ void qtcl_consensus_compute(
         }
     }
 
-    /* Quorum hash: SHA3-256 Merkle root over all auth_tags */
-    uint8_t leaves_buf[n * 32];
-    for (int i = 0; i < n; i++)
-        memcpy(leaves_buf + i*32, measurements[i].auth_tag, 32);
-    qtcl_merkle_root(leaves_buf, (uint32_t)n, out->quorum_hash);
+    /* Quorum hash: SHA3-256 Merkle root over all auth_tags.
+       Use heap (not VLA) so the goto cleanup above cannot bypass
+       initialization — C99 §6.8.6.1 forbids jumping over VLAs. */
+    uint8_t *leaves_buf = (uint8_t*)malloc((size_t)n * 32);
+    if (leaves_buf) {
+        for (int i = 0; i < n; i++)
+            memcpy(leaves_buf + i*32, measurements[i].auth_tag, 32);
+        qtcl_merkle_root(leaves_buf, (uint32_t)n, out->quorum_hash);
+        free(leaves_buf);
+    } else {
+        memset(out->quorum_hash, 0, 32);
+    }
 
     /* Agreement score: 1 - std(fidelity)/mean(fidelity) clamped [0,1] */
     double mean_f = 0.0;
@@ -9679,8 +9686,10 @@ static void *_sse_thread(void *arg) {
     QtclSSEClient *c = (QtclSSEClient*)arg;
     static int ssl_init_done = 0;
     if (!ssl_init_done) {
-        SSL_library_init();
-        SSL_load_error_strings();
+        /* OpenSSL 1.1+ — SSL_library_init/SSL_load_error_strings removed.
+           OPENSSL_init_ssl() with 0 flags performs all required initialization. */
+        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS |
+                         OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
         ssl_init_done = 1;
     }
 
@@ -10209,6 +10218,22 @@ int qtcl_p2p_connect(const char *host, uint16_t port) {
     pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
     pthread_attr_destroy(&a);
     return (int)(slot - _P2P.peers);  /* connection handle */
+}
+
+void qtcl_p2p_disconnect(int conn_handle) {
+    if (conn_handle < 0 || conn_handle >= P2P_MAX_PEERS) return;
+    pthread_mutex_lock(&_P2P.peers_lock);
+    _P2PConn *slot = &_P2P.peers[conn_handle];
+    if (slot->active) {
+        slot->active = 0;
+        if (slot->fd >= 0) {
+            shutdown(slot->fd, SHUT_RDWR);
+            close(slot->fd);
+            slot->fd = -1;
+        }
+        if (_P2P.n_peers > 0) _P2P.n_peers--;
+    }
+    pthread_mutex_unlock(&_P2P.peers_lock);
 }
 
 void qtcl_p2p_shutdown(void) {
