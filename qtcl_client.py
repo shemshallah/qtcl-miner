@@ -9393,11 +9393,16 @@ void qtcl_fuse_oracle_dm(
     }
 }
 
+
 /* ═══════════════════════════════════════════════════════════════════════════
    §Meas — MEASUREMENT STRUCTS, SIGNING, VERIFICATION
+   QtclWStateMeasurement and QtclWStateConsensus use NATURAL alignment so
+   the C compiler's reported alignment (8, from double fields) matches the
+   alignment CFFI computes from the cdef — eliminating VerificationError.
+   Both structs are internally self-aligned (first double at offset 32 /
+   offset 0 respectively) so packed vs natural sizes are identical.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-#pragma pack(push, 1)
 typedef struct {
     uint8_t  node_id[16];
     uint32_t chain_height;
@@ -9440,6 +9445,8 @@ typedef struct {
     double   hyp_area_median;
 } QtclWStateConsensus;
 
+/* Only QtclMsgHeader needs byte-perfect wire packing (no doubles) */
+#pragma pack(push, 1)
 typedef struct {
     uint8_t  magic[4];
     uint8_t  command[12];
@@ -9448,7 +9455,7 @@ typedef struct {
     uint8_t  version;
     uint8_t  flags;
     uint8_t  reserved[2];
-} QtclMsgHeader; /* last struct that needs byte-perfect wire packing */
+} QtclMsgHeader;
 #pragma pack(pop)
 
 /* QtclPeer is NOT packed — natural alignment lets the C compiler produce
