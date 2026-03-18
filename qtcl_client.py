@@ -11709,9 +11709,10 @@ int64_t qtcl_pow_search(
      * full_bytes = (diff * 4) / 8 = diff / 2
      * rem_nibble = diff % 2  → if 1, the high nibble of next byte must be 0x0
      */
+    uint32_t nw  = (512 * 1024) / 64;
     uint32_t total_bits = diff * 4u;
-    uint32_t fb  = total_bits / 8u;   /* full zero bytes */
-    uint32_t rb  = total_bits % 8u;   /* remaining bits (0 or 4) */
+    uint32_t fb  = total_bits / 8u;
+    uint32_t rb  = total_bits % 8u;
     uint8_t  rm  = rb ? (uint8_t)(0xffu << (8u - rb)) : 0u;
 
     /* round_in: state(32) + window(64) + round_be32(4) = 100 bytes */
