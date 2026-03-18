@@ -11886,40 +11886,58 @@ class QtclClientApp:
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
 
                 # ── Tight inline nonce loop ──────────────────────────────────
-                # SHA3 on 224-byte inputs does NOT release the GIL — threading
-                # provides zero benefit (benchmarked: 12k single vs 11k threaded).
-                # Simple inline loop is fastest on Termux/mobile.
-                # Yields to event loop every 2000 nonces → display updates ~5× /s.
+                # SHA3 has no ARM hardware accel — 3-4k H/s on mobile is the
+                # physical ceiling. Optimizations applied:
+                #   • Struct object (pre-compiled pack/unpack, faster than module fn)
+                #   • Static header prefix (pack everything except nonce once)
+                #   • memoryview scratchpad (zero-copy 64-byte window reads)
+                #   • h.update() (avoids 128 byte-concat mallocs per nonce)
+                #   • All hot names localized to avoid dict lookups in inner loop
                 import struct as _pow_st
-                _YIELD_EVERY  = 2000   # yield to event loop every N nonces
-                _REFR_EVERY   = 25     # oracle seed refresh interval (seconds)
+                _YIELD_EVERY  = 2000
+                _REFR_EVERY   = 25
                 nonce         = 0
                 _winning_seed = _w_entropy_seed
                 hex_zeros     = "0" * difficulty_bits
                 _found        = False
 
-                # Pre-compute fixed header parts that don't change per nonce
+                # Pre-compute all fixed header parts
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
                 _wsz  = 64
                 _nw   = len(scratchpad) // _wsz
+                # Struct object: pre-compiled, faster than module-level pack/unpack
+                _SI   = _pow_st.Struct(">I")
+                _SI_pack   = _SI.pack
+                _SI_unpack = _SI.unpack_from
+                # Static header prefix: Q(height) I(ts) 32s 32s I = 80 bytes
+                _pfx  = _pow_st.pack(">Q I 32s 32s I",
+                                     target_height, timestamp, _ph32, _mr32, difficulty_bits)
+                # Round bytes pre-computed: 64 × 4 bytes, avoids pack() in inner loop
+                _RNDS = [_SI_pack(r) for r in range(64)]
+                # PoW prefix bytes (constant)
+                _POW_PFX = b"QTCL_POW_v1:"
+                # Localize sha3_256 constructor
+                _sha3 = _hl.sha3_256
 
                 while not _found:
-                    # Inner burst: _YIELD_EVERY hashes before yielding
                     _nb32 = _w_entropy_seed[:32]
-                    _sp   = scratchpad
+                    _sfx  = _ma40 + _nb32           # 72 bytes suffix (changes on seed refresh)
+                    _spv  = memoryview(scratchpad)   # zero-copy slicing
+
                     for _i in range(_YIELD_EVERY):
-                        hdr   = _pow_st.pack(">Q I 32s 32s I I 40s 32s",
-                                             target_height, timestamp,
-                                             _ph32, _mr32,
-                                             difficulty_bits, nonce,
-                                             _ma40, _nb32)
-                        state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
-                        for _r in range(64):
-                            _wi   = _pow_st.unpack_from(">I", state, 0)[0] % _nw
-                            _ws   = _wi * _wsz
-                            state = _hl.sha3_256(state + _sp[_ws:_ws+_wsz] + _pow_st.pack(">I", _r)).digest()
+                        # Header = prefix(80) + nonce(4) + suffix(72) = 156 bytes
+                        hdr   = _pfx + _SI_pack(nonce) + _sfx
+                        state = _sha3(_POW_PFX + hdr).digest()
+                        # 64 sequential scratchpad rounds — inner loop is the bottleneck
+                        for _rnd_b in _RNDS:
+                            _ws = _SI_unpack(state)[0] % _nw * _wsz
+                            _h  = _sha3()
+                            _h.update(state)
+                            _h.update(_spv[_ws:_ws + _wsz])
+                            _h.update(_rnd_b)
+                            state = _h.digest()
                         if state.hex().startswith(hex_zeros):
                             block_hash    = state.hex()
                             _winning_seed = _w_entropy_seed
@@ -11934,7 +11952,10 @@ class QtclClientApp:
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                     await _asyncio.sleep(0)
 
-                    # Oracle seed refresh
+                    # Oracle seed refresh — also updates block timestamp to keep
+                    # seed_age = current_time - timestamp_s within TTL on server.
+                    # Server checks: seed_age = now - block_timestamp_s ≤ 120s.
+                    # Without this, a long mining run (diff≥19) always expires.
                     if _t.time() - _seed_fetch_time > _REFR_EVERY:
                         try:
                             _wstate2 = kapi._get("/api/oracle/w-state") or {}
@@ -11953,10 +11974,14 @@ class QtclClientApp:
                                         str(_weh2).encode() + str(int(_t.time()/30)).encode()
                                     ).digest()
                             scratchpad = _build_scratchpad(_w_entropy_seed)
-                            _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
-                            _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
+                            # ── Critical: refresh timestamp so server seed_age check passes ──
+                            timestamp = int(_t.time())
+                            _pfx  = _pow_st.pack(">Q I 32s 32s I",
+                                                 target_height, timestamp,
+                                                 _ph32, _mr32, difficulty_bits)
                             _nw   = len(scratchpad) // _wsz
                             _seed_fetch_time = _t.time()
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] Seed+timestamp refreshed nonce={nonce}")
                         except Exception:
                             _seed_fetch_time = _t.time()
 
