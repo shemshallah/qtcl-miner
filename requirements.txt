@@ -1,0 +1,52 @@
+# QTCL Client - Production Dependencies
+# Python 3.9+
+# Cryptography: Via OpenSSL (C library), not Python package
+
+# Web Framework & Async
+flask==2.3.3
+python-socketio==5.9.0
+python-engineio==4.7.1
+gunicorn==21.2.0
+gevent==23.9.1
+gevent-websocket==0.10.1
+
+# Database
+asyncpg==0.28.0
+sqlalchemy==2.0.21
+alembic==1.12.0
+
+# Async & Concurrency
+aiohttp==3.9.0
+aiofiles==23.2.1
+
+# Scientific Computing
+numpy==1.24.3
+scipy==1.11.3
+
+# C FFI Binding (for embedded C quantum metrics)
+cffi==1.16.0
+
+# HTTP & Networking
+requests==2.31.0
+urllib3==2.0.7
+
+# Serialization
+msgpack==1.0.7
+protobuf==4.24.4
+
+# Logging & Monitoring
+python-json-logger==2.0.7
+prometheus-client==0.18.0
+
+# Configuration
+python-dotenv==1.0.0
+pydantic==2.4.2
+
+# Utilities
+click==8.1.7
+colorama==0.4.6
+tqdm==4.66.1
+
+# Build & Distribution
+setuptools==68.1.2
+wheel==0.41.3
