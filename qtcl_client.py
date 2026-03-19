@@ -13638,6 +13638,7 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[METRICS-PY] Error: {_pme}")
                 return {}
 
+        def _run_bootstrap() -> tuple:
             """
             Run the full blockfield build in C.
             Returns (oracle_ok, meas_ptr, seed32_bytes, report_str).
