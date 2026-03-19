@@ -2653,16 +2653,6 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
     return _P2P_NODE
 
 _EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready")
-# Attempt auto-start; if C acceleration is not yet available the module still
-# imports cleanly — the hard RuntimeError fires at measure()/get_pow_seed() time.
-try:
-    _LOCAL_ORACLE.start()
-    _EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine SSE listener started")
-except RuntimeError as _start_err:
-    _EXP_LOG.warning(
-        f"[QTCL P2P v2] ⚠️  LocalOracleEngine deferred — C unavailable at import: {_start_err}\n"
-        f"               Call _LOCAL_ORACLE.start() again after qtcl_accel.so is loaded."
-    )
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -11556,17 +11546,14 @@ def _compile_c_layer() -> None:
 
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
 
-# ── Re-attempt LocalOracleEngine start now that C may be available ────────────
-# The module-level _LOCAL_ORACLE.start() at line ~2633 fires before _compile_c_layer()
-# completes, so it always defers on first import.  Re-attempt here — idempotent if
-# it somehow already started.
+# ── Start LocalOracleEngine SSE listener now that C is confirmed available ────
 if _accel_ok:
     try:
         _LOCAL_ORACLE.start()
     except RuntimeError as _restart_err:
         import logging as _rl
         _rl.getLogger(__name__).warning(
-            f"[ACCEL] LocalOracleEngine re-start failed: {_restart_err}"
+            f"[ACCEL] LocalOracleEngine start failed: {_restart_err}"
         )
 
 # ── Convenience helpers for tight-loop C buffer allocation ────────────────────
