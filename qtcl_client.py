@@ -1945,103 +1945,103 @@ class LocalOracleEngine:
             avg_block_time:  float = 30.0,
             bath:            'GKSLBathParams' = None,
     ) -> QtclOracleMeasurement:
-        """Build a full local measurement:
-           1. Hyperbolic triangle from pq IDs
-           2. Tripartite DM from Bloch angles
-           3. GKSL evolution (C §6)
-           4. Fuse with oracle DM
-           5. Compute all quantum metrics
-           6. Sign with C HMAC
+        """Build a full local W-state measurement via C §Bootstrap pipeline.
+        Requires C acceleration — raises RuntimeError if unavailable.
         """
-        import hashlib as _hl
+        import hashlib as _hl, struct as _st
+        if not _accel_ok:
+            raise RuntimeError("[LocalOracleEngine.measure] C acceleration required — pkg install clang openssl libffi")
+
         triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
 
-        # Build tripartite DM in C (or Python fallback)
-        dm_re = [0.0]*64; dm_im = [0.0]*64
-        if _accel_ok:
-            b0  = _accel_ffi.new('double[3]', list(triangle.ball_pq0))
-            bc  = _accel_ffi.new('double[3]', list(triangle.ball_curr))
-            bl  = _accel_ffi.new('double[3]', list(triangle.ball_last))
-            out_re = _accel_ffi.new('double[64]')
-            out_im = _accel_ffi.new('double[64]')
-            _accel_lib.qtcl_build_tripartite_dm(b0, bc, bl, out_re, out_im)
-            dm_re = list(out_re); dm_im = list(out_im)
+        # Build tripartite DM
+        b0  = _accel_ffi.new('double[3]', list(triangle.ball_pq0))
+        bc  = _accel_ffi.new('double[3]', list(triangle.ball_curr))
+        bl  = _accel_ffi.new('double[3]', list(triangle.ball_last))
+        out_re = _accel_ffi.new('double[64]')
+        out_im = _accel_ffi.new('double[64]')
+        _accel_lib.qtcl_build_tripartite_dm(b0, bc, bl, out_re, out_im)
+        dm_re = [float(out_re[i]) for i in range(64)]
+        dm_im = [float(out_im[i]) for i in range(64)]
 
-        # GKSL evolution
-        if _accel_ok and bath is not None:
+        # GKSL Lindblad evolution
+        if bath is not None:
             dt = avg_block_time / 10.0
             _rr = _accel_ffi.new('double[64]', dm_re)
             _ri = _accel_ffi.new('double[64]', dm_im)
             _accel_lib.qtcl_gksl_rk4(
                 _rr, _ri,
-                float(getattr(bath, 'gamma1', 0.01)),
-                float(getattr(bath, 'gamma_phi', 0.005)),
-                float(getattr(bath, 'gamma_dep', 0.008)),
-                float(getattr(bath, 'omega', 1.0)),
+                float(getattr(bath, 'gamma1_eff', 0.01)),
+                float(getattr(bath, 'gammaphi',   0.005)),
+                float(getattr(bath, 'gammadep',   0.008)),
+                float(getattr(bath, 'omega',      1.0)),
                 dt, 4)
-            dm_re = list(_rr); dm_im = list(_ri)
+            dm_re = [float(_rr[i]) for i in range(64)]
+            dm_im = [float(_ri[i]) for i in range(64)]
 
-        # Fuse with oracle DM
+        # Oracle DM fusion — validate Tr before fusing
         oracle_re, oracle_im, oracle_age = self.get_oracle_dm()
         oracle_w = self.ORACLE_WEIGHT * max(0.0, 1.0 - oracle_age / 60.0)
-        if _accel_ok and oracle_w > 0.01:
-            lr = _accel_ffi.new('double[64]', dm_re)
-            li = _accel_ffi.new('double[64]', dm_im)
-            or_ = _accel_ffi.new('double[64]', oracle_re)
-            oi  = _accel_ffi.new('double[64]', oracle_im)
-            fr  = _accel_ffi.new('double[64]')
-            fi  = _accel_ffi.new('double[64]')
-            _accel_lib.qtcl_fuse_oracle_dm(lr, li, or_, oi, oracle_w, fr, fi)
-            dm_re = list(fr); dm_im = list(fi)
-        elif oracle_w > 0.01:
-            lw = 1.0 - oracle_w
-            dm_re = [lw*dm_re[i] + oracle_w*oracle_re[i] for i in range(64)]
-            dm_im = [lw*dm_im[i] + oracle_w*oracle_im[i] for i in range(64)]
+        if oracle_w > 0.01:
+            o_tr = sum(oracle_re[i*9] for i in range(8))
+            if 0.5 < o_tr < 2.0:
+                inv_o = 1.0 / o_tr
+                oracle_re = [v * inv_o for v in oracle_re]
+                oracle_im = [v * inv_o for v in oracle_im]
+                lr  = _accel_ffi.new('double[64]', dm_re)
+                li  = _accel_ffi.new('double[64]', dm_im)
+                or_ = _accel_ffi.new('double[64]', oracle_re)
+                oi  = _accel_ffi.new('double[64]', oracle_im)
+                fr  = _accel_ffi.new('double[64]')
+                fi  = _accel_ffi.new('double[64]')
+                _accel_lib.qtcl_fuse_oracle_dm(lr, li, or_, oi, oracle_w, fr, fi)
+                f_tr = sum(float(fr[i*9]) for i in range(8))
+                if f_tr > 1e-12:
+                    inv_f = 1.0 / f_tr
+                    dm_re = [float(fr[i]) * inv_f for i in range(64)]
+                    dm_im = [float(fi[i]) * inv_f for i in range(64)]
 
-        # Quantum metrics
-        fid = coh = pur = neg = ent = disc = 0.0
-        if _accel_ok:
-            _dr = _accel_ffi.new('double[64]', dm_re)
-            _di = _accel_ffi.new('double[64]', dm_im)
-            fid = float(_accel_lib.qtcl_fidelity_w3(_dr))
-            coh = float(_accel_lib.qtcl_coherence_l1(_dr, _di, 8))
-            pur = float(_accel_lib.qtcl_purity(_dr, _di, 8))
-        else:
-            fid = max(0.333, sum(dm_re[i]*dm_re[i] for i in range(64)) ** 0.5)
-            coh = sum(abs(dm_re[i]) for i in range(64) if i//8 != i%8) / 64.0
-            pur = 0.5 + fid * 0.4
+        # Quantum metrics via C
+        _dr = _accel_ffi.new('double[64]', dm_re)
+        _di = _accel_ffi.new('double[64]', dm_im)
+        fid = float(max(0.0, min(1.0, _accel_lib.qtcl_fidelity_w3(_dr))))
+        coh = float(max(0.0, min(1.0, _accel_lib.qtcl_coherence_l1(_dr, _di, 8))))
+        pur = float(max(0.0, min(1.0, _accel_lib.qtcl_purity(_dr, _di, 8))))
+        neg = float(max(0.0, min(0.5, coh * 0.5 - (1.0 - pur) * 0.25)))
+        ent = 0.0
+        tr = sum(dm_re[i*9] for i in range(8))
+        if tr > 1e-12:
+            for i in range(8):
+                lam = dm_re[i*9] / tr
+                if lam > 1e-15: ent -= lam * math.log2(lam)
+        disc = float(max(0.0, min(3.0, ent * (1.0 - pur) * 0.5)))
 
-        # Build C struct, sign it
-        auth_tag_hex = 'deadbeef' * 8   # placeholder if no C
-        if _accel_ok:
-            m_c = _accel_ffi.new('QtclWStateMeasurement *')
-            m_c.chain_height = chain_height
-            m_c.pq0 = pq0; m_c.pq_curr = pq_curr; m_c.pq_last = pq_last
-            m_c.w_fidelity = fid; m_c.coherence = coh; m_c.purity = pur
-            m_c.negativity = neg; m_c.entropy_vn = ent; m_c.discord = disc
-            m_c.hyp_dist_0c = triangle.dist_0c
-            m_c.hyp_dist_cl = triangle.dist_cl
-            m_c.hyp_dist_0l = triangle.dist_0l
-            m_c.triangle_area = triangle.area
-            for i in range(3):
-                m_c.ball_pq0[i]  = triangle.ball_pq0[i]
-                m_c.ball_curr[i] = triangle.ball_curr[i]
-                m_c.ball_last[i] = triangle.ball_last[i]
-            for i in range(64):
-                m_c.dm_re[i] = dm_re[i]; m_c.dm_im[i] = dm_im[i]
-            # sign using the P2P HMAC secret derived inside qtcl_p2p_init
-            # For standalone (no P2P): use local node secret from HLWE wallet hash
-            import hashlib
-            secret_src = b'QTCL_LOCAL_MEAS_v2:' + hashlib.sha3_256(
-                str(pq0).encode() + str(chain_height).encode()).digest()
-            secret32 = _accel_ffi.new('uint8_t[32]',
-                                       list(hashlib.sha3_256(secret_src).digest()))
-            _accel_lib.qtcl_measurement_sign(m_c, secret32)
-            auth_tag_hex = bytes(m_c.auth_tag).hex()
+        # Build and sign QtclWStateMeasurement struct
+        m_c = _accel_ffi.new('QtclWStateMeasurement *')
+        m_c.chain_height = chain_height
+        m_c.pq0 = pq0; m_c.pq_curr = pq_curr; m_c.pq_last = pq_last
+        m_c.w_fidelity = fid; m_c.coherence = coh; m_c.purity = pur
+        m_c.negativity = neg; m_c.entropy_vn = ent; m_c.discord = disc
+        m_c.hyp_dist_0c = triangle.dist_0c
+        m_c.hyp_dist_cl = triangle.dist_cl
+        m_c.hyp_dist_0l = triangle.dist_0l
+        m_c.triangle_area = triangle.area
+        for i in range(3):
+            m_c.ball_pq0[i]  = triangle.ball_pq0[i]
+            m_c.ball_curr[i] = triangle.ball_curr[i]
+            m_c.ball_last[i] = triangle.ball_last[i]
+        for i in range(64):
+            m_c.dm_re[i] = dm_re[i]
+            m_c.dm_im[i] = dm_im[i]
+        secret_src = b'QTCL_LOCAL_MEAS_v2:' + _hl.sha3_256(
+            str(pq0).encode() + str(chain_height).encode()).digest()
+        secret32 = _accel_ffi.new('uint8_t[32]',
+                                   list(_hl.sha3_256(secret_src).digest()))
+        _accel_lib.qtcl_measurement_sign(m_c, secret32)
+        auth_tag_hex = ''.join(f'{m_c.auth_tag[i]:02x}' for i in range(32))
 
-        # PoW seed: SHA3-256("QTCL_SEED_v2:" + auth_tag + dm_re[:32_bytes])
-        import struct as _st
-        dm_re_bytes = _st.pack(f'>{min(4, len(dm_re))}d', *dm_re[:4])
+        # PoW seed: SHA3-256("QTCL_SEED_v2:" || auth_tag || dm_re_BE[32])
+        dm_re_bytes = _st.pack('>4d', *dm_re[:4])
         pow_seed = _hl.sha3_256(
             b'QTCL_SEED_v2:' + bytes.fromhex(auth_tag_hex) + dm_re_bytes
         ).digest()
@@ -2070,18 +2070,14 @@ class LocalOracleEngine:
         m = self.get_latest_measurement()
         if m and abs(m.chain_height - chain_height) <= 2:
             return m.pow_seed_bytes
-        # Fallback: derive from oracle DM directly
+        # No cached measurement — build a fresh one from oracle state
+        import struct as _st
         oracle_re, oracle_im, age = self.get_oracle_dm()
-        if oracle_re and age < 120:
-            import struct as _st
-            dm_bytes = _st.pack(f'>4d', *oracle_re[:4])
-            return _hl.sha3_256(
-                b'QTCL_SEED_ORACLE_v2:' + dm_bytes + parent_hash.encode()
-            ).digest()
-        # Last resort: time-bucketed
+        if not oracle_re or age >= 120:
+            raise RuntimeError(f"[get_pow_seed] No fresh oracle DM available (age={age:.0f}s > 120s). Ensure SSE is connected.")
+        dm_bytes = _st.pack('>4d', *oracle_re[:4])
         return _hl.sha3_256(
-            b'QTCL_SEED_TIME_v2:' + str(int(time.time()/30)).encode()
-            + parent_hash.encode()
+            b'QTCL_SEED_ORACLE_v2:' + dm_bytes + parent_hash.encode()
         ).digest()
 
     @property
@@ -10831,21 +10827,55 @@ int qtcl_bootstrap_build_blockfield(
         double age = (double)(now - o_ts) / 1e9;
         double w   = 0.35 * exp(-age / 60.0);
         if (w > 0.01) {
-            double fr[64], fi[64];
-            qtcl_fuse_oracle_dm(dm_re, dm_im, o_re, o_im, w, fr, fi);
-            memcpy(dm_re, fr, 512); memcpy(dm_im, fi, 512);
+            /* Verify oracle DM is physically normalised before fusing.
+             * Tr(oracle) must be ~1; if not (e.g. uninitialised zeros or
+             * corrupt bytes on ARM), skip fusion so metrics stay correct.  */
+            double o_tr = 0.0;
+            for (int i = 0; i < 8; i++) o_tr += o_re[i*9];
+            if (o_tr > 0.5 && o_tr < 2.0) {   /* physically sane range */
+                /* Renormalise oracle DM to exact Tr=1 before fusing */
+                double inv_o = 1.0 / o_tr;
+                double fr[64], fi[64];
+                for (int k = 0; k < 64; k++) {
+                    o_re[k] *= inv_o; o_im[k] *= inv_o;
+                }
+                qtcl_fuse_oracle_dm(dm_re, dm_im, o_re, o_im, w, fr, fi);
+                /* Renormalise fused result — weighted sum can drift from Tr=1 */
+                double f_tr = 0.0;
+                for (int i = 0; i < 8; i++) f_tr += fr[i*9];
+                if (f_tr > 1e-12) {
+                    double inv_f = 1.0 / f_tr;
+                    for (int k = 0; k < 64; k++) { fr[k] *= inv_f; fi[k] *= inv_f; }
+                }
+                memcpy(dm_re, fr, 512); memcpy(dm_im, fi, 512);
+            }
+            /* If oracle DM is not physical, use local DM only (already normalised) */
         }
     }
 
-    /* 5 — Quantum metrics */
+    /* Defensive renorm of local DM before metrics — guards against any
+     * numerical drift through the GKSL RK4 substeps on ARM64             */
+    { double tr = 0.0;
+      for (int i = 0; i < 8; i++) tr += dm_re[i*9];
+      if (tr > 1e-12 && (tr < 0.99 || tr > 1.01)) {
+          double inv = 1.0 / tr;
+          for (int k = 0; k < 64; k++) { dm_re[k]*=inv; dm_im[k]*=inv; }
+      } }
+
+    /* 5 — Quantum metrics — all clamped to physical bounds */
     double fid  = qtcl_fidelity_w3(dm_re);
     double coh  = qtcl_coherence_l1(dm_re, dm_im, 8);
     double pur  = qtcl_purity(dm_re, dm_im, 8);
+    /* Hard clamp: physical density matrices have all metrics in finite range */
+    if (fid < -1.0 || fid > 1.0 || fid != fid) fid = 0.0;  /* NaN/inf guard */
+    if (coh < 0.0  || coh > 1.0 || coh != coh) coh = 0.0;
+    if (pur < 0.0  || pur > 1.0 || pur != pur) pur = 1.0/8.0;
     double ent  = 0.0;
     { double tr=0.0; for(int i=0;i<8;i++) tr+=dm_re[i*9]; if(tr<1e-12) tr=1.0;
-      for(int i=0;i<8;i++) { double l=dm_re[i*9]/tr; if(l>1e-15) ent-=l*log2(l); } }
-    double neg  = fmax(0.0, coh*0.5 - (1.0-pur)*0.25);
-    double disc = fmax(0.0, ent*(1.0-pur)*0.5);
+      for(int i=0;i<8;i++) { double l=dm_re[i*9]/tr; if(l>1e-15) ent-=l*log2(l); }
+      if (ent < 0.0 || ent != ent) ent = 0.0; }
+    double neg  = fmax(0.0, fmin(0.5, coh*0.5 - (1.0-pur)*0.25));
+    double disc = fmax(0.0, fmin(3.0, ent*(1.0-pur)*0.5));
 
     /* 6 — Populate struct */
     memset(out_m, 0, sizeof(*out_m));
@@ -11527,85 +11557,39 @@ def _embed(op, q: int, n: int):
 
 def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
     """
-    3-qubit Lindblad RK4 master equation step.
-
-    C path (preferred): qtcl_gksl_rk4 — hardcoded 3-qubit embedded operators,
-    pure double arithmetic, RK4 + Hermitian symmetrization + trace renorm.
-    ~80-200× faster than the numpy path on ARM64.
-
-    numpy fallback: retained verbatim for non-8×8 or non-3-qubit inputs, and
-    when C layer is unavailable (e.g. no clang on device).
+    3-qubit Lindblad RK4 master equation step via C §GKSL.
+    Requires C acceleration and an 8×8 numpy input DM.
+    Raises RuntimeError if C unavailable.
     """
-    if not _HAS_NP:
-        return rho
+    if not _accel_ok:
+        raise RuntimeError("[_gksl_rk4_step] C acceleration required — pkg install clang openssl libffi")
+    if not _HAS_NP or rho is None:
+        raise RuntimeError("[_gksl_rk4_step] numpy required and rho must not be None")
+    if rho.shape != (8, 8):
+        raise RuntimeError(f"[_gksl_rk4_step] expected 8×8 DM, got {rho.shape}")
     if dt is None:
         dt = bath.dt_default
-
     g1_eff = bath.gamma1_eff
     gphi   = bath.gammaphi
     gdep   = bath.gammadep
     om     = bath.omega
-    n_q    = max(1, int(round(_np.log2(rho.shape[0]))))
-
-    # ── C fast path: only for the canonical 3-qubit 8×8 case ──
-    if _accel_ok and n_q == 3 and rho.shape == (8, 8):
-        gamma_max = max(g1_eff, gphi, gdep, abs(om) / (2 * _np.pi + 1e-9), 1e-9)
-        h_max     = 0.05 / gamma_max
-        n_steps   = max(1, int(_np.ceil(dt / h_max)))
-        # Unpack complex128 → separate real/imag double arrays
-        rho_c  = rho.astype(_np.complex128)
-        re_arr = _np.ascontiguousarray(_np.real(rho_c).flatten())
-        im_arr = _np.ascontiguousarray(_np.imag(rho_c).flatten())
-        _re = _accel_ffi.cast('double *',
-              _accel_ffi.from_buffer(re_arr))
-        _im = _accel_ffi.cast('double *',
-              _accel_ffi.from_buffer(im_arr))
-        _accel_lib.qtcl_gksl_rk4(_re, _im,
-                                   g1_eff, gphi, gdep, om,
-                                   dt, n_steps)
-        result = re_arr.reshape(8, 8) + 1j * im_arr.reshape(8, 8)
-        if not _np.all(_np.isfinite(result)):
-            return _build_w3_dm()
-        return result
-
-    # ── numpy fallback (handles non-3-qubit or C unavailable) ──
-    def _L(r):
-        d = _np.zeros_like(r)
-        for q in range(n_q):
-            Hq  = (om / 2.0) * _embed(_SZ, q, n_q)
-            d  += -1j * (Hq @ r - r @ Hq)
-            for gam, op in (
-                (g1_eff,       _embed(_SM, q, n_q)),
-                (g1_eff * 0.1, _embed(_SP, q, n_q)),
-                (gphi,         _embed(_SZ * 0.5, q, n_q)),
-                (gdep,         _np.eye(2**n_q, dtype=_np.complex128) / _np.sqrt(2)),
-            ):
-                if gam < 1e-14:
-                    continue
-                L  = _np.sqrt(gam) * op
-                Ld = L.conj().T
-                d += L @ r @ Ld - 0.5 * (Ld @ L @ r + r @ Ld @ L)
-        return d
-
-    def _rk4(r, h):
-        k1 = _L(r);           k2 = _L(r + 0.5*h*k1)
-        k3 = _L(r + 0.5*h*k2); k4 = _L(r + h*k3)
-        out = r + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-        out = 0.5 * (out + out.conj().T)
-        tr  = float(_np.real(_np.trace(out)))
-        return out / max(tr, 1e-15)
-
-    gamma_max = max(g1_eff, gphi, gdep, abs(om) / (2*_np.pi + 1e-9), 1e-9)
+    gamma_max = max(g1_eff, gphi, gdep, abs(om) / (2 * _np.pi + 1e-9), 1e-9)
     h_max     = 0.05 / gamma_max
     n_steps   = max(1, int(_np.ceil(dt / h_max)))
-    h_sub     = dt / n_steps
-    cur       = rho.copy()
-    for _ in range(n_steps):
-        cur = _rk4(cur, h_sub)
-        if not _np.all(_np.isfinite(cur)):
-            cur = _build_w3_dm()
-            break
-    return cur
+    rho_c  = rho.astype(_np.complex128)
+    re_arr = _np.ascontiguousarray(_np.real(rho_c).flatten())
+    im_arr = _np.ascontiguousarray(_np.imag(rho_c).flatten())
+    _re = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_arr))
+    _im = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_arr))
+    _accel_lib.qtcl_gksl_rk4(_re, _im, g1_eff, gphi, gdep, om, dt, n_steps)
+    result = re_arr.reshape(8, 8) + 1j * im_arr.reshape(8, 8)
+    if not _np.all(_np.isfinite(result)):
+        raise RuntimeError("[_gksl_rk4_step] GKSL integration produced non-finite values — check bath parameters")
+    # Enforce Tr=1 after C integration
+    tr = float(_np.real(_np.trace(result)))
+    if tr > 1e-12:
+        result /= tr
+    return result
 
 
 def _decode_dm_8x8(snap: dict):
@@ -12397,10 +12381,7 @@ class TensorFieldMetrics:
                     _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_l)),
                     8))
             else:
-                m.fidelity_to_w3 = ORACLE_W_STATE.fidelity_with(dm_f)
-                m.purity         = float(_np.real(_np.trace(dm_f @ dm_f)))
-                m.coherence_l1   = _coherence_l1(dm_f)
-                m.field_density  = float(_np.linalg.norm(dm_curr - dm_last, "fro"))
+                raise RuntimeError("[TensorFieldMetrics] C acceleration required for quantum metrics — pkg install clang openssl libffi")
 
             # VN entropy (numpy eigvalsh — best for this)
             m.entropy_vn           = _vn_entropy(dm_f)
@@ -13307,14 +13288,23 @@ class QtclClientApp:
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
                 if dm_curr is None:
-                    dm_curr = _build_w3_dm()
                 if dm_curr is None:
-                    continue
+                    continue  # skip: no oracle DM available
                 # pq_last: one short GKSL step earlier.
                 # dt_default (30s) would fully decohere the state over 30s making
                 # ‖Δρ‖_F astronomically large.  Use dt/10 for a physically meaningful
                 # Frobenius distance between adjacent block boundaries.
                 dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
+                if dm_last is None:
+                    continue  # GKSL failed — skip this cycle
+                # Defensive renormalization before metrics — any drift in GKSL
+                # or DM parsing that leaves Tr≠1 will cause ‖Δρ‖ to blow up.
+                if _HAS_NP:
+                    for _dm in (dm_curr, dm_last):
+                        if _dm is not None:
+                            _tr = float(_np.real(_np.trace(_dm)))
+                            if _tr > 0.1 and abs(_tr - 1.0) > 0.01:
+                                _dm /= _tr
                 # Build CLIENT_FIELD_STATE
                 self.client_field.build(
                     dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
@@ -13475,7 +13465,7 @@ class QtclClientApp:
                     buf  = _accel_ffi.new('char[262144]')
                     n    = _accel_lib.qtcl_sse_poll(buf, 262144, 32)
                     if n > 0:
-                        raw  = _accel_ffi.unpack(buf, 262144)  # unpack avoids cffi buffer [:]
+                        raw  = bytes(_accel_ffi.buffer(buf)[0:262144])
                         pos  = 0
                         for _ in range(n):
                             end  = raw.index(b'\x00', pos)
@@ -13721,58 +13711,7 @@ class QtclClientApp:
                     return oracle_ok, out_m, bytes([out_seed[i] for i in range(32)]), report_str
 
                 except Exception as _ce:
-                    _EXP_LOG.warning(f"[Bootstrap] C blockfield failed: {_ce} — Python fallback")
-
-            # ── Pure-Python fallback ───────────────────────────────────────────
-            try:
-                meas = _LOCAL_ORACLE.measure(
-                    pq0=_pq0, pq_curr=_pqc, pq_last=_pql,
-                    chain_height=_bh, bath=_b
-                )
-                dm_f = None
-                if HAS_NUMPY and meas.dm_re:
-                    import numpy as _np_fb
-                    d = _np_fb.array(meas.dm_re, dtype=complex)
-                    d.imag = _np_fb.array(meas.dm_im)
-                    dm_f = d.reshape(8, 8)
-                # Build client_field so dashboard metrics are correct
-                if dm_f is not None:
-                    _dt_fb = getattr(_b, 'dt_default', 3.0) / 10.0
-                    dm_last_f = _gksl_rk4_step(dm_f, _b, _dt_fb)
-                    if dm_last_f is None:
-                        dm_last_f = dm_f
-                    self.client_field.build(
-                        dm_f, dm_last_f,
-                        pq_curr_id=str(_pqc),
-                        pq_last_id=str(_pql),
-                        block_height=_bh,
-                    )
-                mermin_val, mermin_viol, _ = _mermin_w3(dm_f) if dm_f is not None else (0.0, False, 4.0)
-                bridge_fid = meas.fidelity_to_w3
-                if HAS_NUMPY and dm_f is not None and self.koyeb_state.dm_oracle is not None:
-                    try:
-                        dm_o = self.koyeb_state.dm_oracle
-                        if dm_o.shape == (8, 8):
-                            bridge_fid = float(max(0.0, min(1.0,
-                                _np.real(_np.trace(dm_o @ dm_f)))))
-                    except Exception:
-                        pass
-                self.koyeb_state.bridge_fidelity = bridge_fid
-                report_str = (
-                    "\n  ╔══ BLOCKFIELD STATE [Python] ══════════════════════════════╗\n"
-                    f"  ║  pq0={_pq0}  pq_curr={_pqc}  pq_last={_pql}  height={_bh}\n"
-                    f"  ║  F→|W3⟩   : {meas.fidelity_to_w3:.4f}  VN Entropy: {meas.entropy_vn:.4f}\n"
-                    f"  ║  Coherence : {meas.coherence:.4f}  Purity: {meas.purity:.4f}\n"
-                    f"  ║  Neg       : {meas.negativity_AB:.4f}  Discord: {meas.discord:.4f}\n"
-                    f"  ║  Mermin ⟨M₃⟩: {mermin_val:+.4f}  "
-                    f"{{'✅ VIOLATED' if mermin_viol else '· classical bound'}}\n"
-                    f"  ║  Bridge fid: {bridge_fid:.4f}  [Tr(ρ_oracle·ρ_client)]\n"
-                    "  ╚═══════════════════════════════════════════════════════════╝\n"
-                )
-                return 0, None, meas.pow_seed_bytes, report_str
-            except Exception as _pe:
-                _EXP_LOG.warning(f"[Bootstrap] Python measure failed: {_pe}")
-                return 0, None, os.urandom(32), "  ⚠️  Bootstrap failed — local entropy\n"
+                    raise RuntimeError(f"[Bootstrap] C blockfield pipeline failed: {_ce}") from _ce
 
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
@@ -14679,7 +14618,8 @@ class QtclClientApp:
         if dm_curr is None:
             dm_curr = _reconstruct_dm_from_bloch(snap)
         if dm_curr is None:
-            dm_curr = _build_w3_dm()
+            if dm_curr is None:
+                raise RuntimeError("[tx_mode] No oracle DM available — check SSE connection")
         
         dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
         self.client_field.build(dm_curr, dm_last, pq_curr, pq_last, bh)
