@@ -1838,12 +1838,18 @@ class LocalOracleEngine:
         self._oracle_state_lock    = threading.Lock()
 
     def start(self) -> None:
-        """Start C SSE listener + poll thread. C is required — raises if unavailable."""
+        """Start C SSE listener + poll thread. C is required — raises if unavailable.
+        Idempotent: safe to call again after a deferred-start at import time.
+        """
         if not _accel_ok:
             raise RuntimeError(
                 "[LocalOracleEngine.start] C acceleration required — "
                 "build qtcl_accel.so before starting oracle engine"
             )
+        # Guard against double-start (e.g. module-level call already succeeded)
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            _EXP_LOG.debug("[LOCAL-ORACLE] start() called but poll thread already running — skipped")
+            return
         self._stop.clear()
         host = self.ORACLE_HOST.encode() + b'\x00'
         path = self.SSE_PATH.encode() + b'\x00'
@@ -2621,8 +2627,16 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
     return _P2P_NODE
 
 _EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready")
-# C is required — will raise RuntimeError with a clear message if unavailable
-_LOCAL_ORACLE.start()
+# Attempt auto-start; if C acceleration is not yet available the module still
+# imports cleanly — the hard RuntimeError fires at measure()/get_pow_seed() time.
+try:
+    _LOCAL_ORACLE.start()
+    _EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine SSE listener started")
+except RuntimeError as _start_err:
+    _EXP_LOG.warning(
+        f"[QTCL P2P v2] ⚠️  LocalOracleEngine deferred — C unavailable at import: {_start_err}\n"
+        f"               Call _LOCAL_ORACLE.start() again after qtcl_accel.so is loaded."
+    )
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
