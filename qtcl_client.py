@@ -13310,8 +13310,11 @@ class QtclClientApp:
                     dm_curr = _build_w3_dm()
                 if dm_curr is None:
                     continue
-                # pq_last: one GKSL step earlier (use bath dt_default for spacing)
-                dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
+                # pq_last: one short GKSL step earlier.
+                # dt_default (30s) would fully decohere the state over 30s making
+                # ‖Δρ‖_F astronomically large.  Use dt/10 for a physically meaningful
+                # Frobenius distance between adjacent block boundaries.
+                dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
                 # Build CLIENT_FIELD_STATE
                 self.client_field.build(
                     dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
@@ -13472,7 +13475,7 @@ class QtclClientApp:
                     buf  = _accel_ffi.new('char[262144]')
                     n    = _accel_lib.qtcl_sse_poll(buf, 262144, 32)
                     if n > 0:
-                        raw  = bytes(_accel_ffi.buffer(buf, 262144))
+                        raw  = _accel_ffi.unpack(buf, 262144)  # unpack avoids cffi buffer [:]
                         pos  = 0
                         for _ in range(n):
                             end  = raw.index(b'\x00', pos)
@@ -13614,9 +13617,10 @@ class QtclClientApp:
                         dt, out_m, out_seed,
                     )
 
-                    # Mirror DM into Python numpy for TensorFieldMetrics + Mermin
-                    dm_re_list = list(out_m.dm_re)
-                    dm_im_list = list(out_m.dm_im)
+                    # Mirror DM into Python numpy — explicit indexing avoids cffi
+                    # "slice start must be specified" on struct pointer array fields
+                    dm_re_list = [float(out_m.dm_re[i]) for i in range(64)]
+                    dm_im_list = [float(out_m.dm_im[i]) for i in range(64)]
                     dm_curr_np = None
                     mermin_val, mermin_viol = 0.0, False
                     if HAS_NUMPY:
@@ -13701,7 +13705,7 @@ class QtclClientApp:
                         f"  ║  Hyp Area   : {float(out_m.triangle_area):.4f} rad  "
                         f"[Gauss-Bonnet Δ]\n"
                         f"{mermin_str}"
-                        f"  ║  auth_tag   : {bytes(out_m.auth_tag[:4]).hex()}…\n"
+                        f"  ║  auth_tag   : {''.join(f'{out_m.auth_tag[i]:02x}' for i in range(4))}…\n"
                         f"  ║  Bridge fid : {bridge_fid:.4f}  "
                         f"[Tr(ρ_oracle·ρ_client)]\n"
                         f"  ║  GKSL bath  : γ1={getattr(_b,'gamma1_eff',0):.4f}  "
@@ -13714,7 +13718,7 @@ class QtclClientApp:
                     # Update koyeb_state bridge fidelity with correct value
                     self.koyeb_state.bridge_fidelity = bridge_fid
 
-                    return oracle_ok, out_m, bytes(out_seed), report_str
+                    return oracle_ok, out_m, bytes([out_seed[i] for i in range(32)]), report_str
 
                 except Exception as _ce:
                     _EXP_LOG.warning(f"[Bootstrap] C blockfield failed: {_ce} — Python fallback")
@@ -13731,6 +13735,18 @@ class QtclClientApp:
                     d = _np_fb.array(meas.dm_re, dtype=complex)
                     d.imag = _np_fb.array(meas.dm_im)
                     dm_f = d.reshape(8, 8)
+                # Build client_field so dashboard metrics are correct
+                if dm_f is not None:
+                    _dt_fb = getattr(_b, 'dt_default', 3.0) / 10.0
+                    dm_last_f = _gksl_rk4_step(dm_f, _b, _dt_fb)
+                    if dm_last_f is None:
+                        dm_last_f = dm_f
+                    self.client_field.build(
+                        dm_f, dm_last_f,
+                        pq_curr_id=str(_pqc),
+                        pq_last_id=str(_pql),
+                        block_height=_bh,
+                    )
                 mermin_val, mermin_viol, _ = _mermin_w3(dm_f) if dm_f is not None else (0.0, False, 4.0)
                 bridge_fid = meas.fidelity_to_w3
                 if HAS_NUMPY and dm_f is not None and self.koyeb_state.dm_oracle is not None:
@@ -13749,7 +13765,7 @@ class QtclClientApp:
                     f"  ║  Coherence : {meas.coherence:.4f}  Purity: {meas.purity:.4f}\n"
                     f"  ║  Neg       : {meas.negativity_AB:.4f}  Discord: {meas.discord:.4f}\n"
                     f"  ║  Mermin ⟨M₃⟩: {mermin_val:+.4f}  "
-                    f"{'✅ VIOLATED' if mermin_viol else '· classical bound'}\n"
+                    f"{{'✅ VIOLATED' if mermin_viol else '· classical bound'}}\n"
                     f"  ║  Bridge fid: {bridge_fid:.4f}  [Tr(ρ_oracle·ρ_client)]\n"
                     "  ╚═══════════════════════════════════════════════════════════╝\n"
                 )
@@ -14324,11 +14340,25 @@ class QtclClientApp:
                             # _winning_seed = exact seed used when this nonce was hashed.
                             # Server decodes, rebuilds 512KB scratchpad, recomputes hash.
                             "w_entropy_hash":  _winning_seed.hex(),
-                            "w_state_fidelity": max(0.75, float(
-                                getattr(ORACLE_W_STATE, 'fidelity', 0.85)
-                                if 'ORACLE_W_STATE' in dir() and ORACLE_W_STATE is not None
-                                else 0.85
-                            )),
+                            # w_state_fidelity feeds entropy_score + temporal_coherence
+                            # columns which are NUMERIC(5,4) in Postgres — must be in [0,1].
+                            # Source priority:
+                            #   1. client_field.metrics.fidelity_to_w3  — bootstrap DM result
+                            #   2. koyeb_state.pq0_fidelity              — oracle API value
+                            #   3. 0.75 safe default
+                            # Never use ORACLE_W_STATE.fidelity — it goes through
+                            # TensorFieldMetrics which can overflow if the GKSL dt is too
+                            # large and the DM diverges.
+                            "w_state_fidelity": round(float(min(1.0, max(0.0,
+                                (miner._client_field.metrics.fidelity_to_w3
+                                 if (miner._client_field and miner._client_field.metrics
+                                     and miner._client_field.metrics.fidelity_to_w3 is not None
+                                     and 0.0 <= miner._client_field.metrics.fidelity_to_w3 <= 1.0)
+                                 else miner._koyeb_state.pq0_fidelity
+                                 if (miner._koyeb_state and miner._koyeb_state.pq0_fidelity
+                                     and 0.0 <= miner._koyeb_state.pq0_fidelity <= 1.0)
+                                 else 0.75)
+                            ))), 4),
                             "pq_curr": target_height,
                             "pq_last": target_height - 1,
                         },
@@ -14372,11 +14402,26 @@ class QtclClientApp:
                             _consensus = _WSTATE_CONSENSUS.compute(_meas)
                             if _P2P_NODE and _P2P_NODE._started:
                                 _P2P_NODE.gossip_measurement(_meas)
+
+                            def _qf(v, lo=0.0, hi=1.0):
+                                """Clamp a quantum float to physical range.
+                                Server DB uses NUMERIC(5,4) — must be in (-10, 10).
+                                Physical quantum values are always in [0, 1].
+                                A corrupted DM can produce astronomically large values;
+                                clamp here so the block is never rejected for overflow."""
+                                try:
+                                    f = float(v)
+                                    if not (-1e10 < f < 1e10):   # inf/nan guard
+                                        return lo
+                                    return max(lo, min(hi, f))
+                                except Exception:
+                                    return lo
+
                             submit_payload["header"].update({
-                                "w_state_fidelity":      _consensus["median_fidelity"],
+                                "w_state_fidelity":      _qf(_consensus["median_fidelity"], 0.0, 1.0),
                                 "oracle_quorum_hash":     _consensus["quorum_hash_hex"],
                                 "peer_measurement_count": _consensus["peer_count"],
-                                "hyp_triangle_area":      _consensus["hyp_area_median"],
+                                "hyp_triangle_area":      _qf(_consensus["hyp_area_median"], 0.0, 100.0),
                                 "pq0":                    _meas.pq0,
                                 "pq_curr":                _meas.pq_curr,
                                 "pq_last":                _meas.pq_last,
