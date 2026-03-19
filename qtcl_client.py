@@ -15094,7 +15094,15 @@ class QtclClientApp:
         snap    = self.api.get_oracle_pq0_bloch() or {}
         bath    = GKSLBathParams.from_snap(snap)
         bh      = int(snap.get("block_height") or snap.get("height") or 0)
-        pq_curr = str(bh) if bh > 0 else "0"
+        # Oracle pq0-bloch endpoint may omit block_height — fall back to chain tip
+        if bh == 0:
+            try:
+                _fb = self.api.get_block_height()
+                if _fb and int(_fb) > 0:
+                    bh = int(_fb)
+            except Exception:
+                pass
+        pq_curr = str(bh)     if bh > 0 else "0"
         pq_last = str(bh - 1) if bh > 0 else "0"
         # ✅ FIXED: Proper None checks instead of 'or' with numpy arrays
         # (numpy arrays have ambiguous truth values)
@@ -15109,7 +15117,8 @@ class QtclClientApp:
         self.client_field.build(dm_curr, dm_last, pq_curr, pq_last, bh)
         self.koyeb_state.sync(self.client_field)
         self._start_threads()
-        print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_last}  bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
+        pq_next = str(bh + 1)
+        print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_next}  bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
         
         while True:
             print("\n" + "━" * 62)
