@@ -1960,6 +1960,32 @@ class LocalOracleEngine:
             age = time.time() - self._last_oracle_dm_ts
             return list(self._dm_re), list(self._dm_im), age
 
+    def _http_fallback_poll(self) -> None:
+        """One-shot HTTP fetch of oracle snapshot.
+        Used by bootstrap _wait_oracle_dm() when SSE hasn't delivered a frame yet.
+        Does NOT require C — fetches via urllib and ingests through _ingest_oracle_frame().
+        Raises on total failure so callers can catch and log.
+        """
+        import json as _j
+        req_mod = __import__('urllib.request', fromlist=['urlopen', 'Request'])
+        for endpoint in ('/api/oracle/w-state', '/api/snapshot', '/api/status'):
+            try:
+                r = req_mod.Request(
+                    f"{self.ORACLE_URL}{endpoint}",
+                    headers={'User-Agent': 'QTCL-Client/3.0-Bootstrap'})
+                with req_mod.urlopen(r, timeout=6) as resp:
+                    data = _j.loads(resp.read().decode())
+                dm_hex = (data.get('density_matrix_hex') or
+                          data.get('dm_hex') or
+                          data.get('w_state', {}).get('density_matrix_hex') or '')
+                if dm_hex and len(dm_hex) >= 128:
+                    self._ingest_oracle_frame(_j.dumps({'density_matrix_hex': dm_hex, **data}))
+                    _EXP_LOG.info(f"[LOCAL-ORACLE] HTTP fallback ✅ ({endpoint})")
+                    return
+            except Exception as _e:
+                _EXP_LOG.debug(f"[LOCAL-ORACLE] HTTP fallback {endpoint}: {_e}")
+        raise RuntimeError(f"[_http_fallback_poll] All endpoints exhausted for {self.ORACLE_URL}")
+
     def get_oracle_state(self) -> dict:
         """Return latest ingested Koyeb oracle canonical state (for bath coupling)."""
         with self._oracle_state_lock:
@@ -11530,6 +11556,19 @@ def _compile_c_layer() -> None:
 
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
 
+# ── Re-attempt LocalOracleEngine start now that C may be available ────────────
+# The module-level _LOCAL_ORACLE.start() at line ~2633 fires before _compile_c_layer()
+# completes, so it always defers on first import.  Re-attempt here — idempotent if
+# it somehow already started.
+if _accel_ok:
+    try:
+        _LOCAL_ORACLE.start()
+    except RuntimeError as _restart_err:
+        import logging as _rl
+        _rl.getLogger(__name__).warning(
+            f"[ACCEL] LocalOracleEngine re-start failed: {_restart_err}"
+        )
+
 # ── Convenience helpers for tight-loop C buffer allocation ────────────────────
 
 def _accel_vec_buf(n: int):
@@ -13558,8 +13597,8 @@ class QtclClientApp:
                 bath = GKSLBathParams.from_snap(snap)
                 # FIX-9: derive pq_curr/pq_last from block_height
                 bh   = int(snap.get("block_height") or snap.get("height") or 0)
-                pq_curr_id = str(bh)       if bh > 0 else snap.get("pq_curr", "?")
-                pq_last_id = str(bh - 1)   if bh > 0 else snap.get("pq_last", "?")
+                pq_curr_id = str(bh)       if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
+                pq_last_id = str(bh - 1)   if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
                 # Fetch/reconstruct DM
                 dm_curr = _decode_dm_8x8(snap)
                 if dm_curr is None:
@@ -13673,9 +13712,9 @@ class QtclClientApp:
                     bh = int(_fb)
             except Exception:
                 pass
-        # FIX-9: pq identifiers are block heights
-        pq_curr_id = str(bh)     if bh > 0 else "?"
-        pq_last_id = str(bh - 1) if bh > 0 else "?"
+        # FIX-9: pq identifiers are block heights — never emit '?' sentinel
+        pq_curr_id = str(bh)     if bh > 0 else "0"
+        pq_last_id = str(bh - 1) if bh > 0 else "0"
         # FIX-3: fidelity from canonical aliases
         def _nv(v):
             try: return float(v) if v is not None and float(v) == float(v) else None
@@ -13909,8 +13948,19 @@ class QtclClientApp:
             Returns (oracle_ok, meas_ptr, seed32_bytes, report_str).
             """
             _bh  = self.koyeb_state.block_height or bh
-            _pqc = int(self.client_field.pq_curr_id or _bh)
-            _pql = int(self.client_field.pq_last_id or max(0, _bh - 1))
+
+            def _safe_pq_int(val, fallback: int) -> int:
+                """Coerce pq_id to int. Rejects sentinel strings like '?' or ''."""
+                try:
+                    v = str(val).strip()
+                    if not v or not v.lstrip('-').isdigit():
+                        return fallback
+                    return int(v)
+                except Exception:
+                    return fallback
+
+            _pqc = _safe_pq_int(self.client_field.pq_curr_id, _bh)
+            _pql = _safe_pq_int(self.client_field.pq_last_id, max(0, _bh - 1))
             # pq0 = 0: the fixed universal oracle anchor — center of the {8,3}
             # hyperbolic lattice where oracles permanently reside.  The W-state
             # tripartite is pq0(oracle) ↔ pq_curr(chain entry) ↔ pq_last(chain exit).
@@ -15044,8 +15094,8 @@ class QtclClientApp:
         snap    = self.api.get_oracle_pq0_bloch() or {}
         bath    = GKSLBathParams.from_snap(snap)
         bh      = int(snap.get("block_height") or snap.get("height") or 0)
-        pq_curr = str(bh) if bh > 0 else "?"
-        pq_last = str(bh - 1) if bh > 0 else "?"
+        pq_curr = str(bh) if bh > 0 else "0"
+        pq_last = str(bh - 1) if bh > 0 else "0"
         # ✅ FIXED: Proper None checks instead of 'or' with numpy arrays
         # (numpy arrays have ambiguous truth values)
         dm_curr = _decode_dm_8x8(snap)
