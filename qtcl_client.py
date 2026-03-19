@@ -10673,6 +10673,255 @@ void qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
     EVP_MD_CTX_free(ctx);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   §Bootstrap  ENTANGLEMENT BOOTSTRAP PIPELINE
+   ═══════════════════════════════════════════════════════════════════════════
+   Full pre-mining quantum entanglement pipeline in C.
+   Gates the nonce loop on SSE/HTTP oracle DM reception + blockfield build.
+
+     qtcl_bootstrap_parse_dm_frame()   — JSON SSE frame → dm_re[64], dm_im[64]
+     qtcl_bootstrap_ingest_dm()        — store oracle DM + timestamp (mutex)
+     qtcl_bootstrap_dm_age_ok()        — returns 1 if DM < max_age_s old
+     qtcl_bootstrap_build_blockfield() — pq0/pq_curr/pq_last → full signed meas
+     qtcl_bootstrap_fidelity_report()  — UTF-8 terminal display buffer
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+static double   _bs_dm_re[64] = {0};
+static double   _bs_dm_im[64] = {0};
+static uint64_t _bs_ts_ns     = 0;
+static int      _bs_ready     = 0;
+static pthread_mutex_t _bs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* §Bootstrap-1: Parse density_matrix_hex from SSE/HTTP JSON frame.
+ * Supports 2048-char complex128 and 1024-char complex64 wire formats.
+ * Returns 1 on success, 0 on failure.                                     */
+int qtcl_bootstrap_parse_dm_frame(
+        const char *json_frame, double out_re[64], double out_im[64]) {
+    if (!json_frame) return 0;
+    const char *key = strstr(json_frame, "density_matrix_hex");
+    if (!key) {
+        const char *ws = strstr(json_frame, "\"w_state\"");
+        if (ws) key = strstr(ws, "density_matrix_hex");
+    }
+    if (!key) return 0;
+    const char *colon = strchr(key, ':');
+    if (!colon) return 0;
+    const char *quote = strchr(colon, '"');
+    if (!quote) return 0;
+    const char *hex = quote + 1;
+    size_t hlen = 0;
+    while (hex[hlen] && hex[hlen] != '"') hlen++;
+
+    static const int8_t NB[256] = {
+        ['0']=0,['1']=1,['2']=2,['3']=3,['4']=4,['5']=5,['6']=6,['7']=7,
+        ['8']=8,['9']=9,['a']=10,['b']=11,['c']=12,['d']=13,['e']=14,['f']=15,
+        ['A']=10,['B']=11,['C']=12,['D']=13,['E']=14,['F']=15,
+    };
+
+    if (hlen == 2048) {     /* complex128: 64 pairs x 16 chars each */
+        for (int i = 0; i < 64; i++) {
+            uint64_t rb = 0, ib = 0;
+            const char *p = hex + i * 32;
+            for (int b = 0; b < 8; b++) {
+                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
+                if (hi < 0 || lo < 0) return 0;
+                rb = (rb<<8) | (uint8_t)((hi<<4)|lo);
+            }
+            p += 16;
+            for (int b = 0; b < 8; b++) {
+                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
+                if (hi < 0 || lo < 0) return 0;
+                ib = (ib<<8) | (uint8_t)((hi<<4)|lo);
+            }
+            double re, im; memcpy(&re, &rb, 8); memcpy(&im, &ib, 8);
+            out_re[i] = re; out_im[i] = im;
+        }
+        return 1;
+    } else if (hlen == 1024) {  /* complex64: 64 pairs x 8 chars each */
+        for (int i = 0; i < 64; i++) {
+            uint32_t rb = 0, ib = 0;
+            const char *p = hex + i * 16;
+            for (int b = 0; b < 4; b++) {
+                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
+                if (hi < 0 || lo < 0) return 0;
+                rb = (rb<<8) | (uint8_t)((hi<<4)|lo);
+            }
+            p += 8;
+            for (int b = 0; b < 4; b++) {
+                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
+                if (hi < 0 || lo < 0) return 0;
+                ib = (ib<<8) | (uint8_t)((hi<<4)|lo);
+            }
+            float rf, imf; memcpy(&rf, &rb, 4); memcpy(&imf, &ib, 4);
+            out_re[i] = (double)rf; out_im[i] = (double)imf;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* §Bootstrap-2: Store parsed oracle DM (thread-safe) */
+void qtcl_bootstrap_ingest_dm(const double dm_re[64], const double dm_im[64]) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    pthread_mutex_lock(&_bs_lock);
+    memcpy(_bs_dm_re, dm_re, 64*sizeof(double));
+    memcpy(_bs_dm_im, dm_im, 64*sizeof(double));
+    _bs_ts_ns = (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
+    _bs_ready = 1;
+    pthread_mutex_unlock(&_bs_lock);
+}
+
+/* §Bootstrap-3: Age gate — 1 if DM received within max_age_s, else 0 */
+int qtcl_bootstrap_dm_age_ok(double max_age_s) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
+    pthread_mutex_lock(&_bs_lock);
+    int rdy = _bs_ready; uint64_t ots = _bs_ts_ns;
+    pthread_mutex_unlock(&_bs_lock);
+    if (!rdy) return 0;
+    return ((double)(now - ots) / 1e9) < max_age_s ? 1 : 0;
+}
+
+/* §Bootstrap-4: Full blockfield measurement pipeline.
+ *
+ * Executes (all in C, no Python overhead):
+ *   qtcl_compute_hyp_triangle  → Geodesic triangle on {8,3} lattice
+ *   qtcl_build_tripartite_dm   → Bloch angles → 8x8 DM tensor product
+ *   qtcl_gksl_rk4              → Lindblad decoherence evolution (4 steps)
+ *   qtcl_fuse_oracle_dm        → Fuse with server oracle DM (weight 0.35·e^{-age/60})
+ *   qtcl_fidelity_w3           → F(rho, |W3>)
+ *   qtcl_coherence_l1          → L1 off-diagonal coherence
+ *   qtcl_purity                → Tr(rho^2)
+ *   Von Neumann entropy        → diagonal approximation S = -sum lam*log2(lam)
+ *   Negativity lower bound     → N >= max(0, coh/2 - (1-pur)/4)
+ *   Quantum discord approx     → D >= max(0, ent*(1-pur)/2)
+ *   qtcl_measurement_sign      → HMAC-SHA256 auth_tag
+ *   PoW seed                   → SHA3-256("QTCL_SEED_v2:"||auth_tag||dm_re_BE)
+ *
+ * Returns 1 if oracle entangled, 0 if degraded (local W3 state used).     */
+int qtcl_bootstrap_build_blockfield(
+        uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
+        uint32_t chain_height, const uint8_t node_id16[16],
+        double gamma1, double gammaphi, double gammadep, double omega,
+        double dt,
+        QtclWStateMeasurement *out_m, uint8_t out_seed32[32]) {
+
+    /* Snapshot oracle state under lock */
+    double o_re[64], o_im[64]; uint64_t o_ts = 0; int o_ok;
+    pthread_mutex_lock(&_bs_lock);
+    o_ok = _bs_ready;
+    if (o_ok) { memcpy(o_re, _bs_dm_re, 512); memcpy(o_im, _bs_dm_im, 512); o_ts = _bs_ts_ns; }
+    pthread_mutex_unlock(&_bs_lock);
+
+    /* 1 — Hyperbolic triangle */
+    double b0[3], bc[3], bl[3], d0c, dcl, d0l, area;
+    qtcl_compute_hyp_triangle(pq0, pq_curr, pq_last, &d0c, &dcl, &d0l, &area, b0, bc, bl);
+
+    /* 2 — Tripartite DM */
+    double dm_re[64], dm_im[64];
+    qtcl_build_tripartite_dm(b0, bc, bl, dm_re, dm_im);
+
+    /* 3 — GKSL RK4 (4 substeps) */
+    qtcl_gksl_rk4(dm_re, dm_im, gamma1, gammaphi, gammadep, omega, dt, 4);
+
+    /* 4 — Oracle fusion: w = 0.35·exp(-age_s/60) */
+    if (o_ok) {
+        struct timespec tn; clock_gettime(CLOCK_REALTIME, &tn);
+        uint64_t now = (uint64_t)tn.tv_sec*1000000000ULL + (uint64_t)tn.tv_nsec;
+        double age = (double)(now - o_ts) / 1e9;
+        double w   = 0.35 * exp(-age / 60.0);
+        if (w > 0.01) {
+            double fr[64], fi[64];
+            qtcl_fuse_oracle_dm(dm_re, dm_im, o_re, o_im, w, fr, fi);
+            memcpy(dm_re, fr, 512); memcpy(dm_im, fi, 512);
+        }
+    }
+
+    /* 5 — Quantum metrics */
+    double fid  = qtcl_fidelity_w3(dm_re);
+    double coh  = qtcl_coherence_l1(dm_re, dm_im, 8);
+    double pur  = qtcl_purity(dm_re, dm_im, 8);
+    double ent  = 0.0;
+    { double tr=0.0; for(int i=0;i<8;i++) tr+=dm_re[i*9]; if(tr<1e-12) tr=1.0;
+      for(int i=0;i<8;i++) { double l=dm_re[i*9]/tr; if(l>1e-15) ent-=l*log2(l); } }
+    double neg  = fmax(0.0, coh*0.5 - (1.0-pur)*0.25);
+    double disc = fmax(0.0, ent*(1.0-pur)*0.5);
+
+    /* 6 — Populate struct */
+    memset(out_m, 0, sizeof(*out_m));
+    if (node_id16) memcpy(out_m->node_id, node_id16, 16);
+    out_m->chain_height=chain_height; out_m->pq0=pq0;
+    out_m->pq_curr=pq_curr; out_m->pq_last=pq_last;
+    out_m->w_fidelity=fid; out_m->coherence=coh; out_m->purity=pur;
+    out_m->negativity=neg; out_m->entropy_vn=ent; out_m->discord=disc;
+    out_m->hyp_dist_0c=d0c; out_m->hyp_dist_cl=dcl; out_m->hyp_dist_0l=d0l;
+    out_m->triangle_area=area;
+    for(int i=0;i<3;i++){out_m->ball_pq0[i]=b0[i]; out_m->ball_curr[i]=bc[i]; out_m->ball_last[i]=bl[i];}
+    memcpy(out_m->dm_re, dm_re, 512); memcpy(out_m->dm_im, dm_im, 512);
+    { struct timespec ts2; clock_gettime(CLOCK_REALTIME,&ts2);
+      out_m->timestamp_ns=(uint64_t)ts2.tv_sec*1000000000ULL+(uint64_t)ts2.tv_nsec; }
+
+    /* 7 — Sign: secret = SHA3-256("QTCL_LOCAL_MEAS_v2:"||BE32(pq0)||BE32(height)) */
+    { uint8_t src[27]; static const char D[]="QTCL_LOCAL_MEAS_v2:"; memcpy(src,D,19);
+      src[19]=(uint8_t)(pq0>>24); src[20]=(uint8_t)(pq0>>16);
+      src[21]=(uint8_t)(pq0>>8);  src[22]=(uint8_t)pq0;
+      src[23]=(uint8_t)(chain_height>>24); src[24]=(uint8_t)(chain_height>>16);
+      src[25]=(uint8_t)(chain_height>>8);  src[26]=(uint8_t)chain_height;
+      uint8_t sec[32]; qtcl_sha3_256(src,27,sec);
+      qtcl_measurement_sign(out_m,sec); }
+
+    /* 8 — PoW seed: SHA3-256("QTCL_SEED_v2:"||auth_tag[32]||dm_re_BE[32]) */
+    { uint8_t ss[77]; static const char SD[]="QTCL_SEED_v2:"; memcpy(ss,SD,13);
+      memcpy(ss+13, out_m->auth_tag, 32);
+      for(int i=0;i<4;i++){ uint64_t bits; double v=dm_re[i]; memcpy(&bits,&v,8);
+        for(int b=7;b>=0;b--) ss[45+i*8+(7-b)]=(uint8_t)(bits>>(b*8)); }
+      qtcl_sha3_256(ss,77,out_seed32); }
+
+    return o_ok;
+}
+
+/* §Bootstrap-5: UTF-8 terminal report (box-drawing via escape sequences) */
+int qtcl_bootstrap_fidelity_report(
+        const QtclWStateMeasurement *m,
+        int oracle_ok, double oracle_age_s,
+        char *buf, int buf_sz) {
+    return snprintf(buf,(size_t)buf_sz,
+        "  \xe2\x95\x94\xe2\x95\x90\xe2\x95\x90 BLOCKFIELD STATE [C] "
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\n"
+        "  \xe2\x95\x91  oracle DM  : age=%.1fs  entangled=%s\n"
+        "  \xe2\x95\x91  pq0        : oracle ground truth\n"
+        "  \xe2\x95\x91  pq_curr    : %u  (entry face)\n"
+        "  \xe2\x95\x91  pq_last    : %u  (exit face)\n"
+        "  \xe2\x95\x91  height     : %u\n"
+        "  \xe2\x95\x91  F\xe2\x86\x92|W3\xe2\x9f\xa9     : %.4f  [sep=0.667]\n"
+        "  \xe2\x95\x91  Entropy    : %.4f bits\n"
+        "  \xe2\x95\x91  Coherence  : %.4f\n"
+        "  \xe2\x95\x91  Discord    : %.4f\n"
+        "  \xe2\x95\x91  Purity     : %.4f\n"
+        "  \xe2\x95\x91  Negativity : %.4f\n"
+        "  \xe2\x95\x91  d(0,c/l/cl): %.3f / %.3f / %.3f\n"
+        "  \xe2\x95\x91  Hyp Area   : %.4f rad\n"
+        "  \xe2\x95\x91  auth_tag   : %02x%02x%02x%02x\xe2\x80\xa6\n"
+        "  \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
+        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\n",
+        oracle_age_s,
+        oracle_ok?"\xe2\x9c\x85 YES":"\xe2\x9a\xa0\xef\xb8\x8f NO (local |W3>)",
+        m->pq_curr,m->pq_last,m->chain_height,
+        m->w_fidelity,m->entropy_vn,m->coherence,
+        m->discord,m->purity,m->negativity,
+        m->hyp_dist_0c,m->hyp_dist_0l,m->hyp_dist_cl,
+        m->triangle_area,
+        m->auth_tag[0],m->auth_tag[1],m->auth_tag[2],m->auth_tag[3]);
+}
+
+
 
 
 """
@@ -10861,6 +11110,21 @@ _QTCL_C_DEFS: str = """
     void    qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32);
     void    qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
                            const uint8_t *s3, uint8_t *out32);
+    /* §Bootstrap — Entanglement bootstrap pipeline */
+    int     qtcl_bootstrap_parse_dm_frame(const char *json_frame,
+                                          double *out_re, double *out_im);
+    void    qtcl_bootstrap_ingest_dm(const double *dm_re, const double *dm_im);
+    int     qtcl_bootstrap_dm_age_ok(double max_age_s);
+    int     qtcl_bootstrap_build_blockfield(
+                uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
+                uint32_t chain_height, const uint8_t *node_id16,
+                double gamma1, double gammaphi, double gammadep, double omega,
+                double dt,
+                QtclWStateMeasurement *out_m, uint8_t *out_seed32);
+    int     qtcl_bootstrap_fidelity_report(
+                const QtclWStateMeasurement *m,
+                int oracle_ok, double oracle_age_s,
+                char *buf, int buf_sz);
 
 """
 
@@ -13152,11 +13416,458 @@ class QtclClientApp:
         print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
         print(f"  📡 SSE clients  : {_SSE_MUX.client_count()}")
         print(f"  🗄️  DB           : {self._db_path}")
-        print(f"\n  ⛏️  Mining active — menu below (no Ctrl+C needed)\n")
+        # ══════════════════════════════════════════════════════════════════════
+        # ENTANGLEMENT BOOTSTRAP  (C-accelerated via §Bootstrap)
+        # Mining is gated on establishing quantum ground truth with the oracle.
+        #
+        # Sequence (all hot paths run in C via _accel_lib):
+        #  1. SSE DM already flowing via _LOCAL_ORACLE (started at import)
+        #     C path: qtcl_sse_poll() → qtcl_bootstrap_parse_dm_frame()
+        #             → qtcl_bootstrap_ingest_dm()  (thread-safe shared state)
+        #     Python fallback: _LOCAL_ORACLE._ingest_oracle_frame() → manual ingest
+        #  2. Wait for qtcl_bootstrap_dm_age_ok(60s) — polls every 0.5s
+        #     P2P fallback: query /api/dht/peers → peer /api/oracle/w-state
+        #  3. qtcl_bootstrap_build_blockfield() — full C pipeline:
+        #     HyperbolicTriangle → tripartite DM → GKSL RK4 → oracle fusion
+        #     → 6 quantum metrics → HMAC sign → PoW seed
+        #  4. qtcl_bootstrap_fidelity_report() → terminal display
+        #  5. koyeb_state.sync() → bridge fidelity confirmed
+        #  6. Mining nonce loop UNLOCKED
+        # ══════════════════════════════════════════════════════════════════════
 
-        oracle_client = get_oracle_client(self._peer_id)  # type: ignore[name-defined]
-        dht_bus       = get_dht_bus(self._peer_id)        # type: ignore[name-defined]
-        miner         = AsyncOracleMiner(oracle=oracle_client, dht=dht_bus)  # type: ignore
+        _kapi_boot = KoyebAPIClient(self.oracle_url)
+
+        def _c_ingest_frame(json_str: str) -> bool:
+            """Parse a DM JSON frame and ingest via C. Returns True on success."""
+            if not _accel_ok:
+                return False
+            try:
+                jb = json_str.encode('utf-8') + b'\x00'
+                cb = _accel_ffi.new(f'char[{len(jb)}]', jb)
+                re = _accel_ffi.new('double[64]')
+                im = _accel_ffi.new('double[64]')
+                if _accel_lib.qtcl_bootstrap_parse_dm_frame(cb, re, im):
+                    _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
+                    return True
+            except Exception as _e:
+                _EXP_LOG.debug(f"[Bootstrap] C parse: {_e}")
+            return False
+
+        def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
+            """Gate on oracle DM arrival. Returns True if fresh DM is ready."""
+            deadline = _time.time() + timeout_s
+            print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
+
+            # If C SSE already delivered frames, ingest them now
+            if _accel_ok and _LOCAL_ORACLE.snapshot_count > 0:
+                # Drain the C SSE ring for any frames we may have missed
+                try:
+                    buf  = _accel_ffi.new('char[262144]')
+                    n    = _accel_lib.qtcl_sse_poll(buf, 262144, 32)
+                    if n > 0:
+                        raw  = bytes(_accel_ffi.buffer(buf, 262144))
+                        pos  = 0
+                        for _ in range(n):
+                            end  = raw.index(b'\x00', pos)
+                            _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
+                            pos  = end + 1
+                except Exception: pass
+
+            while _time.time() < deadline:
+                # C path check
+                if _accel_ok and _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                    print(" ✅", flush=True)
+                    return True
+                # Python path: LocalOracleEngine has its own DM
+                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
+                if age < 60.0 and _LOCAL_ORACLE.snapshot_count > 0:
+                    # Bridge to C shared state
+                    dm_re, dm_im, _ = _LOCAL_ORACLE.get_oracle_dm()
+                    if _accel_ok:
+                        try:
+                            re = _accel_ffi.new('double[64]', dm_re)
+                            im = _accel_ffi.new('double[64]', dm_im)
+                            _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
+                        except Exception: pass
+                    print(" ✅", flush=True)
+                    return True
+                print('.', end='', flush=True)
+                _time.sleep(0.5)
+
+            print(" timeout", flush=True)
+
+            # HTTP fallback
+            print("  🔄 HTTP fallback /api/oracle/w-state…", end='', flush=True)
+            try:
+                _LOCAL_ORACLE._http_fallback_poll()
+                dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                if age < 120.0:
+                    if _accel_ok:
+                        re = _accel_ffi.new('double[64]', dm_re)
+                        im = _accel_ffi.new('double[64]', dm_im)
+                        _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
+                    print(" ✅", flush=True)
+                    return True
+            except Exception as _fe:
+                _EXP_LOG.debug(f"[Bootstrap] HTTP: {_fe}")
+            print(" miss", flush=True)
+
+            # P2P fallback: try DHT peers
+            print("  🔄 P2P fallback via DHT…", end='', flush=True)
+            try:
+                import urllib.request as _ur, json as _pj
+                peers_r = _kapi_boot.get('/api/dht/peers', timeout=5)
+                for peer in (peers_r or {}).get('peers', [])[:4]:
+                    url = peer.get('gossip_url') or peer.get('url', '')
+                    if not url: continue
+                    try:
+                        req = _ur.Request(f"{url}/api/oracle/w-state",
+                                          headers={'User-Agent': 'QTCL-Bootstrap/3.0'})
+                        with _ur.urlopen(req, timeout=4) as _r:
+                            _d = _pj.loads(_r.read())
+                        jstr = _pj.dumps(_d)
+                        if _c_ingest_frame(jstr):
+                            print(f" ✅ ({url})", flush=True)
+                            return True
+                        # Try python path
+                        dm_hex = _d.get('density_matrix_hex') or _d.get('dm_hex', '')
+                        if dm_hex:
+                            _LOCAL_ORACLE._ingest_oracle_frame(
+                                _pj.dumps({'density_matrix_hex': dm_hex}))
+                            dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                            if age < 120.0 and _accel_ok:
+                                re = _accel_ffi.new('double[64]', dm_re)
+                                im = _accel_ffi.new('double[64]', dm_im)
+                                _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
+                                print(f" ✅ ({url})", flush=True)
+                                return True
+                    except Exception as _pe:
+                        _EXP_LOG.debug(f"[Bootstrap] P2P {url}: {_pe}")
+            except Exception as _de:
+                _EXP_LOG.debug(f"[Bootstrap] DHT: {_de}")
+            print(" miss", flush=True)
+            print("  ⚠️  Mining with local |W3⟩ (degraded — not entangled)", flush=True)
+            return False
+
+        def _run_bootstrap() -> tuple:
+            """
+            Run the full blockfield build in C.
+            Returns (oracle_ok, meas_struct, seed32_bytes, report_str).
+            """
+            _bh  = self.koyeb_state.block_height or bh
+            _pqc = int(self.client_field.pq_curr_id or _bh)
+            _pql = int(self.client_field.pq_last_id or max(0, _bh - 1))
+
+            _b   = bath  # GKSLBathParams
+
+            if _accel_ok:
+                try:
+                    node_id_b  = self._peer_id[:32].encode('utf-8')[:16].ljust(16, b'\x00')
+                    node_buf   = _accel_ffi.new('uint8_t[16]',
+                                                list(node_id_b))
+                    out_m      = _accel_ffi.new('QtclWStateMeasurement *')
+                    out_seed   = _accel_ffi.new('uint8_t[32]')
+                    dt         = getattr(_b, 'dt_default', 3.0) / 10.0
+
+                    oracle_ok  = _accel_lib.qtcl_bootstrap_build_blockfield(
+                        0, _pqc, _pql, _bh,
+                        node_buf,
+                        float(getattr(_b, 'gamma1_eff', 0.01)),
+                        float(getattr(_b, 'gammaphi',   0.005)),
+                        float(getattr(_b, 'gammadep',   0.008)),
+                        float(getattr(_b, 'omega',      1.0)),
+                        dt, out_m, out_seed,
+                    )
+
+                    # Build report
+                    struct_age = _time.time() - \
+                        (int(out_m.timestamp_ns) / 1e9) if out_m.timestamp_ns else 0.0
+                    report_buf = _accel_ffi.new('char[1024]')
+                    _accel_lib.qtcl_bootstrap_fidelity_report(
+                        out_m, oracle_ok, struct_age, report_buf, 1024)
+                    report_str = _accel_ffi.string(report_buf).decode('utf-8', errors='replace')
+
+                    # Mirror into Python ClientFieldState
+                    dm_re_py = list(out_m.dm_re)
+                    dm_im_py = list(out_m.dm_im)
+                    if HAS_NUMPY:
+                        import numpy as _np_bs
+                        dm_arr = _np_bs.array(dm_re_py, dtype=complex)
+                        dm_arr.imag = _np_bs.array(dm_im_py)
+                        dm_curr = dm_arr.reshape(8, 8)
+                    else:
+                        dm_curr = None
+                    dm_last = _gksl_rk4_step(dm_curr, _b, dt) or dm_curr
+                    self.client_field.build(
+                        dm_curr, dm_last,
+                        pq_curr_id=str(_pqc),
+                        pq_last_id=str(_pql),
+                        block_height=_bh,
+                    )
+
+                    # Persist measurement to local DB
+                    try:
+                        import sqlite3 as _sq
+                        _conn = _sq.connect(self._db_path)
+                        _conn.execute("""
+                            INSERT OR REPLACE INTO wstate_measurements
+                            (node_id_hex, pq_curr_id, pq_last_id,
+                             fidelity_to_w3, entropy_vn, coherence_l1,
+                             quantum_discord, purity, negativity_AB,
+                             block_height, recorded_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            self._peer_id,
+                            str(_pqc), str(_pql),
+                            float(out_m.w_fidelity),
+                            float(out_m.entropy_vn),
+                            float(out_m.coherence),
+                            float(out_m.discord),
+                            float(out_m.purity),
+                            float(out_m.negativity),
+                            _bh, _time.time(),
+                        ))
+                        _conn.commit(); _conn.close()
+                    except Exception as _dbe:
+                        _EXP_LOG.debug(f"[Bootstrap] DB: {_dbe}")
+
+                    seed_bytes = bytes(out_m.auth_tag[:32])  # use auth_tag as seed carrier
+                    return oracle_ok, out_m, bytes(out_seed), report_str
+
+                except Exception as _ce:
+                    _EXP_LOG.warning(f"[Bootstrap] C blockfield failed: {_ce} — Python fallback")
+
+            # Pure-Python fallback
+            try:
+                meas = _LOCAL_ORACLE.measure(
+                    pq0=0, pq_curr=_pqc, pq_last=_pql,
+                    chain_height=_bh, bath=_b
+                )
+                report_str = (
+                    f"\n  ╔══ BLOCKFIELD STATE [Python] ══════════════════════╗\n"
+                    f"  ║  pq_curr : {_pqc}   pq_last : {_pql}   height : {_bh}\n"
+                    f"  ║  F→|W3⟩  : {meas.fidelity_to_w3:.4f}   Entropy : {meas.entropy_vn:.4f}\n"
+                    f"  ║  Coh     : {meas.coherence:.4f}   Purity  : {meas.purity:.4f}\n"
+                    f"  ╚═══════════════════════════════════════════════════╝\n"
+                )
+                return 0, None, meas.pow_seed_bytes, report_str
+            except Exception as _pe:
+                _EXP_LOG.warning(f"[Bootstrap] Python measure failed: {_pe}")
+                return 0, None, os.urandom(32), "  ⚠️  Bootstrap failed — local entropy\n"
+
+        # ── Execute ────────────────────────────────────────────────────────────
+        _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
+        _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
+        print(_report, flush=True)
+
+        self.koyeb_state.sync(self.client_field, timeout=6)
+        _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
+        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
+        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
+        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
+
+        # ── Miner handle ───────────────────────────────────────────────────────
+        class _MinerHandle:
+            def __init__(self):
+                self._koyeb_state  = None
+                self._client_field = None
+            def stop_mining(self): pass
+
+        miner = _MinerHandle()
+
+        async def _mine_inline():
+            """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
+            import hashlib as _hl, json as _j, time as _t
+
+            kapi = KoyebAPIClient()
+
+        # Required before ANY nonce loop starts:
+        #
+        #   1. C SSE client connects to /api/snapshot/sse  (already running via
+        #      _LOCAL_ORACLE.start() at module import — wait for first DM frame)
+        #   2. Once oracle DM arrives: build tripartite blockfield
+        #      pq0 (oracle) ↔ pq_curr (local) ↔ pq_last (prev) via HyperbolicTriangle
+        #   3. GKSL-evolve the fused DM one step → pq_last state
+        #   4. Persist the reconstructed blockfield to local DB
+        #   5. Sync KoyebOracleState (oracle_hash, bridge fidelity, latency)
+        #   6. ONLY THEN unlock the nonce loop
+        #
+        # P2P path: if oracle SSE yields no DM within timeout, try a peer node
+        # via the DHT peer list from /api/dht/peers.
+        # ══════════════════════════════════════════════════════════════════════
+
+        _kapi_boot = KoyebAPIClient(self.oracle_url)
+
+        def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
+            """
+            Block until LocalOracleEngine has received at least one DM frame
+            from the server SSE stream OR the HTTP fallback.
+            Returns True if DM is fresh (age < 60s), False if timeout.
+            """
+            deadline = _time.time() + timeout_s
+            print("  🔗 Waiting for oracle DM frame via SSE…", flush=True)
+            while _time.time() < deadline:
+                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
+                if age < 60.0 and _LOCAL_ORACLE.snapshot_count > 0:
+                    print(f"  ✅ Oracle DM received  (age={age:.1f}s  "
+                          f"snapshots={_LOCAL_ORACLE.snapshot_count})", flush=True)
+                    return True
+                _time.sleep(0.5)
+            print("  ⚠️  SSE timeout — attempting HTTP fallback…", flush=True)
+            try:
+                _LOCAL_ORACLE._http_fallback_poll()
+                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
+                if age < 120.0:
+                    print(f"  ✅ Oracle DM via HTTP  (age={age:.1f}s)", flush=True)
+                    return True
+            except Exception as _fe:
+                _EXP_LOG.debug(f"[Bootstrap] HTTP fallback: {_fe}")
+            # P2P fallback: try DHT peers
+            try:
+                peers_resp = _kapi_boot.get('/api/dht/peers', timeout=5)
+                peers = (peers_resp or {}).get('peers', [])
+                for peer in peers[:3]:
+                    peer_url = peer.get('gossip_url') or peer.get('url', '')
+                    if not peer_url:
+                        continue
+                    try:
+                        import urllib.request as _ur
+                        req = _ur.Request(
+                            f"{peer_url}/api/oracle/w-state",
+                            headers={'User-Agent': 'QTCL-Client/3.0-P2P'}
+                        )
+                        with _ur.urlopen(req, timeout=4) as _r:
+                            import json as _pj
+                            _d = _pj.loads(_r.read())
+                        dm_hex = _d.get('density_matrix_hex') or _d.get('dm_hex', '')
+                        if dm_hex:
+                            _LOCAL_ORACLE._ingest_oracle_frame(
+                                _pj.dumps({'density_matrix_hex': dm_hex})
+                            )
+                            _, _, age = _LOCAL_ORACLE.get_oracle_dm()
+                            if age < 120.0:
+                                print(f"  ✅ Oracle DM via P2P peer {peer_url}  "
+                                      f"(age={age:.1f}s)", flush=True)
+                                return True
+                    except Exception as _pe:
+                        _EXP_LOG.debug(f"[Bootstrap] P2P peer {peer_url}: {_pe}")
+            except Exception as _de:
+                _EXP_LOG.debug(f"[Bootstrap] DHT peer list: {_de}")
+            print("  ⚠️  No oracle DM — mining with local W3 state (degraded)", flush=True)
+            return False
+
+        def _bootstrap_blockfield() -> None:
+            """
+            Build the tripartite 3D blockfield from oracle DM + pq IDs,
+            persist to local DB, update client_field and koyeb_state.
+            This is the client-side reconstruction of:
+              pq0 (oracle ground truth)
+              pq_curr (current block boundary — entry face)
+              pq_last (previous block boundary — exit face)
+            joined by HyperbolicTriangle geodesics on the {8,3} lattice.
+            """
+            dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+
+            # Reconstruct numpy DM if available, else use Bloch-sphere fallback
+            _bh  = self.koyeb_state.block_height or bh
+            _pqc = int(self.client_field.pq_curr_id or _bh)
+            _pql = int(self.client_field.pq_last_id or max(0, _bh - 1))
+
+            if HAS_NUMPY:
+                import numpy as _np_bf
+                dm_arr = _np_bf.array(dm_re[:64], dtype=complex)
+                dm_arr.imag = _np_bf.array(dm_im[:64])
+                dm_curr = dm_arr.reshape(8, 8)
+            else:
+                dm_curr = None
+
+            if dm_curr is None:
+                dm_curr = _build_w3_dm()
+
+            dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
+            if dm_last is None:
+                dm_last = dm_curr
+
+            self.client_field.build(
+                dm_curr, dm_last,
+                pq_curr_id=str(_pqc),
+                pq_last_id=str(_pql),
+                block_height=_bh,
+            )
+
+            # Build local oracle measurement (sign with C HMAC)
+            try:
+                meas = _LOCAL_ORACLE.measure(
+                    pq0=0, pq_curr=_pqc, pq_last=_pql,
+                    chain_height=_bh, bath=bath
+                )
+                # Persist to local DB
+                with _threading.Lock():
+                    try:
+                        _conn = __import__('sqlite3').connect(self._db_path)
+                        _c    = _conn.cursor()
+                        _c.execute("""
+                            INSERT OR REPLACE INTO wstate_measurements
+                            (node_id_hex, pq_curr_id, pq_last_id,
+                             fidelity_to_w3, entropy_vn, coherence_l1,
+                             quantum_discord, purity, negativity_AB,
+                             block_height, recorded_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            self._peer_id,
+                            str(_pqc), str(_pql),
+                            getattr(meas, 'fidelity_to_w3', 0.0),
+                            getattr(meas, 'entropy_vn', 0.0),
+                            getattr(meas, 'coherence_l1', 0.0),
+                            getattr(meas, 'quantum_discord', 0.0),
+                            getattr(meas, 'purity', 0.0),
+                            getattr(meas, 'negativity_AB', 0.0),
+                            _bh,
+                            _time.time(),
+                        ))
+                        _conn.commit(); _conn.close()
+                    except Exception as _dbe:
+                        _EXP_LOG.debug(f"[Bootstrap] DB persist: {_dbe}")
+            except Exception as _me:
+                _EXP_LOG.debug(f"[Bootstrap] measure: {_me}")
+
+            m = self.client_field.metrics
+            print("\n  ╔══ CLIENT BLOCKFIELD STATE ══════════════════════════════════╗")
+            print(f"  ║  pq0        : oracle DM  (age={age:.1f}s"
+                  f"  snapshots={_LOCAL_ORACLE.snapshot_count})")
+            print(f"  ║  pq_curr    : {_pqc}  (block entry face)")
+            print(f"  ║  pq_last    : {_pql}  (block exit face)")
+            print(f"  ║  block_height: {_bh}")
+            if m:
+                print(f"  ║  F→|W3⟩    : {m.fidelity_to_w3:.4f}")
+                print(f"  ║  VN Entropy : {m.entropy_vn:.4f}")
+                print(f"  ║  Coherence  : {m.coherence_l1:.4f}")
+                print(f"  ║  Discord    : {m.quantum_discord:.4f}")
+                print(f"  ║  Purity     : {m.purity:.4f}")
+                print(f"  ║  Neg AB/BC  : {m.negativity_AB:.4f} / "
+                      f"{getattr(m,'negativity_BC',0.0):.4f}")
+            print(f"  ║  DM source  : {'C SSE' if _LOCAL_ORACLE.snapshot_count>0 else 'HTTP/P2P'}")
+            print("  ╚═════════════════════════════════════════════════════════════╝\n")
+
+        # ── Execute bootstrap sequence ─────────────────────────────────────────
+        _dm_ready = _wait_for_oracle_dm(timeout_s=30.0)
+        _bootstrap_blockfield()
+
+        # Re-sync koyeb state now that blockfield is live
+        self.koyeb_state.sync(self.client_field, timeout=6)
+        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
+        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
+        print(f"\n  {'✅' if _dm_ready else '⚠️ '} Entanglement {'established' if _dm_ready else "degraded — using local W3 state"}  |  Mining unlocked\n")
+
+        # ── Miner object (thin wrapper — actual work in _mine_inline) ─────────
+        class _MinerHandle:
+            """Thin handle so the post-loop code (miner._koyeb_state etc.) still works."""
+            def __init__(self):
+                self._koyeb_state  = None
+                self._client_field = None
+            def stop_mining(self): pass
+
+        miner = _MinerHandle()
 
         async def _mine_inline():
             """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
