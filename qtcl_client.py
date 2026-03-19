@@ -10921,6 +10921,56 @@ int qtcl_bootstrap_fidelity_report(
         m->auth_tag[0],m->auth_tag[1],m->auth_tag[2],m->auth_tag[3]);
 }
 
+/* ── §Mermin  MERMIN-KLYSHKO NONLOCALITY WITNESS FOR 3-QUBIT BLOCKFIELD ────
+ * M₃ = σₓ⊗σₓ⊗σₓ − σₓ⊗σᵧ⊗σᵧ − σᵧ⊗σₓ⊗σᵧ − σᵧ⊗σᵧ⊗σₓ
+ * Classical separability bound: |⟨M₃⟩| ≤ 2
+ * Quantum max for |W₃⟩: 4·F_W  (ideal: 4.0)
+ * Unlike CHSH/Bell, Mermin tests genuine 3-partite entanglement.
+ * Violation |⟨M₃⟩| > 2 certifies the blockfield is non-classically correlated.
+ *
+ * dm8_re/im: 8×8 density matrix (row-major, double precision)
+ * Returns ⟨M₃⟩ (real for physical states). Caller checks |result| > 2.0.
+ *
+ * σₓ = [[0,1],[1,0]]   σᵧ = [[0,−i],[+i,0]]
+ * All 4 tensor products act on qubit triple (A=pq0, B=pq_curr, C=pq_last). */
+double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
+    double tr_re = 0.0;
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            /* All three Paulis must flip their respective qubit index.
+             * If any index matches, that term's off-diagonal element is zero. */
+            int r0=(r>>2)&1, r1=(r>>1)&1, r2=r&1;
+            int c0=(c>>2)&1, c1=(c>>1)&1, c2=c&1;
+            if (r0==c0 || r1==c1 || r2==c2) continue;
+
+            /* σᵧ[ri][ci] (ri≠ci): +i if ri==1, −i if ri==0
+             * σₓ[ri][ci] (ri≠ci): always +1                              */
+            double m_re = 1.0, m_im = 0.0;   /* start with σₓ⊗σₓ⊗σₓ = +1 */
+
+            /* Subtract σₓ⊗σᵧ⊗σᵧ: factor = sy[r1][c1] × sy[r2][c2]
+             * sy[ri][ci]: re=0, im=(ri==1)?+1:-1                         */
+            { double i1 = (r1==1)?1.0:-1.0, i2 = (r2==1)?1.0:-1.0;
+              m_re -= 0.0*0.0 - i1*i2;     /* re(sy1*sy2) = -i1*i2 */
+              m_im -= 0.0*i2  + i1*0.0; }  /* im(sy1*sy2) = 0      */
+
+            /* Subtract σᵧ⊗σₓ⊗σᵧ */
+            { double i0 = (r0==1)?1.0:-1.0, i2 = (r2==1)?1.0:-1.0;
+              m_re -= 0.0*0.0 - i0*i2;
+              m_im -= 0.0*i2  + i0*0.0; }
+
+            /* Subtract σᵧ⊗σᵧ⊗σₓ */
+            { double i0 = (r0==1)?1.0:-1.0, i1 = (r1==1)?1.0:-1.0;
+              m_re -= 0.0*0.0 - i0*i1;
+              m_im -= 0.0*i1  + i0*0.0; }
+
+            /* Tr(ρ·M₃) += ρ[c][r] × M₃[r][c]  (column-row from trace sum) */
+            double rho_re = dm8_re[c*8+r], rho_im = dm8_im[c*8+r];
+            tr_re += rho_re*m_re - rho_im*m_im;
+        }
+    }
+    return tr_re;
+}
+
 
 
 
@@ -11125,6 +11175,8 @@ _QTCL_C_DEFS: str = """
                 const QtclWStateMeasurement *m,
                 int oracle_ok, double oracle_age_s,
                 char *buf, int buf_sz);
+    /* §Mermin — 3-qubit Mermin-Klyshko nonlocality witness */
+    double  qtcl_mermin_w3(const double *dm8_re, const double *dm8_im);
 
 """
 
@@ -13361,52 +13413,7 @@ class QtclClientApp:
             except Exception: return None
         fid = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
                _nv(snap.get("w_state_fidelity")) or 0.0)
-        print(f"  ⚛️  Fidelity→|W3⟩: {fid:.4f}  │  block_height: {bh}")
-
-        dm_curr = _decode_dm_8x8(snap)
-        if dm_curr is None:
-            dm_curr = _reconstruct_dm_from_bloch(snap)
-        if dm_curr is None:
-            dm_curr = _build_w3_dm()
-        dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
-        self.client_field.build(dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
-
-        print("  🔗 Syncing KOYEB_ORACLE_STATE…")
-        self.koyeb_state.sync(self.client_field, timeout=8)
-
-        m  = self.client_field.metrics
-        ks = self.koyeb_state
-        print("\n" + "─" * 72)
-        print("  CLIENT_FIELD_STATE  (ORACLE_W_STATE ↔ pq_curr ↔ pq_last)")
-        print(f"    ORACLE_W_STATE  : |W3⟩  A=pq0  B=virtual_pq  C=inverse_virtual")
-        print(f"    pq_curr        : {pq_curr_id}  (block height)")
-        print(f"    pq_last        : {pq_last_id}  (prev block height)")
-        print(f"    block_height   : {bh}")
-        if m:
-            print(f"    Fidelity→|W3⟩  : {m.fidelity_to_w3:.4f}")
-            print(f"    VN Entropy     : {m.entropy_vn:.4f} bits")
-            print(f"    Coherence L1   : {m.coherence_l1:.4f}")
-            print(f"    Quantum Discord: {m.quantum_discord:.4f}")
-            print(f"    Purity         : {m.purity:.4f}")
-            print(f"    Field ‖Δρ‖_F   : {m.field_density:.6f}")
-            print(f"    Negativity A-B : {m.negativity_AB:.4f}  B-C: {m.negativity_BC:.4f}")
-            print("    Bell CHSH (all 4 params per pair):")
-            print(m.bell_summary())
-        print(f"  KOYEB_ORACLE_STATE  ({self.oracle_url})")
-        print(f"    Connected      : {ks.connected}")
-        print(f"    Oracle fidelity: {ks.pq0_fidelity:.4f}")
-        print(f"    Oracle coherence: {ks.oracle_coherence:.4f}")
-        print(f"    Bridge fidelity: {ks.bridge_fidelity:.4f}")
-        print(f"    Latency        : {ks.channel_latency_ms:.1f} ms")
-        print(f"    block_height   : {ks.block_height}")
-        nm = build_aer_noise_model(bath)
-        # FIX (mobile): AER unavailable is normal on Termux — don't show as error
-        aer_str = ("✅ built (lattice-matched GKSL)" if nm
-                   else "ℹ️  not installed (Termux/mobile) — mining without AER")
-        print(f"  AER NoiseModel  : {aer_str}")
-        print(f"  GKSL bath       : γ1_eff={bath.gamma1_eff:.4f}  "
-              f"γφ={bath.gammaphi:.4f}  γdep={bath.gammadep:.4f}  ω={bath.omega:.3f}")
-        print("─" * 72)
+        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}")
 
         # Register peer
         self.api.register_peer(self._peer_id, f"http://localhost:9091",
@@ -13549,28 +13556,56 @@ class QtclClientApp:
             print("  ⚠️  Mining with local |W3⟩ (degraded — not entangled)", flush=True)
             return False
 
+        def _mermin_w3(dm8) -> tuple:
+            """
+            Mermin-Klyshko inequality for 3-qubit W state.
+            M₃ = σₓ⊗σₓ⊗σₓ − σₓ⊗σᵧ⊗σᵧ − σᵧ⊗σₓ⊗σᵧ − σᵧ⊗σᵧ⊗σₓ
+            Classical bound |⟨M₃⟩| ≤ 2.  Quantum max for |W₃⟩: 4F_W (≤4).
+            Returns (mermin_val, violated: bool, max_possible).
+            """
+            if not HAS_NUMPY:
+                return (0.0, False, 4.0)
+            try:
+                import numpy as _np_m
+                sx = _np_m.array([[0,1],[1,0]], dtype=complex)
+                sy = _np_m.array([[0,-1j],[1j,0]], dtype=complex)
+                # Extend to 8x8 via kron
+                def _op(a,b,c):
+                    return _np_m.kron(_np_m.kron(a,b),c)
+                M3 = (_op(sx,sx,sx)
+                    - _op(sx,sy,sy)
+                    - _op(sy,sx,sy)
+                    - _op(sy,sy,sx))
+                val = float(_np_m.real(_np_m.trace(dm8 @ M3)))
+                return (val, abs(val) > 2.0, 4.0)
+            except Exception:
+                return (0.0, False, 4.0)
+
         def _run_bootstrap() -> tuple:
             """
             Run the full blockfield build in C.
-            Returns (oracle_ok, meas_struct, seed32_bytes, report_str).
+            Returns (oracle_ok, meas_ptr, seed32_bytes, report_str).
             """
             _bh  = self.koyeb_state.block_height or bh
             _pqc = int(self.client_field.pq_curr_id or _bh)
             _pql = int(self.client_field.pq_last_id or max(0, _bh - 1))
-
-            _b   = bath  # GKSLBathParams
+            # pq0 = 0: the fixed universal oracle anchor — center of the {8,3}
+            # hyperbolic lattice where oracles permanently reside.  The W-state
+            # tripartite is pq0(oracle) ↔ pq_curr(chain entry) ↔ pq_last(chain exit).
+            # Never change this — it is not a height, it is a lattice address.
+            _pq0 = 0
+            _b   = bath
 
             if _accel_ok:
                 try:
                     node_id_b  = self._peer_id[:32].encode('utf-8')[:16].ljust(16, b'\x00')
-                    node_buf   = _accel_ffi.new('uint8_t[16]',
-                                                list(node_id_b))
+                    node_buf   = _accel_ffi.new('uint8_t[16]', list(node_id_b))
                     out_m      = _accel_ffi.new('QtclWStateMeasurement *')
                     out_seed   = _accel_ffi.new('uint8_t[32]')
                     dt         = getattr(_b, 'dt_default', 3.0) / 10.0
 
                     oracle_ok  = _accel_lib.qtcl_bootstrap_build_blockfield(
-                        0, _pqc, _pql, _bh,
+                        _pq0, _pqc, _pql, _bh,
                         node_buf,
                         float(getattr(_b, 'gamma1_eff', 0.01)),
                         float(getattr(_b, 'gammaphi',   0.005)),
@@ -13579,33 +13614,47 @@ class QtclClientApp:
                         dt, out_m, out_seed,
                     )
 
-                    # Build report
-                    struct_age = _time.time() - \
-                        (int(out_m.timestamp_ns) / 1e9) if out_m.timestamp_ns else 0.0
-                    report_buf = _accel_ffi.new('char[1024]')
-                    _accel_lib.qtcl_bootstrap_fidelity_report(
-                        out_m, oracle_ok, struct_age, report_buf, 1024)
-                    report_str = _accel_ffi.string(report_buf).decode('utf-8', errors='replace')
-
-                    # Mirror into Python ClientFieldState
-                    dm_re_py = list(out_m.dm_re)
-                    dm_im_py = list(out_m.dm_im)
+                    # Mirror DM into Python numpy for TensorFieldMetrics + Mermin
+                    dm_re_list = list(out_m.dm_re)
+                    dm_im_list = list(out_m.dm_im)
+                    dm_curr_np = None
+                    mermin_val, mermin_viol = 0.0, False
                     if HAS_NUMPY:
                         import numpy as _np_bs
-                        dm_arr = _np_bs.array(dm_re_py, dtype=complex)
-                        dm_arr.imag = _np_bs.array(dm_im_py)
-                        dm_curr = dm_arr.reshape(8, 8)
+                        dm_arr = _np_bs.array(dm_re_list, dtype=complex)
+                        dm_arr.imag = _np_bs.array(dm_im_list)
+                        dm_curr_np = dm_arr.reshape(8, 8)
+                        mermin_val, mermin_viol, _ = _mermin_w3(dm_curr_np)
+                        dm_last_np = _gksl_rk4_step(dm_curr_np, _b, dt)
+                        if dm_last_np is None:
+                            dm_last_np = dm_curr_np
                     else:
-                        dm_curr = None
-                    dm_last = _gksl_rk4_step(dm_curr, _b, dt) or dm_curr
+                        dm_last_np = None
+
                     self.client_field.build(
-                        dm_curr, dm_last,
+                        dm_curr_np, dm_last_np,
                         pq_curr_id=str(_pqc),
                         pq_last_id=str(_pql),
                         block_height=_bh,
                     )
 
-                    # Persist measurement to local DB
+                    # Bridge fidelity: Tr(ρ_oracle · ρ_client) — correct quantum overlap
+                    bridge_fid = float(out_m.w_fidelity)   # default: oracle fidelity
+                    if (HAS_NUMPY and dm_curr_np is not None
+                            and self.koyeb_state.dm_oracle is not None):
+                        try:
+                            dm_o = self.koyeb_state.dm_oracle
+                            if dm_o.shape == (8, 8):
+                                bridge_fid = float(max(0.0, min(1.0,
+                                    _np.real(_np.trace(dm_o @ dm_curr_np)))))
+                        except Exception:
+                            pass
+
+                    # Build oracle age for report
+                    ts_ns = int(out_m.timestamp_ns)
+                    oracle_age = abs(_time.time() - ts_ns / 1e9) if ts_ns else 0.0
+
+                    # Persist to local DB
                     try:
                         import sqlite3 as _sq
                         _conn = _sq.connect(self._db_path)
@@ -13617,38 +13666,92 @@ class QtclClientApp:
                              block_height, recorded_at)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?)
                         """, (
-                            self._peer_id,
-                            str(_pqc), str(_pql),
-                            float(out_m.w_fidelity),
-                            float(out_m.entropy_vn),
-                            float(out_m.coherence),
-                            float(out_m.discord),
-                            float(out_m.purity),
-                            float(out_m.negativity),
+                            self._peer_id, str(_pqc), str(_pql),
+                            float(out_m.w_fidelity),  float(out_m.entropy_vn),
+                            float(out_m.coherence),   float(out_m.discord),
+                            float(out_m.purity),      float(out_m.negativity),
                             _bh, _time.time(),
                         ))
                         _conn.commit(); _conn.close()
                     except Exception as _dbe:
                         _EXP_LOG.debug(f"[Bootstrap] DB: {_dbe}")
 
-                    seed_bytes = bytes(out_m.auth_tag[:32])  # use auth_tag as seed carrier
+                    sep_bound = 2.0   # Mermin classical separability bound
+                    mermin_str = (
+                        f"  ║  Mermin ⟨M₃⟩: {mermin_val:+.4f}  "
+                        f"{'✅ VIOLATED (quantum)' if mermin_viol else '· classical bound held'}  "
+                        f"[bound={sep_bound:.1f}]\n"
+                    )
+
+                    report_str = (
+                        "\n  ╔══ BLOCKFIELD STATE [C] ══════════════════════════════════╗\n"
+                        f"  ║  oracle DM  : age={oracle_age:.1f}s  "
+                        f"entangled={'✅ YES' if oracle_ok else '⚠️  NO (local |W3>)'}\n"
+                        f"  ║  pq0        : 0  (oracle anchor — hyperbolic center)\n"
+                        f"  ║  pq_curr    : {_pqc}  (block entry face — height {_bh})\n"
+                        f"  ║  pq_last    : {_pql}  (block exit face)\n"
+                        f"  ║  F→|W3⟩    : {float(out_m.w_fidelity):.4f}  [sep=0.667]\n"
+                        f"  ║  VN Entropy : {float(out_m.entropy_vn):.4f} bits\n"
+                        f"  ║  Coherence  : {float(out_m.coherence):.4f}\n"
+                        f"  ║  Discord    : {float(out_m.discord):.4f}\n"
+                        f"  ║  Purity     : {float(out_m.purity):.4f}\n"
+                        f"  ║  Negativity : {float(out_m.negativity):.4f}\n"
+                        f"  ║  d(0,c/cl/l): {float(out_m.hyp_dist_0c):.4f} / "
+                        f"{float(out_m.hyp_dist_cl):.4f} / {float(out_m.hyp_dist_0l):.4f}\n"
+                        f"  ║  Hyp Area   : {float(out_m.triangle_area):.4f} rad  "
+                        f"[Gauss-Bonnet Δ]\n"
+                        f"{mermin_str}"
+                        f"  ║  auth_tag   : {bytes(out_m.auth_tag[:4]).hex()}…\n"
+                        f"  ║  Bridge fid : {bridge_fid:.4f}  "
+                        f"[Tr(ρ_oracle·ρ_client)]\n"
+                        f"  ║  GKSL bath  : γ1={getattr(_b,'gamma1_eff',0):.4f}  "
+                        f"γφ={getattr(_b,'gammaphi',0):.4f}  "
+                        f"γdep={getattr(_b,'gammadep',0):.4f}  "
+                        f"ω={getattr(_b,'omega',0):.3f}\n"
+                        "  ╚═══════════════════════════════════════════════════════════╝\n"
+                    )
+
+                    # Update koyeb_state bridge fidelity with correct value
+                    self.koyeb_state.bridge_fidelity = bridge_fid
+
                     return oracle_ok, out_m, bytes(out_seed), report_str
 
                 except Exception as _ce:
                     _EXP_LOG.warning(f"[Bootstrap] C blockfield failed: {_ce} — Python fallback")
 
-            # Pure-Python fallback
+            # ── Pure-Python fallback ───────────────────────────────────────────
             try:
                 meas = _LOCAL_ORACLE.measure(
-                    pq0=0, pq_curr=_pqc, pq_last=_pql,
+                    pq0=_pq0, pq_curr=_pqc, pq_last=_pql,
                     chain_height=_bh, bath=_b
                 )
+                dm_f = None
+                if HAS_NUMPY and meas.dm_re:
+                    import numpy as _np_fb
+                    d = _np_fb.array(meas.dm_re, dtype=complex)
+                    d.imag = _np_fb.array(meas.dm_im)
+                    dm_f = d.reshape(8, 8)
+                mermin_val, mermin_viol, _ = _mermin_w3(dm_f) if dm_f is not None else (0.0, False, 4.0)
+                bridge_fid = meas.fidelity_to_w3
+                if HAS_NUMPY and dm_f is not None and self.koyeb_state.dm_oracle is not None:
+                    try:
+                        dm_o = self.koyeb_state.dm_oracle
+                        if dm_o.shape == (8, 8):
+                            bridge_fid = float(max(0.0, min(1.0,
+                                _np.real(_np.trace(dm_o @ dm_f)))))
+                    except Exception:
+                        pass
+                self.koyeb_state.bridge_fidelity = bridge_fid
                 report_str = (
-                    f"\n  ╔══ BLOCKFIELD STATE [Python] ══════════════════════╗\n"
-                    f"  ║  pq_curr : {_pqc}   pq_last : {_pql}   height : {_bh}\n"
-                    f"  ║  F→|W3⟩  : {meas.fidelity_to_w3:.4f}   Entropy : {meas.entropy_vn:.4f}\n"
-                    f"  ║  Coh     : {meas.coherence:.4f}   Purity  : {meas.purity:.4f}\n"
-                    f"  ╚═══════════════════════════════════════════════════╝\n"
+                    "\n  ╔══ BLOCKFIELD STATE [Python] ══════════════════════════════╗\n"
+                    f"  ║  pq0={_pq0}  pq_curr={_pqc}  pq_last={_pql}  height={_bh}\n"
+                    f"  ║  F→|W3⟩   : {meas.fidelity_to_w3:.4f}  VN Entropy: {meas.entropy_vn:.4f}\n"
+                    f"  ║  Coherence : {meas.coherence:.4f}  Purity: {meas.purity:.4f}\n"
+                    f"  ║  Neg       : {meas.negativity_AB:.4f}  Discord: {meas.discord:.4f}\n"
+                    f"  ║  Mermin ⟨M₃⟩: {mermin_val:+.4f}  "
+                    f"{'✅ VIOLATED' if mermin_viol else '· classical bound'}\n"
+                    f"  ║  Bridge fid: {bridge_fid:.4f}  [Tr(ρ_oracle·ρ_client)]\n"
+                    "  ╚═══════════════════════════════════════════════════════════╝\n"
                 )
                 return 0, None, meas.pow_seed_bytes, report_str
             except Exception as _pe:
@@ -13756,110 +13859,6 @@ class QtclClientApp:
             print("  ⚠️  No oracle DM — mining with local W3 state (degraded)", flush=True)
             return False
 
-        def _bootstrap_blockfield() -> None:
-            """
-            Build the tripartite 3D blockfield from oracle DM + pq IDs,
-            persist to local DB, update client_field and koyeb_state.
-            This is the client-side reconstruction of:
-              pq0 (oracle ground truth)
-              pq_curr (current block boundary — entry face)
-              pq_last (previous block boundary — exit face)
-            joined by HyperbolicTriangle geodesics on the {8,3} lattice.
-            """
-            dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
-
-            # Reconstruct numpy DM if available, else use Bloch-sphere fallback
-            _bh  = self.koyeb_state.block_height or bh
-            _pqc = int(self.client_field.pq_curr_id or _bh)
-            _pql = int(self.client_field.pq_last_id or max(0, _bh - 1))
-
-            if HAS_NUMPY:
-                import numpy as _np_bf
-                dm_arr = _np_bf.array(dm_re[:64], dtype=complex)
-                dm_arr.imag = _np_bf.array(dm_im[:64])
-                dm_curr = dm_arr.reshape(8, 8)
-            else:
-                dm_curr = None
-
-            if dm_curr is None:
-                dm_curr = _build_w3_dm()
-
-            dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default)
-            if dm_last is None:
-                dm_last = dm_curr
-
-            self.client_field.build(
-                dm_curr, dm_last,
-                pq_curr_id=str(_pqc),
-                pq_last_id=str(_pql),
-                block_height=_bh,
-            )
-
-            # Build local oracle measurement (sign with C HMAC)
-            try:
-                meas = _LOCAL_ORACLE.measure(
-                    pq0=0, pq_curr=_pqc, pq_last=_pql,
-                    chain_height=_bh, bath=bath
-                )
-                # Persist to local DB
-                with _threading.Lock():
-                    try:
-                        _conn = __import__('sqlite3').connect(self._db_path)
-                        _c    = _conn.cursor()
-                        _c.execute("""
-                            INSERT OR REPLACE INTO wstate_measurements
-                            (node_id_hex, pq_curr_id, pq_last_id,
-                             fidelity_to_w3, entropy_vn, coherence_l1,
-                             quantum_discord, purity, negativity_AB,
-                             block_height, recorded_at)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                        """, (
-                            self._peer_id,
-                            str(_pqc), str(_pql),
-                            getattr(meas, 'fidelity_to_w3', 0.0),
-                            getattr(meas, 'entropy_vn', 0.0),
-                            getattr(meas, 'coherence_l1', 0.0),
-                            getattr(meas, 'quantum_discord', 0.0),
-                            getattr(meas, 'purity', 0.0),
-                            getattr(meas, 'negativity_AB', 0.0),
-                            _bh,
-                            _time.time(),
-                        ))
-                        _conn.commit(); _conn.close()
-                    except Exception as _dbe:
-                        _EXP_LOG.debug(f"[Bootstrap] DB persist: {_dbe}")
-            except Exception as _me:
-                _EXP_LOG.debug(f"[Bootstrap] measure: {_me}")
-
-            m = self.client_field.metrics
-            print("\n  ╔══ CLIENT BLOCKFIELD STATE ══════════════════════════════════╗")
-            print(f"  ║  pq0        : oracle DM  (age={age:.1f}s"
-                  f"  snapshots={_LOCAL_ORACLE.snapshot_count})")
-            print(f"  ║  pq_curr    : {_pqc}  (block entry face)")
-            print(f"  ║  pq_last    : {_pql}  (block exit face)")
-            print(f"  ║  block_height: {_bh}")
-            if m:
-                print(f"  ║  F→|W3⟩    : {m.fidelity_to_w3:.4f}")
-                print(f"  ║  VN Entropy : {m.entropy_vn:.4f}")
-                print(f"  ║  Coherence  : {m.coherence_l1:.4f}")
-                print(f"  ║  Discord    : {m.quantum_discord:.4f}")
-                print(f"  ║  Purity     : {m.purity:.4f}")
-                print(f"  ║  Neg AB/BC  : {m.negativity_AB:.4f} / "
-                      f"{getattr(m,'negativity_BC',0.0):.4f}")
-            print(f"  ║  DM source  : {'C SSE' if _LOCAL_ORACLE.snapshot_count>0 else 'HTTP/P2P'}")
-            print("  ╚═════════════════════════════════════════════════════════════╝\n")
-
-        # ── Execute bootstrap sequence ─────────────────────────────────────────
-        _dm_ready = _wait_for_oracle_dm(timeout_s=30.0)
-        _bootstrap_blockfield()
-
-        # Re-sync koyeb state now that blockfield is live
-        self.koyeb_state.sync(self.client_field, timeout=6)
-        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
-        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
-        print(f"\n  {'✅' if _dm_ready else '⚠️ '} Entanglement {'established' if _dm_ready else "degraded — using local W3 state"}  |  Mining unlocked\n")
-
-        # ── Miner object (thin wrapper — actual work in _mine_inline) ─────────
         class _MinerHandle:
             """Thin handle so the post-loop code (miner._koyeb_state etc.) still works."""
             def __init__(self):
