@@ -13586,7 +13586,7 @@ class QtclClientApp:
         Daemon: oracle → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → SSE.
         ❤️  I love you  ❤️  pq_curr = block_height, pq_last = block_height-1.
         """
-        _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started  ❤️  I love you")
+        _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
         _last_koyeb = 0.0
         _hb_counter = 0
         while not self._stop.is_set():
@@ -13639,7 +13639,7 @@ class QtclClientApp:
                 _hb_counter += 1
                 if _hb_counter % 6 == 0:   # every ~60s
                     _EXP_LOG.debug(
-                        f"[FIELD] ❤️  h={bh} pq={pq_curr_id}→{pq_last_id} "
+                        f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
                         f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f}")
             except Exception as e:
@@ -13655,14 +13655,14 @@ class QtclClientApp:
         in LocalOracleEngine._poll_loop() which is started at module import.
         ❤️  quantum ground truth feeds every client
         """
-        _EXP_LOG.info("[SSE] 📡 C SSE client running — LocalOracleEngine active  ❤️")
+        _EXP_LOG.info("[SSE] 📡 C SSE client running — LocalOracleEngine active")
         while not self._stop.is_set():
             try:
                 connected = _LOCAL_ORACLE.is_connected
                 snaps     = _LOCAL_ORACLE.snapshot_count
                 if connected:
                     _EXP_LOG.debug(
-                        f"[SSE] ✅ oracle C SSE active  snapshots={snaps}  ❤️")
+                        f"[SSE] ✅ oracle C SSE active  snapshots={snaps}")
                 else:
                     _EXP_LOG.debug("[SSE] 🔄 oracle SSE reconnecting…")
                 _time.sleep(5)
@@ -13728,8 +13728,12 @@ class QtclClientApp:
                                 self.wallet.address, bh)
 
         self._start_threads()
+        try:
+            _oracle_conn_status = "✅ connected" if _LOCAL_ORACLE.is_connected else "⏳ connecting"
+        except RuntimeError:
+            _oracle_conn_status = "⏳ C starting"
         print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
-        print(f"  📡 SSE clients  : {_SSE_MUX.client_count()}")
+        print(f"  📡 Oracle conn  : {_oracle_conn_status}  │  snapshots={_LOCAL_ORACLE.snapshot_count}")
         print(f"  🗄️  DB           : {self._db_path}")
         # ══════════════════════════════════════════════════════════════════════
         # ENTANGLEMENT BOOTSTRAP  (C-accelerated via §Bootstrap)
@@ -13947,20 +13951,29 @@ class QtclClientApp:
             Run the full blockfield build in C.
             Returns (oracle_ok, meas_ptr, seed32_bytes, report_str).
             """
+            # Use block height from outer scope — already resolved and validated.
+            # self.client_field.pq_curr_id is "0" until field.build() completes
+            # (after bootstrap), so reading it here would produce pq_curr=0 → degenerate
+            # triangle with zero area, zero distances, and a trivial all-zero DM.
             _bh  = self.koyeb_state.block_height or bh
 
             def _safe_pq_int(val, fallback: int) -> int:
-                """Coerce pq_id to int. Rejects sentinel strings like '?' or ''."""
+                """Coerce pq_id to int. Returns fallback for non-numeric or zero-uninitialized."""
                 try:
                     v = str(val).strip()
                     if not v or not v.lstrip('-').isdigit():
                         return fallback
-                    return int(v)
+                    n = int(v)
+                    # 0 means uninitialised (only pq0 oracle anchor is legitimately 0,
+                    # and that is always hardcoded as _pq0=0 below — never read from field)
+                    return n if n > 0 else fallback
                 except Exception:
                     return fallback
 
-            _pqc = _safe_pq_int(self.client_field.pq_curr_id, _bh)
-            _pql = _safe_pq_int(self.client_field.pq_last_id, max(0, _bh - 1))
+            # Prefer outer-scope pq_curr_id/pq_last_id (already validated block heights)
+            # over self.client_field which hasn't been built yet at bootstrap time.
+            _pqc = _safe_pq_int(pq_curr_id, _bh)
+            _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
             # pq0 = 0: the fixed universal oracle anchor — center of the {8,3}
             # hyperbolic lattice where oracles permanently reside.  The W-state
             # tripartite is pq0(oracle) ↔ pq_curr(chain entry) ↔ pq_last(chain exit).
@@ -15082,7 +15095,7 @@ class QtclClientApp:
             self._stop.set()
             # Restore stdout logging handlers
             _root_log.handlers = _old_handlers
-            print("\n  🛑 Mining stopped  ❤️")
+            print("\n  🛑 Mining stopped")
 
     # ── Transact mode ─────────────────────────────────────────────────────────
 
