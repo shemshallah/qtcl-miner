@@ -13741,7 +13741,7 @@ class QtclClientApp:
                             _ent_ok = 0.0 <= _c_entropy <= 2.3
                             
                             if not (_fid_ok and _ent_ok):
-                                # ✅ FIX-METRICS-STRICT: Raise error to expose C library issue
+                                # ✅ STRICT MODE: Raise error to expose C library issue
                                 _EXP_LOG.error(
                                     f"[METRICS] C OUTPUT CORRUPTED: fid={_c_fidelity:.4f} "
                                     f"(expected 0.6-1.0), ent={_c_entropy:.4f} (expected 0.0-2.3 bits). "
