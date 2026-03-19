@@ -13670,11 +13670,32 @@ class QtclClientApp:
                         float(getattr(_b, 'omega',      CANONICAL_BATH.omega)),
                         dt, out_m, out_seed,
                     )
+                    
+                    # ✅ FIX-METRICS-STRICT: If C call failed, raise immediately
+                    if not oracle_ok:
+                        raise RuntimeError(
+                            f"[BOOTSTRAP] C qtcl_bootstrap_build_blockfield() failed: oracle_ok={oracle_ok}. "
+                            f"Check parameters: pq0={_pq0}, pqc={_pqc}, pql={_pql}, height={_bh}, "
+                            f"gamma1_eff={getattr(_b, 'gamma1_eff', CANONICAL_BATH.gamma1_eff):.4f}, "
+                            f"gammaphi={getattr(_b, 'gammaphi', CANONICAL_BATH.gammaphi):.4f}, "
+                            f"dt={dt:.4f}"
+                        )
 
                     # Mirror DM into Python numpy — explicit indexing avoids cffi
                     # "slice start must be specified" on struct pointer array fields
                     dm_re_list = [float(out_m.dm_re[i]) for i in range(64)]
                     dm_im_list = [float(out_m.dm_im[i]) for i in range(64)]
+                    
+                    # ✅ FIX-METRICS-STRICT: Check if DM struct is all zeros (corruption marker)
+                    if all(x == 0.0 for x in dm_re_list) and all(x == 0.0 for x in dm_im_list):
+                        raise RuntimeError(
+                            f"[BOOTSTRAP] C returned all-zero DM matrix (corruption). "
+                            f"out_m struct: w_fidelity={float(out_m.w_fidelity):.6f}, "
+                            f"entropy_vn={float(out_m.entropy_vn):.6f}, "
+                            f"coherence={float(out_m.coherence):.6f}. "
+                            f"Check C library or quantum initialization."
+                        )
+                    
                     dm_curr_np = None
                     mermin_val, mermin_viol = 0.0, False
                     if HAS_NUMPY:
@@ -13720,20 +13741,19 @@ class QtclClientApp:
                             _ent_ok = 0.0 <= _c_entropy <= 2.3
                             
                             if not (_fid_ok and _ent_ok):
-                                _EXP_LOG.warning(
-                                    f"[METRICS] C output suspicious: fid={_c_fidelity:.4f} "
-                                    f"ent={_c_entropy:.4f} — using Python fallback"
+                                # ✅ FIX-METRICS-STRICT: Raise error to expose C library issue
+                                _EXP_LOG.error(
+                                    f"[METRICS] C OUTPUT CORRUPTED: fid={_c_fidelity:.4f} "
+                                    f"(expected 0.6-1.0), ent={_c_entropy:.4f} (expected 0.0-2.3 bits). "
+                                    f"oracle_ok={oracle_ok}, dm_valid={_dm_valid}. "
+                                    f"Python fallback: fid={_py_fidelity:.4f}, ent={_py_entropy:.4f}"
                                 )
-                                # Replace C metrics with Python versions
-                                try:
-                                    # This is a bit hacky but works: we're noting the problem
-                                    # In production, would modify out_m fields directly
-                                    _EXP_LOG.info(
-                                        f"[METRICS] Python: fid={_py_fidelity:.4f} "
-                                        f"ent={_py_entropy:.4f} coherence={_py_metrics.get('coherence', 0.8):.4f}"
-                                    )
-                                except:
-                                    pass
+                                raise RuntimeError(
+                                    f"[METRICS] C qtcl_bootstrap_build_blockfield() returned corrupted metrics: "
+                                    f"w_fidelity={_c_fidelity:.4f} (should be 0.6-1.0), "
+                                    f"entropy_vn={_c_entropy:.4f} bits (should be 0.0-2.3). "
+                                    f"Check C library compilation or DM input. Oracle_ok={oracle_ok}"
+                                )
                         
                         mermin_val, mermin_viol, _ = _mermin_w3(dm_curr_np)
                         
