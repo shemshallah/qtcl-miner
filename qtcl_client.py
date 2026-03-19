@@ -13288,7 +13288,6 @@ class QtclClientApp:
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
                 if dm_curr is None:
-                if dm_curr is None:
                     continue  # skip: no oracle DM available
                 # pq_last: one short GKSL step earlier.
                 # dt_default (30s) would fully decohere the state over 30s making
