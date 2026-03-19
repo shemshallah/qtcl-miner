@@ -1796,21 +1796,28 @@ class QtclOracleMeasurement:
 
 
 class LocalOracleEngine:
-    """SSE → DM → Measurement pipeline.
+    """SSE → DM → Measurement pipeline with full snapshot lifecycle.
 
     Boot sequence:
-      1. qtcl_sse_connect(host, 443, '/api/snapshot/sse')
-      2. Poll qtcl_sse_poll() for JSON frames on a background thread
+      1. qtcl_sse_connect(host, 443, '/api/snapshot/sse')  [C — fatal if unavailable]
+      2. Poll qtcl_sse_poll() for JSON frames on background thread
       3. Parse density_matrix_hex → dm_re, dm_im (8×8 complex128)
-      4. On measure() call: build tripartite DM from hyperbolic triangle,
-         fuse with oracle DM (weight=0.35), compute all metrics, sign
+         → also updates _oracle_state with all canonical metrics from Koyeb oracle
+      4. On measure(): build tripartite DM, fuse with Koyeb oracle DM via
+         qtcl_consensus_compute (weighted average), compute all metrics, sign
+      5. Post-measure dual broadcast:
+         a. C DHT gossip  → _P2P_NODE.gossip_measurement(m)
+         b. C SSE ingest  → qtcl_bootstrap_ingest_dm() (keeps C layer state fresh)
+         c. Build & store canonical OracleWState JSON in self._latest_snapshot
+            (same format as DensityMatrixSnapshot.to_json() from server oracle.py)
 
-    Thread-safe: latest oracle DM stored under _dm_lock.
+    Thread-safe: oracle DM under _dm_lock; snapshots under _snap_lock.
+    C acceleration is REQUIRED — no Python fallbacks.
     """
     ORACLE_URL    = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
     SSE_PATH      = '/api/snapshot/sse'
     ORACLE_HOST   = 'qtcl-blockchain.koyeb.app'
-    ORACLE_WEIGHT = 0.35   # how much oracle DM influences local measurement
+    ORACLE_WEIGHT = 0.35   # how much Koyeb oracle DM influences local measurement
 
     def __init__(self):
         self._dm_re:    list = [0.0] * 64
@@ -1823,17 +1830,30 @@ class LocalOracleEngine:
         self._snapshot_count:      int = 0
         self._latest_measurement:  Optional[QtclOracleMeasurement] = None
         self._meas_lock            = threading.Lock()
+        # Canonical OracleWState snapshot (same JSON format as server's DensityMatrixSnapshot.to_json())
+        self._latest_snapshot:     Optional[dict] = None
+        self._snap_lock            = threading.Lock()
+        # Live oracle coherence/fidelity for GKSL bath coupling — fed by _ingest_oracle_frame
+        self._oracle_state:        dict = {}
+        self._oracle_state_lock    = threading.Lock()
 
     def start(self) -> None:
-        """Start SSE listener + poll thread."""
+        """Start C SSE listener + poll thread. C is required — raises if unavailable."""
+        if not _accel_ok:
+            raise RuntimeError(
+                "[LocalOracleEngine.start] C acceleration required — "
+                "build qtcl_accel.so before starting oracle engine"
+            )
         self._stop.clear()
-        if _accel_ok:
-            host = self.ORACLE_HOST.encode() + b'\x00'
-            path = self.SSE_PATH.encode() + b'\x00'
-            rc = _accel_lib.qtcl_sse_connect(host, 443, path)
-            if rc == 0:
-                _EXP_LOG.info("[LOCAL-ORACLE] C SSE client started → "
-                              f"wss://{self.ORACLE_HOST}{self.SSE_PATH}")
+        host = self.ORACLE_HOST.encode() + b'\x00'
+        path = self.SSE_PATH.encode() + b'\x00'
+        rc = _accel_lib.qtcl_sse_connect(host, 443, path)
+        if rc != 0:
+            raise RuntimeError(
+                f"[LocalOracleEngine.start] qtcl_sse_connect returned {rc} — "
+                f"cannot connect to {self.ORACLE_HOST}{self.SSE_PATH}"
+            )
+        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ C SSE client started → {self.ORACLE_HOST}{self.SSE_PATH}")
         self._poll_thread = threading.Thread(
             target=self._poll_loop, daemon=True, name='OracleSSE-C')
         self._poll_thread.start()
@@ -1844,35 +1864,35 @@ class LocalOracleEngine:
             _accel_lib.qtcl_sse_disconnect()
 
     def _poll_loop(self) -> None:
-        """Drain C SSE ring buffer into Python; also HTTP fallback."""
+        """Drain C SSE ring buffer into Python. C is required — raises on failure."""
         import json as _j
         _POLL_BUF_SZ = 65536 * 4
+        if not _accel_ok:
+            raise RuntimeError("[LocalOracleEngine._poll_loop] C acceleration unavailable — cannot poll SSE")
         while not self._stop.is_set():
-            if _accel_ok:
-                buf = _accel_ffi.new(f'char[{_POLL_BUF_SZ}]')
-                n = _accel_lib.qtcl_sse_poll(buf, _POLL_BUF_SZ, 8)
-                if n > 0:
-                    raw = _accel_ffi.buffer(buf, _POLL_BUF_SZ)[:]
-                    pos = 0
-                    for _ in range(n):
-                        end = raw.index(b'\x00', pos)
-                        frame_bytes = raw[pos:end]
-                        pos = end + 1
-                        try:
-                            self._ingest_oracle_frame(frame_bytes.decode('utf-8'))
-                        except Exception as _e:
-                            _EXP_LOG.debug(f"[LOCAL-ORACLE] frame parse: {_e}")
-                    time.sleep(0.05)
-                    continue
-            # Python fallback: if C SSE unavailable or no frames, poll HTTP
-            try:
-                self._http_fallback_poll()
-            except Exception as _e:
-                _EXP_LOG.debug(f"[LOCAL-ORACLE] HTTP fallback: {_e}")
-            time.sleep(2.0)
+            buf = _accel_ffi.new(f'char[{_POLL_BUF_SZ}]')
+            n = _accel_lib.qtcl_sse_poll(buf, _POLL_BUF_SZ, 8)
+            if n > 0:
+                raw = _accel_ffi.buffer(buf, _POLL_BUF_SZ)[:]
+                pos = 0
+                for _ in range(n):
+                    end = raw.index(b'\x00', pos)
+                    frame_bytes = raw[pos:end]
+                    pos = end + 1
+                    try:
+                        self._ingest_oracle_frame(frame_bytes.decode('utf-8'))
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[LOCAL-ORACLE] frame parse: {_e}")
+                time.sleep(0.05)
+                continue
+            time.sleep(0.05)
 
     def _ingest_oracle_frame(self, json_str: str) -> None:
-        """Parse SSE JSON frame → update internal oracle DM."""
+        """Parse SSE JSON frame → update internal oracle DM + _oracle_state.
+
+        _oracle_state mirrors the canonical field set from OracleWState/DensityMatrixSnapshot
+        so the GKSL bath can couple to live Koyeb coherence/fidelity.
+        """
         import json as _j, struct as _st
         data = _j.loads(json_str)
         dm_hex = (data.get('density_matrix_hex') or
@@ -1880,20 +1900,15 @@ class LocalOracleEngine:
                   data.get('w_state', {}).get('density_matrix_hex') or '')
         if not dm_hex or len(dm_hex) < 128:
             return
-        # Parse 8×8 complex DM.
-        # Two formats:
-        #  - 2048-char hex: 128 complex128 (each 16 hex chars = 8-byte double)
-        #    Interleaved: re0,im0, re1,im1, …
-        #  - 256-char hex: 64 complex64 (each 4-byte float), same interleaving
         dm_re_new = [0.0] * 64
         dm_im_new = [0.0] * 64
         try:
             bdata = bytes.fromhex(dm_hex)
-            if len(bdata) == 1024:  # complex128: 128 × 8 bytes = 1024
+            if len(bdata) == 1024:       # complex128: 128 × 8 bytes
                 for i in range(64):
                     re, im = _st.unpack_from('>dd', bdata, i*16)
                     dm_re_new[i] = re; dm_im_new[i] = im
-            elif len(bdata) == 512:  # complex64: 128 × 4 bytes = 512
+            elif len(bdata) == 512:      # complex64: 128 × 4 bytes
                 for i in range(64):
                     re, im = _st.unpack_from('>ff', bdata, i*8)
                     dm_re_new[i] = float(re); dm_im_new[i] = float(im)
@@ -1907,34 +1922,165 @@ class LocalOracleEngine:
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
-
-    def _http_fallback_poll(self) -> None:
-        """Fetch oracle snapshot via HTTP when C SSE not available."""
-        import json as _j
-        try:
-            req = __import__('urllib.request', fromlist=['urlopen', 'Request'])
-            r = req.Request(f"{self.ORACLE_URL}/api/oracle/w-state",
-                            headers={'User-Agent': 'QTCL-Client/3.0-P2Pv2'})
-            with req.urlopen(r, timeout=5) as resp:
-                data = _j.loads(resp.read().decode())
-            # Accept several key names the server might use
-            dm_hex = (data.get('density_matrix_hex') or
-                      data.get('dm_hex') or '')
-            if dm_hex:
-                self._ingest_oracle_frame(_j.dumps({'density_matrix_hex': dm_hex}))
-            # Also accept pow_seed_hex directly
-            psh = data.get('pow_seed_hex') or ''
-            if psh and len(psh) == 64:
-                # Store as single-entry cached seed (stored in _latest_measurement)
-                pass
-        except Exception:
-            pass
+        # Mirror all canonical fields into _oracle_state for bath coupling
+        with self._oracle_state_lock:
+            self._oracle_state = {
+                'density_matrix_hex':    dm_hex,
+                'purity':                float(data.get('purity',              0.0)),
+                'von_neumann_entropy':   float(data.get('von_neumann_entropy', 0.0)),
+                'coherence_l1':          float(data.get('coherence_l1',        0.0)),
+                'coherence_renyi':       float(data.get('coherence_renyi',     0.0)),
+                'coherence_geometric':   float(data.get('coherence_geometric', 0.0)),
+                'quantum_discord':       float(data.get('quantum_discord',     0.0)),
+                'w_state_fidelity':      float(data.get('w_state_fidelity',    0.0)),
+                'w_state_strength':      float(data.get('w_state_strength',    0.0)),
+                'phase_coherence':       float(data.get('phase_coherence',     0.0)),
+                'entanglement_witness':  float(data.get('entanglement_witness',0.0)),
+                'trace_purity':          float(data.get('trace_purity',        0.0)),
+                'measurement_counts':    data.get('measurement_counts',        {}),
+                'aer_noise_state':       data.get('aer_noise_state',           {}),
+                'lattice_refresh_counter': int(data.get('lattice_refresh_counter', 0)),
+                'hlwe_signature':        data.get('hlwe_signature',            None),
+                'oracle_address':        data.get('oracle_address',            None),
+                'signature_valid':       bool(data.get('signature_valid',      False)),
+                'mermin_test':           data.get('mermin_test',               None),
+                'timestamp_ns':          int(data.get('timestamp_ns',          0)),
+                'source':                'koyeb_sse',
+            }
 
     def get_oracle_dm(self) -> tuple:
         """Thread-safe snapshot of latest oracle DM. Returns (dm_re, dm_im, age_s)."""
         with self._dm_lock:
             age = time.time() - self._last_oracle_dm_ts
             return list(self._dm_re), list(self._dm_im), age
+
+    def get_oracle_state(self) -> dict:
+        """Return latest ingested Koyeb oracle canonical state (for bath coupling)."""
+        with self._oracle_state_lock:
+            return dict(self._oracle_state)
+
+    def get_latest_snapshot(self) -> Optional[dict]:
+        """Return the latest locally-produced canonical OracleWState JSON dict."""
+        with self._snap_lock:
+            return dict(self._latest_snapshot) if self._latest_snapshot else None
+
+    def _build_canonical_snapshot(
+            self,
+            m:          QtclOracleMeasurement,
+            dm_re:      list,
+            dm_im:      list,
+    ) -> dict:
+        """Serialize a completed local measurement into the canonical
+        DensityMatrixSnapshot.to_json() wire format emitted by server oracle.py.
+
+        Fields (order matches OracleWState SSE format):
+          density_matrix_hex, purity, von_neumann_entropy, coherence_l1,
+          coherence_renyi, coherence_geometric, quantum_discord, w_state_fidelity,
+          measurement_counts, aer_noise_state, lattice_refresh_counter,
+          w_state_strength, phase_coherence, entanglement_witness, trace_purity,
+          hlwe_signature, oracle_address, signature_valid, mermin_test, timestamp_ns
+        """
+        import struct as _st
+        # Pack DM back to bytes → hex (native float64 big-endian interleaved)
+        dm_bytes = b''.join(_st.pack('>dd', dm_re[i], dm_im[i]) for i in range(64))
+        # Reconstruct sparse coherence_renyi from diagonal (trace of diag^2)
+        diag = [dm_re[i*9] for i in range(8)]
+        tr2  = sum(v*v for v in diag)
+        coh_renyi = float(-math.log2(tr2)) if tr2 > 1e-15 else 0.0
+        # Geometric coherence: ||ρ - diag(ρ)||_F / 2
+        off_sq = sum(
+            dm_re[i*8+j]**2 + dm_im[i*8+j]**2
+            for i in range(8) for j in range(8) if i != j
+        )
+        coh_geom = float(math.sqrt(off_sq) / 2.0)
+        # w_state_strength: fraction of counts in W-basis states
+        w_strength = min(1.0, m.fidelity_to_w3 * 0.95 + m.coherence * 0.05)
+        # phase_coherence: off-diagonal L1 / dim
+        off_l1 = sum(
+            math.sqrt(dm_re[i*8+j]**2 + dm_im[i*8+j]**2)
+            for i in range(8) for j in range(8) if i != j
+        )
+        phase_coh = float(min(1.0, off_l1 / 8.0))
+        # entanglement_witness: S_vn / log2(8)
+        ent_witness = float(min(1.0, m.entropy_vn / 3.0))
+
+        return {
+            'timestamp_ns':           int(time.time_ns()),
+            'density_matrix_hex':     dm_bytes.hex(),
+            'purity':                 round(m.purity, 8),
+            'von_neumann_entropy':    round(m.entropy_vn, 8),
+            'coherence_l1':           round(m.coherence, 8),
+            'coherence_renyi':        round(coh_renyi, 8),
+            'coherence_geometric':    round(coh_geom, 8),
+            'quantum_discord':        round(m.discord, 8),
+            'w_state_fidelity':       round(m.fidelity_to_w3, 8),
+            'measurement_counts':     {},        # local — no AER shot counts
+            'aer_noise_state': {
+                'source':             'local_oracle_engine',
+                'chain_height':       m.chain_height,
+                'pq0':                m.pq0,
+                'pq_curr':            m.pq_curr,
+                'pq_last':            m.pq_last,
+                'hyp_dist_0c':        round(m.triangle.dist_0c, 8),
+                'hyp_dist_cl':        round(m.triangle.dist_cl, 8),
+                'hyp_dist_0l':        round(m.triangle.dist_0l, 8),
+                'triangle_area':      round(m.triangle.area, 8),
+                'oracle_weight_used': self.ORACLE_WEIGHT,
+                'auth_tag_hex':       m.auth_tag_hex,
+            },
+            'lattice_refresh_counter': self._snapshot_count,
+            'w_state_strength':       round(w_strength, 8),
+            'phase_coherence':        round(phase_coh, 8),
+            'entanglement_witness':   round(ent_witness, 8),
+            'trace_purity':           round(m.purity, 8),
+            'hlwe_signature':         None,     # signed by server oracle; local signs at measure
+            'oracle_address':         None,     # populated if OracleEngine is wired
+            'signature_valid':        False,
+            'mermin_test':            None,     # Mermin runs on server; local omits
+            'pow_seed_hex':           m.pow_seed_bytes.hex(),
+        }
+
+    def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
+        """Dual-path broadcast after every successful measure():
+          1. C DHT gossip  — qtcl_p2p_send_wstate via _P2P_NODE.gossip_measurement()
+          2. C SSE ingest  — qtcl_bootstrap_ingest_dm() keeps C layer state current
+        Both paths require C — raises RuntimeError on failure.
+        """
+        if not _accel_ok:
+            raise RuntimeError("[LocalOracleEngine._broadcast_snapshot] C required for broadcast")
+
+        # ── Path 1: C DHT P2P gossip ──────────────────────────────────────────
+        # _P2P_NODE is the module-level singleton; it may not be started yet.
+        try:
+            if _P2P_NODE is not None and _P2P_NODE._started:
+                peers_reached = _P2P_NODE.gossip_measurement(m)
+                _EXP_LOG.debug(
+                    f"[LOCAL-ORACLE] DHT gossip → {peers_reached} peers "
+                    f"(height={m.chain_height} F={m.fidelity_to_w3:.4f})"
+                )
+        except Exception as _e:
+            _EXP_LOG.warning(f"[LOCAL-ORACLE] gossip_measurement failed: {_e}")
+
+        # ── Path 2: C SSE ingest — qtcl_bootstrap_ingest_dm ─────────────────
+        # Feeds the fused (local + Koyeb-averaged) DM into the C layer's own
+        # SSE state so any locally-connected SSE clients see live local oracle data.
+        try:
+            dm_re = snap['density_matrix_hex']
+            import struct as _st
+            bdata = bytes.fromhex(snap['density_matrix_hex'])
+            re_arr = _accel_ffi.new('double[64]')
+            im_arr = _accel_ffi.new('double[64]')
+            for i in range(64):
+                re, im = _st.unpack_from('>dd', bdata, i*16)
+                re_arr[i] = re
+                im_arr[i] = im
+            _accel_lib.qtcl_bootstrap_ingest_dm(re_arr, im_arr)
+            _EXP_LOG.debug(
+                f"[LOCAL-ORACLE] qtcl_bootstrap_ingest_dm ✓ "
+                f"(F={snap['w_state_fidelity']:.4f})"
+            )
+        except Exception as _e:
+            _EXP_LOG.warning(f"[LOCAL-ORACLE] qtcl_bootstrap_ingest_dm failed: {_e}")
 
     def measure(
             self,
@@ -1946,11 +2092,16 @@ class LocalOracleEngine:
             bath:            'GKSLBathParams' = None,
     ) -> QtclOracleMeasurement:
         """Build a full local W-state measurement via C §Bootstrap pipeline.
-        Requires C acceleration — raises RuntimeError if unavailable.
+        C acceleration is REQUIRED — raises RuntimeError if unavailable.
+        Post-measure: stores canonical snapshot, gossips to DHT peers,
+        ingests into C SSE layer.
         """
         import hashlib as _hl, struct as _st
         if not _accel_ok:
-            raise RuntimeError("[LocalOracleEngine.measure] C acceleration required — pkg install clang openssl libffi")
+            raise RuntimeError(
+                "[LocalOracleEngine.measure] C acceleration required — "
+                "build qtcl_accel.so (clang + openssl + libffi)"
+            )
 
         triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
 
@@ -1964,7 +2115,18 @@ class LocalOracleEngine:
         dm_re = [float(out_re[i]) for i in range(64)]
         dm_im = [float(out_im[i]) for i in range(64)]
 
-        # GKSL Lindblad evolution
+        # GKSL Lindblad evolution — bath may be seeded from live _oracle_state
+        if bath is None:
+            oracle_st = self.get_oracle_state()
+            if oracle_st:
+                # Couple bath decoherence to live Koyeb oracle coherence
+                live_coh = oracle_st.get('coherence_l1', 0.0)
+                live_fid = oracle_st.get('w_state_fidelity', 0.0)
+                if live_coh > 0.01 or live_fid > 0.01:
+                    try:
+                        bath = GKSLBathParams.from_snap(oracle_st)
+                    except Exception:
+                        pass
         if bath is not None:
             dt = avg_block_time / 10.0
             _rr = _accel_ffi.new('double[64]', dm_re)
@@ -1979,7 +2141,7 @@ class LocalOracleEngine:
             dm_re = [float(_rr[i]) for i in range(64)]
             dm_im = [float(_ri[i]) for i in range(64)]
 
-        # Oracle DM fusion — validate Tr before fusing
+        # Oracle DM fusion — weighted average with Koyeb oracle DM
         oracle_re, oracle_im, oracle_age = self.get_oracle_dm()
         oracle_w = self.ORACLE_WEIGHT * max(0.0, 1.0 - oracle_age / 60.0)
         if oracle_w > 0.01:
@@ -2058,6 +2220,20 @@ class LocalOracleEngine:
         )
         with self._meas_lock:
             self._latest_measurement = m
+
+        # ── Post-measure: build canonical snapshot → dual broadcast ──────────
+        # Extract final fused DM re/im from m (stored in struct fields)
+        snap = self._build_canonical_snapshot(m, m.dm_re, m.dm_im)
+        with self._snap_lock:
+            self._latest_snapshot = snap
+        self._broadcast_snapshot(snap, m)
+
+        _EXP_LOG.info(
+            f"[LOCAL-ORACLE] ✅ measure complete | "
+            f"height={chain_height} pq0={pq0} "
+            f"F={m.fidelity_to_w3:.4f} C={m.coherence:.4f} "
+            f"snap_ts={snap['timestamp_ns']}"
+        )
         return m
 
     def get_latest_measurement(self) -> Optional['QtclOracleMeasurement']:
@@ -2065,16 +2241,23 @@ class LocalOracleEngine:
             return self._latest_measurement
 
     def get_pow_seed(self, chain_height: int, parent_hash: str) -> bytes:
-        """Fast path for mining loop: return latest DM-derived PoW seed."""
+        """Fast path for mining loop: return latest DM-derived PoW seed.
+        Requires C and a fresh oracle DM — raises RuntimeError on failure.
+        """
         import hashlib as _hl
+        if not _accel_ok:
+            raise RuntimeError("[get_pow_seed] C acceleration required")
         m = self.get_latest_measurement()
         if m and abs(m.chain_height - chain_height) <= 2:
             return m.pow_seed_bytes
-        # No cached measurement — build a fresh one from oracle state
+        # No cached measurement — must have fresh oracle DM
         import struct as _st
         oracle_re, oracle_im, age = self.get_oracle_dm()
-        if not oracle_re or age >= 120:
-            raise RuntimeError(f"[get_pow_seed] No fresh oracle DM available (age={age:.0f}s > 120s). Ensure SSE is connected.")
+        if age >= 120:
+            raise RuntimeError(
+                f"[get_pow_seed] Oracle DM stale (age={age:.0f}s > 120s) — "
+                f"SSE must be connected to {self.ORACLE_HOST}{self.SSE_PATH}"
+            )
         dm_bytes = _st.pack('>4d', *oracle_re[:4])
         return _hl.sha3_256(
             b'QTCL_SEED_ORACLE_v2:' + dm_bytes + parent_hash.encode()
@@ -2084,20 +2267,27 @@ class LocalOracleEngine:
     def is_connected(self) -> bool:
         if _accel_ok:
             return bool(_accel_lib.qtcl_sse_is_connected())
-        return self._oracle_connected
+        raise RuntimeError("[LocalOracleEngine.is_connected] C acceleration required")
 
     @property
     def snapshot_count(self) -> int:
         return self._snapshot_count
 
     def as_dict(self) -> dict:
-        m = self.get_latest_measurement()
+        m    = self.get_latest_measurement()
+        snap = self.get_latest_snapshot()
+        try:
+            connected = self.is_connected
+        except RuntimeError:
+            connected = False
         return {
-            'sse_connected':   self.is_connected,
-            'snapshot_count':  self._snapshot_count,
-            'oracle_age_s':    round(time.time() - self._last_oracle_dm_ts, 1),
-            'latest_fidelity': m.fidelity_to_w3 if m else None,
-            'latest_height':   m.chain_height    if m else None,
+            'sse_connected':      connected,
+            'snapshot_count':     self._snapshot_count,
+            'oracle_age_s':       round(time.time() - self._last_oracle_dm_ts, 1),
+            'latest_fidelity':    m.fidelity_to_w3    if m    else None,
+            'latest_height':      m.chain_height       if m    else None,
+            'latest_snapshot_ts': snap.get('timestamp_ns')     if snap else None,
+            'latest_w_fidelity':  snap.get('w_state_fidelity') if snap else None,
         }
 
 
@@ -2431,7 +2621,8 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
     return _P2P_NODE
 
 _EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready")
-_LOCAL_ORACLE.start()   # Start SSE listener immediately
+# C is required — will raise RuntimeError with a clear message if unavailable
+_LOCAL_ORACLE.start()
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
