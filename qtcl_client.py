@@ -14752,6 +14752,49 @@ class QtclClientApp:
                     _c_out   = _ffi.new("uint8_t[32]")
                     _pinned_seed = _w_entropy_seed      # track what's currently pinned
 
+                # ── Chain-advance detector ─────────────────────────────────────
+                # Polls the C SSE ring after each chunk for new_block events.
+                # If another miner solved the current height, we abort immediately
+                # instead of wasting time on a stale block (and hitting entropy TTL).
+                _chain_tip_height = target_height  # our current best known height
+
+                def _poll_new_block() -> bool:
+                    """Drain SSE ring; return True if chain advanced past target_height."""
+                    nonlocal _chain_tip_height
+                    if not _accel_ok:
+                        return False
+                    try:
+                        _nb = _accel_ffi.new('char[131072]')
+                        _nn = _accel_lib.qtcl_sse_poll(_nb, 131072, 16)
+                        if _nn > 0:
+                            _raw = bytes(_accel_ffi.buffer(_nb)[0:131072])
+                            _pos = 0
+                            for _ in range(_nn):
+                                try:
+                                    _end = _raw.index(b'\x00', _pos)
+                                    _txt = _raw[_pos:_end].decode('utf-8', errors='replace')
+                                    _pos = _end + 1
+                                    # Feed oracle DM frames while we're here
+                                    _c_ingest_frame(_txt)
+                                    # Check for new_block signal
+                                    if '"type"' in _txt and 'new_block' in _txt:
+                                        try:
+                                            _ev = _json.loads(_txt)
+                                            _ev_h = int(_ev.get('height') or _ev.get('block_height') or 0)
+                                            if _ev_h >= target_height:
+                                                _chain_tip_height = _ev_h
+                                                _EXP_LOG.warning(
+                                                    f"[MINER] ⛔ Chain advanced to h={_ev_h} "                                                    f"— aborting h={target_height} nonce search"
+                                                )
+                                                return True
+                                        except Exception:
+                                            pass
+                                except ValueError:
+                                    break
+                    except Exception:
+                        pass
+                    return False
+
                 while not _found:
                     if _C_AVAIL:
                         # Re-pin seed buffer only when entropy actually changed
@@ -14775,6 +14818,12 @@ class QtclClientApp:
                             _found        = True
                             break
                         nonce += _C_CHUNK
+                        # Check SSE for chain advance — abort if another miner won
+                        if _poll_new_block():
+                            _EXP_LOG.warning(
+                                f"[MINER-SIMPLE] Chain advanced — restarting for h={_chain_tip_height + 1}"
+                            )
+                            break   # exits while-not-_found → outer loop fetches new tip
                         # Yield to event loop after each C chunk — keeps UI alive
                         _MINE_TELEM.update_progress(target_height, difficulty_bits,
                                                      nonce, parent_hash)
@@ -15367,6 +15416,221 @@ class QtclClientApp:
 
     # ── Wallet mode ───────────────────────────────────────────────────────────
 
+
+    def run_oracle_mode(self) -> None:
+        """
+        ═══════════════════════════════════════════════════════════════
+        ORACLE AUDIT PANEL — live server state, full hashes, addresses
+        ═══════════════════════════════════════════════════════════════
+        Polls all five oracle nodes + chain tip every 4 s.
+        Press Enter to refresh, q+Enter to quit, l+Enter for log tail.
+        Full hex strings printed for auditability — nothing truncated.
+        """
+        import os as _osa
+        kapi = KoyebAPIClient(self.oracle_url)
+
+        def _pad(s: str, w: int) -> str:
+            return s.ljust(w)[:w]
+
+        def _bar(v: float, width: int = 24) -> str:
+            filled = max(0, min(width, int(v * width)))
+            return "█" * filled + "░" * (width - filled)
+
+        def _fetch_all():
+            tip      = kapi._get("/api/blocks/tip")            or {}
+            w_state  = kapi._get("/api/oracle/w-state")        or {}
+            pq0      = kapi._get("/api/oracle/pq0-bloch")      or {}
+            diag     = kapi._get("/api/diagnostics")           or {}
+            snap     = kapi._get("/api/snapshot")              or {}
+            peers    = kapi._get("/api/dht/peers")             or {}
+            mempool  = kapi._get("/api/mempool")               or {}
+            return tip, w_state, pq0, diag, snap, peers, mempool
+
+        def _render(tip, w_state, pq0, diag, snap, peers, mempool):
+            # ── terminal width ─────────────────────────────────────
+            try:
+                cols = _osa.get_terminal_size().columns
+            except Exception:
+                cols = 80
+            W = min(cols, 100)
+            HR = "─" * W
+
+            lines = []
+            a = lines.append
+
+            a("")
+            a("╔" + "═" * (W - 2) + "╗")
+            a("║" + "  ⚛️  QTCL ORACLE AUDIT PANEL  —  live server state".center(W - 2) + "║")
+            a("║" + f"  Server: {self.oracle_url}".ljust(W - 2) + "║")
+            a("╚" + "═" * (W - 2) + "╝")
+
+            # ── Chain ──────────────────────────────────────────────
+            height    = tip.get("block_height") or tip.get("height") or "?"
+            parent    = tip.get("parent_hash")  or tip.get("hash")   or "—"
+            tip_hash  = tip.get("block_hash")   or tip.get("hash")   or "—"
+            tip_ts    = tip.get("timestamp_s")  or tip.get("timestamp") or "?"
+            tip_miner = tip.get("miner_address") or "—"
+            tip_diff  = tip.get("difficulty_bits") or tip.get("difficulty") or "?"
+            tip_mr    = tip.get("merkle_root") or "—"
+
+            a(HR)
+            a("  CHAIN")
+            a(f"  Height        : {height}")
+            a(f"  Block hash    : {tip_hash}")
+            a(f"  Parent hash   : {parent}")
+            a(f"  Merkle root   : {tip_mr}")
+            a(f"  Miner address : {tip_miner}")
+            a(f"  Difficulty    : {tip_diff}   Timestamp: {tip_ts}")
+
+            # ── Oracle W-state consensus ────────────────────────────
+            fid   = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or 0)
+            coh   = float(w_state.get("coherence") or w_state.get("coherence_l1") or 0)
+            pur   = float(w_state.get("purity") or 0)
+            ent   = float(w_state.get("entropy") or w_state.get("von_neumann_entropy") or 0)
+            mermin = float(w_state.get("mermin") or w_state.get("mermin_m3") or 0)
+            pq_c  = w_state.get("pq_curr") or pq0.get("pq_curr") or "?"
+            pq_l  = w_state.get("pq_last") or pq0.get("pq_last") or "?"
+            dm_hex = (w_state.get("density_matrix_hex") or
+                      pq0.get("density_matrix_hex") or "—")
+            auth  = w_state.get("auth_tag") or pq0.get("auth_tag") or "—"
+            oracle_addr = w_state.get("oracle_address") or pq0.get("oracle_address") or "—"
+
+            a(HR)
+            a("  ORACLE  —  5-node W-state consensus")
+            a(f"  Oracle address : {oracle_addr}")
+            a(f"  Auth tag       : {auth}")
+            a(f"  pq_curr / pq_last : {pq_c} / {pq_l}")
+            a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  {'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}")
+            a(f"  Coherence  {_bar(coh)}  {coh:.6f}")
+            a(f"  Purity     {_bar(pur)}  {pur:.6f}")
+            a(f"  VN Entropy  {ent:.6f} bits   Mermin ⟨M₃⟩: {mermin:+.4f}  "
+              f"{'✅ quantum' if mermin > 2.0 else '· classical'}")
+
+            # ── DM hex — full, line-wrapped ─────────────────────────
+            a(HR)
+            a("  DENSITY MATRIX HEX (full 2048 chars = 8×8 complex128 row-major)")
+            if dm_hex and dm_hex != "—":
+                chunk = W - 4
+                for i in range(0, len(dm_hex), chunk):
+                    a("  " + dm_hex[i:i + chunk])
+            else:
+                a("  (not available)")
+
+            # ── Per-node breakdown ──────────────────────────────────
+            nodes = (w_state.get("per_node") or w_state.get("nodes") or
+                     pq0.get("per_node") or [])
+            if nodes:
+                a(HR)
+                a("  PER-NODE MEASUREMENTS")
+                for idx, nd in enumerate(nodes):
+                    nf   = float(nd.get("fidelity") or nd.get("w_state_fidelity") or 0)
+                    nc   = float(nd.get("coherence") or 0)
+                    role = nd.get("role") or f"oracle_{idx+1}"
+                    naddr = nd.get("address") or nd.get("oracle_address") or "—"
+                    ntag  = nd.get("auth_tag") or "—"
+                    a(f"  [{idx+1}] {_pad(role, 20)} F={nf:.4f}  C={nc:.4f}")
+                    a(f"      address  : {naddr}")
+                    a(f"      auth_tag : {ntag}")
+
+            # ── pq0 Bloch vector ───────────────────────────────────
+            bloch_x = pq0.get("bloch_x") or pq0.get("x") or "—"
+            bloch_y = pq0.get("bloch_y") or pq0.get("y") or "—"
+            bloch_z = pq0.get("bloch_z") or pq0.get("z") or "—"
+            pq0_fid = pq0.get("pq0_fidelity") or pq0.get("fidelity") or "—"
+            a(HR)
+            a("  pq0 ORACLE ANCHOR  (Poincaré origin — {8,3} hyperbolic lattice)")
+            a(f"  Bloch vector  : x={bloch_x}  y={bloch_y}  z={bloch_z}")
+            a(f"  pq0 fidelity  : {pq0_fid}")
+
+            # ── Mempool ────────────────────────────────────────────
+            pending = mempool.get("transactions") or mempool.get("pending") or []
+            a(HR)
+            a(f"  MEMPOOL  —  {len(pending)} pending transaction(s)")
+            for tx in pending[:8]:
+                tx_id   = tx.get("tx_id") or tx.get("id") or "—"
+                tx_from = tx.get("sender_addr") or tx.get("from") or "—"
+                tx_to   = tx.get("receiver_addr") or tx.get("to") or "—"
+                tx_amt  = tx.get("amount") or "?"
+                tx_fee  = tx.get("fee") or "?"
+                tx_sig  = tx.get("signature") or tx.get("sig") or "—"
+                tx_wit  = (tx.get("witness") or {}).get("proof") or "—"
+                a(f"  TX  {tx_id}")
+                a(f"      {tx_from}")
+                a(f"    → {tx_to}  amt={tx_amt}  fee={tx_fee}")
+                if tx_sig and tx_sig != "—":
+                    a(f"      sig  : {tx_sig[:96]}…")
+                if tx_wit and tx_wit != "—":
+                    a(f"      proof: {str(tx_wit)[:96]}…")
+
+            # ── DHT peers ──────────────────────────────────────────
+            peer_list = peers.get("peers") or []
+            a(HR)
+            a(f"  DHT PEERS  —  {len(peer_list)} known")
+            for p in peer_list[:12]:
+                pid  = p.get("node_id") or p.get("id") or "—"
+                purl = p.get("url") or p.get("gossip_url") or "—"
+                plat = p.get("last_seen") or "?"
+                a(f"  {pid}  {purl}  last={plat}")
+
+            # ── Local C layer status ────────────────────────────────
+            a(HR)
+            a("  LOCAL C LAYER")
+            a(f"  accel compiled : {'✅' if _accel_ok else '❌'}")
+            if _accel_ok:
+                try:
+                    bs_ok = bool(_accel_lib.qtcl_bootstrap_dm_age_ok(300.0))
+                    a(f"  bootstrap DM   : {'✅ fresh' if bs_ok else '⚠️  stale / not yet received'}")
+                    sc = _accel_lib.qtcl_selftest()
+                    a(f"  selftest       : {'✅ PASS' if sc == 1 else f'❌ FAIL ({sc})'}")
+                except Exception as _ce:
+                    a(f"  C query error  : {_ce}")
+
+            # ── Diagnostics ────────────────────────────────────────
+            if diag:
+                a(HR)
+                a("  DIAGNOSTICS  (server /api/diagnostics)")
+                for k, v in list(diag.items())[:20]:
+                    a(f"  {_pad(str(k), 28)}: {v}")
+
+            a(HR)
+            a(f"  [{_time.strftime('%H:%M:%S')}]  Enter=refresh  q=quit  l=last-block-detail")
+            a("")
+            return "\n".join(lines)
+
+        # ── Main loop ──────────────────────────────────────────────
+        print("\n  ⚛️  Fetching oracle state…", flush=True)
+        last_data = _fetch_all()
+        print(_render(*last_data), flush=True)
+
+        while True:
+            try:
+                cmd = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Oracle audit panel closed.")
+                break
+
+            if cmd == "q":
+                print("  Oracle audit panel closed.")
+                break
+
+            elif cmd == "l":
+                # Last block detail — full hashes, full tx list
+                tip = last_data[0]
+                height = tip.get("block_height") or tip.get("height") or "?"
+                bh_data = kapi._get(f"/api/blocks/{height}") or tip
+                print("\n" + "═" * 70)
+                print(f"  BLOCK {height} — full detail")
+                for k, v in bh_data.items():
+                    print(f"  {str(k).ljust(24)}: {v}")
+                print("═" * 70)
+                print("  Enter=refresh  q=quit")
+
+            else:
+                # Refresh
+                print("  ⚛️  Refreshing…", flush=True)
+                last_data = _fetch_all()
+                print(_render(*last_data), flush=True)
+
     def run_wallet_mode(self) -> None:
         while True:
             print("\n" + "━" * 62)
@@ -15494,17 +15758,18 @@ class QtclClientApp:
         print("  │  1.) ⛏️   Mine                                            │")
         print("  │  2.) 💸  Transact                                         │")
         print("  │  3.) 🔑  Wallet                                           │")
+        print("  │  4.) 🔭  Oracle Audit   (live server state + full hashes) │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
         
         try:
-            choice = input("  Enter choice [1/2/3]: ").strip()
+            choice = input("  Enter choice [1/2/3/4]: ").strip()
         except (EOFError, KeyboardInterrupt):
             choice = "1"
         
-        # ✅ Dispatch to selected mode (initialize only after mode selection)
         if   choice == "2": self.run_transact_mode()
         elif choice == "3": self.run_wallet_mode()
+        elif choice == "4": self.run_oracle_mode()
         else:               self.run_mine_mode()
 
 
@@ -15524,6 +15789,8 @@ def main() -> None:  # noqa: F811
     p.add_argument("--mine",         action="store_true")
     p.add_argument("--transact",     action="store_true")
     p.add_argument("--wallet",       action="store_true")
+    p.add_argument("--oracle-audit", action="store_true",
+                   help="Oracle audit panel — live server state + full hashes")
     p.add_argument("--node-type",    default=None,
                    choices=["server", "miner", "oracle"])
     p.add_argument("--log-level",    default="WARNING",
@@ -15558,10 +15825,11 @@ def main() -> None:  # noqa: F811
         return
 
     # ✅ Dispatch modes (only initialize resources for selected mode)
-    if   args.mine:     app.run_mine_mode()
-    elif args.transact: app.run_transact_mode()
-    elif args.wallet:   app.run_wallet_mode()
-    else:               app.run()
+    if   args.mine:                 app.run_mine_mode()
+    elif args.transact:             app.run_transact_mode()
+    elif args.wallet:               app.run_wallet_mode()
+    elif getattr(args, "oracle_audit", False): app.run_oracle_mode()
+    else:                           app.run()
 
 
 if __name__ == "__main__":
