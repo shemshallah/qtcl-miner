@@ -15483,64 +15483,147 @@ class QtclClientApp:
             a(f"  Difficulty    : {tip_diff}   Timestamp: {tip_ts}")
 
             # ── Oracle W-state consensus ────────────────────────────
-            fid   = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or 0)
-            coh   = float(w_state.get("coherence") or w_state.get("coherence_l1") or 0)
-            pur   = float(w_state.get("purity") or 0)
-            ent   = float(w_state.get("entropy") or w_state.get("von_neumann_entropy") or 0)
-            mermin = float(w_state.get("mermin") or w_state.get("mermin_m3") or 0)
-            pq_c  = w_state.get("pq_curr") or pq0.get("pq_curr") or "?"
-            pq_l  = w_state.get("pq_last") or pq0.get("pq_last") or "?"
+            fid  = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or
+                         w_state.get("w3_fidelity") or 0)
+            coh  = min(1.0, max(0.0, float(w_state.get("coherence") or
+                                           w_state.get("coherence_l1") or 0)))
+            pur  = min(1.0, max(0.0, float(w_state.get("purity") or 0)))
+
+            # VN Entropy — server rarely returns it; compute from purity
+            _ent_srv = w_state.get("entropy") or w_state.get("von_neumann_entropy")
+            if _ent_srv:
+                ent = float(_ent_srv)
+            else:
+                try:
+                    import math as _m
+                    _lam1 = pur
+                    _lam_r = max(0.0, (1.0 - pur) / 7.0)
+                    ent = float(-(_lam1 * _m.log2(max(_lam1, 1e-12)) +
+                                   7.0 * _lam_r * _m.log2(max(_lam_r, 1e-12))))
+                    ent = max(0.0, min(3.0, ent))
+                except Exception:
+                    ent = 0.0
+
+            # Mermin — server returns {"M": 2.8, "quantum": true, ...}
+            _mobj = (w_state.get("mermin_test") or w_state.get("bell_test") or
+                     w_state.get("mermin") or {})
+            if isinstance(_mobj, dict):
+                mermin  = float(_mobj.get("M") or _mobj.get("mermin_M") or 0)
+                _mq     = bool(_mobj.get("quantum") or _mobj.get("mermin_is_quantum"))
+                _mverd  = str(_mobj.get("verdict") or _mobj.get("mermin_verdict") or "")
+            else:
+                mermin = float(_mobj or 0)
+                _mq    = mermin > 2.0
+                _mverd = ""
+
+            # pq_curr / pq_last — buried in block_field sub-dict
+            _bf  = w_state.get("block_field") or {}
+            pq_c = str(_bf.get("pq_curr") or w_state.get("pq_curr") or
+                       w_state.get("pq_current") or pq0.get("pq_curr") or "?")
+            pq_l = str(_bf.get("pq_last") or w_state.get("pq_last") or
+                       pq0.get("pq_last") or "?")
+
+            # DM hex
             dm_hex = (w_state.get("density_matrix_hex") or
                       pq0.get("density_matrix_hex") or "—")
-            auth  = w_state.get("auth_tag") or pq0.get("auth_tag") or "—"
-            oracle_addr = w_state.get("oracle_address") or pq0.get("oracle_address") or "—"
+
+            # Oracle identity — server exposes oracle_id not oracle_address
+            oracle_addr = (w_state.get("oracle_id") or pq0.get("oracle_id") or
+                           w_state.get("oracle_role") or pq0.get("oracle_role") or
+                           "koyeb-primary")
+            _bh_label   = str(w_state.get("block_height") or
+                              pq0.get("block_height") or tip.get("block_height") or "—")
 
             a(HR)
             a("  ORACLE  —  5-node W-state consensus")
-            a(f"  Oracle address : {oracle_addr}")
-            a(f"  Auth tag       : {auth}")
-            a(f"  pq_curr / pq_last : {pq_c} / {pq_l}")
-            a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  {'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}")
+            a(f"  Oracle node    : {oracle_addr}")
+            a(f"  Block height   : {_bh_label}  |  pq_curr={pq_c}  pq_last={pq_l}")
+            a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
+              f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}")
             a(f"  Coherence  {_bar(coh)}  {coh:.6f}")
             a(f"  Purity     {_bar(pur)}  {pur:.6f}")
-            a(f"  VN Entropy  {ent:.6f} bits   Mermin ⟨M₃⟩: {mermin:+.4f}  "
-              f"{'✅ quantum' if mermin > 2.0 else '· classical'}")
+            a(f"  VN Entropy  {ent:.4f} bits   "
+              f"Mermin ⟨M₃⟩: {mermin:+.4f}  "
+              f"{'✅ QUANTUM' if _mq else '· classical'}"
+              f"{'  ' + _mverd[:40] if _mverd else ''}")
 
-            # ── DM hex — full, line-wrapped ─────────────────────────
+            # ── Density matrix — structured element display ─────────────────
+            # 8×8 complex128 row-major. Each element = 32 hex chars (re16+im16).
+            # Non-zero rows for |W3⟩: rows 1,2,4 only (|001⟩,|010⟩,|100⟩ basis).
             a(HR)
-            a("  DENSITY MATRIX HEX (full 2048 chars = 8×8 complex128 row-major)")
-            if dm_hex and dm_hex != "—":
-                chunk = W - 4
-                for i in range(0, len(dm_hex), chunk):
-                    a("  " + dm_hex[i:i + chunk])
+            a("  DENSITY MATRIX  8×8 complex128  (IEEE754 LE, row-major)")
+            if dm_hex and dm_hex != "—" and len(dm_hex) == 2048:
+                import struct as _dst
+                _nz_rows = [r for r in range(8)
+                            if any(c != "0" for c in dm_hex[r*256:(r+1)*256])]
+                a(f"  Non-zero rows: {_nz_rows}  (|W3⟩ expects [1,2,4])")
+                for _row in range(8):
+                    _row_hex = dm_hex[_row*256:(_row+1)*256]
+                    if not any(c != "0" for c in _row_hex):
+                        continue
+                    _parts = []
+                    for _col in range(8):
+                        _eh = _row_hex[_col*32:(_col+1)*32]
+                        if any(c != "0" for c in _eh):
+                            try:
+                                _re = _dst.unpack_from("<d", bytes.fromhex(_eh[:16]))[0]
+                                _im = _dst.unpack_from("<d", bytes.fromhex(_eh[16:]))[0]
+                                _parts.append(f"[{_col}]={_re:+.3f}{_im:+.3f}j")
+                            except Exception:
+                                _parts.append(f"[{_col}]={_eh[:8]}…")
+                    a(f"  row[{_row}]  " + "  ".join(_parts))
+            elif dm_hex and dm_hex != "—":
+                a(f"  (unexpected length {len(dm_hex)}, expected 2048 — truncated)")
             else:
-                a("  (not available)")
+                a("  (not available — SSE oracle DM not yet received)")
 
             # ── Per-node breakdown ──────────────────────────────────
-            nodes = (w_state.get("per_node") or w_state.get("nodes") or
-                     pq0.get("per_node") or [])
+            # server key: oracle_measurements (from _gather_oracle_cluster_metrics)
+            nodes = (w_state.get("oracle_measurements") or
+                     w_state.get("per_node") or w_state.get("nodes") or
+                     pq0.get("oracle_measurements") or pq0.get("per_node") or [])
             if nodes:
                 a(HR)
                 a("  PER-NODE MEASUREMENTS")
                 for idx, nd in enumerate(nodes):
-                    nf   = float(nd.get("fidelity") or nd.get("w_state_fidelity") or 0)
-                    nc   = float(nd.get("coherence") or 0)
-                    role = nd.get("role") or f"oracle_{idx+1}"
-                    naddr = nd.get("address") or nd.get("oracle_address") or "—"
-                    ntag  = nd.get("auth_tag") or "—"
-                    a(f"  [{idx+1}] {_pad(role, 20)} F={nf:.4f}  C={nc:.4f}")
-                    a(f"      address  : {naddr}")
-                    a(f"      auth_tag : {ntag}")
+                    nf    = float(nd.get("w_state_fidelity") or nd.get("fidelity") or 0)
+                    nc    = min(1.0, float(nd.get("coherence") or 0))
+                    nent  = float(nd.get("entropy") or 0)
+                    role  = nd.get("oracle_role") or nd.get("role") or f"oracle_{idx+1}"
+                    nid   = nd.get("oracle_id") or nd.get("id") or f"node_{idx+1}"
+                    cons  = "✅" if nd.get("in_consensus") else "·"
+                    a(f"  [{idx+1}] {cons} {_pad(role, 22)} F={nf:.4f}  C={nc:.4f}  S={nent:.3f}")
+                    a(f"      id: {nid}")
 
             # ── pq0 Bloch vector ───────────────────────────────────
-            bloch_x = pq0.get("bloch_x") or pq0.get("x") or "—"
-            bloch_y = pq0.get("bloch_y") or pq0.get("y") or "—"
-            bloch_z = pq0.get("bloch_z") or pq0.get("z") or "—"
-            pq0_fid = pq0.get("pq0_fidelity") or pq0.get("fidelity") or "—"
+            # server returns pq0_bloch_theta (polar) + pq0_bloch_phi (azimuthal)
+            import math as _bmath
+            _btheta = pq0.get("pq0_bloch_theta") or pq0.get("theta") or pq0.get("bloch_x")
+            _bphi   = pq0.get("pq0_bloch_phi")   or pq0.get("phi")   or pq0.get("bloch_y")
+            if _btheta is not None and _bphi is not None:
+                try:
+                    _bt = float(_btheta); _bp = float(_bphi)
+                    bloch_x = f"{_bmath.sin(_bt)*_bmath.cos(_bp):.4f}"
+                    bloch_y = f"{_bmath.sin(_bt)*_bmath.sin(_bp):.4f}"
+                    bloch_z = f"{_bmath.cos(_bt):.4f}"
+                    bloch_raw = f"θ={_bt:.4f}  φ={_bp:.4f}"
+                except Exception:
+                    bloch_x = bloch_y = bloch_z = "—"; bloch_raw = "—"
+            else:
+                bloch_x = pq0.get("bloch_x") or "—"
+                bloch_y = pq0.get("bloch_y") or "—"
+                bloch_z = pq0.get("bloch_z") or "—"
+                bloch_raw = "—"
+            pq0_fid = (pq0.get("pq0_oracle_fidelity") or pq0.get("pq0_fidelity") or
+                       pq0.get("fidelity") or w_state.get("pq0_oracle_fidelity") or "—")
+            # pq0 tripartite components
+            pq0_iv = w_state.get("pq0_IV_fidelity") or pq0.get("pq0_IV_fidelity") or "—"
+            pq0_v  = w_state.get("pq0_V_fidelity")  or pq0.get("pq0_V_fidelity")  or "—"
             a(HR)
             a("  pq0 ORACLE ANCHOR  (Poincaré origin — {8,3} hyperbolic lattice)")
-            a(f"  Bloch vector  : x={bloch_x}  y={bloch_y}  z={bloch_z}")
-            a(f"  pq0 fidelity  : {pq0_fid}")
+            a(f"  Bloch (θ,φ)   : {bloch_raw}")
+            a(f"  Cartesian     : x={bloch_x}  y={bloch_y}  z={bloch_z}")
+            a(f"  pq0 fidelity  : oracle={pq0_fid}  IV={pq0_iv}  V={pq0_v}")
 
             # ── Mempool ────────────────────────────────────────────
             pending = mempool.get("transactions") or mempool.get("pending") or []
