@@ -13948,99 +13948,47 @@ class QtclClientApp:
             return False
 
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
-            """Gate on oracle DM arrival. Returns True if fresh DM is ready."""
+            """
+            Gate on C oracle DM arrival via qtcl_sse_poll → qtcl_bootstrap_ingest_dm.
+            Pure C path — no HTTP/P2P Python fallbacks.
+            Returns True if DM age < 60s.  False = mining continues in degraded mode.
+            """
             deadline = _time.time() + timeout_s
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
 
-            # If C SSE already delivered frames, ingest them now
-            if _accel_ok and _LOCAL_ORACLE.snapshot_count > 0:
-                # Drain the C SSE ring for any frames we may have missed
-                try:
-                    buf  = _accel_ffi.new('char[262144]')
-                    n    = _accel_lib.qtcl_sse_poll(buf, 262144, 32)
-                    if n > 0:
-                        raw  = bytes(_accel_ffi.buffer(buf)[0:262144])
-                        pos  = 0
-                        for _ in range(n):
-                            end  = raw.index(b'\x00', pos)
-                            _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
-                            pos  = end + 1
-                except Exception: pass
+            # Drain C SSE ring immediately — frames already buffered since module load
+            try:
+                buf = _accel_ffi.new('char[262144]')
+                n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
+                if n > 0:
+                    raw = bytes(_accel_ffi.buffer(buf)[0:262144])
+                    pos = 0
+                    for _ in range(n):
+                        end = raw.index(b'\x00', pos)
+                        _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
+                        pos = end + 1
+            except Exception: pass
 
             while _time.time() < deadline:
-                # C path check
-                if _accel_ok and _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
                     print(" ✅", flush=True)
                     return True
-                # Python path: LocalOracleEngine has its own DM
-                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
-                if age < 60.0 and _LOCAL_ORACLE.snapshot_count > 0:
-                    # Bridge to C shared state
-                    dm_re, dm_im, _ = _LOCAL_ORACLE.get_oracle_dm()
-                    if _accel_ok:
-                        try:
-                            re = _accel_ffi.new('double[64]', dm_re)
-                            im = _accel_ffi.new('double[64]', dm_im)
-                            _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
-                        except Exception: pass
-                    print(" ✅", flush=True)
-                    return True
+                # Drain any new SSE frames each poll iteration
+                try:
+                    buf2 = _accel_ffi.new('char[65536]')
+                    n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
+                    if n2 > 0:
+                        raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
+                        pos2 = 0
+                        for _ in range(n2):
+                            end2 = raw2.index(b'\x00', pos2)
+                            _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
+                            pos2 = end2 + 1
+                except Exception: pass
                 print('.', end='', flush=True)
-                _time.sleep(0.5)
+                _time.sleep(0.3)
 
-            print(" timeout", flush=True)
-
-            # HTTP fallback
-            print("  🔄 HTTP fallback /api/oracle/w-state…", end='', flush=True)
-            try:
-                _LOCAL_ORACLE._http_fallback_poll()
-                dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
-                if age < 120.0:
-                    if _accel_ok:
-                        re = _accel_ffi.new('double[64]', dm_re)
-                        im = _accel_ffi.new('double[64]', dm_im)
-                        _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
-                    print(" ✅", flush=True)
-                    return True
-            except Exception as _fe:
-                _EXP_LOG.debug(f"[Bootstrap] HTTP: {_fe}")
-            print(" miss", flush=True)
-
-            # P2P fallback: try DHT peers
-            print("  🔄 P2P fallback via DHT…", end='', flush=True)
-            try:
-                import urllib.request as _ur, json as _pj
-                peers_r = _kapi_boot.get('/api/dht/peers', timeout=5)
-                for peer in (peers_r or {}).get('peers', [])[:4]:
-                    url = peer.get('gossip_url') or peer.get('url', '')
-                    if not url: continue
-                    try:
-                        req = _ur.Request(f"{url}/api/oracle/w-state",
-                                          headers={'User-Agent': 'QTCL-Bootstrap/3.0'})
-                        with _ur.urlopen(req, timeout=4) as _r:
-                            _d = _pj.loads(_r.read())
-                        jstr = _pj.dumps(_d)
-                        if _c_ingest_frame(jstr):
-                            print(f" ✅ ({url})", flush=True)
-                            return True
-                        # Try python path
-                        dm_hex = _d.get('density_matrix_hex') or _d.get('dm_hex', '')
-                        if dm_hex:
-                            _LOCAL_ORACLE._ingest_oracle_frame(
-                                _pj.dumps({'density_matrix_hex': dm_hex}))
-                            dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
-                            if age < 120.0 and _accel_ok:
-                                re = _accel_ffi.new('double[64]', dm_re)
-                                im = _accel_ffi.new('double[64]', dm_im)
-                                _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
-                                print(f" ✅ ({url})", flush=True)
-                                return True
-                    except Exception as _pe:
-                        _EXP_LOG.debug(f"[Bootstrap] P2P {url}: {_pe}")
-            except Exception as _de:
-                _EXP_LOG.debug(f"[Bootstrap] DHT: {_de}")
-            print(" miss", flush=True)
-            print("  ⚠️  Mining with local |W3⟩ (degraded — not entangled)", flush=True)
+            print(" ⏱️  timeout — proceeding in degraded mode", flush=True)
             return False
 
         def _mermin_w3(dm8) -> tuple:
@@ -14174,14 +14122,13 @@ class QtclClientApp:
                         dt, out_m, out_seed,
                     )
                     
-                    # ✅ FIX-METRICS-STRICT: If C call failed, raise immediately
+                    # oracle_ok=0 means no oracle DM yet — C used local |W3⟩.
+                    # This is DEGRADED mode, not a failure.  Mining continues.
                     if not oracle_ok:
-                        raise RuntimeError(
-                            f"[BOOTSTRAP] C qtcl_bootstrap_build_blockfield() failed: oracle_ok={oracle_ok}. "
-                            f"Check parameters: pq0={_pq0}, pqc={_pqc}, pql={_pql}, height={_bh}, "
-                            f"gamma1_eff={getattr(_b, 'gamma1_eff', CANONICAL_BATH.gamma1_eff):.4f}, "
-                            f"gammaphi={getattr(_b, 'gammaphi', CANONICAL_BATH.gammaphi):.4f}, "
-                            f"dt={dt:.4f}"
+                        _EXP_LOG.warning(
+                            f"[BOOTSTRAP] oracle_ok=0 — no fresh oracle DM; "
+                            f"C used local |W3⟩ (pq0={_pq0} pqc={_pqc} pql={_pql} h={_bh}). "
+                            f"SSE not connected or DM too old. Mining in degraded mode."
                         )
 
                     # Mirror DM into Python numpy — explicit indexing avoids cffi
@@ -14383,7 +14330,26 @@ class QtclClientApp:
                     return oracle_ok, out_m, bytes([out_seed[i] for i in range(32)]), report_str
 
                 except Exception as _ce:
-                    raise RuntimeError(f"[Bootstrap] C blockfield pipeline failed: {_ce}") from _ce
+                    # C blockfield exception — log and return degraded local W3 measurement
+                    # rather than crashing the mining loop entirely.
+                    _EXP_LOG.error(
+                        f"[Bootstrap] C blockfield exception: {_ce} — "
+                        f"pq0={_pq0} pqc={_pqc} pql={_pql} h={_bh}. "
+                        f"Returning degraded local |W3⟩ state; mining continues."
+                    )
+                    # Build a minimal degraded report so the caller can display it
+                    _deg_report = (
+                        "\n  ╔══ BLOCKFIELD STATE [DEGRADED] ═══════════════════════════╗\n"
+                        f"  ║  oracle DM  : unavailable — C exception                  ║\n"
+                        f"  ║  pq0/curr/last: 0 / {_pqc} / {_pql}  h={_bh}            ║\n"
+                        f"  ║  Error      : {str(_ce)[:48]}…       ║\n"
+                        "  ╚═══════════════════════════════════════════════════════════╝\n"
+                    )
+                    import hashlib as _hd
+                    _deg_seed = _hd.sha3_256(
+                        b"QTCL_DEGRADED:" + str(_bh).encode() + str(_pqc).encode()
+                    ).digest()
+                    return 0, None, _deg_seed, _deg_report
 
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
@@ -14397,93 +14363,46 @@ class QtclClientApp:
         print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
 
         # ── Miner handle ───────────────────────────────────────────────────────
-        class _MinerHandle:
-            def __init__(self):
-                self._koyeb_state  = None
-                self._client_field = None
-            def stop_mining(self): pass
-
-        miner = _MinerHandle()
-
-        async def _mine_inline():
-            """PURE BITCOIN-STYLE PoW: SHA256 + difficulty bits (no entropy)"""
-            import hashlib as _hl, json as _j, time as _t
-
-            kapi = KoyebAPIClient()
-
-        # Required before ANY nonce loop starts:
-        #
-        #   1. C SSE client connects to /api/snapshot/sse  (already running via
-        #      _LOCAL_ORACLE.start() at module import — wait for first DM frame)
-        #   2. Once oracle DM arrives: build tripartite blockfield
-        #      pq0 (oracle) ↔ pq_curr (local) ↔ pq_last (prev) via HyperbolicTriangle
-        #   3. GKSL-evolve the fused DM one step → pq_last state
-        #   4. Persist the reconstructed blockfield to local DB
-        #   5. Sync KoyebOracleState (oracle_hash, bridge fidelity, latency)
-        #   6. ONLY THEN unlock the nonce loop
-        #
-        # P2P path: if oracle SSE yields no DM within timeout, try a peer node
-        # via the DHT peer list from /api/dht/peers.
-        # ══════════════════════════════════════════════════════════════════════
-
         _kapi_boot = KoyebAPIClient(self.oracle_url)
 
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
-            Block until LocalOracleEngine has received at least one DM frame
-            from the server SSE stream OR the HTTP fallback.
-            Returns True if DM is fresh (age < 60s), False if timeout.
+            Gate on C oracle DM via qtcl_sse_poll → qtcl_bootstrap_dm_age_ok.
+            Pure C — no HTTP/P2P Python fallbacks.
+            Returns True if DM age < 60s. False = degraded mode, mining continues.
             """
             deadline = _time.time() + timeout_s
-            print("  🔗 Waiting for oracle DM frame via SSE…", flush=True)
+            print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
+            # Drain any already-buffered SSE frames first
+            try:
+                buf = _accel_ffi.new('char[262144]')
+                n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
+                if n > 0:
+                    raw = bytes(_accel_ffi.buffer(buf)[0:262144])
+                    pos = 0
+                    for _ in range(n):
+                        end = raw.index(b'\x00', pos)
+                        _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
+                        pos = end + 1
+            except Exception: pass
             while _time.time() < deadline:
-                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
-                if age < 60.0 and _LOCAL_ORACLE.snapshot_count > 0:
-                    print(f"  ✅ Oracle DM received  (age={age:.1f}s  "
-                          f"snapshots={_LOCAL_ORACLE.snapshot_count})", flush=True)
+                if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                    print(f" ✅  snapshots={_LOCAL_ORACLE.snapshot_count}", flush=True)
                     return True
-                _time.sleep(0.5)
-            print("  ⚠️  SSE timeout — attempting HTTP fallback…", flush=True)
-            try:
-                _LOCAL_ORACLE._http_fallback_poll()
-                _, _, age = _LOCAL_ORACLE.get_oracle_dm()
-                if age < 120.0:
-                    print(f"  ✅ Oracle DM via HTTP  (age={age:.1f}s)", flush=True)
-                    return True
-            except Exception as _fe:
-                _EXP_LOG.debug(f"[Bootstrap] HTTP fallback: {_fe}")
-            # P2P fallback: try DHT peers
-            try:
-                peers_resp = _kapi_boot.get('/api/dht/peers', timeout=5)
-                peers = (peers_resp or {}).get('peers', [])
-                for peer in peers[:3]:
-                    peer_url = peer.get('gossip_url') or peer.get('url', '')
-                    if not peer_url:
-                        continue
-                    try:
-                        import urllib.request as _ur
-                        req = _ur.Request(
-                            f"{peer_url}/api/oracle/w-state",
-                            headers={'User-Agent': 'QTCL-Client/3.0-P2P'}
-                        )
-                        with _ur.urlopen(req, timeout=4) as _r:
-                            import json as _pj
-                            _d = _pj.loads(_r.read())
-                        dm_hex = _d.get('density_matrix_hex') or _d.get('dm_hex', '')
-                        if dm_hex:
-                            _LOCAL_ORACLE._ingest_oracle_frame(
-                                _pj.dumps({'density_matrix_hex': dm_hex})
-                            )
-                            _, _, age = _LOCAL_ORACLE.get_oracle_dm()
-                            if age < 120.0:
-                                print(f"  ✅ Oracle DM via P2P peer {peer_url}  "
-                                      f"(age={age:.1f}s)", flush=True)
-                                return True
-                    except Exception as _pe:
-                        _EXP_LOG.debug(f"[Bootstrap] P2P peer {peer_url}: {_pe}")
-            except Exception as _de:
-                _EXP_LOG.debug(f"[Bootstrap] DHT peer list: {_de}")
-            print("  ⚠️  No oracle DM — mining with local W3 state (degraded)", flush=True)
+                try:
+                    buf2 = _accel_ffi.new('char[65536]')
+                    n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
+                    if n2 > 0:
+                        raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
+                        pos2 = 0
+                        for _ in range(n2):
+                            end2 = raw2.index(b'\x00', pos2)
+                            _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
+                            pos2 = end2 + 1
+                except Exception: pass
+                print('.', end='', flush=True)
+                _time.sleep(0.3)
+            print(" ⏱️  timeout — degraded mode", flush=True)
             return False
 
         class _MinerHandle:
