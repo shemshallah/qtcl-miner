@@ -15504,17 +15504,25 @@ class QtclClientApp:
                 except Exception:
                     ent = 0.0
 
-            # Mermin — server returns {"M": 2.8, "quantum": true, ...}
+            # Mermin — server returns:
+            #   "M"       → percentage of W3-max (0-100)  ← WRONG to display
+            #   "M_value" → actual Mermin scalar (0-4)    ← USE THIS
             _mobj = (w_state.get("mermin_test") or w_state.get("bell_test") or
                      w_state.get("mermin") or {})
             if isinstance(_mobj, dict):
-                mermin  = float(_mobj.get("M") or _mobj.get("mermin_M") or 0)
-                _mq     = bool(_mobj.get("quantum") or _mobj.get("mermin_is_quantum"))
+                # M_value is the physical Mermin expectation value in [0,4]
+                # M (no suffix) is percentage of W3-optimal — do not confuse them
+                mermin  = float(_mobj.get("M_value") or _mobj.get("mermin_M") or 0)
+                _mq     = bool(_mobj.get("is_quantum") or _mobj.get("quantum") or
+                               _mobj.get("mermin_is_quantum") or mermin > 2.0)
                 _mverd  = str(_mobj.get("verdict") or _mobj.get("mermin_verdict") or "")
             else:
                 mermin = float(_mobj or 0)
                 _mq    = mermin > 2.0
                 _mverd = ""
+            # Clamp to physical range [0, 4] — anything above is a field-name bug
+            if mermin > 4.0:
+                mermin = 0.0; _mq = False; _mverd = "(field error — check M_value key)"
 
             # pq_curr / pq_last — buried in block_field sub-dict
             _bf  = w_state.get("block_field") or {}
@@ -15598,8 +15606,11 @@ class QtclClientApp:
             # ── pq0 Bloch vector ───────────────────────────────────
             # server returns pq0_bloch_theta (polar) + pq0_bloch_phi (azimuthal)
             import math as _bmath
-            _btheta = pq0.get("pq0_bloch_theta") or pq0.get("theta") or pq0.get("bloch_x")
-            _bphi   = pq0.get("pq0_bloch_phi")   or pq0.get("phi")   or pq0.get("bloch_y")
+            # pq0 endpoint key names: 'theta'/'phi' (primary), 'pq0_bloch_theta' (alt)
+            _btheta = (pq0.get("theta") or pq0.get("pq0_bloch_theta") or
+                       pq0.get("bloch_theta") or pq0.get("bloch_x"))
+            _bphi   = (pq0.get("phi")   or pq0.get("pq0_bloch_phi")   or
+                       pq0.get("bloch_phi")   or pq0.get("bloch_y"))
             if _btheta is not None and _bphi is not None:
                 try:
                     _bt = float(_btheta); _bp = float(_bphi)
