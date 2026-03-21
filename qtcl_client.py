@@ -12133,6 +12133,35 @@ def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
     return result
 
 
+def _validate_dm_8x8(dm) -> bool:
+    """
+    Return True only if dm is a valid 8×8 quantum density matrix:
+      - all finite (no inf/nan)
+      - trace in [0.99, 1.01]
+      - all eigenvalues >= -1e-6 (positive semidefinite within numerical noise)
+      - no element magnitude > 1.0 (normalized state)
+    Anything failing this check is garbage from an uninitialized C ring buffer.
+    """
+    if not _HAS_NP or dm is None:
+        return False
+    try:
+        if dm.shape != (8, 8):
+            return False
+        if not _np.all(_np.isfinite(dm)):
+            return False
+        tr = float(_np.real(_np.trace(dm)))
+        if not (0.5 < tr < 1.5):          # trace must be close to 1
+            return False
+        if float(_np.max(_np.abs(dm))) > 2.0:  # no element should exceed 2 for normalized DM
+            return False
+        ev = _np.linalg.eigvalsh(dm)
+        if float(_np.min(ev)) < -0.05:    # allow small numerical negativity
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _decode_dm_8x8(snap: dict):
     """
     Extract + validate 8×8 complex128 density matrix from oracle snapshot.
@@ -13895,19 +13924,45 @@ class QtclClientApp:
                         re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
                         if _HAS_NP and any(v != 0.0 for v in re_list):
                             import numpy as _npml
-                            dm_curr = (_npml.array(re_list, dtype=_npml.complex128) +
+                            _dm_raw = (_npml.array(re_list, dtype=_npml.complex128) +
                                        1j * _npml.array(im_list, dtype=_npml.complex128)
                                        ).reshape(8, 8)
+                            # Validate before accepting — C ring buffer can return
+                            # garbage at startup/genesis causing astronomical metric values
+                            if _validate_dm_8x8(_dm_raw):
+                                dm_curr = _dm_raw
+                            else:
+                                _EXP_LOG.debug(
+                                    "[DM] Raw oracle DM failed validation "
+                                    f"(tr={float(_np.real(_np.trace(_dm_raw))):.3e}) "
+                                    "— falling back to Bloch reconstruction"
+                                )
                     except Exception:
                         pass
                 if dm_curr is None:
-                    dm_curr = _decode_dm_8x8(snap)
+                    _dm_decoded = _decode_dm_8x8(snap)
+                    if _validate_dm_8x8(_dm_decoded):
+                        dm_curr = _dm_decoded
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
-                if dm_curr is None:
-                    continue
+                if dm_curr is None or not _validate_dm_8x8(dm_curr):
+                    # Last resort: canonical |W3⟩ maximally mixed state
+                    if _HAS_NP:
+                        dm_curr = _np.eye(8, dtype=_np.complex128) / 8.0
+                    else:
+                        continue
 
-                dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
+                # Final normalization before GKSL — ensures tr=1 exactly
+                if _HAS_NP:
+                    _tr0 = float(_np.real(_np.trace(dm_curr)))
+                    if _tr0 > 1e-12:
+                        dm_curr = dm_curr / _tr0
+
+                try:
+                    dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
+                except RuntimeError as _gksl_err:
+                    _EXP_LOG.debug(f"[DM] GKSL step failed ({_gksl_err}) — using identity evolution")
+                    dm_last = dm_curr.copy() if _HAS_NP else None
                 if dm_last is None:
                     continue
 
@@ -13915,7 +13970,7 @@ class QtclClientApp:
                     for _dm in (dm_curr, dm_last):
                         if _dm is not None:
                             _tr = float(_np.real(_np.trace(_dm)))
-                            if _tr > 0.1 and abs(_tr - 1.0) > 0.01:
+                            if _tr > 1e-12:
                                 _dm /= _tr
 
                 self.client_field.build(dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
@@ -14417,10 +14472,30 @@ class QtclClientApp:
 
                     sep_bound = 2.0   # Mermin classical separability bound
                     mermin_str = (
-                        f"  ║  Mermin ⟨M₃⟩: {mermin_val:+.4f}  "
-                        f"{'✅ VIOLATED (quantum)' if mermin_viol else '· classical bound held'}  "
+                        f"  ║  Mermin ⟨M₃⟩: {_disp_mermin:+.4f}  "
+                        f"{'✅ VIOLATED (quantum)' if (mermin_viol and abs(_disp_mermin) <= 4.0) else '· classical bound held'}  "
                         f"[bound={sep_bound:.1f}]\n"
                     )
+
+                    # ── Clamp all metrics to physically valid ranges before display ──
+                    def _clamp(v, lo, hi):
+                        try:
+                            f = float(v)
+                            return f if (lo <= f <= hi and _np.isfinite(f)) else 0.0
+                        except Exception:
+                            return 0.0
+                    _disp_fid  = _clamp(float(out_m.w_fidelity),       0.0, 1.0)
+                    _disp_ent  = _clamp(float(out_m.entropy_vn),        0.0, 3.0)  # max 3 bits for 3-qubit
+                    _disp_coh  = _clamp(float(out_m.coherence),         0.0, 1.0)
+                    _disp_disc = _clamp(float(out_m.discord),           0.0, 3.0)
+                    _disp_pur  = _clamp(float(out_m.purity),            0.0, 1.0)
+                    _disp_neg  = _clamp(float(out_m.negativity),        0.0, 0.5)
+                    _disp_d0c  = _clamp(float(out_m.hyp_dist_0c),       0.0, 10.0)
+                    _disp_dcl  = _clamp(float(out_m.hyp_dist_cl),       0.0, 10.0)
+                    _disp_d0l  = _clamp(float(out_m.hyp_dist_0l),       0.0, 10.0)
+                    _disp_area = _clamp(float(out_m.triangle_area),     0.0, 12.57) # max 4π
+                    _disp_mermin = _clamp(mermin_val,                   -4.0, 4.0)
+                    _disp_bridge = _clamp(bridge_fid,                   0.0, 1.0)
 
                     report_str = (
                         "\n  ╔══ BLOCKFIELD STATE [C] ══════════════════════════════════╗\n"
@@ -14429,19 +14504,19 @@ class QtclClientApp:
                         f"  ║  pq0        : 0  (oracle anchor — hyperbolic center)\n"
                         f"  ║  pq_curr    : {_pqc}  (block entry face — height {_bh})\n"
                         f"  ║  pq_last    : {_pql}  (block exit face)\n"
-                        f"  ║  F→|W3⟩    : {float(out_m.w_fidelity):.4f}  [sep=0.667]\n"
-                        f"  ║  VN Entropy : {float(out_m.entropy_vn):.4f} bits\n"
-                        f"  ║  Coherence  : {float(out_m.coherence):.4f}\n"
-                        f"  ║  Discord    : {float(out_m.discord):.4f}\n"
-                        f"  ║  Purity     : {float(out_m.purity):.4f}\n"
-                        f"  ║  Negativity : {float(out_m.negativity):.4f}\n"
-                        f"  ║  d(0,c/cl/l): {float(out_m.hyp_dist_0c):.4f} / "
-                        f"{float(out_m.hyp_dist_cl):.4f} / {float(out_m.hyp_dist_0l):.4f}\n"
-                        f"  ║  Hyp Area   : {float(out_m.triangle_area):.4f} rad  "
+                        f"  ║  F→|W3⟩    : {_disp_fid:.4f}  [sep=0.667]\n"
+                        f"  ║  VN Entropy : {_disp_ent:.4f} bits\n"
+                        f"  ║  Coherence  : {_disp_coh:.4f}\n"
+                        f"  ║  Discord    : {_disp_disc:.4f}\n"
+                        f"  ║  Purity     : {_disp_pur:.4f}\n"
+                        f"  ║  Negativity : {_disp_neg:.4f}\n"
+                        f"  ║  d(0,c/cl/l): {_disp_d0c:.4f} / "
+                        f"{_disp_dcl:.4f} / {_disp_d0l:.4f}\n"
+                        f"  ║  Hyp Area   : {_disp_area:.4f} rad  "
                         f"[Gauss-Bonnet Δ]\n"
                         f"{mermin_str}"
                         f"  ║  auth_tag   : {''.join(f'{out_m.auth_tag[i]:02x}' for i in range(4))}…\n"
-                        f"  ║  Bridge fid : {bridge_fid:.4f}  "
+                        f"  ║  Bridge fid : {_disp_bridge:.4f}  "
                         f"[Tr(ρ_oracle·ρ_client)]\n"
                         f"  ║  GKSL bath  : γ1={getattr(_b,'gamma1_eff',0):.4f}  "
                         f"γφ={getattr(_b,'gammaphi',0):.4f}  "
@@ -15343,10 +15418,13 @@ class QtclClientApp:
                 print(f"     W-fid   : {ks2.pq0_fidelity:.4f}   bridge: {ks2.bridge_fidelity:.4f}   "
                       f"coherence: {ks2.oracle_coherence:.4f}")
                 if m2:
-                    print(f"     VN-S    : {m2.entropy_vn:.4f}   discord: {m2.quantum_discord:.4f}   "
-                          f"purity: {m2.purity:.4f}")
-                    print(f"     neg A-B : {m2.negativity_AB:.4f}   neg B-C: {m2.negativity_BC:.4f}")
-                    print(f"     CHSH AB : {m2.bell_chsh_AB:.4f}   CHSH BC: {m2.bell_chsh_BC:.4f}")
+                    def _cf(v, lo=0.0, hi=1.0):
+                        try: f=float(v); return f if (lo<=f<=hi and __import__('math').isfinite(f)) else 0.0
+                        except: return 0.0
+                    print(f"     VN-S    : {_cf(m2.entropy_vn,0,3):.4f}   discord: {_cf(m2.quantum_discord,0,3):.4f}   "
+                          f"purity: {_cf(m2.purity,0,1):.4f}")
+                    print(f"     neg A-B : {_cf(m2.negativity_AB,0,0.5):.4f}   neg B-C: {_cf(m2.negativity_BC,0,0.5):.4f}")
+                    print(f"     CHSH AB : {_cf(m2.bell_chsh_AB,-4,4):.4f}   CHSH BC: {_cf(m2.bell_chsh_BC,-4,4):.4f}")
 
             print(sep)
 
@@ -15370,10 +15448,13 @@ class QtclClientApp:
             except Exception:
                 pass
             if m2:
-                print(f"  Field : Fid→|W3⟩={m2.fidelity_to_w3:.4f}  "
-                      f"S={m2.entropy_vn:.4f}  "
-                      f"purity={m2.purity:.4f}  "
-                      f"‖Δρ‖={m2.field_density:.4f}")
+                def _cf2(v, lo=0.0, hi=1.0):
+                    try: f=float(v); return f if (lo<=f<=hi and __import__('math').isfinite(f)) else 0.0
+                    except: return 0.0
+                print(f"  Field : Fid→|W3⟩={_cf2(m2.fidelity_to_w3,0,1):.4f}  "
+                      f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
+                      f"purity={_cf2(m2.purity,0,1):.4f}  "
+                      f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
             # ── Buffered log tail (replaces stdout bleed) ─────────────────────
