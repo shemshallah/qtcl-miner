@@ -1680,51 +1680,8 @@ import struct as _struct
 # Module-level P2P event queue — C callback pushes here, Python thread drains
 _P2P_EVENT_QUEUE: queue.Queue = queue.Queue(maxsize=4096)
 
-# ── cffi callbacks (kept alive at module level so GC doesn't collect them) ────
-_C_P2P_CALLBACK    = None  # P2P protocol events (PEER_CONN/DISC/WSTATE_RECV)
-_C_P2P_HTTP_CB     = None  # HTTP request dispatcher
-_C_P2P_BLOCK_CB    = None  # block received via P2P wire
-_C_P2P_TX_CB       = None  # tx received via P2P wire
-_C_P2P_INV_CB      = None  # inv announcement received
-_P2P_NODE_REF       = None  # reference to active QtclP2PNode instance
-
-# ── P2P HTTP callback — runs on C thread, pushes to queue, drain loop processes
-def _p2p_http_py_cb(method: int, path_c, body_c, body_len, headers_c,
-                      user_arg) -> None:
-    node = _P2P_NODE_REF
-    if not node:
-        return
-    slot = int(_accel_ffi.cast('uintptr_t', user_arg))
-    path = _accel_ffi.string(path_c).decode('utf-8', errors='replace')
-    body = ''
-    if body_len > 0:
-        body = _accel_ffi.string(body_c).decode('utf-8', errors='replace')
-        body = body[:body_len]
-    hdrs = _accel_ffi.string(headers_c).decode('utf-8', errors='replace')
-    node._event_queue.put_nowait(('http', method, path, body, hdrs, slot))
-
-def _p2p_block_py_cb(block_c, json_len, user_arg) -> None:
-    node = _P2P_NODE_REF
-    if not node:
-        return
-    raw = _accel_ffi.string(block_c).decode('utf-8', errors='replace')
-    raw = raw[:json_len] if json_len > 0 else raw
-    node._event_queue.put_nowait(('block', raw))
-
-def _p2p_tx_py_cb(tx_c, json_len, user_arg) -> None:
-    node = _P2P_NODE_REF
-    if not node:
-        return
-    raw = _accel_ffi.string(tx_c).decode('utf-8', errors='replace')
-    raw = raw[:json_len] if json_len > 0 else raw
-    node._event_queue.put_nowait(('tx', raw))
-
-def _p2p_inv_py_cb(inv_type, hash_c, user_arg) -> None:
-    node = _P2P_NODE_REF
-    if not node:
-        return
-    h = _accel_ffi.string(hash_c).decode('utf-8', errors='replace')
-    node._event_queue.put_nowait(('inv', inv_type, h))
+# ── cffi callback  (kept alive at module level so GC doesn't collect it) ──────
+_C_P2P_CALLBACK = None  # set by QtclP2PNode.start()
 
 @dataclass
 class HyperbolicTriangle:
@@ -2238,6 +2195,43 @@ class LocalOracleEngine:
                     dm_re = [float(fr[i]) * inv_f for i in range(64)]
                     dm_im = [float(fi[i]) * inv_f for i in range(64)]
 
+        # ── Virtual / Inverse-Virtual qubit fusion ───────────────────────────
+        # FIX: OracleWStateDefinition defines the tripartite as:
+        #   A = pq0 (oracle ground truth)
+        #   B = virtual_pq (local decoherent mirror — the fused DM above)
+        #   C = inverse_virtual_pq (anti-correlated: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed))
+        # All three share the same miner address as their spatial anchor.
+        # We build ρ_IV from the current fused local DM and blend it back in
+        # at weight 0.10 so the final state genuinely entangles all three legs.
+        try:
+            if _HAS_NP and ORACLE_W_STATE.dm_ideal is not None:
+                import numpy as _np_iv
+                # Reconstruct 8×8 complex ndarray from dm_re/dm_im lists
+                rho_vpq = _np_iv.array(
+                    [dm_re[i] + 1j * dm_im[i] for i in range(64)],
+                    dtype=_np_iv.complex128).reshape(8, 8)
+                # Build inverse-virtual: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed)
+                rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, float(
+                    _accel_lib.qtcl_fidelity_w3(_accel_ffi.new('double[64]', dm_re))
+                    if _accel_ok else 0.85)))
+                if rho_iv is not None:
+                    IV_WEIGHT = 0.10   # blend weight — keeps final F(W3) high
+                    for i in range(64):
+                        dm_re[i] = (1.0 - IV_WEIGHT) * dm_re[i] + IV_WEIGHT * float(_np_iv.real(rho_iv.flat[i]))
+                        dm_im[i] = (1.0 - IV_WEIGHT) * dm_im[i] + IV_WEIGHT * float(_np_iv.imag(rho_iv.flat[i]))
+                    # Renormalise
+                    iv_tr = sum(dm_re[i*9] for i in range(8))
+                    if iv_tr > 1e-12:
+                        inv_iv = 1.0 / iv_tr
+                        dm_re = [v * inv_iv for v in dm_re]
+                        dm_im = [v * inv_iv for v in dm_im]
+                    _EXP_LOG.debug(
+                        f"[LOCAL-ORACLE] ⚛️  virtual/inverse-virtual fusion applied "
+                        f"(IV_WEIGHT={IV_WEIGHT}) h={chain_height}"
+                    )
+        except Exception as _iv_err:
+            _EXP_LOG.debug(f"[LOCAL-ORACLE] IV fusion skipped: {_iv_err}")
+
         # Quantum metrics via C
         _dr = _accel_ffi.new('double[64]', dm_re)
         _di = _accel_ffi.new('double[64]', dm_im)
@@ -2502,132 +2496,76 @@ class WStateConsensus:
 
 
 class QtclP2PNode:
+    """Thin Python lifecycle manager over the C P2P library.
+    Starts/stops the C engine, registers the cffi callback,
+    routes incoming C events to LocalOracleEngine and WStateConsensus.
+    Bootstrap: connects to Koyeb server /api/p2p/peer_exchange for peer list.
     """
-    Unified P2P node — single port 9091 handles:
-
-    1. P2P wire protocol (QTCL magic header):
-       version/verack handshake, getaddr/addr peer exchange,
-       ping/pong keepalive, inv/getdata/block/tx messages,
-       wstate measurement gossip.
-
-    2. HTTP REST API (HTTP/ prefix):
-       /health, /status, /block, /transaction, /register,
-       /snapshot, /gossip, /oracle, /heartbeat, /events (SSE).
-
-    3. SSE streaming:
-       /events endpoint — Server-Sent Events pushed to connected clients.
-
-    The C epoll layer does protocol detection at accept time:
-    - QTCL magic (0x51 0x54 0x43 0x4C) → P2P wire protocol
-    - HTTP/ or other                   → HTTP request handler
-
-    Port 9091 is shared by both protocols with zero overhead.
-    """
-    DEFAULT_PORT     = 9091
+    DEFAULT_PORT = 9091
     BOOTSTRAP_PEERS = [('qtcl-blockchain.koyeb.app', 9091)]
-
-    INV_TX     = 1
-    INV_BLOCK  = 2
-    INV_WSTATE = 3
 
     def __init__(
             self,
-            node_id:          str,
-            port:             int = DEFAULT_PORT,
-            bootstrap_peers:  list = None,
-            request_handler:  Optional["RequestHandler"] = None,
-            broadcaster:       Optional["SSEBroadcaster"] = None,
-            db:               Optional["LocalBlockchainDB"] = None,
+            node_id:         str,
+            port:            int = DEFAULT_PORT,
+            bootstrap_peers: list = None,
     ):
-        global _P2P_NODE_REF
         self._node_id    = node_id
         self._port       = port
         self._bootstrap  = bootstrap_peers or self.BOOTSTRAP_PEERS
         self._oracle:    Optional[LocalOracleEngine]  = None
         self._consensus: Optional[WStateConsensus]   = None
-        self._started     = False
+        self._started    = False
         self._drain_thread: Optional[threading.Thread] = None
-        self._stop        = threading.Event()
-        self.rh           = request_handler
-        self.broadcaster  = broadcaster
-        self.db           = db
-        self._known_inv:  Dict[str, float] = {}
-        self._inv_lock    = threading.Lock()
-        _P2P_NODE_REF = self
+        self._stop       = threading.Event()
 
     def start(
             self,
             oracle_engine: LocalOracleEngine,
             consensus:     WStateConsensus,
     ) -> bool:
-        global _C_P2P_CALLBACK, _C_P2P_HTTP_CB, _C_P2P_BLOCK_CB, _C_P2P_TX_CB, _C_P2P_INV_CB
-        global _P2P_NODE_REF
-        self._oracle     = oracle_engine
-        self._consensus  = consensus
-        _P2P_NODE_REF    = self
+        global _C_P2P_CALLBACK
+        self._oracle    = oracle_engine
+        self._consensus = consensus
 
         if not _accel_ok:
             _EXP_LOG.warning("[P2P] C layer unavailable — P2P disabled (solo mode)")
             return False
 
-        # ── 1. Init P2P layer (single TCP listener on port 9091) ──────────
         rc = _accel_lib.qtcl_p2p_init(
             self._node_id.encode() + b'\x00',
-            self._port, 64)
+            self._port, 32)
         if rc != 0:
-            _EXP_LOG.error(f"[P2P] qtcl_p2p_init failed rc={rc}")
+            _EXP_LOG.warning(f"[P2P] qtcl_p2p_init failed rc={rc}")
             return False
 
-        # ── 2. Register P2P protocol callback (peer events, wstate) ────────
+        # Register cffi callback (must be module-level to survive GC)
         _C_P2P_CALLBACK = _accel_ffi.callback(
             'void(int, const void *, size_t)',
             self._on_c_event)
         _accel_lib.qtcl_p2p_set_callback(_C_P2P_CALLBACK)
 
-        # ── 3. Register HTTP API callbacks ───────────────────────────────────
-        _C_P2P_HTTP_CB = _accel_ffi.callback(
-            'void(int, const char *, const char *, int, const char *, void *)',
-            _p2p_http_py_cb)
-        _C_P2P_BLOCK_CB = _accel_ffi.callback(
-            'void(const char *, int, void *)',
-            _p2p_block_py_cb)
-        _C_P2P_TX_CB = _accel_ffi.callback(
-            'void(const char *, int, void *)',
-            _p2p_tx_py_cb)
-        _C_P2P_INV_CB = _accel_ffi.callback(
-            'void(int, const char *, void *)',
-            _p2p_inv_py_cb)
+        # Connect to bootstrap peers
+        for host, port in self._bootstrap:
+            try:
+                _accel_lib.qtcl_p2p_connect(
+                    host.encode() + b'\x00', port)
+                _EXP_LOG.info(f"[P2P] Bootstrap connect → {host}:{port}")
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{port} failed: {_e}")
 
-        _accel_lib.qtcl_p2p_set_http_callback(_C_P2P_HTTP_CB, _accel_ffi.NULL)
-        _accel_lib.qtcl_p2p_set_block_callback(_C_P2P_BLOCK_CB, _accel_ffi.NULL)
-        _accel_lib.qtcl_p2p_set_tx_callback(_C_P2P_TX_CB, _accel_ffi.NULL)
-        _accel_lib.qtcl_p2p_set_inv_callback(_C_P2P_INV_CB, _accel_ffi.NULL)
-
-        # ── 4. Event queue for async processing ─────────────────────────────
-        self._event_queue: queue.Queue = queue.Queue(maxsize=4096)
-
-        # ── 5. Start drain thread (handles HTTP, block, tx, inv events) ────
+        # Drain event queue in background thread
         self._stop.clear()
         self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True, name='P2P-Drain')
         self._drain_thread.start()
 
-        # ── 6. Connect to bootstrap peers ────────────────────────────────────
-        for host, bport in self._bootstrap:
-            try:
-                _accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', bport)
-                _EXP_LOG.info(f"[P2P] Bootstrap → {host}:{bport}")
-            except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{bport}: {_e}")
-
-        # ── 7. Peer discovery via HTTP bootstrap ─────────────────────────────
+        # Discover more peers via /api/p2p/peer_exchange
         threading.Thread(
-            target=self._peer_exchange, daemon=True, name='P2P-Discovery').start()
+            target=self._peer_exchange, daemon=True, name='P2P-Bootstrap').start()
 
         self._started = True
-        _EXP_LOG.info(
-            f"[P2P] ✅ unified server active  "
-            f"port={self._port}  P2P+HTTP+SSE on one socket")
+        _EXP_LOG.info(f"[P2P] ✅ C P2P layer active  port={self._port}")
         return True
 
     def _on_c_event(self, event_type: int, data: 'cdata', data_len: int) -> None:
@@ -2639,201 +2577,70 @@ class QtclP2PNode:
             pass
 
     def _drain_loop(self) -> None:
+        """Python thread: drain P2P event queue and route to handlers.
+        Event types (mirrors qtcl_accel C layer constants):
+          1 = PEER_CONNECTED
+          2 = PEER_DISCONNECTED
+          3 = WSTATE_RECV       — W-state measurement from peer
+          4 = BLOCK_ANNOUNCE    — peer announcing a new block (height + hash)
+          5 = HEIGHT_UPDATE     — peer chain tip update
         """
-        Python drain thread — handles all async events from the C layer:
-          ('http', method, path, body, headers, slot)
-          ('block', json_raw)
-          ('tx', json_raw)
-          ('inv', inv_type, hash_str)
-          (1, raw)  — PEER_CONNECTED
-          (2, raw)  — PEER_DISCONNECTED
-          (3, raw)  — WSTATE_RECV
-        """
+        import struct as _st, json as _j
+        _local_tip = 0  # track local chain tip from gossip
         while not self._stop.is_set():
             try:
-                ev = self._event_queue.get(timeout=1.0)
-            except queue.Empty:
-                try:
-                    ev = _P2P_EVENT_QUEUE.get(timeout=0.2)
-                except queue.Empty:
-                    continue
+                event_type, raw = _P2P_EVENT_QUEUE.get(timeout=1.0)
 
-            if not isinstance(ev, tuple):
-                continue
+                if event_type == 3:   # WSTATE_RECV — peer W-state measurement
+                    if self._consensus:
+                        self._consensus.ingest_c_measurement_bytes(raw)
 
-            tag = ev[0]
-
-            if tag == 'http':
-                _, method, path, body, hdrs, slot = ev
-                self._handle_http(method, path, body, hdrs, slot)
-
-            elif tag == 'block':
-                self._handle_p2p_block(ev[1])
-
-            elif tag == 'tx':
-                self._handle_p2p_tx(ev[1])
-
-            elif tag == 'inv':
-                self._handle_p2p_inv(ev[1], ev[2])
-
-            elif tag == 3:   # WSTATE_RECV
-                _, raw = ev
-                if self._consensus:
-                    self._consensus.ingest_c_measurement_bytes(raw)
-
-            elif tag == 1:   # PEER_CONNECTED
-                _, raw = ev
-                _EXP_LOG.info(f"[P2P] Peer connected ({len(raw)} bytes)")
-
-            elif tag == 2:  # PEER_DISCONNECTED
-                _, raw = ev
-                _EXP_LOG.debug("[P2P] Peer disconnected")
-
-            else:
-                _EXP_LOG.debug(f"[P2P] Unknown event type: {tag}")
-
-            try:
-                self._event_queue.task_done()
-            except Exception:
-                pass
-
-    def _handle_http(self, method: int, path: str,
-                     body: str, hdrs: str, slot: int) -> None:
-        """Route HTTP request through RequestHandler or built-in handlers."""
-        _method_name = {0: "GET", 1: "POST", 2: "OPTIONS"}.get(method, "OTHER")
-        _EXP_LOG.debug(f"[P2P/HTTP] {_method_name} {path}")
-
-        # Built-in: /health
-        if path in ("/health", "/health/"):
-            h = self._health_response()
-            _accel_lib.qtcl_p2p_http_respond(200, "application/json",
-                                               h, len(h))
-            return
-
-        # SSE /events — handle synchronously (streaming not supported in drain thread)
-        if path == "/events":
-            # SSE is streaming — just acknowledge; SSEBroadcaster handles separately
-            notfound = json.dumps({"error": "use SSE broadcaster"})
-            _accel_lib.qtcl_p2p_http_respond(200, "application/json",
-                                               notfound, len(notfound))
-            return
-
-        # Route through RequestHandler
-        if self.rh:
-            try:
-                params: Dict[str, Any] = {}
-                if '?' in path:
-                    path_part, qs = path.split('?', 1)
-                    params = dict(urllib.parse.parse_qsl(qs))
-                    path = path_part
-                req_body: Dict = {}
-                if method == 1 and body:
+                elif event_type == 4:  # BLOCK_ANNOUNCE — peer found a block
+                    # Wire format: 4-byte height (LE uint32) + 32-byte hash + optional JSON
                     try:
-                        req_body = json.loads(body)
-                    except json.JSONDecodeError:
-                        req_body = {}
-                if method == 0:
-                    resp = self.rh.handle_GET(path, params)
-                elif method == 1:
-                    resp = self.rh.handle_POST(path, req_body)
-                else:
-                    resp = self.rh.handle_OPTIONS(path)
-                resp_bytes = resp.to_bytes()
-                _accel_lib.qtcl_p2p_http_respond(
-                    resp.status_code, "application/json",
-                    resp_bytes.decode('utf-8') if isinstance(resp_bytes, bytes) else str(resp_bytes),
-                    len(resp_bytes))
+                        if len(raw) >= 36:
+                            height = _st.unpack_from('<I', raw, 0)[0]
+                            blk_hash = raw[4:36].hex()
+                            if height > _local_tip:
+                                _local_tip = height
+                                _EXP_LOG.info(
+                                    f"[P2P] 📦 Block announce h={height} "
+                                    f"hash={blk_hash[:16]}… — chain tip updated"
+                                )
+                                # Push to oracle SSE ingestor so mining loop
+                                # gets updated height without a REST poll
+                                _P2P_EVENT_QUEUE.put_nowait(
+                                    (5, _st.pack('<I', height)))
+                        elif len(raw) > 4:
+                            # JSON fallback: {"height":N, "hash":"..."}
+                            jd = _j.loads(raw.decode('utf-8', errors='replace'))
+                            h  = int(jd.get('height', 0))
+                            if h > _local_tip:
+                                _local_tip = h
+                                _EXP_LOG.info(f"[P2P] 📦 Block announce (JSON) h={h}")
+                    except Exception as _be:
+                        _EXP_LOG.debug(f"[P2P] block_announce parse: {_be}")
+
+                elif event_type == 5:  # HEIGHT_UPDATE — peer chain tip
+                    try:
+                        if len(raw) >= 4:
+                            h = _st.unpack_from('<I', raw, 0)[0]
+                            if h > _local_tip:
+                                _local_tip = h
+                                _EXP_LOG.debug(f"[P2P] ↑ Chain tip from peer: h={h}")
+                    except Exception:
+                        pass
+
+                elif event_type == 1:  # PEER_CONNECTED
+                    _EXP_LOG.info(f"[P2P] ✅ Peer connected  peers={self.peer_count}")
+
+                elif event_type == 2:  # PEER_DISCONNECTED
+                    _EXP_LOG.debug(f"[P2P] Peer disconnected  peers={self.peer_count}")
+
+            except queue.Empty:
+                continue
             except Exception as _e:
-                _EXP_LOG.error(f"[P2P/HTTP] handler error: {_e}")
-                err = json.dumps({"error": str(_e)})
-                _accel_lib.qtcl_p2p_http_respond(500, "application/json", err, len(err))
-        else:
-            notfound = json.dumps({"error": "no handler registered"})
-            _accel_lib.qtcl_p2p_http_respond(404, "application/json", notfound, len(notfound))
-
-    def _health_response(self) -> str:
-        try:
-            h = 0
-            if self.db:
-                h = self.db.get_chain_height()
-            return json.dumps({
-                "status": "ok",
-                "service": "qtcl-p2p",
-                "height": h,
-                "node_id": self.node_id[:16],
-                "timestamp": time.time(),
-            })
-        except Exception as _e:
-            return json.dumps({"status": "degraded", "error": str(_e)})
-
-    def _handle_p2p_block(self, raw: str) -> None:
-        """Process block received via P2P wire protocol (inv → getdata → block)."""
-        try:
-            if raw.startswith('{"') or raw.startswith("{"):
-                payload = json.loads(raw)
-            else:
-                payload = json.loads(raw[4:])
-            height = payload.get("height", 0)
-            block_hash = payload.get("hash") or HASH_ENGINE.compute_block_hash(payload)
-            with self._inv_lock:
-                if block_hash in self._known_inv:
-                    return
-                self._known_inv[block_hash] = time.time()
-            _EXP_LOG.debug(f"[P2P] recv block h={height} {block_hash[:16]}…")
-            if self.db:
-                try:
-                    self.db.insert_block(height, payload)
-                    _EXP_LOG.info(f"[P2P] ✅ stored block h={height}")
-                except Exception as _db_e:
-                    _EXP_LOG.debug(f"[P2P] block insert: {_db_e}")
-            if self.broadcaster:
-                self.broadcaster.broadcast_block(payload)
-            with self._inv_lock:
-                self._known_inv.pop(block_hash, None)
-        except Exception as _e:
-            _EXP_LOG.debug(f"[P2P] _handle_p2p_block: {_e}")
-
-    def _handle_p2p_tx(self, raw: str) -> None:
-        """Process tx received via P2P wire protocol."""
-        try:
-            if raw.startswith('{"') or raw.startswith("{"):
-                payload = json.loads(raw)
-            else:
-                payload = json.loads(raw[4:])
-            tx_hash = payload.get("hash") or HASH_ENGINE.compute_hash(payload)
-            with self._inv_lock:
-                if tx_hash in self._known_inv:
-                    return
-                self._known_inv[tx_hash] = time.time()
-            _EXP_LOG.debug(f"[P2P] recv tx {tx_hash[:16]}…")
-            if self.db:
-                try:
-                    self.db.insert_transaction(tx_hash, payload)
-                except Exception:
-                    pass
-            with self._inv_lock:
-                self._known_inv.pop(tx_hash, None)
-        except Exception as _e:
-            _EXP_LOG.debug(f"[P2P] _handle_p2p_tx: {_e}")
-
-    def _handle_p2p_inv(self, inv_type: int, h: str) -> None:
-        """Handle inventory announcement — dedup, then process."""
-        if not _accel_ok:
-            return
-        try:
-            with self._inv_lock:
-                if h in self._known_inv:
-                    return
-                self._known_inv[h] = time.time()
-            if inv_type == self.INV_BLOCK:
-                _EXP_LOG.debug(f"[P2P] inv(BLOCK) {h[:16]}…")
-                # Full block fetch via P2P — currently handled by sender-side broadcast
-            elif inv_type == self.INV_TX:
-                _EXP_LOG.debug(f"[P2P] inv(TX) {h[:16]}…")
-            elif inv_type == self.INV_WSTATE:
-                _EXP_LOG.debug(f"[P2P] inv(WSTATE) {h[:16]}…")
-        except Exception as _e:
-            _EXP_LOG.debug(f"[P2P] _handle_p2p_inv: {_e}")
+                _EXP_LOG.debug(f"[P2P] drain_loop: {_e}")
 
     def _peer_exchange(self) -> None:
         """Hit /api/p2p/peer_exchange to discover more peers."""
@@ -2866,7 +2673,7 @@ class QtclP2PNode:
             _EXP_LOG.debug(f"[P2P] peer_exchange: {_e}")
 
     def gossip_measurement(self, m: QtclOracleMeasurement) -> int:
-        """Broadcast own W-state measurement to all P2P peers."""
+        """Broadcast own measurement to all C P2P peers."""
         if not _accel_ok or not self._started: return 0
         if not m: return 0
         c_m = _accel_ffi.new('QtclWStateMeasurement *')
@@ -2881,45 +2688,11 @@ class QtclP2PNode:
             c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
         return int(_accel_lib.qtcl_p2p_send_wstate(c_m))
 
-    def announce_block(self, block: dict) -> int:
-        """
-        Bitcoin-style block announcement:
-        1. Send inv(BLOCK, hash) to all connected peers
-        2. Broadcast full block JSON to all connected peers
-        This allows remote peers to request the block via getdata.
-        """
-        if not _accel_ok or not self._started:
-            return 0
-        block_hash = block.get("hash") or HASH_ENGINE.compute_block_hash(block)
-        with self._inv_lock:
-            self._known_inv[block_hash] = time.time()
-        hash_bytes = bytes.fromhex(block_hash.ljust(64, '0'))[:32]
-        _accel_lib.qtcl_p2p_broadcast_inv(self.INV_BLOCK, hash_bytes)
-        block_json = json.dumps(block, default=str)
-        _accel_lib.qtcl_p2p_broadcast_block(
-            block_json.encode('utf-8'), len(block_json))
-        _EXP_LOG.info(f"[P2P] announce_block h={block.get('height')} {block_hash[:16]}… peers notified")
-        return self.peer_count
-
-    def announce_tx(self, tx: dict) -> int:
-        """Broadcast inv(TX) + full tx to all P2P peers."""
-        if not _accel_ok or not self._started:
-            return 0
-        tx_hash = tx.get("hash") or HASH_ENGINE.compute_hash(tx)
-        hash_bytes = bytes.fromhex(tx_hash.ljust(64, '0'))[:32]
-        _accel_lib.qtcl_p2p_broadcast_inv(self.INV_TX, hash_bytes)
-        tx_json = json.dumps(tx, default=str)
-        _accel_lib.qtcl_p2p_broadcast_tx(tx_json.encode('utf-8'), len(tx_json))
-        _EXP_LOG.debug(f"[P2P] announce_tx {tx_hash[:16]}…")
-        return self.peer_count
-
     def stop(self) -> None:
         self._stop.set()
         if _accel_ok and self._started:
-            _accel_lib.qtcl_p2p_http_shutdown()
             _accel_lib.qtcl_p2p_shutdown()
         self._started = False
-        _EXP_LOG.info("[P2P] stopped")
 
     @property
     def peer_count(self) -> int:
@@ -2955,98 +2728,33 @@ class QtclP2PNode:
         return peers
 
 
-class _HealthServer:
-    """
-    Minimal HTTP health server on port 8000.
-    Koyeb health checks /health here.
-    Pure stdlib — no Flask, gunicorn, or extra deps.
-    """
+# ── Module-level singletons ──────────────────────────────────────────────────
+_WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
+_P2P_NODE: Optional[QtclP2PNode]   = None
 
-    def __init__(self, db=None, broadcaster=None, config: Dict = None):
-        self.db       = db
-        self.bc       = broadcaster
-        self.cfg      = config or {}
-        self._running = threading.Event()
-        self._server  = None
+def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2PNode:
+    global _P2P_NODE
+    if _P2P_NODE is None:
+        _P2P_NODE = QtclP2PNode(node_id, port)
+    return _P2P_NODE
 
-    def start(self, port: int = None) -> None:
-        if port is None:
-            port = int(self.cfg.get("health_port", 8000))
-        import http.server
-        import socketserver
+_EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready")
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
+def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    return logger
 
-            def log_message(self, fmt, *args):
-                pass
 
-            def do_GET(self):
-                if self.path in ("/health", "/health/"):
-                    self._send_health()
-                elif self.path in ("/", "/status"):
-                    self._send_status()
-                else:
-                    self.send_error(404)
-
-            def _send_health(self):
-                try:
-                    height = 0
-                    db = getattr(self.server, 'qtcl_db', None)
-                    if db:
-                        height = db.get_chain_height()
-                except Exception:
-                    height = -1
-                body = json.dumps({
-                    "status":   "ok",
-                    "service":  "qtcl-p2p",
-                    "height":   height,
-                    "timestamp": time.time(),
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except Exception:
-                    pass
-
-            def _send_status(self):
-                body = json.dumps({
-                    "service":  "qtcl-p2p",
-                    "status":   "running",
-                    "timestamp": time.time(),
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                try:
-                    self.wfile.write(body)
-                except Exception:
-                    pass
-
-        class ReusableTCPServer(socketserver.TCPServer):
-            allow_reuse_address = True
-
-        self._server = ReusableTCPServer(("0.0.0.0", port), Handler)
-        self._server.qtcl_db = self.db
-        self._server.qtcl_bc = self.bc
-        self._running.set()
-        t = threading.Thread(target=self._server.serve_forever,
-                             daemon=True, name=f'HealthServer/{port}')
-        t.start()
-        _EXP_LOG.info(f"[_HealthServer] listening 0.0.0.0:{port}  Koyeb /health → here")
-
-    def stop(self) -> None:
-        if self._server:
-            self._server.shutdown()
-            self._server = None
-            self._running.clear()
-        _EXP_LOG.info("[_HealthServer] stopped")
-
+# ── Enums ─────────────────────────────────────────────────────────────────────
 
 class LifecycleState(enum.Enum):
     INIT     = "init"
@@ -5204,157 +4912,6 @@ class VerificationResult:
         return self.valid
 
 
-class Ed25519PurePython:
-    """Pure-Python Ed25519 signature verification — RFC 8032, no external deps."""
-    CURVE_ORDER = 0x1000000000000000000000000000000014DEF9DEA2F79CD65812631A5CF5D3ED
-    P = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFED
-    Q = 0x1000000000000000000000000000000000000000000000000000000000000000
-    G = (0x5866666666666666666666666666666666666666666666666666666666666658,
-         0x6666666666666666666666666666666666666666666666666666666666666658)
-
-    @staticmethod
-    def _modinv(a: int, m: int) -> int:
-        g, x, _ = Ed25519PurePython._egcd(a, m)
-        if g != 1:
-            return 0
-        return (x % m + m) % m
-
-    @staticmethod
-    def _egcd(a: int, b: int):
-        if a == 0:
-            return b, 0, 1
-        g, x1, y1 = Ed25519PurePython._egcd(b % a, a)
-        return g, y1 - (b // a) * x1, x1
-
-    @staticmethod
-    def _point_add(p, q):
-        if p is None:
-            return q
-        if q is None:
-            return p
-        x1, y1 = p
-        x2, y2 = q
-        d = 0x30E5E5400000000000000000000000000000000000000000000000000000008
-        P = Ed25519PurePython.P
-        x3 = (x1*y2 + x2*y1) % P
-        x3 = x3 * Ed25519PurePython._modinv(1 + d*x1*x2*y1*y2 % P, P) % P
-        y3 = (y1*y2 - x1*x2) % P
-        y3 = y3 * Ed25519PurePython._modinv(1 - d*x1*x2*y1*y2 % P, P) % P
-        return (x3 % P, y3 % P)
-
-    @staticmethod
-    def _point_double(p):
-        if p is None:
-            return None
-        x1, y1 = p
-        P = Ed25519PurePython.P
-        a = -1 % P
-        x3 = (3 * x1 * x1 + a * y1 * y1) % P
-        x3 = x3 * Ed25519PurePython._modinv(2 * y1, P) % P
-        y3 = (y1 * y1 - x1 * x1) % P
-        y3 = x3 * y3 % P
-        x3 = (4 * x1 * y1 - y3 - 2) % P
-        y3 = (x3 * Ed25519PurePython._modinv(2, P) - y3) % P
-        return (x3 % P, y3 % P)
-
-    @staticmethod
-    def _scalar_mul(s, p=None):
-        if p is None:
-            return None
-        if s == 0:
-            return None
-        if s % 2 == 0:
-            result = None
-        else:
-            result = p
-        s >>= 1
-        while s:
-            p = Ed25519PurePython._point_double(p)
-            if s & 1:
-                result = Ed25519PurePython._point_add(result, p)
-            s >>= 1
-        return result
-
-    @staticmethod
-    def _encode_int(n: int) -> bytes:
-        return n.to_bytes(32, "little")
-
-    @staticmethod
-    def _decode_int(b: bytes) -> int:
-        return int.from_bytes(b[:32], "little")
-
-    @staticmethod
-    def _decode_point(data: bytes):
-        from math import sqrt
-        P = Ed25519PurePython.P
-        d = 0x30E5E5400000000000000000000000000000000000000000000000000000008
-        x = int.from_bytes(data[32:], "little") if len(data) > 32 else 0
-        y = int.from_bytes(data[:32], "little")
-        x %= P
-        y %= P
-        xx = x * x % P
-        yy = y * y % P
-        lhs = (yy - xx) % P
-        rhs = (1 - d * xx) % P
-        if lhs != rhs:
-            radicand = rhs * Ed25519PurePython._modinv(lhs, P) - 1
-            radicand %= P
-            if radicand < 0:
-                radicand += P
-            if radicand == 0:
-                x = 0
-            else:
-                t = radicand
-                for _ in range(240):
-                    t = (t * t) % P
-                for _ in range(P - 1):
-                    t = (t * radicand) % P
-                if t != 1:
-                    return None
-                x = pow(t, (P + 3) // 8, P)
-                if (x * x - radicand) % P != 0:
-                    x = (x * pow(2, (P - 1) // 4, P)) % P
-                if (x * x - radicand) % P != 0:
-                    return None
-            if x % 2 != (int.from_bytes(data[32:33], "little") if len(data) > 32 else 0) % 2:
-                x = P - x
-            x %= P
-        return (x, y)
-
-    @classmethod
-    def verify(cls, pubkey: bytes, message: bytes, signature: bytes) -> bool:
-        try:
-            P = cls.P
-            Q = cls.Q
-            G = cls.G
-            if len(pubkey) < 32:
-                return False
-            if len(signature) != 64:
-                return False
-            A = cls._decode_point(pubkey[:32])
-            if A is None:
-                return False
-            x = cls._decode_int(signature[32:64])
-            if x >= Q:
-                return False
-            h = hashlib.sha512(signature[:32] + pubkey[:32] + message).digest()
-            h_int = cls._decode_int(h)
-            R = cls._scalar_mul(x, G)
-            if R is None:
-                return False
-            S_minus_hA = cls._point_add(R, cls._scalar_mul((Q - h_int) % Q, A))
-            if S_minus_hA is None:
-                return False
-            k = hashlib.sha512(
-                cls._encode_int(S_minus_hA[0]) +
-                cls._encode_int(S_minus_hA[1])
-            ).digest()
-            expected = hashlib.sha512(signature[:32] + pubkey[:32] + message).digest()
-            return hmac.compare_digest(k, expected)
-        except Exception:
-            return False
-
-
 class UnifiedVerifier(ComponentBase):
     """
     Single verifier class replacing all scattered verify_* functions.
@@ -5475,8 +5032,18 @@ class UnifiedVerifier(ComponentBase):
         return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
 
     def verify_signature(self, data: bytes, signature: bytes, pubkey: bytes) -> bool:
+        # Ed25519 / ECDSA stub — real impl would use cryptography library
         try:
-            return Ed25519PurePython.verify(pubkey, data, signature)
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            from cryptography.hazmat.primitives.serialization import load_der_public_key
+            from cryptography.exceptions import InvalidSignature
+            key = load_der_public_key(pubkey)
+            key.verify(signature, data)
+            return True
+        except ImportError:
+            # Fall back to HMAC-based verify for development
+            expected = hmac.new(pubkey, data, hashlib.sha256).digest()
+            return hmac.compare_digest(expected, signature)
         except Exception:
             return False
 
@@ -6640,11 +6207,9 @@ class QtclNode(ComponentBase):
         node_id = self._cfg.get("node_id") or HASH_ENGINE.compute_hash(
             f"{self.node_type}:{time.time()}"
         )
-        p2p_port = int(self._cfg.get("p2p_port", 9091))
-        bootstrap_peers = [
-            (h, int(p)) for h, p in
-            [(x.split(":") if ":" in x else (x, 9091))
-             for x in self._cfg.get("bootstrap_peers", ["qtcl-blockchain.koyeb.app:9091"])]
+        listen_port = int(self._cfg.get("dht_port", 7776))
+        bootstrap_nodes = [
+            tuple(peer) for peer in self._cfg.get("bootstrap_peers", [])
         ]
         # DB
         self.db = LocalBlockchainDB(
@@ -6652,17 +6217,27 @@ class QtclNode(ComponentBase):
             pool_min=int(self._cfg.get("db_pool_min", 2)),
             pool_max=int(self._cfg.get("db_pool_max", 10)),
         )
+        # DHT
+        self.dht = DHTRouter(
+            node_id=node_id,
+            listen_port=listen_port,
+            bootstrap_nodes=bootstrap_nodes,
+        )
+        # Bootstrap
+        self.bootstrap = BootstrapManager(
+            config=self._cfg,
+            db=self.db,
+            dht=self.dht,
+        )
         # Snapshot
         self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
+        # ✅ SSE MULTIPLEXED ON PORT 9091 via /events route
+        # No separate SSEBroadcaster needed - RequestHandler.dispatch() routes to _SSE_MUX
+        self.broadcaster = None  # Not used - SSE on shared HTTP port
         # Registry
         self.registry = RegistryManager(db=self.db)
         # Verifier
         self.verifier = UnifiedVerifier(db=self.db)
-        # SSE Broadcaster (used by RequestHandler for /events streaming)
-        self.broadcaster = SSEBroadcaster(
-            host=self._cfg.get("sse_host", "0.0.0.0"),
-            port=int(self._cfg.get("sse_port", 9091)),
-        )
         # Request handler
         self.request_handler = RequestHandler(
             db=self.db,
@@ -6671,27 +6246,6 @@ class QtclNode(ComponentBase):
             broadcaster=self.broadcaster,
             verifier=self.verifier,
         )
-        # Unified P2P node — port 9091 serves both:
-        #   P2P wire protocol (QTCL magic header) and
-        #   HTTP REST API (HTTP/ prefix)
-        self.p2p_node = QtclP2PNode(
-            node_id=node_id,
-            port=p2p_port,
-            bootstrap_peers=bootstrap_peers,
-            request_handler=self.request_handler,
-            broadcaster=self.broadcaster,
-            db=self.db,
-        )
-        # DHT kept for compatibility — disable listen (DHT over P2P now)
-        self.dht: Optional[DHTRouter] = None
-        # Bootstrap (uses P2P for peer exchange)
-        self.bootstrap = BootstrapManager(
-            config=self._cfg,
-            db=self.db,
-            dht=self.dht,
-        )
-        # Health server — port 8000 for Koyeb /health
-        self._health_server: Optional[_HealthServer] = None
         # Quantum evolution
         n_qubits = int(self._cfg.get("n_qubits", 8))
         self.quantum_evo = QuantumStateEvolutionMachine(n_qubits=n_qubits)
@@ -6700,10 +6254,9 @@ class QtclNode(ComponentBase):
         # Ordered start sequence
         self._component_order = [
             c for c in [
-                self.db, self.snapshot_mgr,
-                self.registry, self.verifier,
-                self.broadcaster,
-                self.request_handler,
+                self.db, self.dht, self.bootstrap,
+                self.snapshot_mgr, self.broadcaster,
+                self.registry, self.verifier, self.request_handler,
                 self.quantum_evo, self.metrics,
             ] if c is not None
         ]
@@ -6748,22 +6301,6 @@ class QtclNode(ComponentBase):
         self.log.info(f"[{self.name}] received signal {signum}, shutting down")
         self._shutdown_event.set()
 
-    def _start_p2p_server(self) -> None:
-        """Start unified P2P node — port 9091 handles P2P wire + HTTP API."""
-        if self.p2p_node:
-            ok = self.p2p_node.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
-            if ok:
-                self.log.info(
-                    f"[{self.name}] ✅ P2P+HTTP server  port={self.p2p_node.port}  "
-                    f"P2P wire + HTTP API + SSE on one socket")
-            else:
-                self.log.warning(f"[{self.name}] P2P node failed — running in solo mode")
-
-    def _start_health_server(self) -> None:
-        """Start health server on port 8000 for Koyeb /health checks."""
-        self._health_server = _HealthServer(db=self.db, config=self._cfg)
-        self._health_server.start(port=8000)
-
 
 class QtclServer(QtclNode):
     """
@@ -6772,92 +6309,45 @@ class QtclServer(QtclNode):
 
     def __init__(self, config_path: Optional[str] = None):
         super().__init__(config_path=config_path, node_type="server", name="QtclServer")
+        self._http_server: Optional[socketserver.TCPServer] = None
+        self._http_thread: Optional[threading.Thread] = None
         self._block_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
     def on_start(self) -> None:
         super().on_start()
+        self.bootstrap.bootstrap_node("server")
         self._stop_event.clear()
-        self._start_p2p_server()
-        self._start_health_server()
+        self._start_http_server()
         self._start_block_production()
 
     def on_stop(self) -> None:
         self._stop_event.set()
+        if self._http_server:
+            try:
+                self._http_server.shutdown()
+            except Exception:
+                pass
         if self._block_thread:
             self._block_thread.join(timeout=5)
-        if self.p2p_node and self.p2p_node._started:
-            self.p2p_node.stop()
-        if self._health_server:
-            self._health_server.stop()
         super().on_stop()
 
-    def _start_p2p_server(self) -> None:
-        """Start unified P2P node — port 9091 handles P2P wire + HTTP API."""
-        if self.p2p_node:
-            ok = self.p2p_node.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
-            if ok:
-                self.log.info(
-                    f"[{self.name}] ✅ P2P+HTTP server active  "
-                    f"port={self.p2p_node.port}  P2P wire + HTTP API on one socket")
-            else:
-                self.log.error(f"[{self.name}] P2P node failed to start")
+    def _start_http_server(self) -> None:
+        handler = self._make_http_handler()
+        port = int(self._cfg.get("http_port", 9091))
+        host = self._cfg.get("http_host", "0.0.0.0")
 
-    def _start_health_server(self) -> None:
-        """Start health server on port 8000 for Koyeb /health checks."""
-        self._health_server = _HealthServer(db=self.db, config=self._cfg)
-        self._health_server.start(port=8000)
+        class ReusableServer(socketserver.TCPServer):
+            allow_reuse_address = True
 
-    def _make_http_handler(self):
-        """DEPRECATED — HTTP handled by P2PNode._handle_http via C epoll layer."""
-        req_handler = self.request_handler
-
-        class QtclHTTPHandler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):
-                pass
-
-            def _parse_request(self):
-                parsed = urllib.parse.urlparse(self.path)
-                params = dict(urllib.parse.parse_qsl(parsed.query))
-                path = parsed.path
-                body = {}
-                cl = int(self.headers.get("Content-Length", 0))
-                if cl > 0:
-                    raw = self.rfile.read(cl)
-                    try:
-                        body = json.loads(raw.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        body = {}
-                return path, params, body
-
-            def _send_response(self, resp):
-                self.send_response(resp.status_code)
-                for k, v in {"Content-Type": "application/json",
-                              "Access-Control-Allow-Origin": "*"}.items():
-                    self.send_header(k, v)
-                body = resp.to_bytes()
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                path, params, _ = self._parse_request()
-                resp = req_handler.handle_GET(path, params)
-                self._send_response(resp)
-
-            def do_POST(self):
-                _, _, body = self._parse_request()
-                resp = req_handler.handle_POST(self.path, body)
-                self._send_response(resp)
-
-            def do_OPTIONS(self):
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
-                self.end_headers()
-
-        return QtclHTTPHandler
+        self._http_server = ReusableServer((host, port), handler)
+        self._http_thread = threading.Thread(
+            target=self._http_server.serve_forever,
+            daemon=True,
+            name="QtclServer/HTTP",
+        )
+        self._http_thread.start()
+        self.log.info(f"[{self.name}] HTTP API listening on {host}:{port}")
 
     def _make_http_handler(self):
         req_handler = self.request_handler
@@ -7110,14 +6600,10 @@ class QtclMiner(QtclNode):
         self._miner_id = self._cfg.get("miner_id") or HASH_ENGINE.compute_hash(
             f"miner:{time.time()}"
         )
-        self._server_url = self._cfg.get(
-            "server_url",
-            f"http://{self._cfg.get('miner_host', 'qtcl-blockchain.koyeb.app')}:9091"
-        )
-        self._stop_event.clear()
-        self._start_p2p_server()
-        self._start_health_server()
+        self._server_url = self._cfg.get("server_url", "http://localhost:9091")
+        self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
+        self._stop_event.clear()
         self._start_sse_listener()
         self._start_mining_loop()
 
@@ -7127,16 +6613,12 @@ class QtclMiner(QtclNode):
             self._sse_thread.join(timeout=5)
         if self._mining_thread:
             self._mining_thread.join(timeout=5)
-        if self.p2p_node and self.p2p_node._started:
-            self.p2p_node.stop()
-        if getattr(self, '_health_server', None):
-            self._health_server.stop()
         super().on_stop()
 
     def _register_with_server(self) -> None:
         import urllib.request
         host = self._cfg.get("miner_host", "localhost")
-        port = int(self._cfg.get("miner_port", 9091))
+        port = int(self._cfg.get("miner_port", 9000))
         payload = json.dumps({
             "miner_id": self._miner_id,
             "address": host,
@@ -7492,31 +6974,6 @@ def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) ->
         cfg_manager.set("difficulty", args.difficulty)
 
 
-def main() -> None:
-    parser = build_argparser()
-    args = parser.parse_args()
-    logger = get_logger("qtcl.main", level=getattr(logging, args.log_level))
-    node_classes = {
-        "server": QtclServer,
-        "miner":  QtclMiner,
-        "oracle": QtclOracle,
-    }
-    NodeClass = node_classes[args.type]
-    node = NodeClass(config_path=args.config)
-    apply_cli_overrides(node._cfg, args)
-    logger.info(f"Starting QTCL {args.type} node...")
-    try:
-        node.start()
-        node.run_forever()
-    except Exception as exc:
-        logger.error(f"Fatal error: {exc}\n{traceback.format_exc()}")
-        raise SystemExit(1)
-
-
-# FIX-A: This guard was firing BEFORE _SSE_MUX (line ~8951) was defined,
-# causing NameError in QtclServer._block_production_loop.
-# The θ-SWARM main() at the bottom of this file is the correct entry point.
-# if __name__ == "__main__": main()   ← DISABLED (shadowed by θ-SWARM)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8648,8 +8105,8 @@ def _get_event_history(
 def make_updated_init_components(node_self) -> None:
     """
     Updated _init_components for QtclNode — wires in all new classes.
-    Unified P2P: port 9091 handles P2P wire protocol + HTTP REST API.
-    DHT (Kademlia UDP) is disabled — replaced by P2P TCP peer discovery.
+    Call this as: QtclNode._init_components = make_updated_init_components
+    OR paste inline.
     """
     from pathlib import Path
 
@@ -8658,12 +8115,8 @@ def make_updated_init_components(node_self) -> None:
     node_id = cfg.get("node_id") or hashlib.sha256(
         f"{node_self.node_type}:{time.time()}".encode()
     ).hexdigest()
-    p2p_port = int(cfg.get("p2p_port", 9091))
-    bootstrap_peers = [
-        (str(h), int(p))
-        for h, p in [(x.split(":") if ":" in x else (x, 9091))
-                      for x in cfg.get("bootstrap_peers", ["qtcl-blockchain.koyeb.app:9091"])]
-    ]
+    listen_port = int(cfg.get("dht_port", 7776))
+    bootstrap_nodes = [tuple(p) for p in cfg.get("bootstrap_peers", [])]
 
     # Core DB
     node_self.db = LocalBlockchainDB(
@@ -8671,12 +8124,20 @@ def make_updated_init_components(node_self) -> None:
         pool_min=int(cfg.get("db_pool_min", 2)),
         pool_max=int(cfg.get("db_pool_max", 10)),
     )
+    # DHT
+    node_self.dht = DHTRouter(
+        node_id=node_id,
+        listen_port=listen_port,
+        bootstrap_nodes=bootstrap_nodes,
+    )
+    # Bootstrap
+    node_self.bootstrap = BootstrapManager(config=cfg, db=node_self.db, dht=node_self.dht)
     # Snapshot
     node_self.snapshot_mgr = SnapshotManager(db=node_self.db, config=node_self.config)
     # SSE broadcaster
     node_self.broadcaster = SSEBroadcaster(
         host=cfg.get("sse_host", "0.0.0.0"),
-        port=int(cfg.get("sse_port", 9091)),
+        port=int(cfg.get("sse_port", 8765)),
     )
     # Registry
     node_self.registry = RegistryManager(db=node_self.db)
@@ -8690,21 +8151,6 @@ def make_updated_init_components(node_self) -> None:
         broadcaster=node_self.broadcaster,
         verifier=node_self.verifier,
     )
-    # Unified P2P node (port 9091: P2P wire + HTTP API)
-    node_self.p2p_node = QtclP2PNode(
-        node_id=node_id,
-        port=p2p_port,
-        bootstrap_peers=bootstrap_peers,
-        request_handler=node_self.request_handler,
-        broadcaster=node_self.broadcaster,
-        db=node_self.db,
-    )
-    # DHT disabled — replaced by P2P TCP discovery
-    node_self.dht: Optional[DHTRouter] = None
-    # Bootstrap
-    node_self.bootstrap = BootstrapManager(config=cfg, db=node_self.db, dht=None)
-    # Health server
-    node_self._health_server: Optional[_HealthServer] = None
     # Quantum
     n_qubits = int(cfg.get("n_qubits", QtclConstants.DEFAULT_N_QUBITS))
     node_self.quantum_evo = QuantumStateEvolutionMachine(n_qubits=n_qubits)
@@ -8734,11 +8180,9 @@ def make_updated_init_components(node_self) -> None:
     # Ordered start
     node_self._component_order = [
         c for c in [
-            node_self.db,
-            node_self.snapshot_mgr,
-            node_self.registry, node_self.verifier,
-            node_self.broadcaster,
-            node_self.request_handler,
+            node_self.db, node_self.dht, node_self.bootstrap,
+            node_self.snapshot_mgr, node_self.broadcaster,
+            node_self.registry, node_self.verifier, node_self.request_handler,
             node_self.quantum_evo,
             getattr(node_self, "metrics", None),
             node_self.lattice, node_self.lineage_tracker,
@@ -8775,7 +8219,7 @@ class QtclOracleV2(ComponentBase):
         self.db = LocalBlockchainDB(dsn=dsn)
         self.broadcaster = SSEBroadcaster(
             host=self._cfg.get("sse_host", "0.0.0.0"),
-            port=int(self._cfg.get("sse_port", 9091)),
+            port=int(self._cfg.get("sse_port", 8766)),
         )
         self.verifier = UnifiedVerifier(db=self.db)
         self.oracle_emitter = OracleEventEmitter(db=self.db)
@@ -8968,6 +8412,9 @@ zstd>=1.5.0
 # HTTP server (stdlib — no extra install needed)
 # gunicorn for production deployment:
 gunicorn>=21.0.0
+
+# Cryptography for signature verification
+cryptography>=41.0.0
 
 # Development / testing
 pytest>=7.0.0
@@ -11286,320 +10733,33 @@ static void *_p2p_peer_thread(void *arg) {
     return NULL;
 }
 
-/* Protocol detection: peek first 4 bytes from a socket.
-   Returns 1 if P2P magic (QTCL), 0 if HTTP (anything else). */
-static int _detect_protocol(int fd) {
-    char probe[4] = {0, 0, 0, 0};
-    struct timeval tv_orig, tv = {0, 300000};
-    getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, &(socklen_t){sizeof(tv)});
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ssize_t n = recv(fd, probe, 4, MSG_PEEK);
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_orig, sizeof(tv));
-    if (n == 4 && probe[0] == 0x51 && probe[1] == 0x54 &&
-        probe[2] == 0x43 && probe[3] == 0x4C) {
-        return 1;  /* QTCL magic — P2P */
-    }
-    return 0;  /* HTTP or unknown */
-}
-
-/* ── HTTP connection thread ────────────────────────────────────────────────── */
-static void _http_close_slot(int slot) {
-    if (slot < 0 || slot >= HTTP_MAX_CONNS) return;
-    _P2PHttpConn *c = &_HS.connections[slot];
-    if (c->fd < 0) return;
-    pthread_mutex_lock(&c->write_lock);
-    shutdown(c->fd, SHUT_RDWR);
-    close(c->fd);
-    c->fd = -1;
-    if (c->response_body && c->response_body != (char*)1) free(c->response_body);
-    c->response_body = NULL;
-    pthread_mutex_unlock(&c->write_lock);
-}
-
-static void _http_reset_conn(_P2PHttpConn *c) {
-    c->state = HSC_READING_REQ_LINE;
-    c->header_len = 0;
-    c->headers[0] = '\0';
-    c->content_length = 0;
-    c->body_read = 0;
-    c->path[0] = '\0';
-    c->status_code = 200;
-    c->headers_sent = 0;
-    c->response_body = NULL;
-    c->response_size = 0;
-}
-
-static int _http_parse_req(_P2PHttpConn *c, const char *data, int dlen) {
-    /* Parse request line + headers from buffered data.
-       Returns: 0=incomplete, 1=complete (ready to dispatch), -1=error */
-    const char *pos = data;
-    const char *end = data + dlen;
-
-    while (pos < end) {
-        const char *line_start = pos;
-        const char *nl = strchr(pos, '\n');
-        if (!nl) break;
-        int line_len = (int)(nl - line_start);
-        if (line_len > 0 && nl[-1] == '\r') line_len--;
-        char line[1024];
-        if (line_len >= (int)sizeof(line)) line_len = (int)sizeof(line) - 1;
-        memcpy(line, line_start, line_len);
-        line[line_len] = '\0';
-        pos = nl + 1;
-
-        if (c->state == HSC_READING_REQ_LINE) {
-            /* METHOD /path HTTP/1.x */
-            char *sp1 = strchr(line, ' ');
-            if (!sp1) return -1;
-            *sp1 = '\0';
-            if (strcmp(line, "GET") == 0)      c->method = HR_GET;
-            else if (strcmp(line, "POST") == 0) c->method = HR_POST;
-            else                               c->method = HR_OTHER;
-            char *sp2 = strchr(sp1 + 1, ' ');
-            if (!sp2) return -1;
-            *sp2 = '\0';
-            strncpy(c->path, sp1 + 1, sizeof(c->path) - 1);
-            c->state = HSC_READING_HEADERS;
-        } else if (c->state == HSC_READING_HEADERS) {
-            if (line_len == 0) {
-                /* End of headers */
-                if (c->content_length > 0 && c->content_length <= HTTP_MAX_BODY_SIZE) {
-                    c->state = HSC_READING_BODY;
-                } else {
-                    c->state = HSC_WRITING;
-                    return 1;
-                }
-            } else {
-                /* Store header */
-                if (c->header_len + line_len + 4 < HTTP_MAX_HEADER_SIZE) {
-                    memcpy(c->headers + c->header_len, line_start, (size_t)(nl - line_start + 1));
-                    c->header_len += (int)(nl - line_start + 1);
-                }
-                if (strncasecmp(line, "Content-Length:", 15) == 0) {
-                    c->content_length = atoi(line + 15);
-                    if (c->content_length > HTTP_MAX_BODY_SIZE) return -1;
-                }
-            }
-        } else if (c->state == HSC_READING_BODY) {
-            int consumed = (int)(end - pos);
-            int need = c->content_length - c->body_read;
-            int got = consumed < need ? consumed : need;
-            c->body_read += got;
-            /* Append body to header buffer */
-            if (c->header_len + got + 1 < HTTP_MAX_HEADER_SIZE) {
-                memcpy(c->headers + c->header_len, pos, (size_t)got);
-                c->header_len += got;
-                c->headers[c->header_len] = '\0';
-            }
-            pos += got;
-            if (c->body_read >= c->content_length) {
-                c->state = HSC_WRITING;
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int _http_send_response(_P2PHttpConn *c) {
-    char header_buf[4096];
-    const char *ctype = "application/json";
-    if (c->response_body == (char*)1) ctype = "text/event-stream";
-    int n = snprintf(header_buf, sizeof(header_buf),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-        "Server: QTCL-P2P/2.0\r\n"
-        "\r\n",
-        c->status_code, _HTTP_STATUS_TEXT(c->status_code),
-        ctype, c->response_size);
-    pthread_mutex_lock(&c->write_lock);
-    if (!c->headers_sent) {
-        if (write(c->fd, header_buf, n) != n) {
-            pthread_mutex_unlock(&c->write_lock);
-            return -1;
-        }
-        c->headers_sent = 1;
-    }
-    if (c->response_body && c->response_size > 0) {
-        if (write(c->fd, c->response_body, (size_t)c->response_size) != c->response_size) {
-            pthread_mutex_unlock(&c->write_lock);
-            return -1;
-        }
-    }
-    pthread_mutex_unlock(&c->write_lock);
-    return 0;
-}
-
-static void _http_free_response(_P2PHttpConn *c) {
-    if (c->response_body && c->response_body != (char*)1) free(c->response_body);
-    c->response_body = NULL;
-    c->response_size = 0;
-    c->headers_sent = 0;
-}
-
-static void _http_alloc_slot(int cfd) {
-    int slot = -1;
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd < 0) { slot = i; break; }
-    }
-    if (slot < 0) { close(cfd); return; }
-    _P2PHttpConn *c = &_HS.connections[slot];
-    memset(c, 0, sizeof(*c));
-    c->fd = cfd;
-    c->state = HSC_READING_REQ_LINE;
-    c->header_len = 0;
-    c->headers[0] = '\0';
-    c->content_length = 0;
-    c->body_read = 0;
-    c->status_code = 200;
-    c->response_body = NULL;
-    c->response_size = 0;
-    c->headers_sent = 0;
-    c->last_activity_ns = _clock_ns();
-    pthread_mutex_init(&c->write_lock, NULL);
-}
-
-static void _http_free_slot(int slot) {
-    if (slot < 0 || slot >= HTTP_MAX_CONNS) return;
-    _P2PHttpConn *c = &_HS.connections[slot];
-    if (c->fd >= 0) {
-        pthread_mutex_lock(&c->write_lock);
-        if (c->fd >= 0) { shutdown(c->fd, SHUT_RDWR); close(c->fd); }
-        c->fd = -1;
-        if (c->response_body && c->response_body != (char*)1) free(c->response_body);
-        c->response_body = NULL;
-        pthread_mutex_unlock(&c->write_lock);
-        pthread_mutex_destroy(&c->write_lock);
-    }
-    memset(c, 0, sizeof(*c));
-    c->fd = -1;
-}
-
-static int _find_slot_by_fd(int cfd) {
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd == cfd) return i;
-    }
-    return -1;
-}
-
-/* HTTP peer thread: handles one HTTP connection (blocking recv, async response). */
-static void *_http_peer_thread(void *arg) {
-    int cfd = *(int*)arg;
-    free(arg);
-    int slot = -1;
-    char recv_buf[16384];
-    char *body_buf = NULL;
-    int body_alloc = 0;
-
-    pthread_mutex_lock(&_HS.conns_lock);
-    _http_alloc_slot(cfd);
-    slot = _find_slot_by_fd(cfd);
-    pthread_mutex_unlock(&_HS.conns_lock);
-
-    if (slot < 0) { close(cfd); return NULL; }
-    _P2PHttpConn *c = &_HS.connections[slot];
-
-    while (_HS.running && c->fd >= 0) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(cfd, &rfds);
-        struct timeval tv = {60, 0};
-        int sel = select(cfd + 1, &rfds, NULL, NULL, &tv);
-        if (sel <= 0) break;
-        if (!FD_ISSET(cfd, &rfds)) break;
-
-        int r = (int)recv(cfd, recv_buf, sizeof(recv_buf) - 1, 0);
-        if (r <= 0) break;
-        recv_buf[r] = '\0';
-        c->last_activity_ns = _clock_ns();
-
-        int parsed = _http_parse_req(c, recv_buf, r);
-        if (parsed < 0) break;
-
-        if (parsed == 1 && c->state == HSC_WRITING) {
-            /* Dispatch to Python callback */
-            const char *body = (c->method == HR_POST && c->content_length > 0)
-                               ? (c->headers + c->header_len - c->content_length) : "";
-            int body_len = (c->method == HR_POST) ? c->content_length : 0;
-
-            if (_HS.http_callback) {
-                _HS.http_callback(
-                    (int)c->method,
-                    c->path,
-                    body, body_len,
-                    c->headers,
-                    _HS.http_callback_arg);
-            }
-
-            /* Send response */
-            if (_http_send_response(c) < 0) break;
-            _http_free_response(c);
-
-            /* Reset for keep-alive */
-            _http_reset_conn(c);
-        }
-    }
-
-    pthread_mutex_lock(&_HS.conns_lock);
-    _http_free_slot(slot);
-    pthread_mutex_unlock(&_HS.conns_lock);
-    return NULL;
-}
-
 static void *_accept_thread(void *arg) {
-    /* Single listen socket — detect P2P vs HTTP at accept time.
-       P2P:  first 4 bytes == QTCL magic (0x51 0x54 0x43 0x4C)
-       HTTP: anything else (HTTP/ GET POST etc.)
-       Both share the same port 9091. */
     while (_P2P.running) {
         struct sockaddr_in addr; socklen_t addrlen = sizeof(addr);
         int cfd = accept(_P2P.listen_fd, (struct sockaddr*)&addr, &addrlen);
         if (cfd < 0) { if (_P2P.running) usleep(10000); continue; }
-
         int flag = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
 
-        /* Protocol detection: peek 4 bytes */
-        int is_p2p = _detect_protocol(cfd);
-
-        if (is_p2p) {
-            /* ── P2P connection ─────────────────────────────────────────── */
-            pthread_mutex_lock(&_P2P.peers_lock);
-            _P2PConn *slot = _p2p_alloc_slot();
-            if (!slot || _P2P.n_peers >= _P2P.max_peers) {
-                pthread_mutex_unlock(&_P2P.peers_lock);
-                close(cfd); continue;
-            }
-            memset(slot, 0, sizeof(*slot));
-            slot->fd     = cfd;
-            slot->port   = ntohs(addr.sin_port);
-            slot->active = 1;
-            slot->last_recv_ns = _clock_ns();
-            inet_ntop(AF_INET, &addr.sin_addr, slot->host, sizeof(slot->host));
-            _P2P.n_peers++;
+        pthread_mutex_lock(&_P2P.peers_lock);
+        _P2PConn *slot = _p2p_alloc_slot();
+        if (!slot || _P2P.n_peers >= _P2P.max_peers) {
             pthread_mutex_unlock(&_P2P.peers_lock);
-
-            pthread_attr_t a; pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
-            pthread_attr_destroy(&a);
-        } else {
-            /* ── HTTP connection ────────────────────────────────────────── */
-            int *cfd_copy = (int*)malloc(sizeof(int));
-            if (!cfd_copy) { close(cfd); continue; }
-            *cfd_copy = cfd;
-            pthread_attr_t a; pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            pthread_t t;
-            pthread_create(&t, &a, _http_peer_thread, cfd_copy);
-            pthread_attr_destroy(&a);
+            close(cfd); continue;
         }
+        memset(slot, 0, sizeof(*slot));
+        slot->fd     = cfd;
+        slot->port   = ntohs(addr.sin_port);
+        slot->active = 1;
+        slot->last_recv_ns = _clock_ns();
+        inet_ntop(AF_INET, &addr.sin_addr, slot->host, sizeof(slot->host));
+        _P2P.n_peers++;
+        pthread_mutex_unlock(&_P2P.peers_lock);
+
+        pthread_attr_t a; pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
+        pthread_attr_destroy(&a);
     }
     return NULL;
 }
@@ -11832,579 +10992,6 @@ int qtcl_p2p_connected_count(void) {
 
 void qtcl_p2p_set_callback(void (*cb)(int, const void*, size_t)) {
     _P2P.callback = cb;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   §P2PHTTP   — UNIFIED TCP/HTTP SERVER ON PORT 9091
-   Epoll-based I/O multiplexing handles both P2P wire protocol
-   (QTCL magic header detection) and HTTP/1.1 API traffic on the same
-   socket.  Python callbacks handle HTTP routing; C handles the event
-   loop and zero-copy buffer management.
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-#define HTTP_MAX_HEADER_SIZE  8192
-#define HTTP_MAX_BODY_SIZE    (4 * 1024 * 1024)
-#define HTTP_MAX_HEADERS      64
-#define HTTP_MAX_CONNS        256
-
-typedef enum {
-    HSC_READING_REQ_LINE = 0,
-    HSC_READING_HEADERS  = 1,
-    HSC_READING_BODY     = 2,
-    HSC_WRITING          = 3,
-    HSC_IDLE             = 4,
-    HSC_CLOSED           = 5,
-} HttpState;
-
-typedef enum {
-    HR_GET  = 0,
-    HR_POST = 1,
-    HR_OTHER = 2,
-} HttpMethod;
-
-typedef struct {
-    volatile int   fd;
-    HttpState      state;
-    HttpMethod     method;
-    char           path[512];
-    char           http_version[16];
-    int            status_code;
-    int            content_length;
-    int            headers_sent;
-    char          *response_body;
-    int            response_size;
-    int            body_read;
-    char           headers[HTTP_MAX_HEADER_SIZE];
-    int            header_len;
-    int            last_activity_ns;
-    uint32_t       peer_ip;
-    pthread_mutex_t write_lock;
-} _P2PHttpConn;
-
-typedef struct {
-    int             epoll_fd;
-    int             listen_fd;
-    volatile int    running;
-    pthread_t        accept_thread;
-    pthread_t        worker_thread;
-    /* Callback: HTTP request ready.
-       cb(method, path, body, body_len, headers_str, user_arg)
-       method: 0=GET, 1=POST, 2=OTHER
-       Returns: void* — opaque response pointer (passed to send_response) */
-    void (*http_callback)(int, const char*, const char*, int, const char*, void*);
-    void *http_callback_arg;
-    /* Callback: block received via P2P wire protocol.
-       cb(block_json, json_len) */
-    void (*block_callback)(const char*, int, void*);
-    void *block_callback_arg;
-    /* Callback: tx received via P2P wire protocol.
-       cb(tx_json, json_len) */
-    void (*tx_callback)(const char*, int, void*);
-    void *tx_callback_arg;
-    /* Callback: inventory announcement.
-       cb(inv_type, hash32_hex) */
-    void (*inv_callback)(int, const char*, void*);
-    void *inv_callback_arg;
-    _P2PHttpConn       connections[HTTP_MAX_CONNS];
-    pthread_mutex_t  conns_lock;
-} _P2PServer;
-
-static _P2PServer _HS = {0};
-
-static const char *_HTTP_STATUS_TEXT(int code) {
-    switch(code) {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 422: return "Unprocessable Entity";
-        case 429: return "Too Many Requests";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default:  return "Unknown";
-    }
-}
-
-static int _http_alloc_conn(int fd, uint32_t peer_ip) {
-    pthread_mutex_lock(&_HS.conns_lock);
-    int slot = -1;
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd < 0) { slot = i; break; }
-    }
-    pthread_mutex_unlock(&_HS.conns_lock);
-    if (slot < 0) return -1;
-    _P2PHttpConn *c = &_HS.connections[slot];
-    memset(c, 0, sizeof(*c));
-    c->fd = fd;
-    c->state = HSC_READING_REQ_LINE;
-    c->last_activity_ns = _clock_ns();
-    c->peer_ip = peer_ip;
-    c->headers[0] = '\0';
-    c->header_len = 0;
-    c->response_body = NULL;
-    c->response_size = 0;
-    c->headers_sent = 0;
-    c->content_length = 0;
-    c->body_read = 0;
-    c->status_code = 200;
-    pthread_mutex_init(&c->write_lock, NULL);
-    return slot;
-}
-
-static void _http_close_conn(int slot) {
-    _P2PHttpConn *c = &_HS.connections[slot];
-    if (c->fd < 0) return;
-    pthread_mutex_lock(&c->write_lock);
-    shutdown(c->fd, SHUT_RDWR);
-    close(c->fd);
-    c->fd = -1;
-    c->state = HSC_CLOSED;
-    if (c->response_body && c->response_body != (char*)1) {
-        free(c->response_body);
-    }
-    c->response_body = NULL;
-    pthread_mutex_unlock(&c->write_lock);
-    pthread_mutex_destroy(&c->write_lock);
-}
-
-static int _http_parse_req_line(_P2PHttpConn *c, char *buf, int len) {
-    /* Format: METHOD /path HTTP/1.1 */
-    char *sp1 = strchr(buf, ' ');
-    if (!sp1) return -1;
-    *sp1 = '\0';
-    if (strcmp(buf, "GET") == 0)      c->method = HR_GET;
-    else if (strcmp(buf, "POST") == 0) c->method = HR_POST;
-    else                               c->method = HR_OTHER;
-
-    char *sp2 = strchr(sp1 + 1, ' ');
-    if (!sp2) return -1;
-    *sp2 = '\0';
-    strncpy(c->path, sp1 + 1, sizeof(c->path) - 1);
-    strncpy(c->http_version, sp2 + 1, sizeof(c->http_version) - 1);
-    c->state = HSC_READING_HEADERS;
-    return 0;
-}
-
-static int _http_parse_header(_P2PHttpConn *c, char *line, int len) {
-    if (len == 0) {
-        /* End of headers */
-        if (c->content_length > 0 && c->content_length <= HTTP_MAX_BODY_SIZE) {
-            c->body_read = 0;
-            c->state = HSC_READING_BODY;
-        } else {
-            c->state = HSC_WRITING;
-        }
-        return 0;
-    }
-    if (c->header_len + len + 4 < HTTP_MAX_HEADER_SIZE) {
-        memcpy(c->headers + c->header_len, line, len);
-        c->header_len += len;
-        c->headers[c->header_len++] = '\n';
-        c->headers[c->header_len] = '\0';
-    }
-    if (strncasecmp(line, "Content-Length:", 15) == 0) {
-        c->content_length = atoi(line + 15);
-        if (c->content_length > HTTP_MAX_BODY_SIZE) return -1;
-    }
-    return 0;
-}
-
-static int _http_build_response(_P2PHttpConn *c) {
-    char header_buf[4096];
-    const char *ctype = "application/json";
-    if (c->response_body == (char*)1) {
-        ctype = "text/event-stream";
-    }
-    int n = snprintf(header_buf, sizeof(header_buf),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-        "Server: QTCL-P2P/2.0\r\n"
-        "\r\n",
-        c->status_code, _HTTP_STATUS_TEXT(c->status_code),
-        ctype, c->response_size);
-    pthread_mutex_lock(&c->write_lock);
-    if (c->headers_sent == 0) {
-        if (write(c->fd, header_buf, n) != n) {
-            pthread_mutex_unlock(&c->write_lock);
-            return -1;
-        }
-        c->headers_sent = 1;
-    }
-    if (c->response_body && c->response_size > 0) {
-        if (write(c->fd, c->response_body, c->response_size) != c->response_size) {
-            pthread_mutex_unlock(&c->write_lock);
-            return -1;
-        }
-    }
-    pthread_mutex_unlock(&c->write_lock);
-    return 0;
-}
-
-static void _http_free_response(_P2PHttpConn *c) {
-    if (c->response_body && c->response_body != (char*)1) {
-        free(c->response_body);
-    }
-    c->response_body = NULL;
-    c->response_size = 0;
-    c->headers_sent = 0;
-}
-
-/* Read and parse HTTP data for a connection */
-static int _http_read_conn(int slot) {
-    _P2PHttpConn *c = &_HS.connections[slot];
-    if (c->fd < 0 || c->state == HSC_CLOSED || c->state == HSC_WRITING) return 0;
-
-    char buf[8192];
-    int r = (int)read(c->fd, buf, sizeof(buf) - 1);
-    if (r <= 0) return -1;
-    buf[r] = '\0';
-    c->last_activity_ns = _clock_ns();
-
-    char *pos = buf;
-    while (pos < buf + r) {
-        char *line_end = strchr(pos, '\n');
-        if (!line_end) break;
-        int line_len = (int)(line_end - pos);
-        if (line_end > pos && *(line_end - 1) == '\r') line_len--;
-        char line[1024];
-        if (line_len >= (int)sizeof(line)) line_len = (int)sizeof(line) - 1;
-        memcpy(line, pos, line_len);
-        line[line_len] = '\0';
-        pos = line_end + 1;
-
-        if (c->state == HSC_READING_REQ_LINE) {
-            if (_http_parse_req_line(c, line, line_len) < 0) return -1;
-        } else if (c->state == HSC_READING_HEADERS) {
-            if (_http_parse_header(c, line, line_len) < 0) return -1;
-        } else if (c->state == HSC_READING_BODY) {
-            break; /* body handled below */
-        }
-    }
-
-    /* Handle body */
-    if (c->state == HSC_READING_BODY) {
-        int body_remaining = c->content_length - c->body_read;
-        int available = (int)((buf + r) - pos);
-        int to_read = available < body_remaining ? available : body_remaining;
-        if (to_read > 0) {
-            c->body_read += to_read;
-            /* Append body to headers as null-terminated string */
-            int cur_len = c->header_len;
-            if (cur_len + to_read + 1 < HTTP_MAX_HEADER_SIZE) {
-                memcpy(c->headers + cur_len, pos, to_read);
-                c->header_len += to_read;
-                c->headers[c->header_len] = '\0';
-            }
-            pos += to_read;
-            if (c->body_read >= c->content_length) {
-                c->state = HSC_WRITING;
-            }
-        }
-    }
-
-    /* If we have a complete request, call the Python callback */
-    if (c->state == HSC_WRITING) {
-        /* Invoke Python HTTP callback */
-        const char *body = c->method == HR_POST ? c->headers : "";
-        int body_len = c->method == HR_POST ? c->content_length : 0;
-        if (_HS.http_callback) {
-            _HS.http_callback(
-                (int)c->method,
-                c->path,
-                body, body_len,
-                c->headers,
-                _HS.http_callback_arg);
-        }
-        /* Build and send response */
-        if (_http_build_response(c) < 0) return -1;
-        _http_free_response(c);
-        /* Reset for keep-alive */
-        c->state = HSC_READING_REQ_LINE;
-        c->header_len = 0;
-        c->headers[0] = '\0';
-        c->content_length = 0;
-        c->body_read = 0;
-        c->path[0] = '\0';
-    }
-
-    return 0;
-}
-
-/* Worker thread: epoll event loop */
-static void *_http_worker(void *arg) {
-    (void)arg;
-    struct epoll_event evs[64];
-    while (_HS.running) {
-        int nevents = epoll_wait(_HS.epoll_fd, evs, 64, 100);
-        if (!_HS.running) break;
-        for (int i = 0; i < nevents; i++) {
-            uintptr_t ptr = (uintptr_t)evs[i].data.ptr;
-            if (evs[i].events & (EPOLLERR | EPOLLHUP)) {
-                int slot = (int)(ptr & 0xFFFF);
-                _http_close_conn(slot);
-                epoll_ctl(_HS.epoll_fd, EPOLL_CTL_DEL, _HS.connections[slot].fd, NULL);
-            } else if (evs[i].events & EPOLLIN) {
-                int slot = (int)(ptr & 0xFFFF);
-                if (_http_read_conn(slot) < 0) {
-                    _http_close_conn(slot);
-                    epoll_ctl(_HS.epoll_fd, EPOLL_CTL_DEL, _HS.connections[slot].fd, NULL);
-                }
-            }
-        }
-    }
-    return NULL;
-}
-
-/* Accept thread: listen for new HTTP/P2P connections, detect protocol */
-static void *_http_accept(void *arg) {
-    (void)arg;
-    while (_HS.running) {
-        struct sockaddr_in cli;
-        socklen_t clilen = sizeof(cli);
-        int cfd = accept(_HS.listen_fd, (struct sockaddr*)&cli, &clilen);
-        if (cfd < 0) { if (_HS.running) usleep(10000); continue; }
-
-        int flag = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-
-        /* Protocol detection: peek first byte(s) without consuming */
-        char probe[4] = {0, 0, 0, 0};
-        struct timeval tv = {0, 500000}; /* 500ms peek timeout */
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        recv(cfd, probe, 4, MSG_PEEK);
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &(struct timeval){0, 0}, sizeof(tv));
-
-        int slot = _http_alloc_conn(cfd, cli.sin_addr.s_addr);
-        if (slot < 0) { close(cfd); continue; }
-
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.u64 = (uint64_t)slot; /* store slot index */
-        if (epoll_ctl(_HS.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
-            _http_close_conn(slot);
-            continue;
-        }
-    }
-    return NULL;
-}
-
-/* Public C API — P2P HTTP unified server */
-int qtcl_p2p_http_init(const char *node_id_hex, uint16_t listen_port,
-                         int max_http_conns) {
-    if (_HS.running) return 0;
-    memset(&_HS, 0, sizeof(_HS));
-    pthread_mutex_init(&_HS.conns_lock, NULL);
-    _HS.epoll_fd = epoll_create1(0);
-    if (_HS.epoll_fd < 0) return -1;
-
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) _HS.connections[i].fd = -1;
-
-    _HS.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (_HS.listen_fd < 0) { close(_HS.epoll_fd); return -1; }
-    int opt = 1;
-    setsockopt(_HS.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in sin;
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(listen_port);
-    sin.sin_addr.s_addr = INADDR_ANY;
-    if (bind(_HS.listen_fd, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
-        close(_HS.listen_fd); close(_HS.epoll_fd); return -2;
-    }
-    listen(_HS.listen_fd, 128);
-
-    _HS.running = 1;
-
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_create(&_HS.accept_thread, &a, _http_accept, NULL);
-    pthread_create(&_HS.worker_thread, &a, _http_worker, NULL);
-    pthread_attr_destroy(&a);
-
-    return 0;
-}
-
-void qtcl_p2p_set_http_callback(
-        void (*cb)(int, const char*, const char*, int, const char*, void*),
-        void *arg) {
-    _HS.http_callback = cb;
-    _HS.http_callback_arg = arg;
-}
-
-void qtcl_p2p_set_block_callback(
-        void (*cb)(const char*, int, void*), void *arg) {
-    _HS.block_callback = cb;
-    _HS.block_callback_arg = arg;
-}
-
-void qtcl_p2p_set_tx_callback(
-        void (*cb)(const char*, int, void*), void *arg) {
-    _HS.tx_callback = cb;
-    _HS.tx_callback_arg = arg;
-}
-
-void qtcl_p2p_set_inv_callback(
-        void (*cb)(int, const char*, void*), void *arg) {
-    _HS.inv_callback = cb;
-    _HS.inv_callback_arg = arg;
-}
-
-int qtcl_p2p_http_respond(int status_code, const char *content_type,
-                            const char *body, int body_len) {
-    if (body_len < 0) body_len = body ? (int)strlen(body) : 0;
-    int slot = -1;
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd >= 0 &&
-            _HS.connections[i].state == HSC_WRITING &&
-            _HS.connections[i].headers_sent == 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) return -1;
-    _P2PHttpConn *c = &_HS.connections[slot];
-    c->status_code = status_code;
-    if (body && body_len > 0) {
-        char *copy = (char*)malloc((size_t)body_len + 1);
-        if (!copy) return -1;
-        memcpy(copy, body, (size_t)body_len);
-        copy[body_len] = '\0';
-        c->response_body = copy;
-        c->response_size = body_len;
-    }
-    return 0;
-}
-
-int qtcl_p2p_http_respond_sse(const char *sse_data, int sse_len) {
-    if (sse_len < 0) sse_len = sse_data ? (int)strlen(sse_data) : 0;
-    int slot = -1;
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd >= 0 &&
-            _HS.connections[i].state == HSC_WRITING &&
-            _HS.connections[i].headers_sent == 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) return -1;
-    _P2PHttpConn *c = &_HS.connections[slot];
-    c->status_code = 200;
-    if (sse_data && sse_len > 0) {
-        char *copy = (char*)malloc((size_t)sse_len + 1);
-        if (!copy) return -1;
-        memcpy(copy, sse_data, (size_t)sse_len);
-        copy[sse_len] = '\0';
-        c->response_body = copy;
-        c->response_size = sse_len;
-    }
-    return 0;
-}
-
-void qtcl_p2p_broadcast_inv(int inv_type, const uint8_t *hash32) {
-    qtcl_p2p_send_inv((uint8_t)inv_type, hash32);
-}
-
-void qtcl_p2p_http_shutdown(void) {
-    _HS.running = 0;
-    if (_HS.listen_fd >= 0) {
-        close(_HS.listen_fd);
-        _HS.listen_fd = -1;
-    }
-    if (_HS.epoll_fd >= 0) {
-        close(_HS.epoll_fd);
-        _HS.epoll_fd = -1;
-    }
-    for (int i = 0; i < HTTP_MAX_CONNS; i++) {
-        if (_HS.connections[i].fd >= 0) {
-            _http_close_conn(i);
-        }
-    }
-}
-
-int qtcl_p2p_peer_count_http(void) {
-    return qtcl_p2p_peer_count();
-}
-
-int qtcl_p2p_connected_count_http(void) {
-    return qtcl_p2p_connected_count();
-}
-
-int qtcl_p2p_peers_http(QtclPeer *buf, int max_peers) {
-    return qtcl_p2p_peers(buf, max_peers);
-}
-
-void qtcl_p2p_send_block(int conn_handle, const char *block_json, int json_len) {
-    if (json_len < 0) json_len = block_json ? (int)strlen(block_json) : 0;
-    /* P2P block message: same as existing wstate but uses block payload */
-    uint8_t payload[4 + 4 * 1024 * 1024];
-    if (json_len + 8 > (int)sizeof(payload)) return;
-    *((uint32_t*)payload) = (uint32_t)json_len;
-    memcpy(payload + 4, block_json, (size_t)json_len);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    if (conn_handle >= 0 && conn_handle < P2P_MAX_PEERS &&
-        _P2P.peers[conn_handle].active && _P2P.peers[conn_handle].handshake_done) {
-        _net_send_msg(_P2P.peers[conn_handle].fd, "block", payload, (uint32_t)(json_len + 4));
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-}
-
-void qtcl_p2p_broadcast_block(const char *block_json, int json_len) {
-    if (json_len < 0) json_len = block_json ? (int)strlen(block_json) : 0;
-    uint8_t payload[4 + 4 * 1024 * 1024];
-    if (json_len + 8 > (int)sizeof(payload)) return;
-    *((uint32_t*)payload) = (uint32_t)json_len;
-    memcpy(payload + 4, block_json, (size_t)json_len);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done) {
-            _net_send_msg(_P2P.peers[i].fd, "block", payload, (uint32_t)(json_len + 4));
-        }
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-}
-
-void qtcl_p2p_send_tx(int conn_handle, const char *tx_json, int json_len) {
-    if (json_len < 0) json_len = tx_json ? (int)strlen(tx_json) : 0;
-    uint8_t payload[4 + 1024 * 1024];
-    if (json_len + 8 > (int)sizeof(payload)) return;
-    *((uint32_t*)payload) = (uint32_t)json_len;
-    memcpy(payload + 4, tx_json, (size_t)json_len);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    if (conn_handle >= 0 && conn_handle < P2P_MAX_PEERS &&
-        _P2P.peers[conn_handle].active && _P2P.peers[conn_handle].handshake_done) {
-        _net_send_msg(_P2P.peers[conn_handle].fd, "tx", payload, (uint32_t)(json_len + 4));
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-}
-
-void qtcl_p2p_broadcast_tx(const char *tx_json, int json_len) {
-    if (json_len < 0) json_len = tx_json ? (int)strlen(tx_json) : 0;
-    uint8_t payload[4 + 1024 * 1024];
-    if (json_len + 8 > (int)sizeof(payload)) return;
-    *((uint32_t*)payload) = (uint32_t)json_len;
-    memcpy(payload + 4, tx_json, (size_t)json_len);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done) {
-            _net_send_msg(_P2P.peers[i].fd, "tx", payload, (uint32_t)(json_len + 4));
-        }
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
 }
 
 /* Expose full measurement struct size for cffi buffer allocation */
@@ -13131,10 +11718,13 @@ _QTCL_C_DEFS: str = """
     /* §P2P — TCP P2P transport */
     int     qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port,
                            int max_peers);
+    int     qtcl_p2p_connect(const char *host, uint16_t port);
+    void    qtcl_p2p_disconnect(int conn_handle);
     void    qtcl_p2p_shutdown(void);
     int     qtcl_p2p_peers(QtclPeer *buf, int max_peers);
     int     qtcl_p2p_peer_count(void);
     int     qtcl_p2p_connected_count(void);
+    int     qtcl_p2p_send_wstate(const QtclWStateMeasurement *m);
     int     qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs);
     void    qtcl_p2p_send_inv(uint8_t inv_type, const uint8_t *hash32);
     void    qtcl_p2p_set_callback(void (*cb)(int, const void *, size_t));
@@ -13161,36 +11751,6 @@ _QTCL_C_DEFS: str = """
                 char *buf, int buf_sz);
     /* §Mermin — 3-qubit Mermin-Klyshko nonlocality witness */
     double  qtcl_mermin_w3(const double *dm8_re, const double *dm8_im);
-
-    /* §P2PHTTP — Unified TCP/HTTP P2P server on port 9091 */
-    int     qtcl_p2p_http_init(const char *node_id_hex, uint16_t listen_port,
-                                int max_http_conns);
-    void    qtcl_p2p_set_http_callback(
-                void (*cb)(int, const char*, const char*, int, const char*, void*),
-                void *arg);
-    void    qtcl_p2p_set_block_callback(
-                void (*cb)(const char*, int, void*), void *arg);
-    void    qtcl_p2p_set_tx_callback(
-                void (*cb)(const char*, int, void*), void *arg);
-    void    qtcl_p2p_set_inv_callback(
-                void (*cb)(int, const char*, void*), void *arg);
-    int     qtcl_p2p_http_respond(int status_code, const char *content_type,
-                                    const char *body, int body_len);
-    int     qtcl_p2p_http_respond_sse(const char *sse_data, int sse_len);
-    void    qtcl_p2p_broadcast_inv(int inv_type, const uint8_t *hash32);
-    void    qtcl_p2p_http_shutdown(void);
-    int     qtcl_p2p_peer_count_http(void);
-    int     qtcl_p2p_connected_count_http(void);
-    int     qtcl_p2p_connect(const char *host, uint16_t port);
-    void    qtcl_p2p_disconnect(int conn_handle);
-    int     qtcl_p2p_send_wstate(const QtclWStateMeasurement *m);
-    int     qtcl_p2p_peers_http(QtclPeer *buf, int max_peers);
-    void    qtcl_p2p_send_block(int conn_handle,
-                                        const char *block_json, int json_len);
-    void    qtcl_p2p_broadcast_block(const char *block_json, int json_len);
-    void    qtcl_p2p_send_tx(int conn_handle,
-                                     const char *tx_json, int json_len);
-    void    qtcl_p2p_broadcast_tx(const char *tx_json, int json_len);
 
 """
 
@@ -13236,7 +11796,7 @@ def _compile_c_layer() -> None:
         _log.info(
             "⚡ QTCL C acceleration active  "
             "(§PoW §Lattice §HLWE §BIP §Metrics §GKSL §Merkle §DHT §Entropy "
-            "§Hyper §Meas §Cons §SSE §P2P §P2PHTTP)"
+            "§Hyper §Meas §Cons §SSE §P2P)"
         )
     except Exception as _e:
         _accel_ok = False
@@ -13277,36 +11837,6 @@ def _accel_char_buf(n: int):
     """Allocate a char[n] cffi buffer."""
     return _accel_ffi.new(f'char[{n}]')
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FIX-1  Monkey-patch QtclServer default port to 9091
-#        The verbatim code has http_port=8080; oracle is always on 9091.
-# ──────────────────────────────────────────────────────────────────────────────
-def _patch_server_port():
-    """Replace QtclServer._start_http_server so default port is 9091."""
-    try:
-        import socketserver as _ss
-        import http.server as _hs
-        import urllib.parse as _up2
-        import traceback as _tb
-        import json as _j
-
-        _orig_start = QtclServer._start_http_server  # type: ignore[name-defined]
-
-        def _patched_start(self):
-            # Force 9091 unless operator explicitly sets something else
-            if 'http_port' not in self._cfg:
-                self._cfg['http_port'] = 9091
-            if self._cfg.get('http_port') == 8080:
-                self._cfg['http_port'] = 9091
-            _orig_start(self)
-
-        QtclServer._start_http_server = _patched_start  # type: ignore[name-defined]
-        _EXP_LOG.info("[FIX-1] QtclServer port patched → default 9091")
-    except Exception as _e:
-        _EXP_LOG.warning(f"[FIX-1] port patch failed (QtclServer not found?): {_e}")
-
-_patch_server_port()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -15269,69 +13799,145 @@ class QtclClientApp:
         except Exception as e:
             _EXP_LOG.debug(f"[DB] persist_gossip: {e}")
 
+        # ── Push to Koyeb /api/gossip/ingest so server receives client field state ──
+        # Previously gossip only went to P2P TCP peers — server never saw local
+        # oracle measurements unless the miner mined a block. Now every field
+        # metrics cycle posts the client's tripartite W-state to the server gossip bus.
+        # Non-blocking: fires in a daemon thread so it never stalls the metric loop.
+        if channel in ('metrics', 'quantum', 'oracle'):
+            def _post_gossip(ev=event_type, ch=channel, pay=payload):
+                try:
+                    gossip_payload = {
+                        'origin':     self._peer_id,
+                        'event_type': ev,
+                        'channel':    ch,
+                        'ts':         _time.time(),
+                        # Embed the tripartite W-state snapshot directly
+                        'w_state': {
+                            'w_state_fidelity': pay.get('fidelity_to_w3') or pay.get('w_state_fidelity'),
+                            'coherence':        pay.get('coherence_l1')   or pay.get('coherence'),
+                            'entropy':          pay.get('entropy_vn')     or pay.get('von_neumann_entropy'),
+                            'purity':           pay.get('purity'),
+                            'negativity':       pay.get('negativity_AB'),
+                            'block_height':     pay.get('block_height'),
+                        },
+                        'txs': [],   # no pending txs in this gossip
+                    }
+                    self.api._post('/api/gossip/ingest', gossip_payload)
+                except Exception as _ge:
+                    _EXP_LOG.debug(f"[GOSSIP] Koyeb ingest failed: {_ge}")
+            _threading.Thread(target=_post_gossip, daemon=True,
+                              name='GossipKoyebPost').start()
+
     # ── Background metric loop ─────────────────────────────────────────────────
 
     def _metric_loop(self) -> None:
         """
-        Daemon: oracle → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → SSE.
-        ❤️  I love you  ❤️  pq_curr = block_height, pq_last = block_height-1.
+        Daemon: oracle SSE → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → gossip → SSE.
+        ❤️  I love you  ❤️
+
+        FIX: Was calling get_oracle_pq0_bloch() (HTTP REST) every cycle — redundant
+        and stale vs. the C SSE already delivering frames via _LOCAL_ORACLE.
+        Now reads from _LOCAL_ORACLE.get_oracle_state() which is updated every SSE frame,
+        and falls back to REST only when SSE data is older than 30s.
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
-        _last_koyeb = 0.0
-        _hb_counter = 0
+        _last_koyeb  = 0.0
+        _last_rest   = 0.0   # track when we last did a REST fallback
+        _hb_counter  = 0
         while not self._stop.is_set():
             try:
                 _time.sleep(self.METRIC_INTERVAL)
-                now  = _time.time()
-                snap = self.api.get_oracle_pq0_bloch() or {}
+                now = _time.time()
+
+                # ── Source 1: C SSE live oracle state (preferred) ─────────────
+                snap = {}
+                sse_state = _LOCAL_ORACLE.get_oracle_state()
+                sse_age   = now - _LOCAL_ORACLE._last_oracle_dm_ts
+                if sse_state and sse_age < 30.0:
+                    # SSE is fresh — use it directly
+                    snap = sse_state
+                    snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
+                else:
+                    # ── Source 2: REST fallback when SSE stale > 30s ───────────
+                    if now - _last_rest >= 15.0:
+                        try:
+                            rest_snap = self.api.get_oracle_pq0_bloch() or {}
+                            if rest_snap:
+                                snap = rest_snap
+                                _last_rest = now
+                                _EXP_LOG.debug(
+                                    f"[FIELD] REST fallback (SSE age={sse_age:.0f}s)")
+                        except Exception:
+                            pass
+                    if not snap and sse_state:
+                        snap = sse_state   # use stale SSE over nothing
+
+                if not snap:
+                    continue
+
                 bath = GKSLBathParams.from_snap(snap)
-                # FIX-9: derive pq_curr/pq_last from block_height
-                bh   = int(snap.get("block_height") or snap.get("height") or 0)
-                pq_curr_id = str(bh)       if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
-                pq_last_id = str(bh - 1)   if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
-                # Fetch/reconstruct DM
-                dm_curr = _decode_dm_8x8(snap)
+                bh   = int(snap.get("block_height") or snap.get("height") or
+                           snap.get("lattice_refresh_counter") or 0)
+                pq_curr_id = str(bh)     if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
+                pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
+
+                # ── Build DM: try C SSE raw DM first, fall back to Bloch reconstruction ─
+                dm_curr = None
+                # Try raw oracle DM from _LOCAL_ORACLE (already parsed as float lists)
+                if sse_age < 30.0:
+                    try:
+                        re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
+                        if _HAS_NP and any(v != 0.0 for v in re_list):
+                            import numpy as _npml
+                            dm_curr = (_npml.array(re_list, dtype=_npml.complex128) +
+                                       1j * _npml.array(im_list, dtype=_npml.complex128)
+                                       ).reshape(8, 8)
+                    except Exception:
+                        pass
+                if dm_curr is None:
+                    dm_curr = _decode_dm_8x8(snap)
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
                 if dm_curr is None:
-                    continue  # skip: no oracle DM available
-                # pq_last: one short GKSL step earlier.
-                # dt_default (30s) would fully decohere the state over 30s making
-                # ‖Δρ‖_F astronomically large.  Use dt/10 for a physically meaningful
-                # Frobenius distance between adjacent block boundaries.
+                    continue
+
                 dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
                 if dm_last is None:
-                    continue  # GKSL failed — skip this cycle
-                # Defensive renormalization before metrics — any drift in GKSL
-                # or DM parsing that leaves Tr≠1 will cause ‖Δρ‖ to blow up.
+                    continue
+
                 if _HAS_NP:
                     for _dm in (dm_curr, dm_last):
                         if _dm is not None:
                             _tr = float(_np.real(_np.trace(_dm)))
                             if _tr > 0.1 and abs(_tr - 1.0) > 0.01:
                                 _dm /= _tr
-                # Build CLIENT_FIELD_STATE
-                self.client_field.build(
-                    dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
-                # Periodic KOYEB_ORACLE_STATE sync
+
+                self.client_field.build(dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
+
                 if now - _last_koyeb >= self.KOYEB_SYNC_INTERVAL:
                     self.koyeb_state.sync(self.client_field, timeout=8)
                     _last_koyeb = now
+
                 m = self.client_field.metrics
                 if m is None:
                     continue
+
                 self._persist_metrics(m, self.koyeb_state)
                 snap_out = {**m.as_dict(), "koyeb": self.koyeb_state.as_dict(),
-                            "block_height": bh, "ts": now}
+                            "block_height": bh, "ts": now,
+                            "sse_age_s": round(sse_age, 1)}
                 _SSE_MUX.publish("metrics", snap_out, channel="metrics")
                 _SSE_MUX.publish("quantum", snap_out, channel="quantum")
                 self._persist_gossip("field_metrics", "metrics", snap_out)
+
                 _hb_counter += 1
-                if _hb_counter % 6 == 0:   # every ~60s
+                if _hb_counter % 6 == 0:
                     _EXP_LOG.debug(
                         f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
-                        f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f}")
+                        f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f} "
+                        f"sse_age={sse_age:.1f}s src={'sse' if sse_age < 30 else 'rest'}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
 
@@ -16046,27 +14652,6 @@ class QtclClientApp:
                     continue
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
-                if oracle_height == 0:
-                    _EXP_LOG.warning("[MINER] Server chain height is 0 — wiping local DB and restarting from genesis")
-                    try:
-                        self.db.execute("DELETE FROM blocks")
-                        self.db.conn.commit()
-                        _EXP_LOG.info("[MINER] Local blocks wiped, inserting genesis")
-                        _genesis = {
-                            "height": 0,
-                            "prev_hash": "0" * 64,
-                            "merkle_root": _hl.sha3_256(b"").hexdigest(),
-                            "timestamp": 0,
-                            "nonce": 0,
-                            "difficulty": 1,
-                            "miner_address": "genesis",
-                            "data": {"genesis": True, "message": "QTCL Genesis Block"},
-                        }
-                        _genesis["hash"] = _hl.sha3_256(_j.dumps({k: _genesis[k] for k in sorted(_genesis.keys()) if k != "hash"}, separators=(",", ":")).encode()).hexdigest()
-                        self.db.insert_block(0, _genesis)
-                        _EXP_LOG.info(f"[MINER] Genesis block inserted with hash {_genesis['hash']}")
-                    except Exception as _db_err:
-                        _EXP_LOG.error(f"[MINER] Failed to wipe/reset DB: {_db_err}")
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
                 # Read authoritative difficulty from the server tip.
                 # The server's DifficultyManager sets this; the client must mine to
@@ -16480,11 +15065,10 @@ class QtclClientApp:
                         "transactions": _block_txs,
                     }
 
-                    # FIX: If seed refreshed during mining, coinbase w_proof and tx_id
-                    # were built with the old seed but _winning_seed may differ.
-                    # Rebuild coinbase and merkle_root using _winning_seed so the
-                    # server's merkle recomputation matches the submitted transaction list.
-                    if _winning_seed != _w_entropy_seed or True:  # always rebuild to be safe
+                    # Rebuild coinbase only if seed changed during mining (different nonce window).
+                    # REMOVED: `or True` — that forced a rebuild every block, producing a new
+                    # tx_id every submission and causing double coinbase in the DB.
+                    if _winning_seed != _w_entropy_seed:
                         _winning_cb_id = _hl.sha3_256(
                             json.dumps({
                                 "block_height": target_height,
@@ -16585,11 +15169,6 @@ class QtclClientApp:
                         _MINE_TELEM.record_submission(target_height, reward_qtcl)
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height}")
                         _EXP_LOG.info(f"[MINER-SIMPLE]    🪙 Reward: +{reward_qtcl:.2f} QTCL | Session Total: {_MINE_TELEM.total_earned_qtcl:.2f} QTCL")
-                        # ── P2P block gossip — announce to Ouroboros network ─────────
-                        if _P2P_NODE and _P2P_NODE._started:
-                            _full_block = dict(submit_payload)
-                            _full_block["hash"] = block_hash
-                            _P2P_NODE.announce_block(_full_block)
                     elif r.get("block_hash"):
                         # Ambiguous response - probably accepted; commit height
                         with _mining_lock:
@@ -17010,64 +15589,158 @@ class QtclClientApp:
             a(f"  Difficulty    : {tip_diff}   Timestamp: {tip_ts}")
 
             # ── Oracle W-state consensus ────────────────────────────
-            fid   = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or 0)
-            coh   = float(w_state.get("coherence") or w_state.get("coherence_l1") or 0)
-            pur   = float(w_state.get("purity") or 0)
-            ent   = float(w_state.get("entropy") or w_state.get("von_neumann_entropy") or 0)
-            mermin = float(w_state.get("mermin") or w_state.get("mermin_m3") or 0)
-            pq_c  = w_state.get("pq_curr") or pq0.get("pq_curr") or "?"
-            pq_l  = w_state.get("pq_last") or pq0.get("pq_last") or "?"
+            fid  = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or
+                         w_state.get("w3_fidelity") or 0)
+            coh  = min(1.0, max(0.0, float(w_state.get("coherence") or
+                                           w_state.get("coherence_l1") or 0)))
+            pur  = min(1.0, max(0.0, float(w_state.get("purity") or 0)))
+
+            # VN Entropy — server rarely returns it; compute from purity
+            _ent_srv = w_state.get("entropy") or w_state.get("von_neumann_entropy")
+            if _ent_srv:
+                ent = float(_ent_srv)
+            else:
+                try:
+                    import math as _m
+                    _lam1 = pur
+                    _lam_r = max(0.0, (1.0 - pur) / 7.0)
+                    ent = float(-(_lam1 * _m.log2(max(_lam1, 1e-12)) +
+                                   7.0 * _lam_r * _m.log2(max(_lam_r, 1e-12))))
+                    ent = max(0.0, min(3.0, ent))
+                except Exception:
+                    ent = 0.0
+
+            # Mermin — server returns:
+            #   "M"       → percentage of W3-max (0-100)  ← WRONG to display
+            #   "M_value" → actual Mermin scalar (0-4)    ← USE THIS
+            _mobj = (w_state.get("mermin_test") or w_state.get("bell_test") or
+                     w_state.get("mermin") or {})
+            if isinstance(_mobj, dict):
+                # M_value is the physical Mermin expectation value in [0,4]
+                # M (no suffix) is percentage of W3-optimal — do not confuse them
+                mermin  = float(_mobj.get("M_value") or _mobj.get("mermin_M") or 0)
+                _mq     = bool(_mobj.get("is_quantum") or _mobj.get("quantum") or
+                               _mobj.get("mermin_is_quantum") or mermin > 2.0)
+                _mverd  = str(_mobj.get("verdict") or _mobj.get("mermin_verdict") or "")
+            else:
+                mermin = float(_mobj or 0)
+                _mq    = mermin > 2.0
+                _mverd = ""
+            # Clamp to physical range [0, 4] — anything above is a field-name bug
+            if mermin > 4.0:
+                mermin = 0.0; _mq = False; _mverd = "(field error — check M_value key)"
+
+            # pq_curr / pq_last — buried in block_field sub-dict
+            _bf  = w_state.get("block_field") or {}
+            pq_c = str(_bf.get("pq_curr") or w_state.get("pq_curr") or
+                       w_state.get("pq_current") or pq0.get("pq_curr") or "?")
+            pq_l = str(_bf.get("pq_last") or w_state.get("pq_last") or
+                       pq0.get("pq_last") or "?")
+
+            # DM hex
             dm_hex = (w_state.get("density_matrix_hex") or
                       pq0.get("density_matrix_hex") or "—")
-            auth  = w_state.get("auth_tag") or pq0.get("auth_tag") or "—"
-            oracle_addr = w_state.get("oracle_address") or pq0.get("oracle_address") or "—"
+
+            # Oracle identity — server exposes oracle_id not oracle_address
+            oracle_addr = (w_state.get("oracle_id") or pq0.get("oracle_id") or
+                           w_state.get("oracle_role") or pq0.get("oracle_role") or
+                           "koyeb-primary")
+            _bh_label   = str(w_state.get("block_height") or
+                              pq0.get("block_height") or tip.get("block_height") or "—")
 
             a(HR)
             a("  ORACLE  —  5-node W-state consensus")
-            a(f"  Oracle address : {oracle_addr}")
-            a(f"  Auth tag       : {auth}")
-            a(f"  pq_curr / pq_last : {pq_c} / {pq_l}")
-            a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  {'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}")
+            a(f"  Oracle node    : {oracle_addr}")
+            a(f"  Block height   : {_bh_label}  |  pq_curr={pq_c}  pq_last={pq_l}")
+            a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
+              f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}")
             a(f"  Coherence  {_bar(coh)}  {coh:.6f}")
             a(f"  Purity     {_bar(pur)}  {pur:.6f}")
-            a(f"  VN Entropy  {ent:.6f} bits   Mermin ⟨M₃⟩: {mermin:+.4f}  "
-              f"{'✅ quantum' if mermin > 2.0 else '· classical'}")
+            a(f"  VN Entropy  {ent:.4f} bits   "
+              f"Mermin ⟨M₃⟩: {mermin:+.4f}  "
+              f"{'✅ QUANTUM' if _mq else '· classical'}"
+              f"{'  ' + _mverd[:40] if _mverd else ''}")
 
-            # ── DM hex — full, line-wrapped ─────────────────────────
+            # ── Density matrix — structured element display ─────────────────
+            # 8×8 complex128 row-major. Each element = 32 hex chars (re16+im16).
+            # Non-zero rows for |W3⟩: rows 1,2,4 only (|001⟩,|010⟩,|100⟩ basis).
             a(HR)
-            a("  DENSITY MATRIX HEX (full 2048 chars = 8×8 complex128 row-major)")
-            if dm_hex and dm_hex != "—":
-                chunk = W - 4
-                for i in range(0, len(dm_hex), chunk):
-                    a("  " + dm_hex[i:i + chunk])
+            a("  DENSITY MATRIX  8×8 complex128  (IEEE754 LE, row-major)")
+            if dm_hex and dm_hex != "—" and len(dm_hex) == 2048:
+                import struct as _dst
+                _nz_rows = [r for r in range(8)
+                            if any(c != "0" for c in dm_hex[r*256:(r+1)*256])]
+                a(f"  Non-zero rows: {_nz_rows}  (|W3⟩ expects [1,2,4])")
+                for _row in range(8):
+                    _row_hex = dm_hex[_row*256:(_row+1)*256]
+                    if not any(c != "0" for c in _row_hex):
+                        continue
+                    _parts = []
+                    for _col in range(8):
+                        _eh = _row_hex[_col*32:(_col+1)*32]
+                        if any(c != "0" for c in _eh):
+                            try:
+                                _re = _dst.unpack_from("<d", bytes.fromhex(_eh[:16]))[0]
+                                _im = _dst.unpack_from("<d", bytes.fromhex(_eh[16:]))[0]
+                                _parts.append(f"[{_col}]={_re:+.3f}{_im:+.3f}j")
+                            except Exception:
+                                _parts.append(f"[{_col}]={_eh[:8]}…")
+                    a(f"  row[{_row}]  " + "  ".join(_parts))
+            elif dm_hex and dm_hex != "—":
+                a(f"  (unexpected length {len(dm_hex)}, expected 2048 — truncated)")
             else:
-                a("  (not available)")
+                a("  (not available — SSE oracle DM not yet received)")
 
             # ── Per-node breakdown ──────────────────────────────────
-            nodes = (w_state.get("per_node") or w_state.get("nodes") or
-                     pq0.get("per_node") or [])
+            # server key: oracle_measurements (from _gather_oracle_cluster_metrics)
+            nodes = (w_state.get("oracle_measurements") or
+                     w_state.get("per_node") or w_state.get("nodes") or
+                     pq0.get("oracle_measurements") or pq0.get("per_node") or [])
             if nodes:
                 a(HR)
                 a("  PER-NODE MEASUREMENTS")
                 for idx, nd in enumerate(nodes):
-                    nf   = float(nd.get("fidelity") or nd.get("w_state_fidelity") or 0)
-                    nc   = float(nd.get("coherence") or 0)
-                    role = nd.get("role") or f"oracle_{idx+1}"
-                    naddr = nd.get("address") or nd.get("oracle_address") or "—"
-                    ntag  = nd.get("auth_tag") or "—"
-                    a(f"  [{idx+1}] {_pad(role, 20)} F={nf:.4f}  C={nc:.4f}")
-                    a(f"      address  : {naddr}")
-                    a(f"      auth_tag : {ntag}")
+                    nf    = float(nd.get("w_state_fidelity") or nd.get("fidelity") or 0)
+                    nc    = min(1.0, float(nd.get("coherence") or 0))
+                    nent  = float(nd.get("entropy") or 0)
+                    role  = nd.get("oracle_role") or nd.get("role") or f"oracle_{idx+1}"
+                    nid   = nd.get("oracle_id") or nd.get("id") or f"node_{idx+1}"
+                    cons  = "✅" if nd.get("in_consensus") else "·"
+                    a(f"  [{idx+1}] {cons} {_pad(role, 22)} F={nf:.4f}  C={nc:.4f}  S={nent:.3f}")
+                    a(f"      id: {nid}")
 
             # ── pq0 Bloch vector ───────────────────────────────────
-            bloch_x = pq0.get("bloch_x") or pq0.get("x") or "—"
-            bloch_y = pq0.get("bloch_y") or pq0.get("y") or "—"
-            bloch_z = pq0.get("bloch_z") or pq0.get("z") or "—"
-            pq0_fid = pq0.get("pq0_fidelity") or pq0.get("fidelity") or "—"
+            # server returns pq0_bloch_theta (polar) + pq0_bloch_phi (azimuthal)
+            import math as _bmath
+            # pq0 endpoint key names: 'theta'/'phi' (primary), 'pq0_bloch_theta' (alt)
+            _btheta = (pq0.get("theta") or pq0.get("pq0_bloch_theta") or
+                       pq0.get("bloch_theta") or pq0.get("bloch_x"))
+            _bphi   = (pq0.get("phi")   or pq0.get("pq0_bloch_phi")   or
+                       pq0.get("bloch_phi")   or pq0.get("bloch_y"))
+            if _btheta is not None and _bphi is not None:
+                try:
+                    _bt = float(_btheta); _bp = float(_bphi)
+                    bloch_x = f"{_bmath.sin(_bt)*_bmath.cos(_bp):.4f}"
+                    bloch_y = f"{_bmath.sin(_bt)*_bmath.sin(_bp):.4f}"
+                    bloch_z = f"{_bmath.cos(_bt):.4f}"
+                    bloch_raw = f"θ={_bt:.4f}  φ={_bp:.4f}"
+                except Exception:
+                    bloch_x = bloch_y = bloch_z = "—"; bloch_raw = "—"
+            else:
+                bloch_x = pq0.get("bloch_x") or "—"
+                bloch_y = pq0.get("bloch_y") or "—"
+                bloch_z = pq0.get("bloch_z") or "—"
+                bloch_raw = "—"
+            pq0_fid = (pq0.get("pq0_oracle_fidelity") or pq0.get("pq0_fidelity") or
+                       pq0.get("fidelity") or w_state.get("pq0_oracle_fidelity") or "—")
+            # pq0 tripartite components
+            pq0_iv = w_state.get("pq0_IV_fidelity") or pq0.get("pq0_IV_fidelity") or "—"
+            pq0_v  = w_state.get("pq0_V_fidelity")  or pq0.get("pq0_V_fidelity")  or "—"
             a(HR)
             a("  pq0 ORACLE ANCHOR  (Poincaré origin — {8,3} hyperbolic lattice)")
-            a(f"  Bloch vector  : x={bloch_x}  y={bloch_y}  z={bloch_z}")
-            a(f"  pq0 fidelity  : {pq0_fid}")
+            a(f"  Bloch (θ,φ)   : {bloch_raw}")
+            a(f"  Cartesian     : x={bloch_x}  y={bloch_y}  z={bloch_z}")
+            a(f"  pq0 fidelity  : oracle={pq0_fid}  IV={pq0_iv}  V={pq0_v}")
 
             # ── Mempool ────────────────────────────────────────────
             pending = mempool.get("transactions") or mempool.get("pending") or []
