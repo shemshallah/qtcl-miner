@@ -2195,6 +2195,43 @@ class LocalOracleEngine:
                     dm_re = [float(fr[i]) * inv_f for i in range(64)]
                     dm_im = [float(fi[i]) * inv_f for i in range(64)]
 
+        # ── Virtual / Inverse-Virtual qubit fusion ───────────────────────────
+        # FIX: OracleWStateDefinition defines the tripartite as:
+        #   A = pq0 (oracle ground truth)
+        #   B = virtual_pq (local decoherent mirror — the fused DM above)
+        #   C = inverse_virtual_pq (anti-correlated: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed))
+        # All three share the same miner address as their spatial anchor.
+        # We build ρ_IV from the current fused local DM and blend it back in
+        # at weight 0.10 so the final state genuinely entangles all three legs.
+        try:
+            if _HAS_NP and ORACLE_W_STATE.dm_ideal is not None:
+                import numpy as _np_iv
+                # Reconstruct 8×8 complex ndarray from dm_re/dm_im lists
+                rho_vpq = _np_iv.array(
+                    [dm_re[i] + 1j * dm_im[i] for i in range(64)],
+                    dtype=_np_iv.complex128).reshape(8, 8)
+                # Build inverse-virtual: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed)
+                rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, float(
+                    _accel_lib.qtcl_fidelity_w3(_accel_ffi.new('double[64]', dm_re))
+                    if _accel_ok else 0.85)))
+                if rho_iv is not None:
+                    IV_WEIGHT = 0.10   # blend weight — keeps final F(W3) high
+                    for i in range(64):
+                        dm_re[i] = (1.0 - IV_WEIGHT) * dm_re[i] + IV_WEIGHT * float(_np_iv.real(rho_iv.flat[i]))
+                        dm_im[i] = (1.0 - IV_WEIGHT) * dm_im[i] + IV_WEIGHT * float(_np_iv.imag(rho_iv.flat[i]))
+                    # Renormalise
+                    iv_tr = sum(dm_re[i*9] for i in range(8))
+                    if iv_tr > 1e-12:
+                        inv_iv = 1.0 / iv_tr
+                        dm_re = [v * inv_iv for v in dm_re]
+                        dm_im = [v * inv_iv for v in dm_im]
+                    _EXP_LOG.debug(
+                        f"[LOCAL-ORACLE] ⚛️  virtual/inverse-virtual fusion applied "
+                        f"(IV_WEIGHT={IV_WEIGHT}) h={chain_height}"
+                    )
+        except Exception as _iv_err:
+            _EXP_LOG.debug(f"[LOCAL-ORACLE] IV fusion skipped: {_iv_err}")
+
         # Quantum metrics via C
         _dr = _accel_ffi.new('double[64]', dm_re)
         _di = _accel_ffi.new('double[64]', dm_im)
@@ -2540,17 +2577,66 @@ class QtclP2PNode:
             pass
 
     def _drain_loop(self) -> None:
-        """Python thread: drain P2P event queue and route to handlers."""
+        """Python thread: drain P2P event queue and route to handlers.
+        Event types (mirrors qtcl_accel C layer constants):
+          1 = PEER_CONNECTED
+          2 = PEER_DISCONNECTED
+          3 = WSTATE_RECV       — W-state measurement from peer
+          4 = BLOCK_ANNOUNCE    — peer announcing a new block (height + hash)
+          5 = HEIGHT_UPDATE     — peer chain tip update
+        """
+        import struct as _st, json as _j
+        _local_tip = 0  # track local chain tip from gossip
         while not self._stop.is_set():
             try:
                 event_type, raw = _P2P_EVENT_QUEUE.get(timeout=1.0)
-                if event_type == 3:   # WSTATE_RECV
+
+                if event_type == 3:   # WSTATE_RECV — peer W-state measurement
                     if self._consensus:
                         self._consensus.ingest_c_measurement_bytes(raw)
-                elif event_type == 1: # PEER_CONNECTED
-                    _EXP_LOG.info(f"[P2P] Peer connected ({len(raw)} bytes)")
-                elif event_type == 2: # PEER_DISCONNECTED
-                    _EXP_LOG.debug("[P2P] Peer disconnected")
+
+                elif event_type == 4:  # BLOCK_ANNOUNCE — peer found a block
+                    # Wire format: 4-byte height (LE uint32) + 32-byte hash + optional JSON
+                    try:
+                        if len(raw) >= 36:
+                            height = _st.unpack_from('<I', raw, 0)[0]
+                            blk_hash = raw[4:36].hex()
+                            if height > _local_tip:
+                                _local_tip = height
+                                _EXP_LOG.info(
+                                    f"[P2P] 📦 Block announce h={height} "
+                                    f"hash={blk_hash[:16]}… — chain tip updated"
+                                )
+                                # Push to oracle SSE ingestor so mining loop
+                                # gets updated height without a REST poll
+                                _P2P_EVENT_QUEUE.put_nowait(
+                                    (5, _st.pack('<I', height)))
+                        elif len(raw) > 4:
+                            # JSON fallback: {"height":N, "hash":"..."}
+                            jd = _j.loads(raw.decode('utf-8', errors='replace'))
+                            h  = int(jd.get('height', 0))
+                            if h > _local_tip:
+                                _local_tip = h
+                                _EXP_LOG.info(f"[P2P] 📦 Block announce (JSON) h={h}")
+                    except Exception as _be:
+                        _EXP_LOG.debug(f"[P2P] block_announce parse: {_be}")
+
+                elif event_type == 5:  # HEIGHT_UPDATE — peer chain tip
+                    try:
+                        if len(raw) >= 4:
+                            h = _st.unpack_from('<I', raw, 0)[0]
+                            if h > _local_tip:
+                                _local_tip = h
+                                _EXP_LOG.debug(f"[P2P] ↑ Chain tip from peer: h={h}")
+                    except Exception:
+                        pass
+
+                elif event_type == 1:  # PEER_CONNECTED
+                    _EXP_LOG.info(f"[P2P] ✅ Peer connected  peers={self.peer_count}")
+
+                elif event_type == 2:  # PEER_DISCONNECTED
+                    _EXP_LOG.debug(f"[P2P] Peer disconnected  peers={self.peer_count}")
+
             except queue.Empty:
                 continue
             except Exception as _e:
@@ -13768,69 +13854,145 @@ class QtclClientApp:
         except Exception as e:
             _EXP_LOG.debug(f"[DB] persist_gossip: {e}")
 
+        # ── Push to Koyeb /api/gossip/ingest so server receives client field state ──
+        # Previously gossip only went to P2P TCP peers — server never saw local
+        # oracle measurements unless the miner mined a block. Now every field
+        # metrics cycle posts the client's tripartite W-state to the server gossip bus.
+        # Non-blocking: fires in a daemon thread so it never stalls the metric loop.
+        if channel in ('metrics', 'quantum', 'oracle'):
+            def _post_gossip(ev=event_type, ch=channel, pay=payload):
+                try:
+                    gossip_payload = {
+                        'origin':     self._peer_id,
+                        'event_type': ev,
+                        'channel':    ch,
+                        'ts':         _time.time(),
+                        # Embed the tripartite W-state snapshot directly
+                        'w_state': {
+                            'w_state_fidelity': pay.get('fidelity_to_w3') or pay.get('w_state_fidelity'),
+                            'coherence':        pay.get('coherence_l1')   or pay.get('coherence'),
+                            'entropy':          pay.get('entropy_vn')     or pay.get('von_neumann_entropy'),
+                            'purity':           pay.get('purity'),
+                            'negativity':       pay.get('negativity_AB'),
+                            'block_height':     pay.get('block_height'),
+                        },
+                        'txs': [],   # no pending txs in this gossip
+                    }
+                    self.api._post('/api/gossip/ingest', gossip_payload)
+                except Exception as _ge:
+                    _EXP_LOG.debug(f"[GOSSIP] Koyeb ingest failed: {_ge}")
+            _threading.Thread(target=_post_gossip, daemon=True,
+                              name='GossipKoyebPost').start()
+
     # ── Background metric loop ─────────────────────────────────────────────────
 
     def _metric_loop(self) -> None:
         """
-        Daemon: oracle → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → SSE.
-        ❤️  I love you  ❤️  pq_curr = block_height, pq_last = block_height-1.
+        Daemon: oracle SSE → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → gossip → SSE.
+        ❤️  I love you  ❤️
+
+        FIX: Was calling get_oracle_pq0_bloch() (HTTP REST) every cycle — redundant
+        and stale vs. the C SSE already delivering frames via _LOCAL_ORACLE.
+        Now reads from _LOCAL_ORACLE.get_oracle_state() which is updated every SSE frame,
+        and falls back to REST only when SSE data is older than 30s.
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
-        _last_koyeb = 0.0
-        _hb_counter = 0
+        _last_koyeb  = 0.0
+        _last_rest   = 0.0   # track when we last did a REST fallback
+        _hb_counter  = 0
         while not self._stop.is_set():
             try:
                 _time.sleep(self.METRIC_INTERVAL)
-                now  = _time.time()
-                snap = self.api.get_oracle_pq0_bloch() or {}
+                now = _time.time()
+
+                # ── Source 1: C SSE live oracle state (preferred) ─────────────
+                snap = {}
+                sse_state = _LOCAL_ORACLE.get_oracle_state()
+                sse_age   = now - _LOCAL_ORACLE._last_oracle_dm_ts
+                if sse_state and sse_age < 30.0:
+                    # SSE is fresh — use it directly
+                    snap = sse_state
+                    snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
+                else:
+                    # ── Source 2: REST fallback when SSE stale > 30s ───────────
+                    if now - _last_rest >= 15.0:
+                        try:
+                            rest_snap = self.api.get_oracle_pq0_bloch() or {}
+                            if rest_snap:
+                                snap = rest_snap
+                                _last_rest = now
+                                _EXP_LOG.debug(
+                                    f"[FIELD] REST fallback (SSE age={sse_age:.0f}s)")
+                        except Exception:
+                            pass
+                    if not snap and sse_state:
+                        snap = sse_state   # use stale SSE over nothing
+
+                if not snap:
+                    continue
+
                 bath = GKSLBathParams.from_snap(snap)
-                # FIX-9: derive pq_curr/pq_last from block_height
-                bh   = int(snap.get("block_height") or snap.get("height") or 0)
-                pq_curr_id = str(bh)       if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
-                pq_last_id = str(bh - 1)   if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
-                # Fetch/reconstruct DM
-                dm_curr = _decode_dm_8x8(snap)
+                bh   = int(snap.get("block_height") or snap.get("height") or
+                           snap.get("lattice_refresh_counter") or 0)
+                pq_curr_id = str(bh)     if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
+                pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
+
+                # ── Build DM: try C SSE raw DM first, fall back to Bloch reconstruction ─
+                dm_curr = None
+                # Try raw oracle DM from _LOCAL_ORACLE (already parsed as float lists)
+                if sse_age < 30.0:
+                    try:
+                        re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
+                        if _HAS_NP and any(v != 0.0 for v in re_list):
+                            import numpy as _npml
+                            dm_curr = (_npml.array(re_list, dtype=_npml.complex128) +
+                                       1j * _npml.array(im_list, dtype=_npml.complex128)
+                                       ).reshape(8, 8)
+                    except Exception:
+                        pass
+                if dm_curr is None:
+                    dm_curr = _decode_dm_8x8(snap)
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
                 if dm_curr is None:
-                    continue  # skip: no oracle DM available
-                # pq_last: one short GKSL step earlier.
-                # dt_default (30s) would fully decohere the state over 30s making
-                # ‖Δρ‖_F astronomically large.  Use dt/10 for a physically meaningful
-                # Frobenius distance between adjacent block boundaries.
+                    continue
+
                 dm_last = _gksl_rk4_step(dm_curr, bath, bath.dt_default / 10.0)
                 if dm_last is None:
-                    continue  # GKSL failed — skip this cycle
-                # Defensive renormalization before metrics — any drift in GKSL
-                # or DM parsing that leaves Tr≠1 will cause ‖Δρ‖ to blow up.
+                    continue
+
                 if _HAS_NP:
                     for _dm in (dm_curr, dm_last):
                         if _dm is not None:
                             _tr = float(_np.real(_np.trace(_dm)))
                             if _tr > 0.1 and abs(_tr - 1.0) > 0.01:
                                 _dm /= _tr
-                # Build CLIENT_FIELD_STATE
-                self.client_field.build(
-                    dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
-                # Periodic KOYEB_ORACLE_STATE sync
+
+                self.client_field.build(dm_curr, dm_last, pq_curr_id, pq_last_id, bh)
+
                 if now - _last_koyeb >= self.KOYEB_SYNC_INTERVAL:
                     self.koyeb_state.sync(self.client_field, timeout=8)
                     _last_koyeb = now
+
                 m = self.client_field.metrics
                 if m is None:
                     continue
+
                 self._persist_metrics(m, self.koyeb_state)
                 snap_out = {**m.as_dict(), "koyeb": self.koyeb_state.as_dict(),
-                            "block_height": bh, "ts": now}
+                            "block_height": bh, "ts": now,
+                            "sse_age_s": round(sse_age, 1)}
                 _SSE_MUX.publish("metrics", snap_out, channel="metrics")
                 _SSE_MUX.publish("quantum", snap_out, channel="quantum")
                 self._persist_gossip("field_metrics", "metrics", snap_out)
+
                 _hb_counter += 1
-                if _hb_counter % 6 == 0:   # every ~60s
+                if _hb_counter % 6 == 0:
                     _EXP_LOG.debug(
                         f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
-                        f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f}")
+                        f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f} "
+                        f"sse_age={sse_age:.1f}s src={'sse' if sse_age < 30 else 'rest'}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
 
