@@ -13681,8 +13681,7 @@ class QtclClientApp:
         self._db_path      = _Path("qtcl_blockchain.db")  # FIX: Use main blockchain DB, not isolated client DB
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
-            f"qtcl_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}"
-        )   # NOTE: overwritten with stable wallet-derived ID after wallet loads — see on_start()
+            f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
 
     # ── DB ─────────────────────────────────────────────────────────────────────
 
@@ -13913,40 +13912,9 @@ class QtclClientApp:
                _nv(snap.get("w_state_fidelity")) or 0.0)
         print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}")
 
-        # ── Stable peer_id derived from wallet address (survives restarts) ──────
-        # Was: hash(time.time()) → new orphan row every restart, heartbeats miss
-        # Now: hash(wallet.address) → same row always, last_seen refreshes correctly
-        self._peer_id = f"qtcl_{_hashlib.sha256(self.wallet.address.encode()).hexdigest()[:24]}"
-
-        # Register peer with server — upserts peer_registry row
-        self.api.register_peer(
-            self._peer_id,
-            f"http://localhost:9091",
-            self.wallet.address,
-            bh,
-        )
-
-        # ── Persistent heartbeat thread — keeps miner 'live' in dashboard ─────
-        # Fires every 25 s (server stale threshold = 300 s).
-        # Without this, miner shows as 'seen' after 5 min then 'historic' after 24 h.
-        def _hb_loop():
-            import time as _t
-            while True:
-                _t.sleep(25)
-                try:
-                    self.api.send_heartbeat(self._peer_id, self.db.get_chain_height() if self.db else 0)
-                except Exception:
-                    pass
-                try:
-                    # Also hit /api/miners/heartbeat (new endpoint) for belt-and-suspenders
-                    self.api._post("/api/miners/heartbeat", {
-                        "miner_address": self.wallet.address,
-                        "peer_id": self._peer_id,
-                        "block_height": self.db.get_chain_height() if self.db else 0,
-                    })
-                except Exception:
-                    pass
-        _threading.Thread(target=_hb_loop, daemon=True, name="MinerHeartbeat").start()
+        # Register peer
+        self.api.register_peer(self._peer_id, f"http://localhost:9091",
+                                self.wallet.address, bh)
 
         self._start_threads()
         try:
@@ -14990,11 +14958,10 @@ class QtclClientApp:
                         "transactions": _block_txs,
                     }
 
-                    # FIX: If seed refreshed during mining, coinbase w_proof and tx_id
-                    # were built with the old seed but _winning_seed may differ.
-                    # Rebuild coinbase and merkle_root using _winning_seed so the
-                    # server's merkle recomputation matches the submitted transaction list.
-                    if _winning_seed != _w_entropy_seed or True:  # always rebuild to be safe
+                    # Rebuild coinbase only if seed changed during mining (different nonce window).
+                    # REMOVED: `or True` — that forced a rebuild every block, producing a new
+                    # tx_id every submission and causing double coinbase in the DB.
+                    if _winning_seed != _w_entropy_seed:
                         _winning_cb_id = _hl.sha3_256(
                             json.dumps({
                                 "block_height": target_height,
