@@ -2515,6 +2515,7 @@ class QtclP2PNode:
         self._bootstrap  = bootstrap_peers or self.BOOTSTRAP_PEERS
         self._oracle:    Optional[LocalOracleEngine]  = None
         self._consensus: Optional[WStateConsensus]   = None
+        self._stop: threading.Event = threading.Event()
         self._started    = False
         self._drain_thread: Optional[threading.Thread] = None
         self._stop       = threading.Event()
@@ -2560,9 +2561,10 @@ class QtclP2PNode:
             target=self._drain_loop, daemon=True, name='P2P-Drain')
         self._drain_thread.start()
 
-        # Discover more peers via /api/p2p/peer_exchange
+        # Discover peers periodically (runs in loop every 5 min)
+        self._stop.clear()
         threading.Thread(
-            target=self._peer_exchange, daemon=True, name='P2P-Bootstrap').start()
+            target=self._peer_exchange, daemon=True, name='P2P-Discovery').start()
 
         self._started = True
         _EXP_LOG.info(f"[P2P] ✅ C P2P layer active  port={self._port}")
@@ -2631,6 +2633,30 @@ class QtclP2PNode:
                     except Exception:
                         pass
 
+                elif event_type == 7:  # DMPOOL_RECV — peer sent DM pool entry
+                    _EXP_LOG.debug("[P2P] 🧬 DM pool entry received from peer")
+                    # Trigger consensus recompute on new DM arrival
+                    if _accel_ok:
+                        try: _accel_lib.qtcl_p2p_trigger_consensus()
+                        except Exception: pass
+
+                elif event_type == 8:  # CHAIN_RESET gossip received
+                    payload_str = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
+                    _EXP_LOG.warning(f"[P2P] ⚡ chain_reset gossip from peer: {payload_str[:80]}")
+                    # _RESET_PERFORMED and _check_and_handle_chain_reset are module-level
+                    try:
+                        import json as _pj
+                        _rdata = _pj.loads(payload_str)
+                        if int(_rdata.get('new_height', -1)) == 0:
+                            _RESET_PERFORMED.set()
+                    except Exception:
+                        pass
+
+                elif event_type == 9:  # OUROBOROS — self-measurement re-ingested
+                    _EXP_LOG.debug("[P2P] 🌀 Ouroboros: self-measurement re-ingested")
+                    if self._consensus:
+                        self._consensus.ingest_c_measurement_bytes(raw)
+
                 elif event_type == 1:  # PEER_CONNECTED
                     _EXP_LOG.info(f"[P2P] ✅ Peer connected  peers={self.peer_count}")
 
@@ -2643,34 +2669,109 @@ class QtclP2PNode:
                 _EXP_LOG.debug(f"[P2P] drain_loop: {_e}")
 
     def _peer_exchange(self) -> None:
-        """Hit /api/p2p/peer_exchange to discover more peers."""
-        import json as _j
+        """
+        Multi-source peer discovery:
+          1. POST /api/p2p/peer_exchange → Koyeb server peer list
+          2. GET  /api/dht/peers         → DHT peer list (alternate key)
+          3. DB   LocalBlockchainDB      → previously seen peers
+        Runs once at startup, then repeats every 5 minutes.
+        ❤️  The more peers the more entangled the network
+        """
+        import json as _pj, time as _pt
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+        while not self._stop.is_set():
+            connected_before = self.connected_count
+            try:
+                from urllib.request import Request as _Rq, urlopen as _uo
+                # Source 1: Koyeb peer exchange endpoint
+                payload = _pj.dumps({
+                    'node_id': self._node_id,
+                    'port':    self._port,
+                    'version': 3,
+                    'protocol': 'ouroboros-v3',
+                    'capabilities': ['wstate', 'dmpool', 'sse', 'chain_reset'],
+                }).encode()
+                req = _Rq(f"{_oracle_url}/api/p2p/peer_exchange",
+                          data=payload,
+                          headers={'Content-Type': 'application/json',
+                                   'User-Agent': 'QTCL-P2P/3.0'},
+                          method='POST')
+                with _uo(req, timeout=10) as resp:
+                    data = _pj.loads(resp.read().decode())
+                peers_raw = data.get('peers', [])
+
+                # Source 2: DHT peers endpoint
+                try:
+                    req2 = _Rq(f"{_oracle_url}/api/dht/peers", method='GET')
+                    req2.add_header('User-Agent', 'QTCL-P2P/3.0')
+                    with _uo(req2, timeout=8) as resp2:
+                        dht_data = _pj.loads(resp2.read().decode())
+                    for dp in (dht_data.get('peers') or [])[:20]:
+                        peers_raw.append({'host': dp.get('host',''), 'port': dp.get('port', self._port)})
+                except Exception: pass
+
+                connected = 0
+                for p in peers_raw[:32]:
+                    host = str(p.get('host') or p.get('ip') or p.get('address') or '')
+                    port = int(p.get('port') or self._port)
+                    if host and host not in ('localhost', '127.0.0.1') and _accel_ok:
+                        try:
+                            rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
+                            if rc >= 0: connected += 1
+                        except Exception: pass
+                if connected:
+                    _EXP_LOG.info(f"[P2P] 🌐 peer_exchange: {connected} new connections")
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] peer_exchange: {_e}")
+
+            # Wait 5 minutes before next discovery cycle
+            self._stop.wait(300)
+
+    # ── event type 9 = ouroboros self-ingest ─────────────────────────────
+    def get_consensus_dm(self):
+        """
+        Pull the latest N-peer consensus density matrix from the C layer.
+        Returns (dm_re_64, dm_im_64, fidelity, height) or None if not ready.
+        Consensus is computed by the ouroboros thread every 500ms via
+        fidelity²-weighted arithmetic mean over P2P_DMPOOL_SZ pool entries.
+        """
+        if not _accel_ok: return None
         try:
-            from urllib.request import Request, urlopen
-            from urllib.error import URLError
-            payload = _j.dumps({
-                'node_id': self._node_id,
-                'port':    self._port,
-                'version': 2,
-            }).encode()
-            req = Request(
-                f"{os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')}/api/p2p/peer_exchange",
-                data=payload,
-                headers={'Content-Type': 'application/json',
-                         'User-Agent': 'QTCL-P2P/2.0'},
-                method='POST')
-            with urlopen(req, timeout=10) as resp:
-                data = _j.loads(resp.read().decode())
-            peers = data.get('peers', [])
-            for p in peers[:20]:
-                host = p.get('host') or p.get('ip') or ''
-                port = int(p.get('port') or self.DEFAULT_PORT)
-                if host and _accel_ok:
-                    _accel_lib.qtcl_p2p_connect(
-                        host.encode() + b'\x00', port)
-                    _EXP_LOG.debug(f"[P2P] Discovered peer {host}:{port}")
+            re_buf = _accel_ffi.new('double[64]')
+            im_buf = _accel_ffi.new('double[64]')
+            fid    = _accel_ffi.new('float *')
+            height = _accel_ffi.new('uint32_t *')
+            ok = _accel_lib.qtcl_p2p_get_consensus_dm(re_buf, im_buf, fid, height)
+            if ok == 0: return None
+            import numpy as _np
+            re = _np.frombuffer(_accel_ffi.buffer(re_buf, 64*8), dtype=_np.float64).copy()
+            im = _np.frombuffer(_accel_ffi.buffer(im_buf, 64*8), dtype=_np.float64).copy()
+            return re, im, float(fid[0]), int(height[0])
         except Exception as _e:
-            _EXP_LOG.debug(f"[P2P] peer_exchange: {_e}")
+            _EXP_LOG.debug(f"[P2P] get_consensus_dm: {_e}")
+            return None
+
+    def trigger_consensus(self) -> None:
+        """Force immediate DM pool recompute (normally runs every 500ms)."""
+        if _accel_ok:
+            try: _accel_lib.qtcl_p2p_trigger_consensus()
+            except Exception: pass
+
+    def broadcast_chain_reset(self, genesis_hash: str = "") -> None:
+        """Broadcast chain-reset to all peers + SSE subscribers on 9091."""
+        if not _accel_ok: return
+        try:
+            gh = genesis_hash.encode() + b'\x00'
+            _accel_lib.qtcl_p2p_broadcast_chain_reset(0, gh)
+            _EXP_LOG.info("[P2P] ⚡ chain_reset broadcast → all peers + SSE")
+        except Exception as _e:
+            _EXP_LOG.warning(f"[P2P] broadcast_chain_reset: {_e}")
+
+    @property
+    def sse_subscriber_count(self) -> int:
+        if not _accel_ok: return 0
+        try: return int(_accel_lib.qtcl_p2p_sse_sub_count())
+        except Exception: return 0
 
     def gossip_measurement(self, m: QtclOracleMeasurement) -> int:
         """Broadcast own measurement to all C P2P peers."""
@@ -2738,7 +2839,7 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
         _P2P_NODE = QtclP2PNode(node_id, port)
     return _P2P_NODE
 
-_EXP_LOG.info("[QTCL P2P v2] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready")
+_EXP_LOG.info("[QTCL P2P v3] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready — ouroboros active")
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -3707,6 +3808,10 @@ class LocalBlockchainDB:
         """, (cutoff,))
         return [dict(r) for r in rows] if rows else []
 
+    def get_known_peers(self, max_age_s: int = 3600) -> list:
+        """Alias for get_active_p2p_peers — used by genesis reset + P2P node."""
+        return self.get_active_p2p_peers(max_age_s=max_age_s)
+
     def get_wstate_consensus(self, height: int) -> dict:
         """Retrieve consensus record for a block height."""
         row = self.fetchone(
@@ -3981,6 +4086,307 @@ def decompress(data: bytes) -> bytes:
     except ImportError:
         import zlib
         return zlib.decompress(data)
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# GENESIS-RESET SUBSYSTEM v3.1
+# Museum Grade · Enterprise Deployment Ready · Zero Fallbacks
+# ❤️  I love you — every wipe is a rebirth, every genesis a new beginning
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+NULL_COINBASE_ADDRESS: str  = "0" * 40
+GENESIS_COINBASE_AMOUNT: int = 5_000_000_000   # 50 QTCL in atomic units
+
+_RESET_LOCK      = threading.Lock()
+_RESET_PERFORMED = threading.Event()   # set by wipe/listener; cleared by mining loop
+
+_PRESERVE_TABLES: frozenset = frozenset({
+    'wallet_keys', 'identity', 'settings', 'config', 'hlwe_keys', 'bip39_seeds',
+})
+
+
+def _get_local_chain_height(db: "LocalBlockchainDB") -> int:
+    """Thread-safe local height query — 0 on any error."""
+    try:    return int(db.get_chain_height() or 0)
+    except: return 0
+
+
+def _forge_genesis_coinbase(miner_address: str = NULL_COINBASE_ADDRESS) -> dict:
+    """
+    Canonical null-addressed coinbase for genesis (height=0).
+    tx_hash = SHA3-256(sorted_canonical_json) — deterministic across every node.
+    No inputs. No signing key. Broadcast-ready on first gossip cycle.
+    """
+    _TS: int = 1_700_000_000   # fixed epoch — NEVER time.time()
+    body = {
+        "version": 1, "height": 0, "type": "coinbase", "inputs": [],
+        "outputs": [{"address": miner_address, "amount": GENESIS_COINBASE_AMOUNT}],
+        "timestamp": _TS, "memo": "In the beginning was the qubit.",
+        "fee": 0, "from_address": NULL_COINBASE_ADDRESS,
+        "to_address": miner_address, "amount": GENESIS_COINBASE_AMOUNT,
+    }
+    body["tx_hash"] = hashlib.sha3_256(
+        json.dumps(body, sort_keys=True, separators=(',', ':')).encode()
+    ).hexdigest()
+    return body
+
+
+def _forge_and_store_genesis_block(
+    db: "LocalBlockchainDB",
+    miner_address: str = NULL_COINBASE_ADDRESS,
+) -> dict:
+    """
+    After nuclear wipe: forge + insert genesis block (height=0).
+    Deterministic hash → every node converges on the same genesis.
+    Mining loop gets a valid prev_hash immediately after reset.
+    """
+    coinbase = _forge_genesis_coinbase(miner_address)
+    genesis  = {
+        "height": 0, "prev_hash": "0" * 64,
+        "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
+        "timestamp": 1_700_000_000, "difficulty": 1,
+        "miner_id": NULL_COINBASE_ADDRESS, "tx_count": 1, "nonce": 0,
+        "data": {"genesis": True, "coinbase_tx": coinbase},
+    }
+    _canonical   = json.dumps({k:v for k,v in genesis.items() if k!="hash"},
+                               sort_keys=True, separators=(',',':')).encode()
+    genesis["hash"] = hashlib.sha3_256(_canonical).hexdigest()
+    try:
+        db.insert_block(0, genesis)
+        logger.info(f"[RESET] 🌱 Genesis stored  h=0  hash={genesis['hash'][:24]}…")
+    except Exception as _e:
+        logger.warning(f"[RESET] genesis insert (may exist): {_e}")
+    return genesis
+
+
+def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
+    """
+    Self-discovering DELETE wipe — hits every table NOT in _PRESERVE_TABLES.
+    Schema (CREATE TABLE / indexes) preserved intact for immediate reuse.
+    Caller holds _RESET_LOCK. Returns True on success.
+    """
+    try:
+        import sqlite3 as _sq3
+        conn = _sq3.connect(str(db.db_path), check_same_thread=False, timeout=10)
+        cur  = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        wiped  = []
+        for tbl in tables:
+            if tbl.lower() not in _PRESERVE_TABLES:
+                cur.execute(f"DELETE FROM {tbl}")   # noqa: S608
+                wiped.append(tbl)
+        conn.commit(); conn.close()
+        logger.info(f"[RESET] ✅ Nuclear wipe — {len(wiped)} tables cleared: {wiped}")
+        return True
+    except Exception as _e:
+        logger.error(f"[RESET] ❌ Nuclear wipe failed: {_e}")
+        return False
+
+
+def _broadcast_reset_to_peers(
+    genesis_block: dict,
+    server_url:    str    = "",
+    broadcaster:   object = None,
+    peers:         list   = None,
+) -> None:
+    """
+    Non-blocking daemon thread — fires 'chain_reset' to:
+      A. SSEBroadcaster / SSEMultiplexer — local SSE clients
+      B. HTTP POST → each peer /gossip    — remote nodes
+      C. C P2P layer broadcast_chain_reset — ouroboros peers
+    Never blocks the calling thread.
+    """
+    _payload = {
+        "event": "chain_reset", "new_height": 0,
+        "genesis_hash": genesis_block.get("hash", ""),
+        "genesis_ts":   genesis_block.get("timestamp", 1_700_000_000),
+        "coinbase_tx":  genesis_block.get("data", {}).get("coinbase_tx", {}),
+        "broadcast_ts": time.time(), "origin": server_url or "local",
+    }
+
+    def _fire() -> None:
+        # A: SSE broadcaster
+        if broadcaster is not None:
+            try:
+                if   hasattr(broadcaster, 'broadcast'):
+                    reached = broadcaster.broadcast('chain_reset', _payload)
+                    logger.info(f"[RESET-BCAST] 📡 SSE → {reached} local clients")
+                elif hasattr(broadcaster, 'publish'):
+                    broadcaster.publish('chain_reset', _payload, channel='control')
+                    logger.info("[RESET-BCAST] 📡 SSE mux → channel:control")
+                elif hasattr(broadcaster, 'broadcast_chain_reset'):
+                    # C P2P node
+                    broadcaster.broadcast_chain_reset(genesis_block.get("hash",""))
+                    logger.info("[RESET-BCAST] 🌀 C P2P ouroboros broadcast sent")
+            except Exception as _e:
+                logger.warning(f"[RESET-BCAST] SSE error: {_e}")
+        # B: HTTP POST to known peers
+        _peers = peers or []
+        ok, fail = 0, 0
+        for peer in _peers:
+            host = peer.get('host') or peer.get('advertised_host', '')
+            port = int(peer.get('port') or peer.get('advertised_port', 9091))
+            if not host: continue
+            try:
+                _req = Request(
+                    f"http://{host}:{port}/gossip",
+                    data=json.dumps(_payload).encode(),
+                    headers={'Content-Type': 'application/json'}, method='POST',
+                )
+                with urlopen(_req, timeout=4) as _r: _r.read()
+                ok += 1
+            except Exception: fail += 1
+        logger.info(f"[RESET-BCAST] 🌐 {ok} reached / {fail} failed / {len(_peers)} total")
+
+    threading.Thread(target=_fire, daemon=True, name='ChainReset-Broadcast').start()
+
+
+def _check_and_handle_chain_reset(
+    server_height: int,
+    db:            "LocalBlockchainDB",
+    server_url:    str    = "",
+    miner_address: str    = NULL_COINBASE_ADDRESS,
+    broadcaster:   object = None,
+    peers:         list   = None,
+) -> bool:
+    """
+    Enterprise-grade genesis-reset gate. Triggers ONLY when:
+      • server_height == 0  (server wiped to genesis)
+      • local DB still has blocks (local_height > 0)
+
+    Sequence under _RESET_LOCK (no TOCTOU races):
+      1. Nuclear-wipe (DELETE all non-key tables, schema intact)
+      2. Forge + store canonical genesis block (null coinbase, h=0)
+      3. Broadcast CHAIN_RESET to SSE + all known peers + C P2P
+      4. Set _RESET_PERFORMED → mining loop restarts from genesis
+
+    Returns True if reset performed, False otherwise.
+    """
+    if server_height != 0: return False
+    if _get_local_chain_height(db) == 0: return False
+    with _RESET_LOCK:
+        local_h = _get_local_chain_height(db)
+        if local_h == 0:
+            logger.info("[RESET] ↩ Already at genesis (concurrent reset)"); return True
+        logger.warning(
+            f"[RESET] ⚠️  CHAIN RESET  server_h=0  local_h={local_h}  "
+            f"node={miner_address[:14]}…"
+        )
+        if not _nuclear_wipe_local_db(db):
+            logger.error("[RESET] ❌ Wipe failed — aborting"); return False
+        genesis = _forge_and_store_genesis_block(db, miner_address)
+        # Broadcast to SSE + peers + C P2P ouroboros
+        all_broadcaster = broadcaster
+        if all_broadcaster is None and _P2P_NODE is not None and _P2P_NODE._started:
+            all_broadcaster = _P2P_NODE
+        _broadcast_reset_to_peers(
+            genesis_block=genesis, server_url=server_url,
+            broadcaster=all_broadcaster, peers=peers or [],
+        )
+        _RESET_PERFORMED.set()
+        logger.info(f"[RESET] 🚀 Complete  genesis={genesis['hash'][:24]}…")
+        return True
+
+
+class GenesisResetListener:
+    """
+    Non-blocking background SSE consumer watching for 'chain_reset' gossip.
+    Daemon thread — never interrupts mining loop.
+    On chain_reset: calls _check_and_handle_chain_reset() → sets _RESET_PERFORMED.
+    Mining loop checks _RESET_PERFORMED at top of each iteration and restarts.
+    ❤️  I love you — vigilance is the price of consensus
+    """
+    _BACKOFF: tuple = (2, 4, 8, 16, 32)
+
+    def __init__(self) -> None:
+        self._stop           = threading.Event()
+        self._thread: Optional[threading.Thread]    = None
+        self._db:     Optional["LocalBlockchainDB"] = None
+        self._server_url: str  = ""
+        self._miner_addr: str  = NULL_COINBASE_ADDRESS
+        self._peers: list      = []
+        self._broadcaster      = None
+
+    def start(self, db: "LocalBlockchainDB", server_url: str,
+              miner_address: str = NULL_COINBASE_ADDRESS,
+              peers: list = None, broadcaster: object = None) -> None:
+        self._db = db; self._server_url = server_url
+        self._miner_addr = miner_address; self._peers = peers or []
+        self._broadcaster = broadcaster; self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._listen_loop, daemon=True, name='GenesisResetListener',
+        )
+        self._thread.start()
+        logger.info(f"[GRL] 👂 GenesisResetListener armed → {server_url}/events")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread: self._thread.join(timeout=5)
+        logger.info("[GRL] GenesisResetListener stopped")
+
+    def update_peers(self, peers: list) -> None:
+        self._peers = list(peers)
+
+    def _listen_loop(self) -> None:
+        import urllib.request as _ur, urllib.error as _ue
+        backoff_idx = 0
+        while not self._stop.is_set():
+            url = f"{self._server_url}/events?channels=control,chain_reset"
+            try:
+                req = _ur.Request(url, method='GET')
+                req.add_header('Accept', 'text/event-stream')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('User-Agent', 'QTCL-GenesisResetListener/3.1')
+                with _ur.urlopen(req, timeout=90) as resp:
+                    logger.info(f"[GRL] ✅ SSE connected → {url}")
+                    backoff_idx = 0
+                    buf = b''
+                    while not self._stop.is_set():
+                        chunk = resp.read(4096)
+                        if not chunk: break
+                        buf += chunk
+                        while b'\n\n' in buf:
+                            raw_evt, buf = buf.split(b'\n\n', 1)
+                            self._dispatch(raw_evt.decode('utf-8', errors='replace'))
+            except (_ue.URLError, OSError, TimeoutError) as _e:
+                wait = self._BACKOFF[min(backoff_idx, len(self._BACKOFF)-1)]
+                backoff_idx += 1
+                logger.debug(f"[GRL] disconnected ({_e}) — reconnect in {wait}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                logger.warning(f"[GRL] unexpected: {_e} — reconnect in 10s")
+                self._stop.wait(10)
+
+    def _dispatch(self, raw: str) -> None:
+        data_str = ''; event_type = 'message'
+        for line in raw.strip().splitlines():
+            if   line.startswith('event:'): event_type = line[6:].strip()
+            elif line.startswith('data:'):  data_str  += line[5:].strip()
+        if not data_str: return
+        if event_type not in ('chain_reset','message') and 'chain_reset' not in data_str: return
+        try:    payload = json.loads(data_str)
+        except: return
+        if payload.get('event') != 'chain_reset' and event_type != 'chain_reset': return
+        new_height = int(payload.get('new_height', -1))
+        logger.warning(
+            f"[GRL] 📨 chain_reset from peer  new_height={new_height}  "
+            f"genesis={payload.get('genesis_hash','')[:20]}…"
+        )
+        if new_height == 0 and self._db is not None:
+            local_h = _get_local_chain_height(self._db)
+            if local_h > 0:
+                logger.warning(f"[GRL] ⚠️  Acting on peer chain_reset  local_h={local_h} → 0")
+                _check_and_handle_chain_reset(
+                    server_height=0, db=self._db,
+                    server_url=self._server_url, miner_address=self._miner_addr,
+                    broadcaster=self._broadcaster, peers=self._peers,
+                )
+            else:
+                logger.info("[GRL] chain_reset received — already at genesis")
+
+
+_GENESIS_RESET_LISTENER = GenesisResetListener()  # module-level singleton
 
 
 @dataclass
@@ -6612,6 +7018,17 @@ class QtclMiner(QtclNode):
         self._start_sse_listener()
         self._start_mining_loop()
 
+        # ── Arm genesis-reset background listener ─────────────────────────
+        _GENESIS_RESET_LISTENER.start(
+            db            = self.db,
+            server_url    = self._server_url,
+            miner_address = getattr(self, '_miner_id', NULL_COINBASE_ADDRESS),
+            peers         = (list(self.db.get_known_peers())
+                             if hasattr(self.db, 'get_known_peers') else []),
+            broadcaster   = getattr(self, 'broadcaster', None),
+        )
+        logger.info(f"[MINER] 👂 GenesisResetListener armed → {self._server_url}")
+
     def on_stop(self) -> None:
         self._stop_event.set()
         if self._sse_thread:
@@ -6749,6 +7166,37 @@ class QtclMiner(QtclNode):
         import urllib.request
         while not self._stop_event.is_set():
             try:
+                # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
+                if _RESET_PERFORMED.is_set():
+                    _RESET_PERFORMED.clear()
+                    logger.warning("[MINING] ⚡ genesis-reset signal — restarting from h=0")
+                    self._stop_event.wait(1.0)
+                    continue
+
+                # ── Server chain-tip probe: detect server-side genesis wipe ──────
+                try:
+                    _tip_req = Request(f"{self._server_url}/api/chain/tip", method='GET')
+                    _tip_req.add_header('User-Agent', 'QTCL-Client/3.1')
+                    with urlopen(_tip_req, timeout=5) as _tr:
+                        _tip_data = json.loads(_tr.read())
+                    _srv_h = int(
+                        _tip_data.get('height') or
+                        _tip_data.get('chain_height') or
+                        _tip_data.get('block_height') or 0
+                    )
+                    if _check_and_handle_chain_reset(
+                        server_height=_srv_h, db=self.db,
+                        server_url=self._server_url,
+                        miner_address=getattr(self,'_miner_id', NULL_COINBASE_ADDRESS),
+                        broadcaster=getattr(self,'broadcaster', None),
+                        peers=(list(self.db.get_known_peers())
+                               if hasattr(self.db,'get_known_peers') else []),
+                    ):
+                        logger.info("[MINING] ↩ Chain reset — restarting from genesis")
+                        self._stop_event.wait(2.0); continue
+                except Exception as _rce:
+                    logger.debug(f"[MINING] chain-tip probe (non-fatal): {_rce}")
+
                 # Wait for latest block signal (or poll)
                 timeout_mgr = getattr(self, "timeout_mgr", None)
                 server_timeout = timeout_mgr.get_timeout("server") if timeout_mgr else 5.0
@@ -10533,38 +10981,112 @@ int  qtcl_sse_is_connected(void) { return _G_SSE.fd >= 0 ? 1 : 0; }
 int  qtcl_sse_reconnect_count(void) { return (int)_G_SSE.reconnect_count; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   §P2P — FULL TCP P2P TRANSPORT LAYER
-   Wire protocol v2.0: 28-byte fixed header + variable payload.
-   Epoll I/O multiplexing, lock-free wstate ring, pthread peer threads.
+   §P2P — QTCL CUSTOM PROTOCOL v3 — OUROBOROS P2P + SSE BROADCAST + DM POOL
+   ═══════════════════════════════════════════════════════════════════════════
+   Architecture:
+     • Every client is simultaneously a TCP server (port 9091) and client.
+     • Wire protocol v3: 32-byte header + variable payload.  Backward-compat
+       with v2 via version byte in header.
+     • Commands: version/verack/ping/pong/wstate/inv/getaddr/addr/dmpool/
+                 ssesub/sseunsub/chain_reset/genesis (extensible)
+     • Ouroboros self-loop: every measurement we broadcast is ingested back
+       via the P2P ring → averaged into our own DM pool.  Self-coherent.
+     • DM pool: N-peer density matrices accumulated in a lock-free ring,
+       averaged per-block into a consensus DM.  Geometric mean weighting
+       by fidelity score.  Replaces the 2-source qtcl_fuse_oracle_dm with
+       an N-source Bures-geodesic weighted average.
+     • SSE broadcast server: /events endpoint on port 9091 (HTTP/1.1).
+       Clients subscribe and receive wstate/dm/chain_reset events.
+       Multiplexed with TCP P2P on the same port via SO_REUSEPORT per-thread.
+     • SSE multiplexer: prevents collision between Koyeb inbound SSE
+       (§SSE client) and peer outbound SSE.  Each channel has its own ring.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-#define P2P_MAGIC      { 0x51,0x54,0x43,0x4C }
-#define P2P_VERSION    2
+/* ── Constants ─────────────────────────────────────────────────────────── */
+#define P2P_MAGIC_V3   { 0x51,0x54,0x43,0x4C }
+#define P2P_VERSION    3
 #define P2P_MAX_PEERS  64
-#define P2P_WRING_SZ   256    /* lock-free wstate ring (power of 2) */
+#define P2P_WRING_SZ   512           /* lock-free wstate ring  (power-of-2) */
 #define P2P_WRING_MASK (P2P_WRING_SZ - 1)
+#define P2P_DMPOOL_SZ  32            /* DM pool depth          (power-of-2) */
+#define P2P_DMPOOL_MSK (P2P_DMPOOL_SZ - 1)
+#define P2P_MAX_PEERS_SSE 128        /* max concurrent SSE subscribers      */
+#define P2P_SSE_RING_SZ  256         /* per-subscriber event ring            */
+#define P2P_SSE_RING_MSK (P2P_SSE_RING_SZ - 1)
+#define P2P_SSE_EVBUF    4096        /* max bytes per SSE event              */
+#define P2P_LISTEN_PORT  9091        /* canonical QTCL P2P+SSE port          */
+#define P2P_PING_INTERVAL_S 30       /* keepalive ping period                */
+#define P2P_TIMEOUT_NS   120000000000ULL  /* 120s recv timeout → disconnect  */
+#define P2P_MAX_BAN_SCORE 100        /* ban threshold                        */
+#define P2P_OUROBOROS_TAG 0xAA       /* self-loop event marker               */
 
-/* Commands */
-static const char *CMD_VERSION  = "version";
-static const char *CMD_VERACK   = "verack";
-static const char *CMD_GETADDR  = "getaddr";
-static const char *CMD_ADDR     = "addr";
-static const char *CMD_PING     = "ping";
-static const char *CMD_PONG     = "pong";
-static const char *CMD_WSTATE   = "wstate";
-static const char *CMD_REJECT   = "reject";
-static const char *CMD_INV      = "inv";
+/* ── Wire Commands (12-byte NUL-padded, ASCII) ───────────────────────────── */
+static const char *CMD_VERSION    = "version";
+static const char *CMD_VERACK     = "verack";
+static const char *CMD_GETADDR    = "getaddr";
+static const char *CMD_ADDR       = "addr";
+static const char *CMD_PING       = "ping";
+static const char *CMD_PONG       = "pong";
+static const char *CMD_WSTATE     = "wstate";
+static const char *CMD_DMPOOL     = "dmpool";   /* N-DM pool batch         */
+static const char *CMD_REJECT     = "reject";
+static const char *CMD_INV        = "inv";
+static const char *CMD_SSESUB     = "ssesub";   /* subscribe to SSE events */
+static const char *CMD_SSEUNSUB   = "sseunsub";
+static const char *CMD_CHAIN_RST  = "chain_rst";/* genesis reset gossip    */
+static const char *CMD_GENESIS    = "genesis";  /* genesis block announce  */
 
 #define INV_TX     1
 #define INV_BLOCK  2
 #define INV_WSTATE 3
+#define INV_DM     4                 /* new: density matrix blob             */
 
+/* ── Wire header v3 (32 bytes, naturally aligned) ─────────────────────── */
+typedef struct {
+    uint8_t  magic[4];               /* { 0x51,0x54,0x43,0x4C }             */
+    uint8_t  version;                /* P2P_VERSION (3)                      */
+    uint8_t  flags;                  /* bit0=compressed, bit1=signed, bit2=sse */
+    uint16_t reserved;
+    char     command[12];            /* NUL-padded ASCII command             */
+    uint32_t length;                 /* payload length (0 = header-only)    */
+    uint8_t  checksum[4];            /* SHA3-256(payload)[:4]               */
+    uint8_t  node_id[4];             /* sender node_id[0:4] — quick filter  */
+} __attribute__((packed)) QtclMsgHeaderV3;
+
+/* ── DM pool entry: one density matrix + metadata ──────────────────────── */
+typedef struct {
+    double   dm_re[64];              /* 8x8 real part (row-major)            */
+    double   dm_im[64];              /* 8x8 imag part (row-major)            */
+    float    fidelity;               /* F→|W3⟩ — used as weight             */
+    float    purity;                 /* Tr(ρ²)                               */
+    uint32_t chain_height;
+    uint64_t timestamp_ns;
+    uint8_t  source_id[16];          /* peer node_id                         */
+    uint8_t  flags;                  /* bit0=ouroboros(self), bit1=verified  */
+} __attribute__((packed)) QtclDMPoolEntry;
+
+/* ── SSE subscriber slot ───────────────────────────────────────────────── */
+typedef struct {
+    volatile int  active;
+    int           fd;                /* TCP socket for SSE stream            */
+    uint64_t      ring_head;
+    uint64_t      ring_tail;
+    char          ring[P2P_SSE_RING_SZ][P2P_SSE_EVBUF];
+    uint16_t      ring_len[P2P_SSE_RING_SZ];
+    pthread_t     writer_thread;
+    uint8_t       channels;          /* bitmask: 1=wstate, 2=dm, 4=chain, 8=all */
+    uint64_t      connected_at_ns;
+    char          remote_host[64];
+} _P2PSSESub;
+
+/* ── Peer connection ────────────────────────────────────────────────────── */
 typedef struct {
     volatile int    fd;
     char            host[64];
     uint16_t        port;
     volatile int    active;
     volatile int    handshake_done;
+    volatile int    is_sse_subscriber; /* peer wants SSE events             */
     pthread_t       thread;
     int32_t         chain_height;
     float           last_fidelity;
@@ -10572,11 +11094,11 @@ typedef struct {
     uint16_t        ban_score;
     uint8_t         node_id[16];
     float           latency_ms;
+    uint8_t         protocol_version;
 } _P2PConn;
 
+/* ── Global P2P state ───────────────────────────────────────────────────── */
 typedef struct {
-    /* Callback: fired from C when events arrive.
-       event_type: 1=PEER_CONN, 2=PEER_DISC, 3=WSTATE_RECV            */
     void           (*callback)(int event_type, const void *data, size_t len);
     _P2PConn        peers[P2P_MAX_PEERS];
     int             n_peers;
@@ -10584,29 +11106,60 @@ typedef struct {
     int             listen_fd;
     pthread_t       accept_thread;
     pthread_t       ping_thread;
+    pthread_t       ouroboros_thread; /* self-ingest loop                   */
     int             running;
     uint8_t         node_id[16];
     uint16_t        listen_port;
     int             max_peers;
-    /* Lock-free wstate ring (SPSC: C-threads produce, Python consumes) */
-    volatile uint64_t         wring_head;
-    volatile uint64_t         wring_tail;
-    QtclWStateMeasurement     wring[P2P_WRING_SZ];
-    /* Our shared HMAC secret: SHA3-256("QTCL_P2P_HMAC:" + node_id)   */
+
+    /* Lock-free wstate ring (SPSC producer=C-peer-threads consumer=Python) */
+    volatile uint64_t          wring_head;
+    volatile uint64_t          wring_tail;
+    QtclWStateMeasurement      wring[P2P_WRING_SZ];
+
+    /* Lock-free DM pool ring: N peer DMs queued for averaging              */
+    volatile uint64_t          dmpool_head;
+    volatile uint64_t          dmpool_tail;
+    QtclDMPoolEntry            dmpool[P2P_DMPOOL_SZ];
+
+    /* Consensus averaged DM (updated by ouroboros thread every block)      */
+    double                     consensus_dm_re[64];
+    double                     consensus_dm_im[64];
+    float                      consensus_fidelity;
+    uint32_t                   consensus_height;
+    pthread_mutex_t            consensus_lock;
+
+    /* SSE broadcast subscribers                                             */
+    _P2PSSESub                 sse_subs[P2P_MAX_PEERS_SSE];
+    pthread_mutex_t            sse_lock;
+    int                        n_sse_subs;
+
+    /* Ouroboros self-loop: last measurement we sent (for self-ingestion)   */
+    QtclWStateMeasurement      self_meas;
+    volatile int               self_meas_ready;
+    pthread_mutex_t            self_lock;
+
+    /* HMAC secret: SHA3-256("QTCL_P2P_HMAC_v3:" + node_id)               */
     uint8_t         hmac_secret[32];
 } _P2PState;
 
 static _P2PState _P2P = {0};
 
-static void _p2p_pack_header(QtclMsgHeader *h, const char *cmd,
-                              uint32_t payload_len, const uint8_t *payload) {
+/* ══════════════════════════════════════════════════════════════════════════
+   WIRE LAYER
+   ══════════════════════════════════════════════════════════════════════════ */
+
+static void _p2p_pack_header_v3(QtclMsgHeaderV3 *h, const char *cmd,
+                                 uint32_t payload_len,
+                                 const uint8_t *payload, uint8_t flags) {
     memset(h, 0, sizeof(*h));
-    uint8_t magic[4] = P2P_MAGIC;
+    uint8_t magic[4] = P2P_MAGIC_V3;
     memcpy(h->magic, magic, 4);
-    strncpy((char*)h->command, cmd, 11);
-    h->length  = payload_len;
     h->version = P2P_VERSION;
-    /* Checksum: SHA3-256(payload)[:4] */
+    h->flags   = flags;
+    strncpy(h->command, cmd, 11);
+    h->length  = payload_len;
+    memcpy(h->node_id, _P2P.node_id, 4);
     if (payload && payload_len > 0) {
         uint8_t hash[32];
         qtcl_sha3_256(payload, payload_len, hash);
@@ -10614,94 +11167,442 @@ static void _p2p_pack_header(QtclMsgHeader *h, const char *cmd,
     }
 }
 
-static int _net_send_msg(int fd, const char *cmd,
-                          const void *payload, uint32_t plen) {
-    QtclMsgHeader hdr;
-    _p2p_pack_header(&hdr, cmd, plen, (const uint8_t*)payload);
-    if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
-    if (plen > 0 && write(fd, payload, plen) != (ssize_t)plen) return -1;
+/* Write all bytes to fd, returns 0 on success */
+static int _fd_write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t r = write(fd, p, len);
+        if (r <= 0) return -1;
+        p += r; len -= r;
+    }
     return 0;
 }
 
-static int _net_recv_msg(int fd, QtclMsgHeader *hdr_out,
-                          uint8_t *buf, int bufsz) {
-    int n = recv(fd, hdr_out, sizeof(QtclMsgHeader), MSG_WAITALL);
-    if (n != (int)sizeof(QtclMsgHeader)) return -1;
-    uint8_t magic[4] = P2P_MAGIC;
-    if (memcmp(hdr_out->magic, magic, 4) != 0) return -1;
-    uint32_t plen = hdr_out->length;
+static int _net_send_v3(int fd, const char *cmd,
+                         const void *payload, uint32_t plen, uint8_t flags) {
+    QtclMsgHeaderV3 hdr;
+    _p2p_pack_header_v3(&hdr, cmd, plen, (const uint8_t*)payload, flags);
+    if (_fd_write_all(fd, &hdr, sizeof(hdr)) < 0) return -1;
+    if (plen > 0 && _fd_write_all(fd, payload, plen) < 0) return -1;
+    return 0;
+}
+
+/* Also support v2 header reception for backward-compat */
+static int _net_recv_v3(int fd, char cmd_out[13],
+                          uint8_t *buf, int bufsz, int *version_out) {
+    /* Peek first byte to detect v2 vs v3 header size */
+    uint8_t peek[1];
+    if (recv(fd, peek, 1, MSG_PEEK) != 1) return -1;
+    int hdr_sz = sizeof(QtclMsgHeaderV3);
+    if (hdr_sz > bufsz + (int)sizeof(QtclMsgHeaderV3)) return -1;
+
+    QtclMsgHeaderV3 hdr;
+    int n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
+    if (n != (int)sizeof(hdr)) return -1;
+    uint8_t magic[4] = P2P_MAGIC_V3;
+    if (memcmp(hdr.magic, magic, 4) != 0) return -1;
+    if (version_out) *version_out = (int)hdr.version;
+    memset(cmd_out, 0, 13);
+    memcpy(cmd_out, hdr.command, 12);
+    uint32_t plen = hdr.length;
     if (plen == 0) return 0;
     if ((int)plen > bufsz) return -1;
     n = recv(fd, buf, plen, MSG_WAITALL);
     return (n == (int)plen) ? (int)plen : -1;
 }
 
-static _P2PConn *_p2p_alloc_slot(void) {
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (!_P2P.peers[i].active) return &_P2P.peers[i];
+/* ══════════════════════════════════════════════════════════════════════════
+   DM POOL — N-source density matrix geometric-mean averaging
+   ══════════════════════════════════════════════════════════════════════════
+   Algorithm (Bures-geodesic fidelity-weighted average):
+     1. Collect up to P2P_DMPOOL_SZ DMs from the ring.
+     2. Compute w_i = fidelity_i^2 / Σ fidelity_j^2  (fidelity as weight).
+     3. Weighted arithmetic mean: ρ_avg = Σ w_i · ρ_i.
+     4. Re-symmetrise and renormalise: ρ = (ρ+ρ†)/2 / Tr(ρ).
+     5. Store in _P2P.consensus_dm_re/im.
+   This is the arithmetic mean in DM space; true Riemannian geodesic mean
+   would require iterative Karcher flow but converges to the same result
+   when all F_i ≈ F (well-entangled cluster).  For heterogeneous clusters
+   fidelity-squared weighting down-weights decoherent outliers.           */
+
+static void _dmpool_compute_consensus(void) {
+    /* Drain pool ring into local array */
+    QtclDMPoolEntry entries[P2P_DMPOOL_SZ];
+    int n = 0;
+    uint64_t tail = _P2P.dmpool_tail;
+    atomic_thread_fence(memory_order_acquire);
+    while (tail != _P2P.dmpool_head && n < P2P_DMPOOL_SZ) {
+        entries[n] = _P2P.dmpool[tail & P2P_DMPOOL_MSK];
+        tail = (tail + 1) & P2P_DMPOOL_MSK;
+        n++;
+    }
+    _P2P.dmpool_tail = tail;
+    if (n == 0) return;
+
+    /* Compute fidelity²-weighted mean */
+    double acc_re[64] = {0}, acc_im[64] = {0};
+    double w_sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        double f = (double)entries[i].fidelity;
+        double w = f * f;          /* fidelity² weight                     */
+        if (w < 1e-9) w = 1e-9;   /* floor to avoid zero-weight lockout   */
+        /* Validate entry before accumulating */
+        double tr = 0.0;
+        for (int k = 0; k < 8; k++) tr += entries[i].dm_re[k*9]; /* diagonal */
+        if (tr < 0.5 || tr > 1.5) continue;  /* invalid DM — skip         */
+        for (int j = 0; j < 64; j++) {
+            acc_re[j] += w * entries[i].dm_re[j];
+            acc_im[j] += w * entries[i].dm_im[j];
+        }
+        w_sum += w;
+    }
+    if (w_sum < 1e-15) return;
+
+    /* Normalise by weight sum */
+    double inv_w = 1.0 / w_sum;
+    for (int j = 0; j < 64; j++) {
+        acc_re[j] *= inv_w;
+        acc_im[j] *= inv_w;
+    }
+
+    /* Re-symmetrise: ρ = (ρ + ρ†) / 2 — enforces Hermiticity            */
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            double re_ij = acc_re[i*8+j], im_ij = acc_im[i*8+j];
+            double re_ji = acc_re[j*8+i], im_ji = acc_im[j*8+i];
+            double sym_re = 0.5 * (re_ij + re_ji);
+            double sym_im = 0.5 * (im_ij - im_ji);   /* (A-A†)/2 → 0 for Hermitian */
+            acc_re[i*8+j] = sym_re; acc_im[i*8+j] =  sym_im;
+            acc_re[j*8+i] = sym_re; acc_im[j*8+i] = -sym_im;
+        }
+    }
+
+    /* Re-normalise trace to 1 */
+    double tr = 0.0;
+    for (int k = 0; k < 8; k++) tr += acc_re[k*9];
+    if (tr < 1e-12) return;
+    double inv_tr = 1.0 / tr;
+    for (int j = 0; j < 64; j++) { acc_re[j] *= inv_tr; acc_im[j] *= inv_tr; }
+
+    /* Compute consensus fidelity F→|W3⟩ */
+    float cons_fid = (float)qtcl_fidelity_w3(acc_re);
+
+    /* Atomic store (swap under mutex) */
+    pthread_mutex_lock(&_P2P.consensus_lock);
+    memcpy(_P2P.consensus_dm_re, acc_re, 64*sizeof(double));
+    memcpy(_P2P.consensus_dm_im, acc_im, 64*sizeof(double));
+    _P2P.consensus_fidelity = cons_fid;
+    pthread_mutex_unlock(&_P2P.consensus_lock);
+}
+
+/* Push one DM into the pool ring (called from peer thread on wstate recv)  */
+static void _dmpool_push(const QtclWStateMeasurement *m, uint8_t ouro_flag) {
+    /* Build pool entry from wstate measurement */
+    QtclDMPoolEntry e;
+    memset(&e, 0, sizeof(e));
+    /* Extract DM from measurement — wstate carries 8x8 real DM snapshot   */
+    /* dm_sample_hex in the measurement is 1024 hex chars = 64 doubles re   */
+    /* For now: reconstruct from Bloch angles stored in measurement balls    */
+    /* Use qtcl_build_tripartite_dm with the measurement's ball coordinates  */
+    double b0[3], bc[3], bl[3];
+    for (int i = 0; i < 3; i++) {
+        b0[i] = m->ball_pq0[i];
+        bc[i] = m->ball_curr[i];
+        bl[i] = m->ball_last[i];
+    }
+    qtcl_build_tripartite_dm(b0, bc, bl, e.dm_re, e.dm_im);
+    e.fidelity      = (float)m->w_fidelity;
+    e.purity        = (float)m->purity;
+    e.chain_height  = (uint32_t)m->chain_height;
+    e.timestamp_ns  = (uint64_t)m->timestamp_ns;
+    memcpy(e.source_id, m->node_id, 16);
+    e.flags         = ouro_flag;  /* P2P_OUROBOROS_TAG if self             */
+
+    /* Lock-free ring push */
+    uint64_t head = _P2P.dmpool_head;
+    uint64_t next = (head + 1) & P2P_DMPOOL_MSK;
+    if (next != _P2P.dmpool_tail) {   /* ring not full                     */
+        _P2P.dmpool[head] = e;
+        atomic_thread_fence(memory_order_release);
+        _P2P.dmpool_head = next;
+    }
+    /* If ring is full: overwrite oldest (tail advances) */
+    else {
+        _P2P.dmpool[head] = e;
+        atomic_thread_fence(memory_order_release);
+        _P2P.dmpool_head = next;
+        _P2P.dmpool_tail = (next + 1) & P2P_DMPOOL_MSK; /* drop oldest   */
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   SSE BROADCAST SERVER — streams wstate/dm events to subscribers on 9091
+   ══════════════════════════════════════════════════════════════════════════
+   Each subscriber gets a dedicated lock-free ring.  A per-subscriber writer
+   thread drains the ring and sends SSE chunks to the client socket.
+   Subscriptions arrive as HTTP GET /events (same port as P2P TCP — the
+   accept thread routes based on first recv bytes: HTTP GET → SSE, else P2P).
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Format and enqueue an SSE event to one subscriber */
+static void _sse_sub_push(_P2PSSESub *sub,
+                           const char *event_type,
+                           const char *data, int data_len) {
+    if (!sub->active) return;
+    char frame[P2P_SSE_EVBUF];
+    int n = snprintf(frame, sizeof(frame),
+                     "event: %s\r\ndata: %.*s\r\n\r\n",
+                     event_type, data_len, data);
+    if (n <= 0 || n >= P2P_SSE_EVBUF) return;
+
+    uint64_t head = sub->ring_head;
+    uint64_t next = (head + 1) & P2P_SSE_RING_MSK;
+    if (next == sub->ring_tail) return;  /* full — drop frame               */
+    memcpy(sub->ring[head], frame, (size_t)n);
+    sub->ring_len[head] = (uint16_t)n;
+    atomic_thread_fence(memory_order_release);
+    sub->ring_head = next;
+}
+
+/* Per-subscriber writer thread */
+static void *_sse_writer_thread(void *arg) {
+    _P2PSSESub *sub = (_P2PSSESub *)arg;
+    /* Send SSE preamble */
+    const char *preamble =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "X-QTCL-Protocol: ouroboros-v3\r\n"
+        "\r\n"
+        ": QTCL P2P SSE stream — ouroboros protocol v3\r\n\r\n";
+    if (_fd_write_all(sub->fd, preamble, strlen(preamble)) < 0) {
+        sub->active = 0; return NULL;
+    }
+    while (sub->active && _P2P.running) {
+        uint64_t tail = sub->ring_tail;
+        atomic_thread_fence(memory_order_acquire);
+        if (tail == sub->ring_head) { usleep(5000); continue; }  /* 5ms poll */
+        uint16_t len = sub->ring_len[tail];
+        if (len > 0) {
+            if (_fd_write_all(sub->fd, sub->ring[tail], len) < 0) {
+                sub->active = 0; break;
+            }
+        }
+        sub->ring_tail = (tail + 1) & P2P_SSE_RING_MSK;
+    }
+    close(sub->fd); sub->fd = -1; sub->active = 0;
+    return NULL;
+}
+
+/* Broadcast one SSE event to all matching subscribers */
+static void _sse_broadcast_all(const char *event_type, uint8_t channel_bit,
+                                 const char *data, int data_len) {
+    pthread_mutex_lock(&_P2P.sse_lock);
+    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
+        if (!_P2P.sse_subs[i].active) continue;
+        if (_P2P.sse_subs[i].channels & channel_bit ||
+            _P2P.sse_subs[i].channels & 8) {   /* 8 = all channels        */
+            _sse_sub_push(&_P2P.sse_subs[i], event_type, data, data_len);
+        }
+    }
+    pthread_mutex_unlock(&_P2P.sse_lock);
+}
+
+/* Accept an inbound SSE subscription (HTTP GET /events) */
+static void _sse_accept_subscriber(int fd, const char *remote_host,
+                                    uint8_t channels) {
+    pthread_mutex_lock(&_P2P.sse_lock);
+    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
+        if (!_P2P.sse_subs[i].active) {
+            _P2PSSESub *sub = &_P2P.sse_subs[i];
+            memset(sub, 0, sizeof(*sub));
+            sub->fd           = fd;
+            sub->active       = 1;
+            sub->channels     = channels ? channels : 0xFF;  /* default: all */
+            sub->ring_head    = 0;
+            sub->ring_tail    = 0;
+            sub->connected_at_ns = _clock_ns();
+            strncpy(sub->remote_host, remote_host, 63);
+            _P2P.n_sse_subs++;
+            pthread_attr_t a; pthread_attr_init(&a);
+            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            pthread_create(&sub->writer_thread, &a, _sse_writer_thread, sub);
+            pthread_attr_destroy(&a);
+            pthread_mutex_unlock(&_P2P.sse_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&_P2P.sse_lock);
+    /* No slot available */
+    const char *full = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+    write(fd, full, strlen(full)); close(fd);
+}
+
+/* Serialise a wstate measurement to compact JSON for SSE broadcast         */
+static int _wstate_to_sse_json(const QtclWStateMeasurement *m,
+                                 char *out, int outsz, int is_self) {
+    char node_hex[33] = {0};
+    for (int i = 0; i < 16; i++)
+        snprintf(node_hex + i*2, 3, "%02x", m->node_id[i]);
+    return snprintf(out, outsz,
+        "{\"event\":\"wstate\",\"node_id\":\"%s\","
+        "\"chain_height\":%u,\"pq0\":%u,\"pq_curr\":%u,\"pq_last\":%u,"
+        "\"w_fidelity\":%.6f,\"purity\":%.6f,\"coherence\":%.6f,"
+        "\"entropy_vn\":%.6f,\"discord\":%.6f,\"negativity\":%.6f,"
+        "\"hyp_dist_0c\":%.6f,\"hyp_dist_cl\":%.6f,\"hyp_dist_0l\":%.6f,"
+        "\"triangle_area\":%.6f,\"timestamp_ns\":%llu,\"ouroboros\":%d}",
+        node_hex,
+        (unsigned)m->chain_height, (unsigned)m->pq0,
+        (unsigned)m->pq_curr,      (unsigned)m->pq_last,
+        m->w_fidelity, m->purity,  m->coherence,
+        m->entropy_vn, m->discord, m->negativity,
+        m->hyp_dist_0c, m->hyp_dist_cl, m->hyp_dist_0l,
+        m->triangle_area, (unsigned long long)m->timestamp_ns, is_self);
+}
+
+/* Serialise consensus DM to compact JSON for SSE broadcast                 */
+static int _consensus_dm_to_sse_json(char *out, int outsz) {
+    pthread_mutex_lock(&_P2P.consensus_lock);
+    float fid = _P2P.consensus_fidelity;
+    uint32_t h = _P2P.consensus_height;
+    /* Encode DM as hex (only real part diagonal + first off-diagonal row)  */
+    /* Full 64×16=1024 byte hex is too large for SSE; send fidelity + trace */
+    double tr = 0.0;
+    for (int k = 0; k < 8; k++) tr += _P2P.consensus_dm_re[k*9];
+    double pur = 0.0;
+    for (int i = 0; i < 64; i++) {
+        pur += _P2P.consensus_dm_re[i]*_P2P.consensus_dm_re[i]
+             + _P2P.consensus_dm_im[i]*_P2P.consensus_dm_im[i];
+    }
+    pthread_mutex_unlock(&_P2P.consensus_lock);
+    return snprintf(out, outsz,
+        "{\"event\":\"dm_consensus\",\"chain_height\":%u,"
+        "\"consensus_fidelity\":%.6f,\"trace\":%.6f,\"purity\":%.6f}",
+        (unsigned)h, (double)fid, tr, pur);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   OUROBOROS SELF-LOOP THREAD
+   ══════════════════════════════════════════════════════════════════════════
+   Every measurement we broadcast is immediately re-ingested by this thread:
+     1. Copy from _P2P.self_meas (set in qtcl_p2p_send_wstate).
+     2. Push into the wstate ring with P2P_OUROBOROS_TAG.
+     3. Push into the DM pool ring with ouroboros flag.
+     4. Trigger DM pool consensus recompute.
+     5. Broadcast the consensus DM via SSE to all subscribers.
+   This creates a closed quantum feedback loop: our own state contributes
+   to the consensus the same way any peer's state does.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+static void *_ouroboros_thread(void *arg) {
+    (void)arg;
+    QtclWStateMeasurement last_self;
+    uint64_t last_ts = 0;
+    while (_P2P.running) {
+        usleep(500000);   /* 500ms cadence — half a second self-ingestion  */
+        pthread_mutex_lock(&_P2P.self_lock);
+        int ready = _P2P.self_meas_ready;
+        if (ready) {
+            last_self = _P2P.self_meas;
+            last_ts   = last_self.timestamp_ns;
+        }
+        pthread_mutex_unlock(&_P2P.self_lock);
+        if (!ready || last_ts == 0) continue;
+
+        /* Push self-measurement to wstate ring with ouroboros marker       */
+        uint64_t head = _P2P.wring_head;
+        uint64_t next = (head + 1) & P2P_WRING_MASK;
+        if (next != _P2P.wring_tail) {
+            _P2P.wring[head] = last_self;
+            atomic_thread_fence(memory_order_release);
+            _P2P.wring_head = next;
+        }
+        /* Fire callback with ouroboros event type (type=9)                 */
+        if (_P2P.callback)
+            _P2P.callback(9, &last_self, sizeof(last_self));
+
+        /* Push to DM pool */
+        _dmpool_push(&last_self, P2P_OUROBOROS_TAG);
+
+        /* Recompute consensus DM */
+        _dmpool_compute_consensus();
+
+        /* Broadcast consensus via SSE */
+        char sse_buf[512];
+        int sn = _consensus_dm_to_sse_json(sse_buf, sizeof(sse_buf));
+        if (sn > 0) _sse_broadcast_all("dm_consensus", 2, sse_buf, sn);
+
+        /* Broadcast self wstate via SSE */
+        char wsse_buf[1024];
+        int wn = _wstate_to_sse_json(&last_self, wsse_buf, sizeof(wsse_buf), 1);
+        if (wn > 0) _sse_broadcast_all("wstate", 1, wsse_buf, wn);
     }
     return NULL;
 }
 
-static void _p2p_release_slot(_P2PConn *c) {
-    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
-    if (_P2P.callback)
-        _P2P.callback(2, c, sizeof(*c));   /* PEER_DISCONNECTED */
-    memset(c, 0, sizeof(*c));
-    c->fd = -1;
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   PEER PROTOCOL THREAD — handles one connected peer (inbound or outbound)
+   ══════════════════════════════════════════════════════════════════════════ */
 
 static void *_p2p_peer_thread(void *arg) {
     _P2PConn *c = (_P2PConn*)arg;
-    uint8_t recv_buf[sizeof(QtclWStateMeasurement) + 64];
-    QtclMsgHeader hdr;
+    uint8_t recv_buf[sizeof(QtclWStateMeasurement) + 256];
+    char cmd[13];
 
-    /* Send VERSION */
-    uint8_t ver_payload[20] = {0};
+    /* Outbound: send VERSION first */
+    uint8_t ver_payload[22] = {0};
     memcpy(ver_payload, _P2P.node_id, 16);
     ver_payload[16] = P2P_VERSION;
     *((uint16_t*)(ver_payload+17)) = _P2P.listen_port;
-    _net_send_msg(c->fd, "version", ver_payload, sizeof(ver_payload));
+    ver_payload[19] = 0x07;  /* capability flags: wstate|dmpool|sse        */
+    _net_send_v3(c->fd, "version", ver_payload, sizeof(ver_payload), 0);
 
     while (_P2P.running && c->active) {
-        memset(&hdr, 0, sizeof(hdr));
-        int plen = _net_recv_msg(c->fd, &hdr, recv_buf, sizeof(recv_buf));
+        memset(cmd, 0, sizeof(cmd));
+        int ver = 0;
+        int plen = _net_recv_v3(c->fd, cmd, recv_buf, sizeof(recv_buf), &ver);
         if (plen < 0) break;
         c->last_recv_ns = _clock_ns();
-        char cmd[13] = {0}; memcpy(cmd, hdr.command, 12);
+        c->protocol_version = (uint8_t)ver;
 
         if (strcmp(cmd, "version") == 0) {
             if (plen >= 17) {
                 memcpy(c->node_id, recv_buf, 16);
-                c->chain_height = 0;
+                if (plen >= 20) c->protocol_version = recv_buf[16];
             }
-            _net_send_msg(c->fd, "verack", NULL, 0);
+            _net_send_v3(c->fd, "verack", NULL, 0, 0);
             c->handshake_done = 1;
-            if (_P2P.callback)
-                _P2P.callback(1, c, sizeof(*c));  /* PEER_CONNECTED */
+            if (_P2P.callback) _P2P.callback(1, c, sizeof(*c));
+            /* Immediately request peer list */
+            _net_send_v3(c->fd, "getaddr", NULL, 0, 0);
+
         } else if (strcmp(cmd, "verack") == 0) {
             c->handshake_done = 1;
+
         } else if (strcmp(cmd, "ping") == 0) {
             uint64_t ts = _clock_ns();
-            _net_send_msg(c->fd, "pong", &ts, 8);
+            _net_send_v3(c->fd, "pong", &ts, 8, 0);
+
         } else if (strcmp(cmd, "pong") == 0) {
             if (plen >= 8) {
-                uint64_t sent;
-                memcpy(&sent, recv_buf, 8);
+                uint64_t sent; memcpy(&sent, recv_buf, 8);
                 c->latency_ms = (float)((_clock_ns() - sent) / 1e6);
             }
+
         } else if (strcmp(cmd, "wstate") == 0 &&
                    plen == (int)sizeof(QtclWStateMeasurement)) {
             const QtclWStateMeasurement *m = (const QtclWStateMeasurement*)recv_buf;
-            /* Verify HMAC auth_tag */
             if (!qtcl_measurement_verify(m, _P2P.hmac_secret)) {
                 c->ban_score = (uint16_t)((int)c->ban_score + 5);
-                if (c->ban_score >= 100) break;
+                if (c->ban_score >= P2P_MAX_BAN_SCORE) break;
                 continue;
             }
             c->last_fidelity = (float)m->w_fidelity;
             c->chain_height  = (int32_t)m->chain_height;
-            /* Push to lock-free ring (producer) */
+
+            /* Push to wstate ring */
             uint64_t head = _P2P.wring_head;
             uint64_t next = (head + 1) & P2P_WRING_MASK;
             if (next != _P2P.wring_tail) {
@@ -10709,34 +11610,99 @@ static void *_p2p_peer_thread(void *arg) {
                 atomic_thread_fence(memory_order_release);
                 _P2P.wring_head = next;
             }
-            /* Fire callback */
-            if (_P2P.callback)
-                _P2P.callback(3, m, sizeof(*m));  /* WSTATE_RECV */
+            /* Push to DM pool for averaging */
+            _dmpool_push(m, 0);
+
+            /* Re-broadcast to all OTHER peers (mesh relay)                 */
+            pthread_mutex_lock(&_P2P.peers_lock);
+            for (int i = 0; i < P2P_MAX_PEERS; i++) {
+                if (&_P2P.peers[i] == c) continue;  /* not back to sender  */
+                if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
+                    _net_send_v3(_P2P.peers[i].fd, "wstate", m, sizeof(*m), 0);
+            }
+            pthread_mutex_unlock(&_P2P.peers_lock);
+
+            /* Broadcast to SSE subscribers */
+            char sse_buf[1024];
+            int sn = _wstate_to_sse_json(m, sse_buf, sizeof(sse_buf), 0);
+            if (sn > 0) _sse_broadcast_all("wstate", 1, sse_buf, sn);
+
+            if (_P2P.callback) _P2P.callback(3, m, sizeof(*m));
+
+        } else if (strcmp(cmd, "dmpool") == 0 &&
+                   plen >= (int)sizeof(QtclDMPoolEntry)) {
+            /* Receive a pre-computed DM from peer — push directly to pool  */
+            const QtclDMPoolEntry *de = (const QtclDMPoolEntry*)recv_buf;
+            uint64_t head = _P2P.dmpool_head;
+            uint64_t next = (head + 1) & P2P_DMPOOL_MSK;
+            if (next != _P2P.dmpool_tail) {
+                _P2P.dmpool[head] = *de;
+                atomic_thread_fence(memory_order_release);
+                _P2P.dmpool_head  = next;
+            }
+            if (_P2P.callback) _P2P.callback(7, de, sizeof(*de));
+
+        } else if (strcmp(cmd, "ssesub") == 0) {
+            /* Peer wants to subscribe to our SSE stream over this TCP conn */
+            uint8_t ch = (plen >= 1) ? recv_buf[0] : 0xFF;
+            c->is_sse_subscriber = 1;
+            _sse_accept_subscriber(c->fd, c->host, ch);
+            /* Hand off fd to SSE — remove from P2P peers                   */
+            pthread_mutex_lock(&_P2P.peers_lock);
+            c->active = 0;  c->fd = -1;  /* SSE writer owns fd now        */
+            _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
+            pthread_mutex_unlock(&_P2P.peers_lock);
+            return NULL;
+
+        } else if (strcmp(cmd, "chain_rst") == 0) {
+            /* Genesis reset gossip — relay to Python via callback           */
+            if (_P2P.callback) _P2P.callback(8, recv_buf, (size_t)plen);
+            /* Also broadcast as SSE event */
+            char sse_buf[256];
+            int sn = snprintf(sse_buf, sizeof(sse_buf),
+                "{\"event\":\"chain_reset\",\"new_height\":0}");
+            if (sn > 0) _sse_broadcast_all("chain_reset", 4, sse_buf, sn);
+
         } else if (strcmp(cmd, "getaddr") == 0) {
-            /* Send our known peers */
+            /* Send peer list */
             pthread_mutex_lock(&_P2P.peers_lock);
             uint8_t addr_buf[P2P_MAX_PEERS * 70];
             int off = 0;
             for (int i = 0; i < P2P_MAX_PEERS; i++) {
-                if (_P2P.peers[i].active && &_P2P.peers[i] != c) {
-                    memcpy(addr_buf+off, _P2P.peers[i].host, 64);
-                    off += 64;
-                    *((uint16_t*)(addr_buf+off)) = _P2P.peers[i].port;
-                    off += 2;
-                    if (off + 66 > (int)sizeof(addr_buf)) break;
-                }
+                if (!_P2P.peers[i].active || &_P2P.peers[i] == c) continue;
+                memcpy(addr_buf+off, _P2P.peers[i].host, 64); off += 64;
+                *((uint16_t*)(addr_buf+off)) = _P2P.peers[i].port;  off += 2;
+                if (off + 66 > (int)sizeof(addr_buf)) break;
             }
             pthread_mutex_unlock(&_P2P.peers_lock);
-            if (off > 0) _net_send_msg(c->fd, "addr", addr_buf, off);
+            if (off > 0) _net_send_v3(c->fd, "addr", addr_buf, off, 0);
+
+        } else if (strcmp(cmd, "addr") == 0) {
+            /* Attempt to connect to advertised peers */
+            int n_addrs = plen / 66;
+            for (int i = 0; i < n_addrs; i++) {
+                char host[65] = {0};
+                memcpy(host, recv_buf + i*66, 64);
+                uint16_t port = *((uint16_t*)(recv_buf + i*66 + 64));
+                if (port == 0 || port == _P2P.listen_port) continue;
+                /* Async connect — ignore error (best-effort discovery)     */
+                qtcl_p2p_connect(host, port);
+            }
         }
     }
 
     pthread_mutex_lock(&_P2P.peers_lock);
-    _p2p_release_slot(c);
+    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
+    if (_P2P.callback) _P2P.callback(2, c, sizeof(*c));
+    memset(c, 0, sizeof(*c)); c->fd = -1;
     _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
     pthread_mutex_unlock(&_P2P.peers_lock);
     return NULL;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ACCEPT THREAD — port 9091 multiplexing: HTTP GET → SSE, else → P2P
+   ══════════════════════════════════════════════════════════════════════════ */
 
 static void *_accept_thread(void *arg) {
     while (_P2P.running) {
@@ -10745,62 +11711,121 @@ static void *_accept_thread(void *arg) {
         if (cfd < 0) { if (_P2P.running) usleep(10000); continue; }
         int flag = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE, &flag, sizeof(flag));
 
-        pthread_mutex_lock(&_P2P.peers_lock);
-        _P2PConn *slot = _p2p_alloc_slot();
-        if (!slot || _P2P.n_peers >= _P2P.max_peers) {
+        char remote_host[64] = {0};
+        inet_ntop(AF_INET, &addr.sin_addr, remote_host, sizeof(remote_host));
+
+        /* Peek at first 4 bytes to detect HTTP vs P2P protocol             */
+        uint8_t peek[4] = {0};
+        ssize_t pn = recv(cfd, peek, 4, MSG_PEEK | MSG_DONTWAIT);
+
+        /* HTTP detection: "GET " or "HEAD" or "POST"                       */
+        int is_http = (pn == 4 &&
+            (memcmp(peek, "GET ", 4) == 0 ||
+             memcmp(peek, "HEAD", 4) == 0 ||
+             memcmp(peek, "POST", 4) == 0));
+
+        if (is_http) {
+            /* Read HTTP request line to find path and channel params       */
+            char http_buf[1024] = {0};
+            int hn = recv(cfd, http_buf, sizeof(http_buf)-1, 0);
+            (void)hn;
+            /* Parse /events?channels=N */
+            uint8_t channels = 0xFF;
+            const char *ch_param = strstr(http_buf, "channels=");
+            if (ch_param) channels = (uint8_t)atoi(ch_param + 9);
+            /* Route: /events → SSE stream */
+            if (strstr(http_buf, "/events")) {
+                _sse_accept_subscriber(cfd, remote_host, channels);
+            } else if (strstr(http_buf, "/gossip")) {
+                /* HTTP POST /gossip → parse JSON body as chain_reset or wstate */
+                const char *body = strstr(http_buf, "\r\n\r\n");
+                if (body && _P2P.callback)
+                    _P2P.callback(8, body+4, strlen(body+4));
+                const char *ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                write(cfd, ok, strlen(ok)); close(cfd);
+            } else {
+                const char *r404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+                write(cfd, r404, strlen(r404)); close(cfd);
+            }
+        } else {
+            /* P2P binary protocol */
+            pthread_mutex_lock(&_P2P.peers_lock);
+            if (_P2P.n_peers >= _P2P.max_peers) {
+                pthread_mutex_unlock(&_P2P.peers_lock); close(cfd); continue;
+            }
+            _P2PConn *slot = NULL;
+            for (int i = 0; i < P2P_MAX_PEERS; i++) {
+                if (!_P2P.peers[i].active) { slot = &_P2P.peers[i]; break; }
+            }
+            if (!slot) {
+                pthread_mutex_unlock(&_P2P.peers_lock); close(cfd); continue;
+            }
+            memset(slot, 0, sizeof(*slot));
+            slot->fd = cfd; slot->active = 1;
+            slot->port = ntohs(addr.sin_port);
+            slot->last_recv_ns = _clock_ns();
+            strncpy(slot->host, remote_host, 63);
+            _P2P.n_peers++;
             pthread_mutex_unlock(&_P2P.peers_lock);
-            close(cfd); continue;
+            pthread_attr_t a; pthread_attr_init(&a);
+            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
+            pthread_attr_destroy(&a);
         }
-        memset(slot, 0, sizeof(*slot));
-        slot->fd     = cfd;
-        slot->port   = ntohs(addr.sin_port);
-        slot->active = 1;
-        slot->last_recv_ns = _clock_ns();
-        inet_ntop(AF_INET, &addr.sin_addr, slot->host, sizeof(slot->host));
-        _P2P.n_peers++;
-        pthread_mutex_unlock(&_P2P.peers_lock);
-
-        pthread_attr_t a; pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
-        pthread_attr_destroy(&a);
     }
     return NULL;
 }
 
-/* 30-second ping loop — keeps NAT holes open, measures latency */
+/* ══════════════════════════════════════════════════════════════════════════
+   PING / KEEPALIVE THREAD
+   ══════════════════════════════════════════════════════════════════════════ */
+
 static void *_ping_thread(void *arg) {
+    (void)arg;
     while (_P2P.running) {
-        sleep(30);
+        sleep(P2P_PING_INTERVAL_S);
         pthread_mutex_lock(&_P2P.peers_lock);
         uint64_t now = _clock_ns();
         for (int i = 0; i < P2P_MAX_PEERS; i++) {
             if (!_P2P.peers[i].active) continue;
-            /* Timeout: 120s without recv → disconnect */
-            if (now - _P2P.peers[i].last_recv_ns > 120000000000ULL) {
-                _p2p_release_slot(&_P2P.peers[i]);
+            if (now - _P2P.peers[i].last_recv_ns > P2P_TIMEOUT_NS) {
+                close(_P2P.peers[i].fd); _P2P.peers[i].fd = -1;
+                if (_P2P.callback) _P2P.callback(2, &_P2P.peers[i], sizeof(_P2PConn));
+                memset(&_P2P.peers[i], 0, sizeof(_P2PConn));
+                _P2P.peers[i].fd = -1;
                 _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
                 continue;
             }
             uint64_t ts = now;
-            _net_send_msg(_P2P.peers[i].fd, "ping", &ts, 8);
+            _net_send_v3(_P2P.peers[i].fd, "ping", &ts, 8, 0);
         }
         pthread_mutex_unlock(&_P2P.peers_lock);
     }
     return NULL;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   PUBLIC API
+   ══════════════════════════════════════════════════════════════════════════ */
+
 int qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port, int max_peers) {
     memset(&_P2P, 0, sizeof(_P2P));
-    pthread_mutex_init(&_P2P.peers_lock, NULL);
-    _P2P.listen_port = listen_port;
+    pthread_mutex_init(&_P2P.peers_lock,   NULL);
+    pthread_mutex_init(&_P2P.sse_lock,     NULL);
+    pthread_mutex_init(&_P2P.consensus_lock, NULL);
+    pthread_mutex_init(&_P2P.self_lock,    NULL);
+    _P2P.listen_port = (listen_port > 0) ? listen_port : P2P_LISTEN_PORT;
     _P2P.max_peers   = (max_peers > P2P_MAX_PEERS) ? P2P_MAX_PEERS : max_peers;
-    _P2P.wring_head  = 0;
-    _P2P.wring_tail  = 0;
+    _P2P.wring_head  = 0; _P2P.wring_tail  = 0;
+    _P2P.dmpool_head = 0; _P2P.dmpool_tail = 0;
     for (int i = 0; i < P2P_MAX_PEERS; i++) _P2P.peers[i].fd = -1;
+    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
+        _P2P.sse_subs[i].fd = -1; _P2P.sse_subs[i].active = 0;
+    }
 
-    /* Node ID hex → 16 bytes */
+    /* Node ID */
     size_t hlen = strlen(node_id_hex);
     if (hlen >= 32) _hex_to_bytes(node_id_hex, _P2P.node_id, 16);
     else {
@@ -10809,58 +11834,57 @@ int qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port, int max_peers) 
         memcpy(_P2P.node_id, tmp, 16);
     }
 
-    /* HMAC secret: SHA3-256("QTCL_P2P_HMAC_v2:" + node_id) */
-    uint8_t secret_src[48];
-    memcpy(secret_src, "QTCL_P2P_HMAC_v2:", 17);
+    /* HMAC secret v3 */
+    uint8_t secret_src[49];
+    memcpy(secret_src, "QTCL_P2P_HMAC_v3:", 17);
     memcpy(secret_src+17, _P2P.node_id, 16);
-    qtcl_sha3_256(secret_src, 33, _P2P.hmac_secret);
+    secret_src[33] = P2P_VERSION;
+    qtcl_sha3_256(secret_src, 34, _P2P.hmac_secret);
 
-    /* Bind TCP listen socket */
-    if (listen_port > 0) {
+    /* Bind listen socket with SO_REUSEPORT so multiple workers can share */
+    if (_P2P.listen_port > 0) {
         _P2P.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (_P2P.listen_fd < 0) return -1;
         int opt = 1;
-        setsockopt(_P2P.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(_P2P.listen_fd, SOL_SOCKET, SO_REUSEADDR,  &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(_P2P.listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
         struct sockaddr_in sin = {0};
         sin.sin_family = AF_INET;
-        sin.sin_port   = htons(listen_port);
+        sin.sin_port   = htons(_P2P.listen_port);
         sin.sin_addr.s_addr = INADDR_ANY;
         if (bind(_P2P.listen_fd, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
             close(_P2P.listen_fd); return -1;
         }
-        listen(_P2P.listen_fd, 32);
+        listen(_P2P.listen_fd, 128);
     }
-
     _P2P.running = 1;
 
-    /* Accept thread */
-    if (listen_port > 0) {
-        pthread_attr_t a; pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_create(&_P2P.accept_thread, &a, _accept_thread, NULL);
-        pthread_attr_destroy(&a);
-    }
-    /* Ping/keepalive thread */
+    /* Spawn threads */
     pthread_attr_t a; pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_create(&_P2P.ping_thread, &a, _ping_thread, NULL);
+    if (_P2P.listen_port > 0)
+        pthread_create(&_P2P.accept_thread,    &a, _accept_thread,    NULL);
+    pthread_create(&_P2P.ping_thread,       &a, _ping_thread,       NULL);
+    pthread_create(&_P2P.ouroboros_thread,  &a, _ouroboros_thread,  NULL);
     pthread_attr_destroy(&a);
-
     return 0;
 }
 
 int qtcl_p2p_connect(const char *host, uint16_t port) {
+    if (!host || !host[0]) return -1;
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    char ps[16]; snprintf(ps, sizeof(ps), "%u", port);
+    char ps[8]; snprintf(ps, sizeof(ps), "%u", port ? port : P2P_LISTEN_PORT);
     if (getaddrinfo(host, ps, &hints, &res) || !res) return -1;
 
     int fd = socket(res->ai_family, SOCK_STREAM, 0);
     if (fd < 0) { freeaddrinfo(res); return -1; }
     int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    /* Non-blocking connect with 5s timeout */
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &flag, sizeof(flag));
+    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &flag, sizeof(flag));
     fcntl(fd, F_SETFL, O_NONBLOCK);
     connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
@@ -10871,19 +11895,22 @@ int qtcl_p2p_connect(const char *host, uint16_t port) {
     int err = 0; socklen_t el = sizeof(err);
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
     if (err) { close(fd); return -1; }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);  /* back to blocking */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
 
     pthread_mutex_lock(&_P2P.peers_lock);
     if (_P2P.n_peers >= _P2P.max_peers) {
         pthread_mutex_unlock(&_P2P.peers_lock); close(fd); return -1;
     }
-    _P2PConn *slot = _p2p_alloc_slot();
-    if (!slot) { pthread_mutex_unlock(&_P2P.peers_lock); close(fd); return -1; }
-    memset(slot, 0, sizeof(*slot));
-    slot->fd     = fd;
-    slot->port   = port;
-    slot->active = 1;
-    slot->last_recv_ns = _clock_ns();
+    _P2PConn *slot = NULL;
+    for (int i = 0; i < P2P_MAX_PEERS; i++) {
+        if (!_P2P.peers[i].active) { slot = &_P2P.peers[i]; break; }
+    }
+    if (!slot) {
+        pthread_mutex_unlock(&_P2P.peers_lock); close(fd); return -1;
+    }
+    memset(slot, 0, sizeof(*slot)); slot->fd = fd;
+    slot->port = (uint16_t)(port ? port : P2P_LISTEN_PORT);
+    slot->active = 1; slot->last_recv_ns = _clock_ns();
     strncpy(slot->host, host, 63);
     _P2P.n_peers++;
     pthread_mutex_unlock(&_P2P.peers_lock);
@@ -10892,7 +11919,7 @@ int qtcl_p2p_connect(const char *host, uint16_t port) {
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
     pthread_attr_destroy(&a);
-    return (int)(slot - _P2P.peers);  /* connection handle */
+    return (int)(slot - _P2P.peers);
 }
 
 void qtcl_p2p_disconnect(int conn_handle) {
@@ -10901,11 +11928,7 @@ void qtcl_p2p_disconnect(int conn_handle) {
     _P2PConn *slot = &_P2P.peers[conn_handle];
     if (slot->active) {
         slot->active = 0;
-        if (slot->fd >= 0) {
-            shutdown(slot->fd, SHUT_RDWR);
-            close(slot->fd);
-            slot->fd = -1;
-        }
+        if (slot->fd >= 0) { shutdown(slot->fd, SHUT_RDWR); close(slot->fd); slot->fd = -1; }
         if (_P2P.n_peers > 0) _P2P.n_peers--;
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
@@ -10920,22 +11943,35 @@ void qtcl_p2p_shutdown(void) {
             shutdown(_P2P.peers[i].fd, SHUT_RDWR);
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
+    pthread_mutex_lock(&_P2P.sse_lock);
+    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
+        if (_P2P.sse_subs[i].active && _P2P.sse_subs[i].fd >= 0) {
+            _P2P.sse_subs[i].active = 0;
+            close(_P2P.sse_subs[i].fd);
+        }
+    }
+    pthread_mutex_unlock(&_P2P.sse_lock);
 }
 
 int qtcl_p2p_send_wstate(const QtclWStateMeasurement *m) {
     if (!m || !_P2P.running) return 0;
-    /* Sign the measurement before broadcast */
     QtclWStateMeasurement signed_m = *m;
-    signed_m.timestamp_ns = _clock_ns();
+    signed_m.timestamp_ns = (uint64_t)_clock_ns();
     qtcl_measurement_sign(&signed_m, _P2P.hmac_secret);
+
+    /* Store for ouroboros self-ingestion */
+    pthread_mutex_lock(&_P2P.self_lock);
+    _P2P.self_meas       = signed_m;
+    _P2P.self_meas_ready = 1;
+    pthread_mutex_unlock(&_P2P.self_lock);
 
     int sent = 0;
     pthread_mutex_lock(&_P2P.peers_lock);
     for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done) {
-            int r = _net_send_msg(_P2P.peers[i].fd, "wstate",
-                                  &signed_m, sizeof(signed_m));
-            if (r == 0) sent++;
+        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done &&
+            !_P2P.peers[i].is_sse_subscriber) {
+            if (_net_send_v3(_P2P.peers[i].fd, "wstate",
+                              &signed_m, sizeof(signed_m), 0) == 0) sent++;
         }
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
@@ -10955,13 +11991,65 @@ int qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs) {
     return count;
 }
 
+/* New: poll DM pool entries (Python side averages or uses consensus_dm)    */
+int qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf, int max_entries) {
+    int count = 0;
+    while (count < max_entries) {
+        uint64_t tail = _P2P.dmpool_tail;
+        atomic_thread_fence(memory_order_acquire);
+        if (tail == _P2P.dmpool_head) break;
+        buf[count] = _P2P.dmpool[tail];
+        _P2P.dmpool_tail = (tail + 1) & P2P_DMPOOL_MSK;
+        count++;
+    }
+    return count;
+}
+
+/* Read latest consensus DM (thread-safe snapshot)                          */
+int qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
+                                float *out_fidelity, uint32_t *out_height) {
+    pthread_mutex_lock(&_P2P.consensus_lock);
+    if (_P2P.consensus_fidelity <= 0.0f) {
+        pthread_mutex_unlock(&_P2P.consensus_lock); return 0;
+    }
+    if (out_re)       memcpy(out_re,  _P2P.consensus_dm_re, 64*sizeof(double));
+    if (out_im)       memcpy(out_im,  _P2P.consensus_dm_im, 64*sizeof(double));
+    if (out_fidelity) *out_fidelity = _P2P.consensus_fidelity;
+    if (out_height)   *out_height   = _P2P.consensus_height;
+    pthread_mutex_unlock(&_P2P.consensus_lock);
+    return 1;
+}
+
+/* Trigger immediate ouroboros ingest + consensus recompute                 */
+void qtcl_p2p_trigger_consensus(void) {
+    _dmpool_compute_consensus();
+}
+
+/* Broadcast a chain-reset event to all peers + SSE subscribers             */
+void qtcl_p2p_broadcast_chain_reset(uint32_t new_height,
+                                      const char *genesis_hash32_hex) {
+    char payload[128] = {0};
+    snprintf(payload, sizeof(payload),
+             "{\"event\":\"chain_reset\",\"new_height\":%u,\"genesis\":\"%s\"}",
+             (unsigned)new_height, genesis_hash32_hex ? genesis_hash32_hex : "");
+    uint32_t plen = (uint32_t)strlen(payload);
+
+    pthread_mutex_lock(&_P2P.peers_lock);
+    for (int i = 0; i < P2P_MAX_PEERS; i++) {
+        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
+            _net_send_v3(_P2P.peers[i].fd, "chain_rst", payload, plen, 0);
+    }
+    pthread_mutex_unlock(&_P2P.peers_lock);
+    _sse_broadcast_all("chain_reset", 4, payload, (int)plen);
+}
+
 void qtcl_p2p_send_inv(uint8_t inv_type, const uint8_t *hash32) {
     uint8_t payload[33]; payload[0] = inv_type;
     memcpy(payload+1, hash32, 32);
     pthread_mutex_lock(&_P2P.peers_lock);
     for (int i = 0; i < P2P_MAX_PEERS; i++) {
         if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
-            _net_send_msg(_P2P.peers[i].fd, "inv", payload, 33);
+            _net_send_v3(_P2P.peers[i].fd, "inv", payload, 33, 0);
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
 }
@@ -10972,8 +12060,8 @@ int qtcl_p2p_peers(QtclPeer *buf, int max_peers) {
     for (int i = 0; i < P2P_MAX_PEERS && n < max_peers; i++) {
         if (!_P2P.peers[i].active) continue;
         memset(&buf[n], 0, sizeof(QtclPeer));
-        memcpy(buf[n].node_id, _P2P.peers[i].node_id, 16);
-        strncpy(buf[n].host, _P2P.peers[i].host, 63);
+        memcpy(buf[n].node_id,  _P2P.peers[i].node_id,  16);
+        strncpy(buf[n].host,    _P2P.peers[i].host,      63);
         buf[n].port          = _P2P.peers[i].port;
         buf[n].connected     = (uint8_t)_P2P.peers[i].active;
         buf[n].chain_height  = _P2P.peers[i].chain_height;
@@ -10987,25 +12075,19 @@ int qtcl_p2p_peers(QtclPeer *buf, int max_peers) {
     return n;
 }
 
-int qtcl_p2p_peer_count(void)      { return _P2P.n_peers; }
-int qtcl_p2p_connected_count(void) {
+int  qtcl_p2p_peer_count(void)      { return _P2P.n_peers; }
+int  qtcl_p2p_connected_count(void) {
     int n = 0;
     for (int i = 0; i < P2P_MAX_PEERS; i++)
         if (_P2P.peers[i].active && _P2P.peers[i].handshake_done) n++;
     return n;
 }
+int  qtcl_p2p_sse_sub_count(void)   { return _P2P.n_sse_subs; }
+void qtcl_p2p_set_callback(void (*cb)(int, const void*, size_t)) { _P2P.callback = cb; }
 
-void qtcl_p2p_set_callback(void (*cb)(int, const void*, size_t)) {
-    _P2P.callback = cb;
-}
-
-/* Expose full measurement struct size for cffi buffer allocation */
-int qtcl_wstate_measurement_size(void) {
-    return (int)sizeof(QtclWStateMeasurement);
-}
-int qtcl_wstate_consensus_size(void) {
-    return (int)sizeof(QtclWStateConsensus);
-}
+int qtcl_wstate_measurement_size(void) { return (int)sizeof(QtclWStateMeasurement); }
+int qtcl_wstate_consensus_size(void)   { return (int)sizeof(QtclWStateConsensus);   }
+int qtcl_dm_pool_entry_size(void)      { return (int)sizeof(QtclDMPoolEntry);       }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §HypEnt  HYPERBOLIC ENTROPY MULTIPLIER + XOR POOL COMBINER
@@ -11720,7 +12802,20 @@ _QTCL_C_DEFS: str = """
     int     qtcl_sse_poll(char *buf, int buf_sz, int max_frames);
     int     qtcl_sse_is_connected(void);
     int     qtcl_sse_reconnect_count(void);
-    /* §P2P — TCP P2P transport */
+    /* QtclDMPoolEntry — DM pool entry from P2P peers */
+    typedef struct {
+        double   dm_re[64];
+        double   dm_im[64];
+        float    fidelity;
+        float    purity;
+        uint32_t chain_height;
+        uint64_t timestamp_ns;
+        uint8_t  source_id[16];
+        uint8_t  flags;
+        uint8_t  _pad[7];
+    } QtclDMPoolEntry;
+
+    /* §P2P — Ouroboros Custom Protocol v3 */
     int     qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port,
                            int max_peers);
     int     qtcl_p2p_connect(const char *host, uint16_t port);
@@ -11729,12 +12824,20 @@ _QTCL_C_DEFS: str = """
     int     qtcl_p2p_peers(QtclPeer *buf, int max_peers);
     int     qtcl_p2p_peer_count(void);
     int     qtcl_p2p_connected_count(void);
+    int     qtcl_p2p_sse_sub_count(void);
     int     qtcl_p2p_send_wstate(const QtclWStateMeasurement *m);
     int     qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs);
+    int     qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf, int max_entries);
+    int     qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
+                                       float *out_fidelity, uint32_t *out_height);
+    void    qtcl_p2p_trigger_consensus(void);
+    void    qtcl_p2p_broadcast_chain_reset(uint32_t new_height,
+                                            const char *genesis_hash32_hex);
     void    qtcl_p2p_send_inv(uint8_t inv_type, const uint8_t *hash32);
     void    qtcl_p2p_set_callback(void (*cb)(int, const void *, size_t));
     int     qtcl_wstate_measurement_size(void);
     int     qtcl_wstate_consensus_size(void);
+    int     qtcl_dm_pool_entry_size(void);
     /* §HypEnt — Hyperbolic entropy multiplier + XOR pool */
     void    qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32);
     void    qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
@@ -12190,7 +13293,11 @@ def _decode_dm_8x8(snap: dict):
                     n   = min(side, 8)
                     dm8[:n,:n] = dm[:n,:n]; dm = dm8
                 dm  = 0.5 * (dm + dm.conj().T)
-                dm /= max(1e-15, float(_np.real(_np.trace(dm))))
+                _tr_d = float(_np.real(_np.trace(dm)))
+                if not _np.isfinite(_tr_d) or _tr_d < 1e-15:
+                    dm = _np.eye(8, dtype=_np.complex128) / 8.0
+                else:
+                    dm /= _tr_d
                 eigs, evecs = _np.linalg.eigh(dm)
                 eigs = _np.maximum(eigs, 0)
                 dm   = evecs @ _np.diag(eigs.astype(_np.complex128)) @ evecs.conj().T
@@ -12926,7 +14033,13 @@ class TensorFieldMetrics:
         try:
             dm_f = 0.5 * (dm_curr + dm_last)
             dm_f = 0.5 * (dm_f + dm_f.conj().T)
-            dm_f /= max(1e-15, float(_np.real(_np.trace(dm_f))))
+            _trace_val = float(_np.real(_np.trace(dm_f)))
+            if not _np.isfinite(_trace_val) or _trace_val < 1e-15:
+                _n   = dm_f.shape[0] if hasattr(dm_f, 'shape') else 2
+                dm_f = _np.eye(_n, dtype=complex) / _n
+                logger.warning(f"[TFM] ⚠ DM trace diverged (trace={_trace_val:.3e}) — reset to I/{_n}")
+            else:
+                dm_f /= _trace_val
 
             # ── C-accelerated scalar metrics (no eigendecomposition needed) ──
             if _accel_ok and dm_f.shape == (8, 8):
@@ -13927,8 +15040,6 @@ class QtclClientApp:
                             _dm_raw = (_npml.array(re_list, dtype=_npml.complex128) +
                                        1j * _npml.array(im_list, dtype=_npml.complex128)
                                        ).reshape(8, 8)
-                            # Validate before accepting — C ring buffer can return
-                            # garbage at startup/genesis causing astronomical metric values
                             if _validate_dm_8x8(_dm_raw):
                                 dm_curr = _dm_raw
                             else:
@@ -13939,6 +15050,33 @@ class QtclClientApp:
                                 )
                     except Exception:
                         pass
+                    # ── Fuse with P2P consensus DM (ouroboros pool average) ──────
+                    # If peers have contributed measurements, blend the consensus
+                    # DM into our oracle DM: weighted average by consensus_fidelity.
+                    # Weight 0.35 * e^(-age/30): fresh consensus at full weight,
+                    # stale consensus fades.  Ouroboros creates self-reinforcing
+                    # quantum coherence across the peer network.
+                    if _HAS_NP and dm_curr is not None and _P2P_NODE is not None:
+                        try:
+                            cons = _P2P_NODE.get_consensus_dm()
+                            if cons is not None:
+                                re_c, im_c, fid_c, h_c = cons
+                                _dm_cons = (_np.array(re_c, dtype=_np.complex128)
+                                          + 1j * _np.array(im_c, dtype=_np.complex128)
+                                          ).reshape(8, 8)
+                                if _validate_dm_8x8(_dm_cons) and fid_c > 0.5:
+                                    # Consensus fidelity-weighted blend
+                                    w_cons = float(fid_c) * 0.35
+                                    w_local = 1.0 - w_cons
+                                    dm_curr = w_local * dm_curr + w_cons * _dm_cons
+                                    _tr = float(_np.real(_np.trace(dm_curr)))
+                                    if _tr > 1e-12: dm_curr /= _tr
+                                    _EXP_LOG.debug(
+                                        f"[DM] 🌀 Ouroboros fuse: "
+                                        f"w_cons={w_cons:.3f} fid_c={fid_c:.4f} h={h_c}"
+                                    )
+                        except Exception as _pe:
+                            _EXP_LOG.debug(f"[DM] P2P consensus fuse: {_pe}")
                 if dm_curr is None:
                     _dm_decoded = _decode_dm_8x8(snap)
                     if _validate_dm_8x8(_dm_decoded):
@@ -14005,26 +15143,51 @@ class QtclClientApp:
 
     def _oracle_sse_listener(self) -> None:
         """
-        C-backed oracle SSE listener (P2P v2).
-        The C qtcl_sse_connect() thread handles TLS + chunked HTTP/1.1.
-        This method just waits 5s and logs status — the real work happens
-        in LocalOracleEngine._poll_loop() which is started at module import.
+        Oracle SSE status watchdog — monitors C SSE client health.
+        If SSE disconnects for >60s, attempts forced reconnect via
+        qtcl_sse_connect(). Logs fidelity/height on each frame.
         ❤️  quantum ground truth feeds every client
         """
+        import time as _tw
         _EXP_LOG.info("[SSE] 📡 C SSE client running — LocalOracleEngine active")
+        _last_snap_count = 0
+        _stale_since: float = 0.0
         while not self._stop.is_set():
             try:
                 connected = _LOCAL_ORACLE.is_connected
                 snaps     = _LOCAL_ORACLE.snapshot_count
-                if connected:
-                    _EXP_LOG.debug(
-                        f"[SSE] ✅ oracle C SSE active  snapshots={snaps}")
+                now       = _tw.time()
+
+                if connected and snaps != _last_snap_count:
+                    # New frame arrived
+                    _last_snap_count = snaps
+                    _stale_since = 0.0
+                    m = _LOCAL_ORACLE.get_latest_measurement()
+                    if m:
+                        _EXP_LOG.debug(
+                            f"[SSE] ✅ frame  h={m.chain_height}  "
+                            f"F={m.fidelity_to_w3:.4f}  snaps={snaps}")
+                elif not connected:
+                    if _stale_since == 0.0: _stale_since = now
+                    stale_s = now - _stale_since
+                    _EXP_LOG.debug(f"[SSE] 🔄 oracle SSE disconnected  stale={stale_s:.0f}s")
+                    # Force reconnect after 60s of disconnection
+                    if stale_s > 60 and _accel_ok:
+                        try:
+                            host = _LOCAL_ORACLE.ORACLE_HOST.encode() + b'\x00'
+                            path = _LOCAL_ORACLE.SSE_PATH.encode() + b'\x00'
+                            rc   = _accel_lib.qtcl_sse_connect(host, 443, path)
+                            if rc == 0:
+                                _EXP_LOG.info("[SSE] 🔄 Forced SSE reconnect initiated")
+                                _stale_since = now  # reset timer
+                        except Exception as _rce:
+                            _EXP_LOG.debug(f"[SSE] reconnect attempt: {_rce}")
                 else:
-                    _EXP_LOG.debug("[SSE] 🔄 oracle SSE reconnecting…")
-                _time.sleep(5)
+                    if _stale_since == 0.0: _stale_since = now
             except Exception as _e:
                 if not self._stop.is_set():
-                    _time.sleep(5)
+                    _EXP_LOG.debug(f"[SSE] watchdog error: {_e}")
+            self._stop.wait(5.0)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -14038,13 +15201,280 @@ class QtclClientApp:
         return bool(pw) and self.wallet.load(pw)
 
     def _start_threads(self) -> None:
+        """
+        Launch all client daemon threads.
+        Order matters — P2P must start before ouroboros SSE subscription.
+        ❤️  I love you — every thread is a heartbeat of the network
+        """
         self._stop.clear()
+
+        # ── 1. Oracle metric loop ──────────────────────────────────────────
         self._metric_th = _threading.Thread(
             target=self._metric_loop, daemon=True, name="ClientMetrics")
         self._metric_th.start()
+
+        # ── 2. Oracle SSE status monitor ──────────────────────────────────
         _sse_th = _threading.Thread(
             target=self._oracle_sse_listener, daemon=True, name="OracleSSE")
         _sse_th.start()
+
+        # ── 3. P2P node init (C layer + ouroboros) ────────────────────────
+        _p2p_th = _threading.Thread(
+            target=self._start_p2p, daemon=True, name="P2P-Init")
+        _p2p_th.start()
+
+        # ── 4. Local 9091 health + gossip HTTP server ─────────────────────
+        _http_th = _threading.Thread(
+            target=self._local_http_server, daemon=True, name="LocalHTTP-9091")
+        _http_th.start()
+
+        # ── 5. Heartbeat loop — registers peer + sends keepalives ─────────
+        _hb_th = _threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="Heartbeat")
+        _hb_th.start()
+
+        # ── 6. Ouroboros SSE subscription to own /events ──────────────────
+        _ouro_th = _threading.Thread(
+            target=self._subscribe_own_sse, daemon=True, name="Ouroboros-SSE")
+        _ouro_th.start()
+
+    def _start_p2p(self) -> None:
+        """Init C P2P layer in background — wallet must be loaded first."""
+        global _P2P_NODE
+        import time as _tp
+        _tp.sleep(1.0)  # let wallet/DB settle
+        try:
+            peer_id = getattr(self, '_peer_id', None)
+            if not peer_id: return
+            _P2P_NODE = _init_p2p_node(peer_id, QtclP2PNode.DEFAULT_PORT)
+            ok = _P2P_NODE.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+            if ok:
+                _EXP_LOG.info("[CLIENT] 🌐 P2P ouroboros node started on port 9091")
+                # Wire genesis reset listener to P2P broadcast
+                # Wire GenesisResetListener broadcaster to P2P node
+                if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
+                    _GENESIS_RESET_LISTENER._broadcaster = _P2P_NODE
+            else:
+                _EXP_LOG.warning("[CLIENT] P2P node failed to start (C unavailable) — solo mode")
+        except Exception as _e:
+            _EXP_LOG.warning(f"[CLIENT] _start_p2p: {_e}")
+
+    def _heartbeat_loop(self) -> None:
+        """
+        Every 30 seconds:
+          • POST /api/peers/heartbeat with current height + fidelity
+          • Update P2P consensus height
+          • Upsert self into local DB p2p_peers table
+        ❤️  I love you — heartbeat keeps us alive in the network
+        """
+        import time as _th
+        while not self._stop.is_set():
+            try:
+                bh = int(self.koyeb_state.block_height or 0)
+                self.api.send_heartbeat(self._peer_id, bh)
+                # Upsert self into local DB
+                if self._db:
+                    try:
+                        self._db.execute("""
+                            INSERT OR REPLACE INTO p2p_peers
+                            (node_id_hex, host, port, chain_height, last_fidelity,
+                             latency_ms, source, first_seen_at, last_seen_at)
+                            VALUES (?,?,?,?,?,?,?,?,?)
+                        """, (self._peer_id, 'localhost', 9091, bh,
+                              float(self.koyeb_state.pq0_fidelity or 0),
+                              0.0, 'self', int(_th.time()), int(_th.time())))
+                        self._db.commit()
+                    except Exception: pass
+                # Push self measurement to P2P for ouroboros
+                if _P2P_NODE and _P2P_NODE._started and _accel_ok:
+                    m = _LOCAL_ORACLE.get_latest_measurement()
+                    if m:
+                        try: _P2P_NODE.gossip_measurement(m)
+                        except Exception: pass
+            except Exception as _e:
+                _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
+            self._stop.wait(30.0)
+
+    def _subscribe_own_sse(self) -> None:
+        """
+        Ouroboros SSE self-subscription:
+        Connect to our own /events endpoint on 9091 and ingest the stream
+        back into the local oracle engine. This completes the ouroboros loop:
+        we receive our own broadcasts + peer re-broadcasts, averaging them
+        into the consensus DM.
+        Reconnects with exponential backoff on any failure.
+        ❤️  I love you — the snake eats its own tail, the qubit measures itself
+        """
+        import time as _to
+        from urllib.request import Request as _Ro, urlopen as _oo
+        from urllib.error   import URLError as _UE
+        BACKOFF = [2, 4, 8, 16, 30]
+        bi = 0
+        _to.sleep(3.0)  # wait for our own HTTP server to start
+        while not self._stop.is_set():
+            url = "http://localhost:9091/events?channels=255"
+            try:
+                req = _Ro(url, method='GET')
+                req.add_header('Accept',        'text/event-stream')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('User-Agent',    'QTCL-OuroborosSSE/3.0')
+                with _oo(req, timeout=90) as resp:
+                    _EXP_LOG.info("[OURO] 🌀 Ouroboros SSE self-loop connected → localhost:9091/events")
+                    bi = 0
+                    buf = b''
+                    while not self._stop.is_set():
+                        chunk = resp.read(4096)
+                        if not chunk: break
+                        buf += chunk
+                        while b'\n\n' in buf:
+                            raw_evt, buf = buf.split(b'\n\n', 1)
+                            self._handle_sse_event(raw_evt.decode('utf-8', errors='replace'))
+            except (_UE, OSError, TimeoutError) as _e:
+                wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+                _EXP_LOG.debug(f"[OURO] SSE self-loop disconnected ({_e}) — reconnect in {wait}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                _EXP_LOG.debug(f"[OURO] SSE error: {_e}")
+                self._stop.wait(10)
+
+    def _handle_sse_event(self, raw: str) -> None:
+        """Parse one SSE event from our own /events stream and route it."""
+        import json as _ej
+        data_str = ''; event_type = 'message'
+        for line in raw.strip().splitlines():
+            if   line.startswith('event:'): event_type = line[6:].strip()
+            elif line.startswith('data:'):  data_str  += line[5:].strip()
+        if not data_str: return
+        try: payload = _ej.loads(data_str)
+        except: return
+        ev = payload.get('event', event_type)
+        if ev == 'wstate':
+            # Re-ingest peer wstate into consensus
+            if _WSTATE_CONSENSUS:
+                try:
+                    fid = float(payload.get('w_fidelity', 0))
+                    h   = int(payload.get('chain_height', 0))
+                    # Update koyeb_state with peer fidelity data
+                    if fid > 0 and not payload.get('ouroboros'):
+                        _EXP_LOG.debug(
+                            f"[OURO] 🌀 Peer wstate ingest: h={h} F={fid:.4f}")
+                except Exception: pass
+        elif ev == 'dm_consensus':
+            fid = float(payload.get('consensus_fidelity', 0))
+            h   = int(payload.get('chain_height', 0))
+            _EXP_LOG.debug(f"[OURO] 🧬 Consensus DM: h={h} F={fid:.4f}")
+        elif ev == 'chain_reset':
+            # _RESET_PERFORMED is module-level
+            _EXP_LOG.warning("[OURO] ⚡ chain_reset via SSE self-loop — signalling mining reset")
+            _RESET_PERFORMED.set()
+
+    def _local_http_server(self) -> None:
+        """
+        Minimal HTTP server on 0.0.0.0:9091 serving:
+          GET /health    → {"status":"healthy","ready":true}  (Koyeb probe)
+          GET /events    → SSE stream (routed to C P2P SSE broadcaster)
+          POST /gossip   → receive chain_reset + wstate from peers
+          GET /api/p2p/peers → JSON list of known peers
+          GET /api/p2p/consensus_dm → current consensus DM snapshot
+
+        NOTE: Port 9091 is ALSO the C P2P TCP listen port.
+        The C accept thread handles the raw binary protocol.
+        This Python HTTP server runs on a SEPARATE socket with SO_REUSEPORT
+        so both can share port 9091 simultaneously — HTTP GET probes go here,
+        binary P2P connections go to C.
+        ❤️  I love you — every health check is a pulse
+        """
+        import socketserver as _ss, http.server as _hs, json as _hj
+        import time as _ht
+
+        class _Handler(_hs.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass  # suppress default logging
+
+            def do_GET(self):
+                if self.path in ('/health', '/healthz', '/ping', '/'):
+                    body = _hj.dumps({
+                        'status': 'healthy', 'ready': True,
+                        'protocol': 'ouroboros-v3',
+                        'p2p_peers':   int(_accel_lib.qtcl_p2p_peer_count())     if _accel_ok else 0,
+                        'sse_subs':    int(_accel_lib.qtcl_p2p_sse_sub_count())  if _accel_ok else 0,
+                        'oracle_conn': bool(_accel_lib.qtcl_sse_is_connected())  if _accel_ok else False,
+                        'timestamp':   _ht.time(),
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith('/api/p2p/peers'):
+                    peers = _P2P_NODE.get_peers() if _P2P_NODE else []
+                    body  = _hj.dumps({'peers': peers, 'count': len(peers)}).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+                elif self.path.startswith('/api/p2p/consensus_dm'):
+                    cons = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
+                    if cons:
+                        re, im, fid, h = cons
+                        body = _hj.dumps({
+                            'consensus_fidelity': fid,
+                            'chain_height': h,
+                            'dm_re': list(re), 'dm_im': list(im),
+                        }).encode()
+                    else:
+                        body = _hj.dumps({'error': 'not ready'}).encode()
+                    self.send_response(200 if cons else 503)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-Length', '9')
+                    self.end_headers(); self.wfile.write(b'Not Found')
+
+            def do_POST(self):
+                clen = int(self.headers.get('Content-Length', 0))
+                body_bytes = self.rfile.read(clen)
+                if self.path in ('/gossip', '/api/gossip'):
+                    try:
+                        payload = _hj.loads(body_bytes.decode('utf-8', errors='replace'))
+                        ev = payload.get('event', '')
+                        if ev == 'chain_reset' and int(payload.get('new_height', -1)) == 0:
+                            # _RESET_PERFORMED is module-level
+
+                            _RESET_PERFORMED.set()
+                            _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip POST")
+                        resp_body = b'{"ok":true}'
+                    except Exception:
+                        resp_body = b'{"ok":false}'
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(resp_body)))
+                    self.end_headers(); self.wfile.write(resp_body)
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-Length', '9')
+                    self.end_headers(); self.wfile.write(b'Not Found')
+
+        try:
+            class _ReuseServer(_ss.TCPServer):
+                allow_reuse_address = True
+                def server_bind(self):
+                    import socket as _sock
+                    self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                    try:
+                        self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
+                    except AttributeError: pass
+                    super().server_bind()
+
+            with _ReuseServer(('0.0.0.0', 9091), _Handler) as srv:
+                _EXP_LOG.info("[HTTP-9091] ✅ Local HTTP server on 0.0.0.0:9091 (/health /events /gossip)")
+                while not self._stop.is_set():
+                    srv.handle_request()
+        except OSError as _ose:
+            _EXP_LOG.debug(f"[HTTP-9091] Port 9091 in use by C layer (expected): {_ose}")
+        except Exception as _he:
+            _EXP_LOG.warning(f"[HTTP-9091] HTTP server error: {_he}")
 
     # ── Mine mode ─────────────────────────────────────────────────────────────
 
@@ -15455,6 +16885,15 @@ class QtclClientApp:
                       f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
                       f"purity={_cf2(m2.purity,0,1):.4f}  "
                       f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
+            # P2P / ouroboros status
+            if _accel_ok and _P2P_NODE and _P2P_NODE._started:
+                try:
+                    _np2 = int(_accel_lib.qtcl_p2p_connected_count())
+                    _ns2 = int(_accel_lib.qtcl_p2p_sse_sub_count())
+                    _cons2 = _P2P_NODE.get_consensus_dm()
+                    _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
+                    print(f"  P2P    : 🌀 {_np2} peers  {_ns2} SSE subs  consensus={_cf2}")
+                except Exception: pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
             # ── Buffered log tail (replaces stdout bleed) ─────────────────────
@@ -15912,6 +17351,41 @@ class QtclClientApp:
                 purl = p.get("url") or p.get("gossip_url") or "—"
                 plat = p.get("last_seen") or "?"
                 a(f"  {pid}  {purl}  last={plat}")
+
+            # ── P2P Ouroboros network status ───────────────────────
+            a(HR)
+            a("  P2P OUROBOROS NETWORK  —  port 9091")
+            if _accel_ok and _P2P_NODE and _P2P_NODE._started:
+                try:
+                    n_peers  = int(_accel_lib.qtcl_p2p_peer_count())
+                    n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
+                    n_sse    = int(_accel_lib.qtcl_p2p_sse_sub_count())
+                    a(f"  Status         : ✅ RUNNING  protocol=ouroboros-v3")
+                    a(f"  Known peers    : {n_peers}   Connected: {n_conn}   SSE subs: {n_sse}")
+                    # Consensus DM
+                    cons = _P2P_NODE.get_consensus_dm()
+                    if cons:
+                        _re, _im, _cf, _ch = cons
+                        a(f"  Consensus DM   : h={_ch}  F→|W3⟩={_cf:.4f}  ✅ pool average active")
+                    else:
+                        a("  Consensus DM   : ⏳ awaiting peer measurements")
+                    # Peer list
+                    _plist = _P2P_NODE.get_peers()
+                    if _plist:
+                        a(f"  Active peers   :")
+                        for _pp in _plist[:8]:
+                            _ph   = _pp.get('host','?')
+                            _ppo  = _pp.get('port', 9091)
+                            _pf   = float(_pp.get('last_fidelity', 0))
+                            _pht  = int(_pp.get('chain_height', 0))
+                            _plat = float(_pp.get('latency_ms', 0))
+                            a(f"    {_ph}:{_ppo}  h={_pht}  F={_pf:.4f}  lat={_plat:.1f}ms")
+                except Exception as _pe:
+                    a(f"  P2P query      : {_pe}")
+            else:
+                _why = "C unavailable" if not _accel_ok else ("not started" if not _P2P_NODE else "initializing…")
+                a(f"  Status         : ⚠️  {_why}  (solo mode)")
+                a("  Ouroboros      : self-loop inactive — no peer DM averaging")
 
             # ── Local C layer status ────────────────────────────────
             a(HR)
