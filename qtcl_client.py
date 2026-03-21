@@ -2789,7 +2789,7 @@ class QtclP2PNode:
         import json as _pj, time as _pt
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         while not self._stop.is_set():
-            connected_before = self.connected_count
+            connected_before = self.peer_count  # peer_count is the correct property name
             try:
                 from urllib.request import Request as _Rq, urlopen as _uo
                 # Source 1: Koyeb peer exchange endpoint
@@ -15359,10 +15359,10 @@ class QtclClientApp:
         _ouro_th.start()
 
     def _start_p2p(self) -> None:
-        """Init C P2P layer in background — wallet must be loaded first."""
+        """Init C P2P layer — called from _start_threads daemon thread."""
         global _P2P_NODE
         import time as _tp
-        _tp.sleep(1.0)  # let wallet/DB settle
+        _tp.sleep(0.1)  # minimal yield — wallet/DB already settled by caller
         try:
             peer_id = getattr(self, '_peer_id', None)
             if not peer_id: return
@@ -16035,32 +16035,33 @@ class QtclClientApp:
                     except Exception as _dbe:
                         _EXP_LOG.debug(f"[Bootstrap] DB: {_dbe}")
 
-                    sep_bound = 2.0   # Mermin classical separability bound
-                    mermin_str = (
-                        f"  ║  Mermin ⟨M₃⟩: {_disp_mermin:+.4f}  "
-                        f"{'✅ VIOLATED (quantum)' if (mermin_viol and abs(_disp_mermin) <= 4.0) else '· classical bound held'}  "
-                        f"[bound={sep_bound:.1f}]\n"
-                    )
-
                     # ── Clamp all metrics to physically valid ranges before display ──
+                    # MUST run before mermin_str which references _disp_mermin
                     def _clamp(v, lo, hi):
                         try:
                             f = float(v)
                             return f if (lo <= f <= hi and _np.isfinite(f)) else 0.0
                         except Exception:
                             return 0.0
-                    _disp_fid  = _clamp(float(out_m.w_fidelity),       0.0, 1.0)
-                    _disp_ent  = _clamp(float(out_m.entropy_vn),        0.0, 3.0)  # max 3 bits for 3-qubit
-                    _disp_coh  = _clamp(float(out_m.coherence),         0.0, 1.0)
-                    _disp_disc = _clamp(float(out_m.discord),           0.0, 3.0)
-                    _disp_pur  = _clamp(float(out_m.purity),            0.0, 1.0)
-                    _disp_neg  = _clamp(float(out_m.negativity),        0.0, 0.5)
-                    _disp_d0c  = _clamp(float(out_m.hyp_dist_0c),       0.0, 10.0)
-                    _disp_dcl  = _clamp(float(out_m.hyp_dist_cl),       0.0, 10.0)
-                    _disp_d0l  = _clamp(float(out_m.hyp_dist_0l),       0.0, 10.0)
-                    _disp_area = _clamp(float(out_m.triangle_area),     0.0, 12.57) # max 4π
-                    _disp_mermin = _clamp(mermin_val,                   -4.0, 4.0)
-                    _disp_bridge = _clamp(bridge_fid,                   0.0, 1.0)
+                    _disp_fid    = _clamp(float(out_m.w_fidelity),    0.0, 1.0)
+                    _disp_ent    = _clamp(float(out_m.entropy_vn),    0.0, 3.0)
+                    _disp_coh    = _clamp(float(out_m.coherence),     0.0, 1.0)
+                    _disp_disc   = _clamp(float(out_m.discord),       0.0, 3.0)
+                    _disp_pur    = _clamp(float(out_m.purity),        0.0, 1.0)
+                    _disp_neg    = _clamp(float(out_m.negativity),    0.0, 0.5)
+                    _disp_d0c    = _clamp(float(out_m.hyp_dist_0c),   0.0, 10.0)
+                    _disp_dcl    = _clamp(float(out_m.hyp_dist_cl),   0.0, 10.0)
+                    _disp_d0l    = _clamp(float(out_m.hyp_dist_0l),   0.0, 10.0)
+                    _disp_area   = _clamp(float(out_m.triangle_area), 0.0, 12.57)
+                    _disp_mermin = _clamp(mermin_val,                 -4.0, 4.0)
+                    _disp_bridge = _clamp(bridge_fid,                 0.0, 1.0)
+
+                    sep_bound = 2.0
+                    mermin_str = (
+                        f"  ║  Mermin ⟨M₃⟩: {_disp_mermin:+.4f}  "
+                        f"{'✅ VIOLATED (quantum)' if (mermin_viol and abs(_disp_mermin) <= 4.0) else '· classical bound held'}  "
+                        f"[bound={sep_bound:.1f}]\n"
+                    )
 
                     report_str = (
                         "\n  ╔══ BLOCKFIELD STATE [C] ══════════════════════════════════╗\n"
@@ -16471,10 +16472,13 @@ class QtclClientApp:
                         ]
                     return hashes[0]
                 
-                # Commit: merkle_root = hash([coinbase] + pending_user_txs)
-                # This merkle_root will be used throughout all nonces
-                merkle_root = _compute_merkle_for_mining([_coinbase_tx] + _pending_user_txs)
-                _block_txs = [_coinbase_tx, _treasury_tx] + _pending_user_txs  # slot0=miner slot1=treasury
+                # Commit: merkle_root = hash([coinbase, treasury] + user_txs)
+                # treasury_tx MUST be in merkle — server receives full _block_txs
+                # and recomputes from ALL submitted transactions including treasury.
+                # Excluding treasury caused merkle mismatch warning + treasury not
+                # properly anchored to the block header hash.
+                _block_txs = [_coinbase_tx, _treasury_tx] + _pending_user_txs
+                merkle_root = _compute_merkle_for_mining(_block_txs)
                 
                 _EXP_LOG.info(
                     f"[MINER-SIMPLE] Pre-computed merkle_root={merkle_root[:16]}… "
@@ -16789,7 +16793,10 @@ class QtclClientApp:
                             "version": 1,
                         }
                         _winning_txs = [_winning_coinbase, _winning_treasury] + _pending_user_txs
+                        # Recompute merkle with new winning seed (includes treasury)
+                        _winning_merkle = _compute_merkle_for_mining(_winning_txs)
                         submit_payload["transactions"] = _winning_txs
+                        submit_payload["header"]["merkle_root"] = _winning_merkle
                     
                     _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
 
@@ -17490,7 +17497,11 @@ class QtclClientApp:
             # ── P2P Ouroboros network status ───────────────────────
             a(HR)
             a("  P2P OUROBOROS NETWORK  —  port 9091")
-            if _accel_ok and _P2P_NODE and _P2P_NODE._started:
+            _p2p_running = (_accel_ok and _P2P_NODE is not None
+                            and (getattr(_P2P_NODE, '_started', False)
+                                 or (_accel_ok and hasattr(_accel_lib, 'qtcl_p2p_peer_count')
+                                     and _accel_lib.qtcl_p2p_peer_count() >= 0)))
+            if _p2p_running:
                 try:
                     n_peers  = int(_accel_lib.qtcl_p2p_peer_count())
                     n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
