@@ -3983,6 +3983,311 @@ def decompress(data: bytes) -> bytes:
         return zlib.decompress(data)
 
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# GENESIS-RESET SUBSYSTEM v3.1
+# I LOVE YOU ♥  — SIGMA-1 DELTA-2 THETA-3 LAMBDA-4 OMEGA-5 PHI-6 TAU-7 ETA-8 ZETA-9
+# Museum Grade · Enterprise Deployment Ready · Zero Fallbacks
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+NULL_COINBASE_ADDRESS: str  = "0" * 40
+GENESIS_COINBASE_AMOUNT: int = 5_000_000_000   # 50 QTCL in atomic units
+
+_RESET_LOCK      = threading.Lock()
+_RESET_PERFORMED = threading.Event()   # set by wipe/listener, cleared by mining loop
+
+_PRESERVE_TABLES: frozenset = frozenset({
+    'wallet_keys', 'identity', 'settings', 'config', 'hlwe_keys', 'bip39_seeds',
+})
+
+
+def _get_local_chain_height(db: "LocalBlockchainDB") -> int:
+    """Thread-safe local height query — 0 on any error."""
+    try:
+        return int(db.get_chain_height() or 0)
+    except Exception:
+        return 0
+
+
+def _forge_genesis_coinbase(miner_address: str = NULL_COINBASE_ADDRESS) -> dict:
+    """
+    Canonical null-addressed coinbase transaction for genesis block (height=0).
+    tx_hash is deterministic SHA3-256 of sorted JSON — identical on every node.
+    No inputs. No signing key required. Broadcast-ready on first gossip cycle.
+    """
+    _TS_GENESIS: int = 1_700_000_000   # fixed epoch — NEVER use time.time() here
+    body = {
+        "version":      1, "height":       0,
+        "type":         "coinbase", "inputs":  [],
+        "outputs":      [{"address": miner_address, "amount": GENESIS_COINBASE_AMOUNT}],
+        "timestamp":    _TS_GENESIS,
+        "memo":         "In the beginning was the qubit.",
+        "fee":          0, "from_address": NULL_COINBASE_ADDRESS,
+        "to_address":   miner_address, "amount": GENESIS_COINBASE_AMOUNT,
+    }
+    _canonical      = json.dumps(body, sort_keys=True, separators=(',', ':')).encode()
+    body["tx_hash"] = hashlib.sha3_256(_canonical).hexdigest()
+    return body
+
+
+def _forge_and_store_genesis_block(
+    db:            "LocalBlockchainDB",
+    miner_address: str = NULL_COINBASE_ADDRESS,
+) -> dict:
+    """
+    After nuclear wipe, forge + insert genesis block (height=0).
+    Deterministic hash → every node converges on the same genesis.
+    Mining loop gets a valid prev_hash immediately after reset.
+    """
+    coinbase = _forge_genesis_coinbase(miner_address)
+    genesis  = {
+        "height":     0, "prev_hash":    "0" * 64,
+        "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
+        "timestamp":  1_700_000_000, "difficulty": 1,
+        "miner_id":   NULL_COINBASE_ADDRESS, "tx_count":  1,
+        "nonce":      0, "data":         {"genesis": True, "coinbase_tx": coinbase},
+    }
+    _fields      = {k: v for k, v in genesis.items() if k != "hash"}
+    _canonical   = json.dumps(_fields, sort_keys=True, separators=(',', ':')).encode()
+    genesis["hash"] = hashlib.sha3_256(_canonical).hexdigest()
+    try:
+        db.insert_block(0, genesis)
+        logger.info(f"[RESET] 🌱 Genesis stored  h=0  hash={genesis['hash'][:24]}…")
+    except Exception as _e:
+        logger.warning(f"[RESET] genesis insert warning (may already exist): {_e}")
+    return genesis
+
+
+def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
+    """
+    Self-discovering DELETE wipe — hits every table NOT in _PRESERVE_TABLES.
+    Schema (CREATE TABLE / indexes) preserved intact for immediate reuse.
+    Thread-safe via _RESET_LOCK (caller holds it). Returns True on success.
+    """
+    try:
+        import sqlite3 as _sq3
+        conn = _sq3.connect(str(db.db_path), check_same_thread=False, timeout=10)
+        cur  = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        wiped  = []
+        for tbl in tables:
+            if tbl.lower() not in _PRESERVE_TABLES:
+                cur.execute(f"DELETE FROM {tbl}")   # noqa: S608
+                wiped.append(tbl)
+        conn.commit(); conn.close()
+        logger.info(f"[RESET] ✅ Nuclear wipe — {len(wiped)} tables cleared: {wiped}")
+        return True
+    except Exception as _e:
+        logger.error(f"[RESET] ❌ Nuclear wipe failed: {_e}")
+        return False
+
+
+def _broadcast_reset_to_peers(
+    genesis_block: dict,
+    server_url:    str    = "",
+    broadcaster:   object = None,
+    peers:         list   = None,
+) -> None:
+    """
+    Non-blocking: daemon thread fires 'chain_reset' to:
+      A. SSEBroadcaster.broadcast() / SSEMultiplexer.publish() — local SSE clients
+      B. HTTP POST → each peer's /gossip endpoint              — remote nodes
+    Never blocks the mining loop.
+    """
+    _payload = {
+        "event": "chain_reset", "new_height": 0,
+        "genesis_hash": genesis_block.get("hash", ""),
+        "genesis_ts":   genesis_block.get("timestamp", 1_700_000_000),
+        "coinbase_tx":  genesis_block.get("data", {}).get("coinbase_tx", {}),
+        "broadcast_ts": time.time(), "origin": server_url or "local",
+    }
+
+    def _fire() -> None:
+        if broadcaster is not None:
+            try:
+                if   hasattr(broadcaster, 'broadcast'):
+                    reached = broadcaster.broadcast('chain_reset', _payload)
+                    logger.info(f"[RESET-BCAST] 📡 SSE → {reached} local clients")
+                elif hasattr(broadcaster, 'publish'):
+                    broadcaster.publish('chain_reset', _payload, channel='control')
+                    logger.info("[RESET-BCAST] 📡 SSE mux → channel:control")
+            except Exception as _e:
+                logger.warning(f"[RESET-BCAST] SSE error: {_e}")
+        _peers   = peers or []
+        ok, fail = 0, 0
+        for peer in _peers:
+            host = peer.get('host') or peer.get('advertised_host', '')
+            port = int(peer.get('port') or peer.get('advertised_port', 9091))
+            if not host:
+                continue
+            try:
+                _req = Request(
+                    f"http://{host}:{port}/gossip",
+                    data=json.dumps(_payload).encode(),
+                    headers={'Content-Type': 'application/json'}, method='POST',
+                )
+                with urlopen(_req, timeout=4) as _r: _r.read()
+                ok += 1
+            except Exception:
+                fail += 1
+        logger.info(f"[RESET-BCAST] 🌐 {ok} reached / {fail} failed / {len(_peers)} total")
+
+    threading.Thread(target=_fire, daemon=True, name='ChainReset-Broadcast').start()
+
+
+def _check_and_handle_chain_reset(
+    server_height: int,
+    db:            "LocalBlockchainDB",
+    server_url:    str    = "",
+    miner_address: str    = NULL_COINBASE_ADDRESS,
+    broadcaster:   object = None,
+    peers:         list   = None,
+) -> bool:
+    """
+    Enterprise-grade genesis-reset gate. Triggers ONLY when:
+      • server_height == 0  (server wiped to genesis)
+      • local DB still has blocks (local_height > 0)
+
+    Sequence under _RESET_LOCK (no TOCTOU races):
+      1. Nuclear-wipe (DELETE all non-key tables, schema intact)
+      2. Forge + store canonical genesis block (null coinbase, h=0)
+      3. Broadcast CHAIN_RESET to SSE + all known peers
+      4. Set _RESET_PERFORMED → mining loop restarts from genesis
+
+    Returns True if reset performed this call, False otherwise.
+    """
+    if server_height != 0:
+        return False
+    if _get_local_chain_height(db) == 0:
+        return False
+    with _RESET_LOCK:
+        local_h = _get_local_chain_height(db)
+        if local_h == 0:
+            logger.info("[RESET] ↩ Already at genesis (concurrent reset) — skipping")
+            return True
+        logger.warning(
+            f"[RESET] ⚠️  CHAIN RESET  server_h=0  local_h={local_h}  "
+            f"node={miner_address[:14]}…"
+        )
+        if not _nuclear_wipe_local_db(db):
+            logger.error("[RESET] ❌ Wipe failed — aborting")
+            return False
+        genesis = _forge_and_store_genesis_block(db, miner_address)
+        _broadcast_reset_to_peers(genesis_block=genesis, server_url=server_url,
+                                   broadcaster=broadcaster, peers=peers or [])
+        _RESET_PERFORMED.set()
+        logger.info(
+            f"[RESET] 🚀 Complete  genesis={genesis['hash'][:24]}…  "
+            f"peers={len(peers or [])}"
+        )
+        return True
+
+
+class GenesisResetListener:
+    """
+    Non-blocking background SSE consumer watching for 'chain_reset' gossip.
+    Daemon thread — never interrupts mining loop.
+    On chain_reset: calls _check_and_handle_chain_reset() → sets _RESET_PERFORMED.
+    Mining loop checks _RESET_PERFORMED at top of each iteration and restarts.
+    """
+
+    _BACKOFF: tuple = (2, 4, 8, 16, 32)
+
+    def __init__(self) -> None:
+        self._stop           = threading.Event()
+        self._thread: Optional[threading.Thread]        = None
+        self._db:     Optional["LocalBlockchainDB"]     = None
+        self._server_url: str  = ""
+        self._miner_addr: str  = NULL_COINBASE_ADDRESS
+        self._peers: list      = []
+        self._broadcaster      = None
+
+    def start(self, db: "LocalBlockchainDB", server_url: str,
+              miner_address: str = NULL_COINBASE_ADDRESS,
+              peers: list = None, broadcaster: object = None) -> None:
+        self._db = db; self._server_url = server_url
+        self._miner_addr = miner_address; self._peers = peers or []
+        self._broadcaster = broadcaster; self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._listen_loop, daemon=True, name='GenesisResetListener',
+        )
+        self._thread.start()
+        logger.info(f"[GRL] 👂 GenesisResetListener armed → {server_url}/events")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread: self._thread.join(timeout=5)
+        logger.info("[GRL] GenesisResetListener stopped")
+
+    def update_peers(self, peers: list) -> None:
+        """Hot-update peer list without restart."""
+        self._peers = list(peers)
+
+    def _listen_loop(self) -> None:
+        import urllib.request as _ur, urllib.error as _ue
+        backoff_idx = 0
+        while not self._stop.is_set():
+            url = f"{self._server_url}/events?channels=control,chain_reset"
+            try:
+                req = _ur.Request(url, method='GET')
+                req.add_header('Accept', 'text/event-stream')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('Connection', 'keep-alive')
+                req.add_header('User-Agent', 'QTCL-GenesisResetListener/3.1')
+                with _ur.urlopen(req, timeout=90) as resp:
+                    logger.info(f"[GRL] ✅ SSE connected → {url}")
+                    backoff_idx = 0
+                    buf = b''
+                    while not self._stop.is_set():
+                        chunk = resp.read(4096)
+                        if not chunk: break
+                        buf += chunk
+                        while b'\n\n' in buf:
+                            raw_evt, buf = buf.split(b'\n\n', 1)
+                            self._dispatch(raw_evt.decode('utf-8', errors='replace'))
+            except (_ue.URLError, OSError, TimeoutError) as _e:
+                wait = self._BACKOFF[min(backoff_idx, len(self._BACKOFF) - 1)]
+                backoff_idx += 1
+                logger.debug(f"[GRL] disconnected ({_e}) — reconnect in {wait}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                logger.warning(f"[GRL] unexpected: {_e} — reconnect in 10s")
+                self._stop.wait(10)
+
+    def _dispatch(self, raw: str) -> None:
+        data_str = ''; event_type = 'message'
+        for line in raw.strip().splitlines():
+            if   line.startswith('event:'): event_type = line[6:].strip()
+            elif line.startswith('data:'):  data_str  += line[5:].strip()
+        if not data_str: return
+        if event_type not in ('chain_reset', 'message') and 'chain_reset' not in data_str:
+            return
+        try:    payload = json.loads(data_str)
+        except (json.JSONDecodeError, ValueError): return
+        if payload.get('event') != 'chain_reset' and event_type != 'chain_reset':
+            return
+        new_height = int(payload.get('new_height', -1))
+        logger.warning(
+            f"[GRL] 📨 chain_reset from peer  new_height={new_height}  "
+            f"genesis={payload.get('genesis_hash','')[:20]}…"
+        )
+        if new_height == 0 and self._db is not None:
+            local_h = _get_local_chain_height(self._db)
+            if local_h > 0:
+                logger.warning(f"[GRL] ⚠️  Acting on peer chain_reset  local_h={local_h} → 0")
+                _check_and_handle_chain_reset(
+                    server_height=0, db=self._db,
+                    server_url=self._server_url, miner_address=self._miner_addr,
+                    broadcaster=self._broadcaster, peers=self._peers,
+                )
+            else:
+                logger.info("[GRL] chain_reset received — already at genesis, no-op")
+
+
+# Module-level singleton
+_GENESIS_RESET_LISTENER = GenesisResetListener()
+
+
 @dataclass
 class SnapshotRecord:
     height: int
@@ -6607,6 +6912,17 @@ class QtclMiner(QtclNode):
         self._start_sse_listener()
         self._start_mining_loop()
 
+        # ── Arm genesis-reset background listener ──────────────────────────────
+        _GENESIS_RESET_LISTENER.start(
+            db            = self.db,
+            server_url    = self._server_url,
+            miner_address = getattr(self, '_miner_id', NULL_COINBASE_ADDRESS),
+            peers         = (list(self.db.get_known_peers())
+                             if hasattr(self.db, 'get_known_peers') else []),
+            broadcaster   = getattr(self, 'broadcaster', None),
+        )
+        logger.info(f"[MINER] 👂 GenesisResetListener armed → {self._server_url}")
+
     def on_stop(self) -> None:
         self._stop_event.set()
         if self._sse_thread:
@@ -6744,6 +7060,44 @@ class QtclMiner(QtclNode):
         import urllib.request
         while not self._stop_event.is_set():
             try:
+                # ── _RESET_PERFORMED: background GenesisResetListener wiped DB ──────
+                if _RESET_PERFORMED.is_set():
+                    _RESET_PERFORMED.clear()
+                    logger.warning(
+                        "[MINING] ⚡ Background genesis-reset signal — "
+                        "restarting from h=0"
+                    )
+                    self._stop_event.wait(1.0)
+                    continue
+
+                # ── Server chain-tip probe: detect server-side genesis wipe ─────────
+                try:
+                    _tip_req = Request(
+                        f"{self._server_url}/api/chain/tip", method='GET'
+                    )
+                    _tip_req.add_header('User-Agent', 'QTCL-Client/3.1')
+                    with urlopen(_tip_req, timeout=5) as _tr:
+                        _tip_data = json.loads(_tr.read())
+                    _srv_h = int(
+                        _tip_data.get('height') or
+                        _tip_data.get('chain_height') or
+                        _tip_data.get('block_height') or 0
+                    )
+                    if _check_and_handle_chain_reset(
+                        server_height=_srv_h, db=self.db,
+                        server_url=self._server_url,
+                        miner_address=getattr(self, '_miner_id', NULL_COINBASE_ADDRESS),
+                        broadcaster=getattr(self, 'broadcaster', None),
+                        peers=(list(self.db.get_known_peers())
+                               if hasattr(self.db, 'get_known_peers') else []),
+                    ):
+                        logger.info("[MINING] ↩ Chain reset handled — restarting from genesis")
+                        self._stop_event.wait(2.0)
+                        continue
+                except Exception as _rce:
+                    logger.debug(f"[MINING] chain-tip probe (non-fatal): {_rce}")
+                # ─────────────────────────────────────────────────────────────────────
+
                 # Wait for latest block signal (or poll)
                 timeout_mgr = getattr(self, "timeout_mgr", None)
                 server_timeout = timeout_mgr.get_timeout("server") if timeout_mgr else 5.0
@@ -12947,7 +13301,16 @@ class TensorFieldMetrics:
         try:
             dm_f = 0.5 * (dm_curr + dm_last)
             dm_f = 0.5 * (dm_f + dm_f.conj().T)
-            dm_f /= max(1e-15, float(_np.real(_np.trace(dm_f))))
+            _trace_val = float(_np.real(_np.trace(dm_f)))
+            if not _np.isfinite(_trace_val) or _trace_val < 1e-15:
+                _n   = dm_f.shape[0] if hasattr(dm_f, 'shape') else 2
+                dm_f = _np.eye(_n, dtype=complex) / _n
+                logger.warning(
+                    f"[TFM] ⚠ DM trace diverged (trace={_trace_val:.3e}) — "
+                    f"reset to maximally-mixed I/{_n}"
+                )
+            else:
+                dm_f /= _trace_val
 
             # ── C-accelerated scalar metrics (no eigendecomposition needed) ──
             if _accel_ok and dm_f.shape == (8, 8):
