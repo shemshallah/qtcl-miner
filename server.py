@@ -5926,21 +5926,43 @@ def initialize_lattice_controller():
         return None
 
 
-LATTICE = initialize_lattice_controller()
+LATTICE = None  # initialized in background thread below — never blocks gunicorn
 
 # ── FIX: Register in globals so OracleWStateManager._extract_snapshot() resolves it ──
 # OracleWStateManager calls `from globals import get_lattice` on every cycle.
 # globals.LATTICE was initialized to None at import time and never updated —
 # this one call fixes the flood of "Lattice is None" errors.
-try:
-    from globals import set_lattice as _glb_set_lattice
-    if LATTICE is not None:
-        _glb_set_lattice(LATTICE)
-        logger.info("[LATTICE] ✅ globals.LATTICE singleton registered — oracle measurements enabled")
-    else:
-        logger.warning("[LATTICE] ⚠️  LatticeController is None — oracle measurements will remain paused")
-except Exception as _glb_err:
-    logger.warning(f"[LATTICE] Could not register globals singleton: {_glb_err}")
+def _deferred_lattice_init():
+    """
+    Initialize the QuantumLatticeController in a background daemon thread.
+
+    KOYEB STARTUP FIX: initialize_spatial_lattice() registers 106,496 pseudoqubits
+    via a pure-Python BFS loop — takes 15-45 s on Koyeb's shared vCPU.
+    Running this synchronously at module level blocked gunicorn from binding port 8000,
+    causing Koyeb's health probe to time out and the instance to never go healthy.
+
+    All subsystems that need LATTICE check for None before use. They will
+    operate in degraded/mock mode for the first ~20-30 s then switch to live
+    state once this thread sets the global LATTICE reference.
+    """
+    global LATTICE
+    try:
+        controller = initialize_lattice_controller()
+        LATTICE = controller
+        if LATTICE is not None:
+            try:
+                from globals import set_lattice as _glb_set_lattice
+                _glb_set_lattice(LATTICE)
+                logger.info("[LATTICE] ✅ globals.LATTICE registered — oracle measurements enabled")
+            except Exception as _glb_err:
+                logger.warning(f"[LATTICE] Could not register globals singleton: {_glb_err}")
+        else:
+            logger.warning("[LATTICE] ⚠️  LatticeController is None — oracle measurements paused")
+    except Exception as _lat_err:
+        logger.error(f"[LATTICE] Deferred init failed: {_lat_err}")
+
+threading.Thread(target=_deferred_lattice_init, daemon=True, name="LatticeInit").start()
+logger.info("[LATTICE] 🚀 Lattice init deferred to background — gunicorn binding NOW")
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 # AGENT INITIALIZATION: Instantiate all 5 metric agents (Museum Grade • θ Deployment)
@@ -7235,6 +7257,19 @@ def _wsgi_startup() -> None:
         _ORACLE_INIT_EVENT.wait(timeout=120)
         oracle_status = "✅ ready" if ORACLE_AVAILABLE else "⚠️  unavailable"
         logger.info(f"[WSGI-INIT] Oracle status: {oracle_status} — proceeding with subsystem init")
+
+        # ── Wait for LATTICE to finish its background init (up to 60 s) ──────
+        # LatticeInit thread runs concurrently with OracleDeferred. On Koyeb
+        # the 106k BFS typically takes 20-40 s. We wait here so the oracle
+        # wiring below gets a live lattice ref instead of None.
+        _lat_waited = 0
+        while LATTICE is None and _lat_waited < 60:
+            time.sleep(1)
+            _lat_waited += 1
+        if LATTICE is not None:
+            logger.info(f"[WSGI-INIT] ✅ LATTICE ready after {_lat_waited}s")
+        else:
+            logger.warning("[WSGI-INIT] ⚠️  LATTICE still None after 60s — oracle will run without lattice ref")
 
         # ── START ORACLE W-STATE CLUSTER ─────────────────────────────────────
         # Must run here — after oracle.py has been imported and ORACLE_W_STATE_MANAGER
@@ -11721,6 +11756,15 @@ def _start_comprehensive_measurement_feed():
     logger.info("[COMPREHENSIVE-FEED] Daemon started (lattice only, Oracle PQ via SYNC daemon)")
 
 
-# Start comprehensive feed daemon
-if LATTICE is not None:
-    _start_comprehensive_measurement_feed()
+# Start comprehensive feed daemon — deferred until LATTICE is ready
+def _start_comprehensive_feed_when_ready():
+    import time as _t
+    for _ in range(90):  # wait up to 90s
+        if LATTICE is not None:
+            _start_comprehensive_measurement_feed()
+            return
+        _t.sleep(1)
+    logger.warning("[COMPREHENSIVE-FEED] LATTICE never became ready — feed not started")
+
+threading.Thread(target=_start_comprehensive_feed_when_ready, daemon=True,
+                 name="ComprehensiveFeedWaiter").start()
