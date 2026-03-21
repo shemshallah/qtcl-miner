@@ -6541,9 +6541,14 @@ class QtclServer(QtclNode):
                 # Apply block reward
                 token_ledger = getattr(self, "token_ledger", None)
                 if token_ledger and token_ledger.is_running():
-                    token_ledger.apply_block_rewards(
-                        block, "server", QtclConstants.BLOCK_REWARD
-                    )
+                    _blk_h = block.get('height', 0)
+                    try:
+                        from globals import TessellationRewardSchedule as _TRS_ar
+                        _ar_rewards = _TRS_ar.get_rewards_for_height(_blk_h)
+                        _ar_total   = _ar_rewards['miner'] + _ar_rewards['treasury']
+                    except Exception:
+                        _ar_total = 800
+                    token_ledger.apply_block_rewards(block, "server", _ar_total)
                 # Broadcast via SSE multiplexer on port 9091
                 if self.broadcaster:  # Fallback if broadcaster exists
                     self.broadcaster.broadcast_block(block)
@@ -6985,7 +6990,7 @@ class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
     GENESIS_HASH: str = "0" * 64
     DEFAULT_DIFFICULTY: int = 4
-    BLOCK_REWARD: int = 50_000_000   # in base units (50 QTCL)
+    BLOCK_REWARD: int = 800           # 8.0 QTCL total per block (miner+treasury) — depth-agnostic display constant only
     MAX_TX_PER_BLOCK: int = 500
     DEFAULT_N_QUBITS: int = 8
     SSE_HEARTBEAT_INTERVAL: int = 30
@@ -14731,23 +14736,58 @@ class QtclClientApp:
                 
                 # Build deterministic coinbase transaction
                 # Uses same formula as server._server_merkle() to ensure hash matches
+                # Height-aware miner reward from canonical schedule
+                try:
+                    from globals import TessellationRewardSchedule as _TRS_m
+                    _miner_reward_base   = _TRS_m.get_miner_reward_base(target_height)
+                    _treasury_reward_base = _TRS_m.get_treasury_reward_base(target_height)
+                    _treasury_address    = _TRS_m.TREASURY_ADDRESS
+                    _tess_depth          = _TRS_m.get_depth_for_height(target_height)
+                except Exception:
+                    _miner_reward_base    = 720   # depth-5 genesis default
+                    _treasury_reward_base = 80
+                    _treasury_address     = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
+                    _tess_depth           = 5
+
                 _coinbase_tx_id = _hl.sha3_256(
                     json.dumps({
                         "block_height": target_height,
                         "miner_address": miner_addr,
-                        "amount": 1250,  # BLOCK_REWARD_BASE in base units
+                        "amount": _miner_reward_base,
                         "w_proof": _w_entropy_seed.hex(),
                         "version": 1,
                     }, sort_keys=True).encode()
                 ).hexdigest()
-                
+
                 _coinbase_tx = {
                     "tx_id": _coinbase_tx_id,
                     "from_addr": "0" * 64,  # COINBASE_ADDRESS — null input
                     "to_addr": miner_addr,
-                    "amount": 1250,
+                    "amount": _miner_reward_base,
                     "block_height": target_height,
-                    "w_proof": _w_entropy_seed.hex(),  # FIX: must match tx_id computation (was _w_entropy_hash)
+                    "w_proof": _w_entropy_seed.hex(),
+                    "tx_type": "coinbase",
+                    "version": 1,
+                }
+
+                # Treasury coinbase — slot 1 — always constructed, server enforces it
+                _treasury_cb_id = _hl.sha3_256(
+                    json.dumps({
+                        "block_height": target_height,
+                        "treasury_address": _treasury_address,
+                        "amount": _treasury_reward_base,
+                        "w_proof": _w_entropy_seed.hex(),
+                        "version": 1,
+                    }, sort_keys=True).encode()
+                ).hexdigest()
+
+                _treasury_tx = {
+                    "tx_id": _treasury_cb_id,
+                    "from_addr": "0" * 64,
+                    "to_addr": _treasury_address,
+                    "amount": _treasury_reward_base,
+                    "block_height": target_height,
+                    "w_proof": _w_entropy_seed.hex(),
                     "tx_type": "coinbase",
                     "version": 1,
                 }
@@ -14794,7 +14834,7 @@ class QtclClientApp:
                 # Commit: merkle_root = hash([coinbase] + pending_user_txs)
                 # This merkle_root will be used throughout all nonces
                 merkle_root = _compute_merkle_for_mining([_coinbase_tx] + _pending_user_txs)
-                _block_txs = [_coinbase_tx] + _pending_user_txs  # Full transaction list to submit
+                _block_txs = [_coinbase_tx, _treasury_tx] + _pending_user_txs  # slot0=miner slot1=treasury
                 
                 _EXP_LOG.info(
                     f"[MINER-SIMPLE] Pre-computed merkle_root={merkle_root[:16]}… "
@@ -15073,7 +15113,7 @@ class QtclClientApp:
                             json.dumps({
                                 "block_height": target_height,
                                 "miner_address": miner_addr,
-                                "amount": 1250,
+                                "amount": _miner_reward_base,
                                 "w_proof": _winning_seed.hex(),
                                 "version": 1,
                             }, sort_keys=True).encode()
@@ -15082,13 +15122,33 @@ class QtclClientApp:
                             "tx_id": _winning_cb_id,
                             "from_addr": "0" * 64,
                             "to_addr": miner_addr,
-                            "amount": 1250,
+                            "amount": _miner_reward_base,
                             "block_height": target_height,
                             "w_proof": _winning_seed.hex(),
                             "tx_type": "coinbase",
                             "version": 1,
                         }
-                        _winning_txs = [_winning_coinbase] + _pending_user_txs
+                        # Rebuild treasury coinbase with winning seed
+                        _winning_treasury_id = _hl.sha3_256(
+                            json.dumps({
+                                "block_height": target_height,
+                                "treasury_address": _treasury_address,
+                                "amount": _treasury_reward_base,
+                                "w_proof": _winning_seed.hex(),
+                                "version": 1,
+                            }, sort_keys=True).encode()
+                        ).hexdigest()
+                        _winning_treasury = {
+                            "tx_id": _winning_treasury_id,
+                            "from_addr": "0" * 64,
+                            "to_addr": _treasury_address,
+                            "amount": _treasury_reward_base,
+                            "block_height": target_height,
+                            "w_proof": _winning_seed.hex(),
+                            "tx_type": "coinbase",
+                            "version": 1,
+                        }
+                        _winning_txs = [_winning_coinbase, _winning_treasury] + _pending_user_txs
                         submit_payload["transactions"] = _winning_txs
                     
                     _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
