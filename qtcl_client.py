@@ -2956,7 +2956,7 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
         _P2P_NODE = QtclP2PNode(node_id, port)
     return _P2P_NODE
 
-_EXP_LOG.info("[QTCL P2P v3] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready — ouroboros active")
+_EXP_LOG.info("[QTCL P2P v4] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready — ouroboros+epidemic active")
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -10855,6 +10855,249 @@ cleanup:
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   §SSE — C SSE HTTP/1.1 CLIENT (Raw socket, zero libcurl dependency)
+   Reads text/event-stream from oracle.  Handles chunked transfer encoding.
+   Termux-safe: only POSIX sockets + OpenSSL for TLS.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#define QTCL_SSE_BUFSZ     65536
+#define QTCL_SSE_MAX_LINE  8192
+
+typedef struct {
+    volatile int        fd;          /* raw TCP socket (-1 = closed)  */
+    SSL_CTX            *ssl_ctx;
+    SSL                *ssl;
+    char                host[256];
+    char                path[512];
+    uint16_t            port;
+    volatile int        running;     /* 1=active, 0=shutdown          */
+    pthread_t           thread;
+    /* Ring buffer for parsed DM snapshots (lock-free SPSC) */
+    /* Producer: SSE thread. Consumer: Python/measurement thread.     */
+    volatile uint64_t   rb_head;     /* write index */
+    volatile uint64_t   rb_tail;     /* read  index */
+#define SSE_RING_SZ  32
+    char                rb_data[SSE_RING_SZ][QTCL_SSE_BUFSZ];
+    uint32_t            rb_len[SSE_RING_SZ];
+    /* Reconnect state */
+    uint32_t            reconnect_count;
+    float               backoff_s;
+} QtclSSEClient;
+
+static QtclSSEClient _G_SSE = {0};
+
+/* Non-blocking write all */
+static int _ssl_write_all(SSL *ssl, const char *buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int r = SSL_write(ssl, buf+sent, len-sent);
+        if (r <= 0) return -1;
+        sent += r;
+    }
+    return sent;
+}
+
+/* Parse one SSE frame, extract JSON from "data: {…}" lines */
+static int _parse_sse_frame(const char *frame, int flen,
+                             char *json_out, int json_max) {
+    const char *p = frame, *end = frame + flen;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', end-p);
+        if (!eol) eol = end;
+        int ll = (int)(eol - p);
+        if (ll >= 5 && memcmp(p, "data:", 5) == 0) {
+            int ds = 5; while (ds < ll && p[ds]==' ') ds++;
+            int dl = ll - ds;
+            if (dl > 0 && dl < json_max) {
+                memcpy(json_out, p+ds, dl);
+                json_out[dl] = '\0';
+                return dl;
+            }
+        }
+        p = eol + 1;
+    }
+    return 0;
+}
+
+static void *_sse_thread(void *arg) {
+    QtclSSEClient *c = (QtclSSEClient*)arg;
+    static int ssl_init_done = 0;
+    if (!ssl_init_done) {
+        /* OpenSSL 1.1+ — SSL_library_init/SSL_load_error_strings removed.
+           OPENSSL_init_ssl() with 0 flags performs all required initialization. */
+        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS |
+                         OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+        ssl_init_done = 1;
+    }
+
+    char line_buf[QTCL_SSE_BUFSZ];
+    char frame_buf[QTCL_SSE_BUFSZ];
+    int  frame_len = 0;
+
+    while (c->running) {
+        /* Resolve host */
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", c->port);
+        int gai = getaddrinfo(c->host, port_str, &hints, &res);
+        if (gai || !res) {
+            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
+            c->backoff_s = bs * 2.0f + 0.5f;
+            usleep((int)(bs * 1e6));
+            continue;
+        }
+
+        int sock = socket(res->ai_family, SOCK_STREAM, 0);
+        if (sock < 0) { freeaddrinfo(res); usleep(2000000); continue; }
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+            freeaddrinfo(res); close(sock);
+            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
+            c->backoff_s = bs * 2.0f + 0.5f;
+            usleep((int)(bs * 1e6));
+            continue;
+        }
+        freeaddrinfo(res);
+
+        /* TLS handshake */
+        if (c->ssl_ctx) { SSL_CTX_free(c->ssl_ctx); }
+        c->ssl_ctx = SSL_CTX_new(TLS_client_method());
+        SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, NULL);
+        c->ssl = SSL_new(c->ssl_ctx);
+        SSL_set_fd(c->ssl, sock);
+        SSL_set_tlsext_host_name(c->ssl, c->host);
+        if (SSL_connect(c->ssl) <= 0) {
+            SSL_free(c->ssl); c->ssl = NULL;
+            SSL_CTX_free(c->ssl_ctx); c->ssl_ctx = NULL;
+            close(sock); usleep(3000000); continue;
+        }
+
+        /* HTTP/1.1 GET request */
+        char req[1024];
+        int rlen = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Accept: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "User-Agent: QTCL-Client/3.0-P2Pv2\r\n\r\n",
+            c->path, c->host);
+        if (_ssl_write_all(c->ssl, req, rlen) < 0) goto reconnect;
+
+        /* Read HTTP response headers */
+        char hdr_buf[4096]; int hdr_len = 0; int hdr_done = 0;
+        while (!hdr_done && c->running) {
+            int n = SSL_read(c->ssl, hdr_buf+hdr_len, sizeof(hdr_buf)-hdr_len-1);
+            if (n <= 0) break;
+            hdr_len += n; hdr_buf[hdr_len] = '\0';
+            if (strstr(hdr_buf, "\r\n\r\n")) hdr_done = 1;
+        }
+        if (!hdr_done) goto reconnect;
+        /* Verify 200 OK */
+        if (!strstr(hdr_buf, "200 ")) goto reconnect;
+
+        c->reconnect_count++;
+        c->backoff_s = 1.0f;  /* reset backoff on success */
+        c->fd = sock;
+        frame_len = 0;
+
+        /* Main SSE read loop */
+        char buf[4096];
+        int lb_pos = 0;
+        while (c->running) {
+            int n = SSL_read(c->ssl, buf, sizeof(buf));
+            if (n <= 0) break;
+            /* Feed bytes into line buffer, looking for \n\n frame boundary */
+            for (int i = 0; i < n; i++) {
+                char ch = buf[i];
+                if (ch == '\r') continue;  /* strip CR */
+                if (frame_len < QTCL_SSE_BUFSZ-1)
+                    frame_buf[frame_len++] = ch;
+                /* Double-newline = end of SSE frame */
+                if (frame_len >= 2 &&
+                    frame_buf[frame_len-1]=='\n' &&
+                    frame_buf[frame_len-2]=='\n') {
+                    char json_tmp[QTCL_SSE_BUFSZ];
+                    int jl = _parse_sse_frame(frame_buf, frame_len,
+                                              json_tmp, QTCL_SSE_BUFSZ);
+                    if (jl > 0) {
+                        /* Write to lock-free ring buffer (SPSC) */
+                        uint64_t head = c->rb_head;
+                        uint64_t next = (head+1) % SSE_RING_SZ;
+                        if (next != c->rb_tail) {
+                            memcpy(c->rb_data[head], json_tmp, jl+1);
+                            c->rb_len[head] = jl;
+                            atomic_thread_fence(memory_order_release);
+                            c->rb_head = next;
+                        }
+                        /* else ring full: drop oldest frame */
+                    }
+                    frame_len = 0;
+                }
+            }
+        }
+reconnect:
+        c->fd = -1;
+        if (c->ssl) { SSL_free(c->ssl); c->ssl = NULL; }
+        if (c->ssl_ctx) { SSL_CTX_free(c->ssl_ctx); c->ssl_ctx = NULL; }
+        close(sock);
+        if (c->running) {
+            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
+            c->backoff_s = bs * 2.0f + 0.5f;
+            usleep((int)(bs * 1e6));
+        }
+    }
+    return NULL;
+}
+
+int qtcl_sse_connect(const char *host, uint16_t port, const char *path) {
+    if (_G_SSE.running) return -1;
+    memset(&_G_SSE, 0, sizeof(_G_SSE));
+    strncpy(_G_SSE.host, host, 255);
+    strncpy(_G_SSE.path, path, 511);
+    _G_SSE.port    = port;
+    _G_SSE.fd      = -1;
+    _G_SSE.running = 1;
+    _G_SSE.backoff_s = 1.0f;
+    pthread_attr_t attr; pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    return pthread_create(&_G_SSE.thread, &attr, _sse_thread, &_G_SSE);
+}
+
+void qtcl_sse_disconnect(void) {
+    _G_SSE.running = 0;
+    if (_G_SSE.fd >= 0) { shutdown(_G_SSE.fd, SHUT_RDWR); }
+}
+
+/* Poll for JSON frames (non-blocking). Returns number of frames written. */
+int qtcl_sse_poll(char *buf, int buf_sz, int max_frames) {
+    int count = 0;
+    while (count < max_frames) {
+        uint64_t tail = _G_SSE.rb_tail;
+        atomic_thread_fence(memory_order_acquire);
+        if (tail == _G_SSE.rb_head) break;
+        uint32_t len = _G_SSE.rb_len[tail];
+        if ((int)len+1 <= buf_sz) {
+            memcpy(buf, _G_SSE.rb_data[tail], len+1);
+            buf += len+1; buf_sz -= len+1;
+        }
+        _G_SSE.rb_tail = (tail+1) % SSE_RING_SZ;
+        count++;
+    }
+    return count;
+}
+
+int  qtcl_sse_is_connected(void) { return _G_SSE.fd >= 0 ? 1 : 0; }
+int  qtcl_sse_reconnect_count(void) { return (int)_G_SSE.reconnect_count; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
    §P2P — QTCL CUSTOM PROTOCOL v4 — OUROBOROS · EPIDEMIC GOSSIP · BLOOM
    ═══════════════════════════════════════════════════════════════════════════
    v4 improvements:
@@ -11291,7 +11534,7 @@ static void *_ouroboros_thread(void *arg){
         pthread_mutex_unlock(&_P2P.bloom_lock);
         /* Wstate ring */
         uint64_t h=_P2P.wring_head;
-        if((h+1)&P2P_WRING_MASK!=_P2P.wring_tail){
+        if(((h+1)&P2P_WRING_MASK)!=_P2P.wring_tail){
             _P2P.wring[h]=ls;atomic_thread_fence(memory_order_release);
             _P2P.wring_head=(h+1)&P2P_WRING_MASK;
         }
@@ -11406,7 +11649,7 @@ static void *_p2p_peer_thread(void *arg){
             pthread_mutex_unlock(&_P2P.inv_lock);
             /* Wstate ring */
             uint64_t wh=_P2P.wring_head;
-            if((wh+1)&P2P_WRING_MASK!=_P2P.wring_tail){
+            if(((wh+1)&P2P_WRING_MASK)!=_P2P.wring_tail){
                 _P2P.wring[wh]=*m;atomic_thread_fence(memory_order_release);
                 _P2P.wring_head=(wh+1)&P2P_WRING_MASK;
             }
