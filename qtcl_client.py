@@ -2044,16 +2044,12 @@ class LocalOracleEngine:
             self._oracle_connected = True
             self._snapshot_count += 1
         # ── INSTANT C ABORT: push block height from every oracle frame ─────
-        # Every DM frame carries the current chain height from the oracle.
-        # Setting _qtcl_oracle_height makes the C PoW hot-loop self-abort
-        # within 256 nonces (~22µs at 11kH/s) — no Python polling needed.
         _frame_h = int(data.get('block_height') or data.get('height') or
                         data.get('pq_curr') or data.get('lattice_refresh_counter') or 0)
-        if _frame_h > 0 and _accel_ok:
+        if _frame_h > 0 and _accel_ok and _accel_lib is not None:
             try:
-                _cur_target = int(_accel_lib.qtcl_get_miner_target()) if _accel_ok else 0
+                _cur_target = int(_accel_lib.qtcl_get_miner_target())
                 _accel_lib.qtcl_set_oracle_height(_frame_h)
-                # If height reached/passed our mining target → explicit abort signal
                 if _cur_target > 0 and _frame_h >= _cur_target:
                     _accel_lib.qtcl_pow_set_abort(1)
             except Exception:
@@ -2665,7 +2661,11 @@ class QtclP2PNode:
         self._consensus = consensus
 
         if not _accel_ok:
-            _EXP_LOG.warning("[P2P] C layer unavailable — P2P disabled (solo mode)")
+            _EXP_LOG.warning(
+                "[P2P] C layer unavailable — P2P disabled (solo mode). "
+                "This is caused by the C compile failure above. "
+                "Delete __pycache__ and retry after fixing the compile error."
+            )
             return False
 
         rc = _accel_lib.qtcl_p2p_init(
@@ -13654,7 +13654,12 @@ def _compile_c_layer() -> None:
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
         _accel_lib = _accel_ffi.verify(
             _QTCL_C_SRC,
-            libraries=['ssl', 'crypto', 'sqlite3'],
+            libraries=(['ssl', 'crypto', 'sqlite3']
+                        if __import__('shutil').which('sqlite3') is not None or
+                           __import__('os').path.exists('/usr/lib/x86_64-linux-gnu/libsqlite3.so') or
+                           __import__('os').path.exists('/data/data/com.termux/files/usr/lib/libsqlite3.so') or
+                           __import__('os').path.exists('/usr/lib/libsqlite3.so')
+                        else ['ssl', 'crypto']),
             extra_compile_args=[
                 '-O3', '-march=native', '-ffast-math', '-funroll-loops',
                 '-DOPENSSL_NO_DEPRECATED',
@@ -16527,10 +16532,16 @@ class QtclClientApp:
         bath = GKSLBathParams.from_snap(snap)
         pq_curr_id = str(bh)     if bh > 0 else "0"
         pq_last_id = str(bh - 1) if bh > 0 else "0"
-        _last_ts = _LOCAL_ORACLE._last_oracle_dm_ts
-        _age_str = f"{(_st.time()-_last_ts):.1f}s" if _last_ts > 1e9 else "cold — no frame yet"
+        _last_ts  = _LOCAL_ORACLE._last_oracle_dm_ts
+        _snap_cnt = _LOCAL_ORACLE.snapshot_count
+        if _last_ts > 1e9:
+            _age_str = f"{(_st.time()-_last_ts):.1f}s"
+        elif _snap_cnt == 0 and fid > 0:
+            _age_str = "Python SSE active (DM parsing in progress)"
+        else:
+            _age_str = "cold — no frame yet"
         print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  "
-              f"SSE age: {_age_str}  │  snaps: {_LOCAL_ORACLE.snapshot_count}")
+              f"SSE age: {_age_str}  │  snaps: {_snap_cnt}")
         try:
             _oracle_conn_status = "✅ connected" if _LOCAL_ORACLE.is_connected else "⏳ connecting"
         except RuntimeError:
@@ -17025,6 +17036,24 @@ class QtclClientApp:
                         b"QTCL_DEGRADED:" + str(_bh).encode() + str(_pqc).encode()
                     ).digest()
                     return 0, None, _deg_seed, _deg_report
+
+            # ── Python-only fallback (C unavailable) ───────────────────────────
+            # Build a degraded seed from block height + oracle SSE fidelity
+            import hashlib as _hpy
+            _py_fid  = float(_LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0.0))
+            _py_seed = _hpy.sha3_256(
+                b"QTCL_PY_FALLBACK:" + str(_bh).encode() +
+                str(_pqc).encode() + str(_py_fid).encode()
+            ).digest()
+            _py_report = (
+                "\n  ╔══ BLOCKFIELD STATE [PYTHON-ONLY] ══════════════════════════╗\n"
+                f"  ║  C accel  : unavailable                                    ║\n"
+                f"  ║  oracle F : {_py_fid:.4f}   h={_bh}                         ║\n"
+                f"  ║  pq0/curr : 0 / {_pqc} / {_pql}                             ║\n"
+                f"  ║  seed     : {_py_seed.hex()[:16]}…                          ║\n"
+                "  ╚═══════════════════════════════════════════════════════════════╝\n"
+            )
+            return 0, None, _py_seed, _py_report
 
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
