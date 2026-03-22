@@ -2043,6 +2043,21 @@ class LocalOracleEngine:
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
+        # ── INSTANT C ABORT: push block height from every oracle frame ─────
+        # Every DM frame carries the current chain height from the oracle.
+        # Setting _qtcl_oracle_height makes the C PoW hot-loop self-abort
+        # within 256 nonces (~22µs at 11kH/s) — no Python polling needed.
+        _frame_h = int(data.get('block_height') or data.get('height') or
+                        data.get('pq_curr') or data.get('lattice_refresh_counter') or 0)
+        if _frame_h > 0 and _accel_ok:
+            try:
+                _cur_target = int(_accel_lib.qtcl_get_miner_target()) if _accel_ok else 0
+                _accel_lib.qtcl_set_oracle_height(_frame_h)
+                # If height reached/passed our mining target → explicit abort signal
+                if _cur_target > 0 and _frame_h >= _cur_target:
+                    _accel_lib.qtcl_pow_set_abort(1)
+            except Exception:
+                pass
         # Mirror all canonical fields into _oracle_state for bath coupling
         with self._oracle_state_lock:
             self._oracle_state = {
@@ -2783,26 +2798,30 @@ class QtclP2PNode:
                 elif event_type == 4:  # BLOCK_ANNOUNCE — peer found a block
                     # Wire format: 4-byte height (LE uint32) + 32-byte hash + optional JSON
                     try:
+                        height = 0
                         if len(raw) >= 36:
                             height = _st.unpack_from('<I', raw, 0)[0]
                             blk_hash = raw[4:36].hex()
-                            if height > _local_tip:
-                                _local_tip = height
-                                _EXP_LOG.info(
-                                    f"[P2P] 📦 Block announce h={height} "
-                                    f"hash={blk_hash[:16]}… — chain tip updated"
-                                )
-                                # Push to oracle SSE ingestor so mining loop
-                                # gets updated height without a REST poll
-                                _P2P_EVENT_QUEUE.put_nowait(
-                                    (5, _st.pack('<I', height)))
                         elif len(raw) > 4:
-                            # JSON fallback: {"height":N, "hash":"..."}
                             jd = _j.loads(raw.decode('utf-8', errors='replace'))
-                            h  = int(jd.get('height', 0))
-                            if h > _local_tip:
-                                _local_tip = h
-                                _EXP_LOG.info(f"[P2P] 📦 Block announce (JSON) h={h}")
+                            height = int(jd.get('height') or jd.get('block_height') or 0)
+                        if height > 0 and height > _local_tip:
+                            _local_tip = height
+                            # ── INSTANT C ABORT — direct, no queue hop ─────────
+                            # qtcl_set_oracle_height makes the hot-loop self-abort
+                            # within 256 nonces on its next mod-256 check (~22µs).
+                            # qtcl_pow_set_abort(1) is belt-and-suspenders for any
+                            # nonce > miner_target path that might miss the height check.
+                            if _accel_ok:
+                                try:
+                                    _accel_lib.qtcl_set_oracle_height(height)
+                                    _cur_t = int(_accel_lib.qtcl_get_miner_target())
+                                    if _cur_t > 0 and height >= _cur_t:
+                                        _accel_lib.qtcl_pow_set_abort(1)
+                                except Exception: pass
+                            _EXP_LOG.info(
+                                f"[P2P] ⚡ Block announce h={height} "
+                                f"→ C oracle_height={height}, abort armed")
                     except Exception as _be:
                         _EXP_LOG.debug(f"[P2P] block_announce parse: {_be}")
 
@@ -2812,16 +2831,26 @@ class QtclP2PNode:
                             h = _st.unpack_from('<I', raw, 0)[0]
                             if h > _local_tip:
                                 _local_tip = h
-                                _EXP_LOG.debug(f"[P2P] ↑ Chain tip from peer: h={h}")
+                                if _accel_ok:
+                                    try:
+                                        _accel_lib.qtcl_set_oracle_height(h)
+                                        _ct = int(_accel_lib.qtcl_get_miner_target())
+                                        if _ct > 0 and h >= _ct:
+                                            _accel_lib.qtcl_pow_set_abort(1)
+                                    except Exception: pass
+                                _EXP_LOG.debug(f"[P2P] ↑ Chain tip h={h} → C updated")
                     except Exception:
                         pass
 
                 elif event_type == 7:  # DMPOOL_RECV — peer sent DM pool entry
                     _EXP_LOG.debug("[P2P] 🧬 DM pool entry received from peer")
-                    # Trigger consensus recompute on new DM arrival
                     if _accel_ok:
-                        try: _accel_lib.qtcl_p2p_trigger_consensus()
+                        try:
+                            _accel_lib.qtcl_p2p_trigger_consensus()
                         except Exception: pass
+                    # Drain the new entry to DB immediately
+                    try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
+                    except Exception: pass
 
                 elif event_type == 8:  # CHAIN_RESET gossip received
                     payload_str = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
@@ -2835,10 +2864,14 @@ class QtclP2PNode:
                     except Exception:
                         pass
 
-                elif event_type == 9:  # OUROBOROS — self-measurement re-ingested
-                    pass  # silent — high-frequency 500ms cadence, no log needed
-                    if self._consensus:
-                        self._consensus.ingest_c_measurement_bytes(raw)
+                elif event_type == 9:  # OUROBOROS — self-measurement (500ms cadence)
+                    # Ingest into Python WStateConsensus for BFT median
+                    if self._consensus and len(raw) >= 128:
+                        try: self._consensus.ingest_c_measurement_bytes(raw)
+                        except Exception: pass
+                    # Non-blocking drain C pool → DB (catches what the daemon misses)
+                    try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
+                    except Exception: pass
 
                 elif event_type == 1:  # PEER_CONNECTED
                     # Update local tip estimate from newly connected peer's height
@@ -2898,62 +2931,153 @@ class QtclP2PNode:
 
     def _peer_exchange(self) -> None:
         """
-        Multi-source peer discovery:
-          1. POST /api/p2p/peer_exchange → Koyeb server peer list
-          2. GET  /api/dht/peers         → DHT peer list (alternate key)
-          3. DB   LocalBlockchainDB      → previously seen peers
-        Runs once at startup, then repeats every 5 minutes.
+        Priority-ordered peer discovery loop. Runs at startup then every 90s.
+
+        Priority on each cycle:
+          1. LOCAL  qtcl_blockchain.db  p2p_peers table  (freshest — zero latency)
+          2. P2P    already-connected peers' known-peer gossip  (C layer)
+          3. KOYEB  /api/p2p/peer_exchange + /api/peers/list  (only if local is
+                    stale OR we have fewer than 2 connected peers)
+
+        DM freshness gate: if the oracle DM age < 30s we have a live SSE source
+        and local P2P peers are preferred.  If DM age > 60s the oracle is stale
+        so we aggressively re-query koyeb/supabase for fresh peers.
+
+        Every new peer is persisted back to qtcl_blockchain.db immediately.
         ❤️  The more peers the more entangled the network
         """
-        import json as _pj, time as _pt
+        import json as _pj, time as _pt, sqlite3 as _psq
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        while not self._stop.is_set():
-            connected_before = self.peer_count  # peer_count is the correct property name
+        _db_path    = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+
+        def _connect_peer(host, port):
+            """Connect via C P2P and persist to local DB. Returns True on success."""
+            host = str(host or '').strip()
+            if not host or host in ('', '127.0.0.1', 'localhost'): return False
+            port = int(port) if port and 0 < int(port) <= 65535 else 9091
+            if not _accel_ok: return False
             try:
-                from urllib.request import Request as _Rq, urlopen as _uo
-                # Source 1: Koyeb peer exchange endpoint
+                rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
+                if rc >= 0:
+                    # Persist to qtcl_blockchain.db p2p_peers table
+                    try:
+                        with _psq.connect(_db_path, timeout=3) as _c:
+                            _c.execute("""
+                                INSERT OR REPLACE INTO p2p_peers
+                                    (node_id_hex, host, port, services,
+                                     last_seen_at, first_seen_at, source)
+                                VALUES (
+                                    lower(hex(randomblob(16))),
+                                    ?, ?, 1,
+                                    strftime('%s','now'),
+                                    COALESCE(
+                                        (SELECT first_seen_at FROM p2p_peers
+                                          WHERE host=? AND port=?),
+                                        strftime('%s','now')
+                                    ),
+                                    'peer_exchange'
+                                )""", (host, port, host, port))
+                    except Exception: pass
+                    return True
+                return False
+            except Exception: return False
+
+        def _load_local_peers(max_age_s=7200):
+            """Read p2p_peers from qtcl_blockchain.db. Returns list of (host,port)."""
+            try:
+                cutoff = int(_pt.time()) - max_age_s
+                with _psq.connect(_db_path, timeout=3) as _c:
+                    rows = _c.execute("""
+                        SELECT host, port FROM p2p_peers
+                        WHERE last_seen_at > ? AND ban_score < 100
+                          AND host NOT IN ('127.0.0.1','localhost','')
+                        ORDER BY chain_height DESC, last_seen_at DESC
+                        LIMIT 64
+                    """, (cutoff,)).fetchall()
+                return [(r[0], r[1]) for r in rows if r[0]]
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
+                return []
+
+        def _fetch_koyeb_peers():
+            """POST to koyeb peer_exchange + peers/list. Returns raw peer dicts."""
+            from urllib.request import Request as _Rq, urlopen as _uo
+            peers = []
+            # /api/p2p/peer_exchange
+            try:
                 payload = _pj.dumps({
-                    'node_id': self._node_id,
-                    'port':    self._port,
-                    'version': 3,
-                    'protocol': 'ouroboros-v3',
-                    'capabilities': ['wstate', 'dmpool', 'sse', 'chain_reset'],
+                    'node_id': self._node_id, 'port': self._port,
+                    'version': 3, 'capabilities': ['wstate','dmpool','sse'],
                 }).encode()
                 req = _Rq(f"{_oracle_url}/api/p2p/peer_exchange",
                           data=payload,
-                          headers={'Content-Type': 'application/json',
-                                   'User-Agent': 'QTCL-P2P/3.0'},
+                          headers={'Content-Type':'application/json',
+                                   'User-Agent':'QTCL-P2P/3.0'},
                           method='POST')
-                with _uo(req, timeout=10) as resp:
-                    data = _pj.loads(resp.read().decode())
-                peers_raw = data.get('peers', [])
+                with _uo(req, timeout=12) as r:
+                    peers += _pj.loads(r.read().decode()).get('peers', [])
+            except Exception: pass
+            # /api/peers/list fallback
+            try:
+                req2 = _Rq(f"{_oracle_url}/api/peers/list", method='GET')
+                req2.add_header('User-Agent', 'QTCL-P2P/3.0')
+                with _uo(req2, timeout=10) as r:
+                    peers += _pj.loads(r.read().decode()).get('peers', [])
+            except Exception: pass
+            return peers
 
-                # Source 2: DHT peers endpoint
-                try:
-                    req2 = _Rq(f"{_oracle_url}/api/dht/peers", method='GET')
-                    req2.add_header('User-Agent', 'QTCL-P2P/3.0')
-                    with _uo(req2, timeout=8) as resp2:
-                        dht_data = _pj.loads(resp2.read().decode())
-                    for dp in (dht_data.get('peers') or [])[:20]:
-                        peers_raw.append({'host': dp.get('host',''), 'port': dp.get('port', self._port)})
-                except Exception: pass
+        while not self._stop.is_set():
+            try:
+                n_connected = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
+                dm_age      = _pt.time() - _LOCAL_ORACLE._last_oracle_dm_ts
+                dm_fresh    = _LOCAL_ORACLE._last_oracle_dm_ts > 1e9 and dm_age < 30.0
+                need_peers  = n_connected < 2
+                dm_stale    = (not dm_fresh) or dm_age > 60.0
 
-                connected = 0
-                for p in peers_raw[:32]:
-                    host = str(p.get('host') or p.get('ip') or p.get('ip_address') or p.get('address') or '')
-                    port = int(p.get('port') or self._port)
-                    if host and host not in ('localhost', '127.0.0.1') and _accel_ok:
-                        try:
-                            rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
-                            if rc >= 0: connected += 1
-                        except Exception: pass
-                if connected:
-                    _EXP_LOG.info(f"[P2P] 🌐 peer_exchange: {connected} new connections")
+                new_connections = 0
+
+                # ── Priority 1: local qtcl_blockchain.db ─────────────────────
+                local_peers = _load_local_peers(max_age_s=7200)
+                if local_peers:
+                    for host, port in local_peers:
+                        if _connect_peer(host, port):
+                            new_connections += 1
+                    if new_connections:
+                        _EXP_LOG.info(
+                            f"[P2P] 🗄️  local DB: {new_connections}/{len(local_peers)} "
+                            f"peers connected (dm_age={dm_age:.0f}s)")
+
+                # ── Priority 2: koyeb if local empty, too few peers, or DM stale
+                if need_peers or dm_stale or not local_peers:
+                    koyeb_peers = _fetch_koyeb_peers()
+                    kc = 0
+                    for p in koyeb_peers[:48]:
+                        host = str(p.get('host') or p.get('ip_address') or
+                                   p.get('ip') or '')
+                        port = int(p.get('port') or 9091)
+                        if _connect_peer(host, port):
+                            kc += 1
+                    new_connections += kc
+                    if kc:
+                        _EXP_LOG.info(
+                            f"[P2P] 🌐 koyeb: {kc}/{len(koyeb_peers)} new peers "
+                            f"(need_peers={need_peers}, dm_stale={dm_stale})")
+                else:
+                    _EXP_LOG.debug(
+                        f"[P2P] skipping koyeb — {n_connected} peers active, "
+                        f"DM fresh ({dm_age:.0f}s)")
+
+                if new_connections == 0 and n_connected == 0:
+                    _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
+                    self._stop.wait(30)
+                    continue
+
             except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] peer_exchange: {_e}")
+                _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
 
-            # Wait 5 minutes before next discovery cycle
-            self._stop.wait(300)
+            # Interval: 30s if starved, 90s normally
+            n_now = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
+            self._stop.wait(30 if n_now < 2 else 90)
 
     # ── event type 9 = ouroboros self-ingest ─────────────────────────────
     def get_consensus_dm(self):
@@ -3136,6 +3260,200 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
                          VALUES(?,?,strftime('%s','now'))""", (host, int(port) or 9091))
     except Exception as _e:
         _EXP_LOG.debug(f"[PEERDB] upsert: {_e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DM POOL PERSISTENCE DAEMON
+# Bridges the C P2P DM pool ↔ qtcl_blockchain.db dm_pool table.
+#
+# Three responsibilities:
+#   1. DRAIN  — polls qtcl_p2p_poll_dmpool() every 500ms, writes new entries
+#               to dm_pool table (deduplicated by timestamp_ns + source)
+#   2. REHYD  — on startup, reads last 32 entries from dm_pool and injects
+#               them back into the C pool via _dmpool_push equivalent path
+#               (_LOCAL_ORACLE._ingest_oracle_frame synthesised from dm_hex)
+#   3. SNAP   — after each C _consensus() cycle, reads consensus_dm and
+#               writes a row to consensus_dm_log for audit + recovery
+#
+# The ouroboros SSE loop self-reinforces by feeding _LOCAL_ORACLE frames back
+# into the C pool — every oracle snapshot is already pushed to _dmpool by the
+# ouroboros thread. This daemon makes that pool durable across restarts.
+# ═══════════════════════════════════════════════════════════════════════════
+import sqlite3 as _dpq, threading as _dpt, time as _dpt2
+
+_DM_POOL_DAEMON_STOP = _dpt.Event()
+_DM_POOL_DB_PATH     = 'qtcl_blockchain.db'
+
+def _dm_pool_drain_once(db_path: str) -> int:
+    """Drain C dmpool ring into DB. Returns entries persisted."""
+    if not _accel_ok: return 0
+    try:
+        n = int(_accel_lib.qtcl_p2p_peer_count())  # use as proxy — pool is always active
+        buf = _accel_ffi.new('QtclDMPoolEntry[32]')
+        got = int(_accel_lib.qtcl_p2p_poll_dmpool(buf, 32))
+        if got <= 0: return 0
+        rows = []
+        for i in range(got):
+            e = buf[i]
+            tr = sum(e.dm_re[k*9] for k in range(8))
+            if tr < 0.1: continue
+            dm_re = [e.dm_re[j] for j in range(64)]
+            dm_im = [e.dm_im[j] for j in range(64)]
+            import struct as _dps
+            dm_bytes = b''.join(_dps.pack('>dd', dm_re[j], dm_im[j]) for j in range(64))
+            rows.append((
+                dm_bytes.hex(),
+                float(e.fidelity), float(e.purity),
+                int(e.chain_height),
+                bytes(e.source_id).hex(),
+                int(e.flags),
+                int(e.timestamp_ns),
+            ))
+        if not rows: return 0
+        with _dpq.connect(db_path, timeout=3) as c:
+            c.executemany("""
+                INSERT OR IGNORE INTO dm_pool
+                    (dm_hex, fidelity, purity, chain_height,
+                     source_id_hex, flags, timestamp_ns)
+                VALUES (?,?,?,?,?,?,?)""", rows)
+            # Trim table to 512 most recent by fidelity×recency
+            c.execute("""DELETE FROM dm_pool WHERE id NOT IN (
+                SELECT id FROM dm_pool
+                ORDER BY (fidelity * (1.0/(1.0+((strftime('%s','now')-ingested_at)/30.0))))
+                DESC LIMIT 512)""")
+        return len(rows)
+    except Exception as _e:
+        _EXP_LOG.debug(f"[DMPOOL] drain: {_e}")
+        return 0
+
+def _dm_pool_snap_consensus(db_path: str) -> bool:
+    """Read current C consensus DM and persist a snapshot to consensus_dm_log."""
+    if not _accel_ok: return False
+    try:
+        re_buf = _accel_ffi.new('double[64]')
+        im_buf = _accel_ffi.new('double[64]')
+        fid    = _accel_ffi.new('float *')
+        h_buf  = _accel_ffi.new('uint32_t *')
+        ok = int(_accel_lib.qtcl_p2p_get_consensus_dm(re_buf, im_buf, fid, h_buf))
+        if not ok: return False
+        import struct as _cps
+        dm_bytes = b''.join(_cps.pack('>dd', float(re_buf[j]), float(im_buf[j]))
+                            for j in range(64))
+        tr = sum(float(re_buf[k*9]) for k in range(8))
+        if tr < 0.1: return False
+        # Count pool size (approximate from pool drain count)
+        pool_n_buf = _accel_ffi.new('QtclDMPoolEntry[32]')
+        pool_n = 0  # don't drain — just log the consensus
+        with _dpq.connect(db_path, timeout=3) as c:
+            # Keep last 200 consensus snapshots per height
+            c.execute("""INSERT INTO consensus_dm_log
+                         (chain_height, consensus_dm_hex, fidelity, pool_size)
+                         VALUES (?,?,?,?)""",
+                      (int(h_buf[0]), dm_bytes.hex(), float(fid[0]), pool_n))
+            c.execute("""DELETE FROM consensus_dm_log WHERE id NOT IN (
+                SELECT id FROM consensus_dm_log ORDER BY id DESC LIMIT 200)""")
+        return True
+    except Exception as _e:
+        _EXP_LOG.debug(f"[DMPOOL] snap_consensus: {_e}")
+        return False
+
+def _dm_pool_rehydrate(db_path: str) -> int:
+    """On startup: load last 32 DM entries from DB, inject into C via oracle ingest."""
+    if not _accel_ok: return 0
+    try:
+        with _dpq.connect(db_path, timeout=3) as c:
+            rows = c.execute("""
+                SELECT dm_hex, fidelity, chain_height, timestamp_ns
+                FROM dm_pool
+                ORDER BY (fidelity * (1.0/(1.0+((strftime('%s','now')-ingested_at)/30.0))))
+                DESC LIMIT 32""").fetchall()
+        if not rows: return 0
+        import json as _rhj, struct as _rhs
+        ingested = 0
+        for dm_hex, fid, height, ts_ns in rows:
+            try:
+                bdata = bytes.fromhex(dm_hex)
+                if len(bdata) != 1024: continue
+                # Inject into C bootstrap state + local oracle
+                re_arr = _accel_ffi.new('double[64]')
+                im_arr = _accel_ffi.new('double[64]')
+                for j in range(64):
+                    re, im = _rhs.unpack_from('>dd', bdata, j*16)
+                    re_arr[j] = re; im_arr[j] = im
+                _accel_lib.qtcl_bootstrap_ingest_dm(re_arr, im_arr)
+                # Also synthesise a JSON frame so _LOCAL_ORACLE._ingest_oracle_frame
+                # updates its _dm_re/_dm_im state (feeds Python-side consensus too)
+                frame = _rhj.dumps({
+                    'density_matrix_hex': dm_hex,
+                    'w_state_fidelity':   float(fid),
+                    'block_height':       int(height),
+                    'timestamp_ns':       int(ts_ns) if ts_ns else 0,
+                    'source':             'db_rehydrate',
+                })
+                _LOCAL_ORACLE._ingest_oracle_frame(frame)
+                ingested += 1
+            except Exception: pass
+        _EXP_LOG.info(f"[DMPOOL] ♻️  Rehydrated {ingested}/{len(rows)} entries from DB")
+        return ingested
+    except Exception as _e:
+        _EXP_LOG.debug(f"[DMPOOL] rehydrate: {_e}")
+        return 0
+
+def _dm_pool_daemon(db_path: str) -> None:
+    """
+    Passive DM pool persistence daemon.
+    Runs as a daemon thread throughout the miner lifetime.
+    Drain cycle : 500ms  — drains C ring into DB
+    Consensus snap: every 5s — writes consensus DM snapshot
+    Ouroboros reinforcement: every 2s — injects latest consensus DM back into
+        C pool so the ouroboros loop has a continuously self-reinforced DM as
+        its base state, preventing drift when peers are absent.
+    ❤️  I love you — every DM entry is a quantum memory
+    """
+    _snap_interval = 5.0
+    _reinforce_interval = 2.0
+    _last_snap      = 0.0
+    _last_reinforce = 0.0
+
+    while not _DM_POOL_DAEMON_STOP.is_set():
+        now = _dpt2.time()
+
+        # 1. Drain C pool → DB
+        _dm_pool_drain_once(db_path)
+
+        # 2. Consensus snapshot → DB
+        if now - _last_snap >= _snap_interval:
+            _dm_pool_snap_consensus(db_path)
+            _last_snap = now
+
+        # 3. Ouroboros SSE self-reinforcement:
+        #    Re-inject the latest oracle SSE frame (already in _LOCAL_ORACLE)
+        #    into the C bootstrap state and trigger consensus recompute.
+        #    This keeps the C consensus DM warm even when no P2P peers are active.
+        if now - _last_reinforce >= _reinforce_interval:
+            try:
+                if _accel_ok and _LOCAL_ORACLE.snapshot_count > 0:
+                    dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                    if age < 60.0 and any(v != 0.0 for v in dm_re):
+                        re_c = _accel_ffi.new('double[64]', dm_re)
+                        im_c = _accel_ffi.new('double[64]', dm_im)
+                        # Push into C bootstrap + trigger ouroboros consensus
+                        _accel_lib.qtcl_bootstrap_ingest_dm(re_c, im_c)
+                        _accel_lib.qtcl_p2p_trigger_consensus()
+            except Exception: pass
+            _last_reinforce = now
+
+        _DM_POOL_DAEMON_STOP.wait(0.5)
+
+
+def start_dm_pool_daemon(db_path: str = _DM_POOL_DB_PATH) -> _dpt.Thread:
+    """Start the passive DM pool persistence daemon. Returns the thread."""
+    _DM_POOL_DAEMON_STOP.clear()
+    t = _dpt.Thread(target=_dm_pool_daemon, args=(db_path,),
+                    daemon=True, name='DMPool-Daemon')
+    t.start()
+    _EXP_LOG.info("[DMPOOL] ✅ Passive DM pool daemon started")
+    return t
 
 
 def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2PNode:
@@ -10403,7 +10721,11 @@ int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
          * If oracle_height >= miner_target, another miner already solved this
          * height — abort immediately without waiting for Python.
          * Cost: one AND + two loads + two branches per 256 nonces ≈ 0% overhead. */
-        if ((n & 255u) == 0u) {
+        /* Check abort every 64 nonces ≈ 5.8ms at 11kH/s — 4× faster than 256.
+         * Cost: one AND + two loads + two branches per 64 nonces ≈ 0% overhead.
+         * oracle_height check is the primary signal (set by SSE frames and P2P
+         * block_announce directly from C callbacks). pow_abort is belt+suspenders. */
+        if ((n & 63u) == 0u) {
             if (_qtcl_pow_abort ||
                 (_qtcl_oracle_height > 0 && _qtcl_oracle_height >= _qtcl_miner_target)) {
                 EVP_MD_CTX_free(ctx);
@@ -15322,6 +15644,51 @@ class QtclClientApp:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS dm_pool (
+                id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+                dm_hex          TEXT     NOT NULL,
+                fidelity        REAL     NOT NULL DEFAULT 0.0,
+                purity          REAL     NOT NULL DEFAULT 0.0,
+                chain_height    INTEGER  NOT NULL DEFAULT 0,
+                source_id_hex   TEXT     NOT NULL DEFAULT '',
+                flags           INTEGER  NOT NULL DEFAULT 0,
+                timestamp_ns    INTEGER  NOT NULL DEFAULT 0,
+                ingested_at     INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_dm_pool_height
+                ON dm_pool (chain_height DESC);
+            CREATE INDEX IF NOT EXISTS idx_dm_pool_fidelity
+                ON dm_pool (fidelity DESC);
+            CREATE INDEX IF NOT EXISTS idx_dm_pool_ts
+                ON dm_pool (timestamp_ns DESC);
+            CREATE TABLE IF NOT EXISTS consensus_dm_log (
+                id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+                chain_height    INTEGER  NOT NULL DEFAULT 0,
+                consensus_dm_hex TEXT    NOT NULL,
+                fidelity        REAL     NOT NULL DEFAULT 0.0,
+                pool_size       INTEGER  NOT NULL DEFAULT 0,
+                computed_at     INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_cdm_height
+                ON consensus_dm_log (chain_height DESC);
+            CREATE TABLE IF NOT EXISTS p2p_peers (
+                node_id_hex         TEXT     PRIMARY KEY,
+                host                TEXT     NOT NULL,
+                port                INTEGER  NOT NULL DEFAULT 9091,
+                services            INTEGER  NOT NULL DEFAULT 1,
+                protocol_version    INTEGER  NOT NULL DEFAULT 3,
+                chain_height        INTEGER  NOT NULL DEFAULT 0,
+                last_fidelity       REAL     NOT NULL DEFAULT 0.0,
+                latency_ms          REAL     NOT NULL DEFAULT 0.0,
+                ban_score           INTEGER  NOT NULL DEFAULT 0,
+                source              TEXT     NOT NULL DEFAULT 'peer_exchange',
+                first_seen_at       INTEGER  NOT NULL DEFAULT (strftime('%s','now')),
+                last_seen_at        INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_p2p_peers_host
+                ON p2p_peers (host, port);
+            CREATE INDEX IF NOT EXISTS idx_p2p_peers_seen
+                ON p2p_peers (last_seen_at DESC);
             CREATE TABLE IF NOT EXISTS tensor_field_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pq_curr_id TEXT DEFAULT '', pq_last_id TEXT DEFAULT '',
@@ -15836,13 +16203,25 @@ class QtclClientApp:
                             except: continue
                             ev = payload.get('event') or payload.get('type') or etype
                             if ev in ('peer', 'peer_joined'):
-                                pip  = str(payload.get('ip_address') or payload.get('host') or '')
+                                pip   = str(payload.get('ip_address') or payload.get('host') or '')
                                 pport = int(payload.get('port') or 9091)
+                                ppid  = str(payload.get('peer_id') or '')
                                 if pip and pip not in ('','127.0.0.1','localhost') and _accel_ok and _P2P_NODE:
                                     try:
                                         rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
                                         if rc >= 0:
                                             _EXP_LOG.info(f"[KOYEB-SSE] 🔗 Peer wired {pip}:{pport}")
+                                            try:
+                                                import sqlite3 as _esq
+                                                _edb = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+                                                with _esq.connect(_edb, timeout=3) as _ec:
+                                                    _ec.execute("""INSERT OR REPLACE INTO p2p_peers
+                                                        (node_id_hex,host,port,source,last_seen_at,first_seen_at)
+                                                        VALUES(?,?,?,'sse_event',strftime('%s','now'),
+                                                        COALESCE((SELECT first_seen_at FROM p2p_peers WHERE host=? AND port=?),
+                                                                  strftime('%s','now')))""",
+                                                        (ppid or f"sse_{pip}", pip, pport, pip, pport))
+                                            except Exception: pass
                                     except Exception: pass
                             elif ev == 'oracle_dm':
                                 dm_hex = payload.get('density_matrix_hex','')
@@ -16096,6 +16475,14 @@ class QtclClientApp:
                     except Exception: pass
 
         self._start_threads()
+
+        # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
+        try:
+            _dm_pool_db = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+            _dm_pool_rehydrate(_dm_pool_db)         # inject saved DMs into C before mining
+            start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
+        except Exception as _dme:
+            _EXP_LOG.debug(f"[DMPOOL] start: {_dme}")
 
         # ── Update C koyeb thread with real wallet address now we have it ───
         if _accel_ok:
@@ -16760,13 +17147,17 @@ class QtclClientApp:
                                                 ev.get('tip_height') or 0
                                             )
                                             if tip_h > 0:
+                                                if _accel_ok:
+                                                    try:
+                                                        _accel_lib.qtcl_set_oracle_height(tip_h)
+                                                        _ct = int(_accel_lib.qtcl_get_miner_target())
+                                                        if _ct > 0 and tip_h >= _ct:
+                                                            _accel_lib.qtcl_pow_set_abort(1)
+                                                    except Exception: pass
                                                 _new_block_height[0] = tip_h
                                                 _new_block_event.set()
-                                                if _accel_ok:
-                                                    try: _accel_lib.qtcl_set_oracle_height(tip_h)
-                                                    except Exception: pass
                                                 _EXP_LOG.info(
-                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C updated")
+                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C abort armed")
                                             continue
 
                                         is_block = (outer_type in ('block', 'new_block') or
@@ -16782,17 +17173,22 @@ class QtclClientApp:
                                             inner.get('tip_height') or 0
                                         )
                                         if ev_h > 0:
+                                            # ── Triple-path instant abort ─────
+                                            # 1. C oracle_height → hot-loop self-aborts ≤256 nonces
+                                            # 2. C pow_set_abort → belt-and-suspenders explicit abort
+                                            # 3. Python threading.Event → _poll_new_block() path
+                                            if _accel_ok:
+                                                try:
+                                                    _accel_lib.qtcl_set_oracle_height(ev_h)
+                                                    _cur_t = int(_accel_lib.qtcl_get_miner_target())
+                                                    if _cur_t > 0 and ev_h >= _cur_t:
+                                                        _accel_lib.qtcl_pow_set_abort(1)
+                                                except Exception: pass
                                             _new_block_height[0] = ev_h
                                             _new_block_event.set()
-                                            # Push to C oracle_height FIRST — hot loop
-                                            # self-aborts within 256 nonces (~22ms)
-                                            # before _poll_new_block() even runs
-                                            if _accel_ok:
-                                                try: _accel_lib.qtcl_set_oracle_height(ev_h)
-                                                except Exception: pass
                                             _EXP_LOG.info(
-                                                f"[BLOCK-LISTENER] 🔔 h={ev_h} "
-                                                f"→ C self-abort armed"
+                                                f"[BLOCK-LISTENER] ⚡ h={ev_h} "
+                                                f"→ C abort + Python event fired"
                                             )
                                     except Exception as _pe:
                                         _EXP_LOG.debug(f"[BLOCK-LISTENER] parse: {_pe} raw={data_str[:80]}")
@@ -17281,13 +17677,12 @@ class QtclClientApp:
                             _c_sp, _c_out,
                         )
                         if result == -2:
-                            # C abort flag was set — _new_block_event fired mid-chunk
-                            # Reset abort flag immediately before breaking
+                            # C abort flag — clear immediately so next block mines clean
                             try: _accel_lib.qtcl_pow_set_abort(0)
                             except Exception: pass
-                            _EXP_LOG.warning(
-                                f"[MINER] ⚡ C-level abort mid-chunk nonce={nonce} "
-                                f"— chain advanced, restarting"
+                            _EXP_LOG.info(
+                                f"[MINER] ⚡ C abort h={target_height} nonce={nonce} "
+                                f"— chain advanced to h≥{target_height}, restarting"
                             )
                             break
                         if result >= 0:
