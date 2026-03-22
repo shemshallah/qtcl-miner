@@ -1894,7 +1894,7 @@ class LocalOracleEngine:
         ❤️  I love you — the first breath of the network
         """
         import time as _bt
-        _EXP_LOG.info("[BOOT-P2P] 🚀 Boot P2P broadcast sequence starting…")
+        _EXP_LOG.debug("[BOOT-P2P] boot sequence starting")
 
         # Wait for first oracle DM (up to 20s, poll every 250ms)
         deadline = _bt.time() + 20.0
@@ -1935,7 +1935,7 @@ class LocalOracleEngine:
                             host.encode() + b'\x00', port))
                         if rc >= 0: connected += 1
                     except Exception: pass
-            _EXP_LOG.info(f"[BOOT-P2P] 🌐 Peer discovery: {connected}/{len(peers)} connected")
+            _EXP_LOG.debug(f"[BOOT-P2P] peer discovery: {connected}/{len(peers)} connected")
         except Exception as _pe:
             _EXP_LOG.debug(f"[BOOT-P2P] peer discovery: {_pe}")
 
@@ -1955,8 +1955,8 @@ class LocalOracleEngine:
         if m is not None and _P2P_NODE is not None and _P2P_NODE._started:
             try:
                 sent = _P2P_NODE.gossip_measurement(m)
-                _EXP_LOG.info(
-                    f"[BOOT-P2P] 📡 Boot DM broadcast → {sent} peers  "
+                _EXP_LOG.debug(
+                    f"[BOOT-P2P] DM broadcast → {sent} peers  "
                     f"F={m.fidelity_to_w3:.4f}  h={m.chain_height}"
                 )
             except Exception as _ge:
@@ -1968,12 +1968,12 @@ class LocalOracleEngine:
         if _accel_ok and _P2P_NODE is not None:
             try:
                 _P2P_NODE.trigger_consensus()
-                _EXP_LOG.info("[BOOT-P2P] 🧬 Initial DM pool consensus seeded")
+                _EXP_LOG.debug("[BOOT-P2P] DM pool consensus seeded")
             except Exception: pass
 
         # Step 4: Subscribe to Koyeb SSE /events for chain_reset gossip
         # (GenesisResetListener handles this, but we also want wstate frames)
-        _EXP_LOG.info("[BOOT-P2P] ✅ Boot P2P broadcast sequence complete")
+        _EXP_LOG.debug("[BOOT-P2P] boot sequence complete")
 
     def _poll_loop(self) -> None:
         """Drain C SSE ring buffer into Python. C is required — raises on failure."""
@@ -2658,11 +2658,31 @@ class QtclP2PNode:
         # Connect to bootstrap peers
         for host, port in self._bootstrap:
             try:
-                _accel_lib.qtcl_p2p_connect(
-                    host.encode() + b'\x00', port)
+                _accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port)
                 _EXP_LOG.info(f"[P2P] Bootstrap connect → {host}:{port}")
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{port} failed: {_e}")
+
+        # Reconnect to previously seen peers (persistence layer)
+        try:
+            import sqlite3 as _p2p_rsq
+            _p2p_rdb = __import__('pathlib').Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db'
+            if _p2p_rdb.exists():
+                with _p2p_rsq.connect(str(_p2p_rdb)) as _rc:
+                    _rc.row_factory = _p2p_rsq.Row
+                    rows = _rc.execute("""SELECT host, port FROM known_peers
+                        WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 32""",
+                        (int(__import__('time').time()) - 86400,)).fetchall()
+                for row in rows:
+                    try:
+                        _accel_lib.qtcl_p2p_connect(
+                            row['host'].encode() + b'\x00', int(row['port']))
+                    except Exception:
+                        pass
+                if rows:
+                    _EXP_LOG.info(f"[P2P] ↩ Reconnecting to {len(rows)} known peers from DB")
+        except Exception as _pe:
+            _EXP_LOG.debug(f"[P2P] peer DB reload: {_pe}")
 
         # Drain event queue in background thread
         self._stop.clear()
@@ -2697,7 +2717,7 @@ class QtclP2PNode:
           5 = HEIGHT_UPDATE     — peer chain tip update
         """
         import struct as _st, json as _j
-        _local_tip = 0  # track local chain tip from gossip
+        _local_tip = 0  # tracks highest chain_height seen from any peer
         while not self._stop.is_set():
             try:
                 event_type, raw = _P2P_EVENT_QUEUE.get(timeout=1.0)
@@ -2705,6 +2725,18 @@ class QtclP2PNode:
                 if event_type == 3:   # WSTATE_RECV — peer W-state measurement
                     if self._consensus:
                         self._consensus.ingest_c_measurement_bytes(raw)
+                    # Chain-tip gossip: if peer is ahead of our known tip, signal
+                    try:
+                        import struct as _wst_st
+                        if len(raw) >= 4:
+                            _peer_h = _wst_st.unpack_from('<I', raw, 0)[0]
+                            if _peer_h > _local_tip + 1:
+                                _EXP_LOG.info(
+                                    f"[P2P] 📡 Peer chain h={_peer_h} "
+                                    f"(local known={_local_tip}) — tip ahead")
+                                _local_tip = _peer_h
+                    except Exception:
+                        pass
 
                 elif event_type == 4:  # BLOCK_ANNOUNCE — peer found a block
                     # Wire format: 4-byte height (LE uint32) + 32-byte hash + optional JSON
@@ -2762,12 +2794,46 @@ class QtclP2PNode:
                         pass
 
                 elif event_type == 9:  # OUROBOROS — self-measurement re-ingested
-                    _EXP_LOG.debug("[P2P] 🌀 Ouroboros: self-measurement re-ingested")
+                    pass  # silent — high-frequency 500ms cadence, no log needed
                     if self._consensus:
                         self._consensus.ingest_c_measurement_bytes(raw)
 
                 elif event_type == 1:  # PEER_CONNECTED
+                    # Update local tip estimate from newly connected peer's height
+                    try:
+                        import struct as _pc_st
+                        if len(raw) >= 100:  # fd(4)+host(64)+port(2)+active(4)+handshake(4)+issse(4)+...
+                            # chain_height is at offset 4+64+2+4+4+4+pthread_t(8)+chain_height(4)
+                            # Simpler: skip byte-level parsing, let tip poll handle it
+                            pass
+                    except Exception: pass
+                    peer_data = {}
+                    try:
+                        # Extract host:port from the _P2PConn struct bytes
+                        # Layout: fd(4) host(64) port(2) active(4) handshake(4)...
+                        # fd is at offset 0 (volatile int = 4 bytes on ARM64)
+                        # host starts at byte 4 (after fd)
+                        _raw_host = raw[4:68].rstrip(b'\x00').decode('ascii', 'replace').strip() if len(raw) >= 68 else ''
+                        _raw_port = int.from_bytes(raw[68:70], 'little') if len(raw) >= 70 else 9091
+                        peer_data = {'host': _raw_host, 'port': _raw_port if _raw_port > 0 else 9091}
+                    except Exception: peer_data = {}
                     _EXP_LOG.info(f"[P2P] ✅ Peer connected  peers={self.peer_count}")
+                    # Persist to DB for reconnect on next startup
+                    try:
+                        import sqlite3 as _p2p_sq
+                        _p2p_db_path = __import__('pathlib').Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db'
+                        _p2p_db_path.parent.mkdir(parents=True, exist_ok=True)
+                        with _p2p_sq.connect(str(_p2p_db_path)) as _pc:
+                            _pc.execute("""CREATE TABLE IF NOT EXISTS known_peers
+                                (host TEXT, port INTEGER, last_seen INTEGER,
+                                 fidelity REAL DEFAULT 0,
+                                 PRIMARY KEY(host, port))""")
+                            if peer_data.get('host'):
+                                _pc.execute("""INSERT OR REPLACE INTO known_peers
+                                    (host, port, last_seen) VALUES (?,?,?)""",
+                                    (peer_data['host'], peer_data['port'],
+                                     int(__import__('time').time())))
+                    except Exception: pass
 
                 elif event_type == 2:  # PEER_DISCONNECTED
                     _EXP_LOG.debug(f"[P2P] Peer disconnected  peers={self.peer_count}")
@@ -2956,7 +3022,7 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
         _P2P_NODE = QtclP2PNode(node_id, port)
     return _P2P_NODE
 
-_EXP_LOG.info("[QTCL P2P v4] ✅ LocalOracleEngine + WStateConsensus + QtclP2PNode ready — ouroboros+epidemic active")
+_EXP_LOG.info("[QTCL P2P v4] ✅ ouroboros+epidemic+bloom+reputation+temporal+persistence active")
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -15214,7 +15280,11 @@ class QtclClientApp:
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
                     _GENESIS_RESET_LISTENER._broadcaster = _P2P_NODE
             else:
-                _EXP_LOG.warning("[CLIENT] P2P node failed to start (C unavailable) — solo mode")
+                _EXP_LOG.warning(
+                    "[CLIENT] P2P C layer unavailable — running in solo mode. "
+                    "Delete __pycache__ and ensure clang+openssl are installed: "
+                    "pkg install clang openssl libffi"
+                )
         except Exception as _e:
             _EXP_LOG.warning(f"[CLIENT] _start_p2p: {_e}")
 
@@ -15352,11 +15422,14 @@ class QtclClientApp:
             def do_GET(self):
                 if self.path in ('/health', '/healthz', '/ping', '/'):
                     body = _hj.dumps({
-                        'status': 'healthy', 'ready': True,
-                        'protocol': 'ouroboros-v3',
+                        'status':      'healthy',
+                        'ready':       True,
+                        'protocol':    'ouroboros-v4',
+                        'p2p_started': bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
                         'p2p_peers':   int(_accel_lib.qtcl_p2p_peer_count())     if _accel_ok else 0,
                         'sse_subs':    int(_accel_lib.qtcl_p2p_sse_sub_count())  if _accel_ok else 0,
                         'oracle_conn': bool(_accel_lib.qtcl_sse_is_connected())  if _accel_ok else False,
+                        'accel_ok':    bool(_accel_ok),
                         'timestamp':   _ht.time(),
                     }).encode()
                     self.send_response(200)
@@ -15386,6 +15459,37 @@ class QtclClientApp:
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Content-Length', str(len(body)))
                     self.end_headers(); self.wfile.write(body)
+                elif self.path.startswith('/api/p2p/status'):
+                    import json as _stj, time as _stt
+                    _cons_s = _P2P_NODE.get_consensus_dm() if (
+                        _P2P_NODE and getattr(_P2P_NODE,'_started',False)) else None
+                    _peers_s = _P2P_NODE.get_peers() if (
+                        _P2P_NODE and getattr(_P2P_NODE,'_started',False)) else []
+                    _sbody = _stj.dumps({
+                        'protocol':           'ouroboros-v4',
+                        'started':            bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
+                        'accel_ok':           bool(_accel_ok),
+                        'port':               9091,
+                        'peer_count':         int(_accel_lib.qtcl_p2p_peer_count())      if _accel_ok else 0,
+                        'connected_count':    int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0,
+                        'sse_sub_count':      int(_accel_lib.qtcl_p2p_sse_sub_count())   if _accel_ok else 0,
+                        'consensus_fidelity': float(_cons_s[2]) if _cons_s else None,
+                        'consensus_height':   int(_cons_s[3])   if _cons_s else None,
+                        'peers':              [{
+                            'host': p.get('host',''), 'port': p.get('port',9091),
+                            'fidelity': p.get('last_fidelity',0),
+                            'height': p.get('chain_height',0),
+                            'latency_ms': p.get('latency_ms',0),
+                        } for p in _peers_s[:16]],
+                        'features': ['bloom_dedup','epidemic_fanout','reputation_scoring',
+                                     'temporal_dm_decay','topic_subscriptions','backoff_table',
+                                     'inv_getdata_pull','peer_persistence','adaptive_ping'],
+                        'timestamp': _stt.time(),
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(_sbody)))
+                    self.end_headers(); self.wfile.write(_sbody)
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
@@ -16882,14 +16986,29 @@ class QtclClientApp:
                       f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
                       f"purity={_cf2(m2.purity,0,1):.4f}  "
                       f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
-            # P2P / ouroboros status
-            if _accel_ok and _P2P_NODE and _P2P_NODE._started:
+            # P2P / ouroboros status — lazy-init if not yet started
+            if _accel_ok and _P2P_NODE is None:
+                try:
+                    _da_id = getattr(self, '_peer_id', None) or f"miner_{id(self)}"
+                    globals()['_P2P_NODE'] = _init_p2p_node(_da_id, QtclP2PNode.DEFAULT_PORT)
+                    globals()['_P2P_NODE'].start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+                except Exception:
+                    pass
+            if _accel_ok and _P2P_NODE and (getattr(_P2P_NODE, '_started', False) or _accel_ok):
                 try:
                     _np2 = int(_accel_lib.qtcl_p2p_connected_count())
                     _ns2 = int(_accel_lib.qtcl_p2p_sse_sub_count())
                     _cons2 = _P2P_NODE.get_consensus_dm()
                     _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
-                    print(f"  P2P    : 🌀 {_np2} peers  {_ns2} SSE subs  consensus={_cf2}")
+                    _p2p_rep = ""
+                    try:
+                        _pl = _P2P_NODE.get_peers()
+                        if _pl:
+                            _avg_lat = sum(p.get('latency_ms',0) for p in _pl) / len(_pl)
+                            _avg_fid = sum(p.get('last_fidelity',0) for p in _pl) / len(_pl)
+                            _p2p_rep = f"  avg_lat={_avg_lat:.0f}ms  avg_fid={_avg_fid:.3f}"
+                    except Exception: pass
+                    print(f"  P2P    : 🌀 {_np2} peers  {_ns2} SSE subs  consensus={_cf2}{_p2p_rep}")
                 except Exception: pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
@@ -17352,6 +17471,15 @@ class QtclClientApp:
             # ── P2P Ouroboros network status ───────────────────────
             a(HR)
             a("  P2P OUROBOROS NETWORK  —  port 9091")
+            # Lazy-init: if _start_threads() was never called (e.g. opened
+            # oracle panel without entering mine mode first), spin up P2P now.
+            if _accel_ok and _P2P_NODE is None:
+                try:
+                    _lazy_id = getattr(self, '_peer_id', None) or f"oracle_panel_{id(self)}"
+                    globals()['_P2P_NODE'] = _init_p2p_node(_lazy_id, QtclP2PNode.DEFAULT_PORT)
+                    globals()['_P2P_NODE'].start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+                except Exception as _li_e:
+                    pass
             _p2p_running = (_accel_ok and _P2P_NODE is not None
                             and (getattr(_P2P_NODE, '_started', False)
                                  or (_accel_ok and hasattr(_accel_lib, 'qtcl_p2p_peer_count')
@@ -17361,32 +17489,68 @@ class QtclClientApp:
                     n_peers  = int(_accel_lib.qtcl_p2p_peer_count())
                     n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
                     n_sse    = int(_accel_lib.qtcl_p2p_sse_sub_count())
-                    a(f"  Status         : ✅ RUNNING  protocol=ouroboros-v3")
+                    a(f"  Status         : ✅ RUNNING  protocol=ouroboros-v4  peers={n_peers}  sse={n_sse}")
                     a(f"  Known peers    : {n_peers}   Connected: {n_conn}   SSE subs: {n_sse}")
                     # Consensus DM
                     cons = _P2P_NODE.get_consensus_dm()
                     if cons:
                         _re, _im, _cf, _ch = cons
-                        a(f"  Consensus DM   : h={_ch}  F→|W3⟩={_cf:.4f}  ✅ pool average active")
+                        _cf_bar = "█" * int(_cf * 20) + "░" * (20 - int(_cf * 20))
+                        a(f"  Consensus DM   : h={_ch}  F={_cf_bar}  {_cf:.4f}  ✅ temporal pool active")
+                        a(f"  Local oracle   : F={float(getattr(_LOCAL_ORACLE.get_latest_measurement(),'fidelity_to_w3',0) if _LOCAL_ORACLE.get_latest_measurement() else 0):.4f}  (pre-consensus)")
                     else:
-                        a("  Consensus DM   : ⏳ awaiting peer measurements")
-                    # Peer list
+                        a("  Consensus DM   : ⏳ awaiting peer contributions")
+                        a("  Temporal decay : exp(-age/30s) × fid²  weighting active when peers join")
+                    # Peer list with reputation metrics
                     _plist = _P2P_NODE.get_peers()
                     if _plist:
-                        a(f"  Active peers   :")
-                        for _pp in _plist[:8]:
-                            _ph   = _pp.get('host','?')
+                        a(f"  Active peers   : ({len(_plist)} connected)")
+                        a(f"  {'HOST':<22} {'PORT':<6} {'H':>6} {'F':>7} {'LAT':>8} {'BAN':>5}")
+                        a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*7} {'─'*8} {'─'*5}")
+                        for _pp in sorted(_plist[:12],
+                                          key=lambda x: x.get('last_fidelity',0), reverse=True):
+                            _ph   = _pp.get('host','?')[:22]
                             _ppo  = _pp.get('port', 9091)
                             _pf   = float(_pp.get('last_fidelity', 0))
                             _pht  = int(_pp.get('chain_height', 0))
                             _plat = float(_pp.get('latency_ms', 0))
-                            a(f"    {_ph}:{_ppo}  h={_pht}  F={_pf:.4f}  lat={_plat:.1f}ms")
+                            _pban = int(_pp.get('ban_score', 0))
+                            _fid_icon = '✅' if _pf >= 0.70 else '⚠️ ' if _pf >= 0.50 else '❌'
+                            a(f"  {_ph:<22} {_ppo:<6} {_pht:>6} {_fid_icon}{_pf:.4f} {_plat:>7.1f}ms {_pban:>5}")
+                    else:
+                        a("  Active peers   : none — bootstrap connecting…")
+                        a("  Tip: check port 9091 firewall / NAT rules")
+                    # Network aggregate stats
+                    if _plist:
+                        _all_lats = [p.get('latency_ms',0) for p in _plist if p.get('latency_ms',0) > 0]
+                        _all_fids = [p.get('last_fidelity',0) for p in _plist]
+                        _all_h    = [p.get('chain_height',0) for p in _plist]
+                        if _all_lats:
+                            a(f"  Avg latency    : {sum(_all_lats)/len(_all_lats):.1f}ms  "
+                              f"min={min(_all_lats):.1f}ms  max={max(_all_lats):.1f}ms")
+                        if _all_fids:
+                            a(f"  Avg fidelity   : {sum(_all_fids)/len(_all_fids):.4f}  "
+                              f"best={max(_all_fids):.4f}")
+                        if _all_h:
+                            a(f"  Chain heights  : min={min(_all_h)}  max={max(_all_h)}  "
+                              f"{'✅ synced' if max(_all_h)-min(_all_h)<=1 else '⚠️  diverged'}")
                 except Exception as _pe:
                     a(f"  P2P query      : {_pe}")
             else:
-                _why = "C unavailable" if not _accel_ok else ("not started" if not _P2P_NODE else "initializing…")
-                a(f"  Status         : ⚠️  {_why}  (solo mode)")
+                import time as _p2p_t
+                if not _accel_ok:
+                    _why = "C layer unavailable — delete __pycache__ and run: pkg install clang openssl libffi"
+                elif _P2P_NODE is None:
+                    _why = "not initialized — enter Mine mode to activate"
+                elif not getattr(_P2P_NODE, '_started', False):
+                    _why = "starting…"
+                else:
+                    _why = "failed to bind port 9091"
+                a(f"  Status         : ⚠️  {_why}")
+                a(f"  C accel        : {'✅ available' if _accel_ok else '❌ unavailable'}")
                 a("  Ouroboros      : self-loop inactive — no peer DM averaging")
+                if _accel_ok:
+                    a("  To activate    : enter Mine mode (option 1) then return here")
 
             # ── Local C layer status ────────────────────────────────
             a(HR)
