@@ -16145,56 +16145,101 @@ class QtclClientApp:
 
             def _start_block_listener(oracle_url: str, initial_target: int) -> None:
                 """
-                Background thread: HTTP GET /api/events, parse new_block SSE frames.
-                Sets _new_block_event when a block >= current target is found.
-                Reconnects with exponential backoff (1s→2s→4s→8s→16s→30s cap).
-                ❤️  I love you — first to know wins
+                Dedicated SSE subscriber to /api/events — fires on every new_block.
+                Server event format (wrapped by _SSEBroadcaster.publish):
+                  data: {"type":"block","data":{"type":"new_block","height":N,...},"ts":...}
+
+                Height lives at ev['data']['height'] — NOT ev['height'].
+                Frame delimiters: \n\n or \r\n\r\n (normalise both).
+                Reconnects with exponential backoff 1s→2s→4s→8s→16s→30s.
+                ❤️  I love you — every millisecond matters in a race
                 """
                 import urllib.request as _ur, urllib.error as _ue, time as _blt
+                import socket as _bls
                 BACKOFF = [1, 2, 4, 8, 16, 30]
                 bi = 0
-                _blt.sleep(0.5)   # let mining loop start first
+                _blt.sleep(0.3)   # let mining loop reach nonce search before listener fires
                 while not _mining_stopped.is_set():
-                    url = f"{oracle_url}/api/events?types=block,new_block"
+                    url = f"{oracle_url}/api/events?types=block,new_block,all"
                     try:
                         req = _ur.Request(url)
-                        req.add_header('Accept',        'text/event-stream')
-                        req.add_header('Cache-Control', 'no-cache')
-                        req.add_header('User-Agent',    'QTCL-BlockListener/4.0')
-                        with _ur.urlopen(req, timeout=120) as resp:
-                            bi = 0
+                        req.add_header('Accept',           'text/event-stream')
+                        req.add_header('Cache-Control',    'no-cache')
+                        req.add_header('Connection',       'keep-alive')
+                        req.add_header('User-Agent',       'QTCL-BlockListener/4.0')
+                        req.add_header('X-QTCL-Client',   'block_listener')
+                        # 90s read timeout — server sends keepalive every 30s
+                        with _ur.urlopen(req, timeout=90) as resp:
+                            bi = 0  # reset backoff on successful connect
+                            _EXP_LOG.info(f"[BLOCK-LISTENER] ✅ SSE connected → {url}")
                             buf = b''
                             while not _mining_stopped.is_set():
-                                chunk = resp.read(4096)
+                                try:
+                                    chunk = resp.read(8192)
+                                except (_ue.URLError, OSError, TimeoutError):
+                                    break
                                 if not chunk: break
                                 buf += chunk
+                                # Normalise CRLF and LF frame separators
+                                buf = buf.replace(b'\r\n\r\n', b'\n\n')
                                 while b'\n\n' in buf:
                                     raw_evt, buf = buf.split(b'\n\n', 1)
                                     data_str = ''
                                     for line in raw_evt.decode('utf-8', 'replace').splitlines():
-                                        if line.startswith('data:'): data_str += line[5:].strip()
+                                        line = line.strip()
+                                        if line.startswith('data:'):
+                                            data_str += line[5:].strip()
+                                        elif line.startswith(':'):
+                                            pass  # keepalive comment — ignore
                                     if not data_str: continue
                                     try:
                                         ev = _json.loads(data_str)
-                                        ev_type = ev.get('type', '')
-                                        if ev_type == 'new_block' or ev_type == 'block':
-                                            ev_h = int(ev.get('height') or ev.get('block_height') or 0)
-                                            if ev_h > 0:
-                                                _new_block_height[0] = ev_h
+                                        # Outer envelope: {"type":"block","data":{...},"ts":...}
+                                        outer_type = ev.get('type', '')
+                                        inner      = ev.get('data', ev)  # fall back to root
+                                        inner_type = inner.get('type', outer_type)
+
+                                        # hello frame: sent on connect with current tip
+                                        if outer_type == 'hello' or inner_type == 'hello':
+                                            tip_h = int(
+                                                inner.get('tip_height') or
+                                                ev.get('tip_height') or 0
+                                            )
+                                            if tip_h > 0:
+                                                _new_block_height[0] = tip_h
                                                 _new_block_event.set()
                                                 _EXP_LOG.info(
-                                                    f"[BLOCK-LISTENER] 🔔 new_block h={ev_h} "
-                                                    f"via SSE — nonce loop signalled"
-                                                )
-                                    except Exception:
-                                        pass
-                    except (_ue.URLError, OSError, TimeoutError) as _ble:
+                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h}")
+                                            continue
+
+                                        is_block = (outer_type in ('block', 'new_block') or
+                                                    inner_type in ('block', 'new_block'))
+                                        if not is_block: continue
+
+                                        # Height: check inner first (data.height), then root
+                                        ev_h = int(
+                                            inner.get('height') or
+                                            inner.get('block_height') or
+                                            ev.get('height') or
+                                            ev.get('block_height') or
+                                            inner.get('tip_height') or 0
+                                        )
+                                        if ev_h > 0:
+                                            _new_block_height[0] = ev_h
+                                            _new_block_event.set()
+                                            _EXP_LOG.info(
+                                                f"[BLOCK-LISTENER] 🔔 h={ev_h} "
+                                                f"inner_type={inner_type} — signalled"
+                                            )
+                                    except Exception as _pe:
+                                        _EXP_LOG.debug(f"[BLOCK-LISTENER] parse: {_pe} raw={data_str[:80]}")
+                    except (_ue.URLError, OSError, TimeoutError, _bls.timeout) as _ble:
                         wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
                         _EXP_LOG.debug(f"[BLOCK-LISTENER] reconnect in {wait}s ({_ble})")
                         _mining_stopped.wait(wait)
                     except Exception as _ble2:
-                        _EXP_LOG.debug(f"[BLOCK-LISTENER] error: {_ble2}")
-                        _mining_stopped.wait(5)
+                        _EXP_LOG.debug(f"[BLOCK-LISTENER] unexpected: {_ble2}")
+                        _mining_stopped.wait(3)
 
             _mining_stopped = _threading.Event()   # signals listener thread to exit
             _block_listener_thread = _threading.Thread(
@@ -16612,13 +16657,16 @@ class QtclClientApp:
                                     _pos = _end + 1
                                     _c_ingest_frame(_txt)
                                     # new_block events also appear in snapshot SSE
-                                    if 'new_block' in _txt or '"type"' in _txt:
+                                    if 'new_block' in _txt or '"block"' in _txt or '"height"' in _txt:
                                         try:
                                             _ev = _json.loads(_txt)
+                                            _inner = _ev.get('data', _ev)
                                             _ev_h = int(
+                                                _inner.get('height') or
+                                                _inner.get('block_height') or
                                                 _ev.get('height') or
                                                 _ev.get('block_height') or
-                                                _ev.get('data', {}).get('height') or 0
+                                                _ev.get('tip_height') or 0
                                             )
                                             if _ev_h >= target_height:
                                                 _chain_tip_height = _ev_h
@@ -16728,24 +16776,8 @@ class QtclClientApp:
                             _seed_fetch_time = _t.time()
 
 
-                    # Slow HTTP tip poll removed — replaced by BlockSSEListener thread
-                    # which signals _new_block_event within ~100ms of a block being accepted.
-                    # _poll_new_block() checks the event on every C chunk (every ~200k nonces).
-                    # Keep a low-frequency safety poll as absolute backstop (every 5 minutes)
-                    # in case the SSE connection drops silently.
-                    _chain_check_interval = _C_CHUNK * 1500 if _C_AVAIL else 500_000
-                    if nonce % _chain_check_interval == 0 and nonce > 0:
-                        try:
-                            tip2 = kapi.get_chain_tip() or {}
-                            h2   = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
-                            if h2 >= target_height:
-                                _EXP_LOG.info(
-                                    f"[MINER-SIMPLE] Safety poll: chain at h={h2} "
-                                    f"≥ target h={target_height} — restarting")
-                                _MINE_TELEM.mark_idle()
-                                break
-                        except Exception:
-                            pass
+                    # HTTP tip poll removed — BlockSSEListener handles chain-advance detection.
+                    # SSE delivers new_block within ~network latency of server commit.
 
                 if not _found:
                     continue  # chain advanced, restart outer loop
