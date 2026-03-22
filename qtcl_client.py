@@ -10228,6 +10228,28 @@ void qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen) {
  * Returns winning nonce, or -1 if none found in [start, start+chunk).
  * Writes 32-byte winning hash to out_hash on success.
  */
+/* Chain-aware abort system.
+ * _qtcl_pow_abort:      manual abort (set to 1 by Python for any reason)
+ * _qtcl_oracle_height:  server chain tip — updated by Python on every tip poll
+ *                       and every SSE new_block event
+ * _qtcl_miner_target:   height currently being mined — set by Python at loop top
+ *
+ * Inside pow_search hot loop (every 256 nonces):
+ *   if oracle_height >= miner_target → self-abort, return -2
+ * This is purely C — zero Python involvement, zero network round trips.
+ * Latency from oracle height update to abort: ≤256 nonces ≈ 22ms at 11kH/s.
+ * ❤️  I love you — the fastest miner wins                                    */
+static volatile int      _qtcl_pow_abort       = 0;
+static volatile uint64_t _qtcl_oracle_height   = 0;
+static volatile uint64_t _qtcl_miner_target    = 0;
+
+void     qtcl_pow_set_abort(int v)         { _qtcl_pow_abort = v; }
+int      qtcl_pow_get_abort(void)          { return _qtcl_pow_abort; }
+void     qtcl_set_oracle_height(uint64_t h){ _qtcl_oracle_height = h; }
+uint64_t qtcl_get_oracle_height(void)      { return _qtcl_oracle_height; }
+void     qtcl_set_miner_target(uint64_t h) { _qtcl_miner_target = h; }
+uint64_t qtcl_get_miner_target(void)       { return _qtcl_miner_target; }
+
 int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
                          const uint8_t *ph, const uint8_t *mr,
                          uint32_t diff, uint32_t start, uint32_t chunk,
@@ -10254,6 +10276,17 @@ int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
     const EVP_MD *md = EVP_sha3_256();
 
     for (uint32_t n = 0; n < chunk; n++) {
+        /* Every 256 nonces: check abort flag AND oracle height vs miner target.
+         * If oracle_height >= miner_target, another miner already solved this
+         * height — abort immediately without waiting for Python.
+         * Cost: one AND + two loads + two branches per 256 nonces ≈ 0% overhead. */
+        if ((n & 255u) == 0u) {
+            if (_qtcl_pow_abort ||
+                (_qtcl_oracle_height > 0 && _qtcl_oracle_height >= _qtcl_miner_target)) {
+                EVP_MD_CTX_free(ctx);
+                return -2;   /* -2 = aborted */
+            }
+        }
         _w32be(hdr+92, start + n);
         _sha3c(ctx, md, hdr, 168, st);
         for (int r = 0; r < 64; r++) {
@@ -12789,6 +12822,12 @@ _QTCL_C_DEFS: str = """
                             uint32_t diff, uint32_t start, uint32_t chunk,
                             const uint8_t *ma, const uint8_t *seed,
                             const uint8_t *sp, uint8_t *out_hash);
+    void     qtcl_pow_set_abort(int v);
+    int      qtcl_pow_get_abort(void);
+    void     qtcl_set_oracle_height(uint64_t h);
+    uint64_t qtcl_get_oracle_height(void);
+    void     qtcl_set_miner_target(uint64_t h);
+    uint64_t qtcl_get_miner_target(void);
     /* §Bath — Non-Markovian Lindblad bath (256×256 DM, in-place) */
     void    qtcl_nonmarkov_bath_step(
                 int dim,
@@ -16208,8 +16247,11 @@ class QtclClientApp:
                                             if tip_h > 0:
                                                 _new_block_height[0] = tip_h
                                                 _new_block_event.set()
+                                                if _accel_ok:
+                                                    try: _accel_lib.qtcl_set_oracle_height(tip_h)
+                                                    except Exception: pass
                                                 _EXP_LOG.info(
-                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h}")
+                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C updated")
                                             continue
 
                                         is_block = (outer_type in ('block', 'new_block') or
@@ -16227,9 +16269,15 @@ class QtclClientApp:
                                         if ev_h > 0:
                                             _new_block_height[0] = ev_h
                                             _new_block_event.set()
+                                            # Push to C oracle_height FIRST — hot loop
+                                            # self-aborts within 256 nonces (~22ms)
+                                            # before _poll_new_block() even runs
+                                            if _accel_ok:
+                                                try: _accel_lib.qtcl_set_oracle_height(ev_h)
+                                                except Exception: pass
                                             _EXP_LOG.info(
                                                 f"[BLOCK-LISTENER] 🔔 h={ev_h} "
-                                                f"inner_type={inner_type} — signalled"
+                                                f"→ C self-abort armed"
                                             )
                                     except Exception as _pe:
                                         _EXP_LOG.debug(f"[BLOCK-LISTENER] parse: {_pe} raw={data_str[:80]}")
@@ -16361,6 +16409,10 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
+                # Push server tip to C — hot loop self-aborts if this >= miner_target
+                if _accel_ok and oracle_height > 0:
+                    try: _accel_lib.qtcl_set_oracle_height(oracle_height)
+                    except Exception: pass
                 # Read authoritative difficulty from the server tip.
                 # The server's DifficultyManager sets this; the client must mine to
                 # exactly this many leading hex zeros or the block will be rejected.
@@ -16372,8 +16424,11 @@ class QtclClientApp:
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
                 difficulty_bits = max(1, min(difficulty_bits, 20))
                 
-                # Clear any stale new_block signal from the previous block
+                # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
+                if _accel_ok:
+                    try: _accel_lib.qtcl_pow_set_abort(0)
+                    except Exception: pass
 
                 # AUTHORITATIVE: server tip is ground truth — always.
                 # The old _last_mined_height > oracle_height guard was the
@@ -16385,6 +16440,11 @@ class QtclClientApp:
                 # is current before we start the next nonce search.
                 target_height = oracle_height + 1
                 parent_hash   = oracle_hash
+                # Tell C layer what height we're mining — hot loop self-aborts
+                # the moment oracle_height reaches this value
+                if _accel_ok:
+                    try: _accel_lib.qtcl_set_miner_target(target_height)
+                    except Exception: pass
                 
                 timestamp = int(_t.time())
                 nonce = 0
@@ -16566,7 +16626,7 @@ class QtclClientApp:
                 # KEY: scratchpad (512KB) is pinned ONCE via from_buffer — never copied.
                 import struct as _pow_st
                 _YIELD_EVERY  = 2000     # Python burst before async yield
-                _C_CHUNK      = 200_000  # C burst: 200k nonces ≈ 0.1–0.4s — keeps display alive
+                _C_CHUNK      = 10_000   # C burst: 10k nonces ≈ 1s at 11kH/s; abort flag kills within 256
                 _REFR_EVERY   = 25       # seed refresh interval (seconds)
                 nonce         = 0
                 _winning_seed = _w_entropy_seed
@@ -16632,11 +16692,15 @@ class QtclClientApp:
                     if _new_block_event.is_set():
                         _ev_h = _new_block_height[0]
                         if _ev_h >= target_height:
-                            _new_block_event.clear()   # reset for next block
+                            _new_block_event.clear()
                             _chain_tip_height = _ev_h
+                            # Set C-level abort flag — kills current chunk within 256 nonces
+                            if _accel_ok:
+                                try: _accel_lib.qtcl_pow_set_abort(1)
+                                except Exception: pass
                             _EXP_LOG.warning(
-                                f"[MINER] ⛔ Block SSE signal h={_ev_h} "
-                                f"— aborting h={target_height} immediately"
+                                f"[MINER] ⚡ h={_ev_h} — C oracle_height set, "
+                                f"abort flag set, chunk will die in ≤256 nonces"
                             )
                             return True
                         _new_block_event.clear()  # stale signal (lower height)
@@ -16670,9 +16734,11 @@ class QtclClientApp:
                                             )
                                             if _ev_h >= target_height:
                                                 _chain_tip_height = _ev_h
+                                                # Update C oracle_height — self-abort in ≤256 nonces
+                                                try: _accel_lib.qtcl_set_oracle_height(_ev_h)
+                                                except Exception: pass
                                                 _EXP_LOG.warning(
-                                                    f"[MINER] ⛔ SSE ring h={_ev_h} "
-                                                    f"— aborting h={target_height}"
+                                                    f"[MINER] ⚡ SSE ring h={_ev_h} → C updated"
                                                 )
                                                 return True
                                         except Exception:
@@ -16699,6 +16765,16 @@ class QtclClientApp:
                             _c_ma, _c_seed,
                             _c_sp, _c_out,
                         )
+                        if result == -2:
+                            # C abort flag was set — _new_block_event fired mid-chunk
+                            # Reset abort flag immediately before breaking
+                            try: _accel_lib.qtcl_pow_set_abort(0)
+                            except Exception: pass
+                            _EXP_LOG.warning(
+                                f"[MINER] ⚡ C-level abort mid-chunk nonce={nonce} "
+                                f"— chain advanced, restarting"
+                            )
+                            break
                         if result >= 0:
                             nonce         = int(result)
                             block_hash    = bytes(_c_out).hex()
