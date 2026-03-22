@@ -2897,11 +2897,18 @@ class QtclP2PNode:
                         _raw_port = int.from_bytes(raw[68:70], 'little') if len(raw) >= 70 else 9091
                         peer_data = {'host': _raw_host, 'port': _raw_port if _raw_port > 0 else 9091}
                     except Exception: peer_data = {}
-                    _nc = self.peer_count
-                    if _nc <= 4:
-                        _EXP_LOG.info(f"[P2P] ✅ Peer connected  connected={_nc}")
-                    else:
-                        _EXP_LOG.debug(f"[P2P] Peer connected  connected={_nc}")
+                    # Dedup: only log once per host within 5s window
+                    _ph_key = f"{peer_data.get('host','')}:{peer_data.get('port',0)}"
+                    _now_ns = __import__('time').time()
+                    if not hasattr(self, '_logged_peers'):
+                        self._logged_peers = {}
+                    if _ph_key not in self._logged_peers or _now_ns - self._logged_peers.get(_ph_key, 0) > 5.0:
+                        self._logged_peers[_ph_key] = _now_ns
+                        _nc = self.peer_count
+                        if _nc <= 4:
+                            _EXP_LOG.info(f"[P2P] ✅ Peer connected  connected={_nc}")
+                        else:
+                            _EXP_LOG.debug(f"[P2P] Peer connected  connected={_nc}")
                     # Subscribe to peer's local oracle SSE stream for DM aggregation
                     if peer_data.get('host') and peer_data['host'] not in ('','127.0.0.1','localhost'):
                         _ph = peer_data['host']; _pp = int(peer_data.get('port', 9091))
@@ -3116,10 +3123,11 @@ class QtclP2PNode:
                         if _connect_peer(host, port):
                             new_connections += 1
                     _dm_age_str = f"{dm_age:.0f}s" if dm_fresh or (dm_age < 86400 and _lo_ts > 1e9) else "cold"
-                    if new_connections:
+                    if local_peers:
+                        _already_n = len(local_peers) - new_connections - (len(local_peers) - len([p for p in local_peers if p]))
                         _EXP_LOG.info(
-                            f"[P2P] 🗄️  local DB: {new_connections}/{len(local_peers)} "
-                            f"peers connected (dm_age={_dm_age_str})")
+                            f"[P2P] 🗄️  DB: {new_connections} new / {len(local_peers)} stored "
+                            f"(dm_age={_dm_age_str})")
 
                 # ── Priority 2: koyeb if local empty, too few peers, or DM stale
                 if need_peers or dm_stale or not local_peers:
