@@ -11307,7 +11307,7 @@ static void _bo_fail(const char *host){
         if(!strncmp(_BO[i].host,host,63)){uint32_t b=_BO[i].s?(_BO[i].s*2>P2P_BO_MAX_S?P2P_BO_MAX_S:_BO[i].s*2):1;_BO[i].s=b;_BO[i].next_ns=now+(uint64_t)b*1000000000ULL;pthread_mutex_unlock(&_bo_lock);return;}
         if(_BO[i].next_ns<ot){ot=_BO[i].next_ns;oldest=i;}
     }
-    strncpy(_BO[oldest].host,host,63);_BO[oldest].s=1;_BO[oldest].next_ns=now+1000000000ULL;
+    memcpy(_BO[oldest].host,host,63);_BO[oldest].host[63]='\0';_BO[oldest].s=1;_BO[oldest].next_ns=now+1000000000ULL;
     pthread_mutex_unlock(&_bo_lock);
 }
 static void _bo_ok_clear(const char *host){
@@ -11432,14 +11432,16 @@ static int _wra(int fd,const void *b,size_t n){
 }
 static int _send(int fd,const char *cmd,const void *pay,uint32_t plen,uint8_t fl){
     QtclMsgHeaderV3 h; _hdr(&h,cmd,plen,(const uint8_t*)pay,fl);
-    if(_wra(fd,&h,sizeof(h))<0)return -1;
-    if(plen&&_wra(fd,pay,plen)<0)return -1; return 0;
+    if(_wra(fd,&h,sizeof(h))<0) return -1;
+    if(plen>0 && _wra(fd,pay,plen)<0) return -1;
+    return 0;
 }
 static int _recv(int fd,char cmd[13],uint8_t *buf,int bsz,int *ver){
     QtclMsgHeaderV3 h; int n=recv(fd,&h,sizeof(h),MSG_WAITALL);
     if(n!=(int)sizeof(h))return -1;
     uint8_t mg[4]=P2P_MAGIC_V3; if(memcmp(h.magic,mg,4))return -1;
-    if(ver)*ver=(int)h.version; memset(cmd,0,13); memcpy(cmd,h.command,12);
+    if(ver) *ver=(int)h.version;
+    memset(cmd,0,13); memcpy(cmd,h.command,12);
     uint32_t pl=h.length; if(!pl)return 0; if((int)pl>bsz)return -1;
     n=recv(fd,buf,pl,MSG_WAITALL); return n==(int)pl?(int)pl:-1;
 }
@@ -11542,7 +11544,7 @@ static void _sse_accept(int fd,const char *host,uint8_t topics){
             _SSESub *s=&_P2P.sse_subs[i]; memset(s,0,sizeof(*s));
             s->fd=fd;s->active=1;s->topics=topics?topics:TOPIC_ALL;
             s->channels=s->topics;s->connected_at_ns=_clock_ns();
-            strncpy(s->remote_host,host,63);_P2P.n_sse_subs++;
+            memcpy(s->remote_host,host,63);s->remote_host[63]='\0';_P2P.n_sse_subs++;
             pthread_attr_t a;pthread_attr_init(&a);
             pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
             pthread_create(&s->writer_thread,&a,_sse_writer,s);
@@ -11552,7 +11554,7 @@ static void _sse_accept(int fd,const char *host,uint8_t topics){
     }
     pthread_mutex_unlock(&_P2P.sse_lock);
     const char *full="HTTP/1.1 503 Service Unavailable\r\n\r\n";
-    write(fd,full,strlen(full));close(fd);
+    (void)write(fd,full,strlen(full));close(fd);
 }
 static int _wstate_json(const QtclWStateMeasurement *m,char *out,int sz,int self){
     char nh[33]={0};for(int i=0;i<16;i++)snprintf(nh+i*2,3,"%02x",m->node_id[i]);
@@ -11692,7 +11694,8 @@ static void *_p2p_peer_thread(void *arg){
             const QtclWStateMeasurement *m=(const QtclWStateMeasurement*)rb;
             if(!qtcl_measurement_verify(m,_P2P.hmac_secret)){
                 c->ban_score=(uint16_t)((int)c->ban_score+5);
-                if(c->ban_score>=100)break; continue;
+                if(c->ban_score>=100) break;
+                continue;
             }
             c->last_fidelity=(float)m->w_fidelity;
             c->chain_height=(int32_t)m->chain_height;
@@ -11823,7 +11826,7 @@ static void *_accept_thread(void *arg){
                 const char *body=strstr(hb,"\r\n\r\n");
                 if(body&&_P2P.callback)_P2P.callback(8,body+4,strlen(body+4));
                 const char *ok="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                write(cfd,ok,strlen(ok));close(cfd);
+                (void)write(cfd,ok,strlen(ok));close(cfd);
             } else if(strstr(hb,"/api/p2p/peers")){
                 /* Lightweight JSON peer list for discovery */
                 char pb[4096]={0}; int off=0;
@@ -11846,10 +11849,10 @@ static void *_accept_thread(void *arg){
                 char resp[4200]; int rl=snprintf(resp,sizeof(resp),
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                     "Content-Length: %d\r\n\r\n%s",off,pb);
-                write(cfd,resp,rl);close(cfd);
+                (void)write(cfd,resp,rl);close(cfd);
             } else {
                 const char *r404="HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-                write(cfd,r404,strlen(r404));close(cfd);
+                (void)write(cfd,r404,strlen(r404));close(cfd);
             }
         } else {
             pthread_mutex_lock(&_P2P.peers_lock);
@@ -11859,7 +11862,8 @@ static void *_accept_thread(void *arg){
             if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(cfd);continue;}
             memset(slot,0,sizeof(*slot));
             slot->fd=cfd;slot->active=1;slot->port=ntohs(addr.sin_port);
-            slot->last_recv_ns=_clock_ns();strncpy(slot->host,rh,63);
+            slot->last_recv_ns=_clock_ns();
+            memcpy(slot->host,rh,63);slot->host[63]='\0';
             _P2P.n_peers++;
             pthread_mutex_unlock(&_P2P.peers_lock);
             pthread_attr_t a;pthread_attr_init(&a);
@@ -11978,7 +11982,8 @@ int qtcl_p2p_connect(const char *host,uint16_t port){
     if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(fd);return -1;}
     memset(slot,0,sizeof(*slot));slot->fd=fd;
     slot->port=(uint16_t)(port?port:P2P_LISTEN_PORT);
-    slot->active=1;slot->last_recv_ns=_clock_ns();strncpy(slot->host,host,63);
+    slot->active=1;slot->last_recv_ns=_clock_ns();
+    memcpy(slot->host,host,63);slot->host[63]='\0';
     _P2P.n_peers++;
     pthread_mutex_unlock(&_P2P.peers_lock);
     pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
@@ -12093,7 +12098,7 @@ int qtcl_p2p_peers(QtclPeer *buf,int max){
         if(!_P2P.peers[i].active)continue;
         memset(&buf[n],0,sizeof(QtclPeer));
         memcpy(buf[n].node_id,_P2P.peers[i].node_id,16);
-        strncpy(buf[n].host,_P2P.peers[i].host,63);
+        memcpy(buf[n].host,_P2P.peers[i].host,63);buf[n].host[63]='\0';
         buf[n].port=_P2P.peers[i].port; buf[n].connected=(uint8_t)_P2P.peers[i].active;
         buf[n].chain_height=_P2P.peers[i].chain_height;
         buf[n].last_fidelity=_P2P.peers[i].last_fidelity;
@@ -16131,7 +16136,76 @@ class QtclClientApp:
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
 
-            # FIX: Track locally-mined heights to prevent orphaning race
+            # ── New-block signal — set by background SSE listener ─────────────
+            # Using a threading.Event (not asyncio) because the SSE listener
+            # runs in a separate threading.Thread, not in the asyncio event loop.
+            # The nonce loop checks it via is_set() — O(1), no blocking.
+            _new_block_event = _threading.Event()
+            _new_block_height = [0]   # list for mutable capture in nested scope
+
+            def _start_block_listener(oracle_url: str, initial_target: int) -> None:
+                """
+                Background thread: HTTP GET /api/events, parse new_block SSE frames.
+                Sets _new_block_event when a block >= current target is found.
+                Reconnects with exponential backoff (1s→2s→4s→8s→16s→30s cap).
+                ❤️  I love you — first to know wins
+                """
+                import urllib.request as _ur, urllib.error as _ue, time as _blt
+                BACKOFF = [1, 2, 4, 8, 16, 30]
+                bi = 0
+                _blt.sleep(0.5)   # let mining loop start first
+                while not _mining_stopped.is_set():
+                    url = f"{oracle_url}/api/events?types=block,new_block"
+                    try:
+                        req = _ur.Request(url)
+                        req.add_header('Accept',        'text/event-stream')
+                        req.add_header('Cache-Control', 'no-cache')
+                        req.add_header('User-Agent',    'QTCL-BlockListener/4.0')
+                        with _ur.urlopen(req, timeout=120) as resp:
+                            bi = 0
+                            buf = b''
+                            while not _mining_stopped.is_set():
+                                chunk = resp.read(4096)
+                                if not chunk: break
+                                buf += chunk
+                                while b'\n\n' in buf:
+                                    raw_evt, buf = buf.split(b'\n\n', 1)
+                                    data_str = ''
+                                    for line in raw_evt.decode('utf-8', 'replace').splitlines():
+                                        if line.startswith('data:'): data_str += line[5:].strip()
+                                    if not data_str: continue
+                                    try:
+                                        ev = _json.loads(data_str)
+                                        ev_type = ev.get('type', '')
+                                        if ev_type == 'new_block' or ev_type == 'block':
+                                            ev_h = int(ev.get('height') or ev.get('block_height') or 0)
+                                            if ev_h > 0:
+                                                _new_block_height[0] = ev_h
+                                                _new_block_event.set()
+                                                _EXP_LOG.info(
+                                                    f"[BLOCK-LISTENER] 🔔 new_block h={ev_h} "
+                                                    f"via SSE — nonce loop signalled"
+                                                )
+                                    except Exception:
+                                        pass
+                    except (_ue.URLError, OSError, TimeoutError) as _ble:
+                        wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+                        _EXP_LOG.debug(f"[BLOCK-LISTENER] reconnect in {wait}s ({_ble})")
+                        _mining_stopped.wait(wait)
+                    except Exception as _ble2:
+                        _EXP_LOG.debug(f"[BLOCK-LISTENER] error: {_ble2}")
+                        _mining_stopped.wait(5)
+
+            _mining_stopped = _threading.Event()   # signals listener thread to exit
+            _block_listener_thread = _threading.Thread(
+                target=_start_block_listener,
+                args=(kapi.base_url, 1),
+                daemon=True, name='BlockSSEListener'
+            )
+            _block_listener_thread.start()
+            _EXP_LOG.info(f"[MINER] 📡 Block SSE listener started → {kapi.base_url}/api/events")
+
+            # Track locally-mined heights to prevent orphaning race
             _last_mined_height = 0
             _last_mined_hash   = "0" * 64
             _mining_lock       = _threading.Lock()
@@ -16253,6 +16327,9 @@ class QtclClientApp:
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
                 difficulty_bits = max(1, min(difficulty_bits, 20))
                 
+                # Clear any stale new_block signal from the previous block
+                _new_block_event.clear()
+
                 # AUTHORITATIVE: server tip is ground truth — always.
                 # The old _last_mined_height > oracle_height guard was the
                 # chain-skip creator: if oracle returned stale h=N-1 after
@@ -16495,8 +16572,31 @@ class QtclClientApp:
                 _chain_tip_height = target_height  # our current best known height
 
                 def _poll_new_block() -> bool:
-                    """Drain SSE ring; return True if chain advanced past target_height."""
+                    """
+                    Fast new-block detector. Two-stage:
+                      1. threading.Event check (O(1), ~ns) — set by BlockSSEListener thread
+                         which reads /api/events continuously with ~100ms SSE latency.
+                      2. C SSE ring drain — reads /api/snapshot/sse frames which also
+                         carry block height in the oracle DM snapshot.
+                    Returns True immediately when chain has advanced to/past target_height.
+                    ❤️  I love you — speed is everything in a race
+                    """
                     nonlocal _chain_tip_height
+
+                    # Stage 1: threading.Event (fastest path — set by BlockSSEListener)
+                    if _new_block_event.is_set():
+                        _ev_h = _new_block_height[0]
+                        if _ev_h >= target_height:
+                            _new_block_event.clear()   # reset for next block
+                            _chain_tip_height = _ev_h
+                            _EXP_LOG.warning(
+                                f"[MINER] ⛔ Block SSE signal h={_ev_h} "
+                                f"— aborting h={target_height} immediately"
+                            )
+                            return True
+                        _new_block_event.clear()  # stale signal (lower height)
+
+                    # Stage 2: C SSE ring drain (oracle DM snapshots carry height)
                     if not _accel_ok:
                         return False
                     try:
@@ -16510,17 +16610,21 @@ class QtclClientApp:
                                     _end = _raw.index(b'\x00', _pos)
                                     _txt = _raw[_pos:_end].decode('utf-8', errors='replace')
                                     _pos = _end + 1
-                                    # Feed oracle DM frames while we're here
                                     _c_ingest_frame(_txt)
-                                    # Check for new_block signal
-                                    if '"type"' in _txt and 'new_block' in _txt:
+                                    # new_block events also appear in snapshot SSE
+                                    if 'new_block' in _txt or '"type"' in _txt:
                                         try:
                                             _ev = _json.loads(_txt)
-                                            _ev_h = int(_ev.get('height') or _ev.get('block_height') or 0)
+                                            _ev_h = int(
+                                                _ev.get('height') or
+                                                _ev.get('block_height') or
+                                                _ev.get('data', {}).get('height') or 0
+                                            )
                                             if _ev_h >= target_height:
                                                 _chain_tip_height = _ev_h
                                                 _EXP_LOG.warning(
-                                                    f"[MINER] ⛔ Chain advanced to h={_ev_h} "                                                    f"— aborting h={target_height} nonce search"
+                                                    f"[MINER] ⛔ SSE ring h={_ev_h} "
+                                                    f"— aborting h={target_height}"
                                                 )
                                                 return True
                                         except Exception:
@@ -16588,6 +16692,14 @@ class QtclClientApp:
                         if _found:
                             break
 
+                    # Python path also checks new-block signal after every burst
+                    if not _found and _poll_new_block():
+                        _EXP_LOG.warning(
+                            f"[MINER-SIMPLE] Chain advanced (Python path) "
+                            f"— restarting for h={_chain_tip_height + 1}"
+                        )
+                        break
+
                     # Yield to event loop — keeps UI/display alive
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                     await _asyncio.sleep(0)
@@ -16616,21 +16728,20 @@ class QtclClientApp:
                             _seed_fetch_time = _t.time()
 
 
-                    # Chain advance check — interval scales with C chunk size
-                    _chain_check_interval = _C_CHUNK * 10 if _C_AVAIL else 50_000
+                    # Slow HTTP tip poll removed — replaced by BlockSSEListener thread
+                    # which signals _new_block_event within ~100ms of a block being accepted.
+                    # _poll_new_block() checks the event on every C chunk (every ~200k nonces).
+                    # Keep a low-frequency safety poll as absolute backstop (every 5 minutes)
+                    # in case the SSE connection drops silently.
+                    _chain_check_interval = _C_CHUNK * 1500 if _C_AVAIL else 500_000
                     if nonce % _chain_check_interval == 0 and nonce > 0:
                         try:
                             tip2 = kapi.get_chain_tip() or {}
                             h2   = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
-                            with _mining_lock:
-                                _floor = _last_mined_height
-                            # Abort if chain is ahead of what we're mining
-                            # Use max(oracle_height, _last_mined_height) as our
-                            # reference so a just-accepted block doesn't orphan us
                             if h2 >= target_height:
                                 _EXP_LOG.info(
-                                    f"[MINER-SIMPLE] Chain at h={h2} ≥ target h={target_height}"
-                                    f" — restarting")
+                                    f"[MINER-SIMPLE] Safety poll: chain at h={h2} "
+                                    f"≥ target h={target_height} — restarting")
                                 _MINE_TELEM.mark_idle()
                                 break
                         except Exception:
@@ -16842,7 +16953,13 @@ class QtclClientApp:
                     _MINE_TELEM.mark_idle()
 
         async def _mine():
-            await _mine_inline()
+            try:
+                await _mine_inline()
+            finally:
+                try:
+                    _mining_stopped.set()   # stop block listener thread
+                except Exception:
+                    pass
 
         # FIX-6: run async mining in a daemon thread so the main thread is FREE
         # for the interactive menu. _asyncio.run() was blocking startup before.
