@@ -16287,98 +16287,29 @@ class QtclClientApp:
             self._stop.wait(30.0)
 
     def _subscribe_peer_oracle_sse(host: str, port: int) -> None:
-    """
-    Subscribe to a P2P peer's local oracle SSE stream (/api/snapshot/sse).
-    Every frame received is ingested into our own _LOCAL_ORACLE and C DM pool,
-    contributing to consensus DM aggregation across the mesh.
-    Runs as a daemon thread; silently exits if peer disconnects.
-    ❤️  I love you — every peer oracle frame strengthens the mesh
-    """
-    import time as _pot, json as _poj, ssl as _possl
-    from urllib.request import Request as _PoR, urlopen as _PoU
-    from urllib.error   import URLError as _PoE
-    url = f"http://{host}:{port}/api/snapshot/sse?client_id={_MY_IP or 'mesh'}_sub"
-    BACKOFF = [5, 10, 20, 40]; bi = 0
-    _last_snap_count = 0
-    while True:
-        try:
-            req = _PoR(url, method='GET')
-            req.add_header('Accept',        'text/event-stream')
-            req.add_header('Cache-Control', 'no-cache')
-            req.add_header('User-Agent',    'QTCL-MeshNode/4.0')
-            with _PoU(req, timeout=60) as resp:
-                _EXP_LOG.info(f"[MESH] ✅ Subscribed to peer oracle {host}:{port}/api/snapshot/sse")
-                bi = 0; buf = b''
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk: break
-                    buf += chunk
-                    while b'\n\n' in buf:
-                        raw_evt, buf = buf.split(b'\n\n', 1)
-                        for line in raw_evt.decode('utf-8', errors='replace').splitlines():
-                            if line.startswith('data:'):
-                                js = line[5:].strip()
-                                if js and len(js) > 20:
-                                    try:
-                                        _LOCAL_ORACLE._ingest_oracle_frame(js)
-                                        if _accel_ok:
-                                            try: _accel_lib.qtcl_p2p_trigger_consensus()
-                                            except Exception: pass
-                                        _last_snap_count += 1
-                                        if _last_snap_count % 20 == 1:
-                                            _EXP_LOG.debug(
-                                                f"[MESH] Peer {host}: "
-                                                f"{_last_snap_count} oracle frames ingested")
-                                    except Exception: pass
-                                break
-        except (_PoE, OSError, TimeoutError) as _e:
-            wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-            _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s")
-            _pot.sleep(wait)
-            # Stop trying if peer no longer in our DB
-            import sqlite3 as _podb
-            try:
-                with _podb.connect('qtcl_blockchain.db', timeout=2) as _podc:
-                    row = _podc.execute(
-                        "SELECT 1 FROM p2p_peers WHERE host=? AND ban_score<100 LIMIT 1",
-                        (host,)).fetchone()
-                if not row:
-                    _EXP_LOG.debug(f"[MESH] Peer {host} no longer in DB — stopping oracle sub")
-                    return
-            except Exception: pass
-        except Exception as _e:
-            _EXP_LOG.debug(f"[MESH] Peer oracle {host} error: {_e}")
-            _pot.sleep(30)
-            return  # non-recoverable
-
-def _subscribe_snapshot_sse(self) -> None:
         """
-        Python parallel subscriber for /api/snapshot/sse.
-        Works regardless of C SSL_connect result — uses urllib which handles
-        plain HTTP on port 9091 correctly. Feeds _ingest_oracle_frame directly.
-        ❤️  I love you — every frame is a quantum heartbeat
+        Subscribe to a P2P peer's local oracle SSE stream (/api/snapshot/sse).
+        Every frame received is ingested into our own _LOCAL_ORACLE and C DM pool,
+        contributing to consensus DM aggregation across the mesh.
+        Runs as a daemon thread; silently exits if peer disconnects.
+        ❤️  I love you — every peer oracle frame strengthens the mesh
         """
-        import time as _pt, ssl as _ssl
-        from urllib.request import Request as _SR, urlopen as _SO
-        from urllib.error   import URLError as _SE
-        BACKOFF = [2, 4, 8, 16, 30]; bi = 0
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
-        url = f"{_oracle_url}/api/snapshot/sse?client_id={_peer_id}_py"
-        while not self._stop.is_set():
+        import time as _pot, json as _poj, ssl as _possl
+        from urllib.request import Request as _PoR, urlopen as _PoU
+        from urllib.error   import URLError as _PoE
+        url = f"http://{host}:{port}/api/snapshot/sse?client_id={_MY_IP or 'mesh'}_sub"
+        BACKOFF = [5, 10, 20, 40]; bi = 0
+        _last_snap_count = 0
+        while True:
             try:
-                req = _SR(url, method='GET')
-                req.add_header('Accept', 'text/event-stream')
+                req = _PoR(url, method='GET')
+                req.add_header('Accept',        'text/event-stream')
                 req.add_header('Cache-Control', 'no-cache')
-                req.add_header('User-Agent', 'QTCL-PySSE/4.0')
-                ssl_ctx = _ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = _ssl.CERT_NONE
-                with _SO(req, timeout=120, context=ssl_ctx) as resp:
-                    _EXP_LOG.info(f"[PY-SSE] ✅ Python snapshot SSE connected → {url}")
-                    bi = 0
-                    buf = b''
-                    while not self._stop.is_set():
+                req.add_header('User-Agent',    'QTCL-MeshNode/4.0')
+                with _PoU(req, timeout=60) as resp:
+                    _EXP_LOG.info(f"[MESH] ✅ Subscribed to peer oracle {host}:{port}/api/snapshot/sse")
+                    bi = 0; buf = b''
+                    while True:
                         chunk = resp.read(4096)
                         if not chunk: break
                         buf += chunk
@@ -16387,17 +16318,86 @@ def _subscribe_snapshot_sse(self) -> None:
                             for line in raw_evt.decode('utf-8', errors='replace').splitlines():
                                 if line.startswith('data:'):
                                     js = line[5:].strip()
-                                    if js and len(js) > 10:
-                                        try: self._ingest_oracle_frame(js)
+                                    if js and len(js) > 20:
+                                        try:
+                                            _LOCAL_ORACLE._ingest_oracle_frame(js)
+                                            if _accel_ok:
+                                                try: _accel_lib.qtcl_p2p_trigger_consensus()
+                                                except Exception: pass
+                                            _last_snap_count += 1
+                                            if _last_snap_count % 20 == 1:
+                                                _EXP_LOG.debug(
+                                                    f"[MESH] Peer {host}: "
+                                                    f"{_last_snap_count} oracle frames ingested")
                                         except Exception: pass
                                     break
-            except (_SE, OSError, TimeoutError) as _e:
+            except (_PoE, OSError, TimeoutError) as _e:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[PY-SSE] disconnected ({_e}) — retry in {wait}s")
-                self._stop.wait(wait)
+                _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s")
+                _pot.sleep(wait)
+                # Stop trying if peer no longer in our DB
+                import sqlite3 as _podb
+                try:
+                    with _podb.connect('qtcl_blockchain.db', timeout=2) as _podc:
+                        row = _podc.execute(
+                            "SELECT 1 FROM p2p_peers WHERE host=? AND ban_score<100 LIMIT 1",
+                            (host,)).fetchone()
+                    if not row:
+                        _EXP_LOG.debug(f"[MESH] Peer {host} no longer in DB — stopping oracle sub")
+                        return
+                except Exception: pass
             except Exception as _e:
-                _EXP_LOG.debug(f"[PY-SSE] error: {_e}")
-                self._stop.wait(10)
+                _EXP_LOG.debug(f"[MESH] Peer oracle {host} error: {_e}")
+                _pot.sleep(30)
+                return  # non-recoverable
+
+    def _subscribe_snapshot_sse(self) -> None:
+            """
+            Python parallel subscriber for /api/snapshot/sse.
+            Works regardless of C SSL_connect result — uses urllib which handles
+            plain HTTP on port 9091 correctly. Feeds _ingest_oracle_frame directly.
+            ❤️  I love you — every frame is a quantum heartbeat
+            """
+            import time as _pt, ssl as _ssl
+            from urllib.request import Request as _SR, urlopen as _SO
+            from urllib.error   import URLError as _SE
+            BACKOFF = [2, 4, 8, 16, 30]; bi = 0
+            _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+            _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
+            url = f"{_oracle_url}/api/snapshot/sse?client_id={_peer_id}_py"
+            while not self._stop.is_set():
+                try:
+                    req = _SR(url, method='GET')
+                    req.add_header('Accept', 'text/event-stream')
+                    req.add_header('Cache-Control', 'no-cache')
+                    req.add_header('User-Agent', 'QTCL-PySSE/4.0')
+                    ssl_ctx = _ssl.create_default_context()
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = _ssl.CERT_NONE
+                    with _SO(req, timeout=120, context=ssl_ctx) as resp:
+                        _EXP_LOG.info(f"[PY-SSE] ✅ Python snapshot SSE connected → {url}")
+                        bi = 0
+                        buf = b''
+                        while not self._stop.is_set():
+                            chunk = resp.read(4096)
+                            if not chunk: break
+                            buf += chunk
+                            while b'\n\n' in buf:
+                                raw_evt, buf = buf.split(b'\n\n', 1)
+                                for line in raw_evt.decode('utf-8', errors='replace').splitlines():
+                                    if line.startswith('data:'):
+                                        js = line[5:].strip()
+                                        if js and len(js) > 10:
+                                            try: self._ingest_oracle_frame(js)
+                                            except Exception: pass
+                                        break
+                except (_SE, OSError, TimeoutError) as _e:
+                    wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+                    _EXP_LOG.debug(f"[PY-SSE] disconnected ({_e}) — retry in {wait}s")
+                    self._stop.wait(wait)
+                except Exception as _e:
+                    _EXP_LOG.debug(f"[PY-SSE] error: {_e}")
+                    self._stop.wait(10)
 
     def _subscribe_koyeb_events(self) -> None:
         """
