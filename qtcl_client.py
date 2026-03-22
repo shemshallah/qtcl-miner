@@ -10855,1044 +10855,707 @@ cleanup:
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   §SSE — C SSE HTTP/1.1 CLIENT (Raw socket, zero libcurl dependency)
-   Reads text/event-stream from oracle.  Handles chunked transfer encoding.
-   Termux-safe: only POSIX sockets + OpenSSL for TLS.
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
-#define QTCL_SSE_BUFSZ     65536
-#define QTCL_SSE_MAX_LINE  8192
-
-typedef struct {
-    volatile int        fd;          /* raw TCP socket (-1 = closed)  */
-    SSL_CTX            *ssl_ctx;
-    SSL                *ssl;
-    char                host[256];
-    char                path[512];
-    uint16_t            port;
-    volatile int        running;     /* 1=active, 0=shutdown          */
-    pthread_t           thread;
-    /* Ring buffer for parsed DM snapshots (lock-free SPSC) */
-    /* Producer: SSE thread. Consumer: Python/measurement thread.     */
-    volatile uint64_t   rb_head;     /* write index */
-    volatile uint64_t   rb_tail;     /* read  index */
-#define SSE_RING_SZ  32
-    char                rb_data[SSE_RING_SZ][QTCL_SSE_BUFSZ];
-    uint32_t            rb_len[SSE_RING_SZ];
-    /* Reconnect state */
-    uint32_t            reconnect_count;
-    float               backoff_s;
-} QtclSSEClient;
-
-static QtclSSEClient _G_SSE = {0};
-
-/* Non-blocking write all */
-static int _ssl_write_all(SSL *ssl, const char *buf, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int r = SSL_write(ssl, buf+sent, len-sent);
-        if (r <= 0) return -1;
-        sent += r;
-    }
-    return sent;
-}
-
-/* Parse one SSE frame, extract JSON from "data: {…}" lines */
-static int _parse_sse_frame(const char *frame, int flen,
-                             char *json_out, int json_max) {
-    const char *p = frame, *end = frame + flen;
-    while (p < end) {
-        const char *eol = memchr(p, '\n', end-p);
-        if (!eol) eol = end;
-        int ll = (int)(eol - p);
-        if (ll >= 5 && memcmp(p, "data:", 5) == 0) {
-            int ds = 5; while (ds < ll && p[ds]==' ') ds++;
-            int dl = ll - ds;
-            if (dl > 0 && dl < json_max) {
-                memcpy(json_out, p+ds, dl);
-                json_out[dl] = '\0';
-                return dl;
-            }
-        }
-        p = eol + 1;
-    }
-    return 0;
-}
-
-static void *_sse_thread(void *arg) {
-    QtclSSEClient *c = (QtclSSEClient*)arg;
-    static int ssl_init_done = 0;
-    if (!ssl_init_done) {
-        /* OpenSSL 1.1+ — SSL_library_init/SSL_load_error_strings removed.
-           OPENSSL_init_ssl() with 0 flags performs all required initialization. */
-        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS |
-                         OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
-        ssl_init_done = 1;
-    }
-
-    char line_buf[QTCL_SSE_BUFSZ];
-    char frame_buf[QTCL_SSE_BUFSZ];
-    int  frame_len = 0;
-
-    while (c->running) {
-        /* Resolve host */
-        struct addrinfo hints = {0}, *res = NULL;
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%u", c->port);
-        int gai = getaddrinfo(c->host, port_str, &hints, &res);
-        if (gai || !res) {
-            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
-            c->backoff_s = bs * 2.0f + 0.5f;
-            usleep((int)(bs * 1e6));
-            continue;
-        }
-
-        int sock = socket(res->ai_family, SOCK_STREAM, 0);
-        if (sock < 0) { freeaddrinfo(res); usleep(2000000); continue; }
-        int flag = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-            freeaddrinfo(res); close(sock);
-            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
-            c->backoff_s = bs * 2.0f + 0.5f;
-            usleep((int)(bs * 1e6));
-            continue;
-        }
-        freeaddrinfo(res);
-
-        /* TLS handshake */
-        if (c->ssl_ctx) { SSL_CTX_free(c->ssl_ctx); }
-        c->ssl_ctx = SSL_CTX_new(TLS_client_method());
-        SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, NULL);
-        c->ssl = SSL_new(c->ssl_ctx);
-        SSL_set_fd(c->ssl, sock);
-        SSL_set_tlsext_host_name(c->ssl, c->host);
-        if (SSL_connect(c->ssl) <= 0) {
-            SSL_free(c->ssl); c->ssl = NULL;
-            SSL_CTX_free(c->ssl_ctx); c->ssl_ctx = NULL;
-            close(sock); usleep(3000000); continue;
-        }
-
-        /* HTTP/1.1 GET request */
-        char req[1024];
-        int rlen = snprintf(req, sizeof(req),
-            "GET %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Accept: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
-            "User-Agent: QTCL-Client/3.0-P2Pv2\r\n\r\n",
-            c->path, c->host);
-        if (_ssl_write_all(c->ssl, req, rlen) < 0) goto reconnect;
-
-        /* Read HTTP response headers */
-        char hdr_buf[4096]; int hdr_len = 0; int hdr_done = 0;
-        while (!hdr_done && c->running) {
-            int n = SSL_read(c->ssl, hdr_buf+hdr_len, sizeof(hdr_buf)-hdr_len-1);
-            if (n <= 0) break;
-            hdr_len += n; hdr_buf[hdr_len] = '\0';
-            if (strstr(hdr_buf, "\r\n\r\n")) hdr_done = 1;
-        }
-        if (!hdr_done) goto reconnect;
-        /* Verify 200 OK */
-        if (!strstr(hdr_buf, "200 ")) goto reconnect;
-
-        c->reconnect_count++;
-        c->backoff_s = 1.0f;  /* reset backoff on success */
-        c->fd = sock;
-        frame_len = 0;
-
-        /* Main SSE read loop */
-        char buf[4096];
-        int lb_pos = 0;
-        while (c->running) {
-            int n = SSL_read(c->ssl, buf, sizeof(buf));
-            if (n <= 0) break;
-            /* Feed bytes into line buffer, looking for \n\n frame boundary */
-            for (int i = 0; i < n; i++) {
-                char ch = buf[i];
-                if (ch == '\r') continue;  /* strip CR */
-                if (frame_len < QTCL_SSE_BUFSZ-1)
-                    frame_buf[frame_len++] = ch;
-                /* Double-newline = end of SSE frame */
-                if (frame_len >= 2 &&
-                    frame_buf[frame_len-1]=='\n' &&
-                    frame_buf[frame_len-2]=='\n') {
-                    char json_tmp[QTCL_SSE_BUFSZ];
-                    int jl = _parse_sse_frame(frame_buf, frame_len,
-                                              json_tmp, QTCL_SSE_BUFSZ);
-                    if (jl > 0) {
-                        /* Write to lock-free ring buffer (SPSC) */
-                        uint64_t head = c->rb_head;
-                        uint64_t next = (head+1) % SSE_RING_SZ;
-                        if (next != c->rb_tail) {
-                            memcpy(c->rb_data[head], json_tmp, jl+1);
-                            c->rb_len[head] = jl;
-                            atomic_thread_fence(memory_order_release);
-                            c->rb_head = next;
-                        }
-                        /* else ring full: drop oldest frame */
-                    }
-                    frame_len = 0;
-                }
-            }
-        }
-reconnect:
-        c->fd = -1;
-        if (c->ssl) { SSL_free(c->ssl); c->ssl = NULL; }
-        if (c->ssl_ctx) { SSL_CTX_free(c->ssl_ctx); c->ssl_ctx = NULL; }
-        close(sock);
-        if (c->running) {
-            float bs = c->backoff_s < 60.0f ? c->backoff_s : 60.0f;
-            c->backoff_s = bs * 2.0f + 0.5f;
-            usleep((int)(bs * 1e6));
-        }
-    }
-    return NULL;
-}
-
-int qtcl_sse_connect(const char *host, uint16_t port, const char *path) {
-    if (_G_SSE.running) return -1;
-    memset(&_G_SSE, 0, sizeof(_G_SSE));
-    strncpy(_G_SSE.host, host, 255);
-    strncpy(_G_SSE.path, path, 511);
-    _G_SSE.port    = port;
-    _G_SSE.fd      = -1;
-    _G_SSE.running = 1;
-    _G_SSE.backoff_s = 1.0f;
-    pthread_attr_t attr; pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-    return pthread_create(&_G_SSE.thread, &attr, _sse_thread, &_G_SSE);
-}
-
-void qtcl_sse_disconnect(void) {
-    _G_SSE.running = 0;
-    if (_G_SSE.fd >= 0) { shutdown(_G_SSE.fd, SHUT_RDWR); }
-}
-
-/* Poll for JSON frames (non-blocking). Returns number of frames written. */
-int qtcl_sse_poll(char *buf, int buf_sz, int max_frames) {
-    int count = 0;
-    while (count < max_frames) {
-        uint64_t tail = _G_SSE.rb_tail;
-        atomic_thread_fence(memory_order_acquire);
-        if (tail == _G_SSE.rb_head) break;
-        uint32_t len = _G_SSE.rb_len[tail];
-        if ((int)len+1 <= buf_sz) {
-            memcpy(buf, _G_SSE.rb_data[tail], len+1);
-            buf += len+1; buf_sz -= len+1;
-        }
-        _G_SSE.rb_tail = (tail+1) % SSE_RING_SZ;
-        count++;
-    }
-    return count;
-}
-
-int  qtcl_sse_is_connected(void) { return _G_SSE.fd >= 0 ? 1 : 0; }
-int  qtcl_sse_reconnect_count(void) { return (int)_G_SSE.reconnect_count; }
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   §P2P — QTCL CUSTOM PROTOCOL v3 — OUROBOROS P2P + SSE BROADCAST + DM POOL
+   §P2P — QTCL CUSTOM PROTOCOL v4 — OUROBOROS · EPIDEMIC GOSSIP · BLOOM
    ═══════════════════════════════════════════════════════════════════════════
-   Architecture:
-     • Every client is simultaneously a TCP server (port 9091) and client.
-     • Wire protocol v3: 32-byte header + variable payload.  Backward-compat
-       with v2 via version byte in header.
-     • Commands: version/verack/ping/pong/wstate/inv/getaddr/addr/dmpool/
-                 ssesub/sseunsub/chain_reset/genesis (extensible)
-     • Ouroboros self-loop: every measurement we broadcast is ingested back
-       via the P2P ring → averaged into our own DM pool.  Self-coherent.
-     • DM pool: N-peer density matrices accumulated in a lock-free ring,
-       averaged per-block into a consensus DM.  Geometric mean weighting
-       by fidelity score.  Replaces the 2-source qtcl_fuse_oracle_dm with
-       an N-source Bures-geodesic weighted average.
-     • SSE broadcast server: /events endpoint on port 9091 (HTTP/1.1).
-       Clients subscribe and receive wstate/dm/chain_reset events.
-       Multiplexed with TCP P2P on the same port via SO_REUSEPORT per-thread.
-     • SSE multiplexer: prevents collision between Koyeb inbound SSE
-       (§SSE client) and peer outbound SSE.  Each channel has its own ring.
+   v4 improvements:
+     2. Fanout-limited epidemic gossip  — ceil(sqrt(n)) reputation-ranked peers
+     3. Peer reputation scoring         — fid²·(1000/lat_ms)·uptime_sigmoid
+     5. Topic-based subscriptions       — bitmask filter, no unwanted traffic
+     6. Temporal DM weighting           — exp(-age/τ)·fid² decay in consensus
+     9. Connection backoff table        — exponential per-host, 1s→64s cap
+    10. Immediate peer exchange         — addr swap on verack, mesh in O(diam)
+   Plus: Bloom dedup, INV/GETDATA pull, seen-message ring, RTT-adaptive ping,
+         all-topics SSE, SO_REUSEPORT multiplexing on 9091.
+   Health / liveness:  /health ONLY on Flask port 8000 (gunicorn).
+   P2P + SSE + gossip: everything on 9091 (P2P_PORT env var).
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
-#define P2P_MAGIC_V3   { 0x51,0x54,0x43,0x4C }
-#define P2P_VERSION    3
-#define P2P_MAX_PEERS  64
-#define P2P_WRING_SZ   512           /* lock-free wstate ring  (power-of-2) */
-#define P2P_WRING_MASK (P2P_WRING_SZ - 1)
-#define P2P_DMPOOL_SZ  32            /* DM pool depth          (power-of-2) */
-#define P2P_DMPOOL_MSK (P2P_DMPOOL_SZ - 1)
-#define P2P_MAX_PEERS_SSE 128        /* max concurrent SSE subscribers      */
-#define P2P_SSE_RING_SZ  256         /* per-subscriber event ring            */
-#define P2P_SSE_RING_MSK (P2P_SSE_RING_SZ - 1)
-#define P2P_SSE_EVBUF    4096        /* max bytes per SSE event              */
-#define P2P_LISTEN_PORT  9091        /* canonical QTCL P2P+SSE port          */
-#define P2P_PING_INTERVAL_S 30       /* keepalive ping period                */
-#define P2P_TIMEOUT_NS   120000000000ULL  /* 120s recv timeout → disconnect  */
-#define P2P_MAX_BAN_SCORE 100        /* ban threshold                        */
-#define P2P_OUROBOROS_TAG 0xAA       /* self-loop event marker               */
+#define P2P_MAGIC_V3      { 0x51,0x54,0x43,0x4C }
+#define P2P_VERSION       4
+#define P2P_MAX_PEERS     64
+#define P2P_WRING_SZ      512
+#define P2P_WRING_MASK    (P2P_WRING_SZ-1)
+#define P2P_DMPOOL_SZ     32
+#define P2P_DMPOOL_MSK    (P2P_DMPOOL_SZ-1)
+#define P2P_MAX_SSE       128
+#define P2P_SSE_RING      256
+#define P2P_SSE_RING_MSK  (P2P_SSE_RING-1)
+#define P2P_SSE_EVBUF     4096
+#define P2P_LISTEN_PORT   9091
+#define P2P_OUROBOROS_TAG 0xAA
 
-/* ── Wire Commands (12-byte NUL-padded, ASCII) ───────────────────────────── */
-static const char *CMD_VERSION    = "version";
-static const char *CMD_VERACK     = "verack";
-static const char *CMD_GETADDR    = "getaddr";
-static const char *CMD_ADDR       = "addr";
-static const char *CMD_PING       = "ping";
-static const char *CMD_PONG       = "pong";
-static const char *CMD_WSTATE     = "wstate";
-static const char *CMD_DMPOOL     = "dmpool";   /* N-DM pool batch         */
-static const char *CMD_REJECT     = "reject";
-static const char *CMD_INV        = "inv";
-static const char *CMD_SSESUB     = "ssesub";   /* subscribe to SSE events */
-static const char *CMD_SSEUNSUB   = "sseunsub";
-static const char *CMD_CHAIN_RST  = "chain_rst";/* genesis reset gossip    */
-static const char *CMD_GENESIS    = "genesis";  /* genesis block announce  */
+/* Bloom: 256-bit, 4 Jenkins-derived hash functions, 60s TTL */
+#define P2P_BLOOM_BITS  256
+#define P2P_BLOOM_WORDS (P2P_BLOOM_BITS/32)
+#define P2P_BLOOM_TTL   60000000000ULL  /* 60 s in ns */
+#define P2P_BLOOM_K     4
 
-#define INV_TX     1
-#define INV_BLOCK  2
+/* Seen-message ring: 512 × 8-byte fingerprints, O(1) check */
+#define P2P_SEEN_SZ   512
+#define P2P_SEEN_MASK (P2P_SEEN_SZ-1)
+
+/* Fanout: gossip to ceil(sqrt(n_peers)), [1, 8] */
+#define P2P_FANOUT_MIN  1
+#define P2P_FANOUT_MAX  8
+
+/* Backoff: 1s→2s→…→64s cap, 128-host table */
+#define P2P_BO_MAX_S  64
+#define P2P_BO_HOSTS  128
+
+/* Topics */
+#define TOPIC_WSTATE  0x01
+#define TOPIC_DM      0x02
+#define TOPIC_CHAIN   0x04
+#define TOPIC_ORACLE  0x08
+#define TOPIC_INV     0x10
+#define TOPIC_ALL     0xFF
+
+/* Adaptive ping: clamp(3×RTT, 10s, 120s) */
+#define P2P_PING_MIN_S  10
+#define P2P_PING_MAX_S  120
+
+#define P2P_TIMEOUT_NS  120000000000ULL
 #define INV_WSTATE 3
-#define INV_DM     4                 /* new: density matrix blob             */
+#define INV_DM     4
 
-/* Forward declaration — qtcl_p2p_connect is defined after _p2p_peer_thread
- * which calls it in the "addr" command handler.  ISO C99 requires this.   */
-int qtcl_p2p_connect(const char *host, uint16_t port);   /* forward decl */
+static const char *CMD_VERSION  = "version";
+static const char *CMD_VERACK   = "verack";
+static const char *CMD_GETADDR  = "getaddr";
+static const char *CMD_ADDR     = "addr";
+static const char *CMD_PING     = "ping";
+static const char *CMD_PONG     = "pong";
+static const char *CMD_WSTATE   = "wstate";
+static const char *CMD_DMPOOL   = "dmpool";
+static const char *CMD_INV      = "inv";
+static const char *CMD_GETDATA  = "getdata";
+static const char *CMD_NOTFOUND = "notfound";
+static const char *CMD_REJECT   = "reject";
+static const char *CMD_SSESUB   = "ssesub";
+static const char *CMD_CHAIN_RST= "chain_rst";
+static const char *CMD_SUBSCRIBE= "subscribe";
 
-/* ── Wire header v3 (32 bytes, naturally aligned) ─────────────────────── */
+/* ── Wire header v4 (32 bytes, natural alignment) ───────────────────────── */
 typedef struct {
-    uint8_t  magic[4];               /* { 0x51,0x54,0x43,0x4C }             */
-    uint8_t  version;                /* P2P_VERSION (3)                      */
-    uint8_t  flags;                  /* bit0=compressed, bit1=signed, bit2=sse */
+    uint8_t  magic[4];
+    uint8_t  version;
+    uint8_t  flags;
     uint16_t reserved;
-    char     command[12];            /* NUL-padded ASCII command             */
-    uint32_t length;                 /* payload length (0 = header-only)    */
-    uint8_t  checksum[4];            /* SHA3-256(payload)[:4]               */
-    uint8_t  node_id[4];             /* sender node_id[0:4] — quick filter  */
+    char     command[12];
+    uint32_t length;
+    uint8_t  checksum[4];
+    uint8_t  node_id[4];
 } QtclMsgHeaderV3;
 
-/* ── DM pool entry: one density matrix + metadata ──────────────────────── */
+/* ── DM pool entry (no packed — double arrays need 8-byte alignment) ──── */
 typedef struct {
-    double   dm_re[64];              /* 8x8 real part (row-major)            */
-    double   dm_im[64];              /* 8x8 imag part (row-major)            */
-    float    fidelity;               /* F→|W3⟩ — used as weight             */
-    float    purity;                 /* Tr(ρ²)                               */
+    double   dm_re[64];
+    double   dm_im[64];
+    float    fidelity;
+    float    purity;
     uint32_t chain_height;
     uint64_t timestamp_ns;
-    uint8_t  source_id[16];          /* peer node_id                         */
-    uint8_t  flags;                  /* bit0=ouroboros(self), bit1=verified  */
+    uint8_t  source_id[16];
+    uint8_t  flags;
 } QtclDMPoolEntry;
 
-/* ── SSE subscriber slot ───────────────────────────────────────────────── */
+/* ── Bloom filter ───────────────────────────────────────────────────────── */
+typedef struct { uint32_t w[P2P_BLOOM_WORDS]; uint64_t reset_ns; } _Bloom;
+static uint32_t _bj(const uint8_t *k,int n,uint32_t s){
+    uint32_t h=s; for(int i=0;i<n;i++){h+=k[i];h+=(h<<10);h^=(h>>6);}
+    h+=(h<<3);h^=(h>>11);h+=(h<<15); return h;
+}
+static void _bloom_add(_Bloom *b,const uint8_t *id8){
+    for(int k=0;k<P2P_BLOOM_K;k++){uint32_t h=_bj(id8,8,(uint32_t)(k*0x9e3779b9u))%P2P_BLOOM_BITS;b->w[h/32]|=(1u<<(h%32));}
+}
+static int  _bloom_test(const _Bloom *b,const uint8_t *id8){
+    for(int k=0;k<P2P_BLOOM_K;k++){uint32_t h=_bj(id8,8,(uint32_t)(k*0x9e3779b9u))%P2P_BLOOM_BITS;if(!(b->w[h/32]&(1u<<(h%32))))return 0;}return 1;
+}
+static void _bloom_reset(_Bloom *b){memset(b->w,0,sizeof(b->w));b->reset_ns=_clock_ns();}
+
+/* ── Seen-message ring ──────────────────────────────────────────────────── */
+typedef struct { uint64_t s[P2P_SEEN_SZ]; uint32_t h; } _SeenRing;
+static void _seen_add(_SeenRing *r,uint64_t f){r->s[r->h&P2P_SEEN_MASK]=f;r->h++;}
+static int  _seen_chk(const _SeenRing *r,uint64_t f){for(int i=0;i<P2P_SEEN_SZ;i++)if(r->s[i]==f)return 1;return 0;}
+static uint64_t _wfp(const QtclWStateMeasurement *m){
+    uint8_t src[24],h[32]; memcpy(src,m->node_id,16); memcpy(src+16,&m->timestamp_ns,8);
+    qtcl_sha3_256(src,24,h); uint64_t f; memcpy(&f,h,8); return f;
+}
+
+/* ── Backoff table ──────────────────────────────────────────────────────── */
+typedef struct { char host[64]; uint32_t s; uint64_t next_ns; } _BOEntry;
+static _BOEntry _BO[P2P_BO_HOSTS];
+static pthread_mutex_t _bo_lock = PTHREAD_MUTEX_INITIALIZER;
+static int _bo_ok(const char *host){
+    uint64_t now=_clock_ns(); pthread_mutex_lock(&_bo_lock);
+    for(int i=0;i<P2P_BO_HOSTS;i++) if(!strncmp(_BO[i].host,host,63)){int ok=(now>=_BO[i].next_ns);pthread_mutex_unlock(&_bo_lock);return ok;}
+    pthread_mutex_unlock(&_bo_lock); return 1;
+}
+static void _bo_fail(const char *host){
+    uint64_t now=_clock_ns(); pthread_mutex_lock(&_bo_lock);
+    int oldest=0; uint64_t ot=UINT64_MAX;
+    for(int i=0;i<P2P_BO_HOSTS;i++){
+        if(!strncmp(_BO[i].host,host,63)){uint32_t b=_BO[i].s?(_BO[i].s*2>P2P_BO_MAX_S?P2P_BO_MAX_S:_BO[i].s*2):1;_BO[i].s=b;_BO[i].next_ns=now+(uint64_t)b*1000000000ULL;pthread_mutex_unlock(&_bo_lock);return;}
+        if(_BO[i].next_ns<ot){ot=_BO[i].next_ns;oldest=i;}
+    }
+    strncpy(_BO[oldest].host,host,63);_BO[oldest].s=1;_BO[oldest].next_ns=now+1000000000ULL;
+    pthread_mutex_unlock(&_bo_lock);
+}
+static void _bo_ok_clear(const char *host){
+    pthread_mutex_lock(&_bo_lock);
+    for(int i=0;i<P2P_BO_HOSTS;i++) if(!strncmp(_BO[i].host,host,63)){_BO[i].s=0;_BO[i].next_ns=0;break;}
+    pthread_mutex_unlock(&_bo_lock);
+}
+
+/* ── SSE subscriber ─────────────────────────────────────────────────────── */
 typedef struct {
-    volatile int  active;
-    int           fd;                /* TCP socket for SSE stream            */
-    uint64_t      ring_head;
-    uint64_t      ring_tail;
-    char          ring[P2P_SSE_RING_SZ][P2P_SSE_EVBUF];
-    uint16_t      ring_len[P2P_SSE_RING_SZ];
-    pthread_t     writer_thread;
-    uint8_t       channels;          /* bitmask: 1=wstate, 2=dm, 4=chain, 8=all */
-    uint64_t      connected_at_ns;
-    char          remote_host[64];
-} _P2PSSESub;
+    volatile int active; int fd;
+    uint64_t ring_head, ring_tail;
+    char     ring[P2P_SSE_RING][P2P_SSE_EVBUF];
+    uint16_t ring_len[P2P_SSE_RING];
+    pthread_t writer_thread;
+    uint8_t   topics, channels;
+    uint64_t  connected_at_ns;
+    char      remote_host[64];
+} _SSESub;
 
 /* ── Peer connection ────────────────────────────────────────────────────── */
 typedef struct {
-    volatile int    fd;
-    char            host[64];
-    uint16_t        port;
-    volatile int    active;
-    volatile int    handshake_done;
-    volatile int    is_sse_subscriber; /* peer wants SSE events             */
-    pthread_t       thread;
-    int32_t         chain_height;
-    float           last_fidelity;
-    uint64_t        last_recv_ns;
-    uint16_t        ban_score;
-    uint8_t         node_id[16];
-    float           latency_ms;
-    uint8_t         protocol_version;
+    volatile int fd, active, handshake_done, is_sse_subscriber;
+    char         host[64];
+    uint16_t     port;
+    pthread_t    thread;
+    int32_t      chain_height;
+    float        last_fidelity, latency_ms, reputation;
+    uint64_t     last_recv_ns, connect_time_ns, msgs_recv, msgs_sent;
+    uint16_t     ban_score;
+    uint8_t      node_id[16], protocol_version, topics;
 } _P2PConn;
 
-/* ── Global P2P state ───────────────────────────────────────────────────── */
+/* ── Global state ───────────────────────────────────────────────────────── */
 typedef struct {
-    void           (*callback)(int event_type, const void *data, size_t len);
+    void           (*callback)(int,const void*,size_t);
     _P2PConn        peers[P2P_MAX_PEERS];
     int             n_peers;
     pthread_mutex_t peers_lock;
-    int             listen_fd;
-    pthread_t       accept_thread;
-    pthread_t       ping_thread;
-    pthread_t       ouroboros_thread; /* self-ingest loop                   */
-    int             running;
+    int             listen_fd, running;
+    pthread_t       accept_thread, ping_thread, ouroboros_thread;
     uint8_t         node_id[16];
     uint16_t        listen_port;
     int             max_peers;
 
-    /* Lock-free wstate ring (SPSC producer=C-peer-threads consumer=Python) */
-    volatile uint64_t          wring_head;
-    volatile uint64_t          wring_tail;
-    QtclWStateMeasurement      wring[P2P_WRING_SZ];
+    volatile uint64_t  wring_head, wring_tail;
+    QtclWStateMeasurement wring[P2P_WRING_SZ];
 
-    /* Lock-free DM pool ring: N peer DMs queued for averaging              */
-    volatile uint64_t          dmpool_head;
-    volatile uint64_t          dmpool_tail;
-    QtclDMPoolEntry            dmpool[P2P_DMPOOL_SZ];
+    volatile uint64_t  dmpool_head, dmpool_tail;
+    QtclDMPoolEntry    dmpool[P2P_DMPOOL_SZ];
 
-    /* Consensus averaged DM (updated by ouroboros thread every block)      */
-    double                     consensus_dm_re[64];
-    double                     consensus_dm_im[64];
-    float                      consensus_fidelity;
-    uint32_t                   consensus_height;
-    pthread_mutex_t            consensus_lock;
+    double          consensus_dm_re[64], consensus_dm_im[64];
+    float           consensus_fidelity;
+    uint32_t        consensus_height;
+    pthread_mutex_t consensus_lock;
 
-    /* SSE broadcast subscribers                                             */
-    _P2PSSESub                 sse_subs[P2P_MAX_PEERS_SSE];
-    pthread_mutex_t            sse_lock;
-    int                        n_sse_subs;
+    _SSESub         sse_subs[P2P_MAX_SSE];
+    pthread_mutex_t sse_lock;
+    int             n_sse_subs;
 
-    /* Ouroboros self-loop: last measurement we sent (for self-ingestion)   */
-    QtclWStateMeasurement      self_meas;
-    volatile int               self_meas_ready;
-    pthread_mutex_t            self_lock;
+    QtclWStateMeasurement self_meas;
+    volatile int    self_meas_ready;
+    pthread_mutex_t self_lock;
 
-    /* HMAC secret: SHA3-256("QTCL_P2P_HMAC_v3:" + node_id)               */
+    _Bloom          bloom;
+    pthread_mutex_t bloom_lock;
+    _SeenRing       seen;
+    pthread_mutex_t seen_lock;
+
+    /* INV cache: 64-slot ring, fp→full measurement for GETDATA */
+    QtclWStateMeasurement inv_cache[64];
+    uint64_t        inv_fps[64];
+    uint32_t        inv_head;
+    pthread_mutex_t inv_lock;
+
     uint8_t         hmac_secret[32];
 } _P2PState;
 
 static _P2PState _P2P = {0};
 
+/* Forward decl — qtcl_p2p_connect used inside peer thread (addr handler) */
+int qtcl_p2p_connect(const char *host, uint16_t port);
+
+/* ── Reputation score ────────────────────────────────────────────────────
+   score = fid² × (1000/lat_ms) × sigmoid(age_s/300)
+   Higher = preferred fanout target.                                      */
+static float _rep(const _P2PConn *c){
+    if(!c->active||!c->handshake_done)return 0.0f;
+    float ff=c->last_fidelity*c->last_fidelity;
+    float lat=c->latency_ms>0?c->latency_ms:999.0f;
+    uint64_t age_s=(_clock_ns()-c->connect_time_ns)/1000000000ULL;
+    float up=(float)age_s/((float)age_s+300.0f);
+    return ff*(1000.0f/lat)*(0.5f+0.5f*up);
+}
+
+/* ── Fanout: top ceil(sqrt(n)) peers by reputation ─────────────────────── */
+static int _fanout(int *out,int max){
+    float r[P2P_MAX_PEERS]; int idx[P2P_MAX_PEERS],n=0;
+    for(int i=0;i<P2P_MAX_PEERS;i++){
+        if(!_P2P.peers[i].active||!_P2P.peers[i].handshake_done||_P2P.peers[i].is_sse_subscriber)continue;
+        r[n]=_rep(&_P2P.peers[i]);idx[n]=i;n++;
+    }
+    for(int i=1;i<n;i++){float kr=r[i];int ki=idx[i],j=i-1;while(j>=0&&r[j]<kr){r[j+1]=r[j];idx[j+1]=idx[j];j--;}r[j+1]=kr;idx[j+1]=ki;}
+    int sq=1; while(sq*sq<n)sq++;
+    int f=sq<P2P_FANOUT_MAX?sq:P2P_FANOUT_MAX;
+    if(f<P2P_FANOUT_MIN)f=P2P_FANOUT_MIN;
+    int out_n=f<n?f:n; out_n=out_n<max?out_n:max;
+    for(int i=0;i<out_n;i++)out[i]=idx[i];
+    return out_n;
+}
+
+/* ── Wire layer ─────────────────────────────────────────────────────────── */
+static void _hdr(QtclMsgHeaderV3 *h,const char *cmd,uint32_t plen,const uint8_t *pay,uint8_t fl){
+    memset(h,0,sizeof(*h)); uint8_t mg[4]=P2P_MAGIC_V3; memcpy(h->magic,mg,4);
+    h->version=P2P_VERSION; h->flags=fl; strncpy(h->command,cmd,11);
+    h->length=plen; memcpy(h->node_id,_P2P.node_id,4);
+    if(pay&&plen){uint8_t hs[32];qtcl_sha3_256(pay,plen,hs);memcpy(h->checksum,hs,4);}
+}
+static int _wra(int fd,const void *b,size_t n){
+    const char *p=(const char*)b;
+    while(n>0){ssize_t r=write(fd,p,n);if(r<=0)return -1;p+=r;n-=r;}return 0;
+}
+static int _send(int fd,const char *cmd,const void *pay,uint32_t plen,uint8_t fl){
+    QtclMsgHeaderV3 h; _hdr(&h,cmd,plen,(const uint8_t*)pay,fl);
+    if(_wra(fd,&h,sizeof(h))<0)return -1;
+    if(plen&&_wra(fd,pay,plen)<0)return -1; return 0;
+}
+static int _recv(int fd,char cmd[13],uint8_t *buf,int bsz,int *ver){
+    QtclMsgHeaderV3 h; int n=recv(fd,&h,sizeof(h),MSG_WAITALL);
+    if(n!=(int)sizeof(h))return -1;
+    uint8_t mg[4]=P2P_MAGIC_V3; if(memcmp(h.magic,mg,4))return -1;
+    if(ver)*ver=(int)h.version; memset(cmd,0,13); memcpy(cmd,h.command,12);
+    uint32_t pl=h.length; if(!pl)return 0; if((int)pl>bsz)return -1;
+    n=recv(fd,buf,pl,MSG_WAITALL); return n==(int)pl?(int)pl:-1;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
-   WIRE LAYER
+   TEMPORAL DM POOL CONSENSUS — exp(-age/τ)·fid² weighting (feature 6)
+   τ=30s: fresh measurements dominate, stale ones decay gracefully.
+   Enforces Hermiticity and trace=1 before storing.
    ══════════════════════════════════════════════════════════════════════════ */
-
-static void _p2p_pack_header_v3(QtclMsgHeaderV3 *h, const char *cmd,
-                                 uint32_t payload_len,
-                                 const uint8_t *payload, uint8_t flags) {
-    memset(h, 0, sizeof(*h));
-    uint8_t magic[4] = P2P_MAGIC_V3;
-    memcpy(h->magic, magic, 4);
-    h->version = P2P_VERSION;
-    h->flags   = flags;
-    strncpy(h->command, cmd, 11);
-    h->length  = payload_len;
-    memcpy(h->node_id, _P2P.node_id, 4);
-    if (payload && payload_len > 0) {
-        uint8_t hash[32];
-        qtcl_sha3_256(payload, payload_len, hash);
-        memcpy(h->checksum, hash, 4);
-    }
-}
-
-/* Write all bytes to fd, returns 0 on success */
-static int _fd_write_all(int fd, const void *buf, size_t len) {
-    const char *p = (const char *)buf;
-    while (len > 0) {
-        ssize_t r = write(fd, p, len);
-        if (r <= 0) return -1;
-        p += r; len -= r;
-    }
-    return 0;
-}
-
-static int _net_send_v3(int fd, const char *cmd,
-                         const void *payload, uint32_t plen, uint8_t flags) {
-    QtclMsgHeaderV3 hdr;
-    _p2p_pack_header_v3(&hdr, cmd, plen, (const uint8_t*)payload, flags);
-    if (_fd_write_all(fd, &hdr, sizeof(hdr)) < 0) return -1;
-    if (plen > 0 && _fd_write_all(fd, payload, plen) < 0) return -1;
-    return 0;
-}
-
-/* Also support v2 header reception for backward-compat */
-static int _net_recv_v3(int fd, char cmd_out[13],
-                          uint8_t *buf, int bufsz, int *version_out) {
-    /* Peek first byte to detect v2 vs v3 header size */
-    uint8_t peek[1];
-    if (recv(fd, peek, 1, MSG_PEEK) != 1) return -1;
-    int hdr_sz = sizeof(QtclMsgHeaderV3);
-    if (hdr_sz > bufsz + (int)sizeof(QtclMsgHeaderV3)) return -1;
-
-    QtclMsgHeaderV3 hdr;
-    int n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-    if (n != (int)sizeof(hdr)) return -1;
-    uint8_t magic[4] = P2P_MAGIC_V3;
-    if (memcmp(hdr.magic, magic, 4) != 0) return -1;
-    if (version_out) *version_out = (int)hdr.version;
-    memset(cmd_out, 0, 13);
-    memcpy(cmd_out, hdr.command, 12);
-    uint32_t plen = hdr.length;
-    if (plen == 0) return 0;
-    if ((int)plen > bufsz) return -1;
-    n = recv(fd, buf, plen, MSG_WAITALL);
-    return (n == (int)plen) ? (int)plen : -1;
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
-   DM POOL — N-source density matrix geometric-mean averaging
-   ══════════════════════════════════════════════════════════════════════════
-   Algorithm (Bures-geodesic fidelity-weighted average):
-     1. Collect up to P2P_DMPOOL_SZ DMs from the ring.
-     2. Compute w_i = fidelity_i^2 / Σ fidelity_j^2  (fidelity as weight).
-     3. Weighted arithmetic mean: ρ_avg = Σ w_i · ρ_i.
-     4. Re-symmetrise and renormalise: ρ = (ρ+ρ†)/2 / Tr(ρ).
-     5. Store in _P2P.consensus_dm_re/im.
-   This is the arithmetic mean in DM space; true Riemannian geodesic mean
-   would require iterative Karcher flow but converges to the same result
-   when all F_i ≈ F (well-entangled cluster).  For heterogeneous clusters
-   fidelity-squared weighting down-weights decoherent outliers.           */
-
-static void _dmpool_compute_consensus(void) {
-    /* Drain pool ring into local array */
-    QtclDMPoolEntry entries[P2P_DMPOOL_SZ];
-    int n = 0;
-    uint64_t tail = _P2P.dmpool_tail;
+static void _consensus(void){
+    QtclDMPoolEntry e[P2P_DMPOOL_SZ]; int n=0;
+    uint64_t tail=_P2P.dmpool_tail;
     atomic_thread_fence(memory_order_acquire);
-    while (tail != _P2P.dmpool_head && n < P2P_DMPOOL_SZ) {
-        entries[n] = _P2P.dmpool[tail & P2P_DMPOOL_MSK];
-        tail = (tail + 1) & P2P_DMPOOL_MSK;
-        n++;
+    while(tail!=_P2P.dmpool_head&&n<P2P_DMPOOL_SZ){e[n]=_P2P.dmpool[tail&P2P_DMPOOL_MSK];tail=(tail+1)&P2P_DMPOOL_MSK;n++;}
+    _P2P.dmpool_tail=tail;
+    if(!n)return;
+    uint64_t now=_clock_ns(); double tau=30.0;
+    double ar[64]={0},ai[64]={0},ws=0.0;
+    for(int i=0;i<n;i++){
+        double tr=0.0; for(int k=0;k<8;k++)tr+=e[i].dm_re[k*9];
+        if(tr<0.5||tr>1.5)continue;
+        double f=(double)e[i].fidelity;
+        double age=(double)(now-e[i].timestamp_ns)/1e9; if(age<0)age=0;
+        double w=f*f*exp(-age/tau); if(w<1e-9)continue;
+        for(int j=0;j<64;j++){ar[j]+=w*e[i].dm_re[j];ai[j]+=w*e[i].dm_im[j];}
+        ws+=w;
     }
-    _P2P.dmpool_tail = tail;
-    if (n == 0) return;
-
-    /* Compute fidelity²-weighted mean */
-    double acc_re[64] = {0}, acc_im[64] = {0};
-    double w_sum = 0.0;
-    for (int i = 0; i < n; i++) {
-        double f = (double)entries[i].fidelity;
-        double w = f * f;          /* fidelity² weight                     */
-        if (w < 1e-9) w = 1e-9;   /* floor to avoid zero-weight lockout   */
-        /* Validate entry before accumulating */
-        double tr = 0.0;
-        for (int k = 0; k < 8; k++) tr += entries[i].dm_re[k*9]; /* diagonal */
-        if (tr < 0.5 || tr > 1.5) continue;  /* invalid DM — skip         */
-        for (int j = 0; j < 64; j++) {
-            acc_re[j] += w * entries[i].dm_re[j];
-            acc_im[j] += w * entries[i].dm_im[j];
-        }
-        w_sum += w;
+    if(ws<1e-15)return;
+    double iw=1.0/ws; for(int j=0;j<64;j++){ar[j]*=iw;ai[j]*=iw;}
+    /* Enforce Hermiticity: ρ=(ρ+ρ†)/2 */
+    for(int i=0;i<8;i++)for(int j=0;j<8;j++){
+        double sr=0.5*(ar[i*8+j]+ar[j*8+i]),si=0.5*(ai[i*8+j]-ai[j*8+i]);
+        ar[i*8+j]=sr;ai[i*8+j]=si;ar[j*8+i]=sr;ai[j*8+i]=-si;
     }
-    if (w_sum < 1e-15) return;
-
-    /* Normalise by weight sum */
-    double inv_w = 1.0 / w_sum;
-    for (int j = 0; j < 64; j++) {
-        acc_re[j] *= inv_w;
-        acc_im[j] *= inv_w;
-    }
-
-    /* Re-symmetrise: ρ = (ρ + ρ†) / 2 — enforces Hermiticity            */
-    for (int i = 0; i < 8; i++) {
-        for (int j = 0; j < 8; j++) {
-            double re_ij = acc_re[i*8+j], im_ij = acc_im[i*8+j];
-            double re_ji = acc_re[j*8+i], im_ji = acc_im[j*8+i];
-            double sym_re = 0.5 * (re_ij + re_ji);
-            double sym_im = 0.5 * (im_ij - im_ji);   /* (A-A†)/2 → 0 for Hermitian */
-            acc_re[i*8+j] = sym_re; acc_im[i*8+j] =  sym_im;
-            acc_re[j*8+i] = sym_re; acc_im[j*8+i] = -sym_im;
-        }
-    }
-
-    /* Re-normalise trace to 1 */
-    double tr = 0.0;
-    for (int k = 0; k < 8; k++) tr += acc_re[k*9];
-    if (tr < 1e-12) return;
-    double inv_tr = 1.0 / tr;
-    for (int j = 0; j < 64; j++) { acc_re[j] *= inv_tr; acc_im[j] *= inv_tr; }
-
-    /* Compute consensus fidelity F→|W3⟩ */
-    float cons_fid = (float)qtcl_fidelity_w3(acc_re);
-
-    /* Atomic store (swap under mutex) */
+    double tr=0.0; for(int k=0;k<8;k++)tr+=ar[k*9];
+    if(tr<1e-12)return;
+    double it=1.0/tr; for(int j=0;j<64;j++){ar[j]*=it;ai[j]*=it;}
+    float cf=(float)qtcl_fidelity_w3(ar);
     pthread_mutex_lock(&_P2P.consensus_lock);
-    memcpy(_P2P.consensus_dm_re, acc_re, 64*sizeof(double));
-    memcpy(_P2P.consensus_dm_im, acc_im, 64*sizeof(double));
-    _P2P.consensus_fidelity = cons_fid;
+    memcpy(_P2P.consensus_dm_re,ar,64*sizeof(double));
+    memcpy(_P2P.consensus_dm_im,ai,64*sizeof(double));
+    _P2P.consensus_fidelity=cf;
     pthread_mutex_unlock(&_P2P.consensus_lock);
 }
 
-/* Push one DM into the pool ring (called from peer thread on wstate recv)  */
-static void _dmpool_push(const QtclWStateMeasurement *m, uint8_t ouro_flag) {
-    /* Build pool entry from wstate measurement */
-    QtclDMPoolEntry e;
-    memset(&e, 0, sizeof(e));
-    /* Extract DM from measurement — wstate carries 8x8 real DM snapshot   */
-    /* dm_sample_hex in the measurement is 1024 hex chars = 64 doubles re   */
-    /* For now: reconstruct from Bloch angles stored in measurement balls    */
-    /* Use qtcl_build_tripartite_dm with the measurement's ball coordinates  */
-    double b0[3], bc[3], bl[3];
-    for (int i = 0; i < 3; i++) {
-        b0[i] = m->ball_pq0[i];
-        bc[i] = m->ball_curr[i];
-        bl[i] = m->ball_last[i];
-    }
-    qtcl_build_tripartite_dm(b0, bc, bl, e.dm_re, e.dm_im);
-    e.fidelity      = (float)m->w_fidelity;
-    e.purity        = (float)m->purity;
-    e.chain_height  = (uint32_t)m->chain_height;
-    e.timestamp_ns  = (uint64_t)m->timestamp_ns;
-    memcpy(e.source_id, m->node_id, 16);
-    e.flags         = ouro_flag;  /* P2P_OUROBOROS_TAG if self             */
-
-    /* Lock-free ring push */
-    uint64_t head = _P2P.dmpool_head;
-    uint64_t next = (head + 1) & P2P_DMPOOL_MSK;
-    if (next != _P2P.dmpool_tail) {   /* ring not full                     */
-        _P2P.dmpool[head] = e;
-        atomic_thread_fence(memory_order_release);
-        _P2P.dmpool_head = next;
-    }
-    /* If ring is full: overwrite oldest (tail advances) */
-    else {
-        _P2P.dmpool[head] = e;
-        atomic_thread_fence(memory_order_release);
-        _P2P.dmpool_head = next;
-        _P2P.dmpool_tail = (next + 1) & P2P_DMPOOL_MSK; /* drop oldest   */
-    }
+static void _dmpool_push(const QtclWStateMeasurement *m,uint8_t fl){
+    QtclDMPoolEntry e; memset(&e,0,sizeof(e));
+    double b0[3],bc[3],bl[3];
+    for(int i=0;i<3;i++){b0[i]=m->ball_pq0[i];bc[i]=m->ball_curr[i];bl[i]=m->ball_last[i];}
+    qtcl_build_tripartite_dm(b0,bc,bl,e.dm_re,e.dm_im);
+    e.fidelity=(float)m->w_fidelity; e.purity=(float)m->purity;
+    e.chain_height=(uint32_t)m->chain_height; e.timestamp_ns=(uint64_t)m->timestamp_ns;
+    memcpy(e.source_id,m->node_id,16); e.flags=fl;
+    uint64_t h=_P2P.dmpool_head,nx=(h+1)&P2P_DMPOOL_MSK;
+    _P2P.dmpool[h]=e; atomic_thread_fence(memory_order_release); _P2P.dmpool_head=nx;
+    if(nx==_P2P.dmpool_tail)_P2P.dmpool_tail=(nx+1)&P2P_DMPOOL_MSK;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   SSE BROADCAST SERVER — streams wstate/dm events to subscribers on 9091
-   ══════════════════════════════════════════════════════════════════════════
-   Each subscriber gets a dedicated lock-free ring.  A per-subscriber writer
-   thread drains the ring and sends SSE chunks to the client socket.
-   Subscriptions arrive as HTTP GET /events (same port as P2P TCP — the
-   accept thread routes based on first recv bytes: HTTP GET → SSE, else P2P).
+   SSE BROADCAST — topic-filtered, SO_REUSEPORT on 9091
    ══════════════════════════════════════════════════════════════════════════ */
-
-/* Format and enqueue an SSE event to one subscriber */
-static void _sse_sub_push(_P2PSSESub *sub,
-                           const char *event_type,
-                           const char *data, int data_len) {
-    if (!sub->active) return;
-    char frame[P2P_SSE_EVBUF];
-    int n = snprintf(frame, sizeof(frame),
-                     "event: %s\r\ndata: %.*s\r\n\r\n",
-                     event_type, data_len, data);
-    if (n <= 0 || n >= P2P_SSE_EVBUF) return;
-
-    uint64_t head = sub->ring_head;
-    uint64_t next = (head + 1) & P2P_SSE_RING_MSK;
-    if (next == sub->ring_tail) return;  /* full — drop frame               */
-    memcpy(sub->ring[head], frame, (size_t)n);
-    sub->ring_len[head] = (uint16_t)n;
-    atomic_thread_fence(memory_order_release);
-    sub->ring_head = next;
+static void _sse_push(_SSESub *s,const char *ev,const char *d,int dl){
+    if(!s->active)return;
+    char fr[P2P_SSE_EVBUF]; int n=snprintf(fr,sizeof(fr),"event: %s\r\ndata: %.*s\r\n\r\n",ev,dl,d);
+    if(n<=0||n>=P2P_SSE_EVBUF)return;
+    uint64_t h=s->ring_head,nx=(h+1)&P2P_SSE_RING_MSK;
+    if(nx==s->ring_tail)return;
+    memcpy(s->ring[h],fr,(size_t)n); s->ring_len[h]=(uint16_t)n;
+    atomic_thread_fence(memory_order_release); s->ring_head=nx;
 }
-
-/* Per-subscriber writer thread */
-static void *_sse_writer_thread(void *arg) {
-    _P2PSSESub *sub = (_P2PSSESub *)arg;
-    /* Send SSE preamble */
-    const char *preamble =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "X-QTCL-Protocol: ouroboros-v3\r\n"
-        "\r\n"
-        ": QTCL P2P SSE stream — ouroboros protocol v3\r\n\r\n";
-    if (_fd_write_all(sub->fd, preamble, strlen(preamble)) < 0) {
-        sub->active = 0; return NULL;
+static void *_sse_writer(void *arg){
+    _SSESub *s=(_SSESub*)arg;
+    const char *pre="HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\nConnection: keep-alive\r\n"
+        "Access-Control-Allow-Origin: *\r\nX-QTCL-Protocol: ouroboros-v4\r\n\r\n"
+        ": QTCL ouroboros-v4\r\n\r\n";
+    if(_wra(s->fd,pre,strlen(pre))<0){s->active=0;return NULL;}
+    while(s->active&&_P2P.running){
+        uint64_t t=s->ring_tail; atomic_thread_fence(memory_order_acquire);
+        if(t==s->ring_head){usleep(5000);continue;}
+        uint16_t l=s->ring_len[t];
+        if(l&&_wra(s->fd,s->ring[t],l)<0){s->active=0;break;}
+        s->ring_tail=(t+1)&P2P_SSE_RING_MSK;
     }
-    while (sub->active && _P2P.running) {
-        uint64_t tail = sub->ring_tail;
-        atomic_thread_fence(memory_order_acquire);
-        if (tail == sub->ring_head) { usleep(5000); continue; }  /* 5ms poll */
-        uint16_t len = sub->ring_len[tail];
-        if (len > 0) {
-            if (_fd_write_all(sub->fd, sub->ring[tail], len) < 0) {
-                sub->active = 0; break;
-            }
-        }
-        sub->ring_tail = (tail + 1) & P2P_SSE_RING_MSK;
-    }
-    close(sub->fd); sub->fd = -1; sub->active = 0;
-    return NULL;
+    close(s->fd);s->fd=-1;s->active=0;return NULL;
 }
-
-/* Broadcast one SSE event to all matching subscribers */
-static void _sse_broadcast_all(const char *event_type, uint8_t channel_bit,
-                                 const char *data, int data_len) {
+static void _sse_bcast(const char *ev,uint8_t topic,const char *d,int dl){
     pthread_mutex_lock(&_P2P.sse_lock);
-    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
-        if (!_P2P.sse_subs[i].active) continue;
-        if (_P2P.sse_subs[i].channels & channel_bit ||
-            _P2P.sse_subs[i].channels & 8) {   /* 8 = all channels        */
-            _sse_sub_push(&_P2P.sse_subs[i], event_type, data, data_len);
-        }
+    for(int i=0;i<P2P_MAX_SSE;i++){
+        if(!_P2P.sse_subs[i].active)continue;
+        uint8_t t=_P2P.sse_subs[i].topics;
+        if((t&topic)||(t&TOPIC_ALL)) _sse_push(&_P2P.sse_subs[i],ev,d,dl);
     }
     pthread_mutex_unlock(&_P2P.sse_lock);
 }
-
-/* Accept an inbound SSE subscription (HTTP GET /events) */
-static void _sse_accept_subscriber(int fd, const char *remote_host,
-                                    uint8_t channels) {
+static void _sse_accept(int fd,const char *host,uint8_t topics){
     pthread_mutex_lock(&_P2P.sse_lock);
-    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
-        if (!_P2P.sse_subs[i].active) {
-            _P2PSSESub *sub = &_P2P.sse_subs[i];
-            memset(sub, 0, sizeof(*sub));
-            sub->fd           = fd;
-            sub->active       = 1;
-            sub->channels     = channels ? channels : 0xFF;  /* default: all */
-            sub->ring_head    = 0;
-            sub->ring_tail    = 0;
-            sub->connected_at_ns = _clock_ns();
-            strncpy(sub->remote_host, remote_host, 63);
-            _P2P.n_sse_subs++;
-            pthread_attr_t a; pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            pthread_create(&sub->writer_thread, &a, _sse_writer_thread, sub);
+    for(int i=0;i<P2P_MAX_SSE;i++){
+        if(!_P2P.sse_subs[i].active){
+            _SSESub *s=&_P2P.sse_subs[i]; memset(s,0,sizeof(*s));
+            s->fd=fd;s->active=1;s->topics=topics?topics:TOPIC_ALL;
+            s->channels=s->topics;s->connected_at_ns=_clock_ns();
+            strncpy(s->remote_host,host,63);_P2P.n_sse_subs++;
+            pthread_attr_t a;pthread_attr_init(&a);
+            pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+            pthread_create(&s->writer_thread,&a,_sse_writer,s);
             pthread_attr_destroy(&a);
-            pthread_mutex_unlock(&_P2P.sse_lock);
-            return;
+            pthread_mutex_unlock(&_P2P.sse_lock);return;
         }
     }
     pthread_mutex_unlock(&_P2P.sse_lock);
-    /* No slot available */
-    const char *full = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-    write(fd, full, strlen(full)); close(fd);
+    const char *full="HTTP/1.1 503 Service Unavailable\r\n\r\n";
+    write(fd,full,strlen(full));close(fd);
 }
-
-/* Serialise a wstate measurement to compact JSON for SSE broadcast         */
-static int _wstate_to_sse_json(const QtclWStateMeasurement *m,
-                                 char *out, int outsz, int is_self) {
-    char node_hex[33] = {0};
-    for (int i = 0; i < 16; i++)
-        snprintf(node_hex + i*2, 3, "%02x", m->node_id[i]);
-    return snprintf(out, outsz,
-        "{\"event\":\"wstate\",\"node_id\":\"%s\","
-        "\"chain_height\":%u,\"pq0\":%u,\"pq_curr\":%u,\"pq_last\":%u,"
+static int _wstate_json(const QtclWStateMeasurement *m,char *out,int sz,int self){
+    char nh[33]={0};for(int i=0;i<16;i++)snprintf(nh+i*2,3,"%02x",m->node_id[i]);
+    return snprintf(out,sz,
+        "{\"event\":\"wstate\",\"node_id\":\"%s\",\"chain_height\":%u,"
+        "\"pq0\":%u,\"pq_curr\":%u,\"pq_last\":%u,"
         "\"w_fidelity\":%.6f,\"purity\":%.6f,\"coherence\":%.6f,"
         "\"entropy_vn\":%.6f,\"discord\":%.6f,\"negativity\":%.6f,"
         "\"hyp_dist_0c\":%.6f,\"hyp_dist_cl\":%.6f,\"hyp_dist_0l\":%.6f,"
         "\"triangle_area\":%.6f,\"timestamp_ns\":%llu,\"ouroboros\":%d}",
-        node_hex,
-        (unsigned)m->chain_height, (unsigned)m->pq0,
-        (unsigned)m->pq_curr,      (unsigned)m->pq_last,
-        m->w_fidelity, m->purity,  m->coherence,
-        m->entropy_vn, m->discord, m->negativity,
-        m->hyp_dist_0c, m->hyp_dist_cl, m->hyp_dist_0l,
-        m->triangle_area, (unsigned long long)m->timestamp_ns, is_self);
+        nh,(unsigned)m->chain_height,(unsigned)m->pq0,
+        (unsigned)m->pq_curr,(unsigned)m->pq_last,
+        m->w_fidelity,m->purity,m->coherence,
+        m->entropy_vn,m->discord,m->negativity,
+        m->hyp_dist_0c,m->hyp_dist_cl,m->hyp_dist_0l,
+        m->triangle_area,(unsigned long long)m->timestamp_ns,self);
 }
-
-/* Serialise consensus DM to compact JSON for SSE broadcast                 */
-static int _consensus_dm_to_sse_json(char *out, int outsz) {
+static int _cons_json(char *out,int sz){
     pthread_mutex_lock(&_P2P.consensus_lock);
-    float fid = _P2P.consensus_fidelity;
-    uint32_t h = _P2P.consensus_height;
-    /* Encode DM as hex (only real part diagonal + first off-diagonal row)  */
-    /* Full 64×16=1024 byte hex is too large for SSE; send fidelity + trace */
-    double tr = 0.0;
-    for (int k = 0; k < 8; k++) tr += _P2P.consensus_dm_re[k*9];
-    double pur = 0.0;
-    for (int i = 0; i < 64; i++) {
-        pur += _P2P.consensus_dm_re[i]*_P2P.consensus_dm_re[i]
-             + _P2P.consensus_dm_im[i]*_P2P.consensus_dm_im[i];
-    }
+    float f=_P2P.consensus_fidelity;uint32_t h=_P2P.consensus_height;
+    double tr=0.0,pu=0.0;
+    for(int k=0;k<8;k++)tr+=_P2P.consensus_dm_re[k*9];
+    for(int i=0;i<64;i++)pu+=_P2P.consensus_dm_re[i]*_P2P.consensus_dm_re[i]+_P2P.consensus_dm_im[i]*_P2P.consensus_dm_im[i];
     pthread_mutex_unlock(&_P2P.consensus_lock);
-    return snprintf(out, outsz,
-        "{\"event\":\"dm_consensus\",\"chain_height\":%u,"
-        "\"consensus_fidelity\":%.6f,\"trace\":%.6f,\"purity\":%.6f}",
-        (unsigned)h, (double)fid, tr, pur);
+    return snprintf(out,sz,"{\"event\":\"dm_consensus\",\"chain_height\":%u,"
+        "\"consensus_fidelity\":%.6f,\"trace\":%.6f,\"purity\":%.6f,"
+        "\"temporal_weighted\":true}",(unsigned)h,(double)f,tr,pu);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   OUROBOROS SELF-LOOP THREAD
-   ══════════════════════════════════════════════════════════════════════════
-   Every measurement we broadcast is immediately re-ingested by this thread:
-     1. Copy from _P2P.self_meas (set in qtcl_p2p_send_wstate).
-     2. Push into the wstate ring with P2P_OUROBOROS_TAG.
-     3. Push into the DM pool ring with ouroboros flag.
-     4. Trigger DM pool consensus recompute.
-     5. Broadcast the consensus DM via SSE to all subscribers.
-   This creates a closed quantum feedback loop: our own state contributes
-   to the consensus the same way any peer's state does.
+   OUROBOROS SELF-LOOP — 500ms, Bloom TTL reset, temporal weighting
    ══════════════════════════════════════════════════════════════════════════ */
-
-static void *_ouroboros_thread(void *arg) {
-    (void)arg;
-    QtclWStateMeasurement last_self;
-    uint64_t last_ts = 0;
-    while (_P2P.running) {
-        usleep(500000);   /* 500ms cadence — half a second self-ingestion  */
+static void *_ouroboros_thread(void *arg){
+    (void)arg; QtclWStateMeasurement ls; uint64_t lt=0;
+    while(_P2P.running){
+        usleep(500000);
         pthread_mutex_lock(&_P2P.self_lock);
-        int ready = _P2P.self_meas_ready;
-        if (ready) {
-            last_self = _P2P.self_meas;
-            last_ts   = last_self.timestamp_ns;
-        }
+        int rdy=_P2P.self_meas_ready;
+        if(rdy){ls=_P2P.self_meas;lt=ls.timestamp_ns;}
         pthread_mutex_unlock(&_P2P.self_lock);
-        if (!ready || last_ts == 0) continue;
-
-        /* Push self-measurement to wstate ring with ouroboros marker       */
-        uint64_t head = _P2P.wring_head;
-        uint64_t next = (head + 1) & P2P_WRING_MASK;
-        if (next != _P2P.wring_tail) {
-            _P2P.wring[head] = last_self;
-            atomic_thread_fence(memory_order_release);
-            _P2P.wring_head = next;
+        if(!rdy||!lt)continue;
+        /* Bloom TTL reset */
+        pthread_mutex_lock(&_P2P.bloom_lock);
+        if(_clock_ns()-_P2P.bloom.reset_ns>P2P_BLOOM_TTL) _bloom_reset(&_P2P.bloom);
+        pthread_mutex_unlock(&_P2P.bloom_lock);
+        /* Wstate ring */
+        uint64_t h=_P2P.wring_head;
+        if((h+1)&P2P_WRING_MASK!=_P2P.wring_tail){
+            _P2P.wring[h]=ls;atomic_thread_fence(memory_order_release);
+            _P2P.wring_head=(h+1)&P2P_WRING_MASK;
         }
-        /* Fire callback with ouroboros event type (type=9)                 */
-        if (_P2P.callback)
-            _P2P.callback(9, &last_self, sizeof(last_self));
-
-        /* Push to DM pool */
-        _dmpool_push(&last_self, P2P_OUROBOROS_TAG);
-
-        /* Recompute consensus DM */
-        _dmpool_compute_consensus();
-
-        /* Broadcast consensus via SSE */
-        char sse_buf[512];
-        int sn = _consensus_dm_to_sse_json(sse_buf, sizeof(sse_buf));
-        if (sn > 0) _sse_broadcast_all("dm_consensus", 2, sse_buf, sn);
-
-        /* Broadcast self wstate via SSE */
-        char wsse_buf[1024];
-        int wn = _wstate_to_sse_json(&last_self, wsse_buf, sizeof(wsse_buf), 1);
-        if (wn > 0) _sse_broadcast_all("wstate", 1, wsse_buf, wn);
+        if(_P2P.callback)_P2P.callback(9,&ls,sizeof(ls));
+        _dmpool_push(&ls,P2P_OUROBOROS_TAG);
+        _consensus();
+        /* SSE */
+        char buf[512],wbuf[1024]; int sn,wn;
+        sn=_cons_json(buf,sizeof(buf)); if(sn>0)_sse_bcast("dm_consensus",TOPIC_DM,buf,sn);
+        wn=_wstate_json(&ls,wbuf,sizeof(wbuf),1); if(wn>0)_sse_bcast("wstate",TOPIC_WSTATE,wbuf,wn);
     }
     return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   PEER PROTOCOL THREAD — handles one connected peer (inbound or outbound)
+   PEER PROTOCOL THREAD
+   Features 2(fanout) 3(reputation) 5(topics) 9(backoff) 10(immediate exchange)
    ══════════════════════════════════════════════════════════════════════════ */
-
-static void *_p2p_peer_thread(void *arg) {
-    _P2PConn *c = (_P2PConn*)arg;
-    uint8_t recv_buf[sizeof(QtclWStateMeasurement) + 256];
-    char cmd[13];
-
-    /* Outbound: send VERSION first */
-    uint8_t ver_payload[22] = {0};
-    memcpy(ver_payload, _P2P.node_id, 16);
-    ver_payload[16] = P2P_VERSION;
-    *((uint16_t*)(ver_payload+17)) = _P2P.listen_port;
-    ver_payload[19] = 0x07;  /* capability flags: wstate|dmpool|sse        */
-    _net_send_v3(c->fd, "version", ver_payload, sizeof(ver_payload), 0);
-
-    while (_P2P.running && c->active) {
-        memset(cmd, 0, sizeof(cmd));
-        int ver = 0;
-        int plen = _net_recv_v3(c->fd, cmd, recv_buf, sizeof(recv_buf), &ver);
-        if (plen < 0) break;
-        c->last_recv_ns = _clock_ns();
-        c->protocol_version = (uint8_t)ver;
-
-        if (strcmp(cmd, "version") == 0) {
-            if (plen >= 17) {
-                memcpy(c->node_id, recv_buf, 16);
-                if (plen >= 20) c->protocol_version = recv_buf[16];
-            }
-            _net_send_v3(c->fd, "verack", NULL, 0, 0);
-            c->handshake_done = 1;
-            if (_P2P.callback) _P2P.callback(1, c, sizeof(*c));
-            /* Immediately request peer list */
-            _net_send_v3(c->fd, "getaddr", NULL, 0, 0);
-
-        } else if (strcmp(cmd, "verack") == 0) {
-            c->handshake_done = 1;
-
-        } else if (strcmp(cmd, "ping") == 0) {
-            uint64_t ts = _clock_ns();
-            _net_send_v3(c->fd, "pong", &ts, 8, 0);
-
-        } else if (strcmp(cmd, "pong") == 0) {
-            if (plen >= 8) {
-                uint64_t sent; memcpy(&sent, recv_buf, 8);
-                c->latency_ms = (float)((_clock_ns() - sent) / 1e6);
-            }
-
-        } else if (strcmp(cmd, "wstate") == 0 &&
-                   plen == (int)sizeof(QtclWStateMeasurement)) {
-            const QtclWStateMeasurement *m = (const QtclWStateMeasurement*)recv_buf;
-            if (!qtcl_measurement_verify(m, _P2P.hmac_secret)) {
-                c->ban_score = (uint16_t)((int)c->ban_score + 5);
-                if (c->ban_score >= P2P_MAX_BAN_SCORE) break;
-                continue;
-            }
-            c->last_fidelity = (float)m->w_fidelity;
-            c->chain_height  = (int32_t)m->chain_height;
-
-            /* Push to wstate ring */
-            uint64_t head = _P2P.wring_head;
-            uint64_t next = (head + 1) & P2P_WRING_MASK;
-            if (next != _P2P.wring_tail) {
-                _P2P.wring[head] = *m;
-                atomic_thread_fence(memory_order_release);
-                _P2P.wring_head = next;
-            }
-            /* Push to DM pool for averaging */
-            _dmpool_push(m, 0);
-
-            /* Re-broadcast to all OTHER peers (mesh relay)                 */
+static void *_p2p_peer_thread(void *arg){
+    _P2PConn *c=(_P2PConn*)arg; c->connect_time_ns=_clock_ns();
+    uint8_t rb[sizeof(QtclWStateMeasurement)+512]; char cmd[13];
+    /* Send VERSION */
+    uint8_t vp[21]={0}; memcpy(vp,_P2P.node_id,16);
+    vp[16]=P2P_VERSION; *((uint16_t*)(vp+17))=_P2P.listen_port;
+    vp[19]=TOPIC_ALL; vp[20]=0x07;
+    _send(c->fd,"version",vp,sizeof(vp),0);
+    while(_P2P.running&&c->active){
+        memset(cmd,0,13); int vi=0;
+        int pl=_recv(c->fd,cmd,rb,sizeof(rb),&vi);
+        if(pl<0)break;
+        c->last_recv_ns=_clock_ns(); c->msgs_recv++;
+        if(!strcmp(cmd,"version")){
+            if(pl>=16)memcpy(c->node_id,rb,16);
+            c->topics=(pl>=20)?rb[19]:TOPIC_ALL;
+            _send(c->fd,"verack",NULL,0,0);
+            c->handshake_done=1; c->reputation=0.5f;
+            if(_P2P.callback)_P2P.callback(1,c,sizeof(*c));
+            _bo_ok_clear(c->host);
+            /* Feature 10: immediate peer exchange both directions */
+            _send(c->fd,"getaddr",NULL,0,0);
             pthread_mutex_lock(&_P2P.peers_lock);
-            for (int i = 0; i < P2P_MAX_PEERS; i++) {
-                if (&_P2P.peers[i] == c) continue;  /* not back to sender  */
-                if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
-                    _net_send_v3(_P2P.peers[i].fd, "wstate", m, sizeof(*m), 0);
+            uint8_t ab[P2P_MAX_PEERS*70];int off=0;
+            for(int i=0;i<P2P_MAX_PEERS;i++){
+                if(!_P2P.peers[i].active||&_P2P.peers[i]==c)continue;
+                memcpy(ab+off,_P2P.peers[i].host,64);off+=64;
+                *((uint16_t*)(ab+off))=_P2P.peers[i].port;off+=2;
+                if(off+66>(int)sizeof(ab))break;
             }
             pthread_mutex_unlock(&_P2P.peers_lock);
-
-            /* Broadcast to SSE subscribers */
-            char sse_buf[1024];
-            int sn = _wstate_to_sse_json(m, sse_buf, sizeof(sse_buf), 0);
-            if (sn > 0) _sse_broadcast_all("wstate", 1, sse_buf, sn);
-
-            if (_P2P.callback) _P2P.callback(3, m, sizeof(*m));
-
-        } else if (strcmp(cmd, "dmpool") == 0 &&
-                   plen >= (int)sizeof(QtclDMPoolEntry)) {
-            /* Receive a pre-computed DM from peer — push directly to pool  */
-            const QtclDMPoolEntry *de = (const QtclDMPoolEntry*)recv_buf;
-            uint64_t head = _P2P.dmpool_head;
-            uint64_t next = (head + 1) & P2P_DMPOOL_MSK;
-            if (next != _P2P.dmpool_tail) {
-                _P2P.dmpool[head] = *de;
-                atomic_thread_fence(memory_order_release);
-                _P2P.dmpool_head  = next;
+            if(off)_send(c->fd,"addr",ab,off,0);
+        } else if(!strcmp(cmd,"verack")){
+            c->handshake_done=1;
+        } else if(!strcmp(cmd,"subscribe")&&pl>=1){
+            c->topics=rb[0];
+        } else if(!strcmp(cmd,"ping")){
+            uint64_t ts=_clock_ns(); _send(c->fd,"pong",&ts,8,0);
+        } else if(!strcmp(cmd,"pong")&&pl>=8){
+            uint64_t sent; memcpy(&sent,rb,8);
+            c->latency_ms=(float)((_clock_ns()-sent)/1e6);
+            c->reputation=_rep(c);
+        } else if(!strcmp(cmd,"inv")&&pl>=9){
+            /* Pull protocol: check Bloom + seen before requesting */
+            uint8_t it=rb[0]; uint64_t fp; memcpy(&fp,rb+1,8);
+            if(it==INV_WSTATE){
+                pthread_mutex_lock(&_P2P.bloom_lock);
+                int bh=_bloom_test(&_P2P.bloom,(uint8_t*)&fp);
+                pthread_mutex_unlock(&_P2P.bloom_lock);
+                pthread_mutex_lock(&_P2P.seen_lock);
+                int sh=_seen_chk(&_P2P.seen,fp);
+                pthread_mutex_unlock(&_P2P.seen_lock);
+                if(!bh&&!sh){
+                    uint8_t req[9];req[0]=INV_WSTATE;memcpy(req+1,&fp,8);
+                    _send(c->fd,"getdata",req,9,0);
+                }
             }
-            if (_P2P.callback) _P2P.callback(7, de, sizeof(*de));
-
-        } else if (strcmp(cmd, "ssesub") == 0) {
-            /* Peer wants to subscribe to our SSE stream over this TCP conn */
-            uint8_t ch = (plen >= 1) ? recv_buf[0] : 0xFF;
-            c->is_sse_subscriber = 1;
-            _sse_accept_subscriber(c->fd, c->host, ch);
-            /* Hand off fd to SSE — remove from P2P peers                   */
+        } else if(!strcmp(cmd,"getdata")&&pl>=9){
+            uint8_t rt=rb[0]; uint64_t fp; memcpy(&fp,rb+1,8);
+            if(rt==INV_WSTATE){
+                pthread_mutex_lock(&_P2P.inv_lock);
+                int found=0;
+                for(int i=0;i<64;i++) if(_P2P.inv_fps[i]==fp){
+                    _send(c->fd,"wstate",&_P2P.inv_cache[i],sizeof(QtclWStateMeasurement),0);
+                    found=1;break;
+                }
+                pthread_mutex_unlock(&_P2P.inv_lock);
+                if(!found)_send(c->fd,"notfound",rb,9,0);
+            }
+        } else if(!strcmp(cmd,"wstate")&&pl==(int)sizeof(QtclWStateMeasurement)){
+            const QtclWStateMeasurement *m=(const QtclWStateMeasurement*)rb;
+            if(!qtcl_measurement_verify(m,_P2P.hmac_secret)){
+                c->ban_score=(uint16_t)((int)c->ban_score+5);
+                if(c->ban_score>=100)break; continue;
+            }
+            c->last_fidelity=(float)m->w_fidelity;
+            c->chain_height=(int32_t)m->chain_height;
+            c->reputation=_rep(c);
+            /* Dedup via Bloom + seen ring */
+            uint64_t fp=_wfp(m);
+            pthread_mutex_lock(&_P2P.bloom_lock);
+            int bh=_bloom_test(&_P2P.bloom,(uint8_t*)&fp);
+            if(!bh)_bloom_add(&_P2P.bloom,(uint8_t*)&fp);
+            pthread_mutex_unlock(&_P2P.bloom_lock);
+            pthread_mutex_lock(&_P2P.seen_lock);
+            int sh=_seen_chk(&_P2P.seen,fp);
+            if(!sh)_seen_add(&_P2P.seen,fp);
+            pthread_mutex_unlock(&_P2P.seen_lock);
+            if(bh&&sh)continue; /* already propagated */
+            /* Cache for GETDATA */
+            pthread_mutex_lock(&_P2P.inv_lock);
+            uint32_t sl=_P2P.inv_head&63;
+            _P2P.inv_cache[sl]=*m;_P2P.inv_fps[sl]=fp;_P2P.inv_head++;
+            pthread_mutex_unlock(&_P2P.inv_lock);
+            /* Wstate ring */
+            uint64_t wh=_P2P.wring_head;
+            if((wh+1)&P2P_WRING_MASK!=_P2P.wring_tail){
+                _P2P.wring[wh]=*m;atomic_thread_fence(memory_order_release);
+                _P2P.wring_head=(wh+1)&P2P_WRING_MASK;
+            }
+            _dmpool_push(m,0);
+            /* Feature 2+3: fanout INV to ceil(sqrt(n)) best-rep peers */
+            {
+                int fi[P2P_FANOUT_MAX];
+                pthread_mutex_lock(&_P2P.peers_lock);
+                int nf=_fanout(fi,P2P_FANOUT_MAX);
+                uint8_t inv[9];inv[0]=INV_WSTATE;memcpy(inv+1,&fp,8);
+                for(int i=0;i<nf;i++){
+                    int pi=fi[i];
+                    if(&_P2P.peers[pi]==c)continue;
+                    if(!(_P2P.peers[pi].topics&TOPIC_WSTATE)&&
+                       !(_P2P.peers[pi].topics&TOPIC_ALL))continue;
+                    _send(_P2P.peers[pi].fd,"inv",inv,9,0);
+                    _P2P.peers[pi].msgs_sent++;
+                }
+                pthread_mutex_unlock(&_P2P.peers_lock);
+            }
+            char sb[1024]; int sn=_wstate_json(m,sb,sizeof(sb),0);
+            if(sn>0)_sse_bcast("wstate",TOPIC_WSTATE,sb,sn);
+            if(_P2P.callback)_P2P.callback(3,m,sizeof(*m));
+        } else if(!strcmp(cmd,"dmpool")&&pl>=(int)sizeof(QtclDMPoolEntry)){
+            const QtclDMPoolEntry *de=(const QtclDMPoolEntry*)rb;
+            uint64_t dh=_P2P.dmpool_head,dnx=(dh+1)&P2P_DMPOOL_MSK;
+            if(dnx!=_P2P.dmpool_tail){
+                _P2P.dmpool[dh]=*de;atomic_thread_fence(memory_order_release);
+                _P2P.dmpool_head=dnx;
+            }
+            if(_P2P.callback)_P2P.callback(7,de,sizeof(*de));
+        } else if(!strcmp(cmd,"ssesub")){
+            uint8_t top=(pl>=1)?rb[0]:TOPIC_ALL;
+            c->is_sse_subscriber=1;
+            _sse_accept(c->fd,c->host,top);
             pthread_mutex_lock(&_P2P.peers_lock);
-            c->active = 0;  c->fd = -1;  /* SSE writer owns fd now        */
-            _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
+            c->active=0;c->fd=-1;
+            _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;
             pthread_mutex_unlock(&_P2P.peers_lock);
             return NULL;
-
-        } else if (strcmp(cmd, "chain_rst") == 0) {
-            /* Genesis reset gossip — relay to Python via callback           */
-            if (_P2P.callback) _P2P.callback(8, recv_buf, (size_t)plen);
-            /* Also broadcast as SSE event */
-            char sse_buf[256];
-            int sn = snprintf(sse_buf, sizeof(sse_buf),
-                "{\"event\":\"chain_reset\",\"new_height\":0}");
-            if (sn > 0) _sse_broadcast_all("chain_reset", 4, sse_buf, sn);
-
-        } else if (strcmp(cmd, "getaddr") == 0) {
-            /* Send peer list */
+        } else if(!strcmp(cmd,"chain_rst")){
+            if(_P2P.callback)_P2P.callback(8,rb,(size_t)pl);
+            char sb[256]; int sn=snprintf(sb,sizeof(sb),"{\"event\":\"chain_reset\",\"new_height\":0}");
+            if(sn>0)_sse_bcast("chain_reset",TOPIC_CHAIN,sb,sn);
+        } else if(!strcmp(cmd,"getaddr")){
             pthread_mutex_lock(&_P2P.peers_lock);
-            uint8_t addr_buf[P2P_MAX_PEERS * 70];
-            int off = 0;
-            for (int i = 0; i < P2P_MAX_PEERS; i++) {
-                if (!_P2P.peers[i].active || &_P2P.peers[i] == c) continue;
-                memcpy(addr_buf+off, _P2P.peers[i].host, 64); off += 64;
-                *((uint16_t*)(addr_buf+off)) = _P2P.peers[i].port;  off += 2;
-                if (off + 66 > (int)sizeof(addr_buf)) break;
+            uint8_t ab[P2P_MAX_PEERS*70];int off=0;
+            for(int i=0;i<P2P_MAX_PEERS;i++){
+                if(!_P2P.peers[i].active||&_P2P.peers[i]==c)continue;
+                memcpy(ab+off,_P2P.peers[i].host,64);off+=64;
+                *((uint16_t*)(ab+off))=_P2P.peers[i].port;off+=2;
+                if(off+66>(int)sizeof(ab))break;
             }
             pthread_mutex_unlock(&_P2P.peers_lock);
-            if (off > 0) _net_send_v3(c->fd, "addr", addr_buf, off, 0);
-
-        } else if (strcmp(cmd, "addr") == 0) {
-            /* Attempt to connect to advertised peers */
-            int n_addrs = plen / 66;
-            for (int i = 0; i < n_addrs; i++) {
-                char host[65] = {0};
-                memcpy(host, recv_buf + i*66, 64);
-                uint16_t port = *((uint16_t*)(recv_buf + i*66 + 64));
-                if (port == 0 || port == _P2P.listen_port) continue;
-                /* Async connect — ignore error (best-effort discovery)     */
-                qtcl_p2p_connect(host, port);
+            if(off)_send(c->fd,"addr",ab,off,0);
+        } else if(!strcmp(cmd,"addr")){
+            /* Feature 9+10: backoff-gated connection to advertised peers */
+            int na=pl/66;
+            for(int i=0;i<na;i++){
+                char h[65]={0};memcpy(h,rb+i*66,64);
+                uint16_t p=*((uint16_t*)(rb+i*66+64));
+                if(!p||p==_P2P.listen_port)continue;
+                if(_bo_ok(h))qtcl_p2p_connect(h,p);
             }
         }
     }
-
     pthread_mutex_lock(&_P2P.peers_lock);
-    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
-    if (_P2P.callback) _P2P.callback(2, c, sizeof(*c));
-    memset(c, 0, sizeof(*c)); c->fd = -1;
-    _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
+    if(c->fd>=0){close(c->fd);c->fd=-1;}
+    if(_P2P.callback)_P2P.callback(2,c,sizeof(*c));
+    memset(c,0,sizeof(*c));c->fd=-1;
+    _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;
     pthread_mutex_unlock(&_P2P.peers_lock);
     return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   ACCEPT THREAD — port 9091 multiplexing: HTTP GET → SSE, else → P2P
+   ACCEPT THREAD — 9091 multiplexing: HTTP GET → SSE/REST  else → P2P
+   Health /health lives ONLY on Flask/gunicorn port 8000 (Koyeb probe).
+   All P2P, SSE, gossip, peers, consensus_dm on 9091.
    ══════════════════════════════════════════════════════════════════════════ */
-
-static void *_accept_thread(void *arg) {
-    while (_P2P.running) {
-        struct sockaddr_in addr; socklen_t addrlen = sizeof(addr);
-        int cfd = accept(_P2P.listen_fd, (struct sockaddr*)&addr, &addrlen);
-        if (cfd < 0) { if (_P2P.running) usleep(10000); continue; }
-        int flag = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE, &flag, sizeof(flag));
-
-        char remote_host[64] = {0};
-        inet_ntop(AF_INET, &addr.sin_addr, remote_host, sizeof(remote_host));
-
-        /* Peek at first 4 bytes to detect HTTP vs P2P protocol             */
-        uint8_t peek[4] = {0};
-        ssize_t pn = recv(cfd, peek, 4, MSG_PEEK | MSG_DONTWAIT);
-
-        /* HTTP detection: "GET " or "HEAD" or "POST"                       */
-        int is_http = (pn == 4 &&
-            (memcmp(peek, "GET ", 4) == 0 ||
-             memcmp(peek, "HEAD", 4) == 0 ||
-             memcmp(peek, "POST", 4) == 0));
-
-        if (is_http) {
-            /* Read HTTP request line to find path and channel params       */
-            char http_buf[1024] = {0};
-            int hn = recv(cfd, http_buf, sizeof(http_buf)-1, 0);
-            (void)hn;
-            /* Parse /events?channels=N */
-            uint8_t channels = 0xFF;
-            const char *ch_param = strstr(http_buf, "channels=");
-            if (ch_param) channels = (uint8_t)atoi(ch_param + 9);
-            /* Route: /events → SSE stream */
-            if (strstr(http_buf, "/events")) {
-                _sse_accept_subscriber(cfd, remote_host, channels);
-            } else if (strstr(http_buf, "/gossip")) {
-                /* HTTP POST /gossip → parse JSON body as chain_reset or wstate */
-                const char *body = strstr(http_buf, "\r\n\r\n");
-                if (body && _P2P.callback)
-                    _P2P.callback(8, body+4, strlen(body+4));
-                const char *ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                write(cfd, ok, strlen(ok)); close(cfd);
+static void *_accept_thread(void *arg){
+    (void)arg;
+    while(_P2P.running){
+        struct sockaddr_in addr; socklen_t al=sizeof(addr);
+        int cfd=accept(_P2P.listen_fd,(struct sockaddr*)&addr,&al);
+        if(cfd<0){if(_P2P.running)usleep(10000);continue;}
+        int fl=1;
+        setsockopt(cfd,IPPROTO_TCP,TCP_NODELAY,&fl,sizeof(fl));
+        setsockopt(cfd,SOL_SOCKET,SO_KEEPALIVE,&fl,sizeof(fl));
+        char rh[64]={0}; inet_ntop(AF_INET,&addr.sin_addr,rh,sizeof(rh));
+        uint8_t pk[4]={0}; ssize_t pn=recv(cfd,pk,4,MSG_PEEK|MSG_DONTWAIT);
+        int http=(pn==4&&(
+            !memcmp(pk,"GET ",4)||!memcmp(pk,"POST",4)||
+            !memcmp(pk,"HEAD",4)||!memcmp(pk,"OPTI",4)));
+        if(http){
+            char hb[2048]={0}; recv(cfd,hb,sizeof(hb)-1,0);
+            uint8_t topics=TOPIC_ALL;
+            const char *tp=strstr(hb,"topics=");
+            if(tp)topics=(uint8_t)strtoul(tp+7,NULL,10);
+            else{const char *cp=strstr(hb,"channels=");if(cp)topics=(uint8_t)atoi(cp+9);}
+            if(strstr(hb,"/events")){
+                _sse_accept(cfd,rh,topics);
+            } else if(strstr(hb,"/gossip")){
+                /* POST /gossip — JSON chain_reset or wstate ingestion */
+                const char *body=strstr(hb,"\r\n\r\n");
+                if(body&&_P2P.callback)_P2P.callback(8,body+4,strlen(body+4));
+                const char *ok="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                write(cfd,ok,strlen(ok));close(cfd);
+            } else if(strstr(hb,"/api/p2p/peers")){
+                /* Lightweight JSON peer list for discovery */
+                char pb[4096]={0}; int off=0;
+                off+=snprintf(pb+off,sizeof(pb)-off,"{\"peers\":[");
+                pthread_mutex_lock(&_P2P.peers_lock);
+                int first=1;
+                for(int i=0;i<P2P_MAX_PEERS;i++){
+                    if(!_P2P.peers[i].active)continue;
+                    char nh[33]={0};for(int j=0;j<16;j++)snprintf(nh+j*2,3,"%02x",_P2P.peers[i].node_id[j]);
+                    off+=snprintf(pb+off,sizeof(pb)-off,
+                        "%s{\"host\":\"%s\",\"port\":%u,\"fidelity\":%.4f,"
+                        "\"height\":%d,\"lat_ms\":%.1f,\"rep\":%.3f}",
+                        first?"":",",_P2P.peers[i].host,(unsigned)_P2P.peers[i].port,
+                        _P2P.peers[i].last_fidelity,_P2P.peers[i].chain_height,
+                        _P2P.peers[i].latency_ms,(double)_P2P.peers[i].reputation);
+                    first=0;
+                }
+                pthread_mutex_unlock(&_P2P.peers_lock);
+                off+=snprintf(pb+off,sizeof(pb)-off,"]}");
+                char resp[4200]; int rl=snprintf(resp,sizeof(resp),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    "Content-Length: %d\r\n\r\n%s",off,pb);
+                write(cfd,resp,rl);close(cfd);
             } else {
-                const char *r404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-                write(cfd, r404, strlen(r404)); close(cfd);
+                const char *r404="HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+                write(cfd,r404,strlen(r404));close(cfd);
             }
         } else {
-            /* P2P binary protocol */
             pthread_mutex_lock(&_P2P.peers_lock);
-            if (_P2P.n_peers >= _P2P.max_peers) {
-                pthread_mutex_unlock(&_P2P.peers_lock); close(cfd); continue;
-            }
-            _P2PConn *slot = NULL;
-            for (int i = 0; i < P2P_MAX_PEERS; i++) {
-                if (!_P2P.peers[i].active) { slot = &_P2P.peers[i]; break; }
-            }
-            if (!slot) {
-                pthread_mutex_unlock(&_P2P.peers_lock); close(cfd); continue;
-            }
-            memset(slot, 0, sizeof(*slot));
-            slot->fd = cfd; slot->active = 1;
-            slot->port = ntohs(addr.sin_port);
-            slot->last_recv_ns = _clock_ns();
-            strncpy(slot->host, remote_host, 63);
+            if(_P2P.n_peers>=_P2P.max_peers){pthread_mutex_unlock(&_P2P.peers_lock);close(cfd);continue;}
+            _P2PConn *slot=NULL;
+            for(int i=0;i<P2P_MAX_PEERS;i++) if(!_P2P.peers[i].active){slot=&_P2P.peers[i];break;}
+            if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(cfd);continue;}
+            memset(slot,0,sizeof(*slot));
+            slot->fd=cfd;slot->active=1;slot->port=ntohs(addr.sin_port);
+            slot->last_recv_ns=_clock_ns();strncpy(slot->host,rh,63);
             _P2P.n_peers++;
             pthread_mutex_unlock(&_P2P.peers_lock);
-            pthread_attr_t a; pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
+            pthread_attr_t a;pthread_attr_init(&a);
+            pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+            pthread_create(&slot->thread,&a,_p2p_peer_thread,slot);
             pthread_attr_destroy(&a);
         }
     }
@@ -11900,27 +11563,32 @@ static void *_accept_thread(void *arg) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   PING / KEEPALIVE THREAD
+   ADAPTIVE PING THREAD — interval = clamp(3×RTT, 10s, 120s)
    ══════════════════════════════════════════════════════════════════════════ */
-
-static void *_ping_thread(void *arg) {
+static void *_ping_thread(void *arg){
     (void)arg;
-    while (_P2P.running) {
-        sleep(P2P_PING_INTERVAL_S);
+    while(_P2P.running){
+        sleep(P2P_PING_MIN_S);
         pthread_mutex_lock(&_P2P.peers_lock);
-        uint64_t now = _clock_ns();
-        for (int i = 0; i < P2P_MAX_PEERS; i++) {
-            if (!_P2P.peers[i].active) continue;
-            if (now - _P2P.peers[i].last_recv_ns > P2P_TIMEOUT_NS) {
-                close(_P2P.peers[i].fd); _P2P.peers[i].fd = -1;
-                if (_P2P.callback) _P2P.callback(2, &_P2P.peers[i], sizeof(_P2PConn));
-                memset(&_P2P.peers[i], 0, sizeof(_P2PConn));
-                _P2P.peers[i].fd = -1;
-                _P2P.n_peers = (_P2P.n_peers > 0) ? _P2P.n_peers - 1 : 0;
-                continue;
+        uint64_t now=_clock_ns();
+        for(int i=0;i<P2P_MAX_PEERS;i++){
+            if(!_P2P.peers[i].active)continue;
+            if(now-_P2P.peers[i].last_recv_ns>P2P_TIMEOUT_NS){
+                close(_P2P.peers[i].fd);_P2P.peers[i].fd=-1;
+                _bo_fail(_P2P.peers[i].host);
+                if(_P2P.callback)_P2P.callback(2,&_P2P.peers[i],sizeof(_P2PConn));
+                memset(&_P2P.peers[i],0,sizeof(_P2PConn));_P2P.peers[i].fd=-1;
+                _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;continue;
             }
-            uint64_t ts = now;
-            _net_send_v3(_P2P.peers[i].fd, "ping", &ts, 8, 0);
+            /* RTT-adaptive: only ping if interval elapsed */
+            float rtt=_P2P.peers[i].latency_ms;
+            float ivl=(rtt>0?rtt*3.0f/1000.0f:(float)P2P_PING_MIN_S);
+            if(ivl<P2P_PING_MIN_S)ivl=P2P_PING_MIN_S;
+            if(ivl>P2P_PING_MAX_S)ivl=P2P_PING_MAX_S;
+            uint64_t elapsed=(now-_P2P.peers[i].last_recv_ns)/1000000000ULL;
+            if((float)elapsed>=ivl){
+                uint64_t ts=now; _send(_P2P.peers[i].fd,"ping",&ts,8,0);
+            }
         }
         pthread_mutex_unlock(&_P2P.peers_lock);
     }
@@ -11930,285 +11598,212 @@ static void *_ping_thread(void *arg) {
 /* ══════════════════════════════════════════════════════════════════════════
    PUBLIC API
    ══════════════════════════════════════════════════════════════════════════ */
-
-int qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port, int max_peers) {
-    memset(&_P2P, 0, sizeof(_P2P));
-    pthread_mutex_init(&_P2P.peers_lock,   NULL);
-    pthread_mutex_init(&_P2P.sse_lock,     NULL);
-    pthread_mutex_init(&_P2P.consensus_lock, NULL);
-    pthread_mutex_init(&_P2P.self_lock,    NULL);
-    _P2P.listen_port = (listen_port > 0) ? listen_port : P2P_LISTEN_PORT;
-    _P2P.max_peers   = (max_peers > P2P_MAX_PEERS) ? P2P_MAX_PEERS : max_peers;
-    _P2P.wring_head  = 0; _P2P.wring_tail  = 0;
-    _P2P.dmpool_head = 0; _P2P.dmpool_tail = 0;
-    for (int i = 0; i < P2P_MAX_PEERS; i++) _P2P.peers[i].fd = -1;
-    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
-        _P2P.sse_subs[i].fd = -1; _P2P.sse_subs[i].active = 0;
-    }
-
-    /* Node ID */
-    size_t hlen = strlen(node_id_hex);
-    if (hlen >= 32) _hex_to_bytes(node_id_hex, _P2P.node_id, 16);
-    else {
-        uint8_t tmp[32] = {0};
-        qtcl_sha3_256((const uint8_t*)node_id_hex, hlen, tmp);
-        memcpy(_P2P.node_id, tmp, 16);
-    }
-
-    /* HMAC secret v3 */
-    uint8_t secret_src[49];
-    memcpy(secret_src, "QTCL_P2P_HMAC_v3:", 17);
-    memcpy(secret_src+17, _P2P.node_id, 16);
-    secret_src[33] = P2P_VERSION;
-    qtcl_sha3_256(secret_src, 34, _P2P.hmac_secret);
-
-    /* Bind listen socket with SO_REUSEPORT so multiple workers can share */
-    if (_P2P.listen_port > 0) {
-        _P2P.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (_P2P.listen_fd < 0) return -1;
-        int opt = 1;
-        setsockopt(_P2P.listen_fd, SOL_SOCKET, SO_REUSEADDR,  &opt, sizeof(opt));
+int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
+    memset(&_P2P,0,sizeof(_P2P));
+    pthread_mutex_init(&_P2P.peers_lock,NULL);
+    pthread_mutex_init(&_P2P.sse_lock,NULL);
+    pthread_mutex_init(&_P2P.consensus_lock,NULL);
+    pthread_mutex_init(&_P2P.self_lock,NULL);
+    pthread_mutex_init(&_P2P.bloom_lock,NULL);
+    pthread_mutex_init(&_P2P.seen_lock,NULL);
+    pthread_mutex_init(&_P2P.inv_lock,NULL);
+    _bloom_reset(&_P2P.bloom);
+    _P2P.listen_port=listen_port?listen_port:P2P_LISTEN_PORT;
+    _P2P.max_peers=(max_peers>P2P_MAX_PEERS)?P2P_MAX_PEERS:max_peers;
+    for(int i=0;i<P2P_MAX_PEERS;i++)_P2P.peers[i].fd=-1;
+    for(int i=0;i<P2P_MAX_SSE;i++){_P2P.sse_subs[i].fd=-1;_P2P.sse_subs[i].active=0;}
+    size_t hl=strlen(node_id_hex);
+    if(hl>=32)_hex_to_bytes(node_id_hex,_P2P.node_id,16);
+    else{uint8_t t[32]={0};qtcl_sha3_256((const uint8_t*)node_id_hex,hl,t);memcpy(_P2P.node_id,t,16);}
+    uint8_t ss[34]; memcpy(ss,"QTCL_P2P_HMAC_v4:",17); memcpy(ss+17,_P2P.node_id,16); ss[33]=P2P_VERSION;
+    qtcl_sha3_256(ss,34,_P2P.hmac_secret);
+    if(_P2P.listen_port){
+        _P2P.listen_fd=socket(AF_INET,SOCK_STREAM,0);
+        if(_P2P.listen_fd<0)return -1;
+        int opt=1;
+        setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
 #ifdef SO_REUSEPORT
-        setsockopt(_P2P.listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+        setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEPORT,&opt,sizeof(opt));
 #endif
-        struct sockaddr_in sin = {0};
-        sin.sin_family = AF_INET;
-        sin.sin_port   = htons(_P2P.listen_port);
-        sin.sin_addr.s_addr = INADDR_ANY;
-        if (bind(_P2P.listen_fd, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
-            close(_P2P.listen_fd); return -1;
-        }
-        listen(_P2P.listen_fd, 128);
+        struct sockaddr_in sin={0};
+        sin.sin_family=AF_INET;sin.sin_port=htons(_P2P.listen_port);sin.sin_addr.s_addr=INADDR_ANY;
+        if(bind(_P2P.listen_fd,(struct sockaddr*)&sin,sizeof(sin))<0){close(_P2P.listen_fd);return -1;}
+        listen(_P2P.listen_fd,128);
     }
-    _P2P.running = 1;
-
-    /* Spawn threads */
-    pthread_attr_t a; pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    if (_P2P.listen_port > 0)
-        pthread_create(&_P2P.accept_thread,    &a, _accept_thread,    NULL);
-    pthread_create(&_P2P.ping_thread,       &a, _ping_thread,       NULL);
-    pthread_create(&_P2P.ouroboros_thread,  &a, _ouroboros_thread,  NULL);
+    _P2P.running=1;
+    pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+    if(_P2P.listen_port)pthread_create(&_P2P.accept_thread,&a,_accept_thread,NULL);
+    pthread_create(&_P2P.ping_thread,&a,_ping_thread,NULL);
+    pthread_create(&_P2P.ouroboros_thread,&a,_ouroboros_thread,NULL);
     pthread_attr_destroy(&a);
     return 0;
 }
 
-int qtcl_p2p_connect(const char *host, uint16_t port) {
-    if (!host || !host[0]) return -1;
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    char ps[8]; snprintf(ps, sizeof(ps), "%u", port ? port : P2P_LISTEN_PORT);
-    if (getaddrinfo(host, ps, &hints, &res) || !res) return -1;
-
-    int fd = socket(res->ai_family, SOCK_STREAM, 0);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-    int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &flag, sizeof(flag));
-    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &flag, sizeof(flag));
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    connect(fd, res->ai_addr, res->ai_addrlen);
+int qtcl_p2p_connect(const char *host,uint16_t port){
+    if(!host||!host[0])return -1;
+    /* Feature 9: backoff gate */
+    if(!_bo_ok(host))return -2;
+    struct addrinfo hints={0},*res=NULL;
+    hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;
+    char ps[8];snprintf(ps,sizeof(ps),"%u",port?port:P2P_LISTEN_PORT);
+    if(getaddrinfo(host,ps,&hints,&res)||!res)return -1;
+    int fd=socket(res->ai_family,SOCK_STREAM,0);
+    if(fd<0){freeaddrinfo(res);return -1;}
+    int fl=1;
+    setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&fl,sizeof(fl));
+    setsockopt(fd,SOL_SOCKET,SO_KEEPALIVE,&fl,sizeof(fl));
+    fcntl(fd,F_SETFL,O_NONBLOCK);
+    connect(fd,res->ai_addr,res->ai_addrlen);
     freeaddrinfo(res);
-
-    struct timeval tv = {5, 0};
-    fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
-    if (select(fd+1, NULL, &wfds, NULL, &tv) <= 0) { close(fd); return -1; }
-    int err = 0; socklen_t el = sizeof(err);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err) { close(fd); return -1; }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-
+    struct timeval tv={5,0}; fd_set wf;FD_ZERO(&wf);FD_SET(fd,&wf);
+    if(select(fd+1,NULL,&wf,NULL,&tv)<=0){close(fd);_bo_fail(host);return -1;}
+    int err=0;socklen_t el=sizeof(err);
+    getsockopt(fd,SOL_SOCKET,SO_ERROR,&err,&el);
+    if(err){close(fd);_bo_fail(host);return -1;}
+    fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)&~O_NONBLOCK);
+    _bo_ok_clear(host);
     pthread_mutex_lock(&_P2P.peers_lock);
-    if (_P2P.n_peers >= _P2P.max_peers) {
-        pthread_mutex_unlock(&_P2P.peers_lock); close(fd); return -1;
-    }
-    _P2PConn *slot = NULL;
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (!_P2P.peers[i].active) { slot = &_P2P.peers[i]; break; }
-    }
-    if (!slot) {
-        pthread_mutex_unlock(&_P2P.peers_lock); close(fd); return -1;
-    }
-    memset(slot, 0, sizeof(*slot)); slot->fd = fd;
-    slot->port = (uint16_t)(port ? port : P2P_LISTEN_PORT);
-    slot->active = 1; slot->last_recv_ns = _clock_ns();
-    strncpy(slot->host, host, 63);
+    if(_P2P.n_peers>=_P2P.max_peers){pthread_mutex_unlock(&_P2P.peers_lock);close(fd);return -1;}
+    _P2PConn *slot=NULL;
+    for(int i=0;i<P2P_MAX_PEERS;i++) if(!_P2P.peers[i].active){slot=&_P2P.peers[i];break;}
+    if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(fd);return -1;}
+    memset(slot,0,sizeof(*slot));slot->fd=fd;
+    slot->port=(uint16_t)(port?port:P2P_LISTEN_PORT);
+    slot->active=1;slot->last_recv_ns=_clock_ns();strncpy(slot->host,host,63);
     _P2P.n_peers++;
     pthread_mutex_unlock(&_P2P.peers_lock);
-
-    pthread_attr_t a; pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_create(&slot->thread, &a, _p2p_peer_thread, slot);
+    pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+    pthread_create(&slot->thread,&a,_p2p_peer_thread,slot);
     pthread_attr_destroy(&a);
-    return (int)(slot - _P2P.peers);
+    return (int)(slot-_P2P.peers);
 }
 
-void qtcl_p2p_disconnect(int conn_handle) {
-    if (conn_handle < 0 || conn_handle >= P2P_MAX_PEERS) return;
+void qtcl_p2p_disconnect(int h){
+    if(h<0||h>=P2P_MAX_PEERS)return;
     pthread_mutex_lock(&_P2P.peers_lock);
-    _P2PConn *slot = &_P2P.peers[conn_handle];
-    if (slot->active) {
-        slot->active = 0;
-        if (slot->fd >= 0) { shutdown(slot->fd, SHUT_RDWR); close(slot->fd); slot->fd = -1; }
-        if (_P2P.n_peers > 0) _P2P.n_peers--;
-    }
+    _P2PConn *s=&_P2P.peers[h];
+    if(s->active){s->active=0;if(s->fd>=0){shutdown(s->fd,SHUT_RDWR);close(s->fd);s->fd=-1;}if(_P2P.n_peers>0)_P2P.n_peers--;}
     pthread_mutex_unlock(&_P2P.peers_lock);
 }
 
-void qtcl_p2p_shutdown(void) {
-    _P2P.running = 0;
-    if (_P2P.listen_fd >= 0) { close(_P2P.listen_fd); _P2P.listen_fd = -1; }
+void qtcl_p2p_shutdown(void){
+    _P2P.running=0;
+    if(_P2P.listen_fd>=0){close(_P2P.listen_fd);_P2P.listen_fd=-1;}
     pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].fd >= 0)
-            shutdown(_P2P.peers[i].fd, SHUT_RDWR);
-    }
+    for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].fd>=0) shutdown(_P2P.peers[i].fd,SHUT_RDWR);
     pthread_mutex_unlock(&_P2P.peers_lock);
     pthread_mutex_lock(&_P2P.sse_lock);
-    for (int i = 0; i < P2P_MAX_PEERS_SSE; i++) {
-        if (_P2P.sse_subs[i].active && _P2P.sse_subs[i].fd >= 0) {
-            _P2P.sse_subs[i].active = 0;
-            close(_P2P.sse_subs[i].fd);
-        }
-    }
+    for(int i=0;i<P2P_MAX_SSE;i++) if(_P2P.sse_subs[i].active&&_P2P.sse_subs[i].fd>=0){_P2P.sse_subs[i].active=0;close(_P2P.sse_subs[i].fd);}
     pthread_mutex_unlock(&_P2P.sse_lock);
 }
 
-int qtcl_p2p_send_wstate(const QtclWStateMeasurement *m) {
-    if (!m || !_P2P.running) return 0;
-    QtclWStateMeasurement signed_m = *m;
-    signed_m.timestamp_ns = (uint64_t)_clock_ns();
-    qtcl_measurement_sign(&signed_m, _P2P.hmac_secret);
-
-    /* Store for ouroboros self-ingestion */
-    pthread_mutex_lock(&_P2P.self_lock);
-    _P2P.self_meas       = signed_m;
-    _P2P.self_meas_ready = 1;
-    pthread_mutex_unlock(&_P2P.self_lock);
-
-    int sent = 0;
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done &&
-            !_P2P.peers[i].is_sse_subscriber) {
-            if (_net_send_v3(_P2P.peers[i].fd, "wstate",
-                              &signed_m, sizeof(signed_m), 0) == 0) sent++;
-        }
+int qtcl_p2p_send_wstate(const QtclWStateMeasurement *m){
+    if(!m||!_P2P.running)return 0;
+    QtclWStateMeasurement sm=*m; sm.timestamp_ns=(uint64_t)_clock_ns();
+    qtcl_measurement_sign(&sm,_P2P.hmac_secret);
+    pthread_mutex_lock(&_P2P.self_lock); _P2P.self_meas=sm; _P2P.self_meas_ready=1; pthread_mutex_unlock(&_P2P.self_lock);
+    /* Add to Bloom + seen so we don't relay our own broadcast back */
+    uint64_t fp=_wfp(&sm);
+    pthread_mutex_lock(&_P2P.bloom_lock);_bloom_add(&_P2P.bloom,(uint8_t*)&fp);pthread_mutex_unlock(&_P2P.bloom_lock);
+    pthread_mutex_lock(&_P2P.seen_lock);_seen_add(&_P2P.seen,fp);pthread_mutex_unlock(&_P2P.seen_lock);
+    int sent=0;
+    /* Feature 2: fanout broadcast via INV */
+    int fi[P2P_FANOUT_MAX]; pthread_mutex_lock(&_P2P.peers_lock);
+    int nf=_fanout(fi,P2P_FANOUT_MAX);
+    uint8_t inv[9];inv[0]=INV_WSTATE;memcpy(inv+1,&fp,8);
+    for(int i=0;i<nf;i++){
+        if(!(_P2P.peers[fi[i]].topics&TOPIC_WSTATE)&&!(_P2P.peers[fi[i]].topics&TOPIC_ALL))continue;
+        if(_send(_P2P.peers[fi[i]].fd,"inv",inv,9,0)==0)sent++;
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
+    /* Cache locally for GETDATA responses */
+    pthread_mutex_lock(&_P2P.inv_lock);
+    uint32_t sl=_P2P.inv_head&63;_P2P.inv_cache[sl]=sm;_P2P.inv_fps[sl]=fp;_P2P.inv_head++;
+    pthread_mutex_unlock(&_P2P.inv_lock);
     return sent;
 }
 
-int qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs) {
-    int count = 0;
-    while (count < max_msgs) {
-        uint64_t tail = _P2P.wring_tail;
-        atomic_thread_fence(memory_order_acquire);
-        if (tail == _P2P.wring_head) break;
-        buf[count] = _P2P.wring[tail];
-        _P2P.wring_tail = (tail + 1) & P2P_WRING_MASK;
-        count++;
+int qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf,int max){
+    int n=0;
+    while(n<max){
+        uint64_t t=_P2P.wring_tail;atomic_thread_fence(memory_order_acquire);
+        if(t==_P2P.wring_head)break;
+        buf[n]=_P2P.wring[t];_P2P.wring_tail=(t+1)&P2P_WRING_MASK;n++;
     }
-    return count;
+    return n;
 }
 
-/* New: poll DM pool entries (Python side averages or uses consensus_dm)    */
-int qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf, int max_entries) {
-    int count = 0;
-    while (count < max_entries) {
-        uint64_t tail = _P2P.dmpool_tail;
-        atomic_thread_fence(memory_order_acquire);
-        if (tail == _P2P.dmpool_head) break;
-        buf[count] = _P2P.dmpool[tail];
-        _P2P.dmpool_tail = (tail + 1) & P2P_DMPOOL_MSK;
-        count++;
+int qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf,int max){
+    int n=0;
+    while(n<max){
+        uint64_t t=_P2P.dmpool_tail;atomic_thread_fence(memory_order_acquire);
+        if(t==_P2P.dmpool_head)break;
+        buf[n]=_P2P.dmpool[t&P2P_DMPOOL_MSK];_P2P.dmpool_tail=(t+1)&P2P_DMPOOL_MSK;n++;
     }
-    return count;
+    return n;
 }
 
-/* Read latest consensus DM (thread-safe snapshot)                          */
-int qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
-                                float *out_fidelity, uint32_t *out_height) {
+int qtcl_p2p_get_consensus_dm(double *re,double *im,float *fid,uint32_t *h){
     pthread_mutex_lock(&_P2P.consensus_lock);
-    if (_P2P.consensus_fidelity <= 0.0f) {
-        pthread_mutex_unlock(&_P2P.consensus_lock); return 0;
-    }
-    if (out_re)       memcpy(out_re,  _P2P.consensus_dm_re, 64*sizeof(double));
-    if (out_im)       memcpy(out_im,  _P2P.consensus_dm_im, 64*sizeof(double));
-    if (out_fidelity) *out_fidelity = _P2P.consensus_fidelity;
-    if (out_height)   *out_height   = _P2P.consensus_height;
+    if(_P2P.consensus_fidelity<=0.0f){pthread_mutex_unlock(&_P2P.consensus_lock);return 0;}
+    if(re)memcpy(re,_P2P.consensus_dm_re,64*sizeof(double));
+    if(im)memcpy(im,_P2P.consensus_dm_im,64*sizeof(double));
+    if(fid)*fid=_P2P.consensus_fidelity;
+    if(h)*h=_P2P.consensus_height;
     pthread_mutex_unlock(&_P2P.consensus_lock);
     return 1;
 }
 
-/* Trigger immediate ouroboros ingest + consensus recompute                 */
-void qtcl_p2p_trigger_consensus(void) {
-    _dmpool_compute_consensus();
-}
+void qtcl_p2p_trigger_consensus(void){_consensus();}
 
-/* Broadcast a chain-reset event to all peers + SSE subscribers             */
-void qtcl_p2p_broadcast_chain_reset(uint32_t new_height,
-                                      const char *genesis_hash32_hex) {
-    char payload[128] = {0};
-    snprintf(payload, sizeof(payload),
-             "{\"event\":\"chain_reset\",\"new_height\":%u,\"genesis\":\"%s\"}",
-             (unsigned)new_height, genesis_hash32_hex ? genesis_hash32_hex : "");
-    uint32_t plen = (uint32_t)strlen(payload);
-
+void qtcl_p2p_broadcast_chain_reset(uint32_t new_h,const char *genesis_hex){
+    char p[128]={0};
+    snprintf(p,sizeof(p),"{\"event\":\"chain_reset\",\"new_height\":%u,\"genesis\":\"%s\"}",
+             (unsigned)new_h,genesis_hex?genesis_hex:"");
+    uint32_t pl=(uint32_t)strlen(p);
     pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
-            _net_send_v3(_P2P.peers[i].fd, "chain_rst", payload, plen, 0);
-    }
+    for(int i=0;i<P2P_MAX_PEERS;i++)
+        if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)
+            _send(_P2P.peers[i].fd,"chain_rst",p,pl,0);
     pthread_mutex_unlock(&_P2P.peers_lock);
-    _sse_broadcast_all("chain_reset", 4, payload, (int)plen);
+    _sse_bcast("chain_reset",TOPIC_CHAIN,p,(int)pl);
 }
 
-void qtcl_p2p_send_inv(uint8_t inv_type, const uint8_t *hash32) {
-    uint8_t payload[33]; payload[0] = inv_type;
-    memcpy(payload+1, hash32, 32);
+void qtcl_p2p_send_inv(uint8_t t,const uint8_t *h32){
+    uint8_t p[33];p[0]=t;memcpy(p+1,h32,32);
     pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS; i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done)
-            _net_send_v3(_P2P.peers[i].fd, "inv", payload, 33, 0);
-    }
+    for(int i=0;i<P2P_MAX_PEERS;i++)
+        if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)
+            _send(_P2P.peers[i].fd,"inv",p,33,0);
     pthread_mutex_unlock(&_P2P.peers_lock);
 }
 
-int qtcl_p2p_peers(QtclPeer *buf, int max_peers) {
-    int n = 0;
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i = 0; i < P2P_MAX_PEERS && n < max_peers; i++) {
-        if (!_P2P.peers[i].active) continue;
-        memset(&buf[n], 0, sizeof(QtclPeer));
-        memcpy(buf[n].node_id,  _P2P.peers[i].node_id,  16);
-        strncpy(buf[n].host,    _P2P.peers[i].host,      63);
-        buf[n].port          = _P2P.peers[i].port;
-        buf[n].connected     = (uint8_t)_P2P.peers[i].active;
-        buf[n].chain_height  = _P2P.peers[i].chain_height;
-        buf[n].last_fidelity = _P2P.peers[i].last_fidelity;
-        buf[n].latency_ms    = _P2P.peers[i].latency_ms;
-        buf[n].ban_score     = _P2P.peers[i].ban_score;
-        buf[n].last_seen_ns  = (int64_t)_P2P.peers[i].last_recv_ns;
+int qtcl_p2p_peers(QtclPeer *buf,int max){
+    int n=0; pthread_mutex_lock(&_P2P.peers_lock);
+    for(int i=0;i<P2P_MAX_PEERS&&n<max;i++){
+        if(!_P2P.peers[i].active)continue;
+        memset(&buf[n],0,sizeof(QtclPeer));
+        memcpy(buf[n].node_id,_P2P.peers[i].node_id,16);
+        strncpy(buf[n].host,_P2P.peers[i].host,63);
+        buf[n].port=_P2P.peers[i].port; buf[n].connected=(uint8_t)_P2P.peers[i].active;
+        buf[n].chain_height=_P2P.peers[i].chain_height;
+        buf[n].last_fidelity=_P2P.peers[i].last_fidelity;
+        buf[n].latency_ms=_P2P.peers[i].latency_ms;
+        buf[n].ban_score=_P2P.peers[i].ban_score;
+        buf[n].last_seen_ns=(int64_t)_P2P.peers[i].last_recv_ns;
         n++;
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
     return n;
 }
 
-int  qtcl_p2p_peer_count(void)      { return _P2P.n_peers; }
-int  qtcl_p2p_connected_count(void) {
-    int n = 0;
-    for (int i = 0; i < P2P_MAX_PEERS; i++)
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done) n++;
-    return n;
-}
-int  qtcl_p2p_sse_sub_count(void)   { return _P2P.n_sse_subs; }
-void qtcl_p2p_set_callback(void (*cb)(int, const void*, size_t)) { _P2P.callback = cb; }
-
-int qtcl_wstate_measurement_size(void) { return (int)sizeof(QtclWStateMeasurement); }
-int qtcl_wstate_consensus_size(void)   { return (int)sizeof(QtclWStateConsensus);   }
-int qtcl_dm_pool_entry_size(void)      { return (int)sizeof(QtclDMPoolEntry);       }
+int  qtcl_p2p_peer_count(void){return _P2P.n_peers;}
+int  qtcl_p2p_connected_count(void){int n=0;for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)n++;return n;}
+int  qtcl_p2p_sse_sub_count(void){return _P2P.n_sse_subs;}
+void qtcl_p2p_set_callback(void(*cb)(int,const void*,size_t)){_P2P.callback=cb;}
+int  qtcl_wstate_measurement_size(void){return(int)sizeof(QtclWStateMeasurement);}
+int  qtcl_wstate_consensus_size(void){return(int)sizeof(QtclWStateConsensus);}
+int  qtcl_dm_pool_entry_size(void){return(int)sizeof(QtclDMPoolEntry);}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §HypEnt  HYPERBOLIC ENTROPY MULTIPLIER + XOR POOL COMBINER
@@ -12935,7 +12530,8 @@ _QTCL_C_DEFS: str = """
         uint8_t  flags;
     } QtclDMPoolEntry;
 
-    /* §P2P — Ouroboros Custom Protocol v3 */
+    /* §P2P — Ouroboros Custom Protocol v4: epidemic gossip, Bloom dedup,
+       fanout, reputation, temporal DM, backoff, topics, INV/GETDATA */
     int     qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port,
                            int max_peers);
     int     qtcl_p2p_connect(const char *host, uint16_t port);
@@ -16310,14 +15906,16 @@ class QtclClientApp:
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
                 difficulty_bits = max(1, min(difficulty_bits, 20))
                 
-                # FIX: Use max(oracle_height, _last_mined_height) to prevent duplicate mining
-                with _mining_lock:
-                    if _last_mined_height > oracle_height:
-                        target_height = _last_mined_height + 1
-                        parent_hash = _last_mined_hash
-                    else:
-                        target_height = oracle_height + 1
-                        parent_hash = oracle_hash
+                # AUTHORITATIVE: server tip is ground truth — always.
+                # The old _last_mined_height > oracle_height guard was the
+                # chain-skip creator: if oracle returned stale h=N-1 after
+                # we accepted h=N, _last_mined_height was N, so target became
+                # N+1 — skipping a height the server hadn't confirmed yet.
+                # Fix: delete that guard entirely. target = oracle_tip + 1.
+                # The post-accept 1.5s sleep + fresh tip sync ensures oracle_height
+                # is current before we start the next nonce search.
+                target_height = oracle_height + 1
+                parent_hash   = oracle_hash
                 
                 timestamp = int(_t.time())
                 nonce = 0
@@ -16852,19 +16450,14 @@ class QtclClientApp:
                     # ✅ FIXED: Properly extract and record reward
                     if r is None:
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
-                        with _mining_lock:
-                            _last_mined_height = oracle_height   # rollback: treat as rejected
-                            _last_mined_hash = oracle_hash
+                        # No response — outer loop will re-fetch tip next iteration
                         _MINE_TELEM.mark_idle()
                     elif r.get("error"):
-                        # Submission rejected — rollback height to oracle tip so next loop re-syncs
                         error = r.get("error", "unknown error")
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
                         if r.get("details"):
                             _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
-                        with _mining_lock:
-                            _last_mined_height = oracle_height   # rollback: next iter fetches fresh tip
-                            _last_mined_hash = oracle_hash
+                        # Outer loop re-fetches tip — no manual height manipulation needed
                         _MINE_TELEM.mark_idle()
                     elif r.get("status") == "accepted" or r.get("success"):
                         # Submission accepted — commit height IMMEDIATELY
@@ -16885,42 +16478,17 @@ class QtclClientApp:
                             f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height} | "
                             f"+{reward_qtcl:.2f} QTCL | total={_MINE_TELEM.total_earned_qtcl:.2f}")
 
-                        # ── Post-acceptance sync: wait for block to propagate ──
-                        # Without this sleep, the next tip poll may hit a stale
-                        # gunicorn worker that hasn't seen the new block yet,
-                        # returning h=target_height-1 and causing the client to
-                        # mine the same height again → "Invalid height: N, expected N+1"
+                        # Wait for block to propagate to all gunicorn workers
+                        # before fetching tip — prevents mining same height twice.
+                        # No _last_mined_height manipulation needed: the outer loop
+                        # calls get_chain_tip() fresh at the top of every iteration
+                        # and target = server_tip + 1 is always authoritative.
                         await _asyncio.sleep(1.5)
-                        # Force a fresh tip poll to confirm our block landed
-                        try:
-                            _fresh_tip = kapi.get_chain_tip() or {}
-                            _fresh_h   = int(_fresh_tip.get("block_height") or
-                                             _fresh_tip.get("height") or target_height)
-                            with _mining_lock:
-                                if _fresh_h >= target_height:
-                                    # Server confirmed our block — advance state
-                                    _last_mined_height = _fresh_h
-                                    _last_mined_hash   = str(
-                                        _fresh_tip.get("block_hash") or
-                                        _fresh_tip.get("hash") or block_hash)
-                                    _EXP_LOG.info(
-                                        f"[MINER-SIMPLE] 🔗 Chain confirmed h={_fresh_h} "
-                                        f"→ mining h={_fresh_h + 1}")
-                        except Exception as _sync_e:
-                            _EXP_LOG.debug(f"[MINER-SIMPLE] post-accept sync: {_sync_e}")
                     elif r.get("block_hash"):
-                        # Ambiguous response - probably accepted; commit height
-                        with _mining_lock:
-                            _last_mined_height = target_height
-                            _last_mined_hash = block_hash
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
                         _MINE_TELEM.mark_idle()
                     else:
-                        # Unknown response — rollback to be safe
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  Unexpected response: {r}")
-                        with _mining_lock:
-                            _last_mined_height = oracle_height
-                            _last_mined_hash = oracle_hash
                         _MINE_TELEM.mark_idle()
                 except Exception as _e:
                     _EXP_LOG.debug(f"[MINER-SIMPLE] Submit error: {_e}", exc_info=True)
