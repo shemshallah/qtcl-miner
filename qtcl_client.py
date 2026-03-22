@@ -12741,31 +12741,30 @@ double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §KoyebReg  KOYEB HTTPS PEER REGISTRATION + AUTO P2P WIRING
-   Runs a background pthread that:
-     1. POSTs to https://KOYEB_HOST:443/api/peers/register  (TLS, OpenSSL)
-     2. Parses returned live_peers JSON array
-     3. Calls qtcl_p2p_connect() on each returned IP sequentially
-     4. Repeats every 120s (re-register + refresh peer list)
-   Also provides qtcl_koyeb_post() for fire-and-forget event publishing.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 #define KOYEB_HOST_MAX  128
-#define KOYEB_PEER_MAX  64
 #define KOYEB_BUF_MAX   32768
 
 typedef struct {
-    char   koyeb_host[KOYEB_HOST_MAX]; /* e.g. qtcl-blockchain.koyeb.app     */
-    char   peer_id[65];                /* hex node id                         */
-    char   miner_addr[128];            /* QTCL wallet address                 */
-    uint16_t p2p_port;                 /* local P2P listen port (9091)        */
+    char   koyeb_host[KOYEB_HOST_MAX];
+    char   peer_id[65];
+    char   miner_addr[128];
+    uint16_t p2p_port;
     volatile int running;
     pthread_t thread;
 } _KoyebCtx;
 
 static _KoyebCtx _KOYEB = {0};
+static pthread_t _koyeb_hb_tid;
 
-/* Minimal TLS write-all helper (reuses _ssl_write_all from §SSE) */
-static int _koyeb_ssl_write(SSL *ssl, const char *buf, int len) {
+/* forward decl so helpers can reference qtcl_p2p_connect defined earlier */
+int qtcl_p2p_connect(const char *host, uint16_t port);
+int qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
+                               float *out_fidelity, uint32_t *out_height);
+
+/* TLS write-all — not static so cffi placement is safe */
+int _koyeb_ssl_write(SSL *ssl, const char *buf, int len) {
     int sent = 0;
     while (sent < len) {
         int n = SSL_write(ssl, buf+sent, len-sent);
@@ -12775,47 +12774,39 @@ static int _koyeb_ssl_write(SSL *ssl, const char *buf, int len) {
     return sent;
 }
 
-/* POST JSON to koyeb over TLS/443. Reads response into buf (null-terminated).
-   Returns response body length, or -1 on error. */
-static int _koyeb_post_tls(const char *host, const char *path,
-                            const char *json_body,
-                            char *resp_buf, int resp_max) {
+/* POST json to host:443 over TLS. Returns body length or -1. */
+int _koyeb_post_tls(const char *host, const char *path,
+                    const char *json_body,
+                    char *resp_buf, int resp_max) {
     struct addrinfo hints={0},*res=NULL;
     hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
     if (getaddrinfo(host,"443",&hints,&res)||!res) return -1;
-    int fd = socket(res->ai_family,SOCK_STREAM,0);
+    int fd=socket(res->ai_family,SOCK_STREAM,0);
     if (fd<0){freeaddrinfo(res);return -1;}
     struct timeval tv={10,0};
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
     if (connect(fd,res->ai_addr,res->ai_addrlen)){freeaddrinfo(res);close(fd);return -1;}
     freeaddrinfo(res);
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());
     SSL_CTX_set_verify(ctx,SSL_VERIFY_NONE,NULL);
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl,fd);
+    SSL *ssl=SSL_new(ctx); SSL_set_fd(ssl,fd);
     SSL_set_tlsext_host_name(ssl,host);
     if (SSL_connect(ssl)<=0){SSL_free(ssl);SSL_CTX_free(ctx);close(fd);return -1;}
-    /* Build HTTP POST request */
-    int blen = (int)strlen(json_body);
+    int blen=(int)strlen(json_body);
     char req[1024];
-    int rlen = snprintf(req,sizeof(req),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "User-Agent: QTCL-C/4.0\r\n"
-        "Connection: close\r\n\r\n",
-        path, host, blen);
-    if (_koyeb_ssl_write(ssl,req,rlen)<0||_koyeb_ssl_write(ssl,json_body,blen)<0) {
+    int rlen=snprintf(req,sizeof(req),
+        "POST %s HTTP/1.1\r\nHost: %s\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\n"
+        "User-Agent: QTCL-C/4.0\r\nConnection: close\r\n\r\n",
+        path,host,blen);
+    if (_koyeb_ssl_write(ssl,req,rlen)<0||_koyeb_ssl_write(ssl,json_body,blen)<0){
         SSL_free(ssl);SSL_CTX_free(ctx);close(fd);return -1;
     }
-    /* Read full response */
     int total=0; char tmp[4096];
-    while (total<resp_max-1) {
-        int n=SSL_read(ssl,tmp,sizeof(tmp));
-        if (n<=0) break;
-        int copy=n; if(total+copy>=resp_max-1) copy=resp_max-1-total;
+    while (total<resp_max-1){
+        int n=SSL_read(ssl,tmp,sizeof(tmp)); if(n<=0)break;
+        int copy=n; if(total+copy>=resp_max-1)copy=resp_max-1-total;
         memcpy(resp_buf+total,tmp,copy); total+=copy;
     }
     resp_buf[total]='\0';
@@ -12823,106 +12814,91 @@ static int _koyeb_post_tls(const char *host, const char *path,
     return total;
 }
 
-/* Extract string value for a key from flat JSON (no nesting needed for peers array) */
-static int _json_str(const char *json, const char *key, char *out, int out_max) {
+/* Extract a JSON string value for key into out. Returns length or 0. */
+int _json_str_val(const char *json, const char *key, char *out, int out_max) {
     char needle[128]; snprintf(needle,sizeof(needle),"\"%s\":",key);
     const char *p=strstr(json,needle);
     if (!p) return 0;
     p+=strlen(needle);
     while(*p==' ')p++;
-    if (*p=='"'){p++;const char*e=strchr(p,'"');if(!e)return 0;int l=(int)(e-p);if(l>=out_max)l=out_max-1;memcpy(out,p,l);out[l]='\0';return l;}
-    return 0;
+    if (*p=='"'){
+        p++;
+        const char *e=strchr(p,'"'); if(!e) return 0;
+        int l=(int)(e-p); if(l>=out_max)l=out_max-1;
+        memcpy(out,p,l); out[l]='\0'; return l;
+    }
+    /* numeric value */
+    const char *e=p; while(*e&&*e!=','&&*e!='}'&&*e!=']')e++;
+    int l=(int)(e-p); if(l>=out_max)l=out_max-1;
+    memcpy(out,p,l); out[l]='\0'; return l;
 }
 
-/* Parse live_peers array: extract host/ip_address + port, connect sequentially */
-static int _parse_and_connect_peers(const char *json) {
-    const char *arr = strstr(json,"\"live_peers\"");
-    if (!arr) arr = strstr(json,"\"peers\"");
+/* Walk live_peers/peers array, qtcl_p2p_connect each entry. */
+int _parse_and_connect_peers(const char *json) {
+    const char *arr=strstr(json,"\"live_peers\"");
+    if (!arr) arr=strstr(json,"\"peers\"");
     if (!arr) return 0;
-    arr = strchr(arr,'[');
-    if (!arr) return 0;
+    arr=strchr(arr,'['); if(!arr) return 0;
     int connected=0;
     const char *p=arr+1;
-    while (*p && *p!=']') {
-        /* Find next { object } */
+    while (*p&&*p!=']') {
         const char *ob=strchr(p,'{'); if(!ob||*ob==']') break;
         const char *cb=strchr(ob,'}'); if(!cb) break;
-        /* Extract this peer object */
         int olen=(int)(cb-ob+1);
         char obj[512]; if(olen>=512)olen=511;
-        memcpy(obj,ob,olen);obj[olen]='\0';
-        char host[64]={0}; int port=9091;
-        /* Try ip_address first, then host */
-        if (!_json_str(obj,"ip_address",host,sizeof(host)))
-            _json_str(obj,"host",host,sizeof(host));
-        char port_s[16]={0};
-        if (_json_str(obj,"port",port_s,sizeof(port_s)))
+        memcpy(obj,ob,olen); obj[olen]='\0';
+        char host[64]={0}; char port_s[16]={0}; int port=9091;
+        if (!_json_str_val(obj,"ip_address",host,sizeof(host)))
+            _json_str_val(obj,"host",host,sizeof(host));
+        if (_json_str_val(obj,"port",port_s,sizeof(port_s)))
             port=(int)strtol(port_s,NULL,10);
         if (port<=0||port>65535) port=9091;
-        if (host[0] &&
-            strcmp(host,"127.0.0.1")!=0 &&
-            strcmp(host,"localhost")!=0) {
-            int rc=qtcl_p2p_connect(host,(uint16_t)port);
-            if (rc>=0) connected++;
+        if (host[0]&&strcmp(host,"127.0.0.1")!=0&&strcmp(host,"localhost")!=0) {
+            if (qtcl_p2p_connect(host,(uint16_t)port)>=0) connected++;
         }
         p=cb+1;
     }
     return connected;
 }
 
-/* Background thread: register with koyeb every 120s, wire returned peers */
-static void *_koyeb_reg_thread(void *arg) {
+void *_koyeb_reg_thread(void *arg) {
     _KoyebCtx *k=(_KoyebCtx*)arg;
     static int ssl_done=0;
-    if (!ssl_done){OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS|OPENSSL_INIT_LOAD_CRYPTO_STRINGS,NULL);ssl_done=1;}
-    char resp[KOYEB_BUF_MAX];
-    char body[1024];
+    if (!ssl_done){
+        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS|
+                         OPENSSL_INIT_LOAD_CRYPTO_STRINGS,NULL);
+        ssl_done=1;
+    }
+    char resp[KOYEB_BUF_MAX], body[1024];
     while (k->running) {
-        uint32_t bh=0;
-        /* Get current chain height from P2P consensus */
-        double *dummy_re=NULL,*dummy_im=NULL; /* not needed, just get height */
-        float   fid=0.0f; uint32_t h=0;
+        float fid=0.0f; uint32_t h=0;
         qtcl_p2p_get_consensus_dm(NULL,NULL,&fid,&h);
-        bh=h;
         snprintf(body,sizeof(body),
-            "{\"peer_id\":\"%s\","
-            "\"gossip_url\":\"http://localhost:%u\","
-            "\"miner_address\":\"%s\","
-            "\"block_height\":%u,"
-            "\"port\":%u,"
-            "\"network_version\":\"3\","
-            "\"supports_sse\":true}",
-            k->peer_id, (unsigned)k->p2p_port,
-            k->miner_addr, bh, (unsigned)k->p2p_port);
+            "{\"peer_id\":\"%s\",\"gossip_url\":\"http://localhost:%u\","
+            "\"miner_address\":\"%s\",\"block_height\":%u,"
+            "\"port\":%u,\"network_version\":\"3\",\"supports_sse\":true}",
+            k->peer_id,(unsigned)k->p2p_port,k->miner_addr,h,(unsigned)k->p2p_port);
         int n=_koyeb_post_tls(k->koyeb_host,"/api/peers/register",body,resp,sizeof(resp));
-        if (n>0) {
-            /* Skip HTTP headers — body starts after \r\n\r\n */
-            char *body_start=strstr(resp,"\r\n\r\n");
-            if (body_start) {
-                body_start+=4;
-                int wired=_parse_and_connect_peers(body_start);
-                (void)wired;
-            }
+        if (n>0){
+            char *bs=strstr(resp,"\r\n\r\n");
+            if (bs) _parse_and_connect_peers(bs+4);
         }
-        /* Also hit /api/p2p/peer_exchange for additional peer discovery */
         snprintf(body,sizeof(body),
             "{\"node_id\":\"%s\",\"port\":%u,\"version\":3}",
             k->peer_id,(unsigned)k->p2p_port);
         n=_koyeb_post_tls(k->koyeb_host,"/api/p2p/peer_exchange",body,resp,sizeof(resp));
-        if (n>0) {
-            char *body_start=strstr(resp,"\r\n\r\n");
-            if (body_start) _parse_and_connect_peers(body_start+4);
+        if (n>0){
+            char *bs=strstr(resp,"\r\n\r\n");
+            if (bs) _parse_and_connect_peers(bs+4);
         }
-        /* Sleep 120s in 1s increments so we can exit cleanly */
         for (int i=0;i<120&&k->running;i++) sleep(1);
     }
     return NULL;
 }
 
-/* Heartbeat thread: POST /api/peers/heartbeat every 30s */
-static void *_koyeb_hb_thread(void *arg) {
+void *_koyeb_hb_thread(void *arg) {
     _KoyebCtx *k=(_KoyebCtx*)arg;
-    char resp[1024], body[512];
+    char resp[512], body[512];
     while (k->running) {
         float fid=0.0f; uint32_t h=0;
         qtcl_p2p_get_consensus_dm(NULL,NULL,&fid,&h);
@@ -12934,38 +12910,33 @@ static void *_koyeb_hb_thread(void *arg) {
     }
     return NULL;
 }
-static pthread_t _koyeb_hb_tid;
 
 int qtcl_koyeb_start(const char *host, const char *peer_id,
                      const char *miner_addr, uint16_t p2p_port) {
     if (_KOYEB.running) return 0;
-    strncpy(_KOYEB.koyeb_host, host,           KOYEB_HOST_MAX-1);
-    strncpy(_KOYEB.peer_id,    peer_id,         64);
+    strncpy(_KOYEB.koyeb_host, host,                KOYEB_HOST_MAX-1);
+    strncpy(_KOYEB.peer_id,    peer_id,              64);
     strncpy(_KOYEB.miner_addr, miner_addr?miner_addr:"", 127);
     _KOYEB.p2p_port = p2p_port ? p2p_port : 9091;
     _KOYEB.running  = 1;
     pthread_attr_t a; pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-    pthread_create(&_KOYEB.thread,      &a, _koyeb_reg_thread, &_KOYEB);
-    pthread_create(&_koyeb_hb_tid,      &a, _koyeb_hb_thread,  &_KOYEB);
+    pthread_create(&_KOYEB.thread,  &a, _koyeb_reg_thread, &_KOYEB);
+    pthread_create(&_koyeb_hb_tid,  &a, _koyeb_hb_thread,  &_KOYEB);
     pthread_attr_destroy(&a);
     return 1;
 }
-
 void qtcl_koyeb_stop(void) { _KOYEB.running=0; }
 
-/* Fire-and-forget async HTTPS POST — spawns a detached thread */
 typedef struct { char host[KOYEB_HOST_MAX]; char path[256]; char body[KOYEB_BUF_MAX]; } _KPost;
-static void *_kpost_thread(void *arg) {
-    _KPost *p=(_KPost*)arg;
-    char resp[512];
+void *_kpost_thread(void *arg) {
+    _KPost *p=(_KPost*)arg; char resp[512];
     _koyeb_post_tls(p->host,p->path,p->body,resp,sizeof(resp));
     free(p); return NULL;
 }
 void qtcl_koyeb_post_async(const char *host, const char *path, const char *json_body) {
     if (!host||!path||!json_body) return;
-    _KPost *p=(_KPost*)malloc(sizeof(_KPost));
-    if (!p) return;
+    _KPost *p=(_KPost*)malloc(sizeof(_KPost)); if(!p) return;
     strncpy(p->host, host, KOYEB_HOST_MAX-1);
     strncpy(p->path, path, 255);
     strncpy(p->body, json_body, KOYEB_BUF_MAX-1);
@@ -12975,36 +12946,23 @@ void qtcl_koyeb_post_async(const char *host, const char *path, const char *json_
     pthread_attr_destroy(&a);
 }
 
-/* Announce a new block to all P2P peers + koyeb /api/gossip/ingest async */
 void qtcl_p2p_announce_block(uint32_t height, const char *block_hash_hex,
                               const char *miner_addr) {
     if (!_P2P.running) return;
-    /* Build JSON announce payload */
     char json[512];
     snprintf(json,sizeof(json),
-        "{\"type\":\"block\","
-        "\"height\":%u,"
-        "\"hash\":\"%s\","
-        "\"miner\":\"%s\","
-        "\"ts\":%llu}",
-        height,
-        block_hash_hex?block_hash_hex:"",
-        miner_addr?miner_addr:"",
-        (unsigned long long)_clock_ns());
-    /* P2P broadcast via existing chain_reset broadcast mechanism repurposed */
-    /* Send as MSG_TYPE_BLOCK_ANNOUNCE to all connected peers */
-    uint8_t frame[600]; int flen=0;
-    frame[flen++]=8; /* MSG_TYPE=8 chain_reset/announce */
-    int jl=(int)strlen(json); if(jl>580)jl=580;
-    memcpy(frame+flen,json,jl); flen+=jl;
+        "{\"type\":\"block\",\"height\":%u,\"hash\":\"%s\","
+        "\"miner\":\"%s\",\"ts\":%llu}",
+        height, block_hash_hex?block_hash_hex:"",
+        miner_addr?miner_addr:"", (unsigned long long)_clock_ns());
+    int jl=(int)strlen(json);
     pthread_mutex_lock(&_P2P.peers_lock);
     for (int i=0;i<P2P_MAX_PEERS;i++) {
-        if (_P2P.peers[i].active && _P2P.peers[i].handshake_done && _P2P.peers[i].fd>=0)
+        if (_P2P.peers[i].active&&_P2P.peers[i].handshake_done&&_P2P.peers[i].fd>=0)
             _send(_P2P.peers[i].fd,"blk",(uint8_t*)json,jl,0);
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
-    /* Async post to koyeb /api/gossip/ingest */
-    if (_KOYEB.running && _KOYEB.koyeb_host[0]) {
+    if (_KOYEB.running&&_KOYEB.koyeb_host[0]) {
         char body[640];
         snprintf(body,sizeof(body),
             "{\"block\":%s,\"origin\":\"%s\"}",
@@ -13013,29 +12971,25 @@ void qtcl_p2p_announce_block(uint32_t height, const char *block_hash_hex,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   §PeerDB  SQLITE PEER PERSISTENCE — load/save known peers
-   ═══════════════════════════════════════════════════════════════════════════ */
-/* We link against the system sqlite3 on Termux. If unavailable the functions
-   are no-ops (graceful degradation). */
-#ifdef QTCL_NO_SQLITE
-int  qtcl_peerdb_load(const char *db_path){ (void)db_path; return 0; }
-int  qtcl_peerdb_save(const char *db_path){ (void)db_path; return 0; }
-int  qtcl_peerdb_upsert(const char *db_path,const char *host,uint16_t port){ (void)db_path;(void)host;(void)port;return 0;}
-#else
-#include <sqlite3.h>
+/* ─── §PeerDB  SQLite peer persistence ──────────────────────────────────── */
+#if defined(__has_include)
+#  if __has_include(<sqlite3.h>)
+#    define QTCL_HAS_SQLITE 1
+#    include <sqlite3.h>
+#  endif
+#endif
+
+#ifdef QTCL_HAS_SQLITE
 int qtcl_peerdb_load(const char *db_path) {
     sqlite3 *db=NULL;
     if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
     sqlite3_exec(db,
         "CREATE TABLE IF NOT EXISTS known_peers"
-        "(host TEXT, port INTEGER, last_seen INTEGER,"
-        " PRIMARY KEY(host,port));",
+        "(host TEXT,port INTEGER,last_seen INTEGER,PRIMARY KEY(host,port));",
         NULL,NULL,NULL);
     sqlite3_stmt *st=NULL;
     sqlite3_prepare_v2(db,
-        "SELECT host,port FROM known_peers"
-        " ORDER BY last_seen DESC LIMIT 64",
+        "SELECT host,port FROM known_peers ORDER BY last_seen DESC LIMIT 64",
         -1,&st,NULL);
     int loaded=0;
     while (sqlite3_step(st)==SQLITE_ROW) {
@@ -13043,11 +12997,9 @@ int qtcl_peerdb_load(const char *db_path) {
         int p=sqlite3_column_int(st,1);
         if (!h||!h[0]) continue;
         if (p<=0||p>65535) p=9091;
-        int rc=qtcl_p2p_connect(h,(uint16_t)p);
-        if (rc>=0) loaded++;
+        if (qtcl_p2p_connect(h,(uint16_t)p)>=0) loaded++;
     }
-    sqlite3_finalize(st);
-    sqlite3_close(db);
+    sqlite3_finalize(st); sqlite3_close(db);
     return loaded;
 }
 int qtcl_peerdb_save(const char *db_path) {
@@ -13056,8 +13008,7 @@ int qtcl_peerdb_save(const char *db_path) {
     if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
     sqlite3_exec(db,
         "CREATE TABLE IF NOT EXISTS known_peers"
-        "(host TEXT, port INTEGER, last_seen INTEGER,"
-        " PRIMARY KEY(host,port));",
+        "(host TEXT,port INTEGER,last_seen INTEGER,PRIMARY KEY(host,port));",
         NULL,NULL,NULL);
     sqlite3_stmt *st=NULL;
     sqlite3_prepare_v2(db,
@@ -13074,11 +13025,10 @@ int qtcl_peerdb_save(const char *db_path) {
         sqlite3_reset(st);
     }
     pthread_mutex_unlock(&_P2P.peers_lock);
-    sqlite3_finalize(st);
-    sqlite3_close(db);
+    sqlite3_finalize(st); sqlite3_close(db);
     return saved;
 }
-int qtcl_peerdb_upsert(const char *db_path,const char *host,uint16_t port) {
+int qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port) {
     sqlite3 *db=NULL;
     if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
     sqlite3_exec(db,
@@ -13096,14 +13046,13 @@ int qtcl_peerdb_upsert(const char *db_path,const char *host,uint16_t port) {
     sqlite3_finalize(st); sqlite3_close(db);
     return ok;
 }
-#endif /* QTCL_NO_SQLITE */
-
-    return tr_re;
-}
-
-
-
-
+#else
+/* sqlite3 not available — graceful no-ops */
+int  qtcl_peerdb_load(const char *db_path)  { (void)db_path; return 0; }
+int  qtcl_peerdb_save(const char *db_path)  { (void)db_path; return 0; }
+int  qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port)
+     { (void)db_path;(void)host;(void)port; return 0; }
+#endif /* QTCL_HAS_SQLITE */
 """
 
 # ── CFFI function declarations (mirrors every public function in _QTCL_C_SRC) ──
@@ -13387,7 +13336,7 @@ def _compile_c_layer() -> None:
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
         _accel_lib = _accel_ffi.verify(
             _QTCL_C_SRC,
-            libraries=['ssl', 'crypto', 'sqlite3'],
+            libraries=['ssl', 'crypto'],  # sqlite3 included via __has_include guard
             extra_compile_args=[
                 '-O3', '-march=native', '-ffast-math', '-funroll-loops',
                 '-DOPENSSL_NO_DEPRECATED',
