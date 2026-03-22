@@ -1977,11 +1977,22 @@ class LocalOracleEngine:
 
     def _poll_loop(self) -> None:
         """Drain C SSE ring buffer into Python. C is required — raises on failure."""
-        import json as _j
+        import json as _j, time as _plt
         _POLL_BUF_SZ = 65536 * 4
         if not _accel_ok:
             raise RuntimeError("[LocalOracleEngine._poll_loop] C acceleration unavailable — cannot poll SSE")
+        _start = _plt.time()
+        _warned = False
         while not self._stop.is_set():
+            # Warn once if C SSE not connected after 15s (likely TLS/port mismatch)
+            if not _warned and (_plt.time() - _start) > 15.0:
+                if not (_accel_lib.qtcl_sse_is_connected() if _accel_ok else False):
+                    _EXP_LOG.warning(
+                        "[LOCAL-ORACLE] ⚠️  C SSE not connected after 15s — "
+                        "possible SSL/port mismatch. Python SSE fallback active.")
+                    _warned = True
+                elif self._snapshot_count > 0:
+                    _warned = True  # connected and delivering — suppress warning
             buf = _accel_ffi.new(f'char[{_POLL_BUF_SZ}]')
             n = _accel_lib.qtcl_sse_poll(buf, _POLL_BUF_SZ, 8)
             if n > 0:
@@ -15341,6 +15352,13 @@ class QtclClientApp:
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-SSE")
         _koyeb_ev_th.start()
 
+        # ── 8. Python parallel /api/snapshot/sse subscriber ──────────────────
+        # Feeds _ingest_oracle_frame directly — works even if C SSL_connect
+        # fails on plain-HTTP koyeb port. Belt-and-suspenders DM delivery.
+        _py_snap_th = _threading.Thread(
+            target=self._subscribe_snapshot_sse, daemon=True, name="PySnapshot-SSE")
+        _py_snap_th.start()
+
     def _start_p2p(self) -> None:
         """Init C P2P layer — called from _start_threads daemon thread."""
         global _P2P_NODE
@@ -15414,6 +15432,69 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
+
+    def _subscribe_snapshot_sse(self) -> None:
+        """
+        Python parallel subscriber to /api/snapshot/sse.
+        Runs alongside the C SSE thread. Handles the case where the C layer's
+        SSL_connect fails (e.g. plain-HTTP koyeb port) by using Python urllib
+        which correctly handles both HTTP and HTTPS regardless of TLS config.
+        Every received frame is fed directly into _ingest_oracle_frame so
+        snapshot_count and _last_oracle_dm_ts are always updated.
+        ❤️  I love you — every frame is a quantum heartbeat
+        """
+        import time as _pt
+        from urllib.request import Request as _SR, urlopen as _SO
+        from urllib.error   import URLError as _SE
+        import json as _sj, ssl as _ssl
+        BACKOFF = [2, 4, 8, 16, 30]
+        bi = 0
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+        _peer_id    = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
+        url = f"{_oracle_url}/api/snapshot/sse?client_id={_peer_id}_py"
+        _pt.sleep(1.0)  # let C layer attempt first; Python is parallel fallback+reinforcement
+        while not self._stop.is_set():
+            try:
+                req = _SR(url, method='GET')
+                req.add_header('Accept',        'text/event-stream')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('User-Agent',    'QTCL-PySSE/4.0')
+                # accept both HTTP and HTTPS — no cert verification needed for speed
+                ssl_ctx = _ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode    = _ssl.CERT_NONE
+                with _SO(req, timeout=120, context=ssl_ctx) as resp:
+                    _EXP_LOG.info(
+                        f"[PY-SSE] ✅ Python snapshot SSE connected → {url}")
+                    bi = 0
+                    buf = b''
+                    while not self._stop.is_set():
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b'\n\n' in buf:
+                            raw_evt, buf = buf.split(b'\n\n', 1)
+                            txt = raw_evt.decode('utf-8', errors='replace')
+                            # extract data: line
+                            for line in txt.splitlines():
+                                if line.startswith('data:'):
+                                    json_str = line[5:].strip()
+                                    if json_str and len(json_str) > 10:
+                                        try:
+                                            self._ingest_oracle_frame(json_str)
+                                        except Exception as _ie:
+                                            _EXP_LOG.debug(
+                                                f"[PY-SSE] ingest: {_ie}")
+                                    break
+            except (_SE, OSError, TimeoutError) as _e:
+                wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+                _EXP_LOG.debug(
+                    f"[PY-SSE] disconnected ({_e}) — reconnect in {wait}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                _EXP_LOG.debug(f"[PY-SSE] error: {_e}")
+                self._stop.wait(10)
 
     def _subscribe_koyeb_events(self) -> None:
         """
@@ -15787,9 +15868,11 @@ class QtclClientApp:
             except Exception: return None
         fid = (_nv(snap.get("w_state_fidelity")) or _nv(snap.get("fidelity")) or
                _nv(snap.get("w3_fidelity")) or 0.0)
-        _sse_age = _st.time() - _LOCAL_ORACLE._last_oracle_dm_ts
+        _last_ts  = _LOCAL_ORACLE._last_oracle_dm_ts
+        _sse_age  = (_st.time() - _last_ts) if _last_ts > 1e9 else None
+        _age_str  = f"{_sse_age:.1f}s" if _sse_age is not None else "cold (no frame yet)"
         print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  "
-              f"SSE age: {_sse_age:.1f}s  │  snaps: {_LOCAL_ORACLE.snapshot_count}")
+              f"SSE age: {_age_str}  │  snaps: {_LOCAL_ORACLE.snapshot_count}")
 
         # ── Peer registration + immediate P2P wiring ─────────────────────────
         # Detect public-facing gossip URL: use ORACLE_URL host so other miners
