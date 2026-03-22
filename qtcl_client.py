@@ -15781,6 +15781,24 @@ _MINE_TELEM = _MiningTelemetry()
 # η-SWARM  QtclClientApp  (FIX-9: pq_curr / pq_last from block_height)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Module-level SSE subscriber lists for local HTTP oracle server
+# Threads appended/removed by _local_http_server handler connections
+_sse_local_subs: list = []   # /api/snapshot/sse subscribers
+_sse_event_subs: list = []   # /api/events subscribers
+
+
+def _broadcast_oracle_to_local_subs(snap: dict) -> None:
+    """Push oracle snapshot to all local SSE subscribers (called by DM daemon)."""
+    import json as _blj
+    ev = {'type': 'oracle_dm', 'ts': snap.get('timestamp_ns', 0), **snap}
+    for q in list(_sse_local_subs):
+        try: q.put_nowait(snap)
+        except Exception: pass
+    for q in list(_sse_event_subs):
+        try: q.put_nowait(ev)
+        except Exception: pass
+
+
 class QtclClientApp:
     """
     QTCL Client interactive entrypoint.
@@ -16552,23 +16570,6 @@ class QtclClientApp:
             # _RESET_PERFORMED is module-level
             _EXP_LOG.warning("[OURO] ⚡ chain_reset via SSE self-loop — signalling mining reset")
             _RESET_PERFORMED.set()
-
-# Module-level SSE subscriber lists for local HTTP oracle server
-# Threads appended/removed by _local_http_server handler connections
-_sse_local_subs: list = []   # /api/snapshot/sse subscribers
-_sse_event_subs: list = []   # /api/events subscribers
-
-def _broadcast_oracle_to_local_subs(snap: dict) -> None:
-    """Push oracle snapshot to all local SSE subscribers (called by DM daemon)."""
-    import json as _blj
-    frame_str = _blj.dumps(snap)
-    ev = {'type': 'oracle_dm', 'ts': snap.get('timestamp_ns', 0), **snap}
-    for q in list(_sse_local_subs):
-        try: q.put_nowait(snap)
-        except Exception: pass
-    for q in list(_sse_event_subs):
-        try: q.put_nowait(ev)
-        except Exception: pass
 
     def _local_http_server(self) -> None:
         """
