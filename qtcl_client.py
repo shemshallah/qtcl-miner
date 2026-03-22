@@ -1799,7 +1799,7 @@ class LocalOracleEngine:
     """SSE → DM → Measurement pipeline with full snapshot lifecycle.
 
     Boot sequence:
-      1. qtcl_sse_connect(host, 443, '/api/snapshot/sse')  [C — fatal if unavailable]
+      1. qtcl_sse_connect(host, 9091, '/api/snapshot/sse')  [C — fatal if unavailable]
       2. Poll qtcl_sse_poll() for JSON frames on background thread
       3. Parse density_matrix_hex → dm_re, dm_im (8×8 complex128)
          → also updates _oracle_state with all canonical metrics from Koyeb oracle
@@ -1853,7 +1853,7 @@ class LocalOracleEngine:
         self._stop.clear()
         host = self.ORACLE_HOST.encode() + b'\x00'
         path = self.SSE_PATH.encode() + b'\x00'
-        rc = _accel_lib.qtcl_sse_connect(host, 443, path)
+        rc = _accel_lib.qtcl_sse_connect(host, 9091, path)
         if rc != 0:
             raise RuntimeError(
                 f"[LocalOracleEngine.start] qtcl_sse_connect returned {rc} — "
@@ -13856,7 +13856,7 @@ class KoyebAPIClient:
         try:
             import socket
             host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
-            sock = socket.create_connection((host, 443 if "https" in self.base_url else 80), timeout=3)
+            sock = socket.create_connection((host, 9091), timeout=3)
             sock.close()
             lines.append(f"     Network:    ✅ Reachable ({host})")
         except Exception as e:
@@ -15245,7 +15245,7 @@ class QtclClientApp:
                         try:
                             host = _LOCAL_ORACLE.ORACLE_HOST.encode() + b'\x00'
                             path = _LOCAL_ORACLE.SSE_PATH.encode() + b'\x00'
-                            rc   = _accel_lib.qtcl_sse_connect(host, 443, path)
+                            rc   = _accel_lib.qtcl_sse_connect(host, 9091, path)
                             if rc == 0:
                                 _EXP_LOG.info("[SSE] 🔄 Forced SSE reconnect initiated")
                                 _stale_since = now  # reset timer
