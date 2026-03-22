@@ -1983,10 +1983,13 @@ class LocalOracleEngine:
             raise RuntimeError("[LocalOracleEngine._poll_loop] C acceleration unavailable — cannot poll SSE")
         _pstart = _plt.time(); _warned = False
         while not self._stop.is_set():
-            if not _warned and (_plt.time() - _pstart) > 15.0 and self._snapshot_count == 0:
-                _EXP_LOG.warning(
-                    "[LOCAL-ORACLE] ⚠️  C SSE not connected after 15s — "
-                    "possible SSL/port mismatch. Python SSE fallback active.")
+            if not _warned and (_plt.time() - _pstart) > 15.0:
+                if not (_accel_ok and _accel_lib.qtcl_sse_is_connected()):
+                    if self._snapshot_count == 0:
+                        _EXP_LOG.warning(
+                            "[LOCAL-ORACLE] ⚠️  C SSE silent after 15s — Python SSE fallback active.")
+                    else:
+                        _EXP_LOG.debug("[LOCAL-ORACLE] C SSE inactive — Python SSE delivering frames ✅")
                 _warned = True
             buf = _accel_ffi.new(f'char[{_POLL_BUF_SZ}]')
             n = _accel_lib.qtcl_sse_poll(buf, _POLL_BUF_SZ, 8)
@@ -2617,7 +2620,9 @@ class QtclP2PNode:
     Bootstrap: connects to Koyeb server /api/p2p/peer_exchange for peer list.
     """
     DEFAULT_PORT = 9091
-    BOOTSTRAP_PEERS = [('qtcl-blockchain.koyeb.app', 443)]
+    # Bootstrap peers = real miner IPs only (raw TCP P2P — not koyeb)
+    # Koyeb peer discovery uses /api/p2p/peer_exchange HTTP endpoint instead
+    BOOTSTRAP_PEERS: list = []
 
     def __init__(
             self,
@@ -15747,6 +15752,7 @@ class QtclClientApp:
                   snap.get("lattice_refresh_counter") or 0)
         fid = (_nv(snap.get("w_state_fidelity")) or _nv(snap.get("fidelity")) or
                _nv(snap.get("w3_fidelity")) or 0.0)
+        bath = GKSLBathParams.from_snap(snap)
         pq_curr_id = str(bh)     if bh > 0 else "0"
         pq_last_id = str(bh - 1) if bh > 0 else "0"
         _last_ts = _LOCAL_ORACLE._last_oracle_dm_ts
