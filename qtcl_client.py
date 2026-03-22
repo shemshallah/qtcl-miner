@@ -1927,9 +1927,9 @@ class LocalOracleEngine:
             peers = pdata.get('peers', [])
             connected = 0
             for p in peers[:24]:
-                host = str(p.get('host') or p.get('ip') or '')
+                host = str(p.get('host') or p.get('ip') or p.get('ip_address') or '')
                 port = int(p.get('port') or 9091)
-                if host and _accel_ok:
+                if host and host not in ('127.0.0.1', 'localhost') and _accel_ok:
                     try:
                         rc = int(_accel_lib.qtcl_p2p_connect(
                             host.encode() + b'\x00', port))
@@ -2887,7 +2887,7 @@ class QtclP2PNode:
 
                 connected = 0
                 for p in peers_raw[:32]:
-                    host = str(p.get('host') or p.get('ip') or p.get('address') or '')
+                    host = str(p.get('host') or p.get('ip') or p.get('ip_address') or p.get('address') or '')
                     port = int(p.get('port') or self._port)
                     if host and host not in ('localhost', '127.0.0.1') and _accel_ok:
                         try:
@@ -2897,7 +2897,38 @@ class QtclP2PNode:
                 if connected:
                     _EXP_LOG.info(f"[P2P] 🌐 peer_exchange: {connected} new connections")
             except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] peer_exchange: {_e}")
+                _EXP_LOG.debug(f"[P2P] peer_exchange /api/p2p/peer_exchange failed: {_e}")
+                # ── Fallback: /api/peers/register + /api/peers/list ───────────
+                # Covers case where server doesn't yet have /api/p2p/peer_exchange
+                try:
+                    import json as _fj
+                    _freg_payload = _fj.dumps({
+                        'peer_id': self._node_id, 'port': self._port,
+                        'gossip_url': f"http://localhost:{self._port}",
+                        'block_height': 0, 'network_version': '3',
+                    }).encode()
+                    _freg_req = _Rq(f"{_oracle_url}/api/peers/register",
+                                    data=_freg_payload,
+                                    headers={'Content-Type': 'application/json',
+                                             'User-Agent': 'QTCL-P2P/3.0'},
+                                    method='POST')
+                    with _uo(_freg_req, timeout=10) as _freg_resp:
+                        _freg_data = _fj.loads(_freg_resp.read().decode())
+                    _fb_peers = _freg_data.get('live_peers') or []
+                    _fb_connected = 0
+                    for _fbp in _fb_peers[:32]:
+                        _fbhost = str(_fbp.get('ip_address') or _fbp.get('host') or '')
+                        _fbport = int(_fbp.get('port') or self._port)
+                        if _fbhost and _fbhost not in ('', '127.0.0.1', 'localhost') and _accel_ok:
+                            try:
+                                _rc2 = int(_accel_lib.qtcl_p2p_connect(
+                                    _fbhost.encode() + b'\x00', _fbport))
+                                if _rc2 >= 0: _fb_connected += 1
+                            except Exception: pass
+                    if _fb_connected:
+                        _EXP_LOG.info(f"[P2P] 🌐 fallback peer_list: {_fb_connected} new connections")
+                except Exception as _fe:
+                    _EXP_LOG.debug(f"[P2P] fallback peer_list: {_fe}")
 
             # Wait 5 minutes before next discovery cycle
             self._stop.wait(300)
@@ -15345,6 +15376,19 @@ class QtclClientApp:
             try:
                 bh = int(self.koyeb_state.block_height or 0)
                 self.api.send_heartbeat(self._peer_id, bh)
+                # Every 4th heartbeat (~2 min) re-register with full body so Koyeb
+                # NAT IP is refreshed in peer_registry and other miners stay wired.
+                _hb_count = getattr(self, '_hb_count', 0) + 1
+                self._hb_count = _hb_count
+                if _hb_count % 4 == 0:
+                    try:
+                        self.api.register_peer(
+                            self._peer_id,
+                            f"http://auto:{9091}",  # server overwrites with remote_addr
+                            getattr(getattr(self,'wallet',None),'address',''),
+                            bh,
+                        )
+                    except Exception: pass
                 # Upsert self into local DB
                 if self._db:
                     try:
@@ -15436,6 +15480,21 @@ class QtclClientApp:
             fid = float(payload.get('consensus_fidelity', 0))
             h   = int(payload.get('chain_height', 0))
             _EXP_LOG.debug(f"[OURO] 🧬 Consensus DM: h={h} F={fid:.4f}")
+        elif ev in ('peer', 'peer_joined', 'peer_exchange'):
+            # New miner joined — wire them into C P2P immediately
+            peer_ip   = str(payload.get('ip_address') or payload.get('host') or '')
+            peer_port = int(payload.get('port') or 9091)
+            peer_pid  = str(payload.get('peer_id') or '')
+            if peer_ip and peer_ip not in ('', '127.0.0.1', 'localhost') and _accel_ok and _P2P_NODE:
+                try:
+                    _rc_peer = int(_accel_lib.qtcl_p2p_connect(
+                        peer_ip.encode() + b'\x00', peer_port))
+                    if _rc_peer >= 0:
+                        _EXP_LOG.info(
+                            f"[OURO] 🔗 SSE peer-join → C P2P wired {peer_ip}:{peer_port} "                            f"(peer_id={peer_pid[:12]}…)"
+                        )
+                except Exception as _pe:
+                    _EXP_LOG.debug(f"[OURO] peer-join connect {peer_ip}:{peer_port}: {_pe}")
         elif ev == 'chain_reset':
             # _RESET_PERFORMED is module-level
             _EXP_LOG.warning("[OURO] ⚡ chain_reset via SSE self-loop — signalling mining reset")
@@ -15616,9 +15675,31 @@ class QtclClientApp:
                _nv(snap.get("w_state_fidelity")) or 0.0)
         print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}")
 
-        # Register peer
-        self.api.register_peer(self._peer_id, f"http://localhost:9091",
-                                self.wallet.address, bh)
+        # ── Peer registration + immediate P2P wiring ─────────────────────────
+        # Detect public-facing gossip URL: use ORACLE_URL host so other miners
+        # can reach us (Koyeb assigns a stable public IP per deployment).
+        _my_gossip_url = f"http://localhost:9091"  # fallback; server overrides with remote_addr
+        _reg_resp = self.api.register_peer(
+            self._peer_id, _my_gossip_url, self.wallet.address, bh)
+        # Feed returned live_peers directly into C P2P connect layer so miners
+        # see each other immediately on startup without waiting 5-min discovery
+        if _reg_resp and _accel_ok:
+            _boot_peers = _reg_resp.get('live_peers') or []
+            _wired = 0
+            for _bp in _boot_peers[:32]:
+                _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
+                _bport = int(_bp.get('port') or 9091)
+                if _bhost and _bhost not in ('', '127.0.0.1', 'localhost'):
+                    try:
+                        _rc = int(_accel_lib.qtcl_p2p_connect(
+                            _bhost.encode() + b'\x00', _bport))
+                        if _rc >= 0:
+                            _wired += 1
+                            _EXP_LOG.info(f"[BOOT-PEER] ✅ C P2P wired → {_bhost}:{_bport}")
+                    except Exception as _bpe:
+                        _EXP_LOG.debug(f"[BOOT-PEER] connect {_bhost}:{_bport}: {_bpe}")
+            if _wired:
+                print(f"  🔗 P2P peers wired at boot: {_wired}/{len(_boot_peers)}")
 
         self._start_threads()
         try:
