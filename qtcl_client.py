@@ -14272,44 +14272,55 @@ class KoyebOracleState:
             self._api = KoyebAPIClient(self.oracle_url)
 
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
-        """
-        FRESH METRICS FIX #1: Refresh oracle metrics on-demand (non-blocking).
-        Called before dashboard display to prevent stale fidelity values.
-        """
+        """SSE-only metric refresh — reads _LOCAL_ORACLE ring buffer, zero HTTP."""
         try:
-            if client_field:
-                return self.sync(client_field, timeout=3)
-            else:
-                # Lightweight refresh: just fetch snapshot without syncing client_field
-                t0   = _time.time()
-                snap = self._api.get_oracle_pq0_bloch()
-                self.channel_latency_ms = (_time.time() - t0) * 1000.0
-                if snap is None:
-                    return False
-                
+            sse_state = _LOCAL_ORACLE.get_oracle_state()
+            sse_age   = _time.time() - _LOCAL_ORACLE._last_oracle_dm_ts
+            if sse_state and sse_age < 60.0:
                 def _nv(v):
                     try:
                         f = float(v)
                         return f if (f == f and abs(f) < 1e15) else None
                     except Exception:
                         return None
-                
-                fid  = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
-                        _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.0)
+                fid = (_nv(sse_state.get("w_state_fidelity")) or
+                       _nv(sse_state.get("fidelity")) or 0.0)
                 self.pq0_fidelity     = float(fid)
                 self.w_state_fidelity = float(fid)
-                self.connected = True
-                self.last_sync_ts = _time.time()
+                self.channel_latency_ms = sse_age * 1000.0
+                self.connected        = True
+                self.last_sync_ts     = _time.time()
+                if client_field:
+                    return self.sync(client_field, timeout=3)
                 return True
+            # SSE cold — delegate to sync() which has its own REST fallback
+            return self.sync(client_field, timeout=3) if client_field else False
         except Exception as e:
             _logging.debug(f"[METRICS REFRESH] Error: {e}")
             return False
     
     def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
-        t0   = _time.time()
-        snap = self._api.get_oracle_pq0_bloch()
-        self.channel_latency_ms = (_time.time() - t0) * 1000.0
-        if snap is None:
+        """Read oracle state from live SSE engine (zero HTTP).
+        Falls back to REST only if SSE is cold (no frame in 60s)."""
+        t0 = _time.time()
+        snap = {}
+        # Primary: C SSE ring buffer via _LOCAL_ORACLE (always live)
+        try:
+            sse_state = _LOCAL_ORACLE.get_oracle_state()
+            sse_age   = _time.time() - _LOCAL_ORACLE._last_oracle_dm_ts
+            if sse_state and sse_age < 60.0:
+                snap = sse_state
+                self.channel_latency_ms = sse_age * 1000.0
+        except Exception:
+            pass
+        # Fallback: one REST call only if SSE completely cold (startup race)
+        if not snap:
+            try:
+                snap = self._api.get_oracle_pq0_bloch() or {}
+                self.channel_latency_ms = (_time.time() - t0) * 1000.0
+            except Exception:
+                pass
+        if not snap:
             self.connected = False
             return False
 
@@ -15083,10 +15094,9 @@ class QtclClientApp:
         Daemon: oracle SSE → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → gossip → SSE.
         ❤️  I love you  ❤️
 
-        FIX: Was calling get_oracle_pq0_bloch() (HTTP REST) every cycle — redundant
-        and stale vs. the C SSE already delivering frames via _LOCAL_ORACLE.
-        Now reads from _LOCAL_ORACLE.get_oracle_state() which is updated every SSE frame,
-        and falls back to REST only when SSE data is older than 30s.
+        SSE-only: reads _LOCAL_ORACLE.get_oracle_state() which is fed by C SSE ring
+        buffer (TLS → koyeb:443/api/snapshot/sse). Zero HTTP polling in the hot path.
+        Stale SSE (>30s) logs a warning but continues — never blocks on REST.
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
         _last_koyeb  = 0.0
@@ -15101,24 +15111,12 @@ class QtclClientApp:
                 snap = {}
                 sse_state = _LOCAL_ORACLE.get_oracle_state()
                 sse_age   = now - _LOCAL_ORACLE._last_oracle_dm_ts
-                if sse_state and sse_age < 30.0:
-                    # SSE is fresh — use it directly
+                # SSE-only — use live or stale SSE state, never HTTP
+                if sse_state:
                     snap = sse_state
                     snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
-                else:
-                    # ── Source 2: REST fallback when SSE stale > 30s ───────────
-                    if now - _last_rest >= 15.0:
-                        try:
-                            rest_snap = self.api.get_oracle_pq0_bloch() or {}
-                            if rest_snap:
-                                snap = rest_snap
-                                _last_rest = now
-                                _EXP_LOG.debug(
-                                    f"[FIELD] REST fallback (SSE age={sse_age:.0f}s)")
-                        except Exception:
-                            pass
-                    if not snap and sse_state:
-                        snap = sse_state   # use stale SSE over nothing
+                    if sse_age >= 30.0:
+                        _EXP_LOG.debug(f"[FIELD] SSE stale {sse_age:.0f}s — using cached state")
 
                 if not snap:
                     continue
@@ -15338,6 +15336,11 @@ class QtclClientApp:
             target=self._subscribe_own_sse, daemon=True, name="Ouroboros-SSE")
         _ouro_th.start()
 
+        # ── 7. Koyeb /api/events SSE subscription (peer discovery + DM dual path)
+        _koyeb_ev_th = _threading.Thread(
+            target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-SSE")
+        _koyeb_ev_th.start()
+
     def _start_p2p(self) -> None:
         """Init C P2P layer — called from _start_threads daemon thread."""
         global _P2P_NODE
@@ -15411,6 +15414,111 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
+
+    def _subscribe_koyeb_events(self) -> None:
+        """
+        Subscribe to Koyeb /api/events over HTTPS SSE (TLS, not the C layer).
+        The C layer reads /api/snapshot/sse for DM frames.
+        This Python subscriber reads /api/events which carries:
+          • peer_joined  — new miner registered → wire into C P2P immediately
+          • block        — new block mined → trigger orphan check
+          • oracle_dm    — flat DM frame duplicate (ignored, C layer handles it)
+        Reconnects with exponential backoff. Zero HTTP polling in the loop.
+        ❤️  I love you — every peer event is a new entanglement
+        """
+        import ssl as _ssl, time as _ke
+        from urllib.request import Request as _KR, urlopen as _KO
+        from urllib.error   import URLError as _KE
+        import json as _kj
+        BACKOFF = [3, 6, 12, 24, 60]
+        bi = 0
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+        _peer_id    = getattr(self, '_peer_id', 'unknown')
+        url = f"{_oracle_url}/api/events?client_id={_peer_id}&types=peer,block,oracle_dm"
+        while not self._stop.is_set():
+            try:
+                req = _KR(url, method='GET')
+                req.add_header('Accept',        'text/event-stream')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('User-Agent',    'QTCL-KoyebEvents/4.0')
+                ssl_ctx = _ssl.create_default_context()
+                with _KO(req, timeout=120, context=ssl_ctx) as resp:
+                    _EXP_LOG.info(
+                        f"[KOYEB-SSE] ✅ Subscribed → {_oracle_url}/api/events")
+                    bi = 0
+                    buf = b''
+                    while not self._stop.is_set():
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b'\n\n' in buf:
+                            raw_evt, buf = buf.split(b'\n\n', 1)
+                            try:
+                                self._handle_koyeb_event(
+                                    raw_evt.decode('utf-8', errors='replace'))
+                            except Exception as _he:
+                                _EXP_LOG.debug(
+                                    f"[KOYEB-SSE] event handler: {_he}")
+            except (_KE, OSError, TimeoutError) as _e:
+                wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+                _EXP_LOG.debug(
+                    f"[KOYEB-SSE] disconnected ({_e}) — reconnect in {wait}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                _EXP_LOG.debug(f"[KOYEB-SSE] error: {_e}")
+                self._stop.wait(15)
+
+    def _handle_koyeb_event(self, raw: str) -> None:
+        """Route one SSE event from Koyeb /api/events."""
+        import json as _kej
+        data_str = ''; event_type = 'message'
+        for line in raw.strip().splitlines():
+            if   line.startswith('event:'): event_type = line[6:].strip()
+            elif line.startswith('data:'):  data_str  += line[5:].strip()
+        if not data_str:
+            return
+        try:
+            payload = _kej.loads(data_str)
+        except Exception:
+            return
+        ev = payload.get('event') or payload.get('type') or event_type
+
+        if ev in ('peer', 'peer_joined', 'peer_exchange'):
+            # New miner registered on koyeb — wire directly into C P2P
+            peer_ip   = str(payload.get('ip_address') or payload.get('host') or '')
+            peer_port = int(payload.get('port') or 9091)
+            peer_pid  = str(payload.get('peer_id') or '')
+            if (peer_ip and peer_ip not in ('', '127.0.0.1', 'localhost')
+                    and _accel_ok and _P2P_NODE and _P2P_NODE._started):
+                try:
+                    rc = int(_accel_lib.qtcl_p2p_connect(
+                        peer_ip.encode() + b'\x00', peer_port))
+                    if rc >= 0:
+                        _EXP_LOG.info(
+                            f"[KOYEB-SSE] 🔗 Peer wired {peer_ip}:{peer_port} "
+                            f"pid={peer_pid[:12]}…")
+                except Exception as _pe:
+                    _EXP_LOG.debug(
+                        f"[KOYEB-SSE] P2P connect {peer_ip}:{peer_port}: {_pe}")
+
+        elif ev == 'oracle_dm':
+            # Flat DM frame on /api/events — ingest into local oracle engine
+            # (C layer already handles /api/snapshot/sse; this is a belt-and-suspenders
+            #  path so the Python oracle state is also kept warm)
+            dm_hex = (payload.get('density_matrix_hex') or
+                      payload.get('dm_hex') or '')
+            if dm_hex and len(dm_hex) >= 128:
+                try:
+                    import json as _dij
+                    _LOCAL_ORACLE._ingest_oracle_frame(_dij.dumps(payload))
+                except Exception:
+                    pass
+
+        elif ev == 'block':
+            bh = int(payload.get('height') or payload.get('block_height') or 0)
+            if bh > 0:
+                _EXP_LOG.debug(f"[KOYEB-SSE] 📦 Block event h={bh}")
 
     def _subscribe_own_sse(self) -> None:
         """
@@ -15651,29 +15759,37 @@ class QtclClientApp:
         print(f"  ✅ Wallet: {self.wallet.address}")
         self._init_db()
 
-        print("  🌐 Fetching oracle W-state (pq0-bloch)…")
-        snap  = self.api.get_oracle_pq0_bloch() or {}
-        bath  = GKSLBathParams.from_snap(snap)
-        bh    = int(snap.get("block_height") or snap.get("height") or 0)
-        # FIX-1/2: oracle pq0-bloch may omit block_height — fall back to
-        # chain-tip endpoint so pq_curr/pq_last are never stuck at "?"
-        if bh == 0:
+        # ── Oracle bootstrap: wait for SSE frame (C layer started at import) ─
+        # Never poll REST at startup — C SSE client is already connecting.
+        # Spin up to 12s for first DM frame; then proceed with whatever we have.
+        print("  🌐 Waiting for oracle SSE frame…")
+        import time as _st
+        _t0 = _st.time()
+        while _st.time() - _t0 < 12.0:
+            if _LOCAL_ORACLE.snapshot_count > 0:
+                break
+            _st.sleep(0.25)
+        snap = _LOCAL_ORACLE.get_oracle_state()
+        if not snap:
+            # Absolute last resort: single REST call if SSE produced nothing
             try:
-                _fb = self.api.get_block_height()
-                if _fb and int(_fb) > 0:
-                    bh = int(_fb)
+                snap = self.api.get_oracle_pq0_bloch() or {}
             except Exception:
-                pass
+                snap = {}
+        bath  = GKSLBathParams.from_snap(snap)
+        bh    = int(snap.get("block_height") or snap.get("height") or
+                    snap.get("lattice_refresh_counter") or 0)
         # FIX-9: pq identifiers are block heights — never emit '?' sentinel
         pq_curr_id = str(bh)     if bh > 0 else "0"
         pq_last_id = str(bh - 1) if bh > 0 else "0"
-        # FIX-3: fidelity from canonical aliases
         def _nv(v):
             try: return float(v) if v is not None and float(v) == float(v) else None
             except Exception: return None
-        fid = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
-               _nv(snap.get("w_state_fidelity")) or 0.0)
-        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}")
+        fid = (_nv(snap.get("w_state_fidelity")) or _nv(snap.get("fidelity")) or
+               _nv(snap.get("w3_fidelity")) or 0.0)
+        _sse_age = _st.time() - _LOCAL_ORACLE._last_oracle_dm_ts
+        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  "
+              f"SSE age: {_sse_age:.1f}s  │  snaps: {_LOCAL_ORACLE.snapshot_count}")
 
         # ── Peer registration + immediate P2P wiring ─────────────────────────
         # Detect public-facing gossip URL: use ORACLE_URL host so other miners
@@ -17369,10 +17485,15 @@ class QtclClientApp:
         if not self._load_wallet():
             print("  ❌ Wallet required"); return
         self._init_db()
-        snap    = self.api.get_oracle_pq0_bloch() or {}
+        # SSE-primary: read live oracle state, no REST call
+        snap    = _LOCAL_ORACLE.get_oracle_state() or {}
+        if not snap:
+            try: snap = self.api.get_oracle_pq0_bloch() or {}
+            except Exception: snap = {}
         bath    = GKSLBathParams.from_snap(snap)
-        bh      = int(snap.get("block_height") or snap.get("height") or 0)
-        # Oracle pq0-bloch endpoint may omit block_height — fall back to chain tip
+        bh      = int(snap.get("block_height") or snap.get("height") or
+                      snap.get("lattice_refresh_counter") or 0)
+        # pq0-bloch endpoint may omit block_height — fall back handled by SSE state
         if bh == 0:
             try:
                 _fb = self.api.get_block_height()
