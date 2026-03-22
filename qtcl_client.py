@@ -12032,7 +12032,7 @@ static void _sse_accept(int fd,const char *host,uint8_t topics){
     }
     pthread_mutex_unlock(&_P2P.sse_lock);
     const char *full="HTTP/1.1 503 Service Unavailable\r\n\r\n";
-    (void)write(fd,full,strlen(full));close(fd);
+    if(write(fd,full,strlen(full))<0){};close(fd);
 }
 static int _wstate_json(const QtclWStateMeasurement *m,char *out,int sz,int self){
     char nh[33]={0};for(int i=0;i<16;i++)snprintf(nh+i*2,3,"%02x",m->node_id[i]);
@@ -12304,7 +12304,7 @@ static void *_accept_thread(void *arg){
                 const char *body=strstr(hb,"\r\n\r\n");
                 if(body&&_P2P.callback)_P2P.callback(8,body+4,strlen(body+4));
                 const char *ok="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                (void)write(cfd,ok,strlen(ok));close(cfd);
+                if(write(cfd,ok,strlen(ok))<0){};close(cfd);
             } else if(strstr(hb,"/api/p2p/peers")){
                 /* Lightweight JSON peer list for discovery */
                 char pb[4096]={0}; int off=0;
@@ -12327,10 +12327,10 @@ static void *_accept_thread(void *arg){
                 char resp[4200]; int rl=snprintf(resp,sizeof(resp),
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                     "Content-Length: %d\r\n\r\n%s",off,pb);
-                (void)write(cfd,resp,rl);close(cfd);
+                if(write(cfd,resp,rl)<0){};close(cfd);
             } else {
                 const char *r404="HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-                (void)write(cfd,r404,strlen(r404));close(cfd);
+                if(write(cfd,r404,strlen(r404))<0){};close(cfd);
             }
         } else {
             pthread_mutex_lock(&_P2P.peers_lock);
@@ -13675,11 +13675,19 @@ def _compile_c_layer() -> None:
         )
     except Exception as _e:
         _accel_ok = False
-        _log.warning(
-            f"[ACCEL] C layer unavailable ({type(_e).__name__}: {_e}). "
-            f"Pure-Python fallbacks engaged. "
-            f"For full acceleration on Termux: pkg install clang openssl libffi"
-        )
+        _err = str(_e)
+        if any(x in _err for x in ('error:', 'CompileError', 'VerificationError', 'cannot locate symbol')):
+            _log.warning(
+                f"[ACCEL] ❌ C compile/link FAILED — pure-Python mode active\n"
+                f"  Cause: {_err[:400]}\n"
+                f"  Fix:   rm -rf __pycache__ && pkg install clang openssl libffi sqlite && python qtcl_client.py"
+            )
+        else:
+            _log.warning(
+                f"[ACCEL] C layer unavailable ({type(_e).__name__}: {_e}). "
+                f"Pure-Python fallbacks engaged. "
+                f"For full acceleration on Termux: pkg install clang openssl libffi sqlite"
+            )
 
 
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
@@ -16569,42 +16577,53 @@ class QtclClientApp:
 
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
-            Gate on C oracle DM arrival via qtcl_sse_poll → qtcl_bootstrap_ingest_dm.
-            Pure C path — no HTTP/P2P Python fallbacks.
-            Returns True if DM age < 60s.  False = mining continues in degraded mode.
+            Gate on oracle DM arrival.
+            C path (preferred): qtcl_sse_poll → qtcl_bootstrap_ingest_dm
+            Python fallback: _LOCAL_ORACLE.snapshot_count > 0 (Python SSE thread)
+            Returns True when DM is fresh enough to mine. Always returns within timeout_s.
             """
             deadline = _time.time() + timeout_s
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
 
-            # Drain C SSE ring immediately — frames already buffered since module load
-            try:
-                buf = _accel_ffi.new('char[262144]')
-                n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
-                if n > 0:
-                    raw = bytes(_accel_ffi.buffer(buf)[0:262144])
-                    pos = 0
-                    for _ in range(n):
-                        end = raw.index(b'\x00', pos)
-                        _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
-                        pos = end + 1
-            except Exception: pass
+            # C path: drain SSE ring buffer (frames buffered since import)
+            if _accel_ok:
+                try:
+                    buf = _accel_ffi.new('char[262144]')
+                    n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
+                    if n > 0:
+                        raw = bytes(_accel_ffi.buffer(buf)[0:262144])
+                        pos = 0
+                        for _ in range(n):
+                            end = raw.index(b'\x00', pos)
+                            _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
+                            pos = end + 1
+                except Exception: pass
 
             while _time.time() < deadline:
-                if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
-                    print(" ✅", flush=True)
+                # C path: check bootstrap DM age
+                if _accel_ok:
+                    try:
+                        if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                            print(" ✅ (C SSE)", flush=True)
+                            return True
+                    except Exception: pass
+                # Python fallback: Python SSE thread delivered a frame
+                if _LOCAL_ORACLE.snapshot_count > 0:
+                    print(" ✅ (Python SSE)", flush=True)
                     return True
-                # Drain any new SSE frames each poll iteration
-                try:
-                    buf2 = _accel_ffi.new('char[65536]')
-                    n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
-                    if n2 > 0:
-                        raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
-                        pos2 = 0
-                        for _ in range(n2):
-                            end2 = raw2.index(b'\x00', pos2)
-                            _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
-                            pos2 = end2 + 1
-                except Exception: pass
+                # Drain any new C SSE frames each poll iteration
+                if _accel_ok:
+                    try:
+                        buf2 = _accel_ffi.new('char[65536]')
+                        n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
+                        if n2 > 0:
+                            raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
+                            pos2 = 0
+                            for _ in range(n2):
+                                end2 = raw2.index(b'\x00', pos2)
+                                _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
+                                pos2 = end2 + 1
+                    except Exception: pass
                 print('.', end='', flush=True)
                 _time.sleep(0.3)
 
@@ -17029,33 +17048,41 @@ class QtclClientApp:
             """
             deadline = _time.time() + timeout_s
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
-            # Drain any already-buffered SSE frames first
-            try:
-                buf = _accel_ffi.new('char[262144]')
-                n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
-                if n > 0:
-                    raw = bytes(_accel_ffi.buffer(buf)[0:262144])
-                    pos = 0
-                    for _ in range(n):
-                        end = raw.index(b'\x00', pos)
-                        _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
-                        pos = end + 1
-            except Exception: pass
-            while _time.time() < deadline:
-                if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
-                    print(f" ✅  snapshots={_LOCAL_ORACLE.snapshot_count}", flush=True)
-                    return True
+            # Drain any already-buffered C SSE frames first
+            if _accel_ok:
                 try:
-                    buf2 = _accel_ffi.new('char[65536]')
-                    n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
-                    if n2 > 0:
-                        raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
-                        pos2 = 0
-                        for _ in range(n2):
-                            end2 = raw2.index(b'\x00', pos2)
-                            _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
-                            pos2 = end2 + 1
+                    buf = _accel_ffi.new('char[262144]')
+                    n   = _accel_lib.qtcl_sse_poll(buf, 262144, 64)
+                    if n > 0:
+                        raw = bytes(_accel_ffi.buffer(buf)[0:262144])
+                        pos = 0
+                        for _ in range(n):
+                            end = raw.index(b'\x00', pos)
+                            _c_ingest_frame(raw[pos:end].decode('utf-8', errors='replace'))
+                            pos = end + 1
                 except Exception: pass
+            while _time.time() < deadline:
+                if _accel_ok:
+                    try:
+                        if _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                            print(f" ✅ (C)  snaps={_LOCAL_ORACLE.snapshot_count}", flush=True)
+                            return True
+                    except Exception: pass
+                if _LOCAL_ORACLE.snapshot_count > 0:
+                    print(f" ✅ (Python SSE)  snaps={_LOCAL_ORACLE.snapshot_count}", flush=True)
+                    return True
+                if _accel_ok:
+                    try:
+                        buf2 = _accel_ffi.new('char[65536]')
+                        n2   = _accel_lib.qtcl_sse_poll(buf2, 65536, 8)
+                        if n2 > 0:
+                            raw2 = bytes(_accel_ffi.buffer(buf2)[0:65536])
+                            pos2 = 0
+                            for _ in range(n2):
+                                end2 = raw2.index(b'\x00', pos2)
+                                _c_ingest_frame(raw2[pos2:end2].decode('utf-8', errors='replace'))
+                                pos2 = end2 + 1
+                    except Exception: pass
                 print('.', end='', flush=True)
                 _time.sleep(0.3)
             print(" ⏱️  timeout — degraded mode", flush=True)
