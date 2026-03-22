@@ -12739,6 +12739,10 @@ double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
     }
 
 
+    return tr_re;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
    §KoyebReg  KOYEB HTTPS PEER REGISTRATION + AUTO P2P WIRING
    ═══════════════════════════════════════════════════════════════════════════ */
