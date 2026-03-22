@@ -2738,6 +2738,7 @@ class QtclP2PNode:
                     _khost.encode() + b'\x00',
                     _kpid.encode()  + b'\x00',
                     _kaddr.encode() + b'\x00',
+                    (_MY_IP or '').encode() + b'\x00',
                     self._port,
                 )
                 _EXP_LOG.info("[P2P] ✅ C koyeb registration thread started")
@@ -3006,8 +3007,12 @@ class QtclP2PNode:
             # /api/p2p/peer_exchange
             try:
                 payload = _pj.dumps({
-                    'node_id': self._node_id, 'port': self._port,
-                    'version': 3, 'capabilities': ['wstate','dmpool','sse'],
+                    'node_id':    self._node_id,
+                    'port':       self._port,
+                    'ip_address': _MY_IP,
+                    'gossip_url': f"http://{_MY_IP}:{self._port}" if _MY_IP else f"http://localhost:{self._port}",
+                    'version':    3,
+                    'capabilities': ['wstate','dmpool','sse'],
                 }).encode()
                 req = _Rq(f"{_oracle_url}/api/p2p/peer_exchange",
                           data=payload,
@@ -3026,12 +3031,14 @@ class QtclP2PNode:
             except Exception: pass
             return peers
 
+        _pe_cycle = 0
         while not self._stop.is_set():
             try:
+                _pe_cycle += 1
                 n_connected = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
                 dm_age      = _pt.time() - _LOCAL_ORACLE._last_oracle_dm_ts
                 dm_fresh    = _LOCAL_ORACLE._last_oracle_dm_ts > 1e9 and dm_age < 30.0
-                need_peers  = n_connected < 2
+                need_peers  = n_connected < 4           # want at least 4 peers
                 dm_stale    = (not dm_fresh) or dm_age > 60.0
 
                 new_connections = 0
@@ -3063,9 +3070,28 @@ class QtclP2PNode:
                             f"[P2P] 🌐 koyeb: {kc}/{len(koyeb_peers)} new peers "
                             f"(need_peers={need_peers}, dm_stale={dm_stale})")
                 else:
+                    # Even when healthy, re-announce self every 5 cycles (~5min)
+                    # so new miners joining can find us
+                    if _pe_cycle % 5 == 0:
+                        try:
+                            _ann = _pj.dumps({
+                                'node_id':    self._node_id,
+                                'port':       self._port,
+                                'ip_address': _MY_IP,
+                                'gossip_url': f"http://{_MY_IP}:{self._port}" if _MY_IP else '',
+                                'block_height': n_connected,
+                            }).encode()
+                            from urllib.request import Request as _ArRq, urlopen as _ArUo
+                            _arr = _ArRq(f"{_oracle_url}/api/peers/register",
+                                         data=_ann,
+                                         headers={'Content-Type':'application/json',
+                                                  'User-Agent':'QTCL-P2P/3.0'},
+                                         method='POST')
+                            with _ArUo(_arr, timeout=6): pass
+                        except Exception: pass
                     _EXP_LOG.debug(
-                        f"[P2P] skipping koyeb — {n_connected} peers active, "
-                        f"DM fresh ({dm_age:.0f}s)")
+                        f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
+                        f"local-only cycle")
 
                 if new_connections == 0 and n_connected == 0:
                     _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
@@ -3075,9 +3101,15 @@ class QtclP2PNode:
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
 
-            # Interval: 30s if starved, 90s normally
+            # Interval: aggressive when starved, back off as peers accumulate
             n_now = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
-            self._stop.wait(30 if n_now < 2 else 90)
+            if   n_now == 0: _wait = 10   # no peers — hammer every 10s
+            elif n_now < 2:  _wait = 20   # 1 peer — try hard
+            elif n_now < 4:  _wait = 30   # getting there
+            else:            _wait = 60   # healthy — relax
+            _EXP_LOG.debug(
+                f"[P2P] discovery cycle {_pe_cycle}: connected={n_now} → next in {_wait}s")
+            self._stop.wait(_wait)
 
     # ── event type 9 = ouroboros self-ingest ─────────────────────────────
     def get_consensus_dm(self):
@@ -3455,6 +3487,47 @@ def start_dm_pool_daemon(db_path: str = _DM_POOL_DB_PATH) -> _dpt.Thread:
     _EXP_LOG.info("[DMPOOL] ✅ Passive DM pool daemon started")
     return t
 
+
+# ── Hardware IP detection — used by P2P registration and gossip_url ──────────
+def _get_hardware_ip() -> str:
+    """Return the outbound LAN/WAN IP of this machine.
+    Uses connect-to-remote trick: bind to 0.0.0.0, probe 8.8.8.8:80,
+    read the assigned source address.  Never actually sends a packet.
+    Falls back through multiple methods; returns '' on total failure.
+    ❤️  I love you — every miner deserves to be found
+    """
+    import socket as _ips
+    # Method 1: outbound UDP probe (most reliable, works behind NAT)
+    try:
+        s = _ips.socket(_ips.AF_INET, _ips.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+            return ip
+    except Exception:
+        pass
+    # Method 2: hostname resolution
+    try:
+        ip = _ips.gethostbyname(_ips.gethostname())
+        if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+            return ip
+    except Exception:
+        pass
+    # Method 3: enumerate interfaces via /proc/net/if_inet6 + /proc/net/fib_trie (Linux)
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(['ip', 'route', 'get', '8.8.8.8'],
+                               stderr=_sp.DEVNULL, timeout=2).decode()
+        for part in out.split():
+            if part.startswith(('192.168.', '10.', '172.')):
+                return part
+    except Exception:
+        pass
+    return ''
+
+_MY_IP: str = _get_hardware_ip()   # resolved once at module load
 
 def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2PNode:
     global _P2P_NODE
@@ -13145,6 +13218,7 @@ typedef struct {
     char   koyeb_host[KOYEB_HOST_MAX];
     char   peer_id[65];
     char   miner_addr[128];
+    char   my_ip[64];          /* outbound hardware IP — never "localhost" */
     uint16_t p2p_port;
     volatile int running;
     pthread_t thread;
@@ -13269,10 +13343,13 @@ void *_koyeb_reg_thread(void *arg) {
         float fid=0.0f; uint32_t h=0;
         qtcl_p2p_get_consensus_dm(NULL,NULL,&fid,&h);
         snprintf(body,sizeof(body),
-            "{\"peer_id\":\"%s\",\"gossip_url\":\"http://localhost:%u\","
+            "{\"peer_id\":\"%s\",\"gossip_url\":\"http://%s:%u\","
             "\"miner_address\":\"%s\",\"block_height\":%u,"
             "\"port\":%u,\"network_version\":\"3\",\"supports_sse\":true}",
-            k->peer_id,(unsigned)k->p2p_port,k->miner_addr,h,(unsigned)k->p2p_port);
+            k->peer_id,
+            k->my_ip[0] ? k->my_ip : "0.0.0.0",
+            (unsigned)k->p2p_port,
+            k->miner_addr, h, (unsigned)k->p2p_port);
         int n=_koyeb_post_tls(k->koyeb_host,"/api/peers/register",body,resp,sizeof(resp));
         if (n>0){
             char *bs=strstr(resp,"\r\n\r\n");
@@ -13307,11 +13384,12 @@ void *_koyeb_hb_thread(void *arg) {
 }
 
 int qtcl_koyeb_start(const char *host, const char *peer_id,
-                     const char *miner_addr, uint16_t p2p_port) {
+                     const char *miner_addr, const char *my_ip, uint16_t p2p_port) {
     if (_KOYEB.running) return 0;
-    strncpy(_KOYEB.koyeb_host, host,                KOYEB_HOST_MAX-1);
-    strncpy(_KOYEB.peer_id,    peer_id,              64);
+    strncpy(_KOYEB.koyeb_host, host,                     KOYEB_HOST_MAX-1);
+    strncpy(_KOYEB.peer_id,    peer_id,                  64);
     strncpy(_KOYEB.miner_addr, miner_addr?miner_addr:"", 127);
+    strncpy(_KOYEB.my_ip,      my_ip?my_ip:"",           63);
     _KOYEB.p2p_port = p2p_port ? p2p_port : 9091;
     _KOYEB.running  = 1;
     pthread_attr_t a; pthread_attr_init(&a);
@@ -13613,7 +13691,8 @@ _QTCL_C_DEFS: str = """
 
     /* §KoyebReg — HTTPS peer registration + fire-and-forget posts */
     int     qtcl_koyeb_start(const char *host, const char *peer_id,
-                              const char *miner_addr, uint16_t p2p_port);
+                              const char *miner_addr, const char *my_ip,
+                              uint16_t p2p_port);
     void    qtcl_koyeb_stop(void);
     void    qtcl_koyeb_post_async(const char *host, const char *path,
                                    const char *json_body);
@@ -16108,12 +16187,13 @@ class QtclClientApp:
                 # Upsert self into local DB
                 if self._db:
                     try:
+                        _self_ip = _MY_IP or 'localhost'
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (self._peer_id, 'localhost', 9091, bh,
+                        """, (self._peer_id, _self_ip, 9091, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
@@ -16474,8 +16554,13 @@ class QtclClientApp:
         self._init_db()
 
         # ── Register peer with height=0 (updated after SSE delivers first frame)
+        # Use outbound hardware IP so other miners can actually reach us.
+        # Server also records request.remote_addr as fallback but gossip_url
+        # with the real IP is what gets returned in live_peers to other miners.
+        _p2p_gossip_ip = _MY_IP or 'localhost'
+        _my_gossip_url = f"http://{_p2p_gossip_ip}:9091"
         _reg_resp = self.api.register_peer(
-            self._peer_id, "http://localhost:9091", self.wallet.address, 0)
+            self._peer_id, _my_gossip_url, self.wallet.address, 0)
         if _reg_resp and _accel_ok:
             for _bp in (_reg_resp.get('live_peers') or [])[:32]:
                 _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
@@ -16505,7 +16590,8 @@ class QtclClientApp:
                 _kaddr = (getattr(getattr(self,'wallet',None),'address','') or '').encode() + b'\x00'
                 _accel_lib.qtcl_koyeb_stop()
                 import time as _kst; _kst.sleep(0.05)
-                _accel_lib.qtcl_koyeb_start(_khost, _kpid, _kaddr, 9091)
+                _kip = (_MY_IP or '').encode() + b'\x00'
+                _accel_lib.qtcl_koyeb_start(_khost, _kpid, _kaddr, _kip, 9091)
                 _EXP_LOG.info("[CLIENT] ✅ C koyeb registration thread (re)started with wallet address")
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
