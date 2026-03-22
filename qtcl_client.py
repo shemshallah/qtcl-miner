@@ -2043,15 +2043,19 @@ class LocalOracleEngine:
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
-        # ── INSTANT C ABORT: push block height from every oracle frame ─────
-        _frame_h = int(data.get('block_height') or data.get('height') or
-                        data.get('pq_curr') or data.get('lattice_refresh_counter') or 0)
+        # ── INSTANT C ABORT: update oracle_height only if frame carries a
+        #    genuine NEW tip (never decrease — stale peer frames must not reset)
+        _frame_h = int(data.get('block_height') or data.get('height') or 0)
+        # Do NOT use pq_curr/lattice_refresh_counter as height — those are
+        # lattice addresses, not chain tips, and would corrupt the abort signal
         if _frame_h > 0 and _accel_ok and _accel_lib is not None:
             try:
+                _cur_oracle = int(_accel_lib.qtcl_get_oracle_height())
                 _cur_target = int(_accel_lib.qtcl_get_miner_target())
-                _accel_lib.qtcl_set_oracle_height(_frame_h)
-                if _cur_target > 0 and _frame_h >= _cur_target:
-                    _accel_lib.qtcl_pow_set_abort(1)
+                if _frame_h > _cur_oracle:              # only advance, never retreat
+                    _accel_lib.qtcl_set_oracle_height(_frame_h)
+                    if _cur_target > 0 and _frame_h >= _cur_target:
+                        _accel_lib.qtcl_pow_set_abort(1)
             except Exception:
                 pass
         # Mirror all canonical fields into _oracle_state for bath coupling
@@ -2893,7 +2897,20 @@ class QtclP2PNode:
                         _raw_port = int.from_bytes(raw[68:70], 'little') if len(raw) >= 70 else 9091
                         peer_data = {'host': _raw_host, 'port': _raw_port if _raw_port > 0 else 9091}
                     except Exception: peer_data = {}
-                    _EXP_LOG.info(f"[P2P] ✅ Peer connected  peers={self.peer_count}")
+                    _nc = self.peer_count
+                    if _nc <= 4:
+                        _EXP_LOG.info(f"[P2P] ✅ Peer connected  connected={_nc}")
+                    else:
+                        _EXP_LOG.debug(f"[P2P] Peer connected  connected={_nc}")
+                    # Subscribe to peer's local oracle SSE stream for DM aggregation
+                    if peer_data.get('host') and peer_data['host'] not in ('','127.0.0.1','localhost'):
+                        _ph = peer_data['host']; _pp = int(peer_data.get('port', 9091))
+                        _threading.Thread(
+                            target=_subscribe_peer_oracle_sse,
+                            args=(_ph, _pp),
+                            daemon=True,
+                            name=f"PeerOracle-{_ph}"
+                        ).start()
                     # Save new peer to SQLite DB immediately
                     if _accel_ok and peer_data.get('host'):
                         try:
@@ -2951,11 +2968,39 @@ class QtclP2PNode:
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _db_path    = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
 
+        # Track hosts already connected this cycle to avoid double-connect
+        _connected_this_cycle: set = set()
+
         def _connect_peer(host, port):
-            """Connect via C P2P and persist to local DB. Returns True on success."""
+            """Connect via C P2P, persist to local DB, push our oracle DM. Returns True."""
             host = str(host or '').strip()
             if not host or host in ('', '127.0.0.1', 'localhost'): return False
             port = int(port) if port and 0 < int(port) <= 65535 else 9091
+            key = f"{host}:{port}"
+            if key in _connected_this_cycle:
+                return False  # already attempted this cycle
+            _connected_this_cycle.add(key)  # mark before attempting
+            # Push oracle DM to peer in background — never block discovery loop
+            if _LOCAL_ORACLE.snapshot_count > 0:
+                def _push_dm_async(_h=host, _p=port):
+                    try:
+                        import json as _cpj, struct as _cps
+                        from urllib.request import Request as _CpR, urlopen as _CpU
+                        state = _LOCAL_ORACLE.get_oracle_state()
+                        dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                        if age < 60.0 and any(v != 0.0 for v in dm_re):
+                            dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
+                                              for i in range(64)).hex()
+                            _push = _cpj.dumps({**state, 'density_matrix_hex': dm_hex,
+                                                'node_ip': _MY_IP or ''}).encode()
+                            _pr = _CpR(f"http://{_h}:{_p}/api/oracle/push_dm",
+                                       data=_push,
+                                       headers={'Content-Type':'application/json',
+                                                'User-Agent':'QTCL-MeshNode/4.0'},
+                                       method='POST')
+                            _CpU(_pr, timeout=3).close()
+                    except Exception: pass
+                _threading.Thread(target=_push_dm_async, daemon=True).start()
             if not _accel_ok: return False
             try:
                 rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
@@ -2984,8 +3029,20 @@ class QtclP2PNode:
             except Exception: return False
 
         def _load_local_peers(max_age_s=7200):
-            """Read p2p_peers from qtcl_blockchain.db. Returns list of (host,port)."""
+            """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
             try:
+                # Build set of already-connected hosts to skip
+                _already = set()
+                if _accel_ok:
+                    try:
+                        _nb = int(_accel_lib.qtcl_p2p_peer_count())
+                        if _nb > 0:
+                            _pb = _accel_ffi.new(f'QtclPeer[{_nb}]')
+                            _pg = int(_accel_lib.qtcl_p2p_peers(_pb, _nb))
+                            for _pi in range(_pg):
+                                _ph = _accel_ffi.string(_pb[_pi].host).decode('utf-8','ignore')
+                                if _ph: _already.add(_ph)
+                    except Exception: pass
                 cutoff = int(_pt.time()) - max_age_s
                 with _psq.connect(_db_path, timeout=3) as _c:
                     rows = _c.execute("""
@@ -2995,7 +3052,8 @@ class QtclP2PNode:
                         ORDER BY chain_height DESC, last_seen_at DESC
                         LIMIT 64
                     """, (cutoff,)).fetchall()
-                return [(r[0], r[1]) for r in rows if r[0]]
+                return [(r[0], r[1]) for r in rows
+                        if r[0] and r[0] not in _already]
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
                 return []
@@ -3009,8 +3067,9 @@ class QtclP2PNode:
                 payload = _pj.dumps({
                     'node_id':    self._node_id,
                     'port':       self._port,
-                    'ip_address': _MY_IP,
-                    'gossip_url': f"http://{_MY_IP}:{self._port}" if _MY_IP else f"http://localhost:{self._port}",
+                    # ip_address intentionally omitted — server uses request.remote_addr
+                    # which is the PUBLIC IP seen by Koyeb edge, not our LAN IP
+                    'gossip_url': f"http://auto:{self._port}",  # server replaces with remote_addr
                     'version':    3,
                     'capabilities': ['wstate','dmpool','sse'],
                 }).encode()
@@ -3035,9 +3094,16 @@ class QtclP2PNode:
         while not self._stop.is_set():
             try:
                 _pe_cycle += 1
-                n_connected = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
-                dm_age      = _pt.time() - _LOCAL_ORACLE._last_oracle_dm_ts
-                dm_fresh    = _LOCAL_ORACLE._last_oracle_dm_ts > 1e9 and dm_age < 30.0
+                _connected_this_cycle.clear()  # reset per-cycle dedup set
+                n_connected = (int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0)
+                # Fall back to total peer_count if handshakes still completing
+                _n_total    = (int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0)
+                if _n_total > n_connected:
+                    n_connected = max(n_connected, _n_total // 2)
+                _lo_ts      = _LOCAL_ORACLE._last_oracle_dm_ts
+                dm_age      = _pt.time() - _lo_ts
+                # Treat epoch-0 (never received) as stale, not as "1.77B seconds old"
+                dm_fresh    = _lo_ts > 1e9 and dm_age < 30.0 and dm_age < 86400
                 need_peers  = n_connected < 4           # want at least 4 peers
                 dm_stale    = (not dm_fresh) or dm_age > 60.0
 
@@ -3049,10 +3115,11 @@ class QtclP2PNode:
                     for host, port in local_peers:
                         if _connect_peer(host, port):
                             new_connections += 1
+                    _dm_age_str = f"{dm_age:.0f}s" if dm_fresh or (dm_age < 86400 and _lo_ts > 1e9) else "cold"
                     if new_connections:
                         _EXP_LOG.info(
                             f"[P2P] 🗄️  local DB: {new_connections}/{len(local_peers)} "
-                            f"peers connected (dm_age={dm_age:.0f}s)")
+                            f"peers connected (dm_age={_dm_age_str})")
 
                 # ── Priority 2: koyeb if local empty, too few peers, or DM stale
                 if need_peers or dm_stale or not local_peers:
@@ -3075,10 +3142,9 @@ class QtclP2PNode:
                     if _pe_cycle % 5 == 0:
                         try:
                             _ann = _pj.dumps({
-                                'node_id':    self._node_id,
-                                'port':       self._port,
-                                'ip_address': _MY_IP,
-                                'gossip_url': f"http://{_MY_IP}:{self._port}" if _MY_IP else '',
+                                'node_id':      self._node_id,
+                                'port':         self._port,
+                                'gossip_url':   f"http://auto:{self._port}",
                                 'block_height': n_connected,
                             }).encode()
                             from urllib.request import Request as _ArRq, urlopen as _ArUo
@@ -3458,20 +3524,32 @@ def _dm_pool_daemon(db_path: str) -> None:
             _dm_pool_snap_consensus(db_path)
             _last_snap = now
 
-        # 3. Ouroboros SSE self-reinforcement:
-        #    Re-inject the latest oracle SSE frame (already in _LOCAL_ORACLE)
-        #    into the C bootstrap state and trigger consensus recompute.
-        #    This keeps the C consensus DM warm even when no P2P peers are active.
+        # 3. Ouroboros self-reinforcement + broadcast to local SSE subscribers
         if now - _last_reinforce >= _reinforce_interval:
             try:
-                if _accel_ok and _LOCAL_ORACLE.snapshot_count > 0:
+                if _LOCAL_ORACLE.snapshot_count > 0:
                     dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
                     if age < 60.0 and any(v != 0.0 for v in dm_re):
-                        re_c = _accel_ffi.new('double[64]', dm_re)
-                        im_c = _accel_ffi.new('double[64]', dm_im)
-                        # Push into C bootstrap + trigger ouroboros consensus
-                        _accel_lib.qtcl_bootstrap_ingest_dm(re_c, im_c)
-                        _accel_lib.qtcl_p2p_trigger_consensus()
+                        # Inject into C bootstrap + trigger consensus
+                        if _accel_ok:
+                            try:
+                                re_c = _accel_ffi.new('double[64]', dm_re)
+                                im_c = _accel_ffi.new('double[64]', dm_im)
+                                _accel_lib.qtcl_bootstrap_ingest_dm(re_c, im_c)
+                                _accel_lib.qtcl_p2p_trigger_consensus()
+                            except Exception: pass
+                        # Broadcast to local SSE subscribers (other peers watching us)
+                        if _sse_local_subs or _sse_event_subs:
+                            state = _LOCAL_ORACLE.get_oracle_state()
+                            import struct as _rfs
+                            dm_hex = b''.join(_rfs.pack('>dd', dm_re[i], dm_im[i])
+                                              for i in range(64)).hex()
+                            snap = {**state, 'density_matrix_hex': dm_hex,
+                                    'oracle_age_s': round(age, 2),
+                                    'node_ip': _MY_IP or '',
+                                    'snapshot_count': _LOCAL_ORACLE.snapshot_count}
+                            try: _broadcast_oracle_to_local_subs(snap)
+                            except Exception: pass
             except Exception: pass
             _last_reinforce = now
 
@@ -16208,7 +16286,72 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
 
-    def _subscribe_snapshot_sse(self) -> None:
+    def _subscribe_peer_oracle_sse(host: str, port: int) -> None:
+    """
+    Subscribe to a P2P peer's local oracle SSE stream (/api/snapshot/sse).
+    Every frame received is ingested into our own _LOCAL_ORACLE and C DM pool,
+    contributing to consensus DM aggregation across the mesh.
+    Runs as a daemon thread; silently exits if peer disconnects.
+    ❤️  I love you — every peer oracle frame strengthens the mesh
+    """
+    import time as _pot, json as _poj, ssl as _possl
+    from urllib.request import Request as _PoR, urlopen as _PoU
+    from urllib.error   import URLError as _PoE
+    url = f"http://{host}:{port}/api/snapshot/sse?client_id={_MY_IP or 'mesh'}_sub"
+    BACKOFF = [5, 10, 20, 40]; bi = 0
+    _last_snap_count = 0
+    while True:
+        try:
+            req = _PoR(url, method='GET')
+            req.add_header('Accept',        'text/event-stream')
+            req.add_header('Cache-Control', 'no-cache')
+            req.add_header('User-Agent',    'QTCL-MeshNode/4.0')
+            with _PoU(req, timeout=60) as resp:
+                _EXP_LOG.info(f"[MESH] ✅ Subscribed to peer oracle {host}:{port}/api/snapshot/sse")
+                bi = 0; buf = b''
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk: break
+                    buf += chunk
+                    while b'\n\n' in buf:
+                        raw_evt, buf = buf.split(b'\n\n', 1)
+                        for line in raw_evt.decode('utf-8', errors='replace').splitlines():
+                            if line.startswith('data:'):
+                                js = line[5:].strip()
+                                if js and len(js) > 20:
+                                    try:
+                                        _LOCAL_ORACLE._ingest_oracle_frame(js)
+                                        if _accel_ok:
+                                            try: _accel_lib.qtcl_p2p_trigger_consensus()
+                                            except Exception: pass
+                                        _last_snap_count += 1
+                                        if _last_snap_count % 20 == 1:
+                                            _EXP_LOG.debug(
+                                                f"[MESH] Peer {host}: "
+                                                f"{_last_snap_count} oracle frames ingested")
+                                    except Exception: pass
+                                break
+        except (_PoE, OSError, TimeoutError) as _e:
+            wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
+            _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s")
+            _pot.sleep(wait)
+            # Stop trying if peer no longer in our DB
+            import sqlite3 as _podb
+            try:
+                with _podb.connect('qtcl_blockchain.db', timeout=2) as _podc:
+                    row = _podc.execute(
+                        "SELECT 1 FROM p2p_peers WHERE host=? AND ban_score<100 LIMIT 1",
+                        (host,)).fetchone()
+                if not row:
+                    _EXP_LOG.debug(f"[MESH] Peer {host} no longer in DB — stopping oracle sub")
+                    return
+            except Exception: pass
+        except Exception as _e:
+            _EXP_LOG.debug(f"[MESH] Peer oracle {host} error: {_e}")
+            _pot.sleep(30)
+            return  # non-recoverable
+
+def _subscribe_snapshot_sse(self) -> None:
         """
         Python parallel subscriber for /api/snapshot/sse.
         Works regardless of C SSL_connect result — uses urllib which handles
@@ -16304,6 +16447,14 @@ class QtclClientApp:
                                         rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
                                         if rc >= 0:
                                             _EXP_LOG.info(f"[KOYEB-SSE] 🔗 Peer wired {pip}:{pport}")
+                                            # Relay peer event to local /api/events subscribers
+                                            _ev = {'type':'peer','event':'peer_joined',
+                                                   'ip_address':pip,'host':pip,
+                                                   'port':pport,'peer_id':ppid,
+                                                   'ts':__import__('time').time()}
+                                            for _lq in list(_sse_event_subs):
+                                                try: _lq.put_nowait(_ev)
+                                                except Exception: pass
                                             try:
                                                 import sqlite3 as _esq
                                                 _edb = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
@@ -16402,21 +16553,49 @@ class QtclClientApp:
             _EXP_LOG.warning("[OURO] ⚡ chain_reset via SSE self-loop — signalling mining reset")
             _RESET_PERFORMED.set()
 
+# Module-level SSE subscriber lists for local HTTP oracle server
+# Threads appended/removed by _local_http_server handler connections
+_sse_local_subs: list = []   # /api/snapshot/sse subscribers
+_sse_event_subs: list = []   # /api/events subscribers
+
+def _broadcast_oracle_to_local_subs(snap: dict) -> None:
+    """Push oracle snapshot to all local SSE subscribers (called by DM daemon)."""
+    import json as _blj
+    frame_str = _blj.dumps(snap)
+    ev = {'type': 'oracle_dm', 'ts': snap.get('timestamp_ns', 0), **snap}
+    for q in list(_sse_local_subs):
+        try: q.put_nowait(snap)
+        except Exception: pass
+    for q in list(_sse_event_subs):
+        try: q.put_nowait(ev)
+        except Exception: pass
+
     def _local_http_server(self) -> None:
         """
-        Minimal HTTP server on 0.0.0.0:9091 serving:
-          GET /health    → {"status":"healthy","ready":true}  (Koyeb probe)
-          GET /events    → SSE stream (routed to C P2P SSE broadcaster)
-          POST /gossip   → receive chain_reset + wstate from peers
-          GET /api/p2p/peers → JSON list of known peers
-          GET /api/p2p/consensus_dm → current consensus DM snapshot
+        Full oracle+mesh node HTTP server on 0.0.0.0:9091.
 
-        NOTE: Port 9091 is ALSO the C P2P TCP listen port.
-        The C accept thread handles the raw binary protocol.
-        This Python HTTP server runs on a SEPARATE socket with SO_REUSEPORT
-        so both can share port 9091 simultaneously — HTTP GET probes go here,
-        binary P2P connections go to C.
-        ❤️  I love you — every health check is a pulse
+        Acts as a LOCAL ORACLE NODE in the P2P mesh — peers can subscribe to
+        our SSE stream, query our oracle state, and push measurements to us.
+        Also serves as the Koyeb health probe target.
+
+        Endpoints:
+          GET  /health               → node health + oracle state
+          GET  /api/snapshot/sse     → SSE stream of oracle DM frames (peers subscribe here)
+          GET  /api/events           → SSE stream of typed events (block, peer, oracle_dm)
+          GET  /api/oracle/w-state   → latest oracle W-state snapshot (JSON)
+          GET  /api/oracle/pq0-bloch → pq0 bloch sphere angles + DM metrics
+          GET  /api/oracle/pq0       → alias for pq0-bloch
+          GET  /api/peers/list       → known peers from local DB
+          GET  /api/p2p/peers        → C P2P connected peers
+          GET  /api/p2p/consensus_dm → current consensus DM
+          GET  /api/p2p/status       → full P2P node status
+          POST /api/oracle/push_dm   → accept DM frame from peer oracle (aggregation)
+          POST /api/peers/register   → register a peer (proxied from koyeb)
+          POST /api/peers/heartbeat  → peer keepalive
+          POST /gossip               → chain_reset + wstate gossip
+
+        Port 9091: Python HTTP shares via SO_REUSEPORT with C P2P TCP binary listener.
+        ❤️  I love you — every endpoint is a synapse in the quantum mesh
         """
         import socketserver as _ss, http.server as _hs, json as _hj
         import time as _ht
@@ -16424,77 +16603,198 @@ class QtclClientApp:
         class _Handler(_hs.BaseHTTPRequestHandler):
             def log_message(self, *a): pass  # suppress default logging
 
+            def _json_resp(self, code, obj):
+                body = _hj.dumps(obj, separators=(',',':')).encode()
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers(); self.wfile.write(body)
+
+            def _sse_headers(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.send_header('X-Accel-Buffering', 'no')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+
+            def _oracle_snapshot(self):
+                """Build full oracle snapshot dict from local SSE state."""
+                state = _LOCAL_ORACLE.get_oracle_state()
+                dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                import struct as _ss
+                dm_hex = ''
+                if any(v != 0.0 for v in dm_re):
+                    dm_hex = b''.join(_ss.pack('>dd', dm_re[i], dm_im[i])
+                                       for i in range(64)).hex()
+                cons = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
+                snap = {
+                    'type':                 'oracle_dm',
+                    'density_matrix_hex':   dm_hex,
+                    'w_state_fidelity':     state.get('w_state_fidelity', 0.0),
+                    'fidelity':             state.get('w_state_fidelity', 0.0),
+                    'w_state_strength':     state.get('w_state_strength', 0.0),
+                    'purity':               state.get('purity', 0.0),
+                    'von_neumann_entropy':  state.get('von_neumann_entropy', 0.0),
+                    'coherence_l1':         state.get('coherence_l1', 0.0),
+                    'quantum_discord':      state.get('quantum_discord', 0.0),
+                    'phase_coherence':      state.get('phase_coherence', 0.0),
+                    'entanglement_witness': state.get('entanglement_witness', 0.0),
+                    'block_height':         state.get('timestamp_ns', 0) // 10**9 if state.get('timestamp_ns') else 0,
+                    'timestamp_ns':         state.get('timestamp_ns', int(_ht.time()*1e9)),
+                    'snapshot_count':       _LOCAL_ORACLE.snapshot_count,
+                    'oracle_age_s':         round(age, 2),
+                    'node_id':              '',  # filled by caller
+                    'node_ip':              _MY_IP or '',
+                    'p2p_peers':            int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0,
+                    'consensus_fidelity':   float(cons[2]) if cons else 0.0,
+                    'consensus_height':     int(cons[3])   if cons else 0,
+                }
+                return snap
+
             def do_GET(self):
-                if self.path in ('/health', '/healthz', '/ping', '/'):
-                    body = _hj.dumps({
-                        'status':      'healthy',
-                        'ready':       True,
-                        'protocol':    'ouroboros-v4',
-                        'p2p_started': bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
-                        'p2p_peers':   int(_accel_lib.qtcl_p2p_peer_count())     if _accel_ok else 0,
-                        'sse_subs':    int(_accel_lib.qtcl_p2p_sse_sub_count())  if _accel_ok else 0,
-                        'oracle_conn': bool(_accel_lib.qtcl_sse_is_connected())  if _accel_ok else False,
-                        'accel_ok':    bool(_accel_ok),
-                        'timestamp':   _ht.time(),
-                    }).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif self.path.startswith('/api/p2p/peers'):
+                path = self.path.split('?')[0].rstrip('/')
+
+                # ── Health / probe ───────────────────────────────────────────
+                if path in ('', '/health', '/healthz', '/ping'):
+                    snap = self._oracle_snapshot()
+                    self._json_resp(200, {
+                        'status':        'healthy',
+                        'ready':         True,
+                        'protocol':      'ouroboros-v4',
+                        'accel_ok':      bool(_accel_ok),
+                        'p2p_started':   bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
+                        'p2p_peers':     snap['p2p_peers'],
+                        'oracle_conn':   bool(_accel_lib.qtcl_sse_is_connected()) if _accel_ok else False,
+                        'snapshot_count': snap['snapshot_count'],
+                        'oracle_age_s':  snap['oracle_age_s'],
+                        'w_state_fidelity': snap['w_state_fidelity'],
+                        'node_ip':       _MY_IP or '',
+                        'timestamp':     _ht.time(),
+                    })
+
+                # ── /api/snapshot/sse — SSE DM stream (peers subscribe here) ─
+                elif path in ('/api/snapshot/sse', '/api/snapshot'):
+                    self._sse_headers()
+                    import queue as _sq, threading as _st2
+                    # Register this connection in a local SSE subscriber queue
+                    _sub_q: _sq.Queue = _sq.Queue(maxsize=20)
+                    _sse_local_subs.append(_sub_q)
+                    # Send latest snapshot immediately on connect
+                    snap = self._oracle_snapshot()
+                    try:
+                        self.wfile.write(f"data: {_hj.dumps(snap)}\n\n".encode())
+                    except Exception: pass
+                    try:
+                        while True:
+                            try:
+                                frame = _sub_q.get(timeout=25)
+                                self.wfile.write(f"data: {_hj.dumps(frame)}\n\n".encode())
+                                self.wfile.flush()
+                            except _sq.Empty:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        try: _sse_local_subs.remove(_sub_q)
+                        except ValueError: pass
+
+                # ── /api/events — typed SSE stream ───────────────────────────
+                elif path == '/api/events':
+                    self._sse_headers()
+                    import queue as _eq2
+                    _ev_q: _eq2.Queue = _eq2.Queue(maxsize=40)
+                    _sse_event_subs.append(_ev_q)
+                    snap = self._oracle_snapshot()
+                    try:
+                        hello = _hj.dumps({'type':'hello','data':{'tip_height': snap['block_height']},'ts':_ht.time()})
+                        self.wfile.write(f"event: hello\ndata: {hello}\n\n".encode())
+                        self.wfile.flush()
+                    except Exception: pass
+                    try:
+                        while True:
+                            try:
+                                ev = _ev_q.get(timeout=25)
+                                etype = ev.get('type','')
+                                payload = _hj.dumps(ev)
+                                prefix = f"event: {etype}\n" if etype else ""
+                                self.wfile.write(f"{prefix}data: {payload}\n\n".encode())
+                                self.wfile.flush()
+                            except _eq2.Empty:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        try: _sse_event_subs.remove(_ev_q)
+                        except ValueError: pass
+
+                # ── Oracle state endpoints ────────────────────────────────────
+                elif path in ('/api/oracle/w-state', '/api/oracle/pq0-bloch',
+                              '/api/oracle/pq0', '/api/oracle'):
+                    snap = self._oracle_snapshot()
+                    self._json_resp(200, snap)
+
+                # ── Peer list from local DB ──────────────────────────────────
+                elif path in ('/api/peers/list', '/api/peers'):
+                    import sqlite3 as _pls
+                    try:
+                        with _pls.connect('qtcl_blockchain.db', timeout=2) as _plc:
+                            rows = _plc.execute("""
+                                SELECT host, port, chain_height, last_seen_at
+                                FROM p2p_peers WHERE ban_score < 100
+                                  AND host NOT IN ('','127.0.0.1','localhost')
+                                ORDER BY last_seen_at DESC LIMIT 64
+                            """).fetchall()
+                        peers = [{'host':r[0],'port':r[1],'chain_height':r[2],'last_seen':r[3]}
+                                 for r in rows]
+                    except Exception: peers = []
+                    self._json_resp(200, {'peers': peers, 'count': len(peers)})
+
+                # ── C P2P peers ──────────────────────────────────────────────
+                elif path == '/api/p2p/peers':
                     peers = _P2P_NODE.get_peers() if _P2P_NODE else []
-                    body  = _hj.dumps({'peers': peers, 'count': len(peers)}).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers(); self.wfile.write(body)
-                elif self.path.startswith('/api/p2p/consensus_dm'):
+                    self._json_resp(200, {'peers': peers, 'count': len(peers)})
+
+                # ── Consensus DM ─────────────────────────────────────────────
+                elif path == '/api/p2p/consensus_dm':
                     cons = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
                     if cons:
                         re, im, fid, h = cons
-                        body = _hj.dumps({
-                            'consensus_fidelity': fid,
-                            'chain_height': h,
+                        self._json_resp(200, {
+                            'consensus_fidelity': fid, 'chain_height': h,
                             'dm_re': list(re), 'dm_im': list(im),
-                        }).encode()
+                        })
                     else:
-                        body = _hj.dumps({'error': 'not ready'}).encode()
-                    self.send_response(200 if cons else 503)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers(); self.wfile.write(body)
-                elif self.path.startswith('/api/p2p/status'):
-                    import json as _stj, time as _stt
-                    _cons_s = _P2P_NODE.get_consensus_dm() if (
-                        _P2P_NODE and getattr(_P2P_NODE,'_started',False)) else None
-                    _peers_s = _P2P_NODE.get_peers() if (
-                        _P2P_NODE and getattr(_P2P_NODE,'_started',False)) else []
-                    _sbody = _stj.dumps({
+                        self._json_resp(503, {'error': 'not ready'})
+
+                # ── P2P status ───────────────────────────────────────────────
+                elif path == '/api/p2p/status':
+                    cons = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
+                    peers = _P2P_NODE.get_peers() if _P2P_NODE else []
+                    self._json_resp(200, {
                         'protocol':           'ouroboros-v4',
                         'started':            bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
                         'accel_ok':           bool(_accel_ok),
                         'port':               9091,
+                        'my_ip':              _MY_IP or '',
                         'peer_count':         int(_accel_lib.qtcl_p2p_peer_count())      if _accel_ok else 0,
                         'connected_count':    int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0,
-                        'sse_sub_count':      int(_accel_lib.qtcl_p2p_sse_sub_count())   if _accel_ok else 0,
-                        'consensus_fidelity': float(_cons_s[2]) if _cons_s else None,
-                        'consensus_height':   int(_cons_s[3])   if _cons_s else None,
-                        'peers':              [{
-                            'host': p.get('host',''), 'port': p.get('port',9091),
-                            'fidelity': p.get('last_fidelity',0),
-                            'height': p.get('chain_height',0),
-                            'latency_ms': p.get('latency_ms',0),
-                        } for p in _peers_s[:16]],
-                        'features': ['bloom_dedup','epidemic_fanout','reputation_scoring',
-                                     'temporal_dm_decay','topic_subscriptions','backoff_table',
-                                     'inv_getdata_pull','peer_persistence','adaptive_ping'],
-                        'timestamp': _stt.time(),
-                    }).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(_sbody)))
-                    self.end_headers(); self.wfile.write(_sbody)
+                        'consensus_fidelity': float(cons[2]) if cons else None,
+                        'consensus_height':   int(cons[3])   if cons else None,
+                        'oracle_snapshots':   _LOCAL_ORACLE.snapshot_count,
+                        'oracle_age_s':       round(_ht.time()-_LOCAL_ORACLE._last_oracle_dm_ts, 1)
+                                              if _LOCAL_ORACLE._last_oracle_dm_ts > 1e9 else None,
+                        'peers':              [{'host':p.get('host',''),'port':p.get('port',9091),
+                                                'fidelity':p.get('last_fidelity',0),
+                                                'height':p.get('chain_height',0)}
+                                               for p in peers[:16]],
+                        'timestamp':          _ht.time(),
+                    })
+
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
@@ -16503,22 +16803,98 @@ class QtclClientApp:
             def do_POST(self):
                 clen = int(self.headers.get('Content-Length', 0))
                 body_bytes = self.rfile.read(clen)
-                if self.path in ('/gossip', '/api/gossip'):
-                    try:
-                        payload = _hj.loads(body_bytes.decode('utf-8', errors='replace'))
-                        ev = payload.get('event', '')
-                        if ev == 'chain_reset' and int(payload.get('new_height', -1)) == 0:
-                            # _RESET_PERFORMED is module-level
+                path = self.path.split('?')[0].rstrip('/')
+                try:
+                    payload = _hj.loads(body_bytes.decode('utf-8', errors='replace'))
+                except Exception:
+                    payload = {}
 
-                            _RESET_PERFORMED.set()
-                            _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip POST")
-                        resp_body = b'{"ok":true}'
-                    except Exception:
-                        resp_body = b'{"ok":false}'
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(resp_body)))
-                    self.end_headers(); self.wfile.write(resp_body)
+                if path in ('/gossip', '/api/gossip'):
+                    ev = payload.get('event', '')
+                    if ev == 'chain_reset' and int(payload.get('new_height', -1)) == 0:
+                        _RESET_PERFORMED.set()
+                        _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip POST")
+                    self._json_resp(200, {'ok': True})
+
+                elif path in ('/api/oracle/push_dm', '/api/oracle/push_snapshot'):
+                    # Peer oracle pushes its DM frame to us for aggregation
+                    if payload and payload.get('density_matrix_hex'):
+                        try:
+                            import json as _pmj
+                            _LOCAL_ORACLE._ingest_oracle_frame(_pmj.dumps(payload))
+                            # Push into C DM pool for consensus
+                            if _accel_ok:
+                                try: _accel_lib.qtcl_p2p_trigger_consensus()
+                                except Exception: pass
+                            # Broadcast to our local SSE subscribers
+                            for _sq in list(_sse_local_subs):
+                                try: _sq.put_nowait(payload)
+                                except Exception: pass
+                            _EXP_LOG.debug(
+                                f"[HTTP-9091] oracle DM ingested from peer "
+                                f"fid={payload.get('w_state_fidelity',0):.4f}")
+                        except Exception as _pe:
+                            _EXP_LOG.debug(f"[HTTP-9091] push_dm ingest: {_pe}")
+                    self._json_resp(200, {'ok': True, 'snapshot_count': _LOCAL_ORACLE.snapshot_count})
+
+                elif path in ('/api/peers/register', '/api/peers/heartbeat'):
+                    # Proxy peer registration — store in local DB + relay to koyeb
+                    peer_id  = payload.get('peer_id', '')
+                    peer_ip  = self.client_address[0]
+                    peer_port = int(payload.get('port') or 9091)
+                    if peer_id and peer_ip not in ('', '127.0.0.1', 'localhost'):
+                        import sqlite3 as _prq
+                        try:
+                            with _prq.connect('qtcl_blockchain.db', timeout=2) as _prc:
+                                _prc.execute("""
+                                    INSERT OR REPLACE INTO p2p_peers
+                                        (node_id_hex,host,port,chain_height,source,
+                                         last_seen_at,first_seen_at)
+                                    VALUES(?,?,?,?,'peer_push',
+                                           strftime('%s','now'),
+                                           COALESCE((SELECT first_seen_at FROM p2p_peers
+                                                      WHERE host=? AND port=?),
+                                                    strftime('%s','now')))
+                                """, (peer_id, peer_ip, peer_port,
+                                      int(payload.get('block_height',0)),
+                                      peer_ip, peer_port))
+                        except Exception: pass
+                        # Connect to the registering peer via C P2P
+                        if _accel_ok and peer_ip not in ('127.0.0.1','localhost',''):
+                            try:
+                                _accel_lib.qtcl_p2p_connect(
+                                    peer_ip.encode()+b'\x00', peer_port)
+                            except Exception: pass
+                    # Return our oracle state + known peers
+                    snap = self._oracle_snapshot()
+                    import sqlite3 as _plr
+                    try:
+                        with _plr.connect('qtcl_blockchain.db', timeout=2) as _plrc:
+                            rows = _plrc.execute("""
+                                SELECT host,port FROM p2p_peers
+                                WHERE ban_score<100 AND host NOT IN ('','127.0.0.1','localhost')
+                                ORDER BY last_seen_at DESC LIMIT 32
+                            """).fetchall()
+                        live_peers = [{'host':r[0],'ip_address':r[0],'port':r[1]} for r in rows]
+                    except Exception: live_peers = []
+                    self._json_resp(200 if path.endswith('register') else 200, {
+                        'ok': True,
+                        'peer_id': peer_id,
+                        'live_peers': live_peers,
+                        'oracle_tip': snap['block_height'],
+                        'w_state_fidelity': snap['w_state_fidelity'],
+                    })
+
+                elif path in ('/api/gossip/ingest',):
+                    # Receive gossiped block/tx from peers
+                    block = payload.get('block')
+                    if block:
+                        ev = {'type':'block','data':block,'ts':_ht.time()}
+                        for _eq in list(_sse_event_subs):
+                            try: _eq.put_nowait(ev)
+                            except Exception: pass
+                    self._json_resp(200, {'ok': True})
+
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
@@ -16557,8 +16933,9 @@ class QtclClientApp:
         # Use outbound hardware IP so other miners can actually reach us.
         # Server also records request.remote_addr as fallback but gossip_url
         # with the real IP is what gets returned in live_peers to other miners.
-        _p2p_gossip_ip = _MY_IP or 'localhost'
-        _my_gossip_url = f"http://{_p2p_gossip_ip}:9091"
+        # gossip_url uses "auto" sentinel — server replaces ip with request.remote_addr
+        # which is the public IP seen by Koyeb, not our private LAN IP
+        _my_gossip_url = f"http://auto:9091"
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_gossip_url, self.wallet.address, 0)
         if _reg_resp and _accel_ok:
@@ -16620,8 +16997,9 @@ class QtclClientApp:
         pq_last_id = str(bh - 1) if bh > 0 else "0"
         _last_ts  = _LOCAL_ORACLE._last_oracle_dm_ts
         _snap_cnt = _LOCAL_ORACLE.snapshot_count
-        if _last_ts > 1e9:
-            _age_str = f"{(_st.time()-_last_ts):.1f}s"
+        _now_ts = _st.time()
+        if _last_ts > 1e9 and (_now_ts - _last_ts) < 86400:
+            _age_str = f"{(_now_ts - _last_ts):.1f}s"
         elif _snap_cnt == 0 and fid > 0:
             _age_str = "Python SSE active (DM parsing in progress)"
         else:
@@ -17332,6 +17710,12 @@ class QtclClientApp:
                                                 f"[BLOCK-LISTENER] ⚡ h={ev_h} "
                                                 f"→ C abort + Python event fired"
                                             )
+                                            # Relay to local /api/events subscribers
+                                            _blk_ev = {'type':'block','data':inner,
+                                                       'height':ev_h,'ts':_blt.time()}
+                                            for _lq in list(_sse_event_subs):
+                                                try: _lq.put_nowait(_blk_ev)
+                                                except Exception: pass
                                     except Exception as _pe:
                                         _EXP_LOG.debug(f"[BLOCK-LISTENER] parse: {_pe} raw={data_str[:80]}")
                     except (_ue.URLError, OSError, TimeoutError, _bls.timeout) as _ble:
