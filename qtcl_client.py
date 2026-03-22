@@ -3069,6 +3069,75 @@ class QtclP2PNode:
 _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
 
+# ── Python peer DB (uses built-in sqlite3 — no C dependency) ─────────────────
+import sqlite3 as _sq3, pathlib as _plib
+
+_PEER_DB_PATH = str(_plib.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
+
+def _peerdb_ensure(path: str) -> None:
+    _plib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with _sq3.connect(path) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS known_peers
+                     (host TEXT, port INTEGER, last_seen INTEGER,
+                      PRIMARY KEY(host, port))""")
+
+def peerdb_load(path: str = _PEER_DB_PATH) -> int:
+    """Load peers from SQLite and connect via C P2P. Returns connected count."""
+    if not _accel_ok: return 0
+    try:
+        _peerdb_ensure(path)
+        with _sq3.connect(path) as c:
+            rows = c.execute(
+                "SELECT host, port FROM known_peers ORDER BY last_seen DESC LIMIT 64"
+            ).fetchall()
+        loaded = 0
+        for host, port in rows:
+            if not host or host in ('127.0.0.1', 'localhost'): continue
+            port = int(port) if port and 0 < port <= 65535 else 9091
+            try:
+                rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
+                if rc >= 0: loaded += 1
+            except Exception: pass
+        return loaded
+    except Exception as _e:
+        _EXP_LOG.debug(f"[PEERDB] load: {_e}")
+        return 0
+
+def peerdb_save(path: str = _PEER_DB_PATH) -> int:
+    """Save all active C P2P peers to SQLite. Returns saved count."""
+    if not _accel_ok: return 0
+    try:
+        _peerdb_ensure(path)
+        n = int(_accel_lib.qtcl_p2p_peer_count())
+        if n <= 0: return 0
+        buf = _accel_ffi.new(f'QtclPeer[{max(n,1)}]')
+        got = int(_accel_lib.qtcl_p2p_peers(buf, n))
+        saved = 0
+        with _sq3.connect(path) as c:
+            for i in range(got):
+                host = _accel_ffi.string(buf[i].host).decode('utf-8', errors='ignore')
+                port = int(buf[i].port) or 9091
+                if not host or host in ('127.0.0.1', 'localhost'): continue
+                c.execute("""INSERT OR REPLACE INTO known_peers(host,port,last_seen)
+                             VALUES(?,?,strftime('%s','now'))""", (host, port))
+                saved += 1
+        return saved
+    except Exception as _e:
+        _EXP_LOG.debug(f"[PEERDB] save: {_e}")
+        return 0
+
+def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
+    """Upsert a single peer into SQLite."""
+    if not host or host in ('127.0.0.1', 'localhost'): return
+    try:
+        _peerdb_ensure(path)
+        with _sq3.connect(path) as c:
+            c.execute("""INSERT OR REPLACE INTO known_peers(host,port,last_seen)
+                         VALUES(?,?,strftime('%s','now'))""", (host, int(port) or 9091))
+    except Exception as _e:
+        _EXP_LOG.debug(f"[PEERDB] upsert: {_e}")
+
+
 def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2PNode:
     global _P2P_NODE
     if _P2P_NODE is None:
@@ -12975,88 +13044,11 @@ void qtcl_p2p_announce_block(uint32_t height, const char *block_hash_hex,
     }
 }
 
-/* ─── §PeerDB  SQLite peer persistence ──────────────────────────────────── */
-#if defined(__has_include)
-#  if __has_include(<sqlite3.h>)
-#    define QTCL_HAS_SQLITE 1
-#    include <sqlite3.h>
-#  endif
-#endif
-
-#ifdef QTCL_HAS_SQLITE
-int qtcl_peerdb_load(const char *db_path) {
-    sqlite3 *db=NULL;
-    if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
-    sqlite3_exec(db,
-        "CREATE TABLE IF NOT EXISTS known_peers"
-        "(host TEXT,port INTEGER,last_seen INTEGER,PRIMARY KEY(host,port));",
-        NULL,NULL,NULL);
-    sqlite3_stmt *st=NULL;
-    sqlite3_prepare_v2(db,
-        "SELECT host,port FROM known_peers ORDER BY last_seen DESC LIMIT 64",
-        -1,&st,NULL);
-    int loaded=0;
-    while (sqlite3_step(st)==SQLITE_ROW) {
-        const char *h=(const char*)sqlite3_column_text(st,0);
-        int p=sqlite3_column_int(st,1);
-        if (!h||!h[0]) continue;
-        if (p<=0||p>65535) p=9091;
-        if (qtcl_p2p_connect(h,(uint16_t)p)>=0) loaded++;
-    }
-    sqlite3_finalize(st); sqlite3_close(db);
-    return loaded;
-}
-int qtcl_peerdb_save(const char *db_path) {
-    if (!_P2P.running) return 0;
-    sqlite3 *db=NULL;
-    if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
-    sqlite3_exec(db,
-        "CREATE TABLE IF NOT EXISTS known_peers"
-        "(host TEXT,port INTEGER,last_seen INTEGER,PRIMARY KEY(host,port));",
-        NULL,NULL,NULL);
-    sqlite3_stmt *st=NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO known_peers(host,port,last_seen)"
-        " VALUES(?,?,strftime('%s','now'));",
-        -1,&st,NULL);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    int saved=0;
-    for (int i=0;i<P2P_MAX_PEERS;i++) {
-        if (!_P2P.peers[i].active||!_P2P.peers[i].host[0]) continue;
-        sqlite3_bind_text(st,1,_P2P.peers[i].host,-1,SQLITE_STATIC);
-        sqlite3_bind_int(st,2,(int)_P2P.peers[i].port);
-        if (sqlite3_step(st)==SQLITE_DONE) saved++;
-        sqlite3_reset(st);
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    sqlite3_finalize(st); sqlite3_close(db);
-    return saved;
-}
-int qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port) {
-    sqlite3 *db=NULL;
-    if (sqlite3_open(db_path,&db)!=SQLITE_OK) return -1;
-    sqlite3_exec(db,
-        "CREATE TABLE IF NOT EXISTS known_peers"
-        "(host TEXT,port INTEGER,last_seen INTEGER,PRIMARY KEY(host,port));",
-        NULL,NULL,NULL);
-    sqlite3_stmt *st=NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO known_peers(host,port,last_seen)"
-        " VALUES(?,?,strftime('%s','now'));",
-        -1,&st,NULL);
-    sqlite3_bind_text(st,1,host,-1,SQLITE_STATIC);
-    sqlite3_bind_int(st,2,(int)port);
-    int ok=(sqlite3_step(st)==SQLITE_DONE)?1:0;
-    sqlite3_finalize(st); sqlite3_close(db);
-    return ok;
-}
-#else
-/* sqlite3 not available — graceful no-ops */
+/* ─── §PeerDB  Stubs — peer persistence handled in Python (built-in sqlite3) ─ */
 int  qtcl_peerdb_load(const char *db_path)  { (void)db_path; return 0; }
 int  qtcl_peerdb_save(const char *db_path)  { (void)db_path; return 0; }
 int  qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port)
      { (void)db_path;(void)host;(void)port; return 0; }
-#endif /* QTCL_HAS_SQLITE */
 """
 
 # ── CFFI function declarations (mirrors every public function in _QTCL_C_SRC) ──
@@ -13340,7 +13332,7 @@ def _compile_c_layer() -> None:
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
         _accel_lib = _accel_ffi.verify(
             _QTCL_C_SRC,
-            libraries=['ssl', 'crypto'],  # sqlite3 included via __has_include guard
+            libraries=['ssl', 'crypto', 'sqlite3'],
             extra_compile_args=[
                 '-O3', '-march=native', '-ffast-math', '-funroll-loops',
                 '-DOPENSSL_NO_DEPRECATED',
