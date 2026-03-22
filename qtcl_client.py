@@ -3059,8 +3059,9 @@ class QtclP2PNode:
                         ORDER BY chain_height DESC, last_seen_at DESC
                         LIMIT 64
                     """, (cutoff,)).fetchall()
-                return [(r[0], r[1]) for r in rows
-                        if r[0] and r[0] not in _already]
+                # Don't filter by already-connected — qtcl_p2p_connect is idempotent
+                # The dedup set _connected_this_cycle handles per-cycle dedup
+                return [(r[0], r[1]) for r in rows if r[0]]
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
                 return []
@@ -3167,7 +3168,9 @@ class QtclP2PNode:
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
 
-                if new_connections == 0 and n_connected == 0:
+                # Check total peers (including handshaking) before warning
+                _n_total_check = int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0
+                if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
                     _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
                     self._stop.wait(30)
                     continue
