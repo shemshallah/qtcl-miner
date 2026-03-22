@@ -1799,7 +1799,7 @@ class LocalOracleEngine:
     """SSE → DM → Measurement pipeline with full snapshot lifecycle.
 
     Boot sequence:
-      1. qtcl_sse_connect(host, 9091, '/api/snapshot/sse')  [C — fatal if unavailable]
+      1. qtcl_sse_connect(host, 443, '/api/snapshot/sse')  [C — fatal if unavailable]
       2. Poll qtcl_sse_poll() for JSON frames on background thread
       3. Parse density_matrix_hex → dm_re, dm_im (8×8 complex128)
          → also updates _oracle_state with all canonical metrics from Koyeb oracle
@@ -1853,7 +1853,7 @@ class LocalOracleEngine:
         self._stop.clear()
         host = self.ORACLE_HOST.encode() + b'\x00'
         path = self.SSE_PATH.encode() + b'\x00'
-        rc = _accel_lib.qtcl_sse_connect(host, 9091, path)
+        rc = _accel_lib.qtcl_sse_connect(host, 443, path)
         if rc != 0:
             raise RuntimeError(
                 f"[LocalOracleEngine.start] qtcl_sse_connect returned {rc} — "
@@ -1909,7 +1909,7 @@ class LocalOracleEngine:
         try:
             import json as _bj
             from urllib.request import Request as _BR, urlopen as _BU
-            oracle_url = f"http://{self.ORACLE_HOST}:9091"
+            oracle_url = f"https://{self.ORACLE_HOST}"
             payload = _bj.dumps({
                 'node_id':      'boot_discovery',
                 'port':         9091,
@@ -2617,7 +2617,7 @@ class QtclP2PNode:
     Bootstrap: connects to Koyeb server /api/p2p/peer_exchange for peer list.
     """
     DEFAULT_PORT = 9091
-    BOOTSTRAP_PEERS = [('qtcl-blockchain.koyeb.app', 9091)]
+    BOOTSTRAP_PEERS = [('qtcl-blockchain.koyeb.app', 443)]
 
     def __init__(
             self,
@@ -2859,11 +2859,7 @@ class QtclP2PNode:
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt
-        _oracle_url = os.getenv('ORACLE_URL', 'http://qtcl-blockchain.koyeb.app:9091')
-        import re as _pre
-        if not _pre.search(r':\d+', _oracle_url.replace('https://','').replace('http://','')):
-            _oracle_url = _oracle_url.rstrip('/') + ':9091'
-        _oracle_url = _oracle_url.replace('https://', 'http://')
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         while not self._stop.is_set():
             connected_before = self.peer_count  # peer_count is the correct property name
             try:
@@ -9242,11 +9238,8 @@ except ImportError:
     import Queue as _queue  # type: ignore
 
 _EXP_LOG = _logging.getLogger("qtcl.client.expansion")
-_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "http://qtcl-blockchain.koyeb.app:9091")
-import re as _burl_re
-if not _burl_re.search(r':\d+', _ORACLE_BASE_URL.replace("https://","").replace("http://","")):
-    _ORACLE_BASE_URL = _ORACLE_BASE_URL.rstrip("/") + ":9091"
-_ORACLE_BASE_URL = _ORACLE_BASE_URL.replace("https://", "http://")
+_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
+
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
@@ -13443,7 +13436,7 @@ def _reconstruct_dm_from_bloch(snap: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KoyebAPIClient:
-    """Thread-safe REST client for qtcl-blockchain.koyeb.app:9091."""
+    """Thread-safe REST client for qtcl-blockchain.koyeb.app (https/443)."""
     TIMEOUT: int = 10
 
     def __init__(self, base_url: str = None, timeout: int = 10):
@@ -13870,7 +13863,7 @@ class KoyebAPIClient:
         try:
             import socket
             host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
-            sock = socket.create_connection((host, 9091), timeout=3)
+            sock = socket.create_connection((host, 443), timeout=3)
             sock.close()
             lines.append(f"     Network:    ✅ Reachable ({host})")
         except Exception as e:
@@ -15253,7 +15246,7 @@ class QtclClientApp:
                         try:
                             host = _LOCAL_ORACLE.ORACLE_HOST.encode() + b'\x00'
                             path = _LOCAL_ORACLE.SSE_PATH.encode() + b'\x00'
-                            rc   = _accel_lib.qtcl_sse_connect(host, 9091, path)
+                            rc   = _accel_lib.qtcl_sse_connect(host, 443, path)
                             if rc == 0:
                                 _EXP_LOG.info("[SSE] 🔄 Forced SSE reconnect initiated")
                                 _stale_since = now  # reset timer
@@ -15397,11 +15390,7 @@ class QtclClientApp:
         from urllib.request import Request as _SR, urlopen as _SO
         from urllib.error   import URLError as _SE
         BACKOFF = [2, 4, 8, 16, 30]; bi = 0
-        _oracle_url = os.getenv('ORACLE_URL', 'http://qtcl-blockchain.koyeb.app:9091')
-        import re as _re
-        if not _re.search(r':\d+', _oracle_url.replace('https://','').replace('http://','')):
-            _oracle_url = _oracle_url.rstrip('/') + ':9091'
-        _oracle_url = _oracle_url.replace('https://', 'http://')
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
         url = f"{_oracle_url}/api/snapshot/sse?client_id={_peer_id}_py"
         while not self._stop.is_set():
@@ -15448,11 +15437,7 @@ class QtclClientApp:
         from urllib.request import Request as _KR, urlopen as _KO
         from urllib.error   import URLError as _KE
         BACKOFF = [3, 6, 12, 24, 60]; bi = 0
-        _oracle_url = os.getenv('ORACLE_URL', 'http://qtcl-blockchain.koyeb.app:9091')
-        import re as _kre
-        if not _kre.search(r':\d+', _oracle_url.replace('https://','').replace('http://','')):
-            _oracle_url = _oracle_url.rstrip('/') + ':9091'
-        _oracle_url = _oracle_url.replace('https://', 'http://')
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _peer_id = getattr(self, '_peer_id', 'unknown')
         url = f"{_oracle_url}/api/events?client_id={_peer_id}&types=peer,block,oracle_dm"
         while not self._stop.is_set():
