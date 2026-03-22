@@ -16676,9 +16676,16 @@ class QtclClientApp:
                     if nonce % _chain_check_interval == 0 and nonce > 0:
                         try:
                             tip2 = kapi.get_chain_tip() or {}
-                            h2 = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
-                            if h2 > oracle_height:
-                                _EXP_LOG.info(f"[MINER-SIMPLE] Chain advanced h={h2}, restarting")
+                            h2   = int(tip2.get("block_height") or tip2.get("height") or oracle_height)
+                            with _mining_lock:
+                                _floor = _last_mined_height
+                            # Abort if chain is ahead of what we're mining
+                            # Use max(oracle_height, _last_mined_height) as our
+                            # reference so a just-accepted block doesn't orphan us
+                            if h2 >= target_height:
+                                _EXP_LOG.info(
+                                    f"[MINER-SIMPLE] Chain at h={h2} ≥ target h={target_height}"
+                                    f" — restarting")
                                 _MINE_TELEM.mark_idle()
                                 break
                         except Exception:
@@ -16860,22 +16867,47 @@ class QtclClientApp:
                             _last_mined_hash = oracle_hash
                         _MINE_TELEM.mark_idle()
                     elif r.get("status") == "accepted" or r.get("success"):
-                        # Submission accepted — NOW commit height
+                        # Submission accepted — commit height IMMEDIATELY
                         with _mining_lock:
                             _last_mined_height = target_height
-                            _last_mined_hash = block_hash
+                            _last_mined_hash   = block_hash
                         reward_str = r.get("miner_reward", "0")
                         try:
-                            if isinstance(reward_str, str):
-                                reward_qtcl = float(reward_str.replace(" QTCL", "").strip())
-                            else:
-                                reward_qtcl = float(reward_str)
-                        except:
+                            reward_qtcl = float(
+                                reward_str.replace(" QTCL", "").strip()
+                                if isinstance(reward_str, str) else reward_str
+                            )
+                        except Exception:
                             reward_qtcl = 0.0
-                        
+
                         _MINE_TELEM.record_submission(target_height, reward_qtcl)
-                        _EXP_LOG.info(f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height}")
-                        _EXP_LOG.info(f"[MINER-SIMPLE]    🪙 Reward: +{reward_qtcl:.2f} QTCL | Session Total: {_MINE_TELEM.total_earned_qtcl:.2f} QTCL")
+                        _EXP_LOG.info(
+                            f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height} | "
+                            f"+{reward_qtcl:.2f} QTCL | total={_MINE_TELEM.total_earned_qtcl:.2f}")
+
+                        # ── Post-acceptance sync: wait for block to propagate ──
+                        # Without this sleep, the next tip poll may hit a stale
+                        # gunicorn worker that hasn't seen the new block yet,
+                        # returning h=target_height-1 and causing the client to
+                        # mine the same height again → "Invalid height: N, expected N+1"
+                        await _asyncio.sleep(1.5)
+                        # Force a fresh tip poll to confirm our block landed
+                        try:
+                            _fresh_tip = kapi.get_chain_tip() or {}
+                            _fresh_h   = int(_fresh_tip.get("block_height") or
+                                             _fresh_tip.get("height") or target_height)
+                            with _mining_lock:
+                                if _fresh_h >= target_height:
+                                    # Server confirmed our block — advance state
+                                    _last_mined_height = _fresh_h
+                                    _last_mined_hash   = str(
+                                        _fresh_tip.get("block_hash") or
+                                        _fresh_tip.get("hash") or block_hash)
+                                    _EXP_LOG.info(
+                                        f"[MINER-SIMPLE] 🔗 Chain confirmed h={_fresh_h} "
+                                        f"→ mining h={_fresh_h + 1}")
+                        except Exception as _sync_e:
+                            _EXP_LOG.debug(f"[MINER-SIMPLE] post-accept sync: {_sync_e}")
                     elif r.get("block_hash"):
                         # Ambiguous response - probably accepted; commit height
                         with _mining_lock:
@@ -17010,6 +17042,18 @@ class QtclClientApp:
             print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
             if tel['total_earned_qtcl'] > 0:
                 print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)")
+            # Show reward breakdown when miner address is treasury address
+            try:
+                from globals import TessellationRewardSchedule as _TRS_disp
+                _bh_disp = int(self.koyeb_state.block_height or 0)
+                _m_disp  = _TRS_disp.get_miner_reward_qtcl(_bh_disp)
+                _t_disp  = _TRS_disp.get_treasury_reward_qtcl(_bh_disp)
+                _ta_disp = _TRS_disp.TREASURY_ADDRESS[:20]
+                if getattr(getattr(self,'wallet',None),'address','') == _TRS_disp.TREASURY_ADDRESS:
+                    print(f"  Split   : miner={_m_disp:.2f} QTCL/blk + treasury={_t_disp:.2f} QTCL/blk → total={_m_disp+_t_disp:.2f} QTCL/blk")
+                    print(f"  Note    : Mining as treasury address — both coinbases credit same wallet")
+            except Exception:
+                pass
             # SUB-AGENT δ: live balance in dashboard
             try:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
