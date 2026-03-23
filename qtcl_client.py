@@ -16621,7 +16621,10 @@ class QtclClientApp:
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
                 self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers(); self.wfile.write(body)
+                try:
+                    self.end_headers(); self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # peer disconnected before response — harmless
 
             def _sse_headers(self):
                 self.send_response(200)
@@ -16810,7 +16813,9 @@ class QtclClientApp:
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
-                    self.end_headers(); self.wfile.write(b'Not Found')
+                    try:
+                        self.end_headers(); self.wfile.write(b'Not Found')
+                    except (BrokenPipeError, ConnectionResetError): pass
 
             def do_POST(self):
                 clen = int(self.headers.get('Content-Length', 0))
@@ -16910,7 +16915,9 @@ class QtclClientApp:
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
-                    self.end_headers(); self.wfile.write(b'Not Found')
+                    try:
+                        self.end_headers(); self.wfile.write(b'Not Found')
+                    except (BrokenPipeError, ConnectionResetError): pass
 
         try:
             class _ReuseServer(_ss.TCPServer):
@@ -18466,11 +18473,38 @@ class QtclClientApp:
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
                         # No response — outer loop will re-fetch tip next iteration
                         _MINE_TELEM.mark_idle()
+                    elif r.get("status") == "duplicate":
+                        # Block already in DB (submitted by another worker or earlier retry).
+                        # The block WAS accepted — this is not a failure.
+                        _EXP_LOG.info(
+                            f"[MINER-SIMPLE] ✅ h={target_height} already accepted "
+                            f"(duplicate submission, tip={r.get('tip', '?')}) — chain advanced")
+                        with _mining_lock:
+                            _last_mined_height = target_height
+                            _last_mined_hash   = block_hash
+                        _MINE_TELEM.mark_idle()
                     elif r.get("error"):
                         error = r.get("error", "unknown error")
-                        _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
-                        if r.get("details"):
-                            _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
+                        tip_from_server = r.get("tip", 0)
+                        # Detect "Invalid height: N, expected N+1" where N == target_height
+                        # and expected == target_height+1 — means the block WAS accepted
+                        # (the chain moved on) and this is a late retry hitting the next slot.
+                        _is_chain_advanced = (
+                            "Invalid height" in error
+                            and f"expected {target_height + 1}" in error
+                        )
+                        if _is_chain_advanced:
+                            _EXP_LOG.info(
+                                f"[MINER-SIMPLE] ✅ h={target_height} already sealed — "
+                                f"chain is at {tip_from_server or target_height + 1} "
+                                f"(late retry, block was accepted)")
+                            with _mining_lock:
+                                _last_mined_height = target_height
+                                _last_mined_hash   = block_hash
+                        else:
+                            _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
+                            if r.get("details"):
+                                _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
                         # Outer loop re-fetches tip — no manual height manipulation needed
                         _MINE_TELEM.mark_idle()
                     elif r.get("status") == "accepted" or r.get("success"):
