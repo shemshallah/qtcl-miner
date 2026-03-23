@@ -19623,77 +19623,102 @@ class QtclClientApp:
         return None
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """
-        RACE-TO-FASTEST HYBRID ORACLE — three concurrent paths, first valid result wins.
-
-        Priority waterfall (in parallel, not sequential):
-          1. Koyeb server /rpc  qtcl_getPythPrice  — HLWE-signed, oracle.py singleton
-          2. Koyeb server /api/pyth/prices          — REST fallback (same Koyeb node)
-          3. Client local Pyth oracle               — direct Hermes v2/v1, no server dep
-
-        All three fire simultaneously via threads.  The first to return a non-empty
-        feeds dict wins.  The loser threads are abandoned (daemon).  This means the
-        Market Explorer is instant even when Koyeb is slow/cold-starting.
-        """
-        import threading as _thr
-
-        result_holder: list = [None]
-        result_evt = _thr.Event()
-        _syms = symbols or []
-
-        def _try_koyeb_rpc():
-            try:
-                snap = self._rpc_call("qtcl_getPythPrice", _syms if _syms else None)
-                if snap and isinstance(snap.get("feeds"), dict) and snap["feeds"]:
-                    snap.setdefault("source", "koyeb_rpc")
-                    if result_holder[0] is None:
-                        result_holder[0] = snap
-                        result_evt.set()
-            except Exception as _e:
-                logger.debug(f"[ORACLE] koyeb_rpc fail: {_e}")
-
-        def _try_koyeb_rest():
-            try:
-                params = {"symbols": ",".join(_syms)} if _syms else {}
-                raw = self.api._get("/api/pyth/prices", params=params, timeout=5)
-                if raw and isinstance(raw.get("feeds"), dict) and raw["feeds"]:
-                    raw.setdefault("source", "koyeb_rest")
-                    if result_holder[0] is None:
-                        result_holder[0] = raw
-                        result_evt.set()
-            except Exception as _e:
-                logger.debug(f"[ORACLE] koyeb_rest fail: {_e}")
-
-        def _try_local_hermes():
-            try:
-                if not hasattr(self, "_client_oracle"):
-                    self._client_oracle = ClientPythOracle()
-                snap = self._client_oracle.fetch_prices(_syms or None)
-                if snap and isinstance(snap.get("feeds"), dict) and snap["feeds"]:
-                    snap.setdefault("source", "client_hermes")
-                    if result_holder[0] is None:
-                        result_holder[0] = snap
-                        result_evt.set()
-            except Exception as _e:
-                logger.debug(f"[ORACLE] local_hermes fail: {_e}")
-
-        threads = [
-            _thr.Thread(target=_try_koyeb_rpc,   daemon=True),
-            _thr.Thread(target=_try_koyeb_rest,   daemon=True),
-            _thr.Thread(target=_try_local_hermes, daemon=True),
-        ]
-        for t in threads:
-            t.start()
-
-        # Wait up to 8 s for any path to deliver valid prices
-        result_evt.wait(timeout=8.0)
-
-        if result_holder[0]:
-            src = result_holder[0].get("source", "unknown")
-            logger.info(f"[ORACLE] ✅ Prices from {src} | feeds={len(result_holder[0].get('feeds', {}))}")
-            return result_holder[0]
-
-        logger.warning("[ORACLE] ❌ All three price paths failed (Koyeb RPC, Koyeb REST, local Hermes)")
+        """Direct Hermes v2 fetch — zero dependency on Koyeb or local oracle."""
+        from urllib.request import Request, urlopen
+        import json as _json
+        import time as _time
+        
+        if not hasattr(self, "_hermes_cache"):
+            self._hermes_cache = {}
+            self._hermes_cache_ts = 0.0
+        
+        now = _time.time()
+        cache_key = "hermes_snapshot"
+        if cache_key in self._hermes_cache and (now - self._hermes_cache_ts) < 5.0:
+            return self._hermes_cache[cache_key]
+        
+        # Define feed IDs directly
+        FEEDS = {
+            "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+            "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
+            "BNB": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+            "AVAX": "0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
+            "MATIC": "0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
+            "LINK": "0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
+            "ADA": "0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
+            "DOT": "0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
+            "ATOM": "0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
+        }
+        
+        ids = [FEEDS[s] for s in (symbols or list(FEEDS.keys())) if s in FEEDS]
+        if not ids:
+            return None
+        
+        # Build symbol lookup
+        sym_map = {fid.lower(): s for s, fid in FEEDS.items()}
+        
+        # Single Hermes endpoint
+        ids_param = "&".join(f"ids[]={fid}" for fid in ids)
+        url = f"https://hermes.pyth.network/v2/updates/price/latest?{ids_param}&parsed=true"
+        
+        try:
+            req = Request(url, headers={"Accept": "application/json", "User-Agent": "QTCL/5.0"})
+            with urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            
+            parsed = data.get("parsed", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            
+            feeds = {}
+            fw = _time.time()
+            for entry in parsed:
+                try:
+                    fid = str(entry.get("id", "")).lower()
+                    sym = sym_map.get(fid)
+                    if not sym:
+                        continue
+                    
+                    pr = entry.get("price", {})
+                    mantissa = int(pr.get("price", 0))
+                    expo = int(pr.get("expo", -8))
+                    price = float(mantissa * (10 ** expo))
+                    
+                    if price <= 0:
+                        continue
+                    
+                    conf = float(int(pr.get("conf", 0)) * (10 ** expo))
+                    age = max(0, fw - int(pr.get("publish_time", 0)))
+                    
+                    feeds[sym] = {
+                        "price_usd": price,
+                        "confidence": conf,
+                        "age_seconds": age,
+                        "status": pr.get("status", "trading"),
+                    }
+                except:
+                    pass
+            
+            if feeds:
+                snap = {
+                    "feeds": feeds,
+                    "snapshot_id": hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd', 0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),
+                    "hermes_ok": True,
+                    "fetch_time_ns": int(_time.time() * 1e9),
+                    "source": "hermes_direct",
+                }
+                self._hermes_cache[cache_key] = snap
+                self._hermes_cache_ts = now
+                logger.info(f"[ORACLE] ✅ Hermes direct fetch | {len(feeds)} feeds")
+                return snap
+        except Exception as e:
+            logger.debug(f"[ORACLE] Hermes fetch error: {type(e).__name__}: {str(e)[:60]}")
+        
+        # Return cached if available
+        if cache_key in self._hermes_cache:
+            logger.info("[ORACLE] Using cached snapshot")
+            return self._hermes_cache[cache_key]
+        
+        logger.warning("[ORACLE] ❌ Hermes fetch failed and no cache")
         return None
 
     def _fmt_price(self, price: float, width: int = 12) -> str:
@@ -20048,7 +20073,7 @@ class QtclClientApp:
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ClientPythOracle:
-    """Independent client-side Pyth Hermes oracle — corrected feed IDs."""
+    """Standalone Hermes oracle client — direct HTTP to Pyth."""
     PRICE_FEEDS={
         "BTC":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
         "ETH":"0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
@@ -20064,55 +20089,46 @@ class ClientPythOracle:
     def __init__(self):
         self.cache={}
         self.cache_ts=0.0
-        self.cache_ttl=5.0
     def fetch_prices(self,symbols:Optional[list]=None)->Optional[dict]:
         symbols=symbols or list(self.PRICE_FEEDS.keys())
         now=time.time()
-        if self.cache and (now-self.cache_ts)<self.cache_ttl:
+        if self.cache and (now-self.cache_ts)<5.0:
             return self.cache
-        feeds={}
         ids=[self.PRICE_FEEDS[s] for s in symbols if s in self.PRICE_FEEDS]
         if not ids:return None
-        _id_to_sym={}
-        for s,fid in self.PRICE_FEEDS.items():
-            _id_to_sym[fid.lower()]=s
-            _id_to_sym[("0x"+fid.lstrip("0x")).lower()]=s
-        def _parse(entries)->dict:
-            result={}
-            fw=time.time()
-            for e in (entries if isinstance(entries,list) else []):
-                try:
-                    rid=str(e.get("id","")).lower()
-                    nid="0x"+rid.lstrip("0x")
-                    sym=_id_to_sym.get(nid) or _id_to_sym.get(rid)
-                    if not sym:continue
-                    pd=e.get("price",{})
-                    p=float(int(pd.get("price",0))*(10**int(pd.get("expo",-8))))
-                    if p<=0:continue
-                    cf=float(int(pd.get("conf",0))*(10**int(pd.get("expo",-8))))
-                    result[sym]={"price_usd":p,"confidence":cf,"age_seconds":max(0,fw-int(pd.get("publish_time",0))),"status":pd.get("status","trading")}
-                except:pass
-            return result
-        _ids="&".join(f"ids[]={i}" for i in ids)
-        url=f"https://hermes.pyth.network/v2/updates/price/latest?{_ids}&parsed=true"
+        sym_map={fid.lower():s for s,fid in self.PRICE_FEEDS.items()}
+        ids_param="&".join(f"ids[]={fid}" for fid in ids)
+        url=f"https://hermes.pyth.network/v2/updates/price/latest?{ids_param}&parsed=true"
         try:
-            _r=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/4.0"})
-            with urlopen(_r,timeout=6) as _resp:
-                _raw=json.loads(_resp.read().decode("utf-8"))
-            _entries=_raw.get("parsed",[]) if isinstance(_raw,dict) else (_raw if isinstance(_raw,list) else [])
-            feeds=_parse(_entries)
+            req=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/5.0"})
+            with urlopen(req,timeout=8) as resp:
+                data=json.loads(resp.read().decode("utf-8"))
+            parsed=data.get("parsed",[]) if isinstance(data,dict) else (data if isinstance(data,list) else [])
+            feeds={}
+            fw=time.time()
+            for e in parsed:
+                try:
+                    fid=str(e.get("id","")).lower()
+                    sym=sym_map.get(fid)
+                    if not sym:continue
+                    pr=e.get("price",{})
+                    mantissa=int(pr.get("price",0))
+                    expo=int(pr.get("expo",-8))
+                    price=float(mantissa*(10**expo))
+                    if price<=0:continue
+                    conf=float(int(pr.get("conf",0))*(10**expo))
+                    age=max(0,fw-int(pr.get("publish_time",0)))
+                    feeds[sym]={"price_usd":price,"confidence":conf,"age_seconds":age,"status":pr.get("status","trading")}
+                except:pass
+            if feeds:
+                snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9),"source":"client_hermes"}
+                self.cache=snap
+                self.cache_ts=now
+                return snap
         except Exception as e:
-            logger.debug(f"[CLIENT-ORACLE] Hermes v2 failed: {e}")
-        if not feeds:
-            if self.cache:
-                logger.debug("[CLIENT-ORACLE] Serving stale cache")
-                return self.cache
-            logger.warning("[CLIENT-ORACLE] Hermes fetch failed")
-            return None
-        snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9),"source":"client_hermes"}
-        self.cache=snap
-        self.cache_ts=now
-        return snap
+            logger.debug(f"[CLIENT-ORACLE] Error: {type(e).__name__}")
+        if self.cache:return self.cache
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
