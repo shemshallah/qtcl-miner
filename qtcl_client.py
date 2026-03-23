@@ -885,73 +885,6 @@ class HLWEEngine:
 # ════════════════════════════════════════════════════════════════════════════════════
 # EMBEDDED PYTH HERMES ORACLE WITH HLWE SIGNING
 # ════════════════════════════════════════════════════════════════════════════════════
-
-class PythHermesOracle:
-    """Direct Pyth Hermes v2 API — corrected feed IDs & single-path fetch."""
-    PRICE_FEEDS={
-        "BTC":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "ETH":"0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-        "SOL":"0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
-        "BNB":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "AVAX":"0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
-        "MATIC":"0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
-        "LINK":"0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
-        "ADA":"0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
-        "DOT":"0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
-        "ATOM":"0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
-    }
-    def __init__(self,hlwe_engine:Optional['HLWEEngine']=None):
-        self.hlwe=hlwe_engine
-        self.cache={}
-        self.cache_ts=0.0
-        self.cache_ttl=5.0
-    def fetch_prices(self,symbols:Optional[list]=None)->Optional[dict]:
-        symbols=symbols or list(self.PRICE_FEEDS.keys())
-        now=time.time()
-        if self.cache and (now-self.cache_ts)<self.cache_ttl:
-            return self.cache
-        feeds={}
-        ids=[self.PRICE_FEEDS[s] for s in symbols if s in self.PRICE_FEEDS]
-        if not ids:return None
-        _id_to_sym={}
-        for s,fid in self.PRICE_FEEDS.items():
-            _id_to_sym[fid.lower()]=s
-            _id_to_sym[fid.lstrip("0x").lower()]=s
-        def _parse(entries)->dict:
-            result={}
-            fw=time.time()
-            for e in (entries if isinstance(entries,list) else []):
-                try:
-                    rid=str(e.get("id","")).lower()
-                    nid="0x"+rid.lstrip("0x")
-                    sym=_id_to_sym.get(nid) or _id_to_sym.get(rid)
-                    if not sym:continue
-                    pd=e.get("price",{})
-                    p=float(int(pd.get("price",0))*(10**int(pd.get("expo",-8))))
-                    if p<=0:continue
-                    cf=float(int(pd.get("conf",0))*(10**int(pd.get("expo",-8))))
-                    result[sym]={"price_usd":p,"confidence":cf,"age_seconds":max(0,fw-int(pd.get("publish_time",0))),"status":pd.get("status","trading")}
-                except:pass
-            return result
-        _ids="&".join(f"ids[]={i}" for i in ids)
-        url=f"https://hermes.pyth.network/v2/updates/price/latest?{_ids}&parsed=true"
-        try:
-            _r=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/4.0"})
-            with urlopen(_r,timeout=6) as _resp:
-                _raw=json.loads(_resp.read().decode("utf-8"))
-            _entries=_raw.get("parsed",[]) if isinstance(_raw,dict) else (_raw if isinstance(_raw,list) else [])
-            feeds=_parse(_entries)
-        except Exception as e:
-            logger.debug(f"[PYTH] Hermes fetch failed: {e}")
-        if not feeds:
-            if self.cache:return self.cache
-            return None
-        snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9)}
-        self.cache=snap
-        self.cache_ts=now
-        return snap
-
-
 class BIP32KeyDerivation:
     """BIP32 Hierarchical Deterministic (HD) key derivation"""
     
@@ -15912,6 +15845,126 @@ def _broadcast_oracle_to_local_subs(snap: dict) -> None:
         except Exception: pass
 
 
+#!/usr/bin/env python3
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# SERVER RPC CLIENT — Pyth oracle metrics from server
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+class ServerRPCClient:
+    """
+    JSON-RPC 2.0 client for server → oracle Pyth metrics.
+    Single responsibility: marshal qtcl_getPythPrice and qtcl_getHealth RPC calls.
+    """
+    
+    def __init__(self, server_url: str = "http://localhost:9091"):
+        """Args: server_url = JSON-RPC endpoint (e.g., http://koyeb:9091)"""
+        self.server_url = server_url.rstrip('/') + '/rpc'
+        self.cache = {}
+        self.cache_ts = 0.0
+        self.cache_ttl = 3.0
+        self.lock = threading.RLock()
+        self.call_id = 0
+    
+    def _next_id(self) -> int:
+        """Atomic increment for JSON-RPC request ID."""
+        with self.lock:
+            self.call_id += 1
+            return self.call_id
+    
+    def call(self, method: str, params: Any = None) -> Dict[str, Any]:
+        """JSON-RPC 2.0 call to server."""
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+        import socket as _socket
+        
+        req_body = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or [],
+            "id": self._next_id()
+        }
+        
+        try:
+            req = Request(
+                self.server_url,
+                data=json.dumps(req_body).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            with urlopen(req, timeout=5) as resp:
+                resp_data = json.loads(resp.read().decode('utf-8'))
+            
+            if 'error' in resp_data:
+                logger.warning(f"[SERVER-RPC] {method} error: {resp_data['error']}")
+                return resp_data
+            
+            return resp_data
+        
+        except (URLError, _socket.timeout, json.JSONDecodeError) as e:
+            logger.error(f"[SERVER-RPC] {method} failed: {type(e).__name__}: {e}")
+            return {"error": str(e)}
+        
+        except Exception as e:
+            logger.error(f"[SERVER-RPC] Unexpected error in {method}: {e}")
+            return {"error": str(e)}
+    
+    def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Fetch Pyth price snapshot from server.
+        
+        Returns: {
+            "feeds": {"BTC": {"price_usd": ..., "confidence": ..., "age_seconds": ...}, ...},
+            "snapshot_id": "...",
+            "fetch_time_ns": ...,
+            "hermes_ok": true,
+            "source": "server_rpc"
+        }
+        """
+        now = time.time()
+        
+        # Check cache
+        cache_key = tuple(sorted(symbols)) if symbols else "all"
+        with self.lock:
+            if cache_key in self.cache:
+                if (now - self.cache_ts) < self.cache_ttl:
+                    return self.cache[cache_key]
+        
+        # Call server RPC
+        resp = self.call("qtcl_getPythPrice", symbols)
+        
+        if 'error' in resp:
+            return None
+        
+        snap = resp.get('result')
+        if not snap:
+            return None
+        
+        snap['source'] = 'server_rpc'
+        
+        # Update cache
+        with self.lock:
+            self.cache[cache_key] = snap
+            self.cache_ts = now
+        
+        logger.debug(f"[SERVER-RPC] ✅ fetched {list(snap.get('feeds', {}).keys())}")
+        return snap
+    
+    def get_health(self) -> Optional[Dict[str, Any]]:
+        """Fetch full system health including Pyth oracle readiness."""
+        resp = self.call("qtcl_getHealth", [])
+        
+        if 'error' in resp:
+            return None
+        
+        return resp.get('result')
+    
+    def is_pyth_ready(self) -> bool:
+        """Check if server's Pyth oracle is initialized."""
+        health = self.get_health()
+        return (health is not None) and health.get('pyth_ready', False)
+
+
+
 class QtclClientApp:
     """
     QTCL Client interactive entrypoint.
@@ -19623,104 +19676,14 @@ class QtclClientApp:
         return None
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Direct Hermes v2 fetch — zero dependency on Koyeb or local oracle."""
-        from urllib.request import Request, urlopen
-        import json as _json
-        import time as _time
-        
-        if not hasattr(self, "_hermes_cache"):
-            self._hermes_cache = {}
-            self._hermes_cache_ts = 0.0
-        
-        now = _time.time()
-        cache_key = "hermes_snapshot"
-        if cache_key in self._hermes_cache and (now - self._hermes_cache_ts) < 5.0:
-            return self._hermes_cache[cache_key]
-        
-        # Define feed IDs directly
-        FEEDS = {
-            "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-            "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-            "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
-            "BNB": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-            "AVAX": "0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
-            "MATIC": "0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
-            "LINK": "0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
-            "ADA": "0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
-            "DOT": "0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
-            "ATOM": "0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
-        }
-        
-        ids = [FEEDS[s] for s in (symbols or list(FEEDS.keys())) if s in FEEDS]
-        if not ids:
-            return None
-        
-        # Build symbol lookup
-        sym_map = {fid.lower(): s for s, fid in FEEDS.items()}
-        
-        # Single Hermes endpoint
-        ids_param = "&".join(f"ids[]={fid}" for fid in ids)
-        url = f"https://hermes.pyth.network/v2/updates/price/latest?{ids_param}&parsed=true"
-        
+        """Fetch Pyth snapshot from server RPC."""
+        if not hasattr(self, '_server_rpc'):
+            self._server_rpc = ServerRPCClient(server_url=self.oracle_url or "http://localhost:9091")
         try:
-            req = Request(url, headers={"Accept": "application/json", "User-Agent": "QTCL/5.0"})
-            with urlopen(req, timeout=8) as resp:
-                data = _json.loads(resp.read().decode("utf-8"))
-            
-            parsed = data.get("parsed", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            
-            feeds = {}
-            fw = _time.time()
-            for entry in parsed:
-                try:
-                    fid = str(entry.get("id", "")).lower()
-                    sym = sym_map.get(fid)
-                    if not sym:
-                        continue
-                    
-                    pr = entry.get("price", {})
-                    mantissa = int(pr.get("price", 0))
-                    expo = int(pr.get("expo", -8))
-                    price = float(mantissa * (10 ** expo))
-                    
-                    if price <= 0:
-                        continue
-                    
-                    conf = float(int(pr.get("conf", 0)) * (10 ** expo))
-                    age = max(0, fw - int(pr.get("publish_time", 0)))
-                    
-                    feeds[sym] = {
-                        "price_usd": price,
-                        "confidence": conf,
-                        "age_seconds": age,
-                        "status": pr.get("status", "trading"),
-                    }
-                except:
-                    pass
-            
-            if feeds:
-                snap = {
-                    "feeds": feeds,
-                    "snapshot_id": hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd', 0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),
-                    "hermes_ok": True,
-                    "fetch_time_ns": int(_time.time() * 1e9),
-                    "source": "hermes_direct",
-                }
-                self._hermes_cache[cache_key] = snap
-                self._hermes_cache_ts = now
-                logger.info(f"[ORACLE] ✅ Hermes direct fetch | {len(feeds)} feeds")
-                return snap
+            return self._server_rpc.get_pyth_prices(symbols)
         except Exception as e:
-            logger.debug(f"[ORACLE] Hermes fetch error: {type(e).__name__}: {str(e)[:60]}")
-        
-        # Return cached if available
-        if cache_key in self._hermes_cache:
-            logger.info("[ORACLE] Using cached snapshot")
-            return self._hermes_cache[cache_key]
-        
-        logger.warning("[ORACLE] ❌ Hermes fetch failed and no cache")
-        return None
-
+            logger.error(f"[PYTH] RPC error: {e}")
+            return None
     def _fmt_price(self, price: float, width: int = 12) -> str:
         """Format USD price with commas, right-aligned."""
         if price >= 10_000:
@@ -20071,174 +20034,6 @@ class QtclClientApp:
 # ════════════════════════════════════════════════════════════════════════════════
 # EMBEDDED PYTH HERMES ORACLE — Standalone Client Oracle
 # ════════════════════════════════════════════════════════════════════════════════
-
-class ClientPythOracle:
-    """Standalone Hermes oracle client — direct HTTP to Pyth."""
-    PRICE_FEEDS={
-        "BTC":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "ETH":"0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-        "SOL":"0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
-        "BNB":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "AVAX":"0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
-        "MATIC":"0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
-        "LINK":"0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
-        "ADA":"0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
-        "DOT":"0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
-        "ATOM":"0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
-    }
-    def __init__(self):
-        self.cache={}
-        self.cache_ts=0.0
-    def fetch_prices(self,symbols:Optional[list]=None)->Optional[dict]:
-        symbols=symbols or list(self.PRICE_FEEDS.keys())
-        now=time.time()
-        if self.cache and (now-self.cache_ts)<5.0:
-            return self.cache
-        ids=[self.PRICE_FEEDS[s] for s in symbols if s in self.PRICE_FEEDS]
-        if not ids:return None
-        sym_map={fid.lower():s for s,fid in self.PRICE_FEEDS.items()}
-        ids_param="&".join(f"ids[]={fid}" for fid in ids)
-        url=f"https://hermes.pyth.network/v2/updates/price/latest?{ids_param}&parsed=true"
-        try:
-            req=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/5.0"})
-            with urlopen(req,timeout=8) as resp:
-                data=json.loads(resp.read().decode("utf-8"))
-            parsed=data.get("parsed",[]) if isinstance(data,dict) else (data if isinstance(data,list) else [])
-            feeds={}
-            fw=time.time()
-            for e in parsed:
-                try:
-                    fid=str(e.get("id","")).lower()
-                    sym=sym_map.get(fid)
-                    if not sym:continue
-                    pr=e.get("price",{})
-                    mantissa=int(pr.get("price",0))
-                    expo=int(pr.get("expo",-8))
-                    price=float(mantissa*(10**expo))
-                    if price<=0:continue
-                    conf=float(int(pr.get("conf",0))*(10**expo))
-                    age=max(0,fw-int(pr.get("publish_time",0)))
-                    feeds[sym]={"price_usd":price,"confidence":conf,"age_seconds":age,"status":pr.get("status","trading")}
-                except:pass
-            if feeds:
-                snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9),"source":"client_hermes"}
-                self.cache=snap
-                self.cache_ts=now
-                return snap
-        except Exception as e:
-            logger.debug(f"[CLIENT-ORACLE] Error: {type(e).__name__}")
-        if self.cache:return self.cache
-        return None
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# CLIENT RPC SERVER — Broadcast metrics and real-time data
-# ════════════════════════════════════════════════════════════════════════════════
-
-class ClientRPCServer:
-    """
-    RPC server for QTCL client.
-    Broadcasts real-time metrics, Pyth prices, wallet state, mining status.
-    """
-    
-    def __init__(self, port: int = 8765, oracle: Optional[ClientPythOracle] = None):
-        self.port = port
-        self.oracle = oracle or ClientPythOracle()
-        self.running = False
-        self.thread = None
-        self.methods = {
-            "qtcl_getPythPrice": self.handle_get_pyth_price,
-            "qtcl_getMetrics": self.handle_get_metrics,
-            "qtcl_getWalletStatus": self.handle_get_wallet_status,
-            "qtcl_ping": self.handle_ping,
-        }
-    
-    def start(self):
-        """Start RPC server in background thread."""
-        if self.running:
-            return
-        
-        self.running = True
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
-        logger.info(f"[CLIENT-RPC] ✅ RPC server listening on port {self.port}")
-    
-    def stop(self):
-        """Stop RPC server."""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-    
-    def _serve(self):
-        """Simple HTTP RPC server (minimal implementation)."""
-        try:
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            
-            server_instance = self
-            
-            class RPCHandler(BaseHTTPRequestHandler):
-                def do_POST(self):
-                    content_length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(content_length)
-                    
-                    try:
-                        req = json.loads(body)
-                        method = req.get("method")
-                        params = req.get("params", [])
-                        
-                        handler = server_instance.methods.get(method)
-                        if handler:
-                            result = handler(*params)
-                            response = {"jsonrpc": "2.0", "result": result, "id": req.get("id")}
-                        else:
-                            response = {"jsonrpc": "2.0", "error": f"Unknown method: {method}", "id": req.get("id")}
-                        
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps(response).encode())
-                    except Exception as e:
-                        self.send_response(500)
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": str(e)}).encode())
-                
-                def log_message(self, format, *args):
-                    pass  # Suppress logs
-            
-            server = HTTPServer(("0.0.0.0", self.port), RPCHandler)
-            while self.running:
-                server.handle_request()
-        except Exception as e:
-            logger.error(f"[CLIENT-RPC] Server error: {e}")
-    
-    def handle_ping(self) -> dict:
-        """Simple ping."""
-        return {"status": "ok", "timestamp": int(time.time())}
-    
-    def handle_get_pyth_price(self, symbols: Optional[list] = None) -> dict:
-        """Get live Pyth prices."""
-        snap = self.oracle.fetch_prices(symbols)
-        return snap or {"error": "fetch failed"}
-    
-    def handle_get_metrics(self) -> dict:
-        """Get real-time metrics."""
-        return {
-            "timestamp": int(time.time()),
-            "pyth": self.oracle.fetch_prices(),
-            "node_status": "ready",
-        }
-    
-    def handle_get_wallet_status(self) -> dict:
-        """Get wallet/client status."""
-        return {
-            "timestamp": int(time.time()),
-            "client_ready": True,
-        }
-
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-
 def main() -> None:  # noqa: F811
     """
     QTCL Client entrypoint.
@@ -20247,10 +20042,10 @@ def main() -> None:  # noqa: F811
     """
 
     # ✅ Initialize client-side Pyth oracle + RPC server
-    _pyth_oracle = ClientPythOracle()
-    _rpc_server = ClientRPCServer(port=8765, oracle=_pyth_oracle)
-    _rpc_server.start()
-    print("✅ Client RPC server started on port 8765", flush=True)
+    # ServerRPCClient embedded in client
+    # No client RPC server needed - use server RPC
+    # Delegating to server RPC
+    # Delegating to server RPC - no local RPC needed, flush=True)
 
 
     import argparse as _ap
