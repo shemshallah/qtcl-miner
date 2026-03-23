@@ -19930,61 +19930,73 @@ class QtclClientApp:
 
         def _do_refresh() -> bool:
             nonlocal prev_prices, refresh_count
+            
             t0   = _time.time()
-            snap = self._fetch_pyth_snapshot(watch_syms)
+            
+            # Retry logic for uninitialized oracle
+            snap = None
+            retry_count = 0
+            max_retries = 3
+            base_delay_s = 0.5
+            
+            while snap is None and retry_count < max_retries:
+                snap = self._fetch_pyth_snapshot(watch_syms)
+                
+                if snap is None:
+                    print(f"\n  {self._T_RED}❌ RPC failed — retrying... (attempt {retry_count + 1}/{max_retries}){self._T_RST}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        _time.sleep(base_delay_s * (2 ** retry_count))
+                    continue
+                
+                # Check if feeds are empty (oracle initializing)
+                feeds = snap.get("feeds", {})
+                hermes_ok = snap.get("hermes_ok", False)
+                
+                if not feeds and not hermes_ok:
+                    print(f"\n  {self._T_YLW}⏳ Oracle initializing... (attempt {retry_count + 1}/3){self._T_RST}")
+                    print(f"  {self._T_DIM}Fetching from Hermes... please wait{self._T_RST}")
+                    retry_count += 1
+                    
+                    if retry_count < 3:
+                        _time.sleep(base_delay_s * (2 ** retry_count))
+                        snap = None
+                        continue
+                    else:
+                        print(f"  {self._T_RED}⚠️  Oracle not ready after {retry_count} attempts{self._T_RST}")
+                        print(f"  {self._T_DIM}Try again in 5-10 seconds{self._T_RST}")
+                        break
+                
+                break
+            
             elapsed = _time.time() - t0
-
-            if not snap:
-                print(f"\n  {self._T_RED}❌ Pyth fetch failed — oracle may be starting up{self._T_RST}")
-                print(f"  {self._T_DIM}Tip: ensure QTCL node is running at {self.oracle_url}{self._T_RST}")
+            
+            if snap is None:
+                print(f"\n  {self._T_RED}❌ Pyth fetch failed{self._T_RST}")
                 return False
-
+            
             refresh_count += 1
+            
             # Build prev snapshot from last run
             prev_snap_prices = {s: f.get("price_usd", 0)
                                 for s, f in (snap.get("feeds") or {}).items()
                                 if s in prev_prices}
             prev_snap_prices.update({s: p for s, p in prev_prices.items()
                                      if s not in prev_snap_prices})
-
+            
             # Clear screen for clean redraw
             print("\033[2J\033[H", end="")   # ANSI clear
             _draw_header()
             print(f"  {self._T_DIM}Refresh #{refresh_count}   watchlist: {', '.join(watch_syms)}{self._T_RST}")
             _draw_table(snap, prev_prices, portfolio, elapsed)
-
+            
             # Store this run's prices for next delta
             prev_prices = {
                 s: f.get("price_usd", 0)
                 for s, f in (snap.get("feeds") or {}).items()
             }
+            
             return True
-
-        try:
-            if mode == "a":
-                # Auto-refresh loop
-                print(f"\n  {self._T_DIM}Starting auto-refresh…{self._T_RST}")
-                while not _stop_event.is_set():
-                    _do_refresh()
-                    print(f"\n  {self._T_DIM}Next refresh in {auto_interval}s  │  "
-                          f"Ctrl+C to stop{self._T_RST}")
-                    _stop_event.wait(auto_interval)
-            else:
-                # Manual refresh loop
-                while True:
-                    _do_refresh()
-                    print(f"\n  {self._T_DIM}Press Enter to refresh, or q+Enter to quit:{self._T_RST} ", end="", flush=True)
-                    try:
-                        ch = input()
-                    except (EOFError, KeyboardInterrupt):
-                        break
-                    if ch.strip().lower() == "q":
-                        break
-
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print(f"\n  {self._T_DIM}Market Explorer closed.{self._T_RST}\n")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
