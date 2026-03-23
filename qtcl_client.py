@@ -19666,22 +19666,10 @@ class QtclClientApp:
         return None
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from Hermes and sign with HLWE oracle."""
-        if not hasattr(self, '_pyth_oracle'):
-            self._pyth_oracle = None
-        if not hasattr(self, '_hlwe_oracle'):
-            self._hlwe_oracle = None
-        
-        if not self._pyth_oracle:
-            try:
-                if not self._hlwe_oracle:
-                    self._hlwe_oracle = HLWEEngine()
-                self._pyth_oracle = PythHermesOracle(hlwe_engine=self._hlwe_oracle)
-            except Exception:
-                self._pyth_oracle = PythHermesOracle(hlwe_engine=None)
-        
-        return self._pyth_oracle.fetch_prices(symbols)
-
+        """Fetch live Pyth prices from embedded ClientPythOracle."""
+        if not hasattr(self, '_client_oracle'):
+            self._client_oracle = ClientPythOracle()
+        return self._client_oracle.fetch_prices(symbols)
 
     def _fmt_price(self, price: float, width: int = 12) -> str:
         """Format USD price with commas, right-aligned."""
