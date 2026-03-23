@@ -988,54 +988,62 @@ class PythHermesOracle:
                     pass
             return result
 
-        # ── Attempt 1: Hermes v2 REST endpoint ──────────────────────────────
-        try:
-            params_v2 = "&".join(f"ids[]={fid}" for fid in ids)
-            url_v2    = f"{self.HERMES_URL}/v2/updates/price/latest?{params_v2}&encoding=hex&parsed=true"
-            req_v2    = Request(url_v2, headers={
-                "Accept":     "application/json",
-                "User-Agent": "QTCL/3.1 PythHermesOracle",
-            })
-            with urlopen(req_v2, timeout=6) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-                # v2 format: {"parsed": [...], "binary": {...}}
-                entries = raw.get("parsed", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-                feeds   = _parse_entries(entries)
-                if feeds:
-                    hermes_ok = True
-        except Exception as exc:
-            _last_exc = f"v2:{exc}"
+        # Build all candidate URL variants — tried in order until one yields prices.
+        # 404 on Android/Termux is often a CDN routing issue, not a real 404.
+        # We exhaust every known working Pyth endpoint format.
+        import urllib.parse as _uparse
 
-        # ── Attempt 2: Hermes v1 REST endpoint (fallback) ───────────────────
-        if not feeds:
+        # ids[]=... with raw brackets (nginx/CDN friendly)
+        _ids_bracket  = "&".join(f"ids[]={fid}" for fid in ids)
+        # ids[]=... percent-encoded brackets (strict RFC 3986 clients)
+        _ids_pct      = "&".join(f"ids%5B%5D={fid}" for fid in ids)
+        # ids=... comma-joined (legacy / some proxies)
+        _ids_comma    = "ids=" + ",".join(ids)
+
+        _CANDIDATES = [
+            # (label, url)
+            ("v2-bracket",  f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
+            ("v2-pct",      f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_pct}&parsed=true"),
+            ("v1-bracket",  f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
+            ("v1-pct",      f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_pct}"),
+            ("v1-comma",    f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_comma}"),
+            # beta mirror — sometimes bypasses geo/CDN restrictions
+            ("beta-v2",     f"https://hermes-beta.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
+            ("beta-v1",     f"https://hermes-beta.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
+        ]
+
+        for _label, _url in _CANDIDATES:
+            if feeds:
+                break
             try:
-                params_v1 = "&".join(f"ids[]={fid}" for fid in ids)
-                url_v1    = f"{self.HERMES_URL}/api/latest_price_feeds?{params_v1}"
-                req_v1    = Request(url_v1, headers={
+                _req = Request(_url, headers={
                     "Accept":     "application/json",
                     "User-Agent": "QTCL/3.1 PythHermesOracle",
                 })
-                with urlopen(req_v1, timeout=6) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                    # v1 format: list directly, or {"data": {"price_feeds": [...]}}
-                    if isinstance(raw, list):
-                        entries = raw
-                    elif isinstance(raw, dict):
-                        entries = (
-                            raw.get("parsed") or
-                            raw.get("data", {}).get("price_feeds") or
-                            raw.get("data") or
-                            []
-                        )
-                    else:
-                        entries = []
-                    feeds = _parse_entries(entries)
-                    if feeds:
-                        hermes_ok = True
-            except Exception as exc:
-                _last_exc += f" | v1:{exc}"
-                hermes_ok = False
-        
+                with urlopen(_req, timeout=6) as _resp:
+                    _raw = json.loads(_resp.read().decode("utf-8"))
+                if isinstance(_raw, list):
+                    _entries = _raw
+                elif isinstance(_raw, dict):
+                    _entries = (
+                        _raw.get("parsed") or
+                        _raw.get("price_feeds") or
+                        _raw.get("data", {}).get("price_feeds") if isinstance(_raw.get("data"), dict) else None or
+                        _raw.get("data") or
+                        []
+                    )
+                else:
+                    _entries = []
+                _f = _parse_entries(_entries)
+                if _f:
+                    feeds     = _f
+                    hermes_ok = True
+                    _last_exc = f"✅ {_label}"
+                else:
+                    _last_exc += f" | {_label}:empty"
+            except Exception as _exc:
+                _last_exc += f" | {_label}:{type(_exc).__name__}:{_exc}"
+
         if not feeds:
             if self.cache:
                 return self.cache
@@ -4181,22 +4189,48 @@ class HashEngine:
             return str(data).encode("utf-8")
         return repr(data).encode("utf-8")
 
-    def proof_of_work(self, block_data: dict, difficulty: int) -> Tuple[int, str]:
-        """Find nonce such that hash starts with `difficulty` zeros."""
-        prefix = "0" * difficulty
-        nonce = 0
+    def proof_of_work(self, block_data: dict, difficulty: float) -> Tuple[int, str]:
+        """Find nonce satisfying fractional difficulty.
+
+        Fractional difficulty encoding:
+          whole  = int(difficulty)          → required leading hex zeros
+          frac   = difficulty - whole        → partial nibble: next nibble ≤ int(frac * 16) - 1
+          e.g. 5.25 → 5 zeros + nibble in [0..3]   (25% of 16 = 4 values → threshold 4)
+               5.50 → 5 zeros + nibble in [0..7]
+               5.75 → 5 zeros + nibble in [0..11]
+               6.0  → 6 zeros (no partial constraint)
+        """
+        whole = int(difficulty)
+        frac  = difficulty - whole
+        prefix = "0" * whole
+        # partial nibble threshold: frac=0 → no extra constraint (threshold=16 = always passes)
+        nibble_threshold = int(round(frac * 16)) if frac > 0.001 else 16
+        nonce     = 0
         candidate = dict(block_data)
         while True:
             candidate["nonce"] = nonce
             h = self.compute_block_hash(candidate)
             if h.startswith(prefix):
-                return nonce, h
+                if nibble_threshold >= 16:
+                    return nonce, h
+                # Check the nibble immediately after the required zeros
+                next_nibble = int(h[whole], 16) if len(h) > whole else 0
+                if next_nibble < nibble_threshold:
+                    return nonce, h
             nonce += 1
 
-    def verify_pow(self, block_data: dict, difficulty: int) -> bool:
-        prefix = "0" * difficulty
+    def verify_pow(self, block_data: dict, difficulty: float) -> bool:
+        whole = int(difficulty)
+        frac  = difficulty - whole
+        prefix = "0" * whole
+        nibble_threshold = int(round(frac * 16)) if frac > 0.001 else 16
         h = self.compute_block_hash(block_data)
-        return h.startswith(prefix)
+        if not h.startswith(prefix):
+            return False
+        if nibble_threshold >= 16:
+            return True
+        next_nibble = int(h[whole], 16) if len(h) > whole else 0
+        return next_nibble < nibble_threshold
 
 
 HASH_ENGINE = HashEngine()
@@ -6341,7 +6375,7 @@ class UnifiedVerifier(ComponentBase):
             if computed != stored_hash:
                 errors.append(f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…")
         # PoW check
-        difficulty = block.get("difficulty", 4)
+        difficulty = float(block.get("difficulty", 5.25))
         if not self._hash.verify_pow(block, difficulty):
             errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
         # Previous block linkage
@@ -6456,7 +6490,7 @@ class UnifiedVerifier(ComponentBase):
             current = self._hash.compute_hash(combined)
         return current == root
 
-    def verify_pow(self, block: Dict[str, Any], difficulty: int) -> bool:
+    def verify_pow(self, block: Dict[str, Any], difficulty: float) -> bool:
         return self._hash.verify_pow(block, difficulty)
 
     def _check_block_structure(self, block: Dict) -> List[str]:
@@ -7863,7 +7897,7 @@ class QtclServer(QtclNode):
 
     def _block_production_loop(self) -> None:
         block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
-        difficulty = int(self._cfg.get("difficulty", 6))
+        difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
         
         # ✅ Import _SSE_MUX at function scope to avoid NameError
@@ -8152,7 +8186,7 @@ class QtclMiner(QtclNode):
         self._mining_thread.start()
 
     def _mining_loop(self) -> None:
-        difficulty = int(self._cfg.get("difficulty", 6))
+        difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
         import urllib.request
         while not self._stop_event.is_set():
@@ -18096,7 +18130,7 @@ class QtclClientApp:
                     6  # conservative fallback if tip is missing the field
                 )
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
-                difficulty_bits = max(6, min(difficulty_bits, 20))
+                difficulty_bits = max(5.25, min(difficulty_bits, 20.0))
                 
                 # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
@@ -20237,50 +20271,58 @@ class ClientPythOracle:
                     pass
             return result
 
-        # ── Attempt 1: Hermes v2 ────────────────────────────────────────────
-        try:
-            params_v2 = "&".join(f"ids[]={fid}" for fid in ids)
-            url_v2    = f"{self.HERMES_URL}/v2/updates/price/latest?{params_v2}&encoding=hex&parsed=true"
-            req_v2    = Request(url_v2, headers={"Accept": "application/json",
-                                                  "User-Agent": "QTCL/3.1 ClientPythOracle"})
-            with urlopen(req_v2, timeout=6) as resp:
-                raw     = json.loads(resp.read().decode("utf-8"))
-                entries = raw.get("parsed", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-                feeds   = _parse_entries(entries)
-                if feeds:
-                    hermes_ok = True
-        except Exception as exc:
-            _last_exc = f"v2:{exc}"
+        # Exhaustive 7-mirror fallback — tries every known Hermes URL/encoding variant.
+        # 404 on Android/Termux often = CDN routing issue, not a missing endpoint.
+        _ids_bracket = "&".join(f"ids[]={fid}" for fid in ids)
+        _ids_pct     = "&".join(f"ids%5B%5D={fid}" for fid in ids)
+        _ids_comma   = "ids=" + ",".join(ids)
 
-        # ── Attempt 2: Hermes v1 fallback ───────────────────────────────────
-        if not feeds:
+        _CANDIDATES = [
+            ("v2-bracket",  f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
+            ("v2-pct",      f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_pct}&parsed=true"),
+            ("v1-bracket",  f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
+            ("v1-pct",      f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_pct}"),
+            ("v1-comma",    f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_comma}"),
+            ("beta-v2",     f"https://hermes-beta.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
+            ("beta-v1",     f"https://hermes-beta.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
+        ]
+
+        for _label, _url in _CANDIDATES:
+            if feeds:
+                break
             try:
-                params_v1 = "&".join(f"ids[]={fid}" for fid in ids)
-                url_v1    = f"{self.HERMES_URL}/api/latest_price_feeds?{params_v1}"
-                req_v1    = Request(url_v1, headers={"Accept": "application/json",
-                                                      "User-Agent": "QTCL/3.1 ClientPythOracle"})
-                with urlopen(req_v1, timeout=6) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                    if isinstance(raw, list):
-                        entries = raw
-                    elif isinstance(raw, dict):
-                        entries = (raw.get("parsed") or
-                                   raw.get("data", {}).get("price_feeds") or
-                                   raw.get("data") or [])
-                    else:
-                        entries = []
-                    feeds = _parse_entries(entries)
-                    if feeds:
-                        hermes_ok = True
-            except Exception as exc:
-                _last_exc += f" | v1:{exc}"
-                logger.warning(f"[CLIENT-ORACLE] Hermes unreachable: {_last_exc}")
+                _req = Request(_url, headers={
+                    "Accept":     "application/json",
+                    "User-Agent": "QTCL/3.1 ClientPythOracle",
+                })
+                with urlopen(_req, timeout=6) as _resp:
+                    _raw = json.loads(_resp.read().decode("utf-8"))
+                if isinstance(_raw, list):
+                    _entries = _raw
+                elif isinstance(_raw, dict):
+                    _entries = (
+                        _raw.get("parsed") or
+                        _raw.get("data", {}).get("price_feeds") if isinstance(_raw.get("data"), dict) else None or
+                        _raw.get("data") or
+                        []
+                    )
+                else:
+                    _entries = []
+                _f = _parse_entries(_entries)
+                if _f:
+                    feeds     = _f
+                    hermes_ok = True
+                    _last_exc = f"✅ {_label}"
+                else:
+                    _last_exc += f" | {_label}:empty"
+            except Exception as _exc:
+                _last_exc += f" | {_label}:{type(_exc).__name__}"
 
         if not feeds:
             if self.cache:
-                logger.debug("[CLIENT-ORACLE] Hermes down — serving stale cache")
+                logger.debug("[CLIENT-ORACLE] All mirrors down — serving stale cache")
                 return self.cache
-            logger.warning(f"[CLIENT-ORACLE] No prices, no cache. Last error: {_last_exc}")
+            logger.warning(f"[CLIENT-ORACLE] All 7 mirrors failed. Errors: {_last_exc}")
             return None
 
         snapshot_id = hashlib.sha256("|".join([
