@@ -19666,10 +19666,33 @@ class QtclClientApp:
         return None
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from embedded ClientPythOracle."""
+        """
+        HYBRID ORACLE: Try server first, fallback to client's own Pyth oracle.
+        
+        Priority:
+          1. Server RPC (if running) — gets signed prices from server
+          2. Client local Pyth oracle (fallback) — fetches directly from Hermes
+        
+        This ensures resilience: works with OR without server.
+        """
+        # Try server first
+        try:
+            snap = self._rpc_call("qtcl_getPythPrice", symbols if symbols else None)
+            if snap and snap.get("feeds"):
+                logger.debug("[ORACLE] ✅ Got prices from SERVER")
+                return snap
+        except Exception as e:
+            logger.debug(f"[ORACLE] ⚠️  Server fetch failed: {e} — falling back to local oracle")
+        
+        # Fallback to client's own Pyth oracle
         if not hasattr(self, '_client_oracle'):
             self._client_oracle = ClientPythOracle()
-        return self._client_oracle.fetch_prices(symbols)
+        
+        snap = self._client_oracle.fetch_prices(symbols)
+        if snap and snap.get("feeds"):
+            logger.info("[ORACLE] ✅ Got prices from CLIENT (local Pyth oracle)")
+            snap["source"] = "client_hermes"  # Mark as coming from client, not server
+        return snap
 
     def _fmt_price(self, price: float, width: int = 12) -> str:
         """Format USD price with commas, right-aligned."""
