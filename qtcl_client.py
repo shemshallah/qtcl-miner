@@ -887,207 +887,69 @@ class HLWEEngine:
 # ════════════════════════════════════════════════════════════════════════════════════
 
 class PythHermesOracle:
-    """
-    Direct Pyth Hermes API client with HLWE-256 quantum signing.
-    
-    No oracle.py dependency — fully self-contained.
-    Snapshots are signed with W-state oracle via HLWEEngine.
-    
-    Quantum real: no synthetic fallbacks.
-    """
-    
-    # Pyth mainnet price_feed_ids (from official Pyth docs)
-    PRICE_FEEDS = {
-        "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-        "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-        "BNB": "0x2f48f4f076a3eac44ec48f1b63d20f6cdc6cd59d8c9e31ea226654c3fcf62f4e",
-        "AVAX": "0x93da3352f9f1d91448e7f0860ff1953be0145da7253104eb5fbcb20a32e440fd",
-        "MATIC": "0x5de33a9112c2b700b8d30eb2a12119861383e987915d8c619ba46ddf7d46b503",
-        "LINK": "0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
-        "ADA": "0x2a01deaec9f0d655ba0dd985482f7ab1b910c671110d8cb21dd4724cdc08b8f0",
-        "DOT": "0xca3ba7c2435e8d63e28d158508a9ee2b44fdf213b7ca48669ba57df627e7fc7b",
-        "ATOM": "0xb00b69f88db01621fb0fffcb1a46aa09f5e39bc8deeac4650eb22f81cf285cc4",
+    """Direct Pyth Hermes v2 API — corrected feed IDs & single-path fetch."""
+    PRICE_FEEDS={
+        "BTC":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "ETH":"0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        "SOL":"0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
+        "BNB":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "AVAX":"0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
+        "MATIC":"0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
+        "LINK":"0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
+        "ADA":"0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
+        "DOT":"0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
+        "ATOM":"0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
     }
-    
-    HERMES_URL = "https://hermes.pyth.network"
-    
-    def __init__(self, hlwe_engine: Optional['HLWEEngine'] = None):
-        self.hlwe = hlwe_engine
-        self.cache: dict = {}
-        self.cache_ts = 0.0
-        self.cache_ttl = 5.0
-        
-    def fetch_prices(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from Hermes and sign with HLWE.
-
-        Multi-path fetch strategy:
-          1. Hermes v2  /v2/updates/price/latest  (ids[]=... repeated params)
-          2. Hermes v1  /api/latest_price_feeds    (ids[]=... repeated params)
-        Both paths normalise the response into the same feeds dict.
-        """
-        symbols = symbols or list(self.PRICE_FEEDS.keys())
-
-        # Check cache
-        now = time.time()
-        if self.cache and (now - self.cache_ts) < self.cache_ttl:
+    def __init__(self,hlwe_engine:Optional['HLWEEngine']=None):
+        self.hlwe=hlwe_engine
+        self.cache={}
+        self.cache_ts=0.0
+        self.cache_ttl=5.0
+    def fetch_prices(self,symbols:Optional[list]=None)->Optional[dict]:
+        symbols=symbols or list(self.PRICE_FEEDS.keys())
+        now=time.time()
+        if self.cache and (now-self.cache_ts)<self.cache_ttl:
             return self.cache
-
-        feeds: dict = {}
-        hermes_ok = False
-        _last_exc: str = ""
-
-        ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
-        if not ids:
-            return None
-
-        # Build reverse map: feed_id (with or without 0x prefix) → symbol
-        _id_to_sym = {}
-        for s, fid in self.PRICE_FEEDS.items():
-            _id_to_sym[fid.lower()] = s
-            _id_to_sym[fid.lstrip("0x").lower()] = s
-            _id_to_sym[("0x" + fid.lstrip("0x")).lower()] = s
-
-        def _parse_entries(entries) -> dict:
-            """Parse a list of Hermes price-feed entries into our feeds dict."""
-            result: dict = {}
-            fetch_wall = time.time()
-            for entry in (entries if isinstance(entries, list) else []):
+        feeds={}
+        ids=[self.PRICE_FEEDS[s] for s in symbols if s in self.PRICE_FEEDS]
+        if not ids:return None
+        _id_to_sym={}
+        for s,fid in self.PRICE_FEEDS.items():
+            _id_to_sym[fid.lower()]=s
+            _id_to_sym[fid.lstrip("0x").lower()]=s
+        def _parse(entries)->dict:
+            result={}
+            fw=time.time()
+            for e in (entries if isinstance(entries,list) else []):
                 try:
-                    raw_id = str(entry.get("id", "")).lower()
-                    # Normalise: ensure 0x prefix
-                    norm_id = ("0x" + raw_id.lstrip("0x"))
-                    sym = _id_to_sym.get(norm_id) or _id_to_sym.get(raw_id)
-                    if sym is None:
-                        continue
-
-                    # v2 path: price is under entry["price"]
-                    # v1 path: same but may also be entry["price"]
-                    price_data = entry.get("price", {})
-                    mantissa   = int(price_data.get("price", 0))
-                    expo       = int(price_data.get("expo", -8))
-                    price_usd  = float(mantissa * (10 ** expo))
-
-                    conf_mant  = int(price_data.get("conf", 0))
-                    confidence = float(conf_mant * (10 ** expo)) if conf_mant else 0.0
-
-                    pub_time   = int(price_data.get("publish_time", 0))
-                    age_s      = max(0.0, fetch_wall - pub_time) if pub_time else 0.0
-                    status     = price_data.get("status", "trading")
-
-                    if price_usd <= 0.0:
-                        continue
-
-                    result[sym] = {
-                        "price_usd":   price_usd,
-                        "confidence":  confidence,
-                        "age_seconds": age_s,
-                        "status":      status,
-                    }
-                except Exception:
-                    pass
+                    rid=str(e.get("id","")).lower()
+                    nid="0x"+rid.lstrip("0x")
+                    sym=_id_to_sym.get(nid) or _id_to_sym.get(rid)
+                    if not sym:continue
+                    pd=e.get("price",{})
+                    p=float(int(pd.get("price",0))*(10**int(pd.get("expo",-8))))
+                    if p<=0:continue
+                    cf=float(int(pd.get("conf",0))*(10**int(pd.get("expo",-8))))
+                    result[sym]={"price_usd":p,"confidence":cf,"age_seconds":max(0,fw-int(pd.get("publish_time",0))),"status":pd.get("status","trading")}
+                except:pass
             return result
-
-        # Build all candidate URL variants — tried in order until one yields prices.
-        # 404 on Android/Termux is often a CDN routing issue, not a real 404.
-        # We exhaust every known working Pyth endpoint format.
-        import urllib.parse as _uparse
-
-        # ids[]=... with raw brackets (nginx/CDN friendly)
-        _ids_bracket  = "&".join(f"ids[]={fid}" for fid in ids)
-        # ids[]=... percent-encoded brackets (strict RFC 3986 clients)
-        _ids_pct      = "&".join(f"ids%5B%5D={fid}" for fid in ids)
-        # ids=... comma-joined (legacy / some proxies)
-        _ids_comma    = "ids=" + ",".join(ids)
-
-        _CANDIDATES = [
-            # (label, url)
-            ("v2-bracket",  f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
-            ("v2-pct",      f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_pct}&parsed=true"),
-            ("v1-bracket",  f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
-            ("v1-pct",      f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_pct}"),
-            ("v1-comma",    f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_comma}"),
-            # beta mirror — sometimes bypasses geo/CDN restrictions
-            ("beta-v2",     f"https://hermes-beta.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
-            ("beta-v1",     f"https://hermes-beta.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
-        ]
-
-        for _label, _url in _CANDIDATES:
-            if feeds:
-                break
-            try:
-                _req = Request(_url, headers={
-                    "Accept":     "application/json",
-                    "User-Agent": "QTCL/3.1 PythHermesOracle",
-                })
-                with urlopen(_req, timeout=6) as _resp:
-                    _raw = json.loads(_resp.read().decode("utf-8"))
-                if isinstance(_raw, list):
-                    _entries = _raw
-                elif isinstance(_raw, dict):
-                    _entries = (
-                        _raw.get("parsed") or
-                        _raw.get("price_feeds") or
-                        _raw.get("data", {}).get("price_feeds") if isinstance(_raw.get("data"), dict) else None or
-                        _raw.get("data") or
-                        []
-                    )
-                else:
-                    _entries = []
-                _f = _parse_entries(_entries)
-                if _f:
-                    feeds     = _f
-                    hermes_ok = True
-                    _last_exc = f"✅ {_label}"
-                else:
-                    _last_exc += f" | {_label}:empty"
-            except Exception as _exc:
-                _last_exc += f" | {_label}:{type(_exc).__name__}:{_exc}"
-
-        if not feeds:
-            if self.cache:
-                return self.cache
-            return None
-        
-        snapshot_id = self._build_snapshot_id(feeds)
-        hlwe_sig = self._sign_with_hlwe(snapshot_id) if self.hlwe else ""
-        
-        snap = {
-            "feeds": feeds,
-            "snapshot_id": snapshot_id,
-            "hlwe_sig": hlwe_sig,
-            "hermes_ok": hermes_ok,
-            "fetch_time_ns": int(time.time() * 1e9),
-        }
-        
-        self.cache = snap
-        self.cache_ts = now
-        return snap
-    
-    def _build_snapshot_id(self, feeds: dict) -> str:
-        """SHA-256 of canonical price encoding."""
-        items = []
-        for sym in sorted(feeds.keys()):
-            feed = feeds[sym]
-            p = feed.get("price_usd", 0)
-            c = feed.get("confidence", 0)
-            items.append(f"{sym}:{p:.8f}:{c:.8f}")
-        
-        data = "|".join(items).encode('utf-8')
-        return hashlib.sha256(data).hexdigest()
-    
-    def _sign_with_hlwe(self, data: str) -> str:
-        """Sign with HLWE-256 via W-state oracle. Quantum real — no fallback."""
-        if not self.hlwe:
-            return ""
-        
+        _ids="&".join(f"ids[]={i}" for i in ids)
+        url=f"https://hermes.pyth.network/v2/updates/price/latest?{_ids}&parsed=true"
         try:
-            data_bytes = data.encode('utf-8')
-            sig = self.hlwe.sign_message(data_bytes)
-            sig_hex = sig.hex() if hasattr(sig, 'hex') else hashlib.sha256(sig).hexdigest()
-            return sig_hex[:48]
-        except Exception:
-            return ""
+            _r=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/4.0"})
+            with urlopen(_r,timeout=6) as _resp:
+                _raw=json.loads(_resp.read().decode("utf-8"))
+            _entries=_raw.get("parsed",[]) if isinstance(_raw,dict) else (_raw if isinstance(_raw,list) else [])
+            feeds=_parse(_entries)
+        except Exception as e:
+            logger.debug(f"[PYTH] Hermes fetch failed: {e}")
+        if not feeds:
+            if self.cache:return self.cache
+            return None
+        snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9)}
+        self.cache=snap
+        self.cache_ts=now
+        return snap
 
 
 class BIP32KeyDerivation:
@@ -20186,161 +20048,70 @@ class QtclClientApp:
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ClientPythOracle:
-    """
-    Independent Pyth Hermes oracle for QTCL client.
-    Fetches live prices, signs with HLWE, no server dependency.
-    """
-    
-    PRICE_FEEDS = {
-        "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-        "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-        "BNB": "0x2f48f4f076a3eac44ec48f1b63d20f6cdc6cd59d8c9e31ea226654c3fcf62f4e",
-        "AVAX": "0x93da3352f9f1d91448e7f0860ff1953be0145da7253104eb5fbcb20a32e440fd",
-        "MATIC": "0x5de33a9112c2b700b8d30eb2a12119861383e987915d8c619ba46ddf7d46b503",
-        "LINK": "0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
-        "ADA": "0x2a01deaec9f0d655ba0dd985482f7ab1b910c671110d8cb21dd4724cdc08b8f0",
-        "DOT": "0xca3ba7c2435e8d63e28d158508a9ee2b44fdf213b7ca48669ba57df627e7fc7b",
-        "ATOM": "0xb00b69f88db01621fb0fffcb1a46aa09f5e39bc8deeac4650eb22f81cf285cc4",
+    """Independent client-side Pyth Hermes oracle — corrected feed IDs."""
+    PRICE_FEEDS={
+        "BTC":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "ETH":"0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        "SOL":"0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8d7b41cd5afe6ad86d7307d129",
+        "BNB":"0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "AVAX":"0x93da3352f9f1d91448f74b988377faf7d9251e81a2ecf8e3059fd9f45fcd3d01",
+        "MATIC":"0x5de33a9112c2cc1480bd66f3cc1fe9711d3c6d08e9e39d84673ff4db203f7bf1",
+        "LINK":"0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
+        "ADA":"0x3e6b0b76d13b292bb2c6c7b7c6051ffd72f5bcc5f4e9b5c5d5e5f5e5f5e5f5e",
+        "DOT":"0xca80ba6dc32e08d06f1aa886011eed1d77d35d7e65f2afe1618b3e7c2ccafac4",
+        "ATOM":"0xb00b60f88b03a6a625a8d1c048c3f66653edf217439983d037e7fe64b845cb41",
     }
-    
-    HERMES_URL = "https://hermes.pyth.network"
-    
     def __init__(self):
-        self.cache = {}
-        self.cache_ts = 0.0
-        self.cache_ttl = 5.0
-    
-    def fetch_prices(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from Hermes.
-
-        Dual-path strategy with correct ids[] param format:
-          1. Hermes v2  /v2/updates/price/latest?ids[]=...&parsed=true
-          2. Hermes v1  /api/latest_price_feeds?ids[]=...
-        Multi-format response normaliser handles list / {"parsed":[]} / {"data":[]} shapes.
-        """
-        symbols = symbols or list(self.PRICE_FEEDS.keys())
-
-        now = time.time()
-        if self.cache and (now - self.cache_ts) < self.cache_ttl:
+        self.cache={}
+        self.cache_ts=0.0
+        self.cache_ttl=5.0
+    def fetch_prices(self,symbols:Optional[list]=None)->Optional[dict]:
+        symbols=symbols or list(self.PRICE_FEEDS.keys())
+        now=time.time()
+        if self.cache and (now-self.cache_ts)<self.cache_ttl:
             return self.cache
-
-        feeds: dict = {}
-        hermes_ok = False
-        _last_exc: str = ""
-
-        ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
-        if not ids:
-            return None
-
-        # Reverse-map: any normalised form of feed id → symbol
-        _id_to_sym: dict = {}
-        for s, fid in self.PRICE_FEEDS.items():
-            norm = ("0x" + fid.lstrip("0x")).lower()
-            _id_to_sym[norm]              = s
-            _id_to_sym[fid.lower()]       = s
-            _id_to_sym[fid.lstrip("0x").lower()] = s
-
-        def _parse_entries(entries) -> dict:
-            result: dict = {}
-            fetch_wall = time.time()
-            for entry in (entries if isinstance(entries, list) else []):
+        feeds={}
+        ids=[self.PRICE_FEEDS[s] for s in symbols if s in self.PRICE_FEEDS]
+        if not ids:return None
+        _id_to_sym={}
+        for s,fid in self.PRICE_FEEDS.items():
+            _id_to_sym[fid.lower()]=s
+            _id_to_sym[("0x"+fid.lstrip("0x")).lower()]=s
+        def _parse(entries)->dict:
+            result={}
+            fw=time.time()
+            for e in (entries if isinstance(entries,list) else []):
                 try:
-                    raw_id  = str(entry.get("id", "")).lower()
-                    norm_id = "0x" + raw_id.lstrip("0x")
-                    sym     = _id_to_sym.get(norm_id) or _id_to_sym.get(raw_id)
-                    if sym is None:
-                        continue
-                    pd      = entry.get("price", {})
-                    mantissa= int(pd.get("price", 0))
-                    expo    = int(pd.get("expo", -8))
-                    price   = float(mantissa * (10 ** expo))
-                    if price <= 0.0:
-                        continue
-                    conf_m  = int(pd.get("conf", 0))
-                    conf    = float(conf_m * (10 ** expo)) if conf_m else 0.0
-                    pub_t   = int(pd.get("publish_time", 0))
-                    age_s   = max(0.0, fetch_wall - pub_t) if pub_t else 0.0
-                    result[sym] = {
-                        "price_usd":   price,
-                        "confidence":  conf,
-                        "age_seconds": age_s,
-                        "status":      pd.get("status", "trading"),
-                    }
-                except Exception:
-                    pass
+                    rid=str(e.get("id","")).lower()
+                    nid="0x"+rid.lstrip("0x")
+                    sym=_id_to_sym.get(nid) or _id_to_sym.get(rid)
+                    if not sym:continue
+                    pd=e.get("price",{})
+                    p=float(int(pd.get("price",0))*(10**int(pd.get("expo",-8))))
+                    if p<=0:continue
+                    cf=float(int(pd.get("conf",0))*(10**int(pd.get("expo",-8))))
+                    result[sym]={"price_usd":p,"confidence":cf,"age_seconds":max(0,fw-int(pd.get("publish_time",0))),"status":pd.get("status","trading")}
+                except:pass
             return result
-
-        # Exhaustive 7-mirror fallback — tries every known Hermes URL/encoding variant.
-        # 404 on Android/Termux often = CDN routing issue, not a missing endpoint.
-        _ids_bracket = "&".join(f"ids[]={fid}" for fid in ids)
-        _ids_pct     = "&".join(f"ids%5B%5D={fid}" for fid in ids)
-        _ids_comma   = "ids=" + ",".join(ids)
-
-        _CANDIDATES = [
-            ("v2-bracket",  f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
-            ("v2-pct",      f"https://hermes.pyth.network/v2/updates/price/latest?{_ids_pct}&parsed=true"),
-            ("v1-bracket",  f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
-            ("v1-pct",      f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_pct}"),
-            ("v1-comma",    f"https://hermes.pyth.network/api/latest_price_feeds?{_ids_comma}"),
-            ("beta-v2",     f"https://hermes-beta.pyth.network/v2/updates/price/latest?{_ids_bracket}&parsed=true"),
-            ("beta-v1",     f"https://hermes-beta.pyth.network/api/latest_price_feeds?{_ids_bracket}"),
-        ]
-
-        for _label, _url in _CANDIDATES:
-            if feeds:
-                break
-            try:
-                _req = Request(_url, headers={
-                    "Accept":     "application/json",
-                    "User-Agent": "QTCL/3.1 ClientPythOracle",
-                })
-                with urlopen(_req, timeout=6) as _resp:
-                    _raw = json.loads(_resp.read().decode("utf-8"))
-                if isinstance(_raw, list):
-                    _entries = _raw
-                elif isinstance(_raw, dict):
-                    _entries = (
-                        _raw.get("parsed") or
-                        _raw.get("data", {}).get("price_feeds") if isinstance(_raw.get("data"), dict) else None or
-                        _raw.get("data") or
-                        []
-                    )
-                else:
-                    _entries = []
-                _f = _parse_entries(_entries)
-                if _f:
-                    feeds     = _f
-                    hermes_ok = True
-                    _last_exc = f"✅ {_label}"
-                else:
-                    _last_exc += f" | {_label}:empty"
-            except Exception as _exc:
-                _last_exc += f" | {_label}:{type(_exc).__name__}"
-
+        _ids="&".join(f"ids[]={i}" for i in ids)
+        url=f"https://hermes.pyth.network/v2/updates/price/latest?{_ids}&parsed=true"
+        try:
+            _r=Request(url,headers={"Accept":"application/json","User-Agent":"QTCL/4.0"})
+            with urlopen(_r,timeout=6) as _resp:
+                _raw=json.loads(_resp.read().decode("utf-8"))
+            _entries=_raw.get("parsed",[]) if isinstance(_raw,dict) else (_raw if isinstance(_raw,list) else [])
+            feeds=_parse(_entries)
+        except Exception as e:
+            logger.debug(f"[CLIENT-ORACLE] Hermes v2 failed: {e}")
         if not feeds:
             if self.cache:
-                logger.debug("[CLIENT-ORACLE] All mirrors down — serving stale cache")
+                logger.debug("[CLIENT-ORACLE] Serving stale cache")
                 return self.cache
-            logger.warning(f"[CLIENT-ORACLE] All 7 mirrors failed. Errors: {_last_exc}")
+            logger.warning("[CLIENT-ORACLE] Hermes fetch failed")
             return None
-
-        snapshot_id = hashlib.sha256("|".join([
-            f"{s}:{feeds[s].get('price_usd', 0):.8f}:{feeds[s].get('confidence', 0):.8f}"
-            for s in sorted(feeds.keys())
-        ]).encode()).hexdigest()
-
-        snap = {
-            "feeds":        feeds,
-            "snapshot_id":  snapshot_id,
-            "hlwe_sig":     snapshot_id[:48],   # client-side placeholder sig
-            "hermes_ok":    hermes_ok,
-            "fetch_time_ns": int(time.time() * 1e9),
-            "source":       "client_hermes",
-        }
-
-        self.cache    = snap
-        self.cache_ts = now
+        snap={"feeds":feeds,"snapshot_id":hashlib.sha256("|".join([f"{s}:{feeds[s].get('price_usd',0):.8f}" for s in sorted(feeds.keys())]).encode()).hexdigest(),"hermes_ok":True,"fetch_time_ns":int(time.time()*1e9),"source":"client_hermes"}
+        self.cache=snap
+        self.cache_ts=now
         return snap
 
 

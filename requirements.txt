@@ -8,12 +8,14 @@ requests>=2.31.0                # HTTP client (cleaner than urllib)
 
 # === NETWORKING & ASYNC ===
 aiohttp>=3.9.0                  # Async HTTP for DHT peer discovery
+pythclient>=0.1.8       # Pyth official Python SDK
+cffi>=1.15.0            # already required
+numpy>=1.24.0       
 
 # === OPTIONAL (Development, Testing, Monitoring) ===
 pytest>=7.4.0                   # Unit test framework
 pytest-asyncio>=0.21.0          # Async test support
-black>=23.0.0                   # Code formatting
-flake8>=6.0.0                   # Linting
+pyth-price-feeds==2.0.0
 
 # === Installation ===
 # pip install -r requirements.txt
