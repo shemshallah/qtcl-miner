@@ -2897,12 +2897,12 @@ class QtclP2PNode:
                         _raw_port = int.from_bytes(raw[68:70], 'little') if len(raw) >= 70 else 9091
                         peer_data = {'host': _raw_host, 'port': _raw_port if _raw_port > 0 else 9091}
                     except Exception: peer_data = {}
-                    # Dedup: only log once per host within 5s window
+                    # Dedup: only log once per host within 30s window
                     _ph_key = f"{peer_data.get('host','')}:{peer_data.get('port',0)}"
                     _now_ns = __import__('time').time()
                     if not hasattr(self, '_logged_peers'):
                         self._logged_peers = {}
-                    if _ph_key not in self._logged_peers or _now_ns - self._logged_peers.get(_ph_key, 0) > 5.0:
+                    if _ph_key not in self._logged_peers or _now_ns - self._logged_peers.get(_ph_key, 0) > 30.0:
                         self._logged_peers[_ph_key] = _now_ns
                         _nc = self.peer_count
                         if _nc <= 4:
@@ -2918,7 +2918,7 @@ class QtclP2PNode:
                             daemon=True,
                             name=f"PeerOracle-{_ph}"
                         ).start()
-                    # Save new peer to SQLite DB immediately
+                    # Save new peer to SQLite DB via C layer (single write, no duplicate)
                     if _accel_ok and peer_data.get('host'):
                         try:
                             import pathlib as _pl2
@@ -2929,22 +2929,6 @@ class QtclP2PNode:
                                 int(peer_data.get('port', 9091)),
                             )
                         except Exception: pass
-                    # Persist to DB for reconnect on next startup
-                    try:
-                        import sqlite3 as _p2p_sq
-                        _p2p_db_path = __import__('pathlib').Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db'
-                        _p2p_db_path.parent.mkdir(parents=True, exist_ok=True)
-                        with _p2p_sq.connect(str(_p2p_db_path)) as _pc:
-                            _pc.execute("""CREATE TABLE IF NOT EXISTS known_peers
-                                (host TEXT, port INTEGER, last_seen INTEGER,
-                                 fidelity REAL DEFAULT 0,
-                                 PRIMARY KEY(host, port))""")
-                            if peer_data.get('host'):
-                                _pc.execute("""INSERT OR REPLACE INTO known_peers
-                                    (host, port, last_seen) VALUES (?,?,?)""",
-                                    (peer_data['host'], peer_data['port'],
-                                     int(__import__('time').time())))
-                    except Exception: pass
 
                 elif event_type == 2:  # PEER_DISCONNECTED
                     _EXP_LOG.debug(f"[P2P] Peer disconnected  peers={self.peer_count}")
@@ -18734,10 +18718,22 @@ class QtclClientApp:
                     try:
                         _pl = _P2P_NODE.get_peers()
                         if _pl:
-                            _avg_lat = sum(p.get('latency_ms',0) for p in _pl) / len(_pl)
-                            _avg_fid = sum(p.get('last_fidelity',0) for p in _pl) / len(_pl)
-                            _p2p_rep = f"  avg_lat={_avg_lat:.0f}ms  avg_fid={_avg_fid:.3f}"
+                            _connected_pl = [p for p in _pl if p.get('connected')]
+                            _fids = [p.get('fidelity', 0) for p in _connected_pl if p.get('fidelity', 0) > 0]
+                            _lats = [p.get('latency_ms', 0) for p in _connected_pl if p.get('latency_ms', 0) > 0]
+                            _avg_fid = sum(_fids) / len(_fids) if _fids else 0.0
+                            _avg_lat = sum(_lats) / len(_lats) if _lats else 0.0
+                            _lat_str = f"{_avg_lat:.0f}ms" if _lats else "N/A"
+                            _fid_str = f"{_avg_fid:.4f}" if _fids else "N/A"
+                            _p2p_rep = f"  avg_lat={_lat_str}  avg_fid={_fid_str}"
                     except Exception: pass
+                    # Better consensus display: if C layer has no consensus yet,
+                    # trigger it and show local oracle fidelity as interim
+                    if not _cons2:
+                        try: _P2P_NODE.trigger_consensus()
+                        except Exception: pass
+                        _local_f = _LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0) if _LOCAL_ORACLE else 0
+                        _cf2 = f"local-only F={_local_f:.4f}" if _local_f > 0 else "awaiting peers…"
                     print(f"  P2P    : 🌀 {_np2} peers  {_ns2} SSE subs  consensus={_cf2}{_p2p_rep}")
                 except Exception: pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
