@@ -16025,10 +16025,15 @@ class QtclClientApp:
                     try:
                         re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
                         if _HAS_NP and any(v != 0.0 for v in re_list):
-                            import numpy as _npml
-                            _dm_raw = (_npml.array(re_list, dtype=_npml.complex128) +
-                                       1j * _npml.array(im_list, dtype=_npml.complex128)
-                                       ).reshape(8, 8)
+                            import numpy as _npml, math as _math
+                            # Sanitize: replace NaN/inf with 0.0 before array construction
+                            # (C ring buffer can contain uninitialized floats on startup)
+                            re_san = [v if _math.isfinite(v) else 0.0 for v in re_list]
+                            im_san = [v if _math.isfinite(v) else 0.0 for v in im_list]
+                            if any(v != 0.0 for v in re_san):
+                                _dm_raw = (_npml.array(re_san, dtype=_npml.complex128) +
+                                           1j * _npml.array(im_san, dtype=_npml.complex128)
+                                           ).reshape(8, 8)
                             if _validate_dm_8x8(_dm_raw):
                                 dm_curr = _dm_raw
                             else:
@@ -16050,8 +16055,11 @@ class QtclClientApp:
                             cons = _P2P_NODE.get_consensus_dm()
                             if cons is not None:
                                 re_c, im_c, fid_c, h_c = cons
-                                _dm_cons = (_np.array(re_c, dtype=_np.complex128)
-                                          + 1j * _np.array(im_c, dtype=_np.complex128)
+                                import math as _cmath
+                                re_cs = [v if _cmath.isfinite(v) else 0.0 for v in re_c]
+                                im_cs = [v if _cmath.isfinite(v) else 0.0 for v in im_c]
+                                _dm_cons = (_np.array(re_cs, dtype=_np.complex128)
+                                          + 1j * _np.array(im_cs, dtype=_np.complex128)
                                           ).reshape(8, 8)
                                 if _validate_dm_8x8(_dm_cons) and fid_c > 0.5:
                                     # Consensus fidelity-weighted blend
@@ -16455,7 +16463,11 @@ class QtclClientApp:
                                 pip   = str(payload.get('ip_address') or payload.get('host') or '')
                                 pport = int(payload.get('port') or 9091)
                                 ppid  = str(payload.get('peer_id') or '')
-                                if pip and pip not in ('','127.0.0.1','localhost') and _accel_ok and _P2P_NODE:
+                                # Exclude self (own IP + loopback) — Koyeb broadcasts our
+                                # own peer_joined back to us; connecting/writing self as peer
+                                # inflates stored count and causes self-connection loops.
+                                _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
+                                if pip and pip not in _self_ips and _accel_ok and _P2P_NODE:
                                     try:
                                         rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
                                         if rc >= 0:
