@@ -8,7 +8,6 @@ requests>=2.31.0                # HTTP client (cleaner than urllib)
 
 # === NETWORKING & ASYNC ===
 aiohttp>=3.9.0                  # Async HTTP for DHT peer discovery
-cryptography>=41.0.0            # TLS, HMAC, key operations
 
 # === OPTIONAL (Development, Testing, Monitoring) ===
 pytest>=7.4.0                   # Unit test framework
