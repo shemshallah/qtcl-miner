@@ -919,61 +919,122 @@ class PythHermesOracle:
         self.cache_ttl = 5.0
         
     def fetch_prices(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from Hermes and sign with HLWE."""
+        """Fetch live Pyth prices from Hermes and sign with HLWE.
+
+        Multi-path fetch strategy:
+          1. Hermes v2  /v2/updates/price/latest  (ids[]=... repeated params)
+          2. Hermes v1  /api/latest_price_feeds    (ids[]=... repeated params)
+        Both paths normalise the response into the same feeds dict.
+        """
         symbols = symbols or list(self.PRICE_FEEDS.keys())
-        
+
         # Check cache
         now = time.time()
         if self.cache and (now - self.cache_ts) < self.cache_ttl:
             return self.cache
-        
-        feeds = {}
+
+        feeds: dict = {}
         hermes_ok = False
-        
-        try:
-            ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
-            if not ids:
-                return None
-            
-            ids_param = ",".join(ids)
-            url = f"{self.HERMES_URL}/api/latest_price_feeds?ids={ids_param}"
-            req = Request(url, headers={"Accept": "application/json"})
-            
-            with urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                hermes_ok = True
-                
-                for feed_data in data.get("data", {}).get("price_feeds", []):
-                    id_ = feed_data.get("id", "")
-                    sym = None
-                    for s, feed_id in self.PRICE_FEEDS.items():
-                        if feed_id == id_:
-                            sym = s
-                            break
-                    
-                    if not sym:
+        _last_exc: str = ""
+
+        ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
+        if not ids:
+            return None
+
+        # Build reverse map: feed_id (with or without 0x prefix) → symbol
+        _id_to_sym = {}
+        for s, fid in self.PRICE_FEEDS.items():
+            _id_to_sym[fid.lower()] = s
+            _id_to_sym[fid.lstrip("0x").lower()] = s
+            _id_to_sym[("0x" + fid.lstrip("0x")).lower()] = s
+
+        def _parse_entries(entries) -> dict:
+            """Parse a list of Hermes price-feed entries into our feeds dict."""
+            result: dict = {}
+            fetch_wall = time.time()
+            for entry in (entries if isinstance(entries, list) else []):
+                try:
+                    raw_id = str(entry.get("id", "")).lower()
+                    # Normalise: ensure 0x prefix
+                    norm_id = ("0x" + raw_id.lstrip("0x"))
+                    sym = _id_to_sym.get(norm_id) or _id_to_sym.get(raw_id)
+                    if sym is None:
                         continue
-                    
-                    price_data = feed_data.get("price", {})
-                    mantissa = int(price_data.get("price", 0))
-                    exponent = int(price_data.get("expo", -8))
-                    price_usd = float(mantissa * (10 ** exponent))
-                    
-                    conf_mant = int(price_data.get("conf", 0))
-                    conf_exp = int(price_data.get("expo", -8))
-                    confidence = float(conf_mant * (10 ** conf_exp)) if conf_mant else 0.0
-                    
-                    pub_time = int(feed_data.get("price", {}).get("publish_time", 0))
-                    age_s = max(0.0, time.time() - pub_time)
-                    
-                    feeds[sym] = {
-                        "price_usd": price_usd,
-                        "confidence": confidence,
+
+                    # v2 path: price is under entry["price"]
+                    # v1 path: same but may also be entry["price"]
+                    price_data = entry.get("price", {})
+                    mantissa   = int(price_data.get("price", 0))
+                    expo       = int(price_data.get("expo", -8))
+                    price_usd  = float(mantissa * (10 ** expo))
+
+                    conf_mant  = int(price_data.get("conf", 0))
+                    confidence = float(conf_mant * (10 ** expo)) if conf_mant else 0.0
+
+                    pub_time   = int(price_data.get("publish_time", 0))
+                    age_s      = max(0.0, fetch_wall - pub_time) if pub_time else 0.0
+                    status     = price_data.get("status", "trading")
+
+                    if price_usd <= 0.0:
+                        continue
+
+                    result[sym] = {
+                        "price_usd":   price_usd,
+                        "confidence":  confidence,
                         "age_seconds": age_s,
-                        "status": "trading",
+                        "status":      status,
                     }
-        except (URLError, HTTPError, TimeoutError, json.JSONDecodeError):
-            hermes_ok = False
+                except Exception:
+                    pass
+            return result
+
+        # ── Attempt 1: Hermes v2 REST endpoint ──────────────────────────────
+        try:
+            params_v2 = "&".join(f"ids[]={fid}" for fid in ids)
+            url_v2    = f"{self.HERMES_URL}/v2/updates/price/latest?{params_v2}&encoding=hex&parsed=true"
+            req_v2    = Request(url_v2, headers={
+                "Accept":     "application/json",
+                "User-Agent": "QTCL/3.1 PythHermesOracle",
+            })
+            with urlopen(req_v2, timeout=6) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                # v2 format: {"parsed": [...], "binary": {...}}
+                entries = raw.get("parsed", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+                feeds   = _parse_entries(entries)
+                if feeds:
+                    hermes_ok = True
+        except Exception as exc:
+            _last_exc = f"v2:{exc}"
+
+        # ── Attempt 2: Hermes v1 REST endpoint (fallback) ───────────────────
+        if not feeds:
+            try:
+                params_v1 = "&".join(f"ids[]={fid}" for fid in ids)
+                url_v1    = f"{self.HERMES_URL}/api/latest_price_feeds?{params_v1}"
+                req_v1    = Request(url_v1, headers={
+                    "Accept":     "application/json",
+                    "User-Agent": "QTCL/3.1 PythHermesOracle",
+                })
+                with urlopen(req_v1, timeout=6) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                    # v1 format: list directly, or {"data": {"price_feeds": [...]}}
+                    if isinstance(raw, list):
+                        entries = raw
+                    elif isinstance(raw, dict):
+                        entries = (
+                            raw.get("parsed") or
+                            raw.get("data", {}).get("price_feeds") or
+                            raw.get("data") or
+                            []
+                        )
+                    else:
+                        entries = []
+                    feeds = _parse_entries(entries)
+                    if feeds:
+                        hermes_ok = True
+            except Exception as exc:
+                _last_exc += f" | v1:{exc}"
+                hermes_ok = False
         
         if not feeds:
             if self.cache:
@@ -7802,7 +7863,7 @@ class QtclServer(QtclNode):
 
     def _block_production_loop(self) -> None:
         block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
-        difficulty = int(self._cfg.get("difficulty", 4))
+        difficulty = int(self._cfg.get("difficulty", 6))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
         
         # ✅ Import _SSE_MUX at function scope to avoid NameError
@@ -8091,7 +8152,7 @@ class QtclMiner(QtclNode):
         self._mining_thread.start()
 
     def _mining_loop(self) -> None:
-        difficulty = int(self._cfg.get("difficulty", 4))
+        difficulty = int(self._cfg.get("difficulty", 6))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
         import urllib.request
         while not self._stop_event.is_set():
@@ -18032,10 +18093,10 @@ class QtclClientApp:
                 difficulty_bits = int(
                     tip.get("difficulty_bits") or
                     tip.get("difficulty") or
-                    5  # conservative fallback if tip is missing the field
+                    6  # conservative fallback if tip is missing the field
                 )
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
-                difficulty_bits = max(1, min(difficulty_bits, 20))
+                difficulty_bits = max(6, min(difficulty_bits, 20))
                 
                 # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
@@ -19667,32 +19728,77 @@ class QtclClientApp:
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
         """
-        HYBRID ORACLE: Try server first, fallback to client's own Pyth oracle.
-        
-        Priority:
-          1. Server RPC (if running) — gets signed prices from server
-          2. Client local Pyth oracle (fallback) — fetches directly from Hermes
-        
-        This ensures resilience: works with OR without server.
+        RACE-TO-FASTEST HYBRID ORACLE — three concurrent paths, first valid result wins.
+
+        Priority waterfall (in parallel, not sequential):
+          1. Koyeb server /rpc  qtcl_getPythPrice  — HLWE-signed, oracle.py singleton
+          2. Koyeb server /api/pyth/prices          — REST fallback (same Koyeb node)
+          3. Client local Pyth oracle               — direct Hermes v2/v1, no server dep
+
+        All three fire simultaneously via threads.  The first to return a non-empty
+        feeds dict wins.  The loser threads are abandoned (daemon).  This means the
+        Market Explorer is instant even when Koyeb is slow/cold-starting.
         """
-        # Try server first
-        try:
-            snap = self._rpc_call("qtcl_getPythPrice", symbols if symbols else None)
-            if snap and snap.get("feeds"):
-                logger.debug("[ORACLE] ✅ Got prices from SERVER")
-                return snap
-        except Exception as e:
-            logger.debug(f"[ORACLE] ⚠️  Server fetch failed: {e} — falling back to local oracle")
-        
-        # Fallback to client's own Pyth oracle
-        if not hasattr(self, '_client_oracle'):
-            self._client_oracle = ClientPythOracle()
-        
-        snap = self._client_oracle.fetch_prices(symbols)
-        if snap and snap.get("feeds"):
-            logger.info("[ORACLE] ✅ Got prices from CLIENT (local Pyth oracle)")
-            snap["source"] = "client_hermes"  # Mark as coming from client, not server
-        return snap
+        import threading as _thr
+
+        result_holder: list = [None]
+        result_evt = _thr.Event()
+        _syms = symbols or []
+
+        def _try_koyeb_rpc():
+            try:
+                snap = self._rpc_call("qtcl_getPythPrice", _syms if _syms else None)
+                if snap and isinstance(snap.get("feeds"), dict) and snap["feeds"]:
+                    snap.setdefault("source", "koyeb_rpc")
+                    if result_holder[0] is None:
+                        result_holder[0] = snap
+                        result_evt.set()
+            except Exception as _e:
+                logger.debug(f"[ORACLE] koyeb_rpc fail: {_e}")
+
+        def _try_koyeb_rest():
+            try:
+                params = {"symbols": ",".join(_syms)} if _syms else {}
+                raw = self.api._get("/api/pyth/prices", params=params, timeout=5)
+                if raw and isinstance(raw.get("feeds"), dict) and raw["feeds"]:
+                    raw.setdefault("source", "koyeb_rest")
+                    if result_holder[0] is None:
+                        result_holder[0] = raw
+                        result_evt.set()
+            except Exception as _e:
+                logger.debug(f"[ORACLE] koyeb_rest fail: {_e}")
+
+        def _try_local_hermes():
+            try:
+                if not hasattr(self, "_client_oracle"):
+                    self._client_oracle = ClientPythOracle()
+                snap = self._client_oracle.fetch_prices(_syms or None)
+                if snap and isinstance(snap.get("feeds"), dict) and snap["feeds"]:
+                    snap.setdefault("source", "client_hermes")
+                    if result_holder[0] is None:
+                        result_holder[0] = snap
+                        result_evt.set()
+            except Exception as _e:
+                logger.debug(f"[ORACLE] local_hermes fail: {_e}")
+
+        threads = [
+            _thr.Thread(target=_try_koyeb_rpc,   daemon=True),
+            _thr.Thread(target=_try_koyeb_rest,   daemon=True),
+            _thr.Thread(target=_try_local_hermes, daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        # Wait up to 8 s for any path to deliver valid prices
+        result_evt.wait(timeout=8.0)
+
+        if result_holder[0]:
+            src = result_holder[0].get("source", "unknown")
+            logger.info(f"[ORACLE] ✅ Prices from {src} | feeds={len(result_holder[0].get('feeds', {}))}")
+            return result_holder[0]
+
+        logger.warning("[ORACLE] ❌ All three price paths failed (Koyeb RPC, Koyeb REST, local Hermes)")
+        return None
 
     def _fmt_price(self, price: float, width: int = 12) -> str:
         """Format USD price with commas, right-aligned."""
@@ -20072,80 +20178,126 @@ class ClientPythOracle:
         self.cache_ttl = 5.0
     
     def fetch_prices(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch live Pyth prices from Hermes."""
+        """Fetch live Pyth prices from Hermes.
+
+        Dual-path strategy with correct ids[] param format:
+          1. Hermes v2  /v2/updates/price/latest?ids[]=...&parsed=true
+          2. Hermes v1  /api/latest_price_feeds?ids[]=...
+        Multi-format response normaliser handles list / {"parsed":[]} / {"data":[]} shapes.
+        """
         symbols = symbols or list(self.PRICE_FEEDS.keys())
-        
+
         now = time.time()
         if self.cache and (now - self.cache_ts) < self.cache_ttl:
             return self.cache
-        
-        feeds = {}
+
+        feeds: dict = {}
         hermes_ok = False
-        
-        try:
-            ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
-            if not ids:
-                return None
-            
-            ids_param = ",".join(ids)
-            url = f"{self.HERMES_URL}/api/latest_price_feeds?ids={ids_param}"
-            req = Request(url, headers={"Accept": "application/json"})
-            
-            with urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                hermes_ok = True
-                
-                for feed_data in data.get("data", {}).get("price_feeds", []):
-                    id_ = feed_data.get("id", "")
-                    sym = None
-                    for s, feed_id in self.PRICE_FEEDS.items():
-                        if feed_id == id_:
-                            sym = s
-                            break
-                    
-                    if not sym:
+        _last_exc: str = ""
+
+        ids = [self.PRICE_FEEDS[sym] for sym in symbols if sym in self.PRICE_FEEDS]
+        if not ids:
+            return None
+
+        # Reverse-map: any normalised form of feed id → symbol
+        _id_to_sym: dict = {}
+        for s, fid in self.PRICE_FEEDS.items():
+            norm = ("0x" + fid.lstrip("0x")).lower()
+            _id_to_sym[norm]              = s
+            _id_to_sym[fid.lower()]       = s
+            _id_to_sym[fid.lstrip("0x").lower()] = s
+
+        def _parse_entries(entries) -> dict:
+            result: dict = {}
+            fetch_wall = time.time()
+            for entry in (entries if isinstance(entries, list) else []):
+                try:
+                    raw_id  = str(entry.get("id", "")).lower()
+                    norm_id = "0x" + raw_id.lstrip("0x")
+                    sym     = _id_to_sym.get(norm_id) or _id_to_sym.get(raw_id)
+                    if sym is None:
                         continue
-                    
-                    price_data = feed_data.get("price", {})
-                    mantissa = int(price_data.get("price", 0))
-                    exponent = int(price_data.get("expo", -8))
-                    price_usd = float(mantissa * (10 ** exponent))
-                    
-                    conf_mant = int(price_data.get("conf", 0))
-                    conf_exp = int(price_data.get("expo", -8))
-                    confidence = float(conf_mant * (10 ** conf_exp)) if conf_mant else 0.0
-                    
-                    pub_time = int(feed_data.get("price", {}).get("publish_time", 0))
-                    age_s = max(0.0, time.time() - pub_time)
-                    
-                    feeds[sym] = {
-                        "price_usd": price_usd,
-                        "confidence": confidence,
+                    pd      = entry.get("price", {})
+                    mantissa= int(pd.get("price", 0))
+                    expo    = int(pd.get("expo", -8))
+                    price   = float(mantissa * (10 ** expo))
+                    if price <= 0.0:
+                        continue
+                    conf_m  = int(pd.get("conf", 0))
+                    conf    = float(conf_m * (10 ** expo)) if conf_m else 0.0
+                    pub_t   = int(pd.get("publish_time", 0))
+                    age_s   = max(0.0, fetch_wall - pub_t) if pub_t else 0.0
+                    result[sym] = {
+                        "price_usd":   price,
+                        "confidence":  conf,
                         "age_seconds": age_s,
-                        "status": "trading",
+                        "status":      pd.get("status", "trading"),
                     }
-        except Exception:
-            hermes_ok = False
-        
+                except Exception:
+                    pass
+            return result
+
+        # ── Attempt 1: Hermes v2 ────────────────────────────────────────────
+        try:
+            params_v2 = "&".join(f"ids[]={fid}" for fid in ids)
+            url_v2    = f"{self.HERMES_URL}/v2/updates/price/latest?{params_v2}&encoding=hex&parsed=true"
+            req_v2    = Request(url_v2, headers={"Accept": "application/json",
+                                                  "User-Agent": "QTCL/3.1 ClientPythOracle"})
+            with urlopen(req_v2, timeout=6) as resp:
+                raw     = json.loads(resp.read().decode("utf-8"))
+                entries = raw.get("parsed", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+                feeds   = _parse_entries(entries)
+                if feeds:
+                    hermes_ok = True
+        except Exception as exc:
+            _last_exc = f"v2:{exc}"
+
+        # ── Attempt 2: Hermes v1 fallback ───────────────────────────────────
+        if not feeds:
+            try:
+                params_v1 = "&".join(f"ids[]={fid}" for fid in ids)
+                url_v1    = f"{self.HERMES_URL}/api/latest_price_feeds?{params_v1}"
+                req_v1    = Request(url_v1, headers={"Accept": "application/json",
+                                                      "User-Agent": "QTCL/3.1 ClientPythOracle"})
+                with urlopen(req_v1, timeout=6) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(raw, list):
+                        entries = raw
+                    elif isinstance(raw, dict):
+                        entries = (raw.get("parsed") or
+                                   raw.get("data", {}).get("price_feeds") or
+                                   raw.get("data") or [])
+                    else:
+                        entries = []
+                    feeds = _parse_entries(entries)
+                    if feeds:
+                        hermes_ok = True
+            except Exception as exc:
+                _last_exc += f" | v1:{exc}"
+                logger.warning(f"[CLIENT-ORACLE] Hermes unreachable: {_last_exc}")
+
         if not feeds:
             if self.cache:
+                logger.debug("[CLIENT-ORACLE] Hermes down — serving stale cache")
                 return self.cache
+            logger.warning(f"[CLIENT-ORACLE] No prices, no cache. Last error: {_last_exc}")
             return None
-        
+
         snapshot_id = hashlib.sha256("|".join([
             f"{s}:{feeds[s].get('price_usd', 0):.8f}:{feeds[s].get('confidence', 0):.8f}"
             for s in sorted(feeds.keys())
         ]).encode()).hexdigest()
-        
+
         snap = {
-            "feeds": feeds,
-            "snapshot_id": snapshot_id,
-            "hlwe_sig": snapshot_id[:48],  # Placeholder
-            "hermes_ok": hermes_ok,
+            "feeds":        feeds,
+            "snapshot_id":  snapshot_id,
+            "hlwe_sig":     snapshot_id[:48],   # client-side placeholder sig
+            "hermes_ok":    hermes_ok,
             "fetch_time_ns": int(time.time() * 1e9),
+            "source":       "client_hermes",
         }
-        
-        self.cache = snap
+
+        self.cache    = snap
         self.cache_ts = now
         return snap
 
