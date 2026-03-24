@@ -1867,6 +1867,7 @@ class LocalOracleEngine:
     def set_rpc_client(self, client):
         """Set the RPC API client for polling (KoyebAPIClient instance)."""
         self._rpc_client = client
+        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC client configured — polling will commence")
 
     def start(self) -> None:
         """Start RPC poll thread for oracle snapshots.
@@ -1993,15 +1994,17 @@ class LocalOracleEngine:
     def _poll_loop(self) -> None:
         """Poll RPC endpoint for oracle snapshots (no SSE, no C buffer)."""
         import json as _j, time as _plt
-        if not self._rpc_client:
-            _EXP_LOG.error("[LOCAL-ORACLE._poll_loop] No RPC client configured — cannot poll")
-            return
         
         _pstart = _plt.time()
         _warned = False
         _last_poll = 0.0
         
         while not self._stop.is_set():
+            # Wait for RPC client to be configured
+            if not self._rpc_client:
+                _plt.sleep(0.5)
+                continue
+            
             _now = _plt.time()
             
             # Warn after 15s of no snapshots
@@ -20141,6 +20144,10 @@ def main() -> None:  # noqa: F811
     # Delegating to server RPC
     # Delegating to server RPC - no local RPC needed, flush=True)
 
+    # Suppress noisy background loggers
+    import logging as _suppress_bg
+    for _bg_logger in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'ORACLE-REG', 'ORACLE_REG', 'P2P.Gossip', 'HTTP']:
+        _suppress_bg.getLogger(_bg_logger).setLevel(_suppress_bg.ERROR)
 
     import argparse as _ap
     p = _ap.ArgumentParser(description="QTCL Client — W-State Entangled Blockchain")
@@ -20179,88 +20186,13 @@ def main() -> None:  # noqa: F811
     try:
         print("⚛️  QTCL Client initializing...", flush=True)
         
-        # ── Database initialization ────────────────────────────────────────
+        # ── Ensure data directory exists ────────────────────────────────────
         import sqlite3 as _init_sq3
         from pathlib import Path as _init_Path
         _db_home = _init_Path.home() / "qtcl-miner" / "data"
         _db_home.mkdir(parents=True, exist_ok=True)
         _db_file = _db_home / "qtcl_blockchain.db"
-        
-        # Initialize and validate database schema
-        _init_conn = _init_sq3.connect(str(_db_file), timeout=10)
-        _init_cur = _init_conn.cursor()
-        
-        # Verify all required tables exist
-        _required_tables = {
-            'blocks': ['height', 'hash', 'timestamp', 'merkle_root', 'nonce', 'difficulty_bits', 'previous_hash', 'miner_addr', 'w_state_hash', 'signatures', 'oracles'],
-            'transactions': ['txid', 'sender', 'receiver', 'amount', 'timestamp', 'signature', 'oracle_timestamp'],
-            'wallets': ['address', 'public_key', 'encrypted_seed', 'created_at'],
-            'p2p_peers': ['peer_id', 'ip_address', 'port', 'last_seen', 'reputation_score'],
-            'dm_pool': ['timestamp', 'dm_hash', 'replica_count', 'source'],
-            'chain_state': ['key', 'value', 'updated_at']
-        }
-        
-        _init_cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        _existing = {row[0] for row in _init_cur.fetchall()}
-        
-        for _table, _cols in _required_tables.items():
-            if _table not in _existing:
-                if _table == 'blocks':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        height INTEGER PRIMARY KEY,
-                        hash TEXT UNIQUE NOT NULL,
-                        timestamp INTEGER NOT NULL,
-                        merkle_root TEXT NOT NULL,
-                        nonce TEXT NOT NULL,
-                        difficulty_bits INTEGER NOT NULL,
-                        previous_hash TEXT NOT NULL,
-                        miner_addr TEXT NOT NULL,
-                        w_state_hash TEXT,
-                        signatures TEXT,
-                        oracles TEXT
-                    )""")
-                elif _table == 'transactions':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        txid TEXT PRIMARY KEY,
-                        sender TEXT NOT NULL,
-                        receiver TEXT NOT NULL,
-                        amount REAL NOT NULL,
-                        timestamp INTEGER NOT NULL,
-                        signature TEXT,
-                        oracle_timestamp INTEGER
-                    )""")
-                elif _table == 'wallets':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        address TEXT PRIMARY KEY,
-                        public_key TEXT NOT NULL,
-                        encrypted_seed TEXT NOT NULL,
-                        created_at INTEGER NOT NULL
-                    )""")
-                elif _table == 'p2p_peers':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        peer_id TEXT PRIMARY KEY,
-                        ip_address TEXT NOT NULL,
-                        port INTEGER NOT NULL,
-                        last_seen INTEGER,
-                        reputation_score REAL DEFAULT 0.0
-                    )""")
-                elif _table == 'dm_pool':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        timestamp INTEGER PRIMARY KEY,
-                        dm_hash TEXT NOT NULL,
-                        replica_count INTEGER DEFAULT 1,
-                        source TEXT
-                    )""")
-                elif _table == 'chain_state':
-                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL,
-                        updated_at INTEGER
-                    )""")
-        
-        _init_conn.commit()
-        _init_conn.close()
-        print(f"  ✅ Database initialized: {_db_file}", flush=True)
+        print(f"  ✅ Data directory ready: {_db_home}", flush=True)
         
         url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
 
