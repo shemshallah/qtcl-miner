@@ -19687,14 +19687,80 @@ class QtclClientApp:
         return None
 
     def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
-        """Fetch Pyth snapshot from server RPC."""
+        """
+        Fetch Pyth snapshot from server RPC, batching into groups of 3.
+
+        Koyeb's qtcl_getPythPrice reliably returns prices for small batches
+        (matches what _display_pyth_ticker uses in wallet/transact mode).
+        Sending all 10 symbols at once causes cache-cold timeouts and empty
+        feeds.  We split, call sequentially, then merge the feeds.
+
+        Merge rules:
+          • feeds      — union of all batches; later batches don't overwrite
+          • hermes_ok  — True if ANY batch returned True (at least one live)
+          • hlwe_sig   — first non-empty sig wins
+          • snapshot_id — SHA-256 of merged feed keys+prices for tamper-evidence
+          • fetch_time_ns — max across batches (most recent)
+          • source       — 'server_rpc_batched'
+        """
         if not hasattr(self, '_server_rpc'):
-            self._server_rpc = ServerRPCClient(server_url=self.oracle_url or "http://localhost:9091")
-        try:
-            return self._server_rpc.get_pyth_prices(symbols)
-        except Exception as e:
-            logger.error(f"[PYTH] RPC error: {e}")
+            self._server_rpc = ServerRPCClient(
+                server_url=self.oracle_url or _ORACLE_BASE_URL)
+
+        _syms = symbols or ["BTC", "ETH", "SOL", "BNB", "AVAX",
+                             "MATIC", "LINK", "ADA", "DOT", "ATOM"]
+        BATCH = 3
+
+        merged_feeds: dict   = {}
+        hermes_ok:    bool   = False
+        hlwe_sig:     str    = ""
+        fetch_ns:     int    = 0
+        any_ok:       bool   = False
+
+        # ── Sequential batched fetch ──────────────────────────────────────────
+        for i in range(0, len(_syms), BATCH):
+            batch = _syms[i:i + BATCH]
+            try:
+                snap = self._server_rpc.get_pyth_prices(batch)
+            except Exception as _e:
+                _EXP_LOG.debug(f"[PYTH-BATCH] batch {batch} exception: {_e}")
+                snap = None
+
+            if not snap:
+                continue
+
+            any_ok = True
+            feeds  = snap.get("feeds") or {}
+            for sym, data in feeds.items():
+                if sym not in merged_feeds:          # first-write wins per sym
+                    merged_feeds[sym] = data
+
+            if snap.get("hermes_ok"):
+                hermes_ok = True
+            if not hlwe_sig and snap.get("hlwe_sig"):
+                hlwe_sig  = snap["hlwe_sig"]
+            ts = snap.get("fetch_time_ns", 0)
+            if ts > fetch_ns:
+                fetch_ns = ts
+
+        if not any_ok:
             return None
+
+        # ── Canonical merged snapshot_id — SHA-256 of sorted price map ───────
+        price_map = {s: d.get("price_usd", 0) for s, d in sorted(merged_feeds.items())}
+        snap_id   = _hashlib.sha256(
+            _json.dumps(price_map, sort_keys=True).encode()
+        ).hexdigest()
+
+        return {
+            "feeds":         merged_feeds,
+            "snapshot_id":   snap_id,
+            "fetch_time_ns": fetch_ns or int(_time.time() * 1e9),
+            "hermes_ok":     hermes_ok,
+            "hlwe_sig":      hlwe_sig,
+            "source":        "server_rpc_batched",
+        }
+
     def _fmt_price(self, price: float, width: int = 12) -> str:
         """Format USD price with commas, right-aligned."""
         if price >= 10_000:
