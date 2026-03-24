@@ -2107,32 +2107,6 @@ class LocalOracleEngine:
             age = time.time() - self._last_oracle_dm_ts
             return list(self._dm_re), list(self._dm_im), age
 
-    def _http_fallback_poll(self) -> None:
-        """One-shot HTTP fetch of oracle snapshot.
-        Used by bootstrap _wait_oracle_dm() when SSE hasn't delivered a frame yet.
-        Does NOT require C — fetches via urllib and ingests through _ingest_oracle_frame().
-        Raises on total failure so callers can catch and log.
-        """
-        import json as _j
-        req_mod = __import__('urllib.request', fromlist=['urlopen', 'Request'])
-        for endpoint in ('/api/oracle/w-state', '/api/snapshot', '/api/status'):
-            try:
-                r = req_mod.Request(
-                    f"{self.ORACLE_URL}{endpoint}",
-                    headers={'User-Agent': 'QTCL-Client/3.0-Bootstrap'})
-                with req_mod.urlopen(r, timeout=6) as resp:
-                    data = _j.loads(resp.read().decode())
-                dm_hex = (data.get('density_matrix_hex') or
-                          data.get('dm_hex') or
-                          data.get('w_state', {}).get('density_matrix_hex') or '')
-                if dm_hex and len(dm_hex) >= 128:
-                    self._ingest_oracle_frame(_j.dumps({'density_matrix_hex': dm_hex, **data}))
-                    _EXP_LOG.info(f"[LOCAL-ORACLE] HTTP fallback ✅ ({endpoint})")
-                    return
-            except Exception as _e:
-                _EXP_LOG.debug(f"[LOCAL-ORACLE] HTTP fallback {endpoint}: {_e}")
-        raise RuntimeError(f"[_http_fallback_poll] All endpoints exhausted for {self.ORACLE_URL}")
-
     def get_oracle_state(self) -> dict:
         """Return latest ingested Koyeb oracle canonical state (for bath coupling)."""
         with self._oracle_state_lock:
@@ -2973,7 +2947,7 @@ class QtclP2PNode:
         """
         import json as _pj, time as _pt, sqlite3 as _psq
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _db_path    = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+        _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
 
         # Track hosts already connected this cycle to avoid double-connect
         _connected_this_cycle: set = set()
@@ -3391,7 +3365,7 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
 import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 
 _DM_POOL_DAEMON_STOP = _dpt.Event()
-_DM_POOL_DB_PATH     = 'qtcl_blockchain.db'
+_DM_POOL_DB_PATH     = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
 
 def _dm_pool_drain_once(db_path: str) -> int:
     """Drain C dmpool ring into DB. Returns entries persisted."""
@@ -4172,9 +4146,9 @@ class LocalBlockchainDB:
         self._pool_max = pool_max
         
         # SQLite setup
-        self.db_dir = Path.home() / '.qtcl' / name
+        self.db_dir = Path.home() / 'qtcl-miner' / 'data'
         self.db_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.db_dir / 'blockchain.db'
+        self.db_path = self.db_dir / 'qtcl_blockchain.db'
         
         # Thread-safe SQLite connection
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
@@ -5706,7 +5680,6 @@ class RequestHandler(ComponentBase):
         self._verifier = verifier
         self._routes: Dict[str, Dict[str, Callable]] = {
             "GET": {
-                "/events":       self._handle_sse_events,  # ✅ SSE multiplexed on 9091
                 "/status":       self._handle_get_chain_status,
                 "/health":       self._handle_health_check,
                 "/snapshot":     self._handle_get_snapshot,
@@ -5871,22 +5844,6 @@ class RequestHandler(ComponentBase):
     def _handle_peer_gossip(self, body: Dict) -> HTTPResponse:
         self._broadcaster.broadcast("gossip", body)
         return HTTPResponse.ok({"status": "propagated"})
-
-    def _handle_sse_events(self, params: Dict) -> HTTPResponse:
-        """
-        Server-Sent Events (SSE) multiplexer on /events.
-        
-        Handled specially in HTTP handler with streaming (not JSON).
-        This method is a placeholder for consistency.
-        
-        Query params:
-          client_id: Optional client identifier
-          channels: Comma-separated event channels to subscribe to
-          timeout: Connection timeout in seconds (default: 300)
-        """
-        # NOTE: This method is not actually called - HTTP handler handles /events specially
-        # with streaming. This exists for route consistency.
-        return HTTPResponse(501, {"error": "/events handled by HTTP handler with streaming"})
 
     def _handle_health_check(self, params: Dict) -> HTTPResponse:
         health = self.get_health()
@@ -7656,25 +7613,10 @@ class QtclServer(QtclNode):
         )
         self._block_thread.start()
 
-    # FIX-B: lazy accessor so _block_production_loop is robust against
-    # any future re-ordering of module-level singleton definitions.
-    @staticmethod
-    def _get_sse_mux():
-        global _SSE_MUX
-        try:
-            return _SSE_MUX
-        except NameError:
-            from __main__ import SSEMultiplexer as _SM
-            _SSE_MUX = _SM.get()
-            return _SSE_MUX
-
     def _block_production_loop(self) -> None:
         block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
         difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        
-        # ✅ Import _SSE_MUX at function scope to avoid NameError
-        global _SSE_MUX
         
         while not self._stop_event.wait(block_interval):
             try:
@@ -7754,24 +7696,15 @@ class QtclServer(QtclNode):
                         _ar_total = 800
                     token_ledger.apply_block_rewards(block, "server", _ar_total)
                 # Broadcast via SSE multiplexer on port 9091
-                if self.broadcaster:  # Fallback if broadcaster exists
+                if self.broadcaster:
                     self.broadcaster.broadcast_block(block)
-                else:  # Publish to SSE multiplexer
-                    QtclServer._get_sse_mux().publish("block", {
-                        "hash": block.get("hash"),
-                        "height": height,
-                        "miner": block.get("miner_id"),
-                        "ts": block.get("timestamp"),
-                    }, channel="blocks")
                 
                 # Snapshot every N blocks
                 if height > 0 and height % snap_interval == 0:
                     try:
                         snap = self.snapshot_mgr.create_snapshot(height)
-                        if self.broadcaster:  # Fallback
+                        if self.broadcaster:
                             self.broadcaster.broadcast_snapshot(snap)
-                        else:  # Publish to SSE multiplexer
-                            QtclServer._get_sse_mux().publish("snapshot", snap, channel="snapshots")
                         self.log.info(f"[{self.name}] snapshot broadcast at height {height}")
                     except Exception as exc:
                         self.log.warning(f"[{self.name}] snapshot failed: {exc}")
@@ -7799,7 +7732,7 @@ class QtclMiner(QtclNode):
         super().__init__(config_path=config_path, node_type="miner", name="QtclMiner")
         self._miner_id: str = ""
         self._server_url: str = ""
-        self._sse_thread: Optional[threading.Thread] = None
+        self._rpc_poller_thread: Optional[threading.Thread] = None
         self._mining_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pending_blocks: queue.Queue = queue.Queue(maxsize=64)
@@ -7829,8 +7762,8 @@ class QtclMiner(QtclNode):
 
     def on_stop(self) -> None:
         self._stop_event.set()
-        if self._sse_thread:
-            self._sse_thread.join(timeout=5)
+        if self._rpc_poller_thread:
+            self._rpc_poller_thread.join(timeout=5)
         if self._mining_thread:
             self._mining_thread.join(timeout=5)
         super().on_stop()
@@ -7859,16 +7792,16 @@ class QtclMiner(QtclNode):
             self.log.warning(f"[{self.name}] server registration failed: {exc}")
 
     def _start_rpc_poller(self) -> None:
-        """Start RPC-only polling thread instead of SSE"""
-        self._sse_thread = threading.Thread(
+        """Start RPC-only polling thread (no SSE)"""
+        self._rpc_poller_thread = threading.Thread(
             target=self._rpc_poller_loop,
             daemon=True,
             name="QtclMiner/RPCPoller",
         )
-        self._sse_thread.start()
+        self._rpc_poller_thread.start()
 
     def _rpc_poller_loop(self) -> None:
-        """RPC-only polling loop. Replaces SSE listener."""
+        """RPC polling loop for chain status (no SSE fallback)"""
         import urllib.request
         rpc_url = f"{self._server_url}/api/chain/status"
         retry_delay = 2.0
@@ -15749,7 +15682,7 @@ class QtclClientApp:
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
         self._stop         = _threading.Event()
         self._metric_th: Optional[_threading.Thread] = None
-        self._db_path      = _Path("qtcl_blockchain.db")
+        self._db_path      = _Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
             f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
@@ -16592,8 +16525,10 @@ class QtclClientApp:
                 _pot.sleep(wait)
                 # Stop trying if peer no longer in our DB
                 import sqlite3 as _podb
+                import pathlib as _poplib
                 try:
-                    with _podb.connect('qtcl_blockchain.db', timeout=2) as _podc:
+                    _db_p = str(_poplib.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                    with _podb.connect(_db_p, timeout=2) as _podc:
                         row = _podc.execute(
                             "SELECT 1 FROM p2p_peers WHERE host=? AND ban_score<100 LIMIT 1",
                             (host,)).fetchone()
@@ -16716,7 +16651,7 @@ class QtclClientApp:
                                         # Save to DB
                                         try:
                                             import sqlite3 as _esq
-                                            _edb = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+                                            _edb = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
                                             with _esq.connect(_edb, timeout=3) as _ec:
                                                 _ec.execute("""INSERT OR REPLACE INTO p2p_peers
                                                     (node_id_hex,host,port,source,last_seen_at,first_seen_at)
@@ -16935,8 +16870,10 @@ class QtclClientApp:
                 # ── Peer list from local DB ──────────────────────────────────
                 elif path in ('/api/peers/list', '/api/peers'):
                     import sqlite3 as _pls
+                    import pathlib as _plspath
                     try:
-                        with _pls.connect('qtcl_blockchain.db', timeout=2) as _plc:
+                        _pls_db = str(_plspath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                        with _pls.connect(_pls_db, timeout=2) as _plc:
                             rows = _plc.execute("""
                                 SELECT host, port, chain_height, last_seen_at
                                 FROM p2p_peers WHERE ban_score < 100
@@ -17037,8 +16974,10 @@ class QtclClientApp:
                     peer_port = int(payload.get('port') or 9091)
                     if peer_id and peer_ip not in ('', '127.0.0.1', 'localhost'):
                         import sqlite3 as _prq
+                        import pathlib as _prqpath
                         try:
-                            with _prq.connect('qtcl_blockchain.db', timeout=2) as _prc:
+                            _prq_db = str(_prqpath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                            with _prq.connect(_prq_db, timeout=2) as _prc:
                                 _prc.execute("""
                                     INSERT OR REPLACE INTO p2p_peers
                                         (node_id_hex,host,port,chain_height,source,
@@ -17061,8 +17000,10 @@ class QtclClientApp:
                     # Return our oracle state + known peers
                     snap = self._oracle_snapshot()
                     import sqlite3 as _plr
+                    import pathlib as _plrpath
                     try:
-                        with _plr.connect('qtcl_blockchain.db', timeout=2) as _plrc:
+                        _plr_db = str(_plrpath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                        with _plr.connect(_plr_db, timeout=2) as _plrc:
                             rows = _plrc.execute("""
                                 SELECT host,port FROM p2p_peers
                                 WHERE ban_score<100 AND host NOT IN ('','127.0.0.1','localhost')
@@ -17146,7 +17087,7 @@ class QtclClientApp:
 
         # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
         try:
-            _dm_pool_db = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+            _dm_pool_db = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
             _dm_pool_rehydrate(_dm_pool_db)         # inject saved DMs into C before mining
             start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
         except Exception as _dme:
@@ -20237,13 +20178,97 @@ def main() -> None:  # noqa: F811
     # ✅ Initialize QtclClientApp with timeout protection
     try:
         print("⚛️  QTCL Client initializing...", flush=True)
+        
+        # ── Database initialization ────────────────────────────────────────
+        import sqlite3 as _init_sq3
+        from pathlib import Path as _init_Path
+        _db_home = _init_Path.home() / "qtcl-miner" / "data"
+        _db_home.mkdir(parents=True, exist_ok=True)
+        _db_file = _db_home / "qtcl_blockchain.db"
+        
+        # Initialize and validate database schema
+        _init_conn = _init_sq3.connect(str(_db_file), timeout=10)
+        _init_cur = _init_conn.cursor()
+        
+        # Verify all required tables exist
+        _required_tables = {
+            'blocks': ['height', 'hash', 'timestamp', 'merkle_root', 'nonce', 'difficulty_bits', 'previous_hash', 'miner_addr', 'w_state_hash', 'signatures', 'oracles'],
+            'transactions': ['txid', 'sender', 'receiver', 'amount', 'timestamp', 'signature', 'oracle_timestamp'],
+            'wallets': ['address', 'public_key', 'encrypted_seed', 'created_at'],
+            'p2p_peers': ['peer_id', 'ip_address', 'port', 'last_seen', 'reputation_score'],
+            'dm_pool': ['timestamp', 'dm_hash', 'replica_count', 'source'],
+            'chain_state': ['key', 'value', 'updated_at']
+        }
+        
+        _init_cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        _existing = {row[0] for row in _init_cur.fetchall()}
+        
+        for _table, _cols in _required_tables.items():
+            if _table not in _existing:
+                if _table == 'blocks':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        height INTEGER PRIMARY KEY,
+                        hash TEXT UNIQUE NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        merkle_root TEXT NOT NULL,
+                        nonce TEXT NOT NULL,
+                        difficulty_bits INTEGER NOT NULL,
+                        previous_hash TEXT NOT NULL,
+                        miner_addr TEXT NOT NULL,
+                        w_state_hash TEXT,
+                        signatures TEXT,
+                        oracles TEXT
+                    )""")
+                elif _table == 'transactions':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        txid TEXT PRIMARY KEY,
+                        sender TEXT NOT NULL,
+                        receiver TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        signature TEXT,
+                        oracle_timestamp INTEGER
+                    )""")
+                elif _table == 'wallets':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        address TEXT PRIMARY KEY,
+                        public_key TEXT NOT NULL,
+                        encrypted_seed TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    )""")
+                elif _table == 'p2p_peers':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        peer_id TEXT PRIMARY KEY,
+                        ip_address TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        last_seen INTEGER,
+                        reputation_score REAL DEFAULT 0.0
+                    )""")
+                elif _table == 'dm_pool':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        timestamp INTEGER PRIMARY KEY,
+                        dm_hash TEXT NOT NULL,
+                        replica_count INTEGER DEFAULT 1,
+                        source TEXT
+                    )""")
+                elif _table == 'chain_state':
+                    _init_cur.execute(f"""CREATE TABLE IF NOT EXISTS {_table} (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at INTEGER
+                    )""")
+        
+        _init_conn.commit()
+        _init_conn.close()
+        print(f"  ✅ Database initialized: {_db_file}", flush=True)
+        
         url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
 
         # ── Wallet existence check ────────────────────────────────────────────
         # If wallet.json doesn't exist, ALWAYS prompt for creation
         # (independent of oracle registration choice)
         from pathlib import Path as _PathLib
-        _wallet_file = _PathLib.home() / ".qtcl" / "wallet.json"
+        _wallet_file = _PathLib.home() / "qtcl-miner" / "data" / "wallet.json"
         if not _wallet_file.exists():
             print()
             print("  ┌──────────────────────────────────────────────────────────┐")
@@ -20260,8 +20285,8 @@ def main() -> None:  # noqa: F811
             if _create_wallet_ans != "n":
                 print()
                 try:
-                    _new_pw  = _getpass.getpass("  New wallet password: ").strip()
-                    _new_pw2 = _getpass.getpass("  Confirm password   : ").strip()
+                    _new_pw  = getpass.getpass("  New wallet password: ").strip()
+                    _new_pw2 = getpass.getpass("  Confirm password   : ").strip()
                     if _new_pw != _new_pw2:
                         print("  ❌ Passwords don't match — using defaults")
                         _new_pw = "default_qtcl_password"
@@ -20304,8 +20329,7 @@ def main() -> None:  # noqa: F811
             print()
             _tmp_wallet = QTCLWallet()
             try:
-                import getpass as _gp_oi
-                _pw_oi = _gp_oi.getpass("  Wallet password: ")
+                _pw_oi = getpass.getpass("  Wallet password: ")
                 if _tmp_wallet.load(_pw_oi):
                     oracle_context = {
                         "wallet_addr": _tmp_wallet.address,
@@ -20327,6 +20351,8 @@ def main() -> None:  # noqa: F811
         print()
 
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
+        # ── Set RPC client for LocalOracleEngine ────────────────────────────
+        _LOCAL_ORACLE.set_rpc_client(_KOYEB)
         print("✅ Ready for input", flush=True)  # DEBUG: Verify we reach here
     except Exception as e:
         print(f"❌ Initialization error: {e}")
