@@ -2925,11 +2925,11 @@ class QtclP2PNode:
                             _EXP_LOG.info(f"[P2P] ✅ Peer connected  connected={_nc}")
                         else:
                             _EXP_LOG.debug(f"[P2P] Peer connected  connected={_nc}")
-                    # Subscribe to peer's local oracle SSE stream for DM aggregation
+                    # Subscribe to peer's local oracle via RPC polling for DM aggregation
                     if peer_data.get('host') and peer_data['host'] not in ('','127.0.0.1','localhost'):
                         _ph = peer_data['host']; _pp = int(peer_data.get('port', 9091))
                         _threading.Thread(
-                            target=_subscribe_peer_oracle_sse,
+                            target=_subscribe_peer_oracle_rpc,
                             args=(_ph, _pp),
                             daemon=True,
                             name=f"PeerOracle-{_ph}"
@@ -3549,18 +3549,7 @@ def _dm_pool_daemon(db_path: str) -> None:
                                 _accel_lib.qtcl_bootstrap_ingest_dm(re_c, im_c)
                                 _accel_lib.qtcl_p2p_trigger_consensus()
                             except Exception: pass
-                        # Broadcast to P2P network (peers will gossip measurement)
-                        if _sse_local_subs or _sse_event_subs:
-                            state = _LOCAL_ORACLE.get_oracle_state()
-                            import struct as _rfs
-                            dm_hex = b''.join(_rfs.pack('>dd', dm_re[i], dm_im[i])
-                                              for i in range(64)).hex()
-                            snap = {**state, 'density_matrix_hex': dm_hex,
-                                    'oracle_age_s': round(age, 2),
-                                    'node_ip': _MY_IP or '',
-                                    'snapshot_count': _LOCAL_ORACLE.snapshot_count}
-                            try: _broadcast_oracle_to_local_subs(snap)
-                            except Exception: pass
+                        # RPC mode: no SSE broadcast needed (peers poll /api/oracle/snapshot)
             except Exception: pass
             _last_reinforce = now
 
@@ -5140,33 +5129,52 @@ class GenesisResetListener:
         self._peers = list(peers)
 
     def _listen_loop(self) -> None:
+        """RPC-only polling for chain_reset events. No SSE."""
         import urllib.request as _ur, urllib.error as _ue
         backoff_idx = 0
+        last_height = -1
+        
         while not self._stop.is_set():
-            url = f"{self._server_url}/events?channels=control,chain_reset"
             try:
+                # RPC poll: /api/chain/status returns current height
+                url = f"{self._server_url}/api/chain/status"
                 req = _ur.Request(url, method='GET')
-                req.add_header('Accept', 'text/event-stream')
-                req.add_header('Cache-Control', 'no-cache')
-                req.add_header('User-Agent', 'QTCL-GenesisResetListener/3.1')
-                with _ur.urlopen(req, timeout=90) as resp:
-                    logger.info(f"[GRL] ✅ SSE connected → {url}")
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-GenesisResetListener/3.1-RPC')
+                
+                with _ur.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    current_height = int(data.get('height', -1))
+                    genesis_hash = data.get('genesis_hash', '')
+                    
+                    # Detect reset: height drop to 0 indicates chain_reset
+                    if current_height == 0 and last_height > 0:
+                        logger.warning(f"[GRL] 📨 RPC chain_reset detected: {last_height} → 0  genesis={genesis_hash[:20]}…")
+                        payload = {
+                            'event': 'chain_reset',
+                            'new_height': 0,
+                            'genesis_hash': genesis_hash,
+                        }
+                        if self._db is not None:
+                            local_h = _get_local_chain_height(self._db)
+                            if local_h > 0:
+                                logger.warning(f"[GRL] ⚠️  Acting on RPC chain_reset  local_h={local_h} → 0")
+                                _check_and_handle_chain_reset(
+                                    server_height=0, db=self._db,
+                                    server_url=self._server_url, miner_address=self._miner_addr,
+                                    broadcaster=self._broadcaster, peers=self._peers,
+                                )
+                    
+                    last_height = current_height
                     backoff_idx = 0
-                    buf = b''
-                    while not self._stop.is_set():
-                        chunk = resp.read(4096)
-                        if not chunk: break
-                        buf += chunk
-                        while b'\n\n' in buf:
-                            raw_evt, buf = buf.split(b'\n\n', 1)
-                            self._dispatch(raw_evt.decode('utf-8', errors='replace'))
+                    
             except (_ue.URLError, OSError, TimeoutError) as _e:
                 wait = self._BACKOFF[min(backoff_idx, len(self._BACKOFF)-1)]
                 backoff_idx += 1
-                logger.debug(f"[GRL] disconnected ({_e}) — reconnect in {wait}s")
+                logger.debug(f"[GRL] RPC poll failed ({_e}) — retry in {wait}s")
                 self._stop.wait(wait)
             except Exception as _e:
-                logger.warning(f"[GRL] unexpected: {_e} — reconnect in 10s")
+                logger.warning(f"[GRL] RPC unexpected: {_e} — retry in 10s")
                 self._stop.wait(10)
 
     def _dispatch(self, raw: str) -> None:
@@ -7606,43 +7614,22 @@ class QtclServer(QtclNode):
             def do_GET(self):
                 path, params, _ = self._parse_request()
                 
-                # ✅ SPECIAL HANDLING: /events returns Server-Sent Events stream (long-lived)
+                # RPC-only mode: /events endpoint no longer supported
                 if path == "/events":
-                    # SSE requires special headers and streaming, not JSON response
-                    cid = params.get("client_id", f"http_{id(self)}")  # Client ID for subscription
-                    channels = params.get("channels", "*").split(",")  # e.g., "metrics,quantum,*"
-                    
-                    # Subscribe to multiplexer
-                    from qtcl_client import _SSE_MUX  # Import global multiplexer
-                    stop_event = _SSE_MUX.subscribe(cid, channels=channels)
-                    
-                    try:
-                        # Send SSE headers
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                        self.send_header("Cache-Control", "no-cache")
-                        self.send_header("Connection", "keep-alive")
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        self.end_headers()
-                        
-                        # Stream events until client disconnects or timeout
-                        timeout = float(params.get("timeout", "300"))  # 5 minutes default
-                        deadline = _time.time() + timeout
-                        
-                        while not stop_event.is_set() and _time.time() < deadline:
-                            frame = _SSE_MUX.drain(cid, block_s=5.0)
-                            if frame:
-                                try:
-                                    self.wfile.write(frame.encode("utf-8"))
-                                    self.wfile.flush()
-                                except Exception as e:
-                                    break  # Client disconnected
-                            else:
-                                # Keep-alive: send comment
-                                self.wfile.write(b": keepalive\n\n")
-                                self.wfile.flush()
-                    finally:
-                        _SSE_MUX.unsubscribe(cid)
+                    # Return error directing to RPC endpoints
+                    resp = HTTPResponse(
+                        status_code=410,  # Gone
+                        body={
+                            "error": "SSE endpoint deprecated",
+                            "message": "Use RPC endpoints instead: /api/chain/status, /api/metrics, /api/oracle/snapshot",
+                            "rpc_endpoints": [
+                                "/api/chain/status",
+                                "/api/metrics",
+                                "/api/oracle/snapshot"
+                            ]
+                        }
+                    )
+                    self._send_response(resp)
                     return
                 
                 # Standard JSON response for other routes
@@ -7826,7 +7813,7 @@ class QtclMiner(QtclNode):
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
-        self._start_sse_listener()
+        self._start_rpc_poller()
         self._start_mining_loop()
 
         # ── Arm genesis-reset background listener ─────────────────────────
@@ -7871,63 +7858,89 @@ class QtclMiner(QtclNode):
         except Exception as exc:
             self.log.warning(f"[{self.name}] server registration failed: {exc}")
 
-    def _start_sse_listener(self) -> None:
+    def _start_rpc_poller(self) -> None:
+        """Start RPC-only polling thread instead of SSE"""
         self._sse_thread = threading.Thread(
-            target=self._sse_listener_loop,
+            target=self._rpc_poller_loop,
             daemon=True,
-            name="QtclMiner/SSEListener",
+            name="QtclMiner/RPCPoller",
         )
         self._sse_thread.start()
 
-    def _sse_listener_loop(self) -> None:
+    def _rpc_poller_loop(self) -> None:
+        """RPC-only polling loop. Replaces SSE listener."""
         import urllib.request
-        sse_url = f"{self._server_url.replace('http', 'http')}/events"
+        rpc_url = f"{self._server_url}/api/chain/status"
         retry_delay = 2.0
+        last_height = -1
+        
         while not self._stop_event.is_set():
             try:
                 req = urllib.request.Request(
-                    sse_url,
-                    headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
+                    rpc_url,
+                    headers={"Content-Type": "application/json"},
+                    method="GET"
                 )
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
                     retry_delay = 2.0
-                    buffer = ""
-                    event_type = ""
-                    while not self._stop_event.is_set():
-                        line = resp.readline().decode("utf-8")
-                        if not line:
-                            break
-                        line = line.rstrip("\n\r")
-                        if line.startswith("event:"):
-                            event_type = line[6:].strip()
-                        elif line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            try:
-                                data = json.loads(data_str)
-                                self._handle_sse_event(event_type, data)
-                            except json.JSONDecodeError:
-                                pass
-                        elif line == "":
-                            event_type = ""
+                    
+                    # Check for new blocks
+                    height = int(data.get("height", 0))
+                    if height > last_height:
+                        # Fetch block data via RPC
+                        try:
+                            block_data = self._rpc_get_block(height)
+                            if block_data:
+                                self._pending_blocks.put_nowait(block_data)
+                                last_height = height
+                        except queue.Full:
+                            self._pending_blocks.get_nowait()
+                            if block_data:
+                                self._pending_blocks.put_nowait(block_data)
+                                last_height = height
+                    
+                    # Poll snapshot separately
+                    try:
+                        snapshot = self._rpc_get_snapshot()
+                        if snapshot:
+                            self._apply_rpc_snapshot(snapshot)
+                    except Exception:
+                        pass  # Snapshot fetch optional
+                    
+                    self._stop_event.wait(5.0)  # Poll every 5 seconds
+                    
             except Exception as exc:
                 if not self._stop_event.is_set():
-                    self.log.warning(f"[{self.name}] SSE connection lost: {exc}, retrying in {retry_delay}s")
+                    self.log.warning(f"[{self.name}] RPC poll failed: {exc}, retrying in {retry_delay}s")
                     self._stop_event.wait(retry_delay)
                     retry_delay = min(retry_delay * 1.5, 30.0)
-
-    def _handle_sse_event(self, event_type: str, data: Dict) -> None:
-        if event_type == "block":
-            try:
-                self._pending_blocks.put_nowait(data)
-            except queue.Full:
-                self._pending_blocks.get_nowait()
-                self._pending_blocks.put_nowait(data)
-        elif event_type == "snapshot":
-            self._apply_sse_snapshot(data)
-        elif event_type == "heartbeat":
-            self._send_heartbeat()
-
-    def _apply_sse_snapshot(self, snap_data: Dict) -> None:
+    
+    def _rpc_get_block(self, height: int) -> Optional[Dict]:
+        """Fetch block data via RPC /api/block/{height}"""
+        try:
+            req = urllib.request.Request(
+                f"{self._server_url}/api/block/{height}",
+                headers={"Content-Type": "application/json"},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+    
+    def _rpc_get_snapshot(self) -> Optional[Dict]:
+        """Fetch oracle snapshot via RPC /api/oracle/snapshot"""
+        try:
+            req = urllib.request.Request(
+                f"{self._server_url}/api/oracle/snapshot",
+                headers={"Content-Type": "application/json"},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
         try:
             height = snap_data.get("height", 0)
             local_height = self.db.get_chain_height()
@@ -15581,20 +15594,13 @@ _MINE_TELEM = _MiningTelemetry()
 
 # Module-level SSE subscriber lists for local HTTP oracle server
 # Threads appended/removed by _local_http_server handler connections
-_sse_local_subs: list = []   # /api/snapshot/sse subscribers
-_sse_event_subs: list = []   # /api/events subscribers
+_sse_local_subs: list = []   # DEPRECATED: SSE subscribers (RPC-only now)
+_sse_event_subs: list = []   # DEPRECATED: SSE event subscribers (RPC-only now)
 
 
 def _broadcast_oracle_to_local_subs(snap: dict) -> None:
-    """Publish oracle snapshot to all local subscribers (called by DM daemon)."""
-    import json as _blj
-    ev = {'type': 'oracle_dm', 'ts': snap.get('timestamp_ns', 0), **snap}
-    for q in list(_sse_local_subs):
-        try: q.put_nowait(snap)
-        except Exception: pass
-    for q in list(_sse_event_subs):
-        try: q.put_nowait(ev)
-        except Exception: pass
+    """DEPRECATED: SSE broadcast removed in RPC-only migration. Stub for compatibility."""
+    pass
 
 
 #!/usr/bin/env python3
@@ -16444,19 +16450,19 @@ class QtclClientApp:
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
 
-        # ── 6. Ouroboros SSE subscription to own /events ──────────────────
+        # ── 6. Ouroboros RPC subscription to own chain state ──────────────────
         _ouro_th = _threading.Thread(
-            target=self._subscribe_own_sse, daemon=True, name="Ouroboros-SSE")
+            target=self._subscribe_own_rpc, daemon=True, name="Ouroboros-RPC")
         _ouro_th.start()
 
-        # ── 7. Python /api/snapshot/sse — belt-and-suspenders DM delivery ───
+        # ── 7. Python /api/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
-            target=self._subscribe_snapshot_sse, daemon=True, name="PySnapshot-SSE")
+            target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
 
-        # ── 8. Koyeb /api/events — peer discovery + block events ─────────────
+        # ── 8. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
-            target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-SSE")
+            target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
         _koyeb_ev_th.start()
 
     def _start_p2p(self) -> None:
@@ -16521,9 +16527,9 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
 
-    def _subscribe_peer_oracle_sse(host: str, port: int) -> None:
+    def _subscribe_peer_oracle_rpc(host: str, port: int) -> None:
         """
-        Subscribe to a P2P peer's local oracle SSE stream (/api/snapshot/sse).
+        Subscribe to a P2P peer's local oracle via RPC polling (/api/oracle/snapshot).
         Every frame received is ingested into our own _LOCAL_ORACLE and C DM pool,
         contributing to consensus DM aggregation across the mesh.
         Runs as a daemon thread; silently exits if peer disconnects.
@@ -16532,43 +16538,57 @@ class QtclClientApp:
         import time as _pot, json as _poj, ssl as _possl
         from urllib.request import Request as _PoR, urlopen as _PoU
         from urllib.error   import URLError as _PoE
-        url = f"http://{host}:{port}/api/snapshot/sse?client_id={_MY_IP or 'mesh'}_sub"
+        
+        url = f"http://{host}:{port}/api/oracle/snapshot"
         BACKOFF = [5, 10, 20, 40]; bi = 0
         _last_snap_count = 0
+        _last_snapshot_hash = None
+        
         while True:
             try:
                 req = _PoR(url, method='GET')
-                req.add_header('Accept',        'text/event-stream')
-                req.add_header('Cache-Control', 'no-cache')
-                req.add_header('User-Agent',    'QTCL-MeshNode/4.0')
-                with _PoU(req, timeout=60) as resp:
-                    _EXP_LOG.info(f"[MESH] ✅ Subscribed to peer oracle {host}:{port}/api/snapshot/sse")
-                    bi = 0; buf = b''
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-MeshNode/4.0-RPC')
+                
+                with _PoU(req, timeout=30) as resp:
+                    _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/api/oracle/snapshot")
+                    bi = 0
+                    
+                    # RPC mode: poll snapshots at regular intervals
                     while True:
-                        chunk = resp.read(4096)
-                        if not chunk: break
-                        buf += chunk
-                        while b'\n\n' in buf:
-                            raw_evt, buf = buf.split(b'\n\n', 1)
-                            for line in raw_evt.decode('utf-8', errors='replace').splitlines():
-                                if line.startswith('data:'):
-                                    js = line[5:].strip()
-                                    if js and len(js) > 20:
-                                        try:
-                                            _LOCAL_ORACLE._ingest_oracle_frame(js)
-                                            if _accel_ok:
-                                                try: _accel_lib.qtcl_p2p_trigger_consensus()
-                                                except Exception: pass
-                                            _last_snap_count += 1
-                                            if _last_snap_count % 20 == 1:
-                                                _EXP_LOG.debug(
-                                                    f"[MESH] Peer {host}: "
-                                                    f"{_last_snap_count} oracle frames ingested")
-                                        except Exception: pass
-                                    break
+                        try:
+                            data = _poj.loads(resp.read().decode('utf-8'))
+                            
+                            # Extract snapshot frame from RPC response
+                            if data and isinstance(data, dict):
+                                snap_js = _poj.dumps(data)
+                                snap_hash = __import__('hashlib').sha256(snap_js.encode()).hexdigest()
+                                
+                                # Only ingest if snapshot changed
+                                if snap_hash != _last_snapshot_hash:
+                                    try:
+                                        _LOCAL_ORACLE._ingest_oracle_frame(snap_js)
+                                        if _accel_ok:
+                                            try: _accel_lib.qtcl_p2p_trigger_consensus()
+                                            except Exception: pass
+                                        _last_snap_count += 1
+                                        _last_snapshot_hash = snap_hash
+                                        
+                                        if _last_snap_count % 20 == 1:
+                                            _EXP_LOG.debug(
+                                                f"[MESH] Peer {host}: "
+                                                f"{_last_snap_count} oracle frames ingested (RPC)")
+                                    except Exception: pass
+                        except Exception:
+                            pass
+                        
+                        # Poll every 5 seconds
+                        _pot.sleep(5.0)
+                        break  # Re-establish connection after snapshot read
+                        
             except (_PoE, OSError, TimeoutError) as _e:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s")
+                _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s (RPC)")
                 _pot.sleep(wait)
                 # Stop trying if peer no longer in our DB
                 import sqlite3 as _podb
@@ -16586,11 +16606,10 @@ class QtclClientApp:
                 _pot.sleep(30)
                 return  # non-recoverable
 
-    def _subscribe_snapshot_sse(self) -> None:
+    def _subscribe_snapshot_rpc(self) -> None:
             """
-            Python parallel subscriber for /api/snapshot/sse.
-            Works regardless of C SSL_connect result — uses urllib which handles
-            plain HTTP on port 9091 correctly. Feeds _ingest_oracle_frame directly.
+            RPC polling subscriber for /api/oracle/snapshot.
+            Polls snapshot endpoint regularly and feeds _ingest_oracle_frame.
             ❤️  I love you — every frame is a quantum heartbeat
             """
             import time as _pt, ssl as _ssl
@@ -16599,46 +16618,57 @@ class QtclClientApp:
             BACKOFF = [2, 4, 8, 16, 30]; bi = 0
             _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
             _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
-            url = f"{_oracle_url}/api/snapshot/sse?client_id={_peer_id}_py"
+            url = f"{_oracle_url}/api/oracle/snapshot"
+            _last_snap_hash = None
+            
             while not self._stop.is_set():
                 try:
                     req = _SR(url, method='GET')
-                    req.add_header('Accept', 'text/event-stream')
-                    req.add_header('Cache-Control', 'no-cache')
-                    req.add_header('User-Agent', 'QTCL-PySSE/4.0')
+                    req.add_header('Content-Type', 'application/json')
+                    req.add_header('User-Agent', 'QTCL-PyRPC/4.0')
                     ssl_ctx = _ssl.create_default_context()
                     ssl_ctx.check_hostname = False
                     ssl_ctx.verify_mode = _ssl.CERT_NONE
-                    with _SO(req, timeout=120, context=ssl_ctx) as resp:
-                        _EXP_LOG.info(f"[PY-SSE] ✅ Python snapshot SSE connected → {url}")
+                    
+                    with _SO(req, timeout=30, context=ssl_ctx) as resp:
+                        _EXP_LOG.info(f"[PY-RPC] ✅ Snapshot RPC polling → {url}")
                         bi = 0
-                        buf = b''
+                        
                         while not self._stop.is_set():
-                            chunk = resp.read(4096)
-                            if not chunk: break
-                            buf += chunk
-                            while b'\n\n' in buf:
-                                raw_evt, buf = buf.split(b'\n\n', 1)
-                                for line in raw_evt.decode('utf-8', errors='replace').splitlines():
-                                    if line.startswith('data:'):
-                                        js = line[5:].strip()
-                                        if js and len(js) > 10:
-                                            try: self._ingest_oracle_frame(js)
-                                            except Exception: pass
-                                        break
+                            try:
+                                import json
+                                data = json.loads(resp.read().decode('utf-8'))
+                                
+                                # Hash to detect changes
+                                js = json.dumps(data)
+                                snap_hash = __import__('hashlib').sha256(js.encode()).hexdigest()
+                                
+                                if snap_hash != _last_snap_hash:
+                                    try:
+                                        self._ingest_oracle_frame(js)
+                                        _last_snap_hash = snap_hash
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            
+                            # Poll every 5 seconds
+                            self._stop.wait(5.0)
+                            break  # Re-establish connection
+                            
                 except (_SE, OSError, TimeoutError) as _e:
                     wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                    _EXP_LOG.debug(f"[PY-SSE] disconnected ({_e}) — retry in {wait}s")
+                    _EXP_LOG.debug(f"[PY-RPC] disconnected ({_e}) — retry in {wait}s")
                     self._stop.wait(wait)
                 except Exception as _e:
-                    _EXP_LOG.debug(f"[PY-SSE] error: {_e}")
+                    _EXP_LOG.debug(f"[PY-RPC] error: {_e}")
                     self._stop.wait(10)
 
     def _subscribe_koyeb_events(self) -> None:
         """
-        HTTPS SSE subscriber for /api/events — peer discovery + block events.
-        Routes peer_joined → qtcl_p2p_connect immediately.
-        ❤️  I love you — every peer event is a new entanglement
+        RPC polling for peer discovery + block events from /api/peers/list and /api/chain/status.
+        Routes new peers to qtcl_p2p_connect immediately.
+        ❤️  I love you — every peer is a new entanglement
         """
         import time as _ke, ssl as _kssl, json as _kj
         from urllib.request import Request as _KR, urlopen as _KO
@@ -16646,88 +16676,76 @@ class QtclClientApp:
         BACKOFF = [3, 6, 12, 24, 60]; bi = 0
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _peer_id = getattr(self, '_peer_id', 'unknown')
-        url = f"{_oracle_url}/api/events?client_id={_peer_id}&types=peer,block,oracle_dm"
+        _last_peers = set()
+        
         while not self._stop.is_set():
             try:
-                req = _KR(url, method='GET')
-                req.add_header('Accept', 'text/event-stream')
-                req.add_header('Cache-Control', 'no-cache')
-                req.add_header('User-Agent', 'QTCL-KoyebEvents/4.0')
+                # Poll peer list via RPC
+                peer_url = f"{_oracle_url}/api/peers/list"
+                req = _KR(peer_url, method='GET')
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-KoyebRPC/4.0')
                 ssl_ctx = _kssl.create_default_context()
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = _kssl.CERT_NONE
-                with _KO(req, timeout=120, context=ssl_ctx) as resp:
-                    _EXP_LOG.info(f"[KOYEB-SSE] ✅ Subscribed → {url}")
-                    bi = 0; buf = b''
-                    while not self._stop.is_set():
-                        chunk = resp.read(4096)
-                        if not chunk: break
-                        buf += chunk
-                        while b'\n\n' in buf:
-                            raw_evt, buf = buf.split(b'\n\n', 1)
-                            data_str = ''; etype = 'message'
-                            for line in raw_evt.decode('utf-8', errors='replace').splitlines():
-                                if line.startswith('event:'): etype = line[6:].strip()
-                                elif line.startswith('data:'): data_str += line[5:].strip()
-                            if not data_str: continue
-                            try: payload = _kj.loads(data_str)
-                            except: continue
-                            ev = payload.get('event') or payload.get('type') or etype
-                            if ev in ('peer', 'peer_joined'):
-                                pip   = str(payload.get('ip_address') or payload.get('host') or '')
-                                pport = int(payload.get('port') or 9091)
-                                ppid  = str(payload.get('peer_id') or '')
-                                # Exclude self (own IP + loopback) — Koyeb broadcasts our
-                                # own peer_joined back to us; connecting/writing self as peer
-                                # inflates stored count and causes self-connection loops.
-                                _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
-                                if pip and pip not in _self_ips and _accel_ok and _P2P_NODE:
-                                    try:
-                                        rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
-                                        if rc >= 0:
-                                            _EXP_LOG.info(f"[KOYEB-SSE] 🔗 Peer wired {pip}:{pport}")
-                                            # Relay peer event to local /api/events subscribers
-                                            _ev = {'type':'peer','event':'peer_joined',
-                                                   'ip_address':pip,'host':pip,
-                                                   'port':pport,'peer_id':ppid,
-                                                   'ts':__import__('time').time()}
-                                            for _lq in list(_sse_event_subs):
-                                                try: _lq.put_nowait(_ev)
-                                                except Exception: pass
-                                            try:
-                                                import sqlite3 as _esq
-                                                _edb = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
-                                                with _esq.connect(_edb, timeout=3) as _ec:
-                                                    _ec.execute("""INSERT OR REPLACE INTO p2p_peers
-                                                        (node_id_hex,host,port,source,last_seen_at,first_seen_at)
-                                                        VALUES(?,?,?,'sse_event',strftime('%s','now'),
-                                                        COALESCE((SELECT first_seen_at FROM p2p_peers WHERE host=? AND port=?),
-                                                                  strftime('%s','now')))""",
-                                                        (ppid or f"sse_{pip}", pip, pport, pip, pport))
-                                            except Exception: pass
-                                    except Exception: pass
-                            elif ev == 'oracle_dm':
-                                dm_hex = payload.get('density_matrix_hex','')
-                                if dm_hex and len(dm_hex) >= 128:
-                                    try: self._ingest_oracle_frame(_kj.dumps(payload))
-                                    except Exception: pass
+                
+                with _KO(req, timeout=30, context=ssl_ctx) as resp:
+                    _EXP_LOG.info(f"[KOYEB-RPC] ✅ Polling peers → {peer_url}")
+                    bi = 0
+                    
+                    data = _kj.loads(resp.read().decode('utf-8'))
+                    peers = data.get('peers', [])
+                    
+                    for peer_info in peers:
+                        pip = str(peer_info.get('ip_address') or peer_info.get('host') or '')
+                        pport = int(peer_info.get('port') or 9091)
+                        ppid = str(peer_info.get('peer_id') or '')
+                        
+                        peer_key = f"{pip}:{pport}"
+                        
+                        # Exclude self
+                        _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
+                        if pip and pip not in _self_ips and peer_key not in _last_peers:
+                            if _accel_ok and _P2P_NODE:
+                                try:
+                                    rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
+                                    if rc >= 0:
+                                        _EXP_LOG.info(f"[KOYEB-RPC] 🔗 Peer wired {pip}:{pport}")
+                                        _last_peers.add(peer_key)
+                                        
+                                        # Save to DB
+                                        try:
+                                            import sqlite3 as _esq
+                                            _edb = str(__import__('pathlib').Path('qtcl_blockchain.db').resolve())
+                                            with _esq.connect(_edb, timeout=3) as _ec:
+                                                _ec.execute("""INSERT OR REPLACE INTO p2p_peers
+                                                    (node_id_hex,host,port,source,last_seen_at,first_seen_at)
+                                                    VALUES(?,?,?,'rpc_peers',strftime('%s','now'),
+                                                    COALESCE((SELECT first_seen_at FROM p2p_peers WHERE host=? AND port=?),
+                                                              strftime('%s','now')))""",
+                                                    (ppid or f"rpc_{pip}", pip, pport, pip, pport))
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                    
+                    # Clean up old peers (keep last 5 minutes)
+                    if len(_last_peers) > 100:
+                        _last_peers.clear()
+                    
             except (_KE, OSError, TimeoutError) as _e:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[KOYEB-SSE] disconnected ({_e}) — retry in {wait}s")
+                _EXP_LOG.debug(f"[KOYEB-RPC] peer poll failed ({_e}) — retry in {wait}s")
                 self._stop.wait(wait)
             except Exception as _e:
-                _EXP_LOG.debug(f"[KOYEB-SSE] error: {_e}")
+                _EXP_LOG.debug(f"[KOYEB-RPC] error: {_e}")
                 self._stop.wait(15)
 
-    def _subscribe_own_sse(self) -> None:
+    def _subscribe_own_rpc(self) -> None:
         """
-        Ouroboros self-subscription to local P2P events:
-        Connect to our own /events endpoint on 9091 and ingest the stream.
-        This completes the ouroboros loop for local consensus reinforcement.
-        Handles wstate and consensus events from peers that connect to us.
-        Oracle DM now sourced from RPC (LocalOracleEngine), not this stream.
-        Reconnects with exponential backoff on any failure.
-        ❤️  I love you — the snake eats its own tail, the qubit measures itself
+        RPC polling of own local chain state (no SSE self-loop).
+        Polls /api/chain/status periodically for consensus reinforcement.
+        ❤️  I love you — the qubit measures itself
         """
         import time as _to
         from urllib.request import Request as _Ro, urlopen as _oo
@@ -16735,62 +16753,40 @@ class QtclClientApp:
         BACKOFF = [2, 4, 8, 16, 30]
         bi = 0
         _to.sleep(3.0)  # wait for our own HTTP server to start
+        _last_height = -1
+        
         while not self._stop.is_set():
-            url = "http://localhost:9091/events?channels=255"
+            url = "http://localhost:9091/api/chain/status"
             try:
                 req = _Ro(url, method='GET')
-                req.add_header('Accept',        'text/event-stream')
-                req.add_header('Cache-Control', 'no-cache')
-                req.add_header('User-Agent',    'QTCL-OuroborosSSE/3.0')
-                with _oo(req, timeout=90) as resp:
-                    _EXP_LOG.info("[OURO] 🌀 Ouroboros SSE self-loop connected → localhost:9091/events")
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-OuroborosRPC/3.0')
+                
+                with _oo(req, timeout=30) as resp:
+                    _EXP_LOG.info("[OURO] 🌀 Ouroboros RPC self-loop connected → localhost:9091/api/chain/status")
                     bi = 0
-                    buf = b''
-                    while not self._stop.is_set():
-                        chunk = resp.read(4096)
-                        if not chunk: break
-                        buf += chunk
-                        while b'\n\n' in buf:
-                            raw_evt, buf = buf.split(b'\n\n', 1)
-                            self._handle_sse_event(raw_evt.decode('utf-8', errors='replace'))
+                    
+                    import json
+                    data = json.loads(resp.read().decode('utf-8'))
+                    
+                    current_height = int(data.get('height', -1))
+                    if current_height > _last_height:
+                        _EXP_LOG.debug(f"[OURO] 🧬 Chain updated: {_last_height} → {current_height}")
+                        _last_height = current_height
+                    
+                    self._stop.wait(5.0)  # Poll every 5 seconds
+                    
             except (_UE, OSError, TimeoutError) as _e:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[OURO] SSE self-loop disconnected ({_e}) — reconnect in {wait}s")
+                _EXP_LOG.debug(f"[OURO] RPC self-loop failed ({_e}) — reconnect in {wait}s")
                 self._stop.wait(wait)
             except Exception as _e:
-                _EXP_LOG.debug(f"[OURO] SSE error: {_e}")
+                _EXP_LOG.debug(f"[OURO] RPC error: {_e}")
                 self._stop.wait(10)
 
     def _handle_sse_event(self, raw: str) -> None:
-        """Parse one SSE event from our own /events stream and route it."""
-        import json as _ej
-        data_str = ''; event_type = 'message'
-        for line in raw.strip().splitlines():
-            if   line.startswith('event:'): event_type = line[6:].strip()
-            elif line.startswith('data:'):  data_str  += line[5:].strip()
-        if not data_str: return
-        try: payload = _ej.loads(data_str)
-        except: return
-        ev = payload.get('event', event_type)
-        if ev == 'wstate':
-            # Re-ingest peer wstate into consensus
-            if _WSTATE_CONSENSUS:
-                try:
-                    fid = float(payload.get('w_fidelity', 0))
-                    h   = int(payload.get('chain_height', 0))
-                    # Update koyeb_state with peer fidelity data
-                    if fid > 0 and not payload.get('ouroboros'):
-                        _EXP_LOG.debug(
-                            f"[OURO] 🌀 Peer wstate ingest: h={h} F={fid:.4f}")
-                except Exception: pass
-        elif ev == 'dm_consensus':
-            fid = float(payload.get('consensus_fidelity', 0))
-            h   = int(payload.get('chain_height', 0))
-            _EXP_LOG.debug(f"[OURO] 🧬 Consensus DM: h={h} F={fid:.4f}")
-        elif ev == 'chain_reset':
-            # _RESET_PERFORMED is module-level
-            _EXP_LOG.warning("[OURO] ⚡ chain_reset via SSE self-loop — signalling mining reset")
-            _RESET_PERFORMED.set()
+        """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
+        pass
 
     def _local_http_server(self) -> None:
         """
@@ -16836,14 +16832,14 @@ class QtclClientApp:
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # peer disconnected before response — harmless
 
-            def _sse_headers(self):
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/event-stream')
-                self.send_header('Cache-Control', 'no-cache')
-                self.send_header('Connection', 'keep-alive')
-                self.send_header('X-Accel-Buffering', 'no')
+            def _json_resp(self, status: int, data: dict) -> None:
+                """Send JSON response."""
+                import json as _jr
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
+                self.wfile.write(_jr.dumps(data, default=str).encode())
 
             def _oracle_snapshot(self):
                 """Build full oracle snapshot dict from local SSE state."""
@@ -16900,62 +16896,35 @@ class QtclClientApp:
                         'timestamp':     _ht.time(),
                     })
 
-                # ── /api/snapshot/sse — SSE DM stream (peers subscribe here) ─
+                # ── /api/snapshot (RPC) — JSON oracle snapshot (was SSE)
                 elif path in ('/api/snapshot/sse', '/api/snapshot'):
-                    self._sse_headers()
-                    import queue as _sq, threading as _st2
-                    # Register this connection in a local SSE subscriber queue
-                    _sub_q: _sq.Queue = _sq.Queue(maxsize=20)
-                    _sse_local_subs.append(_sub_q)
-                    # Send latest snapshot immediately on connect
+                    # Return latest snapshot as JSON, not SSE stream
                     snap = self._oracle_snapshot()
-                    try:
-                        self.wfile.write(f"data: {_hj.dumps(snap)}\n\n".encode())
-                    except Exception: pass
-                    try:
-                        while True:
-                            try:
-                                frame = _sub_q.get(timeout=25)
-                                self.wfile.write(f"data: {_hj.dumps(frame)}\n\n".encode())
-                                self.wfile.flush()
-                            except _sq.Empty:
-                                self.wfile.write(b": keepalive\n\n")
-                                self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    finally:
-                        try: _sse_local_subs.remove(_sub_q)
-                        except ValueError: pass
+                    resp_json = json.dumps({
+                        'status': 'ok',
+                        'snapshot': snap,
+                        'timestamp': time.time()
+                    })
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(resp_json.encode())
 
-                # ── /api/events — typed SSE stream ───────────────────────────
+                # ── /api/events (RPC) — JSON events (was SSE)
                 elif path == '/api/events':
-                    self._sse_headers()
-                    import queue as _eq2
-                    _ev_q: _eq2.Queue = _eq2.Queue(maxsize=40)
-                    _sse_event_subs.append(_ev_q)
+                    # Return current chain status as JSON
                     snap = self._oracle_snapshot()
-                    try:
-                        hello = _hj.dumps({'type':'hello','data':{'tip_height': snap['block_height']},'ts':_ht.time()})
-                        self.wfile.write(f"event: hello\ndata: {hello}\n\n".encode())
-                        self.wfile.flush()
-                    except Exception: pass
-                    try:
-                        while True:
-                            try:
-                                ev = _ev_q.get(timeout=25)
-                                etype = ev.get('type','')
-                                payload = _hj.dumps(ev)
-                                prefix = f"event: {etype}\n" if etype else ""
-                                self.wfile.write(f"{prefix}data: {payload}\n\n".encode())
-                                self.wfile.flush()
-                            except _eq2.Empty:
-                                self.wfile.write(b": keepalive\n\n")
-                                self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    finally:
-                        try: _sse_event_subs.remove(_ev_q)
-                        except ValueError: pass
+                    resp_json = json.dumps({
+                        'type': 'chain_status',
+                        'tip_height': snap.get('block_height', 0),
+                        'timestamp': time.time()
+                    })
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(resp_json.encode())
 
                 # ── Oracle state endpoints ────────────────────────────────────
                 elif path in ('/api/oracle/w-state', '/api/oracle/pq0-bloch',
@@ -17053,10 +17022,7 @@ class QtclClientApp:
                             if _accel_ok:
                                 try: _accel_lib.qtcl_p2p_trigger_consensus()
                                 except Exception: pass
-                            # Publish to local P2P event subscribers (Ouroboros loop)
-                            for _sq in list(_sse_local_subs):
-                                try: _sq.put_nowait(payload)
-                                except Exception: pass
+                            # RPC mode: no local SSE queue broadcast needed
                             _EXP_LOG.debug(
                                 f"[HTTP-9091] oracle DM ingested from peer "
                                 f"fid={payload.get('w_state_fidelity',0):.4f}")
@@ -17116,10 +17082,8 @@ class QtclClientApp:
                     # Receive gossiped block/tx from peers
                     block = payload.get('block')
                     if block:
-                        ev = {'type':'block','data':block,'ts':_ht.time()}
-                        for _eq in list(_sse_event_subs):
-                            try: _eq.put_nowait(ev)
-                            except Exception: pass
+                        # RPC mode: blocks handled via /api/chain/blocks polling
+                        pass
                     self._json_resp(200, {'ok': True})
 
                 else:
@@ -17292,8 +17256,6 @@ class QtclClientApp:
                 if _LOCAL_ORACLE.snapshot_count > 0:
                     print(" ✅ (RPC)", flush=True)
                     return True
-                _time.sleep(0.1)
-                    except Exception: pass
                 print('.', end='', flush=True)
                 _time.sleep(0.3)
 
@@ -17770,127 +17732,75 @@ class QtclClientApp:
 
             def _start_block_listener(oracle_url: str, initial_target: int) -> None:
                 """
-                Dedicated SSE subscriber to /api/events — fires on every new_block.
-                Server event format (wrapped by _SSEBroadcaster.publish):
-                  data: {"type":"block","data":{"type":"new_block","height":N,...},"ts":...}
-
-                Height lives at ev['data']['height'] — NOT ev['height'].
-                Frame delimiters: \n\n or \r\n\r\n (normalise both).
-                Reconnects with exponential backoff 1s→2s→4s→8s→16s→30s.
+                RPC polling for new blocks via /api/chain/status.
+                Polls regularly and triggers abort when target height reached.
                 ❤️  I love you — every millisecond matters in a race
                 """
                 import urllib.request as _ur, urllib.error as _ue, time as _blt
-                import socket as _bls
+                import json as _json, socket as _bls
                 BACKOFF = [1, 2, 4, 8, 16, 30]
                 bi = 0
                 _blt.sleep(0.3)   # let mining loop reach nonce search before listener fires
+                _last_height = -1
+                
                 while not _mining_stopped.is_set():
-                    url = f"{oracle_url}/api/events?types=block,new_block,all"
+                    url = f"{oracle_url}/api/chain/status"
                     try:
                         req = _ur.Request(url)
-                        req.add_header('Accept',           'text/event-stream')
-                        req.add_header('Cache-Control',    'no-cache')
-                        req.add_header('Connection',       'keep-alive')
-                        req.add_header('User-Agent',       'QTCL-BlockListener/4.0')
-                        req.add_header('X-QTCL-Client',   'block_listener')
-                        # 90s read timeout — server sends keepalive every 30s
-                        with _ur.urlopen(req, timeout=90) as resp:
+                        req.add_header('Content-Type', 'application/json')
+                        req.add_header('User-Agent', 'QTCL-BlockListener/4.0-RPC')
+                        req.add_header('X-QTCL-Client', 'block_listener')
+                        
+                        with _ur.urlopen(req, timeout=30) as resp:
                             bi = 0  # reset backoff on successful connect
-                            _EXP_LOG.info(f"[BLOCK-LISTENER] ✅ SSE connected → {url}")
-                            buf = b''
-                            while not _mining_stopped.is_set():
-                                try:
-                                    chunk = resp.read(8192)
-                                except (_ue.URLError, OSError, TimeoutError):
-                                    break
-                                if not chunk: break
-                                buf += chunk
-                                # Normalise CRLF and LF frame separators
-                                buf = buf.replace(b'\r\n\r\n', b'\n\n')
-                                while b'\n\n' in buf:
-                                    raw_evt, buf = buf.split(b'\n\n', 1)
-                                    data_str = ''
-                                    for line in raw_evt.decode('utf-8', 'replace').splitlines():
-                                        line = line.strip()
-                                        if line.startswith('data:'):
-                                            data_str += line[5:].strip()
-                                        elif line.startswith(':'):
-                                            pass  # keepalive comment — ignore
-                                    if not data_str: continue
+                            data = _json.loads(resp.read().decode('utf-8'))
+                            
+                            tip_h = int(data.get('height', 0))
+                            _EXP_LOG.info(f"[BLOCK-LISTENER] ✅ RPC poll → {url} tip={tip_h}")
+                            
+                            # Initial hello on first successful poll
+                            if tip_h > 0 and _last_height == -1:
+                                if _accel_ok:
                                     try:
-                                        ev = _json.loads(data_str)
-                                        # Outer envelope: {"type":"block","data":{...},"ts":...}
-                                        outer_type = ev.get('type', '')
-                                        inner      = ev.get('data', ev)  # fall back to root
-                                        inner_type = inner.get('type', outer_type)
-
-                                        # hello frame: sent on connect with current tip
-                                        if outer_type == 'hello' or inner_type == 'hello':
-                                            tip_h = int(
-                                                inner.get('tip_height') or
-                                                ev.get('tip_height') or 0
-                                            )
-                                            if tip_h > 0:
-                                                if _accel_ok:
-                                                    try:
-                                                        _accel_lib.qtcl_set_oracle_height(tip_h)
-                                                        _ct = int(_accel_lib.qtcl_get_miner_target())
-                                                        if _ct > 0 and tip_h >= _ct:
-                                                            _accel_lib.qtcl_pow_set_abort(1)
-                                                    except Exception: pass
-                                                _new_block_height[0] = tip_h
-                                                _new_block_event.set()
-                                                _EXP_LOG.info(
-                                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C abort armed")
-                                            continue
-
-                                        is_block = (outer_type in ('block', 'new_block') or
-                                                    inner_type in ('block', 'new_block'))
-                                        if not is_block: continue
-
-                                        # Height: check inner first (data.height), then root
-                                        ev_h = int(
-                                            inner.get('height') or
-                                            inner.get('block_height') or
-                                            ev.get('height') or
-                                            ev.get('block_height') or
-                                            inner.get('tip_height') or 0
-                                        )
-                                        if ev_h > 0:
-                                            # ── Triple-path instant abort ─────
-                                            # 1. C oracle_height → hot-loop self-aborts ≤256 nonces
-                                            # 2. C pow_set_abort → belt-and-suspenders explicit abort
-                                            # 3. Python threading.Event → _poll_new_block() path
-                                            if _accel_ok:
-                                                try:
-                                                    _accel_lib.qtcl_set_oracle_height(ev_h)
-                                                    _cur_t = int(_accel_lib.qtcl_get_miner_target())
-                                                    if _cur_t > 0 and ev_h >= _cur_t:
-                                                        _accel_lib.qtcl_pow_set_abort(1)
-                                                except Exception: pass
-                                            _new_block_height[0] = ev_h
-                                            _new_block_event.set()
-                                            _EXP_LOG.info(
-                                                f"[BLOCK-LISTENER] ⚡ h={ev_h} "
-                                                f"→ C abort + Python event fired"
-                                            )
-                                            # Relay to local /api/events subscribers
-                                            _blk_ev = {'type':'block','data':inner,
-                                                       'height':ev_h,'ts':_blt.time()}
-                                            for _lq in list(_sse_event_subs):
-                                                try: _lq.put_nowait(_blk_ev)
-                                                except Exception: pass
-                                    except Exception as _pe:
-                                        _EXP_LOG.debug(f"[BLOCK-LISTENER] parse: {_pe} raw={data_str[:80]}")
+                                        _accel_lib.qtcl_set_oracle_height(tip_h)
+                                        _ct = int(_accel_lib.qtcl_get_miner_target())
+                                        if _ct > 0 and tip_h >= _ct:
+                                            _accel_lib.qtcl_pow_set_abort(1)
+                                    except Exception:
+                                        pass
+                                _new_block_height[0] = tip_h
+                                _new_block_event.set()
+                                _EXP_LOG.info(
+                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C abort armed")
+                            
+                            # New block detected
+                            if tip_h > _last_height:
+                                _last_height = tip_h
+                                if _accel_ok:
+                                    try:
+                                        _accel_lib.qtcl_set_oracle_height(tip_h)
+                                        _ct = int(_accel_lib.qtcl_get_miner_target())
+                                        if _ct > 0 and tip_h >= _ct:
+                                            _accel_lib.qtcl_pow_set_abort(1)
+                                    except Exception:
+                                        pass
+                                _new_block_height[0] = tip_h
+                                _new_block_event.set()
+                                _EXP_LOG.info(
+                                    f"[BLOCK-LISTENER] ⚡ h={tip_h} → C abort + Python event fired")
+                            
+                            # Poll every 1 second
+                            _mining_stopped.wait(1.0)
+                            
                     except (_ue.URLError, OSError, TimeoutError, _bls.timeout) as _ble:
                         wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                        _EXP_LOG.debug(f"[BLOCK-LISTENER] reconnect in {wait}s ({_ble})")
+                        _EXP_LOG.debug(f"[BLOCK-LISTENER] RPC poll failed, reconnect in {wait}s ({_ble})")
                         _mining_stopped.wait(wait)
                     except Exception as _ble2:
                         _EXP_LOG.debug(f"[BLOCK-LISTENER] unexpected: {_ble2}")
                         _mining_stopped.wait(3)
 
-            _mining_stopped = _threading.Event()   # signals listener thread to exit
+                        _mining_stopped = _threading.Event()   # signals listener thread to exit
             _block_listener_thread = _threading.Thread(
                 target=_start_block_listener,
                 args=(kapi.base_url, 1),
