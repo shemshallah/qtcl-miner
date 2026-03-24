@@ -815,13 +815,9 @@ class HLWEEngine:
                 logger.error(f"[HLWE] Signing failed: {e}")
                 raise
     
-    def verify_signature(self, message_hash: bytes, signature_dict: Dict[str, str], public_key_hex: str, private_key_hex: Optional[str] = None) -> bool:
+    def verify_signature(self, message_hash: bytes, signature_dict: Dict[str, str], public_key_hex: str) -> bool:
         """
-        Verify HLWE signature using TRUE Fiat-Shamir scheme.
-        
-        If private_key_hex provided: Full Fiat-Shamir verification (w' = z - s*c)
-        Otherwise: HMAC-SHA3-256 fallback (for address-only verification)
-        
+        Verify HLWE signature.
         C path: CRYPTO_memcmp (OpenSSL constant-time compare) — immune to
         timing side-channels in a way Python str comparison cannot guarantee.
         """
@@ -829,61 +825,19 @@ class HLWEEngine:
             try:
                 sig_hex = signature_dict.get('signature', '')
                 expected_tag = signature_dict.get('auth_tag', '')
-                c_hex = signature_dict.get('c', '0x0')
-                
                 if not sig_hex or not expected_tag:
                     return False
-                
-                n = self.params.DIMENSION
-                q = self.params.MODULUS
-                z_len = n * 8
-                
-                if len(sig_hex) < z_len:
-                    return False
-                
-                z_hex = sig_hex[:z_len]
-                z = self._decode_vector_from_hex(z_hex)
-                c = int(c_hex, 16) if isinstance(c_hex, str) else c_hex
-                
-                if _accel_ok and len(sig_hex) >= 2048:
-                    try:
-                        msg32 = message_hash[:32].ljust(32, b'\x00')
-                        sig_bytes = bytes.fromhex(z_hex)[:256]
-                        _mh = _accel_ffi.new('uint8_t[32]', msg32)
-                        _sig = _accel_ffi.new('uint8_t[256]', sig_bytes)
-                        _tag = _accel_ffi.new('char[]', expected_tag.encode('ascii') + b'\x00')
-                        return bool(_accel_lib.qtcl_hlwe_verify(_mh, _sig, _tag))
-                    except Exception as e:
-                        logger.debug(f"[HLWE] C verification failed: {e}")
-                
-                if private_key_hex is None:
-                    computed = hmac.new(message_hash, z_hex.encode(), hashlib.sha3_256).hexdigest()
-                    return hmac.compare_digest(computed, expected_tag)
-                
-                s = self._decode_vector_from_hex(private_key_hex)
-                
-                y_recovered = []
-                for i in range(n):
-                    yi = (z[i] - s[i] * c) % q
-                    y_recovered.append(yi)
-                
-                y_bytes = b''.join(x.to_bytes(4, 'big') for x in y_recovered)
-                w_commit = hashlib.sha3_256(y_bytes + message_hash).digest()
-                w = [int.from_bytes(w_commit[i:i+2], 'big') % q for i in range(0, min(n*2, 32), 2)]
-                while len(w) < n:
-                    w.append(int.from_bytes(hashlib.sha256(w_commit + len(w).to_bytes(2, 'big')).digest()[:2], 'big') % q)
-                
-                c_input = b''.join(x.to_bytes(4, 'big') for x in w[:16]) + message_hash
-                c_computed = int.from_bytes(hashlib.sha3_256(c_input).digest()[:4], 'big') % q
-                
-                if c_computed != c:
-                    logger.debug(f"[HLWE] Fiat-Shamir challenge mismatch: {c_computed} != {c}")
-                    return False
-                
-                z_hex_enc = self._encode_vector_to_hex(z)
-                auth_tag = hmac.new(message_hash, z_hex_enc.encode(), hashlib.sha3_256).hexdigest()
-                return hmac.compare_digest(auth_tag, expected_tag)
-            
+                if _accel_ok and len(sig_hex) == 512:  # 256 bytes = 512 hex chars
+                    msg32    = message_hash[:32].ljust(32, b'\x00')
+                    sig_bytes = bytes.fromhex(sig_hex)
+                    _mh  = _accel_ffi.new('uint8_t[32]', msg32)
+                    _sig = _accel_ffi.new('uint8_t[256]', sig_bytes[:256])
+                    _tag = _accel_ffi.new('char[]', expected_tag.encode('ascii') + b'\x00')
+                    return bool(_accel_lib.qtcl_hlwe_verify(_mh, _sig, _tag))
+                # Pure-Python fallback
+                sig_bytes = bytes.fromhex(sig_hex)
+                computed = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
+                return hmac.compare_digest(computed, expected_tag)
             except Exception as e:
                 logger.debug(f"[HLWE] Verification failed: {e}")
                 return False
@@ -16608,37 +16562,31 @@ class QtclClientApp:
                 return state.hex()
 
             async def _get_chain_tip_with_retry():
-                """Get chain tip with exponential backoff, fallback to genesis"""
-                tip = None
-                _retries = 0
-                _max_retries = 4
-                _backoff_base = 0.3
+                """Get chain tip - immediate retry once if empty, then genesis protocol"""
+                try:
+                    tip = kapi.get_chain_tip()
+                    if tip and (tip.get("block_height") or tip.get("height")):
+                        return tip
+                except Exception as _e:
+                    _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip error: {type(_e).__name__}: {_e}")
                 
-                while _retries < _max_retries:
-                    try:
-                        tip = kapi.get_chain_tip()
-                        if tip and (tip.get("block_height") or tip.get("height")):
-                            return tip
-                        _retries += 1
-                        if _retries < _max_retries:
-                            _backoff = _backoff_base * (2 ** (_retries - 1))
-                            _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip empty, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
-                            await _asyncio.sleep(_backoff)
-                    except Exception as _e:
-                        _retries += 1
-                        _backoff = _backoff_base * (2 ** (_retries - 1)) if _retries < _max_retries else 0
-                        _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip error: {type(_e).__name__}: {_e}, retry {_retries}/{_max_retries} backoff {_backoff:.1f}s")
-                        if _retries < _max_retries:
-                            await _asyncio.sleep(_backoff)
+                _EXP_LOG.warning("[MINER-SIMPLE] chain_tip empty, immediate retry once...")
+                try:
+                    await _asyncio.sleep(0.2)
+                    tip = kapi.get_chain_tip()
+                    if tip and (tip.get("block_height") or tip.get("height")):
+                        return tip
+                except Exception as _e:
+                    _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip retry error: {type(_e).__name__}: {_e}")
                 
-                # Fallback to genesis if all retries exhausted
-                _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip retries exhausted, falling back to genesis h=0")
+                _EXP_LOG.warning("[MINER-SIMPLE] chain_tip empty after retry, initializing genesis protocol")
                 return {
                     "block_height": 0,
                     "height": 0,
                     "block_hash": "0" * 64,
                     "hash": "0" * 64,
                     "parent_hash": "0" * 64,
+                    "_genesis_init": True,
                 }
             
             while True:
@@ -16659,13 +16607,17 @@ class QtclClientApp:
                 # Read authoritative difficulty from the server tip.
                 # The server's DifficultyManager sets this; the client must mine to
                 # exactly this many leading hex zeros or the block will be rejected.
-                difficulty_bits = int(
-                    tip.get("difficulty_bits") or
-                    tip.get("difficulty") or
-                    5  # conservative fallback if tip is missing the field
-                )
+                # Fractional difficulty (e.g., 5.25, 5.50) is supported - convert to int
+                # for the leading-zeros PoW model, but pass the float to C layer for accuracy.
+                _diff_raw = tip.get("difficulty_bits") or tip.get("difficulty") or 6
+                try:
+                    difficulty_bits = int(float(_diff_raw))
+                except (ValueError, TypeError):
+                    difficulty_bits = 6
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
                 difficulty_bits = max(1, min(difficulty_bits, 20))
+                # Store fractional difficulty for C layer
+                _difficulty_float = float(_diff_raw) if _diff_raw != 6 else 6.0
                 
                 # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
@@ -16757,7 +16709,8 @@ class QtclClientApp:
                 except Exception:
                     _miner_reward_base    = 720   # depth-5 genesis default
                     _treasury_reward_base = 80
-                    _treasury_address     = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
+                    import os as _os
+                    _treasury_address     = _os.getenv('TREASURY_ADDRESS', 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87')
                     _tess_depth           = 5
 
                 _coinbase_tx_id = _hl.sha3_256(
