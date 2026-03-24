@@ -13607,32 +13607,84 @@ class KoyebAPIClient:
             return last_error_response
         return None
 
+    def _rpc(self, method: str, params: dict = None,
+             timeout: int = None, retries: int = 2) -> Optional[dict]:
+        """Make JSON-RPC 2.0 call to server. Returns result or None on error."""
+        t = timeout or self.timeout
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or {},
+            "id": int(_time.time() * 1000),
+        }
+        last_error = None
+        for attempt in range(retries):
+            if _HAS_REQUESTS:
+                try:
+                    r = self._get_session().post(
+                        f"{self.base_url}/rpc",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=t
+                    )
+                    if r.status_code == 200:
+                        resp = r.json()
+                        if "result" in resp:
+                            return resp["result"]
+                        if "error" in resp:
+                            _EXP_LOG.debug(f"[RPC] {method} error: {resp['error']}")
+                            return None
+                    last_error = f"HTTP {r.status_code}"
+                    break
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        _time.sleep(2 ** attempt)
+            else:
+                try:
+                    import urllib.request
+                    data = _json.dumps(payload).encode()
+                    req = urllib.request.Request(
+                        f"{self.base_url}/rpc",
+                        data=data,
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=t) as resp:
+                        resp_data = _json.loads(resp.read())
+                        if "result" in resp_data:
+                            return resp_data["result"]
+                        if "error" in resp_data:
+                            _EXP_LOG.debug(f"[RPC] {method} error: {resp_data['error']}")
+                            return None
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < retries - 1:
+                        _time.sleep(2 ** attempt)
+        _EXP_LOG.debug(f"[RPC] {method} failed: {last_error}")
+        self._last_error = last_error
+        return None
+
     def get_chain_tip(self) -> Optional[dict]:
-        return self._get("/api/blocks/tip")
+        """RPC-only: Get chain tip via JSON-RPC 2.0"""
+        return self._rpc("qtcl_getChainTip")
 
     def get_block_height(self) -> Optional[int]:
+        """RPC-only: Get current block height"""
         tip = self.get_chain_tip()
         if tip:
             h = tip.get("block_height") or tip.get("height")
             if h is not None:
                 return int(h)
-        hello = self._get("/api/dht/hello")
-        if hello:
-            return int(hello.get("block_height", 0))
         return None
 
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
-        r = self._get("/api/oracle/pq0-bloch")
-        if r:
-            return r
-        r = self._get("/api/oracle/w-state")
-        if r:
-            return r
-        return self._get("/api/oracle/pq0")
+        """RPC-only: Get oracle PQ0 Bloch state"""
+        return self._rpc("qtcl_getOracleState")
 
     def get_oracle_w_state(self) -> Optional[dict]:
-        r = self._get("/api/oracle/w-state")
-        return r or self._get("/api/oracle/pq0")
+        """RPC-only: Get oracle W-state via JSON-RPC 2.0"""
+        return self._rpc("qtcl_getOracleState")
 
     def get_pq_state(self) -> dict:
         """
@@ -13689,190 +13741,81 @@ class KoyebAPIClient:
         return GKSLBathParams.from_snap(snap) if snap else CANONICAL_BATH
 
     def get_balance(self, address: str) -> Optional[float]:
-        """
-        SUB-AGENT β: Full 4-tier balance cascade (OPUS-FIXED).
-
-        Tier 1: /api/address/{addr}/balance  — confirmed wallet row
-                (was returning raw BASE UNITS not QTCL — now normalised)
-        Tier 2: /api/wallet?address=...      — always returns QTCL float,
-                handles new wallets with 0.0
-        Tier 3: /api/address/{addr}/history  — sum confirmed incoming TXs
-                (catches miners whose wallet_addresses row is stale)
-        Tier 4: 0.0                          — address verified unreachable
-
-        HOTFIX (Opus Agent ζ): Removed broken _qtcl() heuristic at line 8850
-        that assumed value > 1000 = base units. This caused 1164 → 11.64 bug.
-        Now trusts each endpoint to return correct format.
-
-        Returns None ONLY on total network failure.
-        """
-        def _qtcl(raw) -> Optional[float]:
-            """Normalise: trust the endpoint format, don't assume base units."""
-            try:
-                f = float(raw)
-                # ✅ HOTFIX: Removed the broken heuristic below
-                # OLD CODE (BROKEN):
-                #   if f > 1000 and f == int(f):
-                #       return f / 100.0  ← Caused 1164/100 = 11.64 BUG!
-                # 
-                # NEW CODE (FIXED):
-                # Each endpoint is responsible for returning correct format.
-                # Trust the endpoint, don't try to auto-detect base units vs QTCL.
-                return f
-            except Exception:
-                return None
-
-        # ── Tier 0: /api/address/{addr}/earned — ledger ground truth ────────────
-        # Reads confirmed transactions directly, bypasses wallet_addresses cache.
-        # This is the ONLY reliable source for miners (wallet_addresses may be stale
-        # if blocks were submitted via gossip instead of /api/submit_block).
-        r0 = self._get(f"/api/address/{address}/earned")
-        if r0 is not None and "error" not in r0:
-            v = _qtcl(r0.get("balance_qtcl", r0.get("confirmed_balance",
-                                                       r0.get("balance"))))
-            if v is not None:
-                _EXP_LOG.debug(f"[BALANCE] Tier-0 /earned: {v:.4f} QTCL "
-                               f"({r0.get('blocks_mined',0)} blocks mined)")
-                return v
-
-        # ── Tier 1: /api/address/{addr}/balance ──────────────────────────────
-        r1 = self._get(f"/api/address/{address}/balance")
-        if r1 is not None and "error" not in r1:
-            for k in ("balance_qtcl", "confirmed_balance", "balance"):
-                if k in r1:
-                    v = _qtcl(r1[k])
-                    if v is not None:
-                        return v
-
-        # ── Tier 2: /api/wallet?address=...  (always returns 200) ────────────
-        r2 = self._get("/api/wallet", params={"address": address})
-        if r2 is not None and "error" not in r2:
-            for k in ("balance", "balance_qtcl", "confirmed_balance"):
-                if k in r2:
-                    v = _qtcl(r2[k])
-                    if v is not None:
-                        # /api/wallet already divides by 100 correctly
-                        return float(r2[k]) if float(r2[k]) == v else v
-
-        # ── Tier 3: sum confirmed TXs from history (miner balance recovery) ──
-        try:
-            hist = self._get(f"/api/address/{address}/history",
-                             params={"limit": 200}) or {}
-            txs  = hist.get("transactions", [])
-            if txs:
-                # credits: TXs where this address received funds
-                credits  = sum(float(t.get("amount_qtcl") or
-                                     _qtcl(t.get("amount", 0)) or 0)
-                               for t in txs
-                               if (t.get("to_address") == address or
-                                   t.get("to") == address) and
-                                  t.get("status") == "confirmed")
-                # debits: TXs sent from this address
-                debits   = sum(float(t.get("amount_qtcl") or
-                                     _qtcl(t.get("amount", 0)) or 0) +
-                               float(t.get("fee", 0.001))
-                               for t in txs
-                               if (t.get("from_address") == address or
-                                   t.get("from") == address) and
-                                  t.get("status") == "confirmed")
-                net = max(0.0, credits - debits)
-                _EXP_LOG.debug(
-                    f"[BALANCE] Tier-3 TX scan: credits={credits:.4f} "
-                    f"debits={debits:.4f} net={net:.4f}")
-                return net
-        except Exception as _e:
-            _EXP_LOG.debug(f"[BALANCE] Tier-3 failed: {_e}")
-
-        # ── Tier 4: network total failure ─────────────────────────────────────
-        if r1 is None and r2 is None:
-            return None   # genuine network error → show 'unavailable'
-        return 0.0         # reachable but empty
+        """RPC-only: Get balance via JSON-RPC 2.0"""
+        result = self._rpc("qtcl_getAddressBalance", {"address": address})
+        if result is not None:
+            return result.get("balance")
+        return None
 
     def get_address_history(self, address: str, limit: int = 50) -> list:
-        r = self._get(f"/api/address/{address}/history",
-                      params={"limit": limit})
-        return (r or {}).get("transactions", [])
+        """RPC-only: Get address transaction history"""
+        result = self._rpc("qtcl_getAddressHistory", {"address": address, "limit": limit})
+        if result is not None:
+            return result.get("transactions", [])
+        return []
 
     def get_mempool(self) -> list:
-        return (self._get("/api/mempool") or {}).get("transactions", [])
+        """RPC-only: Get mempool via JSON-RPC 2.0"""
+        result = self._rpc("qtcl_getMempool")
+        if result is not None:
+            return result.get("transactions", [])
+        return []
 
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
-        AGENT-β FIX: Server canonical endpoint is /api/submit_transaction.
-        /api/transactions (no trailing path) doesn't exist → 404 → None.
-        Also normalises amount/fee to base units (×100) which the mempool
-        requires, and ensures timestamp_ns is present.
-        
-        ENHANCED: Added pre-submission health check and multi-fallback strategy.
+        RPC-only: Submit transaction via JSON-RPC 2.0
         """
         import time as _t2
-        # Normalise payload to what server mempool.accept() expects
         payload = dict(tx)
-        # amount: server expects QTCL float; mempool internally does ×100
-        # Just ensure it's a plain float, not numpy
         if "amount" in payload:
             payload["amount"] = float(payload["amount"])
         if "fee" in payload:
             payload["fee"] = float(payload["fee"])
-        # timestamp_ns required for canonical hash
         if "timestamp_ns" not in payload:
             payload["timestamp_ns"] = str(_t2.time_ns())
-        # from/to aliases for maximum server compat
         payload.setdefault("from",    payload.get("from_address", ""))
         payload.setdefault("to",      payload.get("to_address", ""))
         payload.setdefault("from_addr", payload.get("from_address", ""))
         payload.setdefault("to_addr",   payload.get("to_address", ""))
-
-        # ── Endpoint priority list (fallback chain) ────────────────────────────────
-        endpoints = [
-            ("/api/submit_transaction", 3),        # Primary: canonical, 3 retries
-            ("/api/transactions/submit", 2),       # Fallback: alias, 2 retries
-            ("/gossip/ingest", 1),                 # Last resort: broadcast, 1 retry
-        ]
-        
-        for path, max_retries in endpoints:
-            if path == "/gossip/ingest":
-                payload_to_send = {"tx": payload, "origin": "client_wallet"}
-            else:
-                payload_to_send = payload
-            
-            r = self._post(path, payload_to_send, retries=max_retries)
-            if r is not None:
-                return r
-        
-        return None
+        return self._rpc("qtcl_submitTransaction", {"transaction": payload})
 
     def get_peers(self) -> list:
-        return (self._get("/api/peers/list") or {}).get("peers", [])
+        """RPC-only: Get peer list"""
+        result = self._rpc("qtcl_getPeers")
+        if result is not None:
+            return result.get("peers", [])
+        return []
 
     def register_peer(self, peer_id: str, gossip_url: str,
                        miner_address: str = "",
                        block_height: int = 0) -> Optional[dict]:
-        return self._post("/api/peers/register", {
-            "peer_id": peer_id, "gossip_url": gossip_url,
+        """RPC-only: Register peer"""
+        return self._rpc("qtcl_registerPeer", {
+            "peer_id": peer_id, "host": gossip_url.split(":")[0] if gossip_url else "",
+            "port": int(gossip_url.split(":")[1]) if ":" in gossip_url else 9091,
             "miner_address": miner_address,
-            "block_height": block_height, "ts": _time.time(),
+            "block_height": block_height,
         })
 
     def send_heartbeat(self, peer_id: str, block_height: int = 0) -> Optional[dict]:
-        return self._post("/api/peers/heartbeat", {
-            "peer_id": peer_id, "block_height": block_height, "ts": _time.time(),
-        })
+        """RPC-only: Send peer heartbeat"""
+        return self._rpc("qtcl_peerHeartbeat", {"peer_id": peer_id})
 
     def gossip_ingest(self, payload: dict) -> Optional[dict]:
-        return self._post("/gossip/ingest", payload)
+        """RPC-only: Gossip ingest (local P2P)"""
+        return self._rpc("qtcl_gossipIngest", payload)
 
     def oracle_register(self, miner_id: str, miner_address: str) -> Optional[dict]:
-        return self._post("/api/oracle/register",
-                          {"miner_id": miner_id, "address": miner_address})
+        """RPC-only: Oracle registration"""
+        return self._rpc("qtcl_oracleRegister", {"miner_id": miner_id, "address": miner_address})
 
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
-        """Check if oracle is reachable. Caches result for 10 seconds."""
+        """RPC-only: Check if oracle is reachable. Caches result for 10 seconds."""
         now = _time.time()
         if not force and (now - self._health_check_cache["timestamp"]) < 10:
             return self._health_check_cache["status"]
         
-        result = self._get("/api/dht/hello", timeout=timeout) is not None
+        result = self._rpc("qtcl_getHealth") is not None
         self._health_check_cache = {"timestamp": now, "status": result}
         return result
     
@@ -17207,7 +17150,8 @@ class QtclClientApp:
                         _EXP_LOG.debug(f"[MINER] P2P consensus enrichment: {_pe}")
 
                     _MINE_TELEM.mark_submitting()
-                    r = kapi._post("/api/submit_block", submit_payload, timeout=20)
+                    # RPC-only: Submit block via JSON-RPC 2.0
+                    r = kapi._rpc("qtcl_submitBlock", {"block": submit_payload}, timeout=20)
                     
                     # ✅ FIXED: Properly extract and record reward
                     if r is None:
