@@ -19686,79 +19686,139 @@ class QtclClientApp:
             _EXP_LOG.debug(f"[RPC] {method} error: {r['error']}")
         return None
 
-    def _fetch_pyth_snapshot(self, symbols: Optional[list] = None) -> Optional[dict]:
+    # ── Hermes feed-ID cache — populated once, reused forever ────────────────
+    _HERMES_ID_CACHE: dict = {}   # { "BTC": "0xe62df6c8b4a85fe1…", … }
+    _HERMES_BASE = "https://hermes.pyth.network"
+
+    def _hermes_resolve_id(self, sym: str) -> "Optional[str]":
         """
-        Fetch Pyth snapshot from server RPC, batching into groups of 3.
-
-        Koyeb's qtcl_getPythPrice reliably returns prices for small batches
-        (matches what _display_pyth_ticker uses in wallet/transact mode).
-        Sending all 10 symbols at once causes cache-cold timeouts and empty
-        feeds.  We split, call sequentially, then merge the feeds.
-
-        Merge rules:
-          • feeds      — union of all batches; later batches don't overwrite
-          • hermes_ok  — True if ANY batch returned True (at least one live)
-          • hlwe_sig   — first non-empty sig wins
-          • snapshot_id — SHA-256 of merged feed keys+prices for tamper-evidence
-          • fetch_time_ns — max across batches (most recent)
-          • source       — 'server_rpc_batched'
+        Resolve symbol → Pyth hex feed ID using the canonical alias pattern
+        Crypto.{SYM}/USD  via Hermes /v2/price_feeds?query=…
+        Result is cached at class level — only one HTTP call per symbol per process.
         """
-        if not hasattr(self, '_server_rpc'):
-            self._server_rpc = ServerRPCClient(
-                server_url=self.oracle_url or _ORACLE_BASE_URL)
+        if sym in QtclClientApp._HERMES_ID_CACHE:
+            return QtclClientApp._HERMES_ID_CACHE[sym]
+        alias = f"Crypto.{sym}/USD"
+        url   = (f"{self._HERMES_BASE}/v2/price_feeds"
+                 f"?query={_quote(alias)}&asset_type=crypto")
+        try:
+            req = Request(url, headers={"Accept": "application/json",
+                                         "User-Agent": "QTCL-Client/3.1"})
+            with urlopen(req, timeout=8) as r:
+                entries = _json.loads(r.read().decode())
+            if not isinstance(entries, list):
+                return None
+            for entry in entries:
+                attrs = entry.get("attributes", {})
+                if attrs.get("base", "").upper() == sym:
+                    fid = "0x" + entry.get("id", "").lstrip("0x")
+                    if len(fid) > 10:
+                        QtclClientApp._HERMES_ID_CACHE[sym] = fid
+                        return fid
+            if entries:
+                fid = "0x" + entries[0].get("id", "").lstrip("0x")
+                if len(fid) > 10:
+                    QtclClientApp._HERMES_ID_CACHE[sym] = fid
+                    return fid
+        except Exception as _e:
+            _EXP_LOG.debug(f"[HERMES-ID] {sym}: {_e}")
+        return None
 
+    def _fetch_pyth_snapshot(self, symbols: "Optional[list]" = None) -> "Optional[dict]":
+        """
+        Fetch Pyth prices DIRECTLY from hermes.pyth.network — server RPC bypassed.
+
+        Flow:
+          1. Map each symbol → Crypto.{SYM}/USD alias
+          2. Resolve alias → hex feed ID via /v2/price_feeds  (cached after first call)
+          3. ONE batched GET /v2/updates/price/latest?ids[]=id0&ids[]=id1…
+          4. Parse Pyth mantissa × 10^expo → price_usd, confidence, age_seconds
+          5. Compute canonical SHA-256 snapshot_id; HLWE-sign if wallet loaded
+
+        First refresh: O(N) ID lookups + 1 price call.
+        Every subsequent refresh: 1 price call only (IDs cached).
+        """
         _syms = symbols or ["BTC", "ETH", "SOL", "BNB", "AVAX",
                              "MATIC", "LINK", "ADA", "DOT", "ATOM"]
-        BATCH = 3
 
-        merged_feeds: dict   = {}
-        hermes_ok:    bool   = False
-        hlwe_sig:     str    = ""
-        fetch_ns:     int    = 0
-        any_ok:       bool   = False
+        # ── Step 1: resolve feed IDs ──────────────────────────────────────────
+        id_map: dict = {}
+        for sym in _syms:
+            fid = self._hermes_resolve_id(sym)
+            if fid:
+                id_map[sym] = fid
 
-        # ── Sequential batched fetch ──────────────────────────────────────────
-        for i in range(0, len(_syms), BATCH):
-            batch = _syms[i:i + BATCH]
-            try:
-                snap = self._server_rpc.get_pyth_prices(batch)
-            except Exception as _e:
-                _EXP_LOG.debug(f"[PYTH-BATCH] batch {batch} exception: {_e}")
-                snap = None
-
-            if not snap:
-                continue
-
-            any_ok = True
-            feeds  = snap.get("feeds") or {}
-            for sym, data in feeds.items():
-                if sym not in merged_feeds:          # first-write wins per sym
-                    merged_feeds[sym] = data
-
-            if snap.get("hermes_ok"):
-                hermes_ok = True
-            if not hlwe_sig and snap.get("hlwe_sig"):
-                hlwe_sig  = snap["hlwe_sig"]
-            ts = snap.get("fetch_time_ns", 0)
-            if ts > fetch_ns:
-                fetch_ns = ts
-
-        if not any_ok:
+        if not id_map:
             return None
 
-        # ── Canonical merged snapshot_id — SHA-256 of sorted price map ───────
-        price_map = {s: d.get("price_usd", 0) for s, d in sorted(merged_feeds.items())}
+        # ── Step 2: single batched Hermes price fetch ─────────────────────────
+        qs  = "&".join(f"ids[]={fid}" for fid in id_map.values())
+        url = f"{self._HERMES_BASE}/v2/updates/price/latest?{qs}&parsed=true"
+        try:
+            req = Request(url, headers={"Accept": "application/json",
+                                         "User-Agent": "QTCL-Client/3.1"})
+            with urlopen(req, timeout=12) as r:
+                data = _json.loads(r.read().decode())
+        except Exception as _e:
+            _EXP_LOG.debug(f"[HERMES-FETCH] {_e}")
+            return None
+
+        fetch_ns = int(_time.time() * 1e9)
+        now_ts   = int(_time.time())
+
+        # ── Step 3: parse parsed[] ────────────────────────────────────────────
+        rev = {fid.lower().lstrip("0x"): sym for sym, fid in id_map.items()}
+
+        def _pyth_float(mantissa, expo) -> float:
+            try:
+                return int(mantissa) * (10.0 ** int(expo))
+            except Exception:
+                return 0.0
+
+        merged_feeds: dict = {}
+        for entry in (data.get("parsed") or []):
+            raw_id = entry.get("id", "").lower().lstrip("0x")
+            sym    = rev.get(raw_id)
+            if not sym:
+                continue
+            p          = entry.get("price", {})
+            price_usd  = _pyth_float(p.get("price", 0), p.get("expo", 0))
+            confidence = _pyth_float(p.get("conf",  0), p.get("expo", 0))
+            pub_ts     = int(p.get("publish_time", 0) or now_ts)
+            age_secs   = max(0.0, float(now_ts - pub_ts))
+            merged_feeds[sym] = {
+                "price_usd":   price_usd,
+                "confidence":  confidence,
+                "age_seconds": age_secs,
+                "status":      "trading" if price_usd > 0 else "unknown",
+                "feed_id":     "0x" + raw_id,
+            }
+
+        if not merged_feeds:
+            return None
+
+        # ── Step 4: canonical snapshot_id + HLWE sig ──────────────────────────
+        price_map = {s: d["price_usd"] for s, d in sorted(merged_feeds.items())}
         snap_id   = _hashlib.sha256(
             _json.dumps(price_map, sort_keys=True).encode()
         ).hexdigest()
 
+        hlwe_sig = ""
+        try:
+            if hasattr(self, "wallet") and self.wallet.private_key:
+                hlwe_sig = _hashlib.sha3_256(
+                    (snap_id + self.wallet.private_key).encode()
+                ).hexdigest()
+        except Exception:
+            pass
+
         return {
             "feeds":         merged_feeds,
             "snapshot_id":   snap_id,
-            "fetch_time_ns": fetch_ns or int(_time.time() * 1e9),
-            "hermes_ok":     hermes_ok,
+            "fetch_time_ns": fetch_ns,
+            "hermes_ok":     True,
             "hlwe_sig":      hlwe_sig,
-            "source":        "server_rpc_batched",
+            "source":        "hermes_direct",
         }
 
     def _fmt_price(self, price: float, width: int = 12) -> str:
