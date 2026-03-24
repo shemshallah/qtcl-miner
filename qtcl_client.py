@@ -15978,6 +15978,30 @@ class QtclClientApp:
                                     check_same_thread=False, timeout=10)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        
+        # ── Schema migration: detect and upgrade old schemas ──────────────────
+        try:
+            cursor = self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+            existing_tables = {row[0] for row in cursor.fetchall()}
+            
+            # If p2p_peers exists, check if it has the new schema
+            if 'p2p_peers' in existing_tables:
+                cursor = self._db.execute("PRAGMA table_info(p2p_peers)")
+                cols = {row[1] for row in cursor.fetchall()}
+                # Old schema missing chain_height? Drop all app tables
+                if 'chain_height' not in cols:
+                    _EXP_LOG.info("[DB] Detected old schema — recreating tables")
+                    for table in ['dm_pool', 'consensus_dm_log', 'p2p_peers', 
+                                 'tensor_field_metrics', 'gossip_inventory', 'oracle_registry']:
+                        try:
+                            self._db.execute(f"DROP TABLE IF EXISTS {table}")
+                        except Exception: pass
+                    self._db.commit()
+        except Exception as _se:
+            _EXP_LOG.debug(f"[DB] Schema check skipped: {_se}")
+        
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS dm_pool (
                 id              INTEGER  PRIMARY KEY AUTOINCREMENT,
