@@ -19000,10 +19000,19 @@ class QtclClientApp:
         self._start_threads()
         pq_next = str(bh + 1)
         print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_next}  bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
-        
-        while True:
-            print("\n" + "━" * 62)
-            print("  💸  TRANSACTION MENU")
+
+        # ── Silence ALL background thread logs during interactive menu ────────
+        # SSE/P2P/Koyeb threads emit INFO continuously; NullHandler absorbs them
+        # without affecting log records — restores cleanly on break or exception.
+        _tx_root_log     = _logging.getLogger()
+        _tx_old_handlers = _tx_root_log.handlers[:]
+        _tx_old_level    = _tx_root_log.level
+        _tx_root_log.handlers = [_logging.NullHandler()]
+        _tx_root_log.setLevel(_logging.CRITICAL)
+        try:
+            while True:
+                print("\n" + "━" * 62)
+                print("  💸  TRANSACTION MENU")
             print("━" * 62)
             # ── Live Pyth prices ─────────────────────────────────────────────
             _pyth_prev_tx = getattr(self, "_pyth_prev_tx", {})
@@ -19030,6 +19039,10 @@ class QtclClientApp:
                       f"  ({self.wallet.address})")
             elif ch == "4":
                 break
+        finally:
+            # Restore logger handlers unconditionally — never leak a silent logger
+            _tx_root_log.handlers = _tx_old_handlers
+            _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
 
     def _send_tx_wizard(self) -> None:
@@ -19997,6 +20010,46 @@ class QtclClientApp:
             }
             
             return True
+
+        # ── Silence ALL background thread logs during market explorer ─────────
+        # Same NullHandler gate used by mine mode and transact mode — SSE/P2P
+        # threads emit INFO continuously; absorb them without dropping records.
+        # Restored unconditionally in finally whether we exit via q / Ctrl+C / exc.
+        _me_root_log     = _logging.getLogger()
+        _me_old_handlers = _me_root_log.handlers[:]
+        _me_old_level    = _me_root_log.level
+        _me_root_log.handlers = [_logging.NullHandler()]
+        _me_root_log.setLevel(_logging.CRITICAL)
+
+        try:
+            if mode == "a":
+                # ── Auto-refresh: fire once immediately, then wait interval ───
+                while not _stop_event.is_set():
+                    ok = _do_refresh()
+                    if not ok:
+                        print(f"\n  {self._T_YLW}⚠  Fetch failed — retrying in {auto_interval}s…{self._T_RST}")
+                    _stop_event.wait(auto_interval)
+            else:
+                # ── Manual refresh: Enter to refresh, q to quit ───────────────
+                while not _stop_event.is_set():
+                    ok = _do_refresh()
+                    if not ok:
+                        print(f"\n  {self._T_YLW}⚠  Fetch failed — press Enter to retry{self._T_RST}")
+                    try:
+                        inp = input(
+                            f"\n  {self._T_DIM}[Enter] refresh  │  [q] quit: {self._T_RST}"
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if inp == "q":
+                        break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _stop_event.set()
+            _me_root_log.handlers = _me_old_handlers
+            _me_root_log.setLevel(_me_old_level)
+            print(f"\n  {self._T_DIM}Market Explorer closed.{self._T_RST}\n")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
