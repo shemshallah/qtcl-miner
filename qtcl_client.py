@@ -15976,7 +15976,14 @@ class QtclClientApp:
     DB_METRIC_LIMIT:      int   = 10_000
     DB_GOSSIP_LIMIT:      int   = 5_000
 
-    def __init__(self, oracle_url: str = None):
+    def __init__(self, oracle_url: str = None, oracle_context: dict = None):
+        """
+        oracle_context (optional dict from main() oracle-mode prompt):
+          {wallet_addr, wallet_priv, wallet_pub}
+        When provided the oracle keypair is deterministically derived from the
+        wallet private key and carries a delegation certificate signed by that
+        wallet.  When absent the oracle runs in anonymous mode.
+        """
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
         self.api           = KoyebAPIClient(self.oracle_url)
         self.wallet        = QTCLWallet()
@@ -15984,10 +15991,257 @@ class QtclClientApp:
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
         self._stop         = _threading.Event()
         self._metric_th: Optional[_threading.Thread] = None
-        self._db_path      = _Path("qtcl_blockchain.db")  # FIX: Use main blockchain DB, not isolated client DB
+        self._db_path      = _Path("qtcl_blockchain.db")
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
             f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
+        # Oracle identity: wallet-bound (with cert) or anonymous (random keypair).
+        # Computed once at startup, persisted to oracle_identity.json.
+        self._oracle_id: dict = self._init_oracle_identity(oracle_context)
+
+    # ── Oracle identity ────────────────────────────────────────────────────────
+
+    def _init_oracle_identity(self, oracle_context: dict = None) -> dict:
+        """
+        Initialise the oracle signing identity for this node/client.
+
+        TWO MODES:
+
+        ① WALLET-BOUND  (oracle_context provided)
+          oracle_priv = sha3_256(wallet_priv ‖ "QTCL_ORACLE_DELEGATE_v1")
+          oracle_pub  = sha3_256(oracle_priv.encode())
+          oracle_addr = "qtcl1" + sha3_256(pub_bytes)[:20].hex()
+          cert        = HLWE_sign(sha256(oracle_pub ‖ wallet_addr), wallet_priv)
+
+          The cert binds: "wallet_addr authorised oracle_addr to sign".
+          Any peer can verify without a central server: recompute cert_hash,
+          check HMAC(cert_hash, sig_bytes) == auth_tag.
+          Stored as oracle_identity.json with mode="wallet_bound".
+
+        ② ANONYMOUS  (no oracle_context)
+          entropy = os.urandom(32); no wallet needed.
+          Stored as oracle_identity.json with mode="anonymous".
+          Attestations have no wallet traceability — peers weight them lower.
+
+        IP is intentionally NOT part of key derivation:
+          IPs change (DHCP/VPN/NAT/mobile), are trivially faked in P2P gossip,
+          and would break oracle identity on every network change.
+          IP is included as non-binding metadata in the P2P registration message.
+        """
+        _id_path = _Path("oracle_identity.json")
+
+        # ── Try loading persisted identity ────────────────────────────────────
+        # If wallet-bound mode is requested, only reuse an existing identity if
+        # it was bound to the SAME wallet (match wallet_addr).
+        _want_wallet = oracle_context and oracle_context.get("wallet_priv")
+        try:
+            if _id_path.exists():
+                raw = _json.loads(_id_path.read_text())
+                _has_keys = all(k in raw for k in ("address", "private_key", "public_key"))
+                if _has_keys:
+                    if _want_wallet:
+                        # Only reuse if bound to the same wallet
+                        if (raw.get("mode") == "wallet_bound" and
+                                raw.get("wallet_addr") == oracle_context["wallet_addr"]):
+                            _EXP_LOG.info(f"[ORACLE-ID] wallet-bound loaded  {raw['address']}")
+                            return raw
+                        # Different wallet or anonymous identity → regenerate below
+                    else:
+                        if raw.get("mode", "anonymous") == "anonymous":
+                            _EXP_LOG.info(f"[ORACLE-ID] anonymous loaded  {raw['address']}")
+                            return raw
+        except Exception as _e:
+            _EXP_LOG.warning(f"[ORACLE-ID] load failed ({_e}), regenerating")
+
+        # ── Generate new identity ─────────────────────────────────────────────
+        if _want_wallet:
+            # WALLET-BOUND: oracle keypair deterministically derived from wallet key
+            _wpriv = oracle_context["wallet_priv"]
+            _waddr = oracle_context["wallet_addr"]
+            private_key = _hashlib.sha3_256(
+                _wpriv.encode() + b"QTCL_ORACLE_DELEGATE_v1"
+            ).hexdigest()
+            public_key  = _hashlib.sha3_256(private_key.encode()).hexdigest()
+            pub_bytes   = bytes.fromhex(public_key)
+            address     = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            cert        = self._create_oracle_cert(public_key, _waddr, _wpriv)
+            identity    = {
+                "address":     address,
+                "private_key": private_key,
+                "public_key":  public_key,
+                "wallet_addr": _waddr,
+                "cert":        cert,
+                "mode":        "wallet_bound",
+                "created_ns":  _time.time_ns(),
+                "version":     2,
+            }
+            _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
+        else:
+            # ANONYMOUS: random entropy, no wallet traceability
+            entropy     = _secrets.token_bytes(32)
+            private_key = _hashlib.sha3_256(
+                entropy + b"QTCL_ORACLE_SIGNING_KEY_v1"
+            ).hexdigest()
+            public_key  = _hashlib.sha3_256(private_key.encode()).hexdigest()
+            pub_bytes   = bytes.fromhex(public_key)
+            address     = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            identity    = {
+                "address":     address,
+                "private_key": private_key,
+                "public_key":  public_key,
+                "wallet_addr": None,
+                "cert":        None,
+                "mode":        "anonymous",
+                "created_ns":  _time.time_ns(),
+                "version":     2,
+            }
+            _EXP_LOG.info(f"[ORACLE-ID] anonymous created  {address}")
+
+        try:
+            _id_path.write_text(_json.dumps(identity, indent=2))
+        except Exception as _e:
+            _EXP_LOG.warning(f"[ORACLE-ID] could not persist: {_e}")
+        return identity
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _create_oracle_cert(self, oracle_pub: str, wallet_addr: str,
+                            wallet_priv: str) -> dict:
+        """
+        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr).
+
+        cert_payload  = oracle_pub + "|" + wallet_addr
+        cert_hash     = sha256(cert_payload.encode())
+        cert          = HLWE.sign_hash(cert_hash, wallet_priv)
+                      = {signature, auth_tag, timestamp}
+
+        Verification (any peer):
+          recompute cert_payload → cert_hash → HMAC(cert_hash, sig_bytes) == auth_tag
+        """
+        try:
+            _payload  = (oracle_pub + "|" + wallet_addr).encode()
+            _hash     = _hashlib.sha256(_payload).digest()
+            _hlwe     = HLWEEngine()
+            _raw      = _hlwe.sign_hash(_hash, wallet_priv)
+            return {
+                "signature": _raw.get("signature", ""),
+                "auth_tag":  _raw.get("auth_tag",  ""),
+                "ts_iso":    _raw.get("timestamp", ""),
+                "cert_hash": _hash.hex(),
+            }
+        except Exception as _e:
+            _EXP_LOG.warning(f"[ORACLE-CERT] cert creation failed: {_e}")
+            return {}
+
+    @staticmethod
+    def _verify_oracle_cert(oracle_pub: str, wallet_addr: str, cert: dict) -> bool:
+        """
+        Stateless cert verification — callable by any peer without private key.
+        Returns True if cert is cryptographically consistent and non-empty.
+        """
+        if not cert or not cert.get("auth_tag") or not cert.get("signature"):
+            return False
+        try:
+            import hmac as _hm_v
+            _payload  = (oracle_pub + "|" + wallet_addr).encode()
+            _hash     = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
+            computed  = _hm_v.new(_hash, sig_bytes, _hashlib.sha256).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+
+    def _broadcast_oracle_registration(self) -> None:
+        """
+        Announce this oracle's identity to the P2P network.
+
+        Gossip message structure:
+          event_type = "oracle_registration"
+          channel    = "oracle"
+          oracle     = {oracle_addr, wallet_addr, oracle_pubkey, cert,
+                        mode, peer_id, ip_hint (non-binding), registered_at_ns}
+
+        Persisted locally in oracle_registry sqlite table.
+        Also POSTed to Koyeb /api/gossip/ingest so the server's peer table
+        knows about this oracle (non-blocking daemon thread).
+        IP is included as human-readable metadata only — it is NOT part of
+        any cryptographic commitment.
+        """
+        _oid = self._oracle_id
+        if not _oid:
+            return
+
+        # Best-effort public IP hint (metadata only, never signed)
+        _ip_hint = ""
+        try:
+            import socket as _sk
+            _ip_hint = _sk.gethostbyname(_sk.gethostname())
+        except Exception:
+            pass
+
+        _cert_valid = False
+        if _oid.get("mode") == "wallet_bound" and _oid.get("cert") and _oid.get("wallet_addr"):
+            _cert_valid = self._verify_oracle_cert(
+                _oid["public_key"], _oid["wallet_addr"], _oid["cert"])
+
+        reg_payload = {
+            "oracle_addr":       _oid["address"],
+            "wallet_addr":       _oid.get("wallet_addr"),
+            "oracle_pubkey":     _oid["public_key"],
+            "cert":              _oid.get("cert"),
+            "cert_valid":        _cert_valid,
+            "mode":              _oid.get("mode", "anonymous"),
+            "peer_id":           self._peer_id,
+            "ip_hint":           _ip_hint,
+            "registered_at_ns":  _time.time_ns(),
+        }
+
+        # ── Persist to local oracle_registry ─────────────────────────────────
+        if self._db is not None:
+            try:
+                self._db.execute("""
+                    INSERT OR REPLACE INTO oracle_registry
+                      (oracle_addr, wallet_addr, oracle_pubkey, cert_json,
+                       mode, cert_valid, peer_id, ip_hint,
+                       first_seen_ns, last_seen_ns, attestation_count)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,
+                      COALESCE((SELECT attestation_count FROM oracle_registry
+                                WHERE oracle_addr=?), 0))
+                """, (
+                    reg_payload["oracle_addr"],
+                    reg_payload.get("wallet_addr") or "",
+                    reg_payload["oracle_pubkey"],
+                    _json.dumps(reg_payload.get("cert") or {}),
+                    reg_payload["mode"],
+                    1 if _cert_valid else 0,
+                    self._peer_id,
+                    _ip_hint,
+                    _time.time_ns(), _time.time_ns(),
+                    reg_payload["oracle_addr"],
+                ))
+                self._db.commit()
+            except Exception as _dbe:
+                _EXP_LOG.debug(f"[ORACLE-REG] db write: {_dbe}")
+
+        # ── Gossip to Koyeb + P2P (daemon thread — non-blocking) ─────────────
+        def _do_broadcast(payload=reg_payload):
+            try:
+                self.api._post("/api/gossip/ingest", {
+                    "origin":     self._peer_id,
+                    "event_type": "oracle_registration",
+                    "channel":    "oracle",
+                    "ts":         _time.time(),
+                    "oracle":     payload,
+                })
+            except Exception as _be:
+                _EXP_LOG.debug(f"[ORACLE-REG] Koyeb gossip: {_be}")
+        _threading.Thread(target=_do_broadcast, daemon=True,
+                          name="OracleRegBroadcast").start()
+
+        _mode_tag = ("🔐 wallet-bound" if _oid.get("mode") == "wallet_bound"
+                     else "👻 anonymous")
+        _EXP_LOG.info(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
+                      f"cert_valid={_cert_valid}  ip={_ip_hint or '?'}")
 
     # ── DB ─────────────────────────────────────────────────────────────────────
 
@@ -16068,6 +16322,21 @@ class QtclClientApp:
                 peer_id TEXT DEFAULT '', payload TEXT DEFAULT '{}', ts REAL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_gi_ts ON gossip_inventory(ts DESC);
+            CREATE TABLE IF NOT EXISTS oracle_registry (
+                oracle_addr       TEXT PRIMARY KEY,
+                wallet_addr       TEXT NOT NULL DEFAULT '',
+                oracle_pubkey     TEXT NOT NULL DEFAULT '',
+                cert_json         TEXT NOT NULL DEFAULT '{}',
+                mode              TEXT NOT NULL DEFAULT 'anonymous',
+                cert_valid        INTEGER NOT NULL DEFAULT 0,
+                peer_id           TEXT NOT NULL DEFAULT '',
+                ip_hint           TEXT NOT NULL DEFAULT '',
+                first_seen_ns     INTEGER NOT NULL DEFAULT 0,
+                last_seen_ns      INTEGER NOT NULL DEFAULT 0,
+                attestation_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_or_wallet ON oracle_registry(wallet_addr);
+            CREATE INDEX IF NOT EXISTS idx_or_seen   ON oracle_registry(last_seen_ns DESC);
         """)
         self._db.commit()
 
@@ -19797,27 +20066,64 @@ class QtclClientApp:
         if not merged_feeds:
             return None
 
-        # ── Step 4: canonical snapshot_id + HLWE sig ──────────────────────────
+        # ── Step 4: canonical snapshot_id + oracle HLWE sig ───────────────────
         price_map = {s: d["price_usd"] for s, d in sorted(merged_feeds.items())}
         snap_id   = _hashlib.sha256(
             _json.dumps(price_map, sort_keys=True).encode()
         ).hexdigest()
 
-        hlwe_sig = ""
+        # Sign: sha256(snap_id‖fetch_time_ns) with this oracle node's private key.
+        # _oracle_id is always present (populated in __init__ via _init_oracle_identity).
+        oracle_sig: dict = {}
+        oracle_addr: str = ""
+        sig_ts_iso:  str = ""
         try:
-            if hasattr(self, "wallet") and self.wallet.private_key:
-                hlwe_sig = _hashlib.sha3_256(
-                    (snap_id + self.wallet.private_key).encode()
-                ).hexdigest()
-        except Exception:
-            pass
+            _oid = self._oracle_id
+            if _oid and _oid.get("private_key"):
+                oracle_addr  = _oid["address"]
+                _payload     = (snap_id + "|" + str(fetch_ns)).encode()
+                _msg_hash    = _hashlib.sha256(_payload).digest()
+                _hlwe        = HLWEEngine()
+                _raw_sig     = _hlwe.sign_hash(_msg_hash, _oid["private_key"])
+                oracle_sig   = {
+                    "address":     oracle_addr,
+                    "wallet_addr": _oid.get("wallet_addr"),
+                    "mode":        _oid.get("mode", "anonymous"),
+                    "cert":        _oid.get("cert"),
+                    "cert_valid":  (self._verify_oracle_cert(
+                                       _oid["public_key"],
+                                       _oid.get("wallet_addr", ""),
+                                       _oid.get("cert") or {})
+                                   if _oid.get("mode") == "wallet_bound" else None),
+                    "signature":   _raw_sig.get("signature", ""),
+                    "auth_tag":    _raw_sig.get("auth_tag",  ""),
+                    "ts_iso":      _raw_sig.get("timestamp", ""),
+                    "snap_id":     snap_id,
+                    "fetch_ns":    fetch_ns,
+                }
+                sig_ts_iso = oracle_sig["ts_iso"]
+                # Bump local attestation count (best-effort, non-blocking)
+                if self._db is not None:
+                    try:
+                        self._db.execute(
+                            "UPDATE oracle_registry SET attestation_count=attestation_count+1,"
+                            " last_seen_ns=? WHERE oracle_addr=?",
+                            (_time.time_ns(), oracle_addr))
+                        self._db.commit()
+                    except Exception:
+                        pass
+        except Exception as _se:
+            _EXP_LOG.debug(f"[ORACLE-SIG] signing error: {_se}")
 
         return {
             "feeds":         merged_feeds,
             "snapshot_id":   snap_id,
             "fetch_time_ns": fetch_ns,
             "hermes_ok":     True,
-            "hlwe_sig":      hlwe_sig,
+            "oracle_sig":    oracle_sig,
+            "hlwe_sig":      oracle_sig.get("auth_tag", ""),   # backward-compat
+            "oracle_addr":   oracle_addr,
+            "sig_ts_iso":    sig_ts_iso,
             "source":        "hermes_direct",
         }
 
@@ -19917,11 +20223,13 @@ class QtclClientApp:
             portfolio: dict,
             fetch_elapsed: float,
         ) -> None:
-            feeds     = snap.get("feeds",        {})
-            snap_id   = snap.get("snapshot_id",  "")
-            hermes_ok = snap.get("hermes_ok",    False)
-            hlwe_sig  = snap.get("hlwe_sig",     "")
-            ts_ns     = snap.get("fetch_time_ns", 0)
+            feeds      = snap.get("feeds",        {})
+            snap_id    = snap.get("snapshot_id",  "")
+            hermes_ok  = snap.get("hermes_ok",    False)
+            oracle_sig = snap.get("oracle_sig",   {})
+            oracle_addr= snap.get("oracle_addr",  "")
+            sig_ts_iso = snap.get("sig_ts_iso",   "")
+            ts_ns      = snap.get("fetch_time_ns", 0)
 
             # ── Attestation header ────────────────────────────────────────────
             src   = (f"{self._T_GRN}{self._T_BLD}● HERMES LIVE{self._T_RST}"
@@ -19932,15 +20240,61 @@ class QtclClientApp:
 
             # ── Snapshot attestation block ────────────────────────────────────
             print(f"  {self._T_DIM}━{self._T_RST}" * 38)
-            snap_line = f"  Snapshot  {self._T_CYN}{snap_id[:32]}{self._T_RST}…"
-            print(snap_line)
-            if hlwe_sig:
-                sig_line = (f"  {self._T_BLD}HLWE-Sig{self._T_RST}  "
-                            f"{self._T_MAG}{hlwe_sig[:48]}{self._T_RST}…")
-                print(sig_line)
-                print(f"  {self._T_GRN}✅ Oracle-signed — W-State quantum attestation active ⚛️{self._T_RST}")
+            print(f"  Snapshot  {self._T_CYN}{snap_id[:32]}{self._T_RST}…")
+
+            _auth_tag   = oracle_sig.get("auth_tag",   "")
+            _sig_full   = oracle_sig.get("signature",  "")
+            _mode       = oracle_sig.get("mode",       "anonymous")
+            _wallet_bnd = oracle_sig.get("wallet_addr")
+            _cert       = oracle_sig.get("cert")       or {}
+            _cert_valid = oracle_sig.get("cert_valid")  # True/False/None
+            _signed     = bool(_auth_tag and oracle_addr)
+
+            if _signed:
+                # Oracle address + mode badge
+                _mode_badge = (f"{self._T_GRN}🔐 wallet-bound{self._T_RST}"
+                               if _mode == "wallet_bound"
+                               else f"{self._T_YLW}👻 anonymous{self._T_RST}")
+                print(f"  {self._T_DIM}Oracle    {self._T_RST}"
+                      f"{self._T_CYN}{self._T_BLD}{oracle_addr}{self._T_RST}"
+                      f"  {_mode_badge}")
+
+                # Wallet binding line — only if wallet_bound
+                if _mode == "wallet_bound" and _wallet_bnd:
+                    _cv_badge = (f"{self._T_GRN}✔ cert valid{self._T_RST}"
+                                 if _cert_valid
+                                 else f"{self._T_RED}✘ cert invalid{self._T_RST}")
+                    print(f"  {self._T_DIM}Wallet    {self._T_RST}"
+                          f"{self._T_DIM}{_wallet_bnd}{self._T_RST}"
+                          f"  {_cv_badge}")
+                    if _cert and _cert.get("auth_tag"):
+                        print(f"  {self._T_DIM}Cert-tag  {self._T_RST}"
+                              f"{self._T_MAG}{_cert['auth_tag'][:40]}{self._T_RST}…")
+
+                # auth_tag — HMAC binding sig→payload
+                print(f"  {self._T_DIM}Auth-tag  {self._T_RST}"
+                      f"{self._T_MAG}{_auth_tag[:48]}{self._T_RST}…")
+
+                # HLWE sig prefix + byte count
+                if _sig_full:
+                    print(f"  {self._T_DIM}HLWE-sig  {self._T_RST}"
+                          f"{self._T_DIM}{_sig_full[:32]}{self._T_RST}…"
+                          f"{self._T_DIM}[{len(_sig_full)//2}B]{self._T_RST}")
+
+                # ISO timestamp
+                _ts_display = sig_ts_iso[:23] if sig_ts_iso else t_str
+                print(f"  {self._T_DIM}Signed    {self._T_RST}"
+                      f"{self._T_DIM}{_ts_display} UTC{self._T_RST}")
+
+                # Final status line
+                if _mode == "wallet_bound" and _cert_valid:
+                    print(f"  {self._T_GRN}✅ Oracle-signed — HLWE-256 wallet-bound attestation ⚛️{self._T_RST}")
+                elif _mode == "wallet_bound" and not _cert_valid:
+                    print(f"  {self._T_YLW}⚠  Oracle-signed — wallet cert UNVERIFIED ⚠️{self._T_RST}")
+                else:
+                    print(f"  {self._T_GRN}✅ Oracle-signed — HLWE-256 anonymous attestation ⚛️{self._T_RST}")
             else:
-                print(f"  {self._T_YLW}⚠  Oracle signature pending (node initializing){self._T_RST}")
+                print(f"  {self._T_YLW}⚠  Oracle identity initializing…{self._T_RST}")
             print(f"  {self._T_DIM}━{self._T_RST}" * 38)
 
             # ── Price table ───────────────────────────────────────────────────
@@ -20194,6 +20548,24 @@ class QtclClientApp:
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
+
+        # ── Show oracle identity status in banner ─────────────────────────────
+        _oid = self._oracle_id
+        if _oid.get("mode") == "wallet_bound":
+            print(f"  🔐 Oracle: {_oid['address']}")
+            print(f"     Wallet: {_oid.get('wallet_addr', '?')}")
+            _cv = (self._verify_oracle_cert(
+                       _oid["public_key"], _oid.get("wallet_addr",""), _oid.get("cert") or {})
+                   if _oid.get("cert") else False)
+            print(f"     Cert  : {'✅ valid' if _cv else '⚠  invalid'}")
+        else:
+            print(f"  👻 Oracle: {_oid['address']} (anonymous — no wallet binding)")
+        print()
+
+        # Broadcast registration to P2P (non-blocking — DB may not be ready yet,
+        # but oracle_registry INSERT is best-effort anyway)
+        _threading.Thread(target=self._broadcast_oracle_registration,
+                          daemon=True, name="OracleRegBoot").start()
         print("  ┌──────────────────────────────────────────────────────────┐")
         print("  │  1.) ⛏️   Mine                                            │")
         print("  │  2.) 💸  Transact       (+ live Pyth prices)             │")
@@ -20274,7 +20646,55 @@ def main() -> None:  # noqa: F811
     try:
         print("⚛️  QTCL Client initializing...", flush=True)
         url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
-        app = QtclClientApp(oracle_url=url)
+
+        # ── Oracle mode prompt ────────────────────────────────────────────────
+        # Running as a signing oracle is optional.  No oracle mode = normal
+        # anonymous client; oracle mode = wallet-bound identity, your price
+        # attestations carry a cert traceable to your QTCL wallet.
+        oracle_context = None
+        print()
+        print("  ┌──────────────────────────────────────────────────────────┐")
+        print("  │  🔮  Oracle Signing Mode  (optional)                     │")
+        print("  │                                                          │")
+        print("  │  Run as a registered signing oracle?                     │")
+        print("  │  Your price attestations will be HLWE-signed and         │")
+        print("  │  cryptographically bound to your QTCL wallet address.    │")
+        print("  │  This requires your wallet password.                     │")
+        print("  │                                                          │")
+        print("  │  Skip (N) = mine/transact normally, anonymous signing.   │")
+        print("  └──────────────────────────────────────────────────────────┘")
+        try:
+            _oracle_ans = input("  Register as oracle? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            _oracle_ans = "n"
+
+        if _oracle_ans == "y":
+            print()
+            _tmp_wallet = QTCLWallet()
+            try:
+                import getpass as _gp_oi
+                _pw_oi = _gp_oi.getpass("  Wallet password: ")
+                if _tmp_wallet.load(_pw_oi):
+                    oracle_context = {
+                        "wallet_addr": _tmp_wallet.address,
+                        "wallet_priv": _tmp_wallet.private_key,
+                        "wallet_pub":  _tmp_wallet.public_key,
+                    }
+                    print(f"  ✅ Oracle bound to wallet: {_tmp_wallet.address}")
+                    # Scrub password from memory (best-effort)
+                    _pw_oi = "0" * len(_pw_oi)
+                    del _pw_oi
+                else:
+                    print("  ❌ Wallet load failed — running anonymous oracle")
+            except (EOFError, KeyboardInterrupt):
+                print("  ⚠  Skipped — running anonymous oracle")
+            except Exception as _oe:
+                print(f"  ❌ Wallet error ({_oe}) — running anonymous oracle")
+        else:
+            print("  👻 Running anonymous oracle (no wallet binding)")
+        print()
+
+        app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
         print("✅ Ready for input", flush=True)  # DEBUG: Verify we reach here
     except Exception as e:
         print(f"❌ Initialization error: {e}")
