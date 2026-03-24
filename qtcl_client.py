@@ -29,7 +29,7 @@ from __future__ import annotations
 
 # Suppress noisy background thread loggers BEFORE importing anything else
 import logging as _suppress_logging
-for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore']:
+for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
 
@@ -20143,11 +20143,6 @@ def main() -> None:  # noqa: F811
     # No client RPC server needed - use server RPC
     # Delegating to server RPC
     # Delegating to server RPC - no local RPC needed, flush=True)
-
-    # Suppress noisy background loggers
-    import logging as _suppress_bg
-    for _bg_logger in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'ORACLE-REG', 'ORACLE_REG', 'P2P.Gossip', 'HTTP']:
-        _suppress_bg.getLogger(_bg_logger).setLevel(_suppress_bg.ERROR)
 
     import argparse as _ap
     p = _ap.ArgumentParser(description="QTCL Client — W-State Entangled Blockchain")
