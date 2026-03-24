@@ -19009,10 +19009,9 @@ class QtclClientApp:
         _tx_old_level    = _tx_root_log.level
         _tx_root_log.handlers = [_logging.NullHandler()]
         _tx_root_log.setLevel(_logging.CRITICAL)
-        try:
-            while True:
-                print("\n" + "━" * 62)
-                print("  💸  TRANSACTION MENU")
+        while True:
+            print("\n" + "━" * 62)
+            print("  💸  TRANSACTION MENU")
             print("━" * 62)
             # ── Live Pyth prices ─────────────────────────────────────────────
             _pyth_prev_tx = getattr(self, "_pyth_prev_tx", {})
@@ -19039,10 +19038,9 @@ class QtclClientApp:
                       f"  ({self.wallet.address})")
             elif ch == "4":
                 break
-        finally:
-            # Restore logger handlers unconditionally — never leak a silent logger
-            _tx_root_log.handlers = _tx_old_handlers
-            _tx_root_log.setLevel(_tx_old_level)
+        # Restore logger handlers — NullHandler gate lifted after menu exits
+        _tx_root_log.handlers = _tx_old_handlers
+        _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
 
     def _send_tx_wizard(self) -> None:
