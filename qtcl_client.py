@@ -19700,7 +19700,7 @@ class QtclClientApp:
             return QtclClientApp._HERMES_ID_CACHE[sym]
         alias = f"Crypto.{sym}/USD"
         url   = (f"{self._HERMES_BASE}/v2/price_feeds"
-                 f"?query={_quote(alias)}&asset_type=crypto")
+                 f"?query={quote(alias)}&asset_type=crypto")
         try:
             req = Request(url, headers={"Accept": "application/json",
                                          "User-Agent": "QTCL-Client/3.1"})
