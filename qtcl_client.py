@@ -1665,6 +1665,11 @@ class LocalOracleEngine:
         """Set the RPC API client for polling (KoyebAPIClient instance)."""
         self._rpc_client = client
         _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC client configured — polling will commence")
+    
+    def get_oracle_state(self) -> dict:
+        """⚛️  Public accessor for oracle state (measurements + metrics)."""
+        with self._oracle_state_lock:
+            return dict(self._oracle_state)
     def start(self) -> None:
         """Start RPC poll thread for oracle snapshots.
         Idempotent: safe to call again after a deferred-start at import time.
