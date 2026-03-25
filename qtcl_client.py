@@ -17398,7 +17398,13 @@ class QtclClientApp:
                 
                 try:
                     bal = self.api.get_balance(self.wallet.address)
-                    bal_str = f"{bal:.8f} QTCL"
+                    # ── CRITICAL: bal can be None if blockchain not synced ──────────────
+                    if bal is None:
+                        bal_str = "⏳ Blockchain syncing..."
+                    elif isinstance(bal, (int, float)):
+                        bal_str = f"{float(bal):.8f} QTCL"
+                    else:
+                        bal_str = f"❌ Invalid balance type: {type(bal).__name__}"
                 except _CacheExpired as e:
                     # Snapshot cache is stale (RPC may be slow)
                     bal_str = f"⚠️  Snapshot stale ({e.age:.1f}s old, TTL={e.ttl}s)"
