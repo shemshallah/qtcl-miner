@@ -13566,6 +13566,78 @@ class ServerRPCClient:
             logger.debug(f"[RPC] Gossip cache query failed: {e}")
             return None
     
+    def submit_block_broadcast(self, block_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Submit mined block via RPC with P2P broadcast.
+        
+        Calls qtcl_submitBlock on server, logs response to gossip_store for peers.
+        Block payload must include: {header: {height, nonce, miner_address, ...}, transactions: [...]}
+        
+        Returns: {status: 'accepted', block_hash: ..., height: ..., miner: ..., timestamp: ...}
+        """
+        try:
+            logger.info(f"[RPC] Broadcasting block height={block_payload.get('header', {}).get('height')}")
+            resp = self.call("qtcl_submitBlock", [block_payload])
+            
+            if 'error' not in resp:
+                logger.info(f"[RPC] Block broadcast success: {resp.get('result', {}).get('block_hash')}")
+                # Response already logged to gossip_store by _log_rpc_response
+            else:
+                logger.warning(f"[RPC] Block submission error: {resp.get('error')}")
+            
+            return resp.get('result')
+        except Exception as e:
+            logger.error(f"[RPC] Block broadcast failed: {e}")
+            return None
+    
+    def submit_transaction_broadcast(self, tx_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Submit transaction via RPC with P2P broadcast.
+        
+        Calls qtcl_submitTransaction on server, logs response to gossip_store for peers.
+        TX payload must include: {from, to, amount, fee, ...}
+        
+        Returns: {status: 'accepted', tx_hash: ..., from: ..., to: ..., amount: ..., timestamp: ...}
+        """
+        try:
+            logger.info(f"[RPC] Broadcasting transaction {tx_payload.get('from')}->{tx_payload.get('to')}")
+            resp = self.call("qtcl_submitTransaction", [tx_payload])
+            
+            if 'error' not in resp:
+                logger.info(f"[RPC] TX broadcast success: {resp.get('result', {}).get('tx_hash')}")
+                # Response already logged to gossip_store by _log_rpc_response
+            else:
+                logger.warning(f"[RPC] TX submission error: {resp.get('error')}")
+            
+            return resp.get('result')
+        except Exception as e:
+            logger.error(f"[RPC] TX broadcast failed: {e}")
+            return None
+    
+    def register_oracle_broadcast(self, oracle_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Register oracle via RPC with P2P broadcast.
+        
+        Calls qtcl_registerOracle on server, logs response to gossip_store for peers.
+        Oracle payload must include: {oracle_addr, wallet_address, oracle_pub_key, ...}
+        
+        Returns: {status: 'registered', oracle_addr: ..., oracle_id: ..., timestamp: ...}
+        """
+        try:
+            logger.info(f"[RPC] Broadcasting oracle registration {oracle_payload.get('oracle_addr')}")
+            resp = self.call("qtcl_registerOracle", [oracle_payload])
+            
+            if 'error' not in resp:
+                logger.info(f"[RPC] Oracle registration success: {resp.get('result', {}).get('oracle_id')}")
+                # Response already logged to gossip_store by _log_rpc_response
+            else:
+                logger.warning(f"[RPC] Oracle registration error: {resp.get('error')}")
+            
+            return resp.get('result')
+        except Exception as e:
+            logger.error(f"[RPC] Oracle registration failed: {e}")
+            return None
+    
     def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch Pyth price snapshot from server.
