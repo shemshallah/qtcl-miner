@@ -14852,13 +14852,6 @@ class QtclClientApp:
                 else:
                     self._stop.wait(0.5)
                     
-            except Exception as _e:
-                _EXP_LOG.debug(f"[EVENTS-RPC] Fatal: {_e}")
-                self._stop.wait(2)
-                        _EXP_LOG.debug(f"[EVENTS-RPC] GET error ({_re}), retrying...")
-                
-                self._stop.wait(0.35)
-                
             except (_KE, OSError, TimeoutError) as _e:
                 _fail_count += 1
                 wait = min(1.0 + _fail_count * 0.15, 5.0)
