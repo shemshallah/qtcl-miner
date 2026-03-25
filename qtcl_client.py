@@ -11212,11 +11212,17 @@ def _compile_c_layer() -> None:
     _log = _logging.getLogger("qtcl.accel")
     try:
         import cffi as _cffi_mod
+        import platform as _plat
         _accel_ffi = _cffi_mod.FFI()
         _accel_ffi.cdef(_QTCL_C_DEFS)
         _TERMUX = '/data/data/com.termux/files/usr'
         _inc = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
+        
+        # Detect aarch64 (Android/Termux) and avoid -march=native
+        _is_aarch64 = _plat.machine() in ('aarch64', 'arm64')
+        _march_flag = ['-mcpu=cortex-a53'] if _is_aarch64 else ['-march=native']
+        
         _accel_lib = _accel_ffi.verify(
             _QTCL_C_SRC,
             libraries=(['ssl', 'crypto', 'sqlite3']
@@ -11226,7 +11232,7 @@ def _compile_c_layer() -> None:
                            __import__('os').path.exists('/usr/lib/libsqlite3.so')
                         else ['ssl', 'crypto']),
             extra_compile_args=[
-                '-O3', '-march=native', '-ffast-math', '-funroll-loops',
+                '-O3'] + _march_flag + ['-ffast-math', '-funroll-loops',
                 '-DOPENSSL_NO_DEPRECATED',
                 '-Wno-unused-function', '-Wno-unused-variable',
                 '-Wno-unreachable-code',   # CFFI check stubs are intentionally dead
@@ -11240,7 +11246,7 @@ def _compile_c_layer() -> None:
         _log.info(
             "⚡ QTCL C acceleration active  "
             "(§PoW §Lattice §HLWE §BIP §Metrics §GKSL §Merkle §DHT §Entropy "
-            "§Hyper §Meas §Cons §SSE §P2P)"
+            "§Hyper §Meas §Cons §RPC §P2P)"
         )
     except Exception as _e:
         _accel_ok = False
