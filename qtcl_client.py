@@ -110,7 +110,25 @@ P2P_HARDCODED_SEEDS = {
 ENTROPY_LOCK        = threading.Lock()
 SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 
-_accel_ok:  bool = False  # Pure Python mode only
+_accel_ok:bool=False
+_C_LIB=None
+
+try:
+    import ctypes
+    import platform
+    _arch=platform.machine()
+    _os=sys.platform
+    if 'android' not in _os.lower() and 'arm' not in _arch.lower():
+        try:
+            _C_LIB=ctypes.CDLL('./qtcl_accel.so')
+            _accel_ok=True
+            logger.info("[ACCEL] ✅ C acceleration library loaded")
+        except (OSError,ctypes.CDLL.LoadError,Exception):
+            logger.debug("[ACCEL] C library not available, pure Python mode")
+    else:
+        logger.warning("[ACCEL] ARM/Android detected — C compilation unavailable")
+except Exception as e:
+    logger.debug(f"[ACCEL] Init failed: {e} — pure Python mode")
 
 
 
@@ -260,7 +278,7 @@ class HyperbolicEntropyPool:
                     for i, x in enumerate((s + b'\x00' * 32)[:32]): buf[i] = x
                     return buf
                 out = _accel_ffi.new('uint8_t[32]')
-                _accel_lib.qtcl_xor3_pool(_cb(s1), _cb(s2), _cb(s3), out)
+                            pass  # C acceleration unavailable
                 return bytes(out)
             except Exception as e:
                 logger.debug(f"[HypEnt] C xor3: {e}")
@@ -282,7 +300,7 @@ class HyperbolicEntropyPool:
                 sb = _accel_ffi.new('uint8_t[32]')
                 ob = _accel_ffi.new('uint8_t[32]')
                 for i, b in enumerate(seed): sb[i] = b
-                _accel_lib.qtcl_hyp_entropy_mul(sb, depth, ob)
+                            pass  # C acceleration unavailable
                 return bytes(ob)
             except Exception as e:
                 logger.debug(f"[HypEnt] C hyp_mix: {e}")
@@ -633,7 +651,7 @@ class LatticeMath:
             _u = _accel_ffi.new('uint32_t[]', u)
             _v = _accel_ffi.new('uint32_t[]', v)
             _o = _accel_vec_buf(n)
-            _accel_lib.qtcl_vec_add_mod(_u, _v, _o, n, q)
+                            pass  # C acceleration unavailable
             return list(_o)
         return [(u[i] + v[i]) % q for i in range(n)]
 
@@ -647,7 +665,7 @@ class LatticeMath:
             _u = _accel_ffi.new('uint32_t[]', u)
             _v = _accel_ffi.new('uint32_t[]', v)
             _o = _accel_vec_buf(n)
-            _accel_lib.qtcl_vec_sub_mod(_u, _v, _o, n, q)
+                            pass  # C acceleration unavailable
             return list(_o)
         return [(u[i] - v[i]) % q for i in range(n)]
 
@@ -669,7 +687,7 @@ class LatticeMath:
                                 [A[i][j] for i in range(n) for j in range(m)])
             _v = _accel_ffi.new(f'uint32_t[{m}]', v)
             _o = _accel_vec_buf(n)
-            _accel_lib.qtcl_matvec_mod(_A, _v, _o, n, q)
+                            pass  # C acceleration unavailable
             return list(_o)
         result = []
         for i in range(n):
@@ -687,7 +705,7 @@ class LatticeMath:
             seed = data[:32].ljust(32, b'\x00')
             _seed = _accel_ffi.new('uint8_t[32]', seed)
             _out  = _accel_vec_buf(n)
-            _accel_lib.qtcl_hash_to_vec(_seed, _out, n, q)
+                            pass  # C acceleration unavailable
             return list(_out)
         vector, offset = [], 0
         while len(vector) < n:
@@ -747,7 +765,7 @@ class HLWEEngine:
             seed = entropy[:32].ljust(32, b'\x00')
             _e   = _accel_ffi.new('uint8_t[32]', seed)
             _A   = _accel_vec_buf(n * n)
-            _accel_lib.qtcl_derive_basis(_e, _A, n, q)
+                            pass  # C acceleration unavailable
             return [[int(_A[i * n + j]) for j in range(n)] for i in range(n)]
         A = []
         for i in range(n):
@@ -769,7 +787,7 @@ class HLWEEngine:
             seed = entropy[:32].ljust(32, b'\x00')
             _e = _accel_ffi.new('uint8_t[32]', seed)
             _s = _accel_vec_buf(dimension)
-            _accel_lib.qtcl_derive_secret(_e, _s, dimension, q)
+                            pass  # C acceleration unavailable
             return list(_s)
         s = []
         for i in range(dimension):
@@ -796,7 +814,7 @@ class HLWEEngine:
             n = len(public_key)
             _pk  = _accel_ffi.new(f'uint32_t[{n}]', public_key)
             _addr = _accel_char_buf(33)
-            _accel_lib.qtcl_derive_address(_pk, n, _addr)
+                            pass  # C acceleration unavailable
             return _accel_ffi.string(_addr).decode('ascii')
         pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
         return hashlib.sha256(pub_bytes).digest()[:16].hex()
@@ -817,7 +835,7 @@ class HLWEEngine:
                     _pk   = _accel_ffi.new('char[]', private_key_hex.encode('ascii') + b'\x00')
                     _sig  = _accel_bytes_buf(256)
                     _tag  = _accel_char_buf(65)
-                    _accel_lib.qtcl_hlwe_sign(_mh, _pk, self.params.MODULUS, _sig, _tag)
+                            pass  # C acceleration unavailable
                     return {
                         'signature': bytes(_sig).hex(),
                         'auth_tag':  _accel_ffi.string(_tag).decode('ascii'),
@@ -859,7 +877,7 @@ class HLWEEngine:
                     _mh  = _accel_ffi.new('uint8_t[32]', msg32)
                     _sig = _accel_ffi.new('uint8_t[256]', sig_bytes[:256])
                     _tag = _accel_ffi.new('char[]', expected_tag.encode('ascii') + b'\x00')
-                    return bool(_accel_lib.qtcl_hlwe_verify(_mh, _sig, _tag))
+                            pass  # C acceleration unavailable
                 sig_bytes = bytes.fromhex(sig_hex)
                 computed = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
                 return hmac.compare_digest(computed, expected_tag)
@@ -902,7 +920,7 @@ class BIP32KeyDerivation:
                 _k   = _accel_ffi.new(f'uint8_t[{len(key_bytes)}]', key_bytes)
                 _s   = _accel_ffi.new(f'uint8_t[{len(seed)}]', seed)
                 _out = _accel_bytes_buf(64)
-                _accel_lib.qtcl_hmac_sha512(_k, len(key_bytes), _s, len(seed), _out)
+                            pass  # C acceleration unavailable
                 raw = bytes(_out)
             else:
                 raw = hmac.new(self.params.HMAC_KEY, seed, hashlib.sha512).digest()
@@ -927,7 +945,7 @@ class BIP32KeyDerivation:
                 _cc = _accel_ffi.new('uint8_t[32]', parent_chain_code[:32].ljust(32, b'\x00'))
                 _ck = _accel_bytes_buf(32)
                 _nc = _accel_bytes_buf(32)
-                _accel_lib.qtcl_bip32_child_key(_pk, _cc, path_component, hardened, _ck, _nc)
+                            pass  # C acceleration unavailable
                 return bytes(_ck), bytes(_nc)
             if path_component >= 2**31:
                 data = b'\x00' + parent_key + path_component.to_bytes(4, 'big')
@@ -1018,7 +1036,7 @@ class BIP39Mnemonics:
                 _mn  = _accel_ffi.new('char[]', mnemonic.encode('utf-8') + b'\x00')
                 _pp  = _accel_ffi.new('char[]', passphrase.encode('utf-8') + b'\x00')
                 _out = _accel_bytes_buf(64)
-                _accel_lib.qtcl_bip39_mnemonic_to_seed(_mn, _pp, _out)
+                            pass  # C acceleration unavailable
                 seed = bytes(_out)
             else:
                 password = mnemonic.encode('utf-8')
@@ -1685,7 +1703,7 @@ class HyperbolicTriangle:
             dcl = _accel_ffi.new('double *')
             d0l = _accel_ffi.new('double *')
             area = _accel_ffi.new('double *')
-            _accel_lib.qtcl_compute_hyp_triangle(
+                            pass  # C acceleration unavailable
                 pq0, pq_curr, pq_last,
                 d0c, dcl, d0l, area, b0, bc, bl)
             return cls(
@@ -1853,7 +1871,7 @@ class LocalOracleEngine:
 
         deadline = _bt.time() + 20.0
         while _bt.time() < deadline:
-            if _accel_ok and _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
+                            pass  # C acceleration unavailable
                 break
             _bt.sleep(0.25)
         else:
@@ -1884,7 +1902,7 @@ class LocalOracleEngine:
                 port = int(p.get('port') or 9091)
                 if host and _accel_ok:
                     try:
-                        rc = int(_accel_lib.qtcl_p2p_connect(
+                            pass  # C acceleration unavailable
                             host.encode() + b'\x00', port))
                         if rc >= 0: connected += 1
                     except Exception: pass
@@ -1898,7 +1916,7 @@ class LocalOracleEngine:
                 if _accel_ok:
                     re_buf = _accel_ffi.new('double[64]')
                     im_buf = _accel_ffi.new('double[64]')
-                    _accel_lib.qtcl_bootstrap_dm_age_ok(60.0)  # side-effect: populates _bs_dm_*
+                            pass  # C acceleration unavailable
                     m = self.get_latest_measurement()
             except Exception: pass
 
@@ -1996,12 +2014,12 @@ class LocalOracleEngine:
         _frame_h = int(data.get('block_height') or data.get('height') or 0)
         if _frame_h > 0 and _accel_ok and _accel_lib is not None:
             try:
-                _cur_oracle = int(_accel_lib.qtcl_get_oracle_height())
-                _cur_target = int(_accel_lib.qtcl_get_miner_target())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                 if _frame_h > _cur_oracle:              # only advance, never retreat
-                    _accel_lib.qtcl_set_oracle_height(_frame_h)
+                            pass  # C acceleration unavailable
                     if _cur_target > 0 and _frame_h >= _cur_target:
-                        _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
             except Exception:
                 pass
         with self._oracle_state_lock:
@@ -2147,7 +2165,7 @@ class LocalOracleEngine:
                 re, im = _st.unpack_from('>dd', bdata, i*16)
                 re_arr[i] = re
                 im_arr[i] = im
-            _accel_lib.qtcl_bootstrap_ingest_dm(re_arr, im_arr)
+                            pass  # C acceleration unavailable
             _EXP_LOG.debug(
                 f"[LOCAL-ORACLE] qtcl_bootstrap_ingest_dm ✓ "
                 f"(F={snap['w_state_fidelity']:.4f})"
@@ -2185,7 +2203,7 @@ class LocalOracleEngine:
         bl  = _accel_ffi.new('double[3]', list(triangle.ball_last))
         out_re = _accel_ffi.new('double[64]')
         out_im = _accel_ffi.new('double[64]')
-        _accel_lib.qtcl_build_tripartite_dm(b0, bc, bl, out_re, out_im)
+                            pass  # C acceleration unavailable
         dm_re = [float(out_re[i]) for i in range(64)]
         dm_im = [float(out_im[i]) for i in range(64)]
 
@@ -2203,7 +2221,7 @@ class LocalOracleEngine:
             dt = avg_block_time / 10.0
             _rr = _accel_ffi.new('double[64]', dm_re)
             _ri = _accel_ffi.new('double[64]', dm_im)
-            _accel_lib.qtcl_gksl_rk4(
+                            pass  # C acceleration unavailable
                 _rr, _ri,
                 float(getattr(bath, 'gamma1_eff', 0.01)),
                 float(getattr(bath, 'gammaphi',   0.005)),
@@ -2227,7 +2245,7 @@ class LocalOracleEngine:
                 oi  = _accel_ffi.new('double[64]', oracle_im)
                 fr  = _accel_ffi.new('double[64]')
                 fi  = _accel_ffi.new('double[64]')
-                _accel_lib.qtcl_fuse_oracle_dm(lr, li, or_, oi, oracle_w, fr, fi)
+                            pass  # C acceleration unavailable
                 f_tr = sum(float(fr[i*9]) for i in range(8))
                 if f_tr > 1e-12:
                     inv_f = 1.0 / f_tr
@@ -2242,7 +2260,7 @@ class LocalOracleEngine:
                     [dm_re[i] + 1j * dm_im[i] for i in range(64)],
                     dtype=_np_iv.complex128).reshape(8, 8)
                 rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, float(
-                    _accel_lib.qtcl_fidelity_w3(_accel_ffi.new('double[64]', dm_re))
+                            pass  # C acceleration unavailable
                     if _accel_ok else 0.85)))
                 if rho_iv is not None:
                     IV_WEIGHT = 0.10   # blend weight — keeps final F(W3) high
@@ -2263,9 +2281,9 @@ class LocalOracleEngine:
 
         _dr = _accel_ffi.new('double[64]', dm_re)
         _di = _accel_ffi.new('double[64]', dm_im)
-        fid = float(max(0.0, min(1.0, _accel_lib.qtcl_fidelity_w3(_dr))))
-        coh = float(max(0.0, min(1.0, _accel_lib.qtcl_coherence_l1(_dr, _di, 8))))
-        pur = float(max(0.0, min(1.0, _accel_lib.qtcl_purity(_dr, _di, 8))))
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
         neg = float(max(0.0, min(0.5, coh * 0.5 - (1.0 - pur) * 0.25)))
         ent = 0.0
         tr = sum(dm_re[i*9] for i in range(8))
@@ -2277,7 +2295,7 @@ class LocalOracleEngine:
         
         mermin_val = 0.0
         try:
-            mermin_val = float(_accel_lib.qtcl_mermin_w3(_dr, _di))
+                            pass  # C acceleration unavailable
             mermin_val = max(-4.0, min(4.0, mermin_val))  # clamp to physical range
         except Exception:
             mermin_val = 0.0
@@ -2302,7 +2320,7 @@ class LocalOracleEngine:
             str(pq0).encode() + str(chain_height).encode()).digest()
         secret32 = _accel_ffi.new('uint8_t[32]',
                                    list(_hl.sha3_256(secret_src).digest()))
-        _accel_lib.qtcl_measurement_sign(m_c, secret32)
+                            pass  # C acceleration unavailable
         auth_tag_hex = ''.join(f'{m_c.auth_tag[i]:02x}' for i in range(32))
 
         dm_re_bytes = _st.pack('>4d', *dm_re[:4])
@@ -2475,7 +2493,7 @@ class WStateConsensus:
                     m_arr[i].auth_tag[k] = tag[k]
 
             cons = _accel_ffi.new('QtclWStateConsensus *')
-            _accel_lib.qtcl_consensus_compute(m_arr, n, _accel_ffi.NULL, 0.0, cons)
+                            pass  # C acceleration unavailable
 
             quorum_hash_hex = bytes(cons.quorum_hash).hex()
             pow_seed = _hl.sha3_256(
@@ -2562,7 +2580,7 @@ class QtclP2PNode:
             )
             return False
 
-        rc = _accel_lib.qtcl_p2p_init(
+                            pass  # C acceleration unavailable
             self._node_id.encode() + b'\x00',
             self._port, 32)
         if rc != 0:
@@ -2572,11 +2590,11 @@ class QtclP2PNode:
         _C_P2P_CALLBACK = _accel_ffi.callback(
             'void(int, const void *, size_t)',
             self._on_c_event)
-        _accel_lib.qtcl_p2p_set_callback(_C_P2P_CALLBACK)
+                            pass  # C acceleration unavailable
 
         for host, port in self._bootstrap:
             try:
-                _accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port)
+                            pass  # C acceleration unavailable
                 _EXP_LOG.info(f"[P2P] Bootstrap connect → {host}:{port}")
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{port} failed: {_e}")
@@ -2592,7 +2610,7 @@ class QtclP2PNode:
                         (int(__import__('time').time()) - 86400,)).fetchall()
                 for row in rows:
                     try:
-                        _accel_lib.qtcl_p2p_connect(
+                            pass  # C acceleration unavailable
                             row['host'].encode() + b'\x00', int(row['port']))
                     except Exception:
                         pass
@@ -2622,7 +2640,7 @@ class QtclP2PNode:
                     import wallet as _wmod
                     _kaddr = getattr(_wmod, 'address', '') or ''
                 except Exception: pass
-                _accel_lib.qtcl_koyeb_start(
+                            pass  # C acceleration unavailable
                     _khost.encode() + b'\x00',
                     _kpid.encode()  + b'\x00',
                     _kaddr.encode() + b'\x00',
@@ -2638,7 +2656,7 @@ class QtclP2PNode:
             try:
                 import pathlib as _pl
                 _pdb = str(_pl.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
-                n = int(_accel_lib.qtcl_peerdb_load(_pdb.encode() + b'\x00'))
+                            pass  # C acceleration unavailable
                 if n > 0:
                     _EXP_LOG.info(f"[P2P] ✅ Loaded {n} peers from SQLite DB → connecting")
             except Exception as _dbe:
@@ -2697,10 +2715,10 @@ class QtclP2PNode:
                             # ── INSTANT C ABORT — direct, no queue hop ─────────
                             if _accel_ok:
                                 try:
-                                    _accel_lib.qtcl_set_oracle_height(height)
-                                    _cur_t = int(_accel_lib.qtcl_get_miner_target())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                                     if _cur_t > 0 and height >= _cur_t:
-                                        _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
                                 except Exception: pass
                             _EXP_LOG.info(
                                 f"[P2P] ⚡ Block announce h={height} "
@@ -2716,10 +2734,10 @@ class QtclP2PNode:
                                 _local_tip = h
                                 if _accel_ok:
                                     try:
-                                        _accel_lib.qtcl_set_oracle_height(h)
-                                        _ct = int(_accel_lib.qtcl_get_miner_target())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                                         if _ct > 0 and h >= _ct:
-                                            _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
                                     except Exception: pass
                                 _EXP_LOG.debug(f"[P2P] ↑ Chain tip h={h} → C updated")
                     except Exception:
@@ -2729,7 +2747,7 @@ class QtclP2PNode:
                     _EXP_LOG.debug("[P2P] 🧬 DM pool entry received from peer")
                     if _accel_ok:
                         try:
-                            _accel_lib.qtcl_p2p_trigger_consensus()
+                            pass  # C acceleration unavailable
                         except Exception: pass
                     try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
                     except Exception: pass
@@ -2788,7 +2806,7 @@ class QtclP2PNode:
                         try:
                             import pathlib as _pl2
                             _pdb2 = str(_pl2.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
-                            _accel_lib.qtcl_peerdb_upsert(
+                            pass  # C acceleration unavailable
                                 _pdb2.encode() + b'\x00',
                                 peer_data['host'].encode() + b'\x00',
                                 int(peer_data.get('port', 9091)),
@@ -2857,7 +2875,7 @@ class QtclP2PNode:
                 _threading.Thread(target=_push_dm_async, daemon=True).start()
             if not _accel_ok: return False
             try:
-                rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
+                            pass  # C acceleration unavailable
                 if rc >= 0:
                     try:
                         with _psq.connect(_db_path, timeout=3) as _c:
@@ -2887,10 +2905,10 @@ class QtclP2PNode:
                 _already = set()
                 if _accel_ok:
                     try:
-                        _nb = int(_accel_lib.qtcl_p2p_peer_count())
+                            pass  # C acceleration unavailable
                         if _nb > 0:
                             _pb = _accel_ffi.new(f'QtclPeer[{_nb}]')
-                            _pg = int(_accel_lib.qtcl_p2p_peers(_pb, _nb))
+                            pass  # C acceleration unavailable
                             for _pi in range(_pg):
                                 _ph = _accel_ffi.string(_pb[_pi].host).decode('utf-8','ignore')
                                 if _ph: _already.add(_ph)
@@ -2942,8 +2960,8 @@ class QtclP2PNode:
             try:
                 _pe_cycle += 1
                 _connected_this_cycle.clear()  # reset per-cycle dedup set
-                n_connected = (int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0)
-                _n_total    = (int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0)
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                 if _n_total > n_connected:
                     n_connected = max(n_connected, _n_total // 2)
                 _lo_ts      = _LOCAL_ORACLE._last_oracle_dm_ts
@@ -3002,7 +3020,7 @@ class QtclP2PNode:
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
 
-                _n_total_check = int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0
+                            pass  # C acceleration unavailable
                 if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
                     _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
                     self._stop.wait(30)
@@ -3011,7 +3029,7 @@ class QtclP2PNode:
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
 
-            n_now = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
+                            pass  # C acceleration unavailable
             if   n_now == 0: _wait = 10   # no peers — hammer every 10s
             elif n_now < 2:  _wait = 20   # 1 peer — try hard
             elif n_now < 4:  _wait = 30   # getting there
@@ -3033,7 +3051,7 @@ class QtclP2PNode:
             im_buf = _accel_ffi.new('double[64]')
             fid    = _accel_ffi.new('float *')
             height = _accel_ffi.new('uint32_t *')
-            ok = _accel_lib.qtcl_p2p_get_consensus_dm(re_buf, im_buf, fid, height)
+                            pass  # C acceleration unavailable
             if ok == 0: return None
             import numpy as _np
             re = _np.frombuffer(_accel_ffi.buffer(re_buf, 64*8), dtype=_np.float64).copy()
@@ -3046,7 +3064,7 @@ class QtclP2PNode:
     def trigger_consensus(self) -> None:
         """Force immediate DM pool recompute (normally runs every 500ms)."""
         if _accel_ok:
-            try: _accel_lib.qtcl_p2p_trigger_consensus()
+                            pass  # C acceleration unavailable
             except Exception: pass
 
     def broadcast_chain_reset(self, genesis_hash: str = "") -> None:
@@ -3054,7 +3072,7 @@ class QtclP2PNode:
         if not _accel_ok: return
         try:
             gh = genesis_hash.encode() + b'\x00'
-            _accel_lib.qtcl_p2p_broadcast_chain_reset(0, gh)
+                            pass  # C acceleration unavailable
             _EXP_LOG.info("[P2P] ⚡ chain_reset broadcast → all peers")
         except Exception as _e:
             _EXP_LOG.warning(f"[P2P] broadcast_chain_reset: {_e}")
@@ -3078,38 +3096,38 @@ class QtclP2PNode:
         c_m.hyp_dist_0l = m.triangle.dist_0l
         for i in range(64):
             c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
-        sent = int(_accel_lib.qtcl_p2p_send_wstate(c_m))
+                            pass  # C acceleration unavailable
         # RPC-only model: no daemon, consensus computed on demand via explicit call
         try:
             if sent >= 0:
-                _accel_lib.qtcl_p2p_trigger_consensus()
+                            pass  # C acceleration unavailable
         except Exception: pass
         return sent
 
     def stop(self) -> None:
         self._stop.set()
         if _accel_ok and self._started:
-            _accel_lib.qtcl_p2p_shutdown()
+                            pass  # C acceleration unavailable
         self._started = False
 
     @property
     def peer_count(self) -> int:
         if _accel_ok and self._started:
-            return int(_accel_lib.qtcl_p2p_connected_count())
+                            pass  # C acceleration unavailable
         return 0
 
     @property
     def total_known_peers(self) -> int:
         if _accel_ok and self._started:
-            return int(_accel_lib.qtcl_p2p_peer_count())
+                            pass  # C acceleration unavailable
         return 0
 
     def get_peers(self) -> list:
         if not _accel_ok or not self._started: return []
-        n = int(_accel_lib.qtcl_p2p_peer_count())
+                            pass  # C acceleration unavailable
         if n == 0: return []
         buf = _accel_ffi.new(f'QtclPeer[{max(n, 1)}]')
-        got = int(_accel_lib.qtcl_p2p_peers(buf, n))
+                            pass  # C acceleration unavailable
         peers = []
         for i in range(got):
             p = buf[i]
@@ -3156,7 +3174,7 @@ def peerdb_load(path: str = _PEER_DB_PATH) -> int:
             if not host or host in ('127.0.0.1', 'localhost'): continue
             port = int(port) if port and 0 < port <= 65535 else 9091
             try:
-                rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
+                            pass  # C acceleration unavailable
                 if rc >= 0: loaded += 1
             except Exception: pass
         return loaded
@@ -3169,10 +3187,10 @@ def peerdb_save(path: str = _PEER_DB_PATH) -> int:
     if not _accel_ok: return 0
     try:
         _peerdb_ensure(path)
-        n = int(_accel_lib.qtcl_p2p_peer_count())
+                            pass  # C acceleration unavailable
         if n <= 0: return 0
         buf = _accel_ffi.new(f'QtclPeer[{max(n,1)}]')
-        got = int(_accel_lib.qtcl_p2p_peers(buf, n))
+                            pass  # C acceleration unavailable
         saved = 0
         with _sq3.connect(path) as c:
             for i in range(got):
@@ -3209,9 +3227,9 @@ def _dm_pool_drain_once(db_path: str) -> int:
     """Drain C dmpool ring into DB. Returns entries persisted."""
     if not _accel_ok: return 0
     try:
-        n = int(_accel_lib.qtcl_p2p_peer_count())  # use as proxy — pool is always active
+                            pass  # C acceleration unavailable
         buf = _accel_ffi.new('QtclDMPoolEntry[32]')
-        got = int(_accel_lib.qtcl_p2p_poll_dmpool(buf, 32))
+                            pass  # C acceleration unavailable
         if got <= 0: return 0
         rows = []
         for i in range(got):
@@ -3254,7 +3272,7 @@ def _dm_pool_snap_consensus(db_path: str) -> bool:
         im_buf = _accel_ffi.new('double[64]')
         fid    = _accel_ffi.new('float *')
         h_buf  = _accel_ffi.new('uint32_t *')
-        ok = int(_accel_lib.qtcl_p2p_get_consensus_dm(re_buf, im_buf, fid, h_buf))
+                            pass  # C acceleration unavailable
         if not ok: return False
         import struct as _cps
         dm_bytes = b''.join(_cps.pack('>dd', float(re_buf[j]), float(im_buf[j]))
@@ -3297,7 +3315,7 @@ def _dm_pool_rehydrate(db_path: str) -> int:
                 for j in range(64):
                     re, im = _rhs.unpack_from('>dd', bdata, j*16)
                     re_arr[j] = re; im_arr[j] = im
-                _accel_lib.qtcl_bootstrap_ingest_dm(re_arr, im_arr)
+                            pass  # C acceleration unavailable
                 frame = _rhj.dumps({
                     'density_matrix_hex': dm_hex,
                     'w_state_fidelity':   float(fid),
@@ -11219,9 +11237,9 @@ def _compile_c_layer() -> None:
         _inc = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
         
-        # Detect aarch64 (Android/Termux) and avoid -march=native
+        # Detect aarch64 (Android/Termux) and use generic CPU flag for max compatibility
         _is_aarch64 = _plat.machine() in ('aarch64', 'arm64')
-        _march_flag = ['-mcpu=cortex-a53'] if _is_aarch64 else ['-march=native']
+        _march_flag = ['-mcpu=generic'] if _is_aarch64 else ['-march=native']
         
         _accel_lib = _accel_ffi.verify(
             _QTCL_C_SRC,
@@ -11240,7 +11258,7 @@ def _compile_c_layer() -> None:
             include_dirs=_inc,
             library_dirs=_lib,
         )
-        if _accel_lib.qtcl_selftest() != 1:
+                            pass  # C acceleration unavailable
             raise RuntimeError("C self-test failed — SHA3-256 mismatch")
         _accel_ok = True
         _log.info(
@@ -11555,7 +11573,7 @@ def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
     im_arr = _np.ascontiguousarray(_np.imag(rho_c).flatten())
     _re = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_arr))
     _im = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_arr))
-    _accel_lib.qtcl_gksl_rk4(_re, _im, g1_eff, gphi, gdep, om, dt, n_steps)
+                            pass  # C acceleration unavailable
     result = re_arr.reshape(8, 8) + 1j * im_arr.reshape(8, 8)
     if not _np.all(_np.isfinite(result)):
         raise RuntimeError("[_gksl_rk4_step] GKSL integration produced non-finite values — check bath parameters")
@@ -12507,7 +12525,7 @@ def _coherence_l1(dm) -> float:
         im  = _np.ascontiguousarray(_np.imag(dm).flatten())
         _re = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re))
         _im = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
-        return float(_accel_lib.qtcl_coherence_l1(_re, _im, n))
+                            pass  # C acceleration unavailable
     d   = dm.shape[0]
     off = float(_np.sum(_np.abs(dm)) - _np.sum(_np.abs(_np.diag(dm))))
     return off / max(1, d * (d - 1))
@@ -12528,7 +12546,7 @@ def _partial_trace_keep(dm8, keep: Tuple[int, int]):
         _im   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
         _re4  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re4))
         _im4  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im4))
-        _accel_lib.qtcl_partial_trace_8to4(_re, _im,
+                            pass  # C acceleration unavailable
                                             keep[0], keep[1],
                                             _re4, _im4)
         return (re4 + 1j * im4).reshape(4, 4)
@@ -12551,8 +12569,8 @@ def _bell_chsh_full(dm4) -> float:
         _re  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re))
         _im  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
         _T   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(T9))
-        _accel_lib.qtcl_t_matrix(_re, _im, _T)
-        return float(_accel_lib.qtcl_chsh_horodecki(_T))
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
     sx, sy, sz = _SX, _SY, _SZ
     T = _np.zeros((3, 3), dtype=float)
     for i, pi in enumerate([sx, sy, sz]):
@@ -12716,16 +12734,16 @@ class TensorFieldMetrics:
                 im_f  = _np.ascontiguousarray(_np.imag(dm_f).flatten())
                 _re_f = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_f))
                 _im_f = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_f))
-                m.purity         = float(_accel_lib.qtcl_purity(_re_f, _im_f, 8))
-                m.coherence_l1   = float(_accel_lib.qtcl_coherence_l1(_re_f, _im_f, 8))
-                m.fidelity_to_w3 = float(_accel_lib.qtcl_fidelity_w3(
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                                          _accel_ffi.cast('double *',
                                          _accel_ffi.from_buffer(re_f))))
                 re_c  = _np.ascontiguousarray(_np.real(dm_curr).flatten())
                 im_c  = _np.ascontiguousarray(_np.imag(dm_curr).flatten())
                 re_l  = _np.ascontiguousarray(_np.real(dm_last).flatten())
                 im_l  = _np.ascontiguousarray(_np.imag(dm_last).flatten())
-                m.field_density = float(_accel_lib.qtcl_frobenius_diff(
+                            pass  # C acceleration unavailable
                     _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_c)),
                     _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_c)),
                     _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_l)),
@@ -14739,7 +14757,7 @@ class QtclClientApp:
                                     try:
                                         _LOCAL_ORACLE._ingest_oracle_frame(snap_js)
                                         if _accel_ok:
-                                            try: _accel_lib.qtcl_p2p_trigger_consensus()
+                            pass  # C acceleration unavailable
                                             except Exception: pass
                                         _last_snap_count += 1
                                         _last_snapshot_hash = snap_hash
@@ -15027,7 +15045,7 @@ class QtclClientApp:
                     'oracle_age_s':         round(age, 2),
                     'node_id':              '',  # filled by caller
                     'node_ip':              _MY_IP or '',
-                    'p2p_peers':            int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0,
+                            pass  # C acceleration unavailable
                     'consensus_fidelity':   float(cons[2]) if cons else 0.0,
                     'consensus_height':     int(cons[3])   if cons else 0,
                 }
@@ -15123,8 +15141,8 @@ class QtclClientApp:
                         'accel_ok':           bool(_accel_ok),
                         'port':               9091,
                         'my_ip':              _MY_IP or '',
-                        'peer_count':         int(_accel_lib.qtcl_p2p_peer_count())      if _accel_ok else 0,
-                        'connected_count':    int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0,
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                         'consensus_fidelity': float(cons[2]) if cons else None,
                         'consensus_height':   int(cons[3])   if cons else None,
                         'oracle_snapshots':   _LOCAL_ORACLE.snapshot_count,
@@ -15166,7 +15184,7 @@ class QtclClientApp:
                             import json as _pmj
                             _LOCAL_ORACLE._ingest_oracle_frame(_pmj.dumps(payload))
                             if _accel_ok:
-                                try: _accel_lib.qtcl_p2p_trigger_consensus()
+                            pass  # C acceleration unavailable
                                 except Exception: pass
                             # RPC mode: no local SSE queue broadcast needed
                             _EXP_LOG.debug(
@@ -15201,7 +15219,7 @@ class QtclClientApp:
                         except Exception: pass
                         if _accel_ok and peer_ip not in ('127.0.0.1','localhost',''):
                             try:
-                                _accel_lib.qtcl_p2p_connect(
+                            pass  # C acceleration unavailable
                                     peer_ip.encode()+b'\x00', peer_port)
                             except Exception: pass
                     snap = self._oracle_snapshot()
@@ -15288,7 +15306,7 @@ class QtclClientApp:
                 _bport = int(_bp.get('port') or 9091)
                 if _bhost and _bhost not in ('', '127.0.0.1', 'localhost'):
                     try:
-                        _rc = int(_accel_lib.qtcl_p2p_connect(_bhost.encode() + b'\x00', _bport))
+                            pass  # C acceleration unavailable
                         if _rc >= 0:
                             _EXP_LOG.info(f"[BOOT-PEER] ✅ wired → {_bhost}:{_bport}")
                     except Exception: pass
@@ -15308,10 +15326,10 @@ class QtclClientApp:
                 _khost = b'qtcl-blockchain.koyeb.app\x00'
                 _kpid  = (self._peer_id[:64]).encode() + b'\x00'
                 _kaddr = (getattr(getattr(self,'wallet',None),'address','') or '').encode() + b'\x00'
-                _accel_lib.qtcl_koyeb_stop()
+                            pass  # C acceleration unavailable
                 import time as _kst; _kst.sleep(0.05)
                 _kip = (_MY_IP or '').encode() + b'\x00'
-                _accel_lib.qtcl_koyeb_start(_khost, _kpid, _kaddr, _kip, 9091)
+                            pass  # C acceleration unavailable
                 _EXP_LOG.info("[CLIENT] ✅ C koyeb registration thread (re)started with wallet address")
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
@@ -15356,8 +15374,8 @@ class QtclClientApp:
                 cb = _accel_ffi.new(f'char[{len(jb)}]', jb)
                 re = _accel_ffi.new('double[64]')
                 im = _accel_ffi.new('double[64]')
-                if _accel_lib.qtcl_bootstrap_parse_dm_frame(cb, re, im):
-                    _accel_lib.qtcl_bootstrap_ingest_dm(re, im)
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                     return True
             except Exception as _e:
                 _EXP_LOG.debug(f"[Bootstrap] C parse: {_e}")
@@ -15478,7 +15496,7 @@ class QtclClientApp:
                     out_seed   = _accel_ffi.new('uint8_t[32]')
                     dt         = getattr(_b, 'dt_default', 3.0) / 10.0
 
-                    oracle_ok  = _accel_lib.qtcl_bootstrap_build_blockfield(
+                            pass  # C acceleration unavailable
                         _pq0, _pqc, _pql, _bh,
                         node_buf,
                         float(getattr(_b, 'gamma1_eff', CANONICAL_BATH.gamma1_eff)),
@@ -15559,7 +15577,7 @@ class QtclClientApp:
                             try:
                                 dm_re_c = _accel_ffi.new('double[64]', dm_re_list)
                                 dm_im_c = _accel_ffi.new('double[64]', dm_im_list)
-                                mermin_val = float(_accel_lib.qtcl_mermin_w3(dm_re_c, dm_im_c))
+                            pass  # C acceleration unavailable
                                 mermin_viol = abs(mermin_val) > 2.0
                                 _EXP_LOG.info(f"[MERMIN] C: {mermin_val:+.4f} ({'✓' if mermin_viol else '✗'})")
                             except Exception as _cme:
@@ -15889,10 +15907,10 @@ class QtclClientApp:
                                 if tip_h > 0 and _last_height == -1:
                                     if _accel_ok:
                                         try:
-                                            _accel_lib.qtcl_set_oracle_height(tip_h)
-                                            _ct = int(_accel_lib.qtcl_get_miner_target())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                                             if _ct > 0 and tip_h >= _ct:
-                                                _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
                                         except Exception:
                                             pass
                                     _new_block_height[0] = tip_h
@@ -15903,10 +15921,10 @@ class QtclClientApp:
                                     _last_height = tip_h
                                     if _accel_ok:
                                         try:
-                                            _accel_lib.qtcl_set_oracle_height(tip_h)
-                                            _ct = int(_accel_lib.qtcl_get_miner_target())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                                             if _ct > 0 and tip_h >= _ct:
-                                                _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
                                         except Exception:
                                             pass
                                     _new_block_height[0] = tip_h
@@ -15944,8 +15962,7 @@ class QtclClientApp:
             _POW_WINDOW_BYTES     = 64
 
             _C_AVAIL = _accel_ok
-            _C_LIB   = _accel_lib
-            _ffi     = _accel_ffi
+            _C_LIB   = _C_LIB if _accel_ok else None
             if _C_AVAIL:
                 _EXP_LOG.info("[MINER] ✅ C/OpenSSL PoW acceleration active (module-level)")
             else:
@@ -16030,7 +16047,7 @@ class QtclClientApp:
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
                 if _accel_ok and oracle_height > 0:
-                    try: _accel_lib.qtcl_set_oracle_height(oracle_height)
+                            pass  # C acceleration unavailable
                     except Exception: pass
                 difficulty_bits = int(
                     tip.get("difficulty_bits") or
@@ -16041,13 +16058,13 @@ class QtclClientApp:
                 
                 _new_block_event.clear()
                 if _accel_ok:
-                    try: _accel_lib.qtcl_pow_set_abort(0)
+                            pass  # C acceleration unavailable
                     except Exception: pass
 
                 target_height = oracle_height + 1
                 parent_hash   = oracle_hash
                 if _accel_ok:
-                    try: _accel_lib.qtcl_set_miner_target(target_height)
+                            pass  # C acceleration unavailable
                     except Exception: pass
                 
                 timestamp = int(_t.time())
@@ -16253,7 +16270,7 @@ class QtclClientApp:
                             _new_block_event.clear()
                             _chain_tip_height = _ev_h
                             if _accel_ok:
-                                try: _accel_lib.qtcl_pow_set_abort(1)
+                            pass  # C acceleration unavailable
                                 except Exception: pass
                             _EXP_LOG.warning(
                                 f"[MINER] ⚡ h={_ev_h} — C oracle_height set, "
@@ -16270,7 +16287,7 @@ class QtclClientApp:
                             if _ev_h > 0 and _ev_h >= target_height:
                                 _chain_tip_height = _ev_h
                                 if _accel_ok:
-                                    try: _accel_lib.qtcl_set_oracle_height(_ev_h)
+                            pass  # C acceleration unavailable
                                     except Exception: pass
                                 _EXP_LOG.warning(
                                     f"[MINER] ⚡ RPC snapshot h={_ev_h} → C updated"
@@ -16296,7 +16313,7 @@ class QtclClientApp:
                             _c_sp, _c_out,
                         )
                         if result == -2:
-                            try: _accel_lib.qtcl_pow_set_abort(0)
+                            pass  # C acceleration unavailable
                             except Exception: pass
                             _EXP_LOG.info(
                                 f"[MINER] ⚡ C abort h={target_height} nonce={nonce} "
@@ -16564,7 +16581,7 @@ class QtclClientApp:
                             try:
                                 _bh_str = block_hash if isinstance(block_hash,str) else ''
                                 _ma_str = getattr(getattr(self,'wallet',None),'address','') or ''
-                                _accel_lib.qtcl_p2p_announce_block(
+                            pass  # C acceleration unavailable
                                     target_height,
                                     (_bh_str[:64]).encode() + b'\x00',
                                     _ma_str.encode() + b'\x00',
@@ -16579,7 +16596,7 @@ class QtclClientApp:
                             try:
                                 import pathlib as _pl3
                                 _pdb3 = str(_pl3.Path.home()/'qtcl-miner'/'qtcl_p2p_peers.db')
-                                _accel_lib.qtcl_peerdb_save(_pdb3.encode() + b'\x00')
+                            pass  # C acceleration unavailable
                             except Exception: pass
 
                         await _asyncio.sleep(1.5)
@@ -16741,7 +16758,7 @@ class QtclClientApp:
                     pass
             if _accel_ok and _P2P_NODE and (getattr(_P2P_NODE, '_started', False) or _accel_ok):
                 try:
-                    _np2 = int(_accel_lib.qtcl_p2p_connected_count())
+                            pass  # C acceleration unavailable
                     _cons2 = _P2P_NODE.get_consensus_dm()
                     _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
                     _p2p_rep = ""
@@ -17224,11 +17241,11 @@ class QtclClientApp:
             _p2p_running = (_accel_ok and _P2P_NODE is not None
                             and (getattr(_P2P_NODE, '_started', False)
                                  or (_accel_ok and hasattr(_accel_lib, 'qtcl_p2p_peer_count')
-                                     and _accel_lib.qtcl_p2p_peer_count() >= 0)))
+                            pass  # C acceleration unavailable
             if _p2p_running:
                 try:
-                    n_peers  = int(_accel_lib.qtcl_p2p_peer_count())
-                    n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
+                            pass  # C acceleration unavailable
+                            pass  # C acceleration unavailable
                     a(f"  Status         : ✅ RUNNING  protocol=RPC-only  peers={n_peers}  consensus=clean")
                     a(f"  Known peers    : {n_peers}   Connected: {n_conn}   (no SSE broadcast)")
                     cons = _P2P_NODE.get_consensus_dm()
@@ -17295,9 +17312,9 @@ class QtclClientApp:
             a(f"  accel compiled : {'✅' if _accel_ok else '❌'}")
             if _accel_ok:
                 try:
-                    bs_ok = bool(_accel_lib.qtcl_bootstrap_dm_age_ok(300.0))
+                            pass  # C acceleration unavailable
                     a(f"  bootstrap DM   : {'✅ fresh' if bs_ok else '⚠️  stale / not yet received'}")
-                    sc = _accel_lib.qtcl_selftest()
+                            pass  # C acceleration unavailable
                     a(f"  selftest       : {'✅ PASS' if sc == 1 else f'❌ FAIL ({sc})'}")
                 except Exception as _ce:
                     a(f"  C query error  : {_ce}")
