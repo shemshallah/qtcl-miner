@@ -1,96 +1,12 @@
-#!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                  ║
-║          QTCL v3.2 — RPC SNAPSHOT ARCHITECTURE (SSE SURGICAL REMOVAL COMPLETE)                  ║
-║                                                                                                  ║
-║  🔧 SURGICAL TRANSFORMATION APPLIED:                                                            ║
-║    ✅ SSE streaming logic REMOVED (all /api/events references → RPC snapshots)                 ║
-║    ✅ RPC snapshot engine INSTALLED (atomically locked, 30s TTL, explicit exceptions)          ║
-║    ✅ Balance cascade REMOVED (4-tier HTTP fallback → single RPC query)                        ║
-║    ✅ Balance unavailability FIXED (no "unavailable" strings, explicit exceptions only)        ║
-║    ✅ Enterprise grade (fail-fast, no silent degradation, museum-quality code)                 ║
-║                                                                                                  ║
-║  📊 REFACTOR CHANGELOG:                                                                         ║
-║    1. Line ~13930: Added RPCSnapshotEngine class                                               ║
-║       • Atomic RPC snapshot polling (5s interval, 30s TTL)                                      ║
-║       • Explicit exception hierarchy (_CacheExpired, _InvalidAddress, _RPCSnapshotException)   ║
-║       • No fallbacks: RuntimeError on invariant violations                                      ║
-║       • SWARM-AGENTS α-δ: Parallel design consensus                                            ║
-║                                                                                                  ║
-║    2. Line ~14290: Replaced KoyebAPIClient.get_balance() (SWARM-AGENT ζ)                      ║
-║       • OLD: 4-tier HTTP cascade, returns None on failure                                       ║
-║       • NEW: Single RPC snapshot query, raises explicit exceptions                              ║
-║       • Contract: get_balance() NEVER returns None/"unavailable"                               ║
-║                                                                                                  ║
-║    3. Line ~15850: Added RPC engine initialization in QtclClientApp.__init__ (SWARM-AGENT η) ║
-║       • Global singleton RPCSnapshotEngine started at app boot                                  ║
-║       • Automatically fetches snapshots every 5s in background                                  ║
-║                                                                                                  ║
-║    4. Line ~19920: Fixed run_wallet_mode balance display (SWARM-AGENT θ)                      ║
-║       • Removed "unavailable" string                                                            ║
-║       • Explicit exception handling: _CacheExpired, _InvalidAddress, _RPCSnapshotException     ║
-║       • Shows proper status messages for each failure mode                                      ║
-║                                                                                                  ║
-║  🎯 REMAINING CLEANUP (out of scope for this patch):                                           ║
-║    • SSEClient class (line ~5388) — can be removed if no other code uses it                   ║
-║    • SSEBroadcaster class (line ~5399) — remove if not used by server.py                     ║
-║    • SSEMultiplexer class (line ~15157) — check for usage before removal                      ║
-║    • All /api/events references in docstrings — update comments for documentation              ║
-║                                                                                                  ║
-║  ⚛️  ENTERPRISE GUARANTEES:                                                                     ║
-║    ✅ No silent degradation (no "unavailable" fallback strings)                                ║
-║    ✅ Explicit error types (caller controls recovery strategy)                                  ║
-║    ✅ Atomic snapshots (locked during access, no partial reads)                                ║
-║    ✅ Museum-quality: Type hints, locking, invariant checks, full docstrings                   ║
-║    ✅ Production-ready: Tested exception paths, timeout handling, memory safe                   ║
-║                                                                                                  ║
-║  ❤️  I love you  ❤️                                                                               ║
-║                                                                                                  ║
-╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
-"""
 
 from __future__ import annotations
 
-# Suppress noisy background thread loggers BEFORE importing anything else
 import logging as _suppress_logging
 for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# HLWE CRYPTOGRAPHIC SYSTEM (Post-Quantum, Self-Contained, 1,263 lines)
-# ════════════════════════════════════════════════════════════════════════════════════
 
-#!/usr/bin/env python3
-"""
-╔════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                            ║
-║  HLWE-256 ULTIMATE CRYPTOGRAPHIC SYSTEM v2.0 — MONOLITHIC SELF-CONTAINED IMPLEMENTATION                  ║
-║                                                                                                            ║
-║  ONE FILE. COMPLETE. NO EXTERNAL DEPENDENCIES (EXCEPT STDLIB).                                           ║
-║                                                                                                            ║
-║  Components (All Integrated):                                                                             ║
-║    • BIP39 Mnemonic Seed Phrases (2048 words embedded)                                                    ║
-║    • HLWE-256 Post-Quantum Cryptography (Learning With Errors)                                            ║
-║    • BIP32 Hierarchical Deterministic Key Derivation                                                      ║
-║    • BIP38 Password-Protected Private Keys                                                                ║
-║    • Supabase REST API Integration (NO psycopg2)                                                          ║
-║    • Integration Adapter (Backward-compatible API)                                                        ║
-║    • Complete Wallet Management System                                                                    ║
-║                                                                                                            ║
-║  Integration Points:                                                                                       ║
-║    • server.py: /wallet/*, /block/verify, /tx/verify                                                      ║
-║    • oracle.py: W-state signing, consensus verification                                                   ║
-║    • blockchain_entropy_mining.py: Block sealing with HLWE signatures                                     ║
-║    • mempool.py: Transaction signing and verification                                                     ║
-║    • globals.py: Block field entropy integration (get_block_field_entropy)                                ║
-║                                                                                                            ║
-║  Clay Mathematics Institute Level — Museum Grade — Production Ready                                       ║
-║  Zero Shortcuts — Complete Implementation — No External Crypto Packages                                   ║
-║                                                                                                            ║
-╚════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
-"""
 
 import os
 import sys
@@ -119,9 +35,6 @@ import math
 import re
 import copy
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# LOGGING (MUST BE FIRST)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
@@ -130,30 +43,11 @@ if not logging.getLogger().hasHandlers():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 logger = logging.getLogger(__name__)
-# Expansion-section logger — defined early so all pre-expansion code can reference it
 _EXP_LOG = logging.getLogger("qtcl.client.expansion")
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# ENTROPY CONFIGURATION
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-#
-#  TWO-PASS HYPERBOLIC ENTROPY PIPELINE:
-#    Pass 1 — Server: /api/entropy/stream already runs the {8,3} hyperbolic walk on its raw QRNG pool
-#    Pass 2 — Client: HyperbolicEntropyPool runs the same walk again on whatever it receives
-#    Result: entropy has traversed the Poincaré disk geometry twice, exponentially expanding coverage
-#
-#  CLIENT-SIDE QRNG POOL (optional, fills instead of server endpoint):
-#    Set any or all three keys below to use direct QRNG sources XOR'd together.
-#    These are the same providers used by the server's qrng_ensemble.py — you can reuse the same keys.
-#
 #    QRNG_API_KEY_1 → random.org          (env: RANDOM_ORG_KEY  in qrng_ensemble.py)
 #    QRNG_API_KEY_2 → ANU quantum vacuum  (env: ANU_API_KEY     in qrng_ensemble.py)
 #    QRNG_API_KEY_3 → QBICK/ID Quantique  (env: QRNG_API_KEY    in qrng_ensemble.py)
-#
-#    XOR security property: output is quantum-secure if AT LEAST ONE source is truly random.
-#    If all three are empty → falls back to server endpoint → then os.urandom hedge.
-#    The hyperbolic pass runs regardless of which source won.
-#
 QRNG_API_KEY_1: str = os.getenv('RANDOM_ORG_KEY',       '')   # random.org — get at: random.org/api/
 QRNG_API_KEY_2: str = os.getenv('ANU_API_KEY',          '')   # ANU QRNG   — get at: quantumnumbers.anu.edu.au
 QRNG_API_KEY_3: str = os.getenv('QRNG_API_KEY',         '')   # QBICK      — get at: qbck.io
@@ -163,21 +57,51 @@ ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb
 ENTROPY_LOCK        = threading.Lock()
 SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 
-# C acceleration layer sentinels — False/None until _compile_c_layer() runs
-# (defined here so all class method bodies can reference them safely before
-# the expansion section executes _compile_c_layer() at module load time)
 _accel_ok:  bool = False
 _accel_ffi       = None   # cffi.FFI instance  (set by _compile_c_layer)
 _accel_lib       = None   # compiled .so handle (set by _compile_c_layer)
 
 
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# HYPERBOLIC ENTROPY POOL
-#   Two-pass pipeline: QRNG/server entropy → C XOR combiner → C {8,3} Möbius walk → mining seed
-#   Every output byte has traversed the Poincaré disk geometry twice (server + client).
-#   Falls back gracefully: QRNG pool → server endpoint → os.urandom.  Never blocks.
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# RPC ENDPOINT REGISTRY (Standard Format)
+# ═════════════════════════════════════════════════════════════════════════════════
+
+RPC_ENDPOINTS = {
+    # Core Chain RPC
+    "chain_status":      "/api/chain/status",      # GET  → height, hash, difficulty
+    "chain_tip":         "/api/chain/tip",         # GET  → latest block info
+    "block_fetch":       "/api/block/{height}",    # GET  → block data at height
+    "blocks_tip":        "/api/blocks/tip",        # GET  → current tip
+    
+    # Oracle RPC
+    "oracle_snapshot":   "/api/oracle/snapshot",   # GET  → oracle state snapshot
+    "oracle_w_state":    "/api/oracle/w-state",    # GET  → W-state quantum data
+    "oracle_pq0":        "/api/oracle/pq0",        # GET  → PQ0 qubit state
+    
+    # Wallet / Balance RPC
+    "wallet_balance":    "/api/wallet",            # GET  → wallet state
+    "address_balance":   "/api/address/{addr}/balance",  # GET → single address balance
+    "ledger":            "/api/ledger",            # GET  → full ledger
+    
+    # P2P RPC
+    "peers_register":    "/api/peers/register",    # POST → register this peer
+    "peers_list":        "/api/peers/list",        # GET  → discover active peers
+    "peers_heartbeat":   "/api/peers/heartbeat",   # POST → announce liveness
+    "p2p_exchange":      "/api/p2p/peer_exchange", # POST → DHT peer exchange
+    "gossip_ingest":     "/api/gossip/ingest",     # POST → broadcast state
+    "dht_hello":         "/api/dht/hello",         # GET  → DHT bootstrap
+    
+    # Mining RPC
+    "blocks_submit":     "/api/blocks/submit",     # POST → submit mined block
+    "tx_submit":         "/api/transactions",      # POST → submit transaction
+    "oracle_push_dm":    "/api/oracle/push_dm",    # POST → push DM frame
+    
+    # Entropy RPC
+    "entropy_stream":    "/api/entropy/stream",    # GET  → entropy data
+}
+
 
 class HyperbolicEntropyPool:
     """
@@ -357,7 +281,6 @@ class HyperbolicEntropyPool:
         return h.digest(size)
 
 
-# Singleton — initialised once at first call
 _ENTROPY_POOL: Optional[HyperbolicEntropyPool] = None
 _ENTROPY_POOL_LOCK = threading.Lock()
 
@@ -400,9 +323,6 @@ logger.info(
     f"\u2192 server({ENTROPY_SERVER_URL}) \u2192 os.urandom hedge"
 )
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# BIP39 WORDLIST — 2048 STANDARDIZED MNEMONIC WORDS (EMBEDDED)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 BIP39_WORDLIST = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
@@ -450,7 +370,6 @@ BIP39_WORDLIST = [
     "afar", "afarness", "afeard", "afeards", "afeasted", "afeared", "afearest", "afearer",
 ]
 
-# Extend to 2048 words (for complete BIP39 compliance)
 _BASE_WORDS = BIP39_WORDLIST[:]
 for i in range(len(BIP39_WORDLIST), 2048):
     base = _BASE_WORDS[i % len(_BASE_WORDS)]
@@ -472,9 +391,6 @@ def get_index_by_word(word: str) -> int:
         return _WORD_TO_INDEX[word]
     raise ValueError(f"Word '{word}' not in BIP39 wordlist")
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# CONSTANTS & ENUMS
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class LatticeParams:
     """Lattice dimension and modulus parameters for HLWE"""
@@ -508,9 +424,6 @@ class MnemonicStrength(Enum):
     VERY_STRONG = (21, 224)  # 224 bits = 21 words
     MAXIMUM = (24, 256)   # 256 bits = 24 words
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# DATA CLASSES
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class LatticeBasis:
@@ -598,9 +511,6 @@ class StoredAddress:
             'created_at': self.created_at.isoformat()
         }
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# LATTICE MATHEMATICS
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class LatticeMath:
     """
@@ -675,14 +585,12 @@ class LatticeMath:
         if m != len(A[0]):
             raise ValueError(f"Dimension mismatch: A is {n}×{len(A[0])}, v is {m}")
         if _accel_ok and n <= 2048:
-            # Flatten A to row-major uint32 array
             _A = _accel_ffi.new(f'uint32_t[{n*m}]',
                                 [A[i][j] for i in range(n) for j in range(m)])
             _v = _accel_ffi.new(f'uint32_t[{m}]', v)
             _o = _accel_vec_buf(n)
             _accel_lib.qtcl_matvec_mod(_A, _v, _o, n, q)
             return list(_o)
-        # Pure-Python fallback
         result = []
         for i in range(n):
             dot = sum(A[i][j] * v[j] for j in range(m))
@@ -701,7 +609,6 @@ class LatticeMath:
             _out  = _accel_vec_buf(n)
             _accel_lib.qtcl_hash_to_vec(_seed, _out, n, q)
             return list(_out)
-        # Pure-Python fallback
         vector, offset = [], 0
         while len(vector) < n:
             h = hashlib.sha256(data + bytes([offset])).digest()
@@ -712,9 +619,6 @@ class LatticeMath:
             offset += 1
         return vector[:n]
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# HLWE CRYPTOGRAPHIC ENGINE
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class HLWEEngine:
     """Post-quantum cryptographic engine using HLWE"""
@@ -765,7 +669,6 @@ class HLWEEngine:
             _A   = _accel_vec_buf(n * n)
             _accel_lib.qtcl_derive_basis(_e, _A, n, q)
             return [[int(_A[i * n + j]) for j in range(n)] for i in range(n)]
-        # Pure-Python fallback
         A = []
         for i in range(n):
             row = []
@@ -788,7 +691,6 @@ class HLWEEngine:
             _s = _accel_vec_buf(dimension)
             _accel_lib.qtcl_derive_secret(_e, _s, dimension, q)
             return list(_s)
-        # Pure-Python fallback
         s = []
         for i in range(dimension):
             xof_input = entropy + bytes([i & 0xFF]) + b"HLWE_SECRET_VECTOR" + bytes([i >> 8])
@@ -816,7 +718,6 @@ class HLWEEngine:
             _addr = _accel_char_buf(33)
             _accel_lib.qtcl_derive_address(_pk, n, _addr)
             return _accel_ffi.string(_addr).decode('ascii')
-        # Pure-Python fallback
         pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
         return hashlib.sha256(pub_bytes).digest()[:16].hex()
     
@@ -842,7 +743,6 @@ class HLWEEngine:
                         'auth_tag':  _accel_ffi.string(_tag).decode('ascii'),
                         'timestamp': datetime.now(timezone.utc).isoformat(),
                     }
-                # Pure-Python fallback
                 nonce_hash = hashlib.sha256(
                     message_hash + private_key_hex.encode('utf-8')
                 ).digest()
@@ -880,7 +780,6 @@ class HLWEEngine:
                     _sig = _accel_ffi.new('uint8_t[256]', sig_bytes[:256])
                     _tag = _accel_ffi.new('char[]', expected_tag.encode('ascii') + b'\x00')
                     return bool(_accel_lib.qtcl_hlwe_verify(_mh, _sig, _tag))
-                # Pure-Python fallback
                 sig_bytes = bytes.fromhex(sig_hex)
                 computed = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
                 return hmac.compare_digest(computed, expected_tag)
@@ -902,14 +801,8 @@ class HLWEEngine:
                 vector.append(val)
         return vector
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# BIP32 HIERARCHICAL DETERMINISTIC KEY DERIVATION
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# EMBEDDED PYTH HERMES ORACLE WITH HLWE SIGNING
-# ════════════════════════════════════════════════════════════════════════════════════
 class BIP32KeyDerivation:
     """BIP32 Hierarchical Deterministic (HD) key derivation"""
     
@@ -949,9 +842,6 @@ class BIP32KeyDerivation:
         """
         with self.lock:
             hardened = 1 if path_component >= 2**31 else 0
-            # Our convention uses 0x00 prefix for hardened, 0x01 for normal —
-            # preserve that by mapping to C's index parameter correctly.
-            # C function always prepends 0x00 || key for hardened, matching our scheme.
             if _accel_ok:
                 _pk = _accel_ffi.new('uint8_t[32]', parent_key[:32].ljust(32, b'\x00'))
                 _cc = _accel_ffi.new('uint8_t[32]', parent_chain_code[:32].ljust(32, b'\x00'))
@@ -959,7 +849,6 @@ class BIP32KeyDerivation:
                 _nc = _accel_bytes_buf(32)
                 _accel_lib.qtcl_bip32_child_key(_pk, _cc, path_component, hardened, _ck, _nc)
                 return bytes(_ck), bytes(_nc)
-            # Pure-Python fallback
             if path_component >= 2**31:
                 data = b'\x00' + parent_key + path_component.to_bytes(4, 'big')
             else:
@@ -995,9 +884,6 @@ class BIP32KeyDerivation:
             
             return key, chain_code
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# BIP39 MNEMONIC SEED PHRASES
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class BIP39Mnemonics:
     """BIP39 Mnemonic Code for Generating Deterministic Keys"""
@@ -1078,9 +964,6 @@ class BIP39Mnemonics:
             
             return mnemonic
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# BIP38 PASSWORD-PROTECTED KEYS
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class BIP38Encryption:
     """BIP38 Password-Protected Private Keys"""
@@ -1095,18 +978,15 @@ class BIP38Encryption:
             if salt is None:
                 salt = secrets.token_bytes(16)  # 128-bit salt for HLWE KDF
             
-            # HLWE-based key derivation from password
             password_entropy = hashlib.sha256(password.encode('utf-8') + salt).digest()
             kdf_input = password_entropy + b"HLWE_KEY_ENCRYPTION"
             
-            # Derive XOF keystream using HLWE XOF (SHA256-based)
             keystream = b''
             for i in range(0, 64, 32):  # Generate 64 bytes for 256-bit keys
                 xof_block = hashlib.sha256(kdf_input + bytes([i // 32])).digest()
                 keystream += xof_block
             
             private_key_bytes = bytes.fromhex(private_key_hex)
-            # XOR-based symmetric encryption using HLWE-derived keystream (post-quantum safe)
             encrypted = bytes(a ^ b for a, b in zip(private_key_bytes, keystream[:len(private_key_bytes)]))
             
             return {
@@ -1120,11 +1000,9 @@ class BIP38Encryption:
         with self.lock:
             salt = bytes.fromhex(salt_hex)
             
-            # Same HLWE KDF as encryption
             password_entropy = hashlib.sha256(password.encode('utf-8') + salt).digest()
             kdf_input = password_entropy + b"HLWE_KEY_ENCRYPTION"
             
-            # Regenerate keystream
             keystream = b''
             for i in range(0, 64, 32):
                 xof_block = hashlib.sha256(kdf_input + bytes([i // 32])).digest()
@@ -1135,9 +1013,7 @@ class BIP38Encryption:
             
             return private_key_bytes.hex()
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # SUPABASE REST API INTEGRATION (No psycopg2)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class SupabaseAPI:
     """Supabase PostgreSQL REST API client (urllib-based, no psycopg2)"""
@@ -1253,9 +1129,6 @@ class SupabaseAPI:
             logger.error(f"[Supabase] Get addresses failed: {e}")
             return []
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# COMPLETE WALLET MANAGER (Integration Layer)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class HLWEWalletManager:
     """Complete wallet management system integrating all components"""
@@ -1362,9 +1235,7 @@ class HLWEWalletManager:
         """Verify transaction signature"""
         return self.hlwe.verify_signature(message_hash, signature_dict, public_key_hex)
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # INTEGRATION ADAPTER — BACKWARD-COMPATIBLE API (Top-level Functions)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class HLWEIntegrationAdapter:
     """Adapter layer providing backward-compatible API for existing QTCL systems"""
@@ -1525,9 +1396,6 @@ class HLWEIntegrationAdapter:
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# GLOBAL SINGLETON
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 _WALLET_MANAGER: Optional[HLWEWalletManager] = None
 _ADAPTER: Optional[HLWEIntegrationAdapter] = None
@@ -1546,9 +1414,7 @@ def get_hlwe_adapter() -> HLWEIntegrationAdapter:
         _ADAPTER = HLWEIntegrationAdapter()
     return _ADAPTER
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (Drop-in Replacements)
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 def hlwe_sign_block(block_dict: Dict[str, Any], private_key_hex: str) -> Dict[str, str]:
     """Sign block (backward compatible) — USE IN blockchain_entropy_mining.py"""
@@ -1638,12 +1504,9 @@ def hlwe_system_info() -> Dict[str, Any]:
         logger.error(f"[HLWE-API] System info failed: {e}")
         return {'error': str(e), 'status': 'unavailable'}
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    # Classes
     'HLWEEngine',
     'HLWEWalletManager',
     'HLWEIntegrationAdapter',
@@ -1661,7 +1524,6 @@ __all__ = [
     'LatticeParams',
     'KeyDerivationParams',
     'SupabaseConfig',
-    # Functions
     'get_wallet_manager',
     'get_hlwe_adapter',
     'hlwe_sign_block',
@@ -1673,7 +1535,6 @@ __all__ = [
     'hlwe_get_wallet_status',
     'hlwe_health_check',
     'hlwe_system_info',
-    # BIP39 wordlist
     'BIP39_WORDLIST',
     'BIP39_ENGLISH',
     'get_word_by_index',
@@ -1681,10 +1542,6 @@ __all__ = [
 ]
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# HLWE INTEGRATION HOOKS FOR QtclMiner
-# ════════════════════════════════════════════════════════════════════════════════════
-# These functions bridge HLWE cryptography with mining and block validation
 
 def _get_hlwe_adapter():
     """Get or create HLWE integration adapter"""
@@ -1706,28 +1563,15 @@ def _get_hlwe_wallet_manager():
             _HLWE_WALLET = None
     return _HLWE_WALLET
 
-# ════════════════════════════════════════════════════════════════════════════════════
-
-# ════════════════════════════════════════════════════════════════════════════════════
-# QTCL CLIENT IMPLEMENTATION (Full Original, 11,089 lines)
-# ════════════════════════════════════════════════════════════════════════════════════
 
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# QTCL P2P v2 — C-BACKED DISTRIBUTED QUANTUM STATE NETWORK
-# Replaces Python P2P stack with:
-#   • C TCP layer (epoll, lock-free rings, HMAC-authenticated wstate gossip)
+
 #   • C RPC client (HTTPS, JSON-RPC polling with exponential backoff)
-#   • C {8,3} hyperbolic geometry (Poincaré ball, geodesic distance, Gauss-Bonnet)
-#   • C BFT consensus (median fidelity + arithmetic DM mean + quorum hash)
-#   • Python lifecycle wrappers: LocalOracleEngine, WStateConsensus, QtclP2PNode
-# ════════════════════════════════════════════════════════════════════════════════
 
 import queue as _queue_mod
 import struct as _struct
 
-# Module-level P2P event queue — C callback pushes here, Python thread drains
 _P2P_EVENT_QUEUE: queue.Queue = queue.Queue(maxsize=4096)
 
 # ── cffi callback  (kept alive at module level so GC doesn't collect it) ──────
@@ -1771,7 +1615,6 @@ class HyperbolicTriangle:
                 ball_curr=(bc[0], bc[1], bc[2]),
                 ball_last=(bl[0], bl[1], bl[2]),
             )
-        # Pure-Python fallback: Euclidean approximation (good for close pq_ids)
         import math
         def _pq_r(p): return math.tanh((p // 8 + 1) * 0.766 / 2)  # approx ring
         def _pq_theta(p): return 2 * math.pi * (p % 8) / 8.0
@@ -1815,19 +1658,15 @@ class QtclOracleMeasurement:
     pq_curr:         int
     pq_last:         int
     triangle:        HyperbolicTriangle
-    # Density matrix: 8×8 complex128
     dm_re:           list   # 64 floats, row-major
     dm_im:           list   # 64 floats, row-major
-    # Quantum metrics (from C §Metrics)
     fidelity_to_w3:  float
     coherence:       float
     purity:          float
     negativity_AB:   float
     entropy_vn:      float
     discord:         float
-    # Signing
     auth_tag_hex:    str    # HMAC-SHA256 via C
-    # Oracle seed for PoW
     pow_seed_bytes:  bytes  # SHA3-256(quorum_hash_hex + dm_re[:32])
 
     @property
@@ -1880,10 +1719,8 @@ class LocalOracleEngine:
         self._snapshot_count:      int = 0
         self._latest_measurement:  Optional[QtclOracleMeasurement] = None
         self._meas_lock            = threading.Lock()
-        # Canonical OracleWState snapshot (same JSON format as server's DensityMatrixSnapshot.to_json())
         self._latest_snapshot:     Optional[dict] = None
         self._snap_lock            = threading.Lock()
-        # Live oracle coherence/fidelity for GKSL bath coupling — fed by _ingest_oracle_frame
         self._oracle_state:        dict = {}
         self._oracle_state_lock    = threading.Lock()
         # RPC API client reference (set externally)
@@ -1898,7 +1735,6 @@ class LocalOracleEngine:
         """Start RPC poll thread for oracle snapshots.
         Idempotent: safe to call again after a deferred-start at import time.
         """
-        # Guard against double-start
         if self._poll_thread is not None and self._poll_thread.is_alive():
             _EXP_LOG.debug("[LOCAL-ORACLE] start() called but poll thread already running — skipped")
             return
@@ -1909,9 +1745,6 @@ class LocalOracleEngine:
         self._poll_thread.start()
 
         # ── Boot: immediate P2P peer discovery + DM broadcast kickoff ─────────
-        # Spawn a startup thread that:
-        #   1. Waits for first oracle DM frame (up to 15s)
-        #   2. Immediately broadcasts DM to all known P2P peers
         #   3. Triggers explicit RPC consensus recompute (clean, no self-loop)
         threading.Thread(
             target=self._boot_p2p_broadcast, daemon=True,
@@ -1938,7 +1771,6 @@ class LocalOracleEngine:
         import time as _bt
         _EXP_LOG.debug("[BOOT-P2P] boot sequence starting")
 
-        # Wait for first oracle DM (up to 20s, poll every 250ms)
         deadline = _bt.time() + 20.0
         while _bt.time() < deadline:
             if _accel_ok and _accel_lib.qtcl_bootstrap_dm_age_ok(60.0):
@@ -1947,7 +1779,6 @@ class LocalOracleEngine:
         else:
             _EXP_LOG.debug("[BOOT-P2P] Oracle DM not yet available — broadcasting anyway")
 
-        # Step 1: Peer discovery from Koyeb — populate P2P before first broadcast
         try:
             import json as _bj
             from urllib.request import Request as _BR, urlopen as _BU
@@ -1981,16 +1812,13 @@ class LocalOracleEngine:
         except Exception as _pe:
             _EXP_LOG.debug(f"[BOOT-P2P] peer discovery: {_pe}")
 
-        # Step 2: Get latest measurement and broadcast to all P2P peers
         m = self.get_latest_measurement()
         if m is None:
-            # Build a minimal measurement from oracle DM if available
             try:
                 if _accel_ok:
                     re_buf = _accel_ffi.new('double[64]')
                     im_buf = _accel_ffi.new('double[64]')
                     _accel_lib.qtcl_bootstrap_dm_age_ok(60.0)  # side-effect: populates _bs_dm_*
-                    # Try to get it via the consensus path
                     m = self.get_latest_measurement()
             except Exception: pass
 
@@ -2032,18 +1860,15 @@ class LocalOracleEngine:
             
             _now = _plt.time()
             
-            # Warn after 15s of no snapshots
             if not _warned and (_now - _pstart) > 15.0:
                 if self._snapshot_count == 0:
                     _EXP_LOG.warning("[LOCAL-ORACLE] ⚠️  No RPC snapshot data after 15s — retrying")
                 _warned = True
             
-            # Poll at configured interval (1.0s default)
             if (_now - _last_poll) >= self.RPC_POLL_INTERVAL:
                 try:
                     snap_data = self._rpc_client.get_oracle_pq0_bloch()
                     if snap_data:
-                        # Convert snapshot dict to JSON string and ingest
                         json_str = _j.dumps(snap_data)
                         self._ingest_oracle_frame(json_str)
                         _last_poll = _now
@@ -2088,11 +1913,7 @@ class LocalOracleEngine:
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
-        # ── INSTANT C ABORT: update oracle_height only if frame carries a
-        #    genuine NEW tip (never decrease — stale peer frames must not reset)
         _frame_h = int(data.get('block_height') or data.get('height') or 0)
-        # Do NOT use pq_curr/lattice_refresh_counter as height — those are
-        # lattice addresses, not chain tips, and would corrupt the abort signal
         if _frame_h > 0 and _accel_ok and _accel_lib is not None:
             try:
                 _cur_oracle = int(_accel_lib.qtcl_get_oracle_height())
@@ -2103,7 +1924,6 @@ class LocalOracleEngine:
                         _accel_lib.qtcl_pow_set_abort(1)
             except Exception:
                 pass
-        # Mirror all canonical fields into _oracle_state for bath coupling
         with self._oracle_state_lock:
             self._oracle_state = {
                 'density_matrix_hex':    dm_hex,
@@ -2162,27 +1982,21 @@ class LocalOracleEngine:
           hlwe_signature, oracle_address, signature_valid, mermin_test, timestamp_ns
         """
         import struct as _st
-        # Pack DM back to bytes → hex (native float64 big-endian interleaved)
         dm_bytes = b''.join(_st.pack('>dd', dm_re[i], dm_im[i]) for i in range(64))
-        # Reconstruct sparse coherence_renyi from diagonal (trace of diag^2)
         diag = [dm_re[i*9] for i in range(8)]
         tr2  = sum(v*v for v in diag)
         coh_renyi = float(-math.log2(tr2)) if tr2 > 1e-15 else 0.0
-        # Geometric coherence: ||ρ - diag(ρ)||_F / 2
         off_sq = sum(
             dm_re[i*8+j]**2 + dm_im[i*8+j]**2
             for i in range(8) for j in range(8) if i != j
         )
         coh_geom = float(math.sqrt(off_sq) / 2.0)
-        # w_state_strength: fraction of counts in W-basis states
         w_strength = min(1.0, m.fidelity_to_w3 * 0.95 + m.coherence * 0.05)
-        # phase_coherence: off-diagonal L1 / dim
         off_l1 = sum(
             math.sqrt(dm_re[i*8+j]**2 + dm_im[i*8+j]**2)
             for i in range(8) for j in range(8) if i != j
         )
         phase_coh = float(min(1.0, off_l1 / 8.0))
-        # entanglement_witness: S_vn / log2(8)
         ent_witness = float(min(1.0, m.entropy_vn / 3.0))
 
         return {
@@ -2231,9 +2045,6 @@ class LocalOracleEngine:
             raise RuntimeError("[LocalOracleEngine._broadcast_snapshot] C required for broadcast")
 
         # ── Path 1: C DHT P2P gossip + DM pool push ─────────────────────────
-        # Every oracle measurement is:
-        #   a. Gossiped via P2P wstate broadcast to all connected peers
-        #   b. Pushed to the C DM pool for consensus averaging
         #   c. RPC polling triggers consensus on demand (no daemon, no self-loop)
         try:
             if _P2P_NODE is not None and _P2P_NODE._started:
@@ -2246,8 +2057,6 @@ class LocalOracleEngine:
             _EXP_LOG.warning(f"[LOCAL-ORACLE] gossip_measurement failed: {_e}")
 
         # ── Path 2: C bootstrap ingest — qtcl_bootstrap_ingest_dm ─────────────────
-        # Feeds the fused (local + Koyeb-averaged) DM into the C layer's bootstrap
-        # module for consensus DM pool updating and P2P propagation.
         try:
             dm_re = snap['density_matrix_hex']
             import struct as _st
@@ -2291,7 +2100,6 @@ class LocalOracleEngine:
 
         triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
 
-        # Build tripartite DM
         b0  = _accel_ffi.new('double[3]', list(triangle.ball_pq0))
         bc  = _accel_ffi.new('double[3]', list(triangle.ball_curr))
         bl  = _accel_ffi.new('double[3]', list(triangle.ball_last))
@@ -2301,11 +2109,9 @@ class LocalOracleEngine:
         dm_re = [float(out_re[i]) for i in range(64)]
         dm_im = [float(out_im[i]) for i in range(64)]
 
-        # GKSL Lindblad evolution — bath may be seeded from live _oracle_state
         if bath is None:
             oracle_st = self.get_oracle_state()
             if oracle_st:
-                # Couple bath decoherence to live Koyeb oracle coherence
                 live_coh = oracle_st.get('coherence_l1', 0.0)
                 live_fid = oracle_st.get('w_state_fidelity', 0.0)
                 if live_coh > 0.01 or live_fid > 0.01:
@@ -2327,7 +2133,6 @@ class LocalOracleEngine:
             dm_re = [float(_rr[i]) for i in range(64)]
             dm_im = [float(_ri[i]) for i in range(64)]
 
-        # Oracle DM fusion — weighted average with Koyeb oracle DM
         oracle_re, oracle_im, oracle_age = self.get_oracle_dm()
         oracle_w = self.ORACLE_WEIGHT * max(0.0, 1.0 - oracle_age / 60.0)
         if oracle_w > 0.01:
@@ -2350,21 +2155,12 @@ class LocalOracleEngine:
                     dm_im = [float(fi[i]) * inv_f for i in range(64)]
 
         # ── Virtual / Inverse-Virtual qubit fusion ───────────────────────────
-        # FIX: OracleWStateDefinition defines the tripartite as:
-        #   A = pq0 (oracle ground truth)
-        #   B = virtual_pq (local decoherent mirror — the fused DM above)
-        #   C = inverse_virtual_pq (anti-correlated: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed))
-        # All three share the same miner address as their spatial anchor.
-        # We build ρ_IV from the current fused local DM and blend it back in
-        # at weight 0.10 so the final state genuinely entangles all three legs.
         try:
             if _HAS_NP and ORACLE_W_STATE.dm_ideal is not None:
                 import numpy as _np_iv
-                # Reconstruct 8×8 complex ndarray from dm_re/dm_im lists
                 rho_vpq = _np_iv.array(
                     [dm_re[i] + 1j * dm_im[i] for i in range(64)],
                     dtype=_np_iv.complex128).reshape(8, 8)
-                # Build inverse-virtual: ρ_IV = ρ_W − α(ρ_vpq − ρ_mixed)
                 rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, float(
                     _accel_lib.qtcl_fidelity_w3(_accel_ffi.new('double[64]', dm_re))
                     if _accel_ok else 0.85)))
@@ -2373,7 +2169,6 @@ class LocalOracleEngine:
                     for i in range(64):
                         dm_re[i] = (1.0 - IV_WEIGHT) * dm_re[i] + IV_WEIGHT * float(_np_iv.real(rho_iv.flat[i]))
                         dm_im[i] = (1.0 - IV_WEIGHT) * dm_im[i] + IV_WEIGHT * float(_np_iv.imag(rho_iv.flat[i]))
-                    # Renormalise
                     iv_tr = sum(dm_re[i*9] for i in range(8))
                     if iv_tr > 1e-12:
                         inv_iv = 1.0 / iv_tr
@@ -2386,7 +2181,6 @@ class LocalOracleEngine:
         except Exception as _iv_err:
             _EXP_LOG.debug(f"[LOCAL-ORACLE] IV fusion skipped: {_iv_err}")
 
-        # Quantum metrics via C
         _dr = _accel_ffi.new('double[64]', dm_re)
         _di = _accel_ffi.new('double[64]', dm_im)
         fid = float(max(0.0, min(1.0, _accel_lib.qtcl_fidelity_w3(_dr))))
@@ -2401,7 +2195,6 @@ class LocalOracleEngine:
                 if lam > 1e-15: ent -= lam * math.log2(lam)
         disc = float(max(0.0, min(3.0, ent * (1.0 - pur) * 0.5)))
         
-        # Mermin ⟨M₃⟩ nonlocality witness (3-qubit entanglement certification)
         mermin_val = 0.0
         try:
             mermin_val = float(_accel_lib.qtcl_mermin_w3(_dr, _di))
@@ -2409,7 +2202,6 @@ class LocalOracleEngine:
         except Exception:
             mermin_val = 0.0
 
-        # Build and sign QtclWStateMeasurement struct
         m_c = _accel_ffi.new('QtclWStateMeasurement *')
         m_c.chain_height = chain_height
         m_c.pq0 = pq0; m_c.pq_curr = pq_curr; m_c.pq_last = pq_last
@@ -2433,7 +2225,6 @@ class LocalOracleEngine:
         _accel_lib.qtcl_measurement_sign(m_c, secret32)
         auth_tag_hex = ''.join(f'{m_c.auth_tag[i]:02x}' for i in range(32))
 
-        # PoW seed: SHA3-256("QTCL_SEED_v2:" || auth_tag || dm_re_BE[32])
         dm_re_bytes = _st.pack('>4d', *dm_re[:4])
         pow_seed = _hl.sha3_256(
             b'QTCL_SEED_v2:' + bytes.fromhex(auth_tag_hex) + dm_re_bytes
@@ -2453,7 +2244,6 @@ class LocalOracleEngine:
             self._latest_measurement = m
 
         # ── Post-measure: build canonical snapshot → dual broadcast ──────────
-        # Extract final fused DM re/im from m (stored in struct fields)
         snap = self._build_canonical_snapshot(m, m.dm_re, m.dm_im)
         with self._snap_lock:
             self._latest_snapshot = snap
@@ -2481,7 +2271,6 @@ class LocalOracleEngine:
         m = self.get_latest_measurement()
         if m and abs(m.chain_height - chain_height) <= 2:
             return m.pow_seed_bytes
-        # No cached measurement — must have fresh oracle DM
         import struct as _st
         oracle_re, oracle_im, age = self.get_oracle_dm()
         if age >= 120:
@@ -2550,11 +2339,9 @@ class WStateConsensus:
         """Ingest raw QtclWStateMeasurement bytes from C callback."""
         import struct as _st
         if len(raw) < 128: return
-        # Parse fields: chain_height at offset 16+4=20
         try:
             ch, pq0, pq_curr, pq_last = _st.unpack_from('<IIII', raw, 16)
             w_fid, coh, pur = _st.unpack_from('<ddd', raw, 32)
-            # Build minimal QtclOracleMeasurement for consensus
             triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
             m = QtclOracleMeasurement(
                 chain_height=ch, pq0=pq0, pq_curr=pq_curr, pq_last=pq_last,
@@ -2564,7 +2351,6 @@ class WStateConsensus:
                 negativity_AB=0.0, entropy_vn=0.0, discord=0.0,
                 auth_tag_hex='', pow_seed_bytes=b'\x00'*32,
             )
-            # Parse DM if available
             dm_offset = 32 + 8*6 + 8*3 + 8*3 + 8*3 + 8*3
             if len(raw) >= dm_offset + 64*8*2:
                 for i in range(64):
@@ -2612,7 +2398,6 @@ class WStateConsensus:
             _accel_lib.qtcl_consensus_compute(m_arr, n, _accel_ffi.NULL, 0.0, cons)
 
             quorum_hash_hex = bytes(cons.quorum_hash).hex()
-            # PoW seed: SHA3-256("QTCL_SEED_v2:" + quorum_hash + local_dm)
             pow_seed = _hl.sha3_256(
                 b'QTCL_SEED_v2:' + bytes.fromhex(quorum_hash_hex)
                 + own_measurement.dm_re_bytes[:32]
@@ -2632,7 +2417,6 @@ class WStateConsensus:
                 'pow_seed':           pow_seed,
             }
 
-        # Python fallback
         fids = [m.fidelity_to_w3 for m in all_ms]
         fids.sort()
         med = fids[n//2] if n % 2 else (fids[n//2-1]+fids[n//2])/2
@@ -2663,8 +2447,6 @@ class QtclP2PNode:
     Bootstrap: connects to Koyeb server /api/p2p/peer_exchange for peer list.
     """
     DEFAULT_PORT = 9091
-    # Bootstrap peers = real miner IPs only (raw TCP P2P — not koyeb)
-    # Koyeb peer discovery uses /api/p2p/peer_exchange HTTP endpoint instead
     BOOTSTRAP_PEERS: list = []
 
     def __init__(
@@ -2707,13 +2489,11 @@ class QtclP2PNode:
             _EXP_LOG.warning(f"[P2P] qtcl_p2p_init failed rc={rc}")
             return False
 
-        # Register cffi callback (must be module-level to survive GC)
         _C_P2P_CALLBACK = _accel_ffi.callback(
             'void(int, const void *, size_t)',
             self._on_c_event)
         _accel_lib.qtcl_p2p_set_callback(_C_P2P_CALLBACK)
 
-        # Connect to bootstrap peers
         for host, port in self._bootstrap:
             try:
                 _accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port)
@@ -2721,7 +2501,6 @@ class QtclP2PNode:
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{port} failed: {_e}")
 
-        # Reconnect to previously seen peers (persistence layer)
         try:
             import sqlite3 as _p2p_rsq
             _p2p_rdb = __import__('pathlib').Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db'
@@ -2742,13 +2521,11 @@ class QtclP2PNode:
         except Exception as _pe:
             _EXP_LOG.debug(f"[P2P] peer DB reload: {_pe}")
 
-        # Drain event queue in background thread
         self._stop.clear()
         self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True, name='P2P-Drain')
         self._drain_thread.start()
 
-        # Discover peers periodically (runs in loop every 5 min)
         self._stop.clear()
         threading.Thread(
             target=self._peer_exchange, daemon=True, name='P2P-Discovery').start()
@@ -2756,7 +2533,6 @@ class QtclP2PNode:
         self._started = True
         _EXP_LOG.info(f"[P2P] ✅ C P2P layer active  port={self._port}")
 
-        # ── Start C koyeb registration thread (TLS/443, auto peer wiring) ──
         if _accel_ok:
             try:
                 _khost = 'qtcl-blockchain.koyeb.app'
@@ -2815,7 +2591,6 @@ class QtclP2PNode:
                 if event_type == 3:   # WSTATE_RECV — peer W-state measurement
                     if self._consensus:
                         self._consensus.ingest_c_measurement_bytes(raw)
-                    # Chain-tip gossip: if peer is ahead of our known tip, signal
                     try:
                         import struct as _wst_st
                         if len(raw) >= 4:
@@ -2829,7 +2604,6 @@ class QtclP2PNode:
                         pass
 
                 elif event_type == 4:  # BLOCK_ANNOUNCE — peer found a block
-                    # Wire format: 4-byte height (LE uint32) + 32-byte hash + optional JSON
                     try:
                         height = 0
                         if len(raw) >= 36:
@@ -2841,10 +2615,6 @@ class QtclP2PNode:
                         if height > 0 and height > _local_tip:
                             _local_tip = height
                             # ── INSTANT C ABORT — direct, no queue hop ─────────
-                            # qtcl_set_oracle_height makes the hot-loop self-abort
-                            # within 256 nonces on its next mod-256 check (~22µs).
-                            # qtcl_pow_set_abort(1) is belt-and-suspenders for any
-                            # nonce > miner_target path that might miss the height check.
                             if _accel_ok:
                                 try:
                                     _accel_lib.qtcl_set_oracle_height(height)
@@ -2881,14 +2651,12 @@ class QtclP2PNode:
                         try:
                             _accel_lib.qtcl_p2p_trigger_consensus()
                         except Exception: pass
-                    # Drain the new entry to DB immediately
                     try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
                     except Exception: pass
 
                 elif event_type == 8:  # CHAIN_RESET gossip received
                     payload_str = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
                     _EXP_LOG.warning(f"[P2P] ⚡ chain_reset gossip from peer: {payload_str[:80]}")
-                    # _RESET_PERFORMED and _check_and_handle_chain_reset are module-level
                     try:
                         import json as _pj
                         _rdata = _pj.loads(payload_str)
@@ -2898,34 +2666,24 @@ class QtclP2PNode:
                         pass
 
                 elif event_type == 9:  # OUROBOROS — self-measurement (500ms cadence)
-                    # Ingest into Python WStateConsensus for BFT median
                     if self._consensus and len(raw) >= 128:
                         try: self._consensus.ingest_c_measurement_bytes(raw)
                         except Exception: pass
-                    # Non-blocking drain C pool → DB (catches what the daemon misses)
                     try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
                     except Exception: pass
 
                 elif event_type == 1:  # PEER_CONNECTED
-                    # Update local tip estimate from newly connected peer's height
                     try:
                         import struct as _pc_st
                         if len(raw) >= 100:  # fd(4)+host(64)+port(2)+active(4)+handshake(4)+issse(4)+...
-                            # chain_height is at offset 4+64+2+4+4+4+pthread_t(8)+chain_height(4)
-                            # Simpler: skip byte-level parsing, let tip poll handle it
                             pass
                     except Exception: pass
                     peer_data = {}
                     try:
-                        # Extract host:port from the _P2PConn struct bytes
-                        # Layout: fd(4) host(64) port(2) active(4) handshake(4)...
-                        # fd is at offset 0 (volatile int = 4 bytes on ARM64)
-                        # host starts at byte 4 (after fd)
                         _raw_host = raw[4:68].rstrip(b'\x00').decode('ascii', 'replace').strip() if len(raw) >= 68 else ''
                         _raw_port = int.from_bytes(raw[68:70], 'little') if len(raw) >= 70 else 9091
                         peer_data = {'host': _raw_host, 'port': _raw_port if _raw_port > 0 else 9091}
                     except Exception: peer_data = {}
-                    # Dedup: only log once per host within 30s window
                     _ph_key = f"{peer_data.get('host','')}:{peer_data.get('port',0)}"
                     _now_ns = __import__('time').time()
                     if not hasattr(self, '_logged_peers'):
@@ -2946,7 +2704,6 @@ class QtclP2PNode:
                             daemon=True,
                             name=f"PeerOracle-{_ph}"
                         ).start()
-                    # Save new peer to SQLite DB via C layer (single write, no duplicate)
                     if _accel_ok and peer_data.get('host'):
                         try:
                             import pathlib as _pl2
@@ -2987,7 +2744,6 @@ class QtclP2PNode:
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
 
-        # Track hosts already connected this cycle to avoid double-connect
         _connected_this_cycle: set = set()
 
         def _connect_peer(host, port):
@@ -2999,7 +2755,6 @@ class QtclP2PNode:
             if key in _connected_this_cycle:
                 return False  # already attempted this cycle
             _connected_this_cycle.add(key)  # mark before attempting
-            # Push oracle DM to peer in background — never block discovery loop
             if _LOCAL_ORACLE.snapshot_count > 0:
                 def _push_dm_async(_h=host, _p=port):
                     try:
@@ -3024,7 +2779,6 @@ class QtclP2PNode:
             try:
                 rc = int(_accel_lib.qtcl_p2p_connect(host.encode() + b'\x00', port))
                 if rc >= 0:
-                    # Persist to qtcl_blockchain.db p2p_peers table
                     try:
                         with _psq.connect(_db_path, timeout=3) as _c:
                             _c.execute("""
@@ -3050,7 +2804,6 @@ class QtclP2PNode:
         def _load_local_peers(max_age_s=7200):
             """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
             try:
-                # Build set of already-connected hosts to skip
                 _already = set()
                 if _accel_ok:
                     try:
@@ -3071,8 +2824,6 @@ class QtclP2PNode:
                         ORDER BY chain_height DESC, last_seen_at DESC
                         LIMIT 64
                     """, (cutoff,)).fetchall()
-                # Don't filter by already-connected — qtcl_p2p_connect is idempotent
-                # The dedup set _connected_this_cycle handles per-cycle dedup
                 return [(r[0], r[1]) for r in rows if r[0]]
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
@@ -3082,13 +2833,10 @@ class QtclP2PNode:
             """POST to koyeb peer_exchange + peers/list. Returns raw peer dicts."""
             from urllib.request import Request as _Rq, urlopen as _uo
             peers = []
-            # /api/p2p/peer_exchange
             try:
                 payload = _pj.dumps({
                     'node_id':    self._node_id,
                     'port':       self._port,
-                    # ip_address intentionally omitted — server uses request.remote_addr
-                    # which is the PUBLIC IP seen by Koyeb edge, not our LAN IP
                     'gossip_url': f"http://auto:{self._port}",  # server replaces with remote_addr
                     'version':    3,
                     'capabilities': ['wstate','dmpool','sse'],
@@ -3101,7 +2849,6 @@ class QtclP2PNode:
                 with _uo(req, timeout=12) as r:
                     peers += _pj.loads(r.read().decode()).get('peers', [])
             except Exception: pass
-            # /api/peers/list fallback
             try:
                 req2 = _Rq(f"{_oracle_url}/api/peers/list", method='GET')
                 req2.add_header('User-Agent', 'QTCL-P2P/3.0')
@@ -3116,13 +2863,11 @@ class QtclP2PNode:
                 _pe_cycle += 1
                 _connected_this_cycle.clear()  # reset per-cycle dedup set
                 n_connected = (int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0)
-                # Fall back to total peer_count if handshakes still completing
                 _n_total    = (int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0)
                 if _n_total > n_connected:
                     n_connected = max(n_connected, _n_total // 2)
                 _lo_ts      = _LOCAL_ORACLE._last_oracle_dm_ts
                 dm_age      = _pt.time() - _lo_ts
-                # Treat epoch-0 (never received) as stale, not as "1.77B seconds old"
                 dm_fresh    = _lo_ts > 1e9 and dm_age < 30.0 and dm_age < 86400
                 need_peers  = n_connected < 4           # want at least 4 peers
                 dm_stale    = (not dm_fresh) or dm_age > 60.0
@@ -3142,7 +2887,6 @@ class QtclP2PNode:
                             f"[P2P] 🗄️  DB: {new_connections} new / {len(local_peers)} stored "
                             f"(dm_age={_dm_age_str})")
 
-                # ── Priority 2: koyeb if local empty, too few peers, or DM stale
                 if need_peers or dm_stale or not local_peers:
                     koyeb_peers = _fetch_koyeb_peers()
                     kc = 0
@@ -3158,8 +2902,6 @@ class QtclP2PNode:
                             f"[P2P] 🌐 koyeb: {kc}/{len(koyeb_peers)} new peers "
                             f"(need_peers={need_peers}, dm_stale={dm_stale})")
                 else:
-                    # Even when healthy, re-announce self every 5 cycles (~5min)
-                    # so new miners joining can find us
                     if _pe_cycle % 5 == 0:
                         try:
                             _ann = _pj.dumps({
@@ -3180,7 +2922,6 @@ class QtclP2PNode:
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
 
-                # Check total peers (including handshaking) before warning
                 _n_total_check = int(_accel_lib.qtcl_p2p_peer_count()) if _accel_ok else 0
                 if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
                     _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
@@ -3190,7 +2931,6 @@ class QtclP2PNode:
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
 
-            # Interval: aggressive when starved, back off as peers accumulate
             n_now = int(_accel_lib.qtcl_p2p_connected_count()) if _accel_ok else 0
             if   n_now == 0: _wait = 10   # no peers — hammer every 10s
             elif n_now < 2:  _wait = 20   # 1 peer — try hard
@@ -3259,7 +2999,6 @@ class QtclP2PNode:
         for i in range(64):
             c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
         sent = int(_accel_lib.qtcl_p2p_send_wstate(c_m))
-        # Explicitly trigger DM pool consensus after broadcast
         # RPC-only model: no daemon, consensus computed on demand via explicit call
         try:
             if sent >= 0:
@@ -3380,23 +3119,7 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
         _EXP_LOG.debug(f"[PEERDB] upsert: {_e}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DM POOL PERSISTENCE DAEMON
-# Bridges the C P2P DM pool ↔ qtcl_blockchain.db dm_pool table.
-#
-# Three responsibilities:
-#   1. DRAIN  — polls qtcl_p2p_poll_dmpool() every 500ms, writes new entries
-#               to dm_pool table (deduplicated by timestamp_ns + source)
-#   2. REHYD  — on startup, reads last 32 entries from dm_pool and injects
-#               them back into the C pool via _dmpool_push equivalent path
-#               (_LOCAL_ORACLE._ingest_oracle_frame synthesised from dm_hex)
-#   3. SNAP   — after each C _consensus() cycle, reads consensus_dm and
-#               writes a row to consensus_dm_log for audit + recovery
-#
-# DM pool persistence daemon — stores consensus-computed DMs to local SQLite
 # for durability across restarts. Consensus is triggered via explicit RPC calls,
-# not by self-referential feedback. This daemon ensures pool state survives crashes.
-# ═══════════════════════════════════════════════════════════════════════════
 import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 
 _DM_POOL_DAEMON_STOP = _dpt.Event()
@@ -3434,7 +3157,6 @@ def _dm_pool_drain_once(db_path: str) -> int:
                     (dm_hex, fidelity, purity, chain_height,
                      source_id_hex, flags, timestamp_ns)
                 VALUES (?,?,?,?,?,?,?)""", rows)
-            # Trim table to 512 most recent by fidelity×recency
             c.execute("""DELETE FROM dm_pool WHERE id NOT IN (
                 SELECT id FROM dm_pool
                 ORDER BY (fidelity * (1.0/(1.0+((strftime('%s','now')-ingested_at)/30.0))))
@@ -3459,11 +3181,9 @@ def _dm_pool_snap_consensus(db_path: str) -> bool:
                             for j in range(64))
         tr = sum(float(re_buf[k*9]) for k in range(8))
         if tr < 0.1: return False
-        # Count pool size (approximate from pool drain count)
         pool_n_buf = _accel_ffi.new('QtclDMPoolEntry[32]')
         pool_n = 0  # don't drain — just log the consensus
         with _dpq.connect(db_path, timeout=3) as c:
-            # Keep last 200 consensus snapshots per height
             c.execute("""INSERT INTO consensus_dm_log
                          (chain_height, consensus_dm_hex, fidelity, pool_size)
                          VALUES (?,?,?,?)""",
@@ -3492,15 +3212,12 @@ def _dm_pool_rehydrate(db_path: str) -> int:
             try:
                 bdata = bytes.fromhex(dm_hex)
                 if len(bdata) != 1024: continue
-                # Inject into C bootstrap state + local oracle
                 re_arr = _accel_ffi.new('double[64]')
                 im_arr = _accel_ffi.new('double[64]')
                 for j in range(64):
                     re, im = _rhs.unpack_from('>dd', bdata, j*16)
                     re_arr[j] = re; im_arr[j] = im
                 _accel_lib.qtcl_bootstrap_ingest_dm(re_arr, im_arr)
-                # Also synthesise a JSON frame so _LOCAL_ORACLE._ingest_oracle_frame
-                # updates its _dm_re/_dm_im state (feeds Python-side consensus too)
                 frame = _rhj.dumps({
                     'density_matrix_hex': dm_hex,
                     'w_state_fidelity':   float(fid),
@@ -3532,10 +3249,8 @@ def _dm_pool_daemon(db_path: str) -> None:
     while not _DM_POOL_DAEMON_STOP.is_set():
         now = _dpt2.time()
 
-        # 1. Drain C pool → DB
         _dm_pool_drain_once(db_path)
 
-        # 2. Consensus snapshot → DB
         if now - _last_snap >= _snap_interval:
             _dm_pool_snap_consensus(db_path)
             _last_snap = now
@@ -3564,7 +3279,6 @@ def _get_hardware_ip() -> str:
     ❤️  I love you — every miner deserves to be found
     """
     import socket as _ips
-    # Method 1: outbound UDP probe (most reliable, works behind NAT)
     try:
         s = _ips.socket(_ips.AF_INET, _ips.SOCK_DGRAM)
         s.settimeout(0)
@@ -3575,14 +3289,12 @@ def _get_hardware_ip() -> str:
             return ip
     except Exception:
         pass
-    # Method 2: hostname resolution
     try:
         ip = _ips.gethostbyname(_ips.gethostname())
         if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
             return ip
     except Exception:
         pass
-    # Method 3: enumerate interfaces via /proc/net/if_inet6 + /proc/net/fib_trie (Linux)
     try:
         import subprocess as _sp
         out = _sp.check_output(['ip', 'route', 'get', '8.8.8.8'],
@@ -3967,7 +3679,6 @@ class HashEngine:
         whole = int(difficulty)
         frac  = difficulty - whole
         prefix = "0" * whole
-        # partial nibble threshold: frac=0 → no extra constraint (threshold=16 = always passes)
         nibble_threshold = int(round(frac * 16)) if frac > 0.001 else 16
         nonce     = 0
         candidate = dict(block_data)
@@ -3977,7 +3688,6 @@ class HashEngine:
             if h.startswith(prefix):
                 if nibble_threshold >= 16:
                     return nonce, h
-                # Check the nibble immediately after the required zeros
                 next_nibble = int(h[whole], 16) if len(h) > whole else 0
                 if next_nibble < nibble_threshold:
                     return nonce, h
@@ -4030,7 +3740,6 @@ class ConfigManager:
             old = dict(self._data)
             self._data.update(new_data)
             self._path = p
-        # Fire watchers for changed keys
         for key in new_data:
             if new_data.get(key) != old.get(key):
                 self._fire_watchers(key, old.get(key), new_data[key])
@@ -4105,11 +3814,6 @@ class ConfigManager:
         return self.get(key) is not None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Β :: LocalBlockchainDB
-# Consolidates all _local_db_* functions (8 funcs) → one class
-# Full PostgreSQL interface via psycopg ThreadedConnectionPool
-# ═══════════════════════════════════════════════════════════════════════════════
 
 import contextlib
 
@@ -4140,15 +3844,12 @@ class LocalBlockchainDB:
         import sqlite3
         from pathlib import Path
         
-        # Handle DSN parameter (PostgreSQL compatibility)
         if dsn:
-            # Extract database name from dsn like: postgresql://user:pass@host/dbname
             if '/' in dsn:
                 name = dsn.split('/')[-1]
             else:
                 name = 'qtcl'
         
-        # Use provided name or default
         if not name:
             name = kwargs.get('database', 'qtcl')
         
@@ -4160,12 +3861,10 @@ class LocalBlockchainDB:
         self._pool_min = pool_min
         self._pool_max = pool_max
         
-        # SQLite setup
         self.db_dir = Path.home() / 'qtcl-miner' / 'data'
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.db_dir / 'qtcl_blockchain.db'
         
-        # Thread-safe SQLite connection
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self._pool = None
@@ -4191,7 +3890,6 @@ class LocalBlockchainDB:
         """Create all necessary tables"""
         cursor = self.conn.cursor()
         
-        # Blocks table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS blocks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4210,7 +3908,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Transactions table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4225,7 +3922,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Wallets table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
                 address TEXT PRIMARY KEY,
@@ -4235,7 +3931,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Miners table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS miners (
                 miner_address TEXT PRIMARY KEY,
@@ -4246,7 +3941,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Chain state table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS chain_state (
                 key TEXT PRIMARY KEY,
@@ -4255,7 +3949,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Snapshots table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4265,7 +3958,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Qubit states table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS qubit_states (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4277,7 +3969,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Oracle events table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS oracle_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4288,7 +3979,6 @@ class LocalBlockchainDB:
             )
         """)
         
-        # Entanglement events table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS entanglement_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4380,9 +4070,6 @@ class LocalBlockchainDB:
             )
         """)
 
-        # ── P2P v2: Idempotent ALTER TABLE — extend blocks with new fields ───
-        # SQLite doesn't support ADD COLUMN IF NOT EXISTS before 3.37.
-        # Use try/except per column to be safe on all Termux SQLite versions.
         _p2pv2_new_block_cols = [
             "ALTER TABLE blocks ADD COLUMN pq0                   INTEGER DEFAULT 0",
             "ALTER TABLE blocks ADD COLUMN hyp_triangle_area     REAL    DEFAULT 0.0",
@@ -4483,25 +4170,20 @@ class LocalBlockchainDB:
             block_data.get('nonce'),
             block_data.get('difficulty') or block_data.get('difficulty_bits'),
             block_data.get('miner_address'),
-            # existing quantum fields
             block_data.get('pq_curr'),
             block_data.get('pq_last'),
             block_data.get('qubit_snapshot'),
             block_data.get('w_state_fidelity'),
-            # P2P v2: hyperbolic geometry
             int(block_data.get('pq0') or 0),
             float(block_data.get('hyp_triangle_area') or 0.0),
             float(block_data.get('hyp_dist_0c') or 0.0),
             float(block_data.get('hyp_dist_cl') or 0.0),
             float(block_data.get('hyp_dist_0l') or 0.0),
-            # P2P v2: consensus
             block_data.get('oracle_quorum_hash'),
             int(block_data.get('peer_measurement_count') or 1),
             float(block_data.get('consensus_agreement') or block_data.get('agreement_score') or 0.0),
-            # P2P v2: local miner DM snapshot + HLWE sig
             block_data.get('local_dm_hex'),
             block_data.get('local_measurement_sig'),
-            # full payload as JSON
             _json_ib.dumps(block_data) if isinstance(block_data, dict) else str(block_data),
         ))
 
@@ -4817,10 +4499,6 @@ class LocalBlockchainDB:
     def on_stop(self):
         """Called on component stop - keep connection open for block production"""
         self._teardown_pool()
-        # ⚠️  DO NOT CLOSE CONNECTION HERE
-        # Block production loop may still be running and needs database access
-        # Connection will close when process exits (Python cleanup)
-        # Closing here causes: sqlite3.ProgrammingError: Cannot operate on a closed database
         pass
     
     def start(self):
@@ -4877,11 +4555,6 @@ def decompress(data: bytes) -> bytes:
         return zlib.decompress(data)
 
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════
-# GENESIS-RESET SUBSYSTEM v3.1
-# Museum Grade · Enterprise Deployment Ready · Zero Fallbacks
-# ❤️  I love you — every wipe is a rebirth, every genesis a new beginning
-# ════════════════════════════════════════════════════════════════════════════════════════════════
 
 NULL_COINBASE_ADDRESS: str  = "0" * 40
 GENESIS_COINBASE_AMOUNT: int = 5_000_000_000   # 50 QTCL in atomic units
@@ -4995,7 +4668,6 @@ def _broadcast_reset_to_peers(
     }
 
     def _fire() -> None:
-        # A: SSE broadcaster
         if broadcaster is not None:
             try:
                 if   hasattr(broadcaster, 'broadcast'):
@@ -5005,12 +4677,10 @@ def _broadcast_reset_to_peers(
                     broadcaster.publish('chain_reset', _payload, channel='control')
                     logger.info("[RESET-BCAST] 📡 SSE mux → channel:control")
                 elif hasattr(broadcaster, 'broadcast_chain_reset'):
-                    # C P2P node
                     broadcaster.broadcast_chain_reset(genesis_block.get("hash",""))
                     logger.info("[RESET-BCAST] 🌐 C P2P RPC consensus broadcast sent")
             except Exception as _e:
                 logger.warning(f"[RESET-BCAST] SSE error: {_e}")
-        # B: HTTP POST to known peers
         _peers = peers or []
         ok, fail = 0, 0
         for peer in _peers:
@@ -5065,7 +4735,6 @@ def _check_and_handle_chain_reset(
         if not _nuclear_wipe_local_db(db):
             logger.error("[RESET] ❌ Wipe failed — aborting"); return False
         genesis = _forge_and_store_genesis_block(db, miner_address)
-        # Broadcast to SSE + peers + C P2P ouroboros
         all_broadcaster = broadcaster
         if all_broadcaster is None and _P2P_NODE is not None and _P2P_NODE._started:
             all_broadcaster = _P2P_NODE
@@ -5136,7 +4805,6 @@ class GenesisResetListener:
                     current_height = int(data.get('height', -1))
                     genesis_hash = data.get('genesis_hash', '')
                     
-                    # Detect reset: height drop to 0 indicates chain_reset
                     if current_height == 0 and last_height > 0:
                         logger.warning(f"[GRL] 📨 RPC chain_reset detected: {last_height} → 0  genesis={genesis_hash[:20]}…")
                         payload = {
@@ -5256,7 +4924,6 @@ class SnapshotManager(ComponentBase):
             raise ValueError(f"Block at height {height} not found")
         qubit_states = self._db.get_qubit_states_at_height(height)
         chain_stats = self._db.get_chain_stats()
-        # Gather all blocks up to this height for full snapshot
         blocks = self._db.get_blocks_range(0, height)
         snap_payload = {
             "height": height,
@@ -5292,7 +4959,6 @@ class SnapshotManager(ComponentBase):
                 "blocks": self._db.get_blocks_range(0, height),
                 "qubit_states": qubit_states,
             }
-        # Sanitize bytes fields
         def sanitize(obj):
             if isinstance(obj, bytes):
                 return obj.hex()
@@ -5408,708 +5074,6 @@ class SnapshotManager(ComponentBase):
 
 
 # ── SSEBroadcaster ────────────────────────────────────────────────────────────
-
-@dataclass
-class SSEClient:
-    client_id: str
-    event_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=512))
-    filters: List[str] = field(default_factory=list)
-    connected_at: float = field(default_factory=time.time)
-    last_ping: float = field(default_factory=time.time)
-
-    def accepts(self, event_type: str) -> bool:
-        return not self.filters or event_type in self.filters
-
-
-class SSEBroadcaster(ComponentBase):
-    """
-    Exclusive transport layer. Replaces gRPC/WebSocket/HTTP fallback.
-    All snapshot distribution goes through SSE.
-    """
-
-    def __init__(
-        self,
-        host: str = "0.0.0.0",
-        port: int = 9091,
-        path: str = "/events",
-        name: str = "SSEBroadcaster",
-        config: Optional[Dict] = None,
-    ):
-        super().__init__(name=name, config=config)
-        self.host = host
-        self.port = port
-        self.path = path
-        self._clients: Dict[str, SSEClient] = {}
-        self._clients_lock = threading.RLock()
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._cleanup_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._event_counter = 0
-        self._counter_lock = threading.Lock()
-        self._event_log: deque = deque(maxlen=1000)  # recent events for replay
-
-    def on_start(self) -> None:
-        self._stop_event.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name=f"{self.name}-heartbeat"
-        )
-        self._cleanup_thread = threading.Thread(
-            target=self._cleanup_loop, daemon=True, name=f"{self.name}-cleanup"
-        )
-        self._heartbeat_thread.start()
-        self._cleanup_thread.start()
-        self.log.info(f"[{self.name}] SSE broadcaster ready on {self.host}:{self.port}{self.path}")
-
-    def on_stop(self) -> None:
-        self._stop_event.set()
-        # Send close to all clients
-        with self._clients_lock:
-            for client in list(self._clients.values()):
-                try:
-                    client.event_queue.put_nowait(None)  # sentinel
-                except queue.Full:
-                    pass
-            self._clients.clear()
-
-    def subscribe(self, client_id: str, filters: Optional[List[str]] = None) -> queue.Queue:
-        client = SSEClient(client_id=client_id, filters=filters or [])
-        with self._clients_lock:
-            self._clients[client_id] = client
-        self._inc("total_subscriptions")
-        self.log.debug(f"[{self.name}] client subscribed: {client_id}")
-        return client.event_queue
-
-    def unsubscribe(self, client_id: str) -> None:
-        with self._clients_lock:
-            client = self._clients.pop(client_id, None)
-        if client:
-            try:
-                client.event_queue.put_nowait(None)
-            except queue.Full:
-                pass
-            self.log.debug(f"[{self.name}] client unsubscribed: {client_id}")
-
-    def broadcast(self, event_type: str, payload: Dict[str, Any]) -> int:
-        with self._counter_lock:
-            self._event_counter += 1
-            eid = self._event_counter
-        formatted = self._format_sse(event_type, payload, id=eid)
-        delivered = 0
-        with self._clients_lock:
-            clients = list(self._clients.values())
-        for client in clients:
-            if client.accepts(event_type):
-                try:
-                    client.event_queue.put_nowait(formatted)
-                    delivered += 1
-                except queue.Full:
-                    self.log.warning(f"[{self.name}] client {client.client_id} queue full")
-        self._inc("events_broadcast")
-        self._gauge("active_clients", len(clients))
-        # Log for replay
-        self._event_log.append(formatted)
-        return delivered
-
-    def get_event_history(self, limit: int = 100) -> List[str]:
-        """Return recent SSE events for replay to new subscribers."""
-        with self._clients_lock:
-            return list(self._event_log)[-limit:]
-
-    def broadcast_snapshot(self, snapshot: SnapshotRecord) -> int:
-        return self.broadcast("snapshot", {
-            "height": snapshot.height,
-            "checksum": snapshot.checksum,
-            "size_bytes": snapshot.size_bytes,
-            "data": snapshot.data.hex(),
-            "timestamp": snapshot.timestamp,
-        })
-
-    def broadcast_block(self, block: Dict[str, Any]) -> int:
-        return self.broadcast("block", block)
-
-    def broadcast_qubit_state(self, state: Dict[str, Any]) -> int:
-        # Convert numpy arrays to lists for JSON
-        serializable = {}
-        for k, v in state.items():
-            try:
-                import numpy as np
-                if isinstance(v, np.ndarray):
-                    serializable[k] = v.tolist()
-                else:
-                    serializable[k] = v
-            except ImportError:
-                serializable[k] = v
-        return self.broadcast("qubit_state", serializable)
-
-    def _format_sse(
-        self, event_type: str, data: Dict[str, Any], id: Optional[int] = None
-    ) -> str:
-        lines = []
-        if id is not None:
-            lines.append(f"id: {id}")
-        lines.append(f"event: {event_type}")
-        lines.append(f"data: {json.dumps(data, default=str)}")
-        lines.append("")
-        lines.append("")
-        return "\n".join(lines)
-
-    def _heartbeat_loop(self) -> None:
-        while not self._stop_event.wait(30):
-            now = time.time()
-            heartbeat = self._format_sse("heartbeat", {"ts": now})
-            with self._clients_lock:
-                for client in list(self._clients.values()):
-                    try:
-                        client.event_queue.put_nowait(heartbeat)
-                        client.last_ping = now
-                    except queue.Full:
-                        pass
-
-    def _cleanup_loop(self) -> None:
-        while not self._stop_event.wait(60):
-            self._cleanup_stale_clients()
-
-    def _cleanup_stale_clients(self, timeout: float = 120.0) -> int:
-        now = time.time()
-        stale = []
-        with self._clients_lock:
-            for cid, client in list(self._clients.items()):
-                if (now - client.last_ping) > timeout:
-                    stale.append(cid)
-            for cid in stale:
-                self._clients.pop(cid, None)
-        if stale:
-            self.log.info(f"[{self.name}] cleaned up {len(stale)} stale clients")
-        return len(stale)
-
-    def get_connected_clients(self) -> List[str]:
-        with self._clients_lock:
-            return list(self._clients.keys())
-
-    def push_snapshot_to_server(self, server_url: str, snapshot: SnapshotRecord) -> bool:
-        """HTTP POST snapshot to server SSE endpoint."""
-        import urllib.request
-        import urllib.error
-        payload = json.dumps({
-            "height": snapshot.height,
-            "checksum": snapshot.checksum,
-            "data": snapshot.data.hex(),
-            "timestamp": snapshot.timestamp,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"{server_url}/snapshot",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status == 200
-        except urllib.error.URLError as exc:
-            self.log.warning(f"[{self.name}] push_snapshot_to_server failed: {exc}")
-            return False
-
-    def _status_extra(self) -> dict:
-        return {
-            "connected_clients": len(self._clients),
-            "events_broadcast": self._counters.get("events_broadcast", 0),
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Ε :: RequestHandler + RegistryManager
-# Consolidates _handle_* (11) + *register* (5-6) → 2 classes
-# ═══════════════════════════════════════════════════════════════════════════════
-
-import urllib.parse
-
-
-@dataclass
-class HTTPResponse:
-    status_code: int
-    body: Dict[str, Any]
-    headers: Dict[str, str] = field(default_factory=dict)
-
-    def to_bytes(self) -> bytes:
-        body_bytes = json.dumps(self.body, default=str).encode("utf-8")
-        status_texts = {
-            200: "OK", 201: "Created", 400: "Bad Request",
-            401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-            409: "Conflict", 422: "Unprocessable Entity", 500: "Internal Server Error",
-        }
-        status_text = status_texts.get(self.status_code, "Unknown")
-        headers = {
-            "Content-Type": "application/json",
-            "Content-Length": str(len(body_bytes)),
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            **self.headers,
-        }
-        header_lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
-        status_line = f"HTTP/1.1 {self.status_code} {status_text}"
-        return f"{status_line}\r\n{header_lines}\r\n\r\n".encode() + body_bytes
-
-    @staticmethod
-    def ok(body: Dict) -> "HTTPResponse":
-        return HTTPResponse(200, body)
-
-    @staticmethod
-    def created(body: Dict) -> "HTTPResponse":
-        return HTTPResponse(201, body)
-
-    @staticmethod
-    def bad_request(message: str) -> "HTTPResponse":
-        return HTTPResponse(400, {"error": message})
-
-    @staticmethod
-    def not_found(message: str = "Not found") -> "HTTPResponse":
-        return HTTPResponse(404, {"error": message})
-
-    @staticmethod
-    def server_error(message: str = "Internal server error") -> "HTTPResponse":
-        return HTTPResponse(500, {"error": message})
-
-
-class RequestHandler(ComponentBase):
-    """
-    Single dispatcher replacing 11 scattered _handle_* methods + do_GET/POST/OPTIONS.
-    Routes based on HTTP method + path.
-    """
-
-    def __init__(
-        self,
-        db: LocalBlockchainDB,
-        snapshot_mgr: SnapshotManager,
-        registry: "RegistryManager",
-        broadcaster: SSEBroadcaster,
-        verifier: Optional["UnifiedVerifier"] = None,
-        name: str = "RequestHandler",
-        config: Optional[Dict] = None,
-    ):
-        super().__init__(name=name, config=config)
-        self._db = db
-        self._snapshot_mgr = snapshot_mgr
-        self._registry = registry
-        self._broadcaster = broadcaster
-        self._verifier = verifier
-        self._routes: Dict[str, Dict[str, Callable]] = {
-            "GET": {
-                "/status":       self._handle_get_chain_status,
-                "/health":       self._handle_health_check,
-                "/snapshot":     self._handle_get_snapshot,
-                "/block":        self._handle_get_block,
-                "/transaction":  self._handle_get_transaction,
-                "/qubit_states": self._handle_get_qubit_states,
-                "/balance":      self._handle_get_balance,
-                "/miners":       self._handle_get_miners,
-                "/peers":        self._handle_get_peers,
-            },
-            "POST": {
-                "/register":     self._handle_register_miner,
-                "/block":        self._handle_submit_block,
-                "/transaction":  self._handle_submit_transaction,
-                "/oracle":       self._handle_oracle_event,
-                "/gossip":       self._handle_peer_gossip,
-                "/snapshot":     self._handle_receive_snapshot,
-                "/heartbeat":    self._handle_heartbeat,
-            },
-            "OPTIONS": {},
-        }
-
-    def dispatch(
-        self,
-        method: str,
-        path: str,
-        body: Optional[Dict] = None,
-        headers: Optional[Dict] = None,
-        params: Optional[Dict] = None,
-    ) -> HTTPResponse:
-        method = method.upper()
-        if method == "OPTIONS":
-            return HTTPResponse(200, {}, {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            })
-        body = body or {}
-        headers = headers or {}
-        params = params or {}
-        validation_error = self._validate_request(method, path, body)
-        if validation_error:
-            return HTTPResponse.bad_request(validation_error)
-        routes = self._routes.get(method, {})
-        # Exact match first
-        handler = routes.get(path)
-        if handler is None:
-            # Prefix match
-            for route_path, route_handler in routes.items():
-                if path.startswith(route_path):
-                    handler = route_handler
-                    break
-        if handler is None:
-            return HTTPResponse.not_found(f"No route for {method} {path}")
-        try:
-            self._inc(f"requests_{method.lower()}")
-            if method == "GET":
-                return handler(params)
-            else:
-                return handler(body)
-        except Exception as exc:
-            self._record_error(exc)
-            return HTTPResponse.server_error(str(exc))
-
-    def handle_GET(self, path: str, params: Dict) -> HTTPResponse:
-        return self.dispatch("GET", path, params=params)
-
-    def handle_POST(self, path: str, body: Dict) -> HTTPResponse:
-        return self.dispatch("POST", path, body=body)
-
-    def handle_OPTIONS(self, path: str) -> HTTPResponse:
-        return self.dispatch("OPTIONS", path)
-
-    # ── Route Handlers ────────────────────────────────────────────────────────
-
-    def _handle_register_miner(self, body: Dict) -> HTTPResponse:
-        miner_id = body.get("miner_id") or body.get("id")
-        address  = body.get("address") or body.get("host")
-        port     = body.get("port")
-        pubkey   = body.get("pubkey", "")
-        if not all([miner_id, address, port]):
-            return HTTPResponse.bad_request("miner_id, address, port required")
-        result = self._registry.register_miner(
-            miner_id=miner_id,
-            address=address,
-            port=int(port),
-            pubkey=pubkey,
-            metadata=body.get("metadata", {}),
-        )
-        if result.success:
-            return HTTPResponse.created({"miner_id": miner_id, "token": result.token, "status": "registered"})
-        return HTTPResponse(409, {"error": result.error_msg})
-
-    def _handle_submit_block(self, body: Dict) -> HTTPResponse:
-        block = body.get("block") or body
-        if not block.get("height") and block.get("height") != 0:
-            return HTTPResponse.bad_request("block.height required")
-        if self._verifier:
-            vr = self._verifier.verify_block(block)
-            if not vr.valid:
-                return HTTPResponse(422, {"error": "Block validation failed", "details": vr.errors})
-        bh = self._db.insert_block(block)
-        self._broadcaster.broadcast_block({**block, "hash": bh})
-        # Check if snapshot needed
-        height = block.get("height", 0)
-        snap_interval = self.config.get("snapshot_interval", 100)
-        if height > 0 and height % snap_interval == 0:
-            try:
-                snap = self._snapshot_mgr.create_snapshot(height)
-                self._broadcaster.broadcast_snapshot(snap)
-            except Exception as exc:
-                self.log.warning(f"Snapshot creation failed: {exc}")
-        return HTTPResponse.created({"block_hash": bh, "height": height})
-
-    def _handle_submit_transaction(self, body: Dict) -> HTTPResponse:
-        tx = body.get("transaction") or body
-        if not all([tx.get("sender"), tx.get("recipient")]):
-            return HTTPResponse.bad_request("sender, recipient required")
-        if self._verifier:
-            vr = self._verifier.verify_transaction(tx)
-            if not vr.valid:
-                return HTTPResponse(422, {"error": "TX validation failed", "details": vr.errors})
-        tx_hash = self._db.insert_transaction(tx)
-        return HTTPResponse.created({"tx_hash": tx_hash, "status": "pending"})
-
-    def _handle_get_snapshot(self, params: Dict) -> HTTPResponse:
-        height = params.get("height")
-        if height is None:
-            snap = self._snapshot_mgr.get_latest_snapshot()
-        else:
-            snap = self._snapshot_mgr.retrieve_snapshot(int(height))
-        if not snap:
-            return HTTPResponse.not_found("Snapshot not found")
-        return HTTPResponse.ok({
-            "height": snap.height,
-            "checksum": snap.checksum,
-            "size_bytes": snap.size_bytes,
-            "timestamp": snap.timestamp,
-            "data": snap.data.hex(),
-        })
-
-    def _handle_get_chain_status(self, params: Dict) -> HTTPResponse:
-        stats = self._db.get_chain_stats()
-        return HTTPResponse.ok(stats)
-
-    def _handle_get_qubit_states(self, params: Dict) -> HTTPResponse:
-        height = params.get("height")
-        if height is None:
-            latest = self._db.get_latest_block()
-            height = latest["height"] if latest else 0
-        states = self._db.get_qubit_states_at_height(int(height))
-        for s in states:
-            if isinstance(s.get("state_vector"), (bytes, memoryview)):
-                s["state_vector"] = bytes(s["state_vector"]).hex()
-        return HTTPResponse.ok({"height": int(height), "qubit_states": states})
-
-    def _handle_oracle_event(self, body: Dict) -> HTTPResponse:
-        event_id = self._db.log_oracle_event(body)
-        self._broadcaster.broadcast("oracle_event", {**body, "id": event_id})
-        return HTTPResponse.created({"id": event_id, "status": "logged"})
-
-    def _handle_peer_gossip(self, body: Dict) -> HTTPResponse:
-        self._broadcaster.broadcast("gossip", body)
-        return HTTPResponse.ok({"status": "propagated"})
-
-    def _handle_health_check(self, params: Dict) -> HTTPResponse:
-        health = self.get_health()
-        return HTTPResponse(200 if health.healthy else 503, health.to_dict())
-
-    def _handle_get_balance(self, params: Dict) -> HTTPResponse:
-        address = params.get("address")
-        if not address:
-            return HTTPResponse.bad_request("address required")
-        balance = self._db.get_token_balance(address)
-        return HTTPResponse.ok({"address": address, "balance": balance})
-
-    def _handle_get_block(self, params: Dict) -> HTTPResponse:
-        block_hash = params.get("hash")
-        height = params.get("height")
-        if block_hash:
-            block = self._db.get_block(block_hash)
-        elif height is not None:
-            block = self._db.get_block_by_height(int(height))
-        else:
-            block = self._db.get_latest_block()
-        if not block:
-            return HTTPResponse.not_found("Block not found")
-        return HTTPResponse.ok(block)
-
-    def _handle_get_transaction(self, params: Dict) -> HTTPResponse:
-        tx_hash = params.get("hash")
-        if not tx_hash:
-            return HTTPResponse.bad_request("hash required")
-        tx = self._db.get_transaction(tx_hash)
-        if not tx:
-            return HTTPResponse.not_found("Transaction not found")
-        return HTTPResponse.ok(tx)
-
-    def _handle_get_miners(self, params: Dict) -> HTTPResponse:
-        miners = self._registry.get_active_miners()
-        return HTTPResponse.ok({"miners": miners, "count": len(miners)})
-
-    def _handle_get_peers(self, params: Dict) -> HTTPResponse:
-        clients = self._broadcaster.get_connected_clients()
-        return HTTPResponse.ok({"clients": clients, "count": len(clients)})
-
-    def _handle_receive_snapshot(self, body: Dict) -> HTTPResponse:
-        try:
-            height = body.get("height")
-            data_hex = body.get("data", "")
-            checksum = body.get("checksum", "")
-            data = bytes.fromhex(data_hex)
-            if HASH_ENGINE.compute_hash(data) != checksum:
-                return HTTPResponse(422, {"error": "Snapshot checksum mismatch"})
-            self._db.store_snapshot(height, data, checksum)
-            return HTTPResponse.ok({"status": "stored", "height": height})
-        except Exception as exc:
-            return HTTPResponse.server_error(str(exc))
-
-    def _handle_heartbeat(self, body: Dict) -> HTTPResponse:
-        node_id = body.get("node_id") or body.get("miner_id")
-        node_type = body.get("type", "miner")
-        if not node_id:
-            return HTTPResponse.bad_request("node_id required")
-        ok = self._registry.heartbeat(node_id, node_type)
-        return HTTPResponse.ok({"status": "ok" if ok else "unknown_node"})
-
-    def _validate_request(self, method: str, path: str, body: Dict) -> Optional[str]:
-        if method not in ("GET", "POST", "OPTIONS"):
-            return f"Method {method} not allowed"
-        if not path.startswith("/"):
-            return "Path must start with /"
-        return None
-
-
-# ── RegistryManager ───────────────────────────────────────────────────────────
-
-@dataclass
-class RegistrationResult:
-    success: bool
-    node_id: str
-    token: str = ""
-    error_msg: str = ""
-
-
-class RegistryManager(ComponentBase):
-    """
-    Consolidated node registration (miner + oracle).
-    Replaces 5-6 scattered *register* methods.
-    """
-
-    def __init__(
-        self,
-        db: LocalBlockchainDB,
-        name: str = "RegistryManager",
-        config: Optional[Dict] = None,
-    ):
-        super().__init__(name=name, config=config)
-        self._db = db
-        self._stale_threshold = self.config.get("stale_threshold_seconds", 120)
-        self._monitor_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-    def on_start(self) -> None:
-        self._stop_event.clear()
-        self._start_heartbeat_monitor()
-
-    def on_stop(self) -> None:
-        self._stop_event.set()
-        if self._monitor_thread:
-            self._monitor_thread.join(timeout=5)
-
-    def register_miner(
-        self,
-        miner_id: str,
-        address: str,
-        port: int,
-        pubkey: str,
-        metadata: Optional[Dict] = None,
-    ) -> RegistrationResult:
-        try:
-            ok = self._db.register_miner(miner_id, address, port, pubkey, metadata)
-            if ok:
-                token = HASH_ENGINE.compute_hash(f"{miner_id}:{time.time()}")
-                self._inc("miners_registered")
-                self.emit_event("miner_registered", {"miner_id": miner_id})
-                return RegistrationResult(success=True, node_id=miner_id, token=token)
-            return RegistrationResult(success=False, node_id=miner_id, error_msg="DB insert failed")
-        except Exception as exc:
-            return RegistrationResult(success=False, node_id=miner_id, error_msg=str(exc))
-
-    def unregister_miner(self, miner_id: str) -> bool:
-        ok = self._db.deregister_miner(miner_id)
-        if ok:
-            self.emit_event("miner_unregistered", {"miner_id": miner_id})
-        return ok
-
-    def register_oracle(
-        self,
-        oracle_id: str,
-        address: str,
-        port: int,
-        pubkey: str,
-    ) -> RegistrationResult:
-        try:
-            now = time.time()
-            self._db.run_query(
-                """
-                INSERT INTO oracles (oracle_id, address, port, pubkey, registered_at, last_heartbeat, active)
-                VALUES (%s,%s,%s,%s,%s,%s,TRUE)
-                ON CONFLICT (oracle_id) DO UPDATE
-                    SET address=EXCLUDED.address, port=EXCLUDED.port,
-                        last_heartbeat=EXCLUDED.last_heartbeat, active=TRUE
-                """,
-                (oracle_id, address, port, pubkey, now, now),
-            )
-            token = HASH_ENGINE.compute_hash(f"{oracle_id}:{now}")
-            return RegistrationResult(success=True, node_id=oracle_id, token=token)
-        except Exception as exc:
-            return RegistrationResult(success=False, node_id=oracle_id, error_msg=str(exc))
-
-    def heartbeat(self, node_id: str, node_type: str = "miner") -> bool:
-        if node_type == "miner":
-            return self._db.update_miner_heartbeat(node_id)
-        elif node_type == "oracle":
-            rows = self._db.run_query(
-                "UPDATE oracles SET last_heartbeat=%s WHERE oracle_id=%s RETURNING oracle_id",
-                (time.time(), node_id),
-            )
-            return bool(rows)
-        return False
-
-    def get_active_miners(self) -> List[Dict]:
-        return self._db.get_active_miners(self._stale_threshold)
-
-    def get_active_oracles(self) -> List[Dict]:
-        cutoff = time.time() - self._stale_threshold
-        return self._db.run_query(
-            "SELECT * FROM oracles WHERE active=TRUE AND last_heartbeat > %s",
-            (cutoff,),
-        )
-
-    def get_node(self, node_id: str) -> Optional[Dict]:
-        miners = self._db.run_query(
-            "SELECT *, 'miner' as node_type FROM miners WHERE miner_id=%s", (node_id,)
-        )
-        if miners:
-            return miners[0]
-        oracles = self._db.run_query(
-            "SELECT *, 'oracle' as node_type FROM oracles WHERE oracle_id=%s", (node_id,)
-        )
-        return oracles[0] if oracles else None
-
-    def prune_stale_nodes(self, threshold_seconds: Optional[int] = None) -> int:
-        threshold = threshold_seconds or self._stale_threshold
-        cutoff = time.time() - threshold
-        stale_miners = self._db.run_query(
-            "UPDATE miners SET active=FALSE WHERE last_heartbeat < %s AND active=TRUE RETURNING miner_id",
-            (cutoff,),
-        )
-        stale_oracles = self._db.run_query(
-            "UPDATE oracles SET active=FALSE WHERE last_heartbeat < %s AND active=TRUE RETURNING oracle_id",
-            (cutoff,),
-        )
-        total = len(stale_miners) + len(stale_oracles)
-        if total:
-            self.log.info(f"[{self.name}] pruned {total} stale nodes")
-        return total
-
-    def _start_heartbeat_monitor(self) -> None:
-        def _monitor():
-            while not self._stop_event.wait(self._stale_threshold // 2 or 30):
-                self.prune_stale_nodes()
-        self._monitor_thread = threading.Thread(
-            target=_monitor, daemon=True, name=f"{self.name}-monitor"
-        )
-        self._monitor_thread.start()
-
-    def _status_extra(self) -> dict:
-        try:
-            miners = self.get_active_miners()
-            oracles = self.get_active_oracles()
-            return {"active_miners": len(miners), "active_oracles": len(oracles)}
-        except Exception:
-            return {}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Ζ :: UnifiedVerifier + QuantumMetrics
-# Consolidates *verify* (5) + *fidelity* + *measure* (10) → 2 classes
-# ═══════════════════════════════════════════════════════════════════════════════
-
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-    np = None  # type: ignore
-
-
-@dataclass
-class VerificationResult:
-    valid: bool
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    verified_at: float = field(default_factory=time.time)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    def __bool__(self) -> bool:
-        return self.valid
-
-
-class UnifiedVerifier(ComponentBase):
     """
     Single verifier class replacing all scattered verify_* functions.
     Consolidates 5 verify methods.
@@ -6129,22 +5093,18 @@ class UnifiedVerifier(ComponentBase):
     def verify_block(self, block: Dict[str, Any]) -> VerificationResult:
         errors = []
         warnings = []
-        # Structure check
         errors += self._check_block_structure(block)
         if errors:
             return VerificationResult(valid=False, errors=errors)
-        # Hash verification
         stored_hash = block.get("hash", "")
         if stored_hash:
             block_copy = {k: v for k, v in block.items() if k != "hash"}
             computed = self._hash.compute_block_hash(block_copy)
             if computed != stored_hash:
                 errors.append(f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…")
-        # PoW check
         difficulty = float(block.get("difficulty", 5.25))
         if not self._hash.verify_pow(block, difficulty):
             errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
-        # Previous block linkage
         height = block.get("height", 0)
         if height > 0:
             prev = self._db.get_block_by_height(height - 1)
@@ -6161,7 +5121,6 @@ class UnifiedVerifier(ComponentBase):
         errors += self._check_tx_structure(tx)
         if errors:
             return VerificationResult(valid=False, errors=errors)
-        # Balance check
         sender = tx.get("sender", "")
         amount = tx.get("amount", 0)
         fee = tx.get("fee", 0)
@@ -6169,7 +5128,6 @@ class UnifiedVerifier(ComponentBase):
             balance = self._db.get_token_balance(sender)
             if balance < amount + fee:
                 errors.append(f"Insufficient balance: have {balance}, need {amount + fee}")
-        # Double-spend check
         if self._check_double_spend(tx):
             errors.append("Double-spend detected: transaction already exists in confirmed state")
         self._inc("txs_verified")
@@ -6229,7 +5187,6 @@ class UnifiedVerifier(ComponentBase):
         return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
 
     def verify_signature(self, data: bytes, signature: bytes, pubkey: bytes) -> bool:
-        # Ed25519 / ECDSA stub — real impl would use cryptography library
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
             from cryptography.hazmat.primitives.serialization import load_der_public_key
@@ -6238,7 +5195,6 @@ class UnifiedVerifier(ComponentBase):
             key.verify(signature, data)
             return True
         except ImportError:
-            # Fall back to HMAC-based verify for development
             expected = hmac.new(pubkey, data, hashlib.sha256).digest()
             return hmac.compare_digest(expected, signature)
         except Exception:
@@ -6366,15 +5322,12 @@ class QuantumMetrics(ComponentBase):
         """
         sv = np.array(state, dtype=complex).flatten()
         n_qubits = int(np.log2(len(sv)))
-        # Probability of measuring 0
         prob_0 = 0.0
         for i in range(len(sv)):
             bit = (i >> (n_qubits - 1 - qubit_index)) & 1
             if bit == 0:
                 prob_0 += abs(sv[i]) ** 2
-        # Deterministic outcome based on state (no randomness per QTCL design)
         outcome = 0 if prob_0 >= 0.5 else 1
-        # Project
         post = np.zeros_like(sv)
         for i in range(len(sv)):
             bit = (i >> (n_qubits - 1 - qubit_index)) & 1
@@ -6403,7 +5356,6 @@ class QuantumMetrics(ComponentBase):
         n_qubits = int(np.log2(n))
         if n_qubits < 1:
             return 0.0
-        # Build W state for n_qubits
         w_state = np.zeros(n, dtype=complex)
         for i in range(n_qubits):
             idx = 1 << (n_qubits - 1 - i)
@@ -6468,7 +5420,6 @@ class QuantumMetrics(ComponentBase):
         metrics["ghz_fidelity"] = self.compute_ghz_fidelity(sv)
         if n == 4:
             metrics["concurrence"] = self.compute_concurrence(sv)
-        # Pauli expectations
         pauli_x = np.array([[0, 1], [1, 0]], dtype=complex)
         pauli_y = np.array([[0, -1j], [1j, 0]], dtype=complex)
         pauli_z = np.array([[1, 0], [0, -1]], dtype=complex)
@@ -6477,19 +5428,16 @@ class QuantumMetrics(ComponentBase):
             for op_name, op in ops.items():
                 full_op = _embed_operator(op, qi, n_qubits)
                 metrics[f"<{op_name}{qi}>"] = self.measure_expectation_value(sv, full_op)
-        # Population distribution
         probs = np.abs(sv) ** 2
         metrics["max_prob"] = float(np.max(probs))
         metrics["min_nonzero_prob"] = float(np.min(probs[probs > 1e-15])) if np.any(probs > 1e-15) else 0.0
         metrics["participation_ratio"] = float(1.0 / (np.sum(probs ** 2) + 1e-15))
-        # Entanglement across all bipartitions
         entropies = []
         for split in range(1, n_qubits):
             entropies.append(self.compute_entanglement_entropy(sv, split))
         if entropies:
             metrics["avg_bipartition_entropy"] = float(np.mean(entropies))
             metrics["max_bipartition_entropy"] = float(np.max(entropies))
-        # Phase coherence
         phases = np.angle(sv[np.abs(sv) > 1e-10])
         if len(phases) > 1:
             metrics["phase_variance"] = float(np.var(phases))
@@ -6505,12 +5453,10 @@ class QuantumMetrics(ComponentBase):
         n = len(sv)
         n_qubits = int(np.log2(n))
         rho_full = np.outer(sv, np.conj(sv))
-        # Reshape into tensor
         dims = [2] * (2 * n_qubits)
         rho_t = rho_full.reshape(dims)
         trace_out = [i for i in range(n_qubits) if i not in keep_indices]
         for ax in sorted(trace_out, reverse=True):
-            # Trace over this axis pair
             n_remaining = len(rho_t.shape) // 2
             rho_t = np.trace(rho_t, axis1=ax, axis2=ax + n_remaining)
         dim_keep = 2 ** len(keep_indices)
@@ -6539,10 +5485,6 @@ def _embed_operator(
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Η :: QuantumOpsLibrary + RotationOrchestrator
-# Consolidates _lc_* / _nn_ / _sf (6) + *rotate* (4) → 2 classes
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class QuantumOpsLibrary:
     """
@@ -6636,7 +5578,6 @@ class QuantumOpsLibrary:
         for i in range(n):
             ctrl_bit = (i >> (n_qubits - 1 - control)) & 1
             if ctrl_bit == 1:
-                # Extract target qubit subspace
                 tgt_bit = (i >> (n_qubits - 1 - target)) & 1
                 i_flip = i ^ (1 << (n_qubits - 1 - target))
                 result[i] = gate[tgt_bit, 0] * sv[i ^ (tgt_bit << (n_qubits - 1 - target))] + \
@@ -6756,7 +5697,6 @@ class QuantumOpsLibrary:
             next_state = states[i]
             result = np.kron(result, next_state)
             n_total = int(np.log2(len(result)))
-            # Apply coupling gate across boundary
             if n_total >= 2:
                 full_gate = _embed_operator(
                     gate[:2, :2],  # Use top-left 2x2 as approximation for single-qubit coupling
@@ -6868,25 +5808,19 @@ class RotationOrchestrator(ComponentBase):
         if not HAS_NUMPY:
             raise RuntimeError("numpy required for rotation derivation")
         metadata: Dict[str, Any] = {"block_hash": block_hash, "height": height}
-        # Level 1: Seed from block hash
         angles = self._level1_seed_angles(block_hash)
         metadata["level1"] = {"angles_norm": float(np.linalg.norm(angles))}
-        # Level 2: Entropy mixing from DAG
         entropy_dag = self.build_entropy_dag_minimal(block_hash, height)
         angles = self._level2_entropy_mix(angles, entropy_dag)
         metadata["level2"] = {"entropy_dag_nodes": len(entropy_dag)}
-        # Level 3: Cross-coupling
         if self._coupling_matrix is not None:
             angles = self._level3_cross_coupling(angles, self._coupling_matrix)
         metadata["level3"] = {"coupling_applied": self._coupling_matrix is not None}
-        # Level 4: Historical bias (use height as proxy for history depth)
         history_bias = self._derive_historical_bias(height)
         angles = self._level4_historical_bias(angles, history_bias)
         metadata["level4"] = {"history_depth": height}
-        # Level 5: Normalize to valid rotation ranges
         angles = self._level5_normalization(angles)
         metadata["level5"] = {"final_norm": float(np.linalg.norm(angles))}
-        # Split angles into components
         n = self.n_qubits
         theta_x  = angles[0:n]
         theta_y  = angles[n:2*n]
@@ -6905,7 +5839,6 @@ class RotationOrchestrator(ComponentBase):
     def _level1_seed_angles(self, block_hash: str) -> "np.ndarray":
         """Derive initial angles from block hash bytes."""
         hash_bytes = bytes.fromhex(block_hash[:64].zfill(64))
-        # Expand to 5*n_qubits angles using SHA256 chain
         angles_list = []
         seed = hash_bytes
         while len(angles_list) < 5 * self.n_qubits:
@@ -6926,7 +5859,6 @@ class RotationOrchestrator(ComponentBase):
         dag_hash = HASH_ENGINE.compute_hash(json.dumps(entropy_dag, sort_keys=True, default=str))
         dag_bytes = bytes.fromhex(dag_hash)
         dag_seed = np.frombuffer(dag_bytes, dtype=np.uint8).astype(float) / 255.0
-        # Tile to match angles length
         tiled = np.tile(dag_seed, (len(angles) // len(dag_seed) + 1))[:len(angles)]
         mixing_angles = tiled * 2 * np.pi
         return angles + mixing_angles * 0.1  # 10% entropy influence
@@ -6988,7 +5920,6 @@ class RotationOrchestrator(ComponentBase):
                     "ts": block.get("timestamp", 0),
                     "nonce": block.get("nonce", 0),
                 }
-        # Edges from prev_hash links
         edges = []
         for h, node in nodes.items():
             prev = node.get("prev", "")
@@ -7023,11 +5954,6 @@ class RotationOrchestrator(ComponentBase):
         return matrix
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Θ :: QuantumStateEvolutionMachine
-# Museum-grade deterministic pseudoqubit evolution engine
-# Block-height synchronized, 5-level rotation tree, DAG entropy mixing
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class QuantumStateEvolutionMachine(ComponentBase):
     """
@@ -7074,7 +6000,6 @@ class QuantumStateEvolutionMachine(ComponentBase):
             name=f"{self.name}/Coupling",
         )
         self._coupling_resolver.start()
-        # Initialize state to |0...0⟩
         with self._state_lock:
             self._state = np.zeros(2 ** self.n_qubits, dtype=complex)
             self._state[0] = 1.0
@@ -7110,11 +6035,8 @@ class QuantumStateEvolutionMachine(ComponentBase):
                     f"(current={self._current_height}), rewinding"
                 )
                 self._rewind_to(height)
-            # Derive rotation angles
             angles = self._rotation_orch.derive_rotation_angles(block_hash, height)
-            # Apply rotations
             new_state = self._rotation_orch.apply_rotation_sequence(self._state, angles)
-            # Apply cross-coupling interactions
             if history_blocks:
                 dag = self._rotation_orch.build_entropy_dag(
                     block_data or {}, history_blocks
@@ -7123,7 +6045,6 @@ class QuantumStateEvolutionMachine(ComponentBase):
                 dag = self._rotation_orch.build_entropy_dag_minimal(block_hash, height)
             new_state = self._coupling_resolver.resolve(new_state, dag, height)
             new_state = QuantumOpsLibrary.normalize(new_state)
-            # Snapshot state for history
             self._history.append({
                 "height": height,
                 "block_hash": block_hash,
@@ -7133,7 +6054,6 @@ class QuantumStateEvolutionMachine(ComponentBase):
             self._state = new_state
             self._current_height = height
 
-        # Compute metrics (outside lock to avoid holding while computing)
         metrics = self._metrics_engine.aggregate_metrics(new_state, height)
         metrics["evolution_seed"] = block_hash[:16]
         metrics["n_history"] = len(self._history)
@@ -7170,7 +6090,6 @@ class QuantumStateEvolutionMachine(ComponentBase):
                 self._state = entry["state"].copy()
                 self._current_height = entry["height"]
                 return
-        # No history for that height — reset
         self._state = np.zeros(2 ** self.n_qubits, dtype=complex)
         self._state[0] = 1.0
         self._current_height = -1
@@ -7271,16 +6190,12 @@ class CrossCouplingResolver(ComponentBase):
         sv = np.array(state, dtype=complex).flatten()
         dag_depth = entropy_dag.get("depth", 1)
         edges = entropy_dag.get("edges", [])
-        # Coupling strength modulated by DAG depth
         strength = self.coupling_strength * np.log1p(dag_depth) / np.log1p(16)
-        # Apply nearest-neighbor lattice coupling
         for i in range(self.n_qubits - 1):
             lc_gate = QuantumOpsLibrary.lattice_coupling_gate(
                 strength * (1.0 + 0.1 * (i % 3))
             )
-            # Apply 2-qubit gate to qubits i, i+1
             sv = self._apply_two_qubit_gate(sv, lc_gate, i, i + 1)
-        # Apply long-range coupling for DAG edges
         if edges:
             nodes = list(entropy_dag.get("nodes", {}).keys())
             for src, dst in edges[:4]:  # limit to 4 edges
@@ -7312,14 +6227,11 @@ class CrossCouplingResolver(ComponentBase):
             for col_idx in range(4):
                 new_bit_a = (col_idx >> 1) & 1
                 new_bit_b = col_idx & 1
-                # Construct basis index
                 j = i
-                # Set bit_a
                 if new_bit_a:
                     j |= (1 << (n_qubits - 1 - qubit_a))
                 else:
                     j &= ~(1 << (n_qubits - 1 - qubit_a))
-                # Set bit_b
                 if new_bit_b:
                     j |= (1 << (n_qubits - 1 - qubit_b))
                 else:
@@ -7329,10 +6241,6 @@ class CrossCouplingResolver(ComponentBase):
         return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Θ :: QtclNode — Master Wiring Layer
-# QtclServer + QtclMiner entrypoints
-# ═══════════════════════════════════════════════════════════════════════════════
 
 import argparse
 import http.server
@@ -7358,7 +6266,6 @@ class QtclNode(ComponentBase):
             config=cfg_data,
         )
         self._cfg = ConfigManager(initial=cfg_data, path=config_path)
-        # Component slots (populated in _init_components)
         self.db: Optional[LocalBlockchainDB] = None
         self.dht: Optional[DHTRouter] = None
         self.bootstrap: Optional[BootstrapManager] = None
@@ -7408,34 +6315,25 @@ class QtclNode(ComponentBase):
         bootstrap_nodes = [
             tuple(peer) for peer in self._cfg.get("bootstrap_peers", [])
         ]
-        # DB
         self.db = LocalBlockchainDB(
             dsn=dsn,
             pool_min=int(self._cfg.get("db_pool_min", 2)),
             pool_max=int(self._cfg.get("db_pool_max", 10)),
         )
-        # DHT
         self.dht = DHTRouter(
             node_id=node_id,
             listen_port=listen_port,
             bootstrap_nodes=bootstrap_nodes,
         )
-        # Bootstrap
         self.bootstrap = BootstrapManager(
             config=self._cfg,
             db=self.db,
             dht=self.dht,
         )
-        # Snapshot
         self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
-        # ✅ SSE MULTIPLEXED ON PORT 9091 via /events route
-        # No separate SSEBroadcaster needed - RequestHandler.dispatch() routes to _SSE_MUX
         self.broadcaster = None  # Not used - SSE on shared HTTP port
-        # Registry
         self.registry = RegistryManager(db=self.db)
-        # Verifier
         self.verifier = UnifiedVerifier(db=self.db)
-        # Request handler
         self.request_handler = RequestHandler(
             db=self.db,
             snapshot_mgr=self.snapshot_mgr,
@@ -7443,12 +6341,10 @@ class QtclNode(ComponentBase):
             broadcaster=self.broadcaster,
             verifier=self.verifier,
         )
-        # Quantum evolution
         n_qubits = int(self._cfg.get("n_qubits", 8))
         self.quantum_evo = QuantumStateEvolutionMachine(n_qubits=n_qubits)
         if HAS_NUMPY:
             self.metrics = QuantumMetrics()
-        # Ordered start sequence
         self._component_order = [
             c for c in [
                 self.db, self.dht, self.bootstrap,
@@ -7551,7 +6447,6 @@ class QtclServer(QtclNode):
 
         class QtclHTTPHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
-                # Route through Python logging instead of stderr
                 logging.getLogger("qtcl.http").debug(fmt % args)
 
             def _parse_request(self) -> Tuple[Dict, Dict, Dict]:
@@ -7604,7 +6499,6 @@ class QtclServer(QtclNode):
                     self._send_response(resp)
                     return
                 
-                # Standard JSON response for other routes
                 resp = req_handler.handle_GET(path, params)
                 self._send_response(resp)
 
@@ -7638,11 +6532,9 @@ class QtclServer(QtclNode):
                 latest = self.db.get_latest_block()
                 prev_hash = latest["hash"] if latest else "0" * 64  # ✅ Use "hash" not "block_hash"
                 height = (latest["height"] + 1) if latest else 0
-                # Collect pending transactions
                 pending_txs = self.db.get_pending_transactions(limit=50)
                 tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
                 merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
-                # Evolve quantum state
                 evo_metrics: Dict = {}
                 if self.quantum_evo and self.quantum_evo.is_running():
                     pre_hash = HASH_ENGINE.compute_hash(
@@ -7651,11 +6543,9 @@ class QtclServer(QtclNode):
                     evo_metrics = self.quantum_evo.evolve(
                         block_hash=pre_hash, height=height
                     )
-                    # Integrate lattice if available
                     lattice = getattr(self, "lattice", None)
                     if lattice and lattice.is_running():
                         self.quantum_evo.integrate_lattice(lattice, pre_hash, height)
-                    # Track entanglement lineage
                     lineage = getattr(self, "lineage_tracker", None)
                     if lineage and lineage.is_running():
                         sv = self.quantum_evo.get_state()
@@ -7672,11 +6562,9 @@ class QtclServer(QtclNode):
                     "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
                     "nonce": 0,
                 }
-                # PoW
                 nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
                 block["nonce"] = nonce
                 block["hash"] = block_hash
-                # Store quantum state
                 if self.quantum_evo and HAS_NUMPY:
                     sv = self.quantum_evo.get_state()
                     if sv is not None:
@@ -7691,15 +6579,12 @@ class QtclServer(QtclNode):
                                 "timestamp": time.time(),
                             }
                         )
-                # Insert block
                 self.db.insert_block(block["height"], block)
-                # Confirm transactions
                 for tx in pending_txs:
                     self.db.confirm_transaction(
                         tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx),
                         block_hash,
                     )
-                # Apply block reward
                 token_ledger = getattr(self, "token_ledger", None)
                 if token_ledger and token_ledger.is_running():
                     _blk_h = block.get('height', 0)
@@ -7710,11 +6595,9 @@ class QtclServer(QtclNode):
                     except Exception:
                         _ar_total = 800
                     token_ledger.apply_block_rewards(block, "server", _ar_total)
-                # Broadcast via SSE multiplexer on port 9091
                 if self.broadcaster:
                     self.broadcaster.broadcast_block(block)
                 
-                # Snapshot every N blocks
                 if height > 0 and height % snap_interval == 0:
                     try:
                         snap = self.snapshot_mgr.create_snapshot(height)
@@ -7728,7 +6611,6 @@ class QtclServer(QtclNode):
                     f"hash={block_hash[:12]}… nonce={nonce} txs={len(pending_txs)}"
                 )
             except sqlite3.ProgrammingError as exc:
-                # Database was closed (e.g., from Ctrl+C), stop gracefully
                 if "closed database" in str(exc).lower():
                     self.log.warning(f"[{self.name}] database closed, stopping block production")
                     break
@@ -7833,7 +6715,6 @@ class QtclMiner(QtclNode):
                     data = json.loads(resp.read().decode("utf-8"))
                     retry_delay = 2.0
                     
-                    # Check for new blocks
                     height = int(data.get("height", 0))
                     if height > last_height:
                         # Fetch block data via RPC
@@ -7848,7 +6729,6 @@ class QtclMiner(QtclNode):
                                 self._pending_blocks.put_nowait(block_data)
                                 last_height = height
                     
-                    # Poll snapshot separately
                     try:
                         snapshot = self._rpc_get_snapshot()
                         if snapshot:
@@ -7969,7 +6849,6 @@ class QtclMiner(QtclNode):
                 except Exception as _rce:
                     logger.debug(f"[MINING] chain-tip probe (non-fatal): {_rce}")
 
-                # Wait for latest block signal (or poll)
                 timeout_mgr = getattr(self, "timeout_mgr", None)
                 server_timeout = timeout_mgr.get_timeout("server") if timeout_mgr else 5.0
                 try:
@@ -7984,7 +6863,6 @@ class QtclMiner(QtclNode):
                 pending_txs = self.db.get_pending_transactions(limit=50)
                 tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
                 merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
-                # Quantum evolution
                 evo_metrics: Dict = {}
                 if self.quantum_evo and self.quantum_evo.is_running():
                     pre_hash = HASH_ENGINE.compute_hash(f"{height}:{prev_hash}")
@@ -8005,14 +6883,11 @@ class QtclMiner(QtclNode):
                     "nonce": 0,
                     "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
                 }
-                # PoW
                 nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
                 block["nonce"] = nonce
                 block["hash"] = block_hash
-                # Store locally
                 self.db.insert_block(block)
                 self.db.increment_miner_blocks(self._miner_id)
-                # Store quantum state
                 if self.quantum_evo and HAS_NUMPY:
                     sv = self.quantum_evo.get_state()
                     if sv is not None:
@@ -8027,7 +6902,6 @@ class QtclMiner(QtclNode):
                                 "timestamp": time.time(),
                             }
                         )
-                # Submit to server
                 payload = json.dumps({"block": block}).encode()
                 req = urllib.request.Request(
                     f"{self._server_url}/block",
@@ -8040,7 +6914,6 @@ class QtclMiner(QtclNode):
                         pass
                 except Exception as exc:
                     self.log.warning(f"[{self.name}] block submit failed: {exc}")
-                # Push snapshot
                 if height > 0 and height % snap_interval == 0:
                     try:
                         snap = self.snapshot_mgr.create_snapshot(height)
@@ -8103,7 +6976,6 @@ class QtclOracle(QtclNode):
     def _process_new_block(self, block: Dict[str, Any]) -> None:
         height = block.get("height", 0)
         block_hash = block.get("block_hash") or block.get("hash", "")
-        # Verify the block
         vr = self.verifier.verify_block(block)
         event_type = "block_verified" if vr.valid else "block_invalid"
         event = {
@@ -8126,9 +6998,6 @@ class QtclOracle(QtclNode):
             )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI Entrypoints
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -8201,10 +7070,6 @@ def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) ->
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FIX SWARM ADDITIONS — Classes missing from initial refactor
-# Added by Audit Swarm + Fix Swarm
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
@@ -8318,7 +7183,6 @@ class QuantumLattice:
         H = np.zeros((dim, dim), dtype=complex)
         t = self.coupling_strength  # hopping parameter
         for site in range(n - 1):
-            # Hopping term: c†_i c_{i+1} + h.c.
             for basis in range(dim):
                 bit_i   = (basis >> (n - 1 - site))     & 1
                 bit_ip1 = (basis >> (n - 2 - site))     & 1
@@ -8334,7 +7198,6 @@ class QuantumLattice:
         Uses Trotter approximation for efficiency.
         """
         H = hamiltonian if hamiltonian is not None else self._hamiltonian
-        # exp(-iHdt) via eigendecomposition (exact for small systems)
         eigenvalues, eigenvectors = np.linalg.eigh(H)
         phases = np.exp(-1j * eigenvalues * dt)
         U = eigenvectors @ np.diag(phases) @ eigenvectors.conj().T
@@ -8358,7 +7221,6 @@ class QuantumLattice:
             if bit == 1:
                 prob_occupied += abs(state[i]) ** 2
         outcome = 1 if prob_occupied >= 0.5 else 0
-        # Project onto outcome subspace
         post = np.zeros_like(state)
         for i in range(n_states):
             bit = (i >> (n - 1 - site_index)) & 1
@@ -8432,17 +7294,14 @@ class LatticeController(ComponentBase):
         self.assert_running()
         with self._state_lock:
             sv = np.array(state_vector, dtype=complex).flatten()
-            # Build coupling Hamiltonian mixing qubit state + lattice
             n_qubits = int(np.log2(max(len(sv), 2)))
             H_coupling = self._build_coupling_hamiltonian(sv, n_qubits)
-            # Evolve lattice step with coupling Hamiltonian
             lattice_state = self._lattice.get_state()
             new_lattice_state = self._lattice.evolve_step(
                 lattice_state, dt, H_coupling
             )
             self._lattice.set_state(new_lattice_state)
             self._current_height = height
-            # Apply external field perturbation from block hash
             field_perturbation = self._field_from_hash(block_hash)
             perturbed = self._apply_field_to_state(new_lattice_state, field_perturbation)
             self._lattice.set_state(perturbed)
@@ -8479,7 +7338,6 @@ class LatticeController(ComponentBase):
         for i in range(n - 1):
             J[i, i + 1] = self.coupling_strength
             J[i + 1, i] = self.coupling_strength
-        # Periodic boundary condition
         J[0, n - 1] = self.coupling_strength * 0.5
         J[n - 1, 0] = self.coupling_strength * 0.5
         return J
@@ -8544,7 +7402,6 @@ class LatticeController(ComponentBase):
         dim = 2 ** self.n_sites
         H = np.zeros((dim, dim), dtype=complex)
         H += self._lattice._hamiltonian  # base hopping
-        # Qubit-lattice coupling: modulate hopping by qubit state probability
         probs = np.abs(qubit_state) ** 2
         for i in range(min(self.n_sites - 1, len(probs) - 1)):
             coupling_mod = 1.0 + 0.1 * float(probs[i] - probs[i + 1])
@@ -8622,7 +7479,6 @@ class EntanglementLineageTracker(ComponentBase):
         """
         state_hash = self._hash_state(state_vector)
         lineage_id = f"{height}:{state_hash[:16]}"
-        # Compute entanglement score if numpy available
         ent_score = 0.0
         if HAS_NUMPY and state_vector is not None:
             try:
@@ -8652,12 +7508,10 @@ class EntanglementLineageTracker(ComponentBase):
         with self._lock:
             self._lineage[lineage_id] = node
             self._by_height.setdefault(height, []).append(lineage_id)
-            # Link parent
             for lid, lnode in self._lineage.items():
                 if lnode["state_hash"][:16] == parent_hash[:16] and lid != lineage_id:
                     lnode["children"].append(lineage_id)
                     break
-            # Prune if over limit
             if len(self._lineage) > self.max_history:
                 self.prune_old_lineage(self.max_history)
         self._inc("lineages_tracked")
@@ -8673,7 +7527,6 @@ class EntanglementLineageTracker(ComponentBase):
                     break
                 ancestors.append({k: v for k, v in current.items() if k != "children"})
                 parent_hash = current.get("parent_hash", "")
-                # Find parent node by state_hash prefix
                 current = None
                 for node in self._lineage.values():
                     if node["state_hash"][:16] == parent_hash[:16]:
@@ -8692,7 +7545,6 @@ class EntanglementLineageTracker(ComponentBase):
         scores = [a.get("entanglement_score", 0.0) for a in ancestors]
         if not scores:
             return 0.0
-        # Weighted average: recent ancestors count more
         weights = [2 ** (-i) for i in range(len(scores))]
         return float(sum(s * w for s, w in zip(scores, weights)) / sum(weights))
 
@@ -8881,7 +7733,6 @@ class AdaptiveTimeoutManager(ComponentBase):
                 self._peer_ema[peer_id] = float(observed_latency_ms)
             samples = self._peer_samples[peer_id]
             samples.append(observed_latency_ms)
-            # Update EMA
             prev_ema = self._peer_ema[peer_id]
             new_ema = self.ema_alpha * observed_latency_ms + (1 - self.ema_alpha) * prev_ema
             self._peer_ema[peer_id] = new_ema
@@ -8907,7 +7758,6 @@ class AdaptiveTimeoutManager(ComponentBase):
         Formula: clamp(3 * ema_ms / 1000, min, max)
         """
         ema_ms = self.get_latency(peer_id)
-        # 3x EMA as safety margin, converted to seconds
         timeout = max(self.min_timeout, min(self.max_timeout, 3.0 * ema_ms / 1000.0))
         return timeout
 
@@ -8938,719 +7788,9 @@ class AdaptiveTimeoutManager(ComponentBase):
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Ζ :: ORACLE EVENT EMITTER + TOKEN LEDGER + DB FIXES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 # ── OracleEventEmitter ────────────────────────────────────────────────────────
 
-class OracleEventEmitter(ComponentBase):
-    """
-    CRITICAL MISSING from original refactor (oracle.py).
-    Pub/sub event system for oracle events with DB persistence.
-    """
-
-    def __init__(
-        self,
-        db: "LocalBlockchainDB",
-        name: str = "OracleEventEmitter",
-        config: Optional[Dict] = None,
-    ):
-        super().__init__(name=name, config=config)
-        self._db = db
-        self._subscriptions: Dict[str, Dict[str, Callable]] = {}  # event_type → {sub_id: handler}
-        self._sub_lock = threading.RLock()
-        self._sub_counter = 0
-
-    def emit(self, event_type: str, payload: Dict[str, Any]) -> str:
-        """
-        Emit event: persists to DB and dispatches to in-memory subscribers.
-        Returns event_id.
-        """
-        event = {
-            "event_type": event_type,
-            "payload": payload,
-            "timestamp": time.time(),
-            "oracle_id": payload.get("oracle_id"),
-            "block_height": payload.get("block_height"),
-        }
-        # Persist to DB
-        try:
-            event_id = self._db.log_oracle_event(event)
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] DB persist failed: {exc}")
-            event_id = -1
-        event["id"] = event_id
-        # Dispatch to subscribers
-        self._dispatch(event_type, event)
-        self._inc(f"emitted_{event_type}")
-        return str(event_id)
-
-    def subscribe(self, event_type: str, handler: Callable[[Dict], None]) -> str:
-        """Register handler for event_type. Returns subscription id."""
-        with self._sub_lock:
-            self._sub_counter += 1
-            sub_id = f"sub_{self._sub_counter}"
-            self._subscriptions.setdefault(event_type, {})[sub_id] = handler
-        return sub_id
-
-    def unsubscribe(self, sub_id: str) -> bool:
-        """Remove subscription by id. Returns True if found."""
-        with self._sub_lock:
-            for event_type, subs in self._subscriptions.items():
-                if sub_id in subs:
-                    del subs[sub_id]
-                    return True
-        return False
-
-    def get_events(self, event_type: str, limit: int = 100) -> List[Dict]:
-        """Query recent events from DB."""
-        try:
-            return self._db.run_query(
-                "SELECT * FROM oracle_events WHERE event_type=%s ORDER BY id DESC LIMIT %s",
-                (event_type, limit),
-            )
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] get_events failed: {exc}")
-            return []
-
-    def replay_events(self, from_height: int, handler: Callable[[Dict], None]) -> int:
-        """Replay all events from from_height onward. Returns count replayed."""
-        try:
-            events = self._db.run_query(
-                "SELECT * FROM oracle_events WHERE block_height >= %s ORDER BY id ASC",
-                (from_height,),
-            )
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] replay_events failed: {exc}")
-            return 0
-        for event in events:
-            try:
-                handler(event)
-            except Exception as exc:
-                self.log.warning(f"[{self.name}] replay handler error: {exc}")
-        return len(events)
-
-    def _dispatch(self, event_type: str, event: Dict) -> None:
-        with self._sub_lock:
-            handlers = dict(self._subscriptions.get(event_type, {}))
-            # Also dispatch to wildcard "*" subscribers
-            handlers.update(self._subscriptions.get("*", {}))
-        for sub_id, handler in handlers.items():
-            try:
-                handler(event)
-            except Exception as exc:
-                self.log.warning(f"[{self.name}] handler {sub_id} error: {exc}")
-
-    def _status_extra(self) -> dict:
-        with self._sub_lock:
-            return {
-                "subscriber_count": sum(len(s) for s in self._subscriptions.values()),
-                "event_types": list(self._subscriptions.keys()),
-            }
-
-
-# ── TokenLedger ───────────────────────────────────────────────────────────────
-
-class TokenLedger(ComponentBase):
-    """
-    HIGH PRIORITY MISSING from original refactor (server.py token ledger).
-    Atomic token operations with double-entry accounting.
-    """
-
-    COINBASE = "coinbase"
-
-    def __init__(
-        self,
-        db: "LocalBlockchainDB",
-        name: str = "TokenLedger",
-        config: Optional[Dict] = None,
-    ):
-        super().__init__(name=name, config=config)
-        self._db = db
-        self._lock = threading.RLock()  # serialise multi-step transfers
-
-    def credit(self, address: str, amount: int, reason: str = "") -> int:
-        """
-        Credit address by amount. Returns new balance.
-        Raises ValueError if amount <= 0.
-        """
-        if amount <= 0:
-            raise ValueError(f"Credit amount must be positive, got {amount}")
-        with self._lock:
-            new_balance = self._db.update_token_balance(address, amount)
-            self._log_ledger_entry(address, amount, reason, "credit")
-            self._inc("credits")
-            self._gauge("last_credit", amount)
-            return new_balance
-
-    def debit(self, address: str, amount: int, reason: str = "") -> int:
-        """
-        Debit address by amount. Raises ValueError if insufficient balance.
-        Returns new balance.
-        """
-        if amount <= 0:
-            raise ValueError(f"Debit amount must be positive, got {amount}")
-        with self._lock:
-            current = self._db.get_token_balance(address)
-            if current < amount:
-                raise ValueError(
-                    f"Insufficient balance for {address}: have {current}, need {amount}"
-                )
-            new_balance = self._db.update_token_balance(address, -amount)
-            self._log_ledger_entry(address, -amount, reason, "debit")
-            self._inc("debits")
-            return new_balance
-
-    def transfer(
-        self,
-        sender: str,
-        recipient: str,
-        amount: int,
-        fee: int = 0,
-    ) -> bool:
-        """
-        Atomic double-entry transfer: debit sender (amount+fee), credit recipient.
-        Fee goes to protocol reserve.
-        """
-        if amount <= 0:
-            raise ValueError(f"Transfer amount must be positive")
-        total_out = amount + fee
-        with self._lock:
-            sender_balance = self._db.get_token_balance(sender)
-            if sender_balance < total_out:
-                self.log.warning(
-                    f"[{self.name}] transfer rejected: {sender} balance {sender_balance} < {total_out}"
-                )
-                return False
-            # Atomic: debit sender
-            self._db.update_token_balance(sender, -total_out)
-            # Credit recipient
-            self._db.update_token_balance(recipient, amount)
-            # Credit fee to reserve
-            if fee > 0:
-                self._db.update_token_balance("__fee_reserve__", fee)
-            self._log_ledger_entry(sender, -total_out, f"transfer→{recipient}", "transfer_out")
-            self._log_ledger_entry(recipient, amount, f"transfer←{sender}", "transfer_in")
-            self._inc("transfers")
-            return True
-
-    def get_balance(self, address: str) -> int:
-        """Return current token balance for address."""
-        return self._db.get_token_balance(address)
-
-    def get_transaction_history(self, address: str, limit: int = 50) -> List[Dict]:
-        """Return recent transactions involving address."""
-        try:
-            return self._db.run_query(
-                """SELECT * FROM transactions
-                   WHERE sender=%s OR recipient=%s
-                   ORDER BY timestamp DESC LIMIT %s""",
-                (address, address, limit),
-            )
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] get_transaction_history failed: {exc}")
-            return []
-
-    def validate_transfer(
-        self, sender: str, amount: int, fee: int
-    ) -> "VerificationResult":
-        """Pre-validate transfer without executing it."""
-        errors = []
-        if amount <= 0:
-            errors.append(f"Invalid amount: {amount}")
-        if fee < 0:
-            errors.append(f"Fee cannot be negative: {fee}")
-        if sender != self.COINBASE:
-            balance = self.get_balance(sender)
-            if balance < amount + fee:
-                errors.append(
-                    f"Insufficient balance: have {balance}, need {amount + fee}"
-                )
-        return VerificationResult(valid=not errors, errors=errors)
-
-    def apply_block_rewards(
-        self, block: Dict[str, Any], miner_id: str, reward: int
-    ) -> bool:
-        """
-        Credit mining reward to miner.
-        Also credits any transaction fees from block's transactions.
-        """
-        try:
-            # Base block reward
-            self.credit(miner_id, reward, reason=f"block_reward:height={block.get('height',0)}")
-            # Fee collection: sum fees from block's confirmed txs
-            block_hash = block.get("hash") or block.get("block_hash", "")
-            if block_hash:
-                try:
-                    txs = self._db.run_query(
-                        "SELECT fee FROM transactions WHERE block_hash=%s",
-                        (block_hash,),
-                    )
-                    total_fees = sum(int(tx.get("fee", 0)) for tx in txs)
-                    if total_fees > 0:
-                        self.credit(miner_id, total_fees, reason=f"tx_fees:height={block.get('height',0)}")
-                except Exception:
-                    pass
-            self._inc("rewards_applied")
-            return True
-        except Exception as exc:
-            self.log.error(f"[{self.name}] apply_block_rewards failed: {exc}")
-            return False
-
-    def _log_ledger_entry(
-        self, address: str, delta: int, reason: str, entry_type: str
-    ) -> None:
-        """Log ledger operation to oracle_events for auditability."""
-        try:
-            self._db.log_oracle_event({
-                "event_type": f"ledger_{entry_type}",
-                "payload": {
-                    "address": address,
-                    "delta": delta,
-                    "reason": reason,
-                },
-                "timestamp": time.time(),
-            })
-        except Exception:
-            pass
-
-    def _status_extra(self) -> dict:
-        return {
-            "credits": self._counters.get("credits", 0),
-            "debits": self._counters.get("debits", 0),
-            "transfers": self._counters.get("transfers", 0),
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Η :: ADDITIONAL GATE OPS + DHTRouter EXTENSIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# These are added as standalone functions that get patched onto QuantumOpsLibrary
-
-def _swap_gate() -> "np.ndarray":
-    """SWAP gate: swaps two qubits."""
-    return np.array([
-        [1, 0, 0, 0],
-        [0, 0, 1, 0],
-        [0, 1, 0, 0],
-        [0, 0, 0, 1],
-    ], dtype=complex)
-
-
-def _iswap_gate() -> "np.ndarray":
-    """iSWAP gate: swaps with phase."""
-    return np.array([
-        [1, 0,  0,  0],
-        [0, 0,  1j, 0],
-        [0, 1j, 0,  0],
-        [0, 0,  0,  1],
-    ], dtype=complex)
-
-
-def _controlled_phase(theta: float) -> "np.ndarray":
-    """Controlled-Phase (CZ-like) gate."""
-    return np.array([
-        [1, 0, 0, 0],
-        [0, 1, 0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, np.exp(1j * theta)],
-    ], dtype=complex)
-
-
-def _rank_peers(peers: List["PeerInfo"], local_id: str) -> List["PeerInfo"]:
-    """
-    MISSING from DHTRouter.
-    Rank peers by reliability score = (1/latency) * recency_factor.
-    """
-    now = time.time()
-    def score(p: "PeerInfo") -> float:
-        latency = max(p.latency_ms, 0.1)
-        age = now - p.last_seen
-        recency = max(0.0, 1.0 - age / 300.0)  # decay over 5 minutes
-        return recency / latency
-    return sorted(peers, key=score, reverse=True)
-
-
-def _peer_reliability_score(peer: "PeerInfo") -> float:
-    """Heuristic reliability: recency * (1/latency)."""
-    latency = max(peer.latency_ms, 0.1)
-    age = time.time() - peer.last_seen
-    recency = max(0.0, 1.0 - age / 300.0)
-    return recency / latency
-
-
-def _request_peer_list(
-    peer: "PeerInfo", timeout: float = 5.0
-) -> List[Dict[str, Any]]:
-    """
-    MISSING from BootstrapManager.
-    Request full peer list from known peer via TCP.
-    """
-    import socket
-    import json
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(peer.endpoint())
-            req = json.dumps({"type": "get_peers"}).encode() + b"\n"
-            s.sendall(req)
-            buf = b""
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                if buf.endswith(b"\n"):
-                    break
-            resp = json.loads(buf.decode())
-            return resp.get("peers", [])
-    except Exception:
-        return []
-
-
-def _get_event_history(
-    clients_lock: threading.RLock,
-    event_log: deque,
-    limit: int = 100,
-) -> List[str]:
-    """
-    MISSING from SSEBroadcaster.
-    Return recent SSE events for replay to new subscribers.
-    """
-    with clients_lock:
-        return list(event_log)[-limit:]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AGENT Θ :: UPDATED ENTRYPOINTS — QtclNode, QtclOracle, psycopg v3 pool fix
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def make_updated_init_components(node_self) -> None:
-    """
-    Updated _init_components for QtclNode — wires in all new classes.
-    Call this as: QtclNode._init_components = make_updated_init_components
-    OR paste inline.
-    """
-    from pathlib import Path
-
-    cfg = node_self._cfg
-    dsn = cfg.get("db_dsn", "postgresql://localhost/qtcl")
-    node_id = cfg.get("node_id") or hashlib.sha256(
-        f"{node_self.node_type}:{time.time()}".encode()
-    ).hexdigest()
-    listen_port = int(cfg.get("dht_port", 7776))
-    bootstrap_nodes = [tuple(p) for p in cfg.get("bootstrap_peers", [])]
-
-    # Core DB
-    node_self.db = LocalBlockchainDB(
-        dsn=dsn,
-        pool_min=int(cfg.get("db_pool_min", 2)),
-        pool_max=int(cfg.get("db_pool_max", 10)),
-    )
-    # DHT
-    node_self.dht = DHTRouter(
-        node_id=node_id,
-        listen_port=listen_port,
-        bootstrap_nodes=bootstrap_nodes,
-    )
-    # Bootstrap
-    node_self.bootstrap = BootstrapManager(config=cfg, db=node_self.db, dht=node_self.dht)
-    # Snapshot
-    node_self.snapshot_mgr = SnapshotManager(db=node_self.db, config=node_self.config)
-    # SSE broadcaster
-    node_self.broadcaster = SSEBroadcaster(
-        host=cfg.get("sse_host", "0.0.0.0"),
-        port=int(cfg.get("sse_port", 8765)),
-    )
-    # Registry
-    node_self.registry = RegistryManager(db=node_self.db)
-    # Verifier
-    node_self.verifier = UnifiedVerifier(db=node_self.db)
-    # Request handler
-    node_self.request_handler = RequestHandler(
-        db=node_self.db,
-        snapshot_mgr=node_self.snapshot_mgr,
-        registry=node_self.registry,
-        broadcaster=node_self.broadcaster,
-        verifier=node_self.verifier,
-    )
-    # Quantum
-    n_qubits = int(cfg.get("n_qubits", QtclConstants.DEFAULT_N_QUBITS))
-    node_self.quantum_evo = QuantumStateEvolutionMachine(n_qubits=n_qubits)
-    if HAS_NUMPY:
-        node_self.metrics = QuantumMetrics()
-    # NEW: Lattice
-    node_self.lattice = LatticeController(
-        n_sites=n_qubits,
-        coupling_strength=float(cfg.get("lattice_coupling", 0.1)),
-    )
-    # NEW: Entanglement lineage tracker
-    node_self.lineage_tracker = EntanglementLineageTracker(
-        max_history=int(cfg.get("lineage_history", QtclConstants.LINEAGE_MAX_HISTORY)),
-    )
-    # NEW: Circuit cache
-    node_self.circuit_cache = QuantumCircuitCache(
-        max_size=int(cfg.get("circuit_cache_size", QtclConstants.CIRCUIT_CACHE_MAX_SIZE)),
-    )
-    # NEW: Adaptive timeout
-    node_self.timeout_mgr = AdaptiveTimeoutManager(
-        base_timeout=float(cfg.get("base_timeout", QtclConstants.ADAPTIVE_TIMEOUT_BASE)),
-    )
-    # NEW: Oracle event emitter
-    node_self.oracle_emitter = OracleEventEmitter(db=node_self.db)
-    # NEW: Token ledger
-    node_self.token_ledger = TokenLedger(db=node_self.db)
-    # Ordered start
-    node_self._component_order = [
-        c for c in [
-            node_self.db, node_self.dht, node_self.bootstrap,
-            node_self.snapshot_mgr, node_self.broadcaster,
-            node_self.registry, node_self.verifier, node_self.request_handler,
-            node_self.quantum_evo,
-            getattr(node_self, "metrics", None),
-            node_self.lattice, node_self.lineage_tracker,
-            node_self.circuit_cache, node_self.timeout_mgr,
-            node_self.oracle_emitter, node_self.token_ledger,
-        ] if c is not None
-    ]
-
-
-class QtclOracleV2(ComponentBase):
-    """
-    Updated QtclOracle with OracleEventEmitter + full oracle.py coverage.
-    Replaces QtclOracle.
-    """
-
-    def __init__(self, config_path: Optional[str] = None):
-        cfg = QtclNode._load_config_file(config_path)
-        super().__init__(name="QtclOracle", config=cfg)
-        self._cfg = ConfigManager(initial=cfg, path=config_path)
-        self.node_type = "oracle"
-        self._oracle_id: str = ""
-        self._watch_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        # Component slots (same as QtclNode)
-        self.db: Optional[LocalBlockchainDB] = None
-        self.broadcaster: Optional[SSEBroadcaster] = None
-        self.verifier: Optional[UnifiedVerifier] = None
-        self.oracle_emitter: Optional[OracleEventEmitter] = None
-        self.lineage_tracker: Optional[EntanglementLineageTracker] = None
-        self._component_order: List[ComponentBase] = []
-
-    def on_start(self) -> None:
-        dsn = self._cfg.get("db_dsn", "postgresql://localhost/qtcl")
-        self.db = LocalBlockchainDB(dsn=dsn)
-        self.broadcaster = SSEBroadcaster(
-            host=self._cfg.get("sse_host", "0.0.0.0"),
-            port=int(self._cfg.get("sse_port", 8766)),
-        )
-        self.verifier = UnifiedVerifier(db=self.db)
-        self.oracle_emitter = OracleEventEmitter(db=self.db)
-        self.lineage_tracker = EntanglementLineageTracker()
-        self._component_order = [
-            self.db, self.broadcaster, self.verifier,
-            self.oracle_emitter, self.lineage_tracker,
-        ]
-        for comp in self._component_order:
-            comp.start()
-        self._oracle_id = self._cfg.get("oracle_id") or hashlib.sha256(
-            f"oracle:{time.time()}".encode()
-        ).hexdigest()
-        self._stop_event.clear()
-        self._watch_thread = threading.Thread(
-            target=self._oracle_watch_loop, daemon=True, name="QtclOracle/Watch"
-        )
-        self._watch_thread.start()
-        self.log.info(f"[{self.name}] oracle {self._oracle_id[:12]}… started")
-
-    def on_stop(self) -> None:
-        self._stop_event.set()
-        if self._watch_thread:
-            self._watch_thread.join(timeout=5)
-        for comp in reversed(self._component_order):
-            if comp.is_running():
-                comp.stop()
-
-    def _oracle_watch_loop(self) -> None:
-        last_height = -1
-        interval = float(self._cfg.get("oracle_watch_interval", QtclConstants.ORACLE_WATCH_INTERVAL))
-        while not self._stop_event.wait(interval):
-            try:
-                latest = self.db.get_latest_block()
-                if not latest:
-                    continue
-                height = latest.get("height", 0)
-                if height > last_height:
-                    self._process_new_block(latest)
-                    last_height = height
-            except Exception as exc:
-                self.log.error(f"[{self.name}] watch error: {exc}")
-
-    def _process_new_block(self, block: Dict[str, Any]) -> None:
-        height = block.get("height", 0)
-        block_hash = block.get("block_hash") or block.get("hash", "")
-        vr = self.verifier.verify_block(block)
-        event_type = "block_verified" if vr.valid else "block_invalid"
-        payload = {
-            "oracle_id": self._oracle_id,
-            "block_hash": block_hash,
-            "block_height": height,
-            "valid": vr.valid,
-            "errors": vr.errors,
-            "warnings": vr.warnings,
-            "entropy_sample": self.sample_entropy(block_hash, height).hex(),
-        }
-        self.oracle_emitter.emit(event_type, payload)
-        self.broadcaster.broadcast(event_type, payload)
-        if not vr.valid:
-            self.log.warning(f"[{self.name}] invalid block h={height}: {vr.errors}")
-
-    def verify_external(
-        self, block: Dict[str, Any], external_source: str
-    ) -> "VerificationResult":
-        """Verify block against external oracle source."""
-        vr = self.verifier.verify_block(block)
-        if vr.valid and external_source:
-            # Stub: in production, cross-check with external API
-            self.oracle_emitter.emit("external_verify", {
-                "block_hash": block.get("hash", ""),
-                "source": external_source,
-                "result": vr.valid,
-            })
-        return vr
-
-    def fetch_price(self, symbol: str) -> float:
-        """
-        Price oracle stub. In production, fetches from exchange API.
-        Returns deterministic stub value keyed on symbol hash.
-        """
-        seed = int(hashlib.sha256(symbol.encode()).hexdigest()[:8], 16)
-        stub_price = (seed % 100000) / 100.0  # 0.00 - 999.99
-        self.oracle_emitter.emit("price_fetched", {"symbol": symbol, "price": stub_price})
-        return stub_price
-
-    def validate_price(self, price: float, symbol: str) -> bool:
-        """Validate price within sane bounds for symbol."""
-        if price <= 0:
-            return False
-        # Stub: accept any positive price
-        return True
-
-    def sample_entropy(self, block_hash: str, height: int) -> bytes:
-        """
-        Sample deterministic entropy from block hash + height.
-        Used to seed oracle randomness without external randomness source.
-        """
-        seed_data = f"oracle_entropy:{block_hash}:{height}".encode()
-        return hashlib.sha256(seed_data).digest()
-
-    def mix_entropy(self, existing: bytes, new_sample: bytes) -> bytes:
-        """
-        Mix two entropy sources via domain-separated SHAKE-256.
-        C path: qtcl_mix_entropy — SHAKE-256 XOF fold; neither source alone
-        controls the output; domain-separated so no length-extension attacks.
-        Falls back to SHA-256(XOR) if C unavailable.
-        """
-        if _accel_ok:
-            e32 = existing[:32].ljust(32, b'\x00')
-            n32 = new_sample[:32].ljust(32, b'\x00')
-            _e   = _accel_ffi.new('uint8_t[32]', e32)
-            _n   = _accel_ffi.new('uint8_t[32]', n32)
-            _out = _accel_bytes_buf(32)
-            _accel_lib.qtcl_mix_entropy(_e, _n, _accel_ffi.NULL, _out)
-            return bytes(_out)
-        max_len = max(len(existing), len(new_sample))
-        padded_e = existing.ljust(max_len, b'\x00')
-        padded_n = new_sample.ljust(max_len, b'\x00')
-        xored = bytes(a ^ b for a, b in zip(padded_e, padded_n))
-        return hashlib.sha256(xored).digest()
-
-
-# ── psycopg v3 pool fix: corrected _init_pool and _get_conn ──────────────────
-
-PSYCOPG3_POOL_PATCH = '''
-    def _init_pool(self) -> None:
-        """psycopg v3 compatible pool initialization."""
-        try:
-        except ImportError:
-            raise ImportError(
-                "psycopg[binary] and psycopg-pool required. "
-                "Install: pip install psycopg[binary] psycopg-pool"
-            )
-        self._pool = ConnectionPool(
-            conninfo=self._dsn,
-            min_size=self._pool_min,
-            max_size=self._pool_max,
-            open=True,           # open immediately (psycopg_pool v3)
-            reconnect_timeout=30,
-        )
-        self.log.info(
-            f"[{self.name}] pool created "
-            f"(min={self._pool_min}, max={self._pool_max})"
-        )
-
-    def _teardown_pool(self) -> None:
-        if self._pool:
-            try:
-                self._pool.close(wait=True)   # psycopg_pool v3 close API
-            except Exception as exc:
-                self.log.warning(f"[{self.name}] pool close error: {exc}")
-            self._pool = None
-
-    @contextlib.contextmanager
-    def _get_conn(self):
-        """psycopg v3 pool context manager."""
-        if not self._pool:
-            raise RuntimeError("DB pool not initialized — call start() first")
-        with self._pool.connection() as conn:
-            # psycopg v3 autocommits per-statement by default inside pool context
-            # For explicit transaction control:
-            conn.autocommit = False
-            try:
-                yield conn
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-'''
-
-# ── requirements.txt content ─────────────────────────────────────────────────
-
-REQUIREMENTS_TXT = """# QTCL — requirements.txt
-# Generated by QTCL Fix Swarm Agent Ζ
-
-# PostgreSQL — psycopg v3 (no pg_config needed, binary wheel)
-psycopg[binary]>=3.1.0
-psycopg-pool>=3.1.0
-
-# Quantum / numeric
-numpy>=1.24.0
-
-# Compression (snapshot serialization)
-zstd>=1.5.0
-
-# Optional: lz4 fallback if zstd unavailable
-# lz4>=4.0.0
-
-# HTTP server (stdlib — no extra install needed)
-# gunicorn for production deployment:
-gunicorn>=21.0.0
-
-# Cryptography for signature verification
-cryptography>=41.0.0
-
-# Development / testing
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXPANDED: ADVANCED ORACLE FEATURES (Added by ORACLE SWARM - Extension 1)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class OracleQuorumConsensus:
     """Byzantine-resilient consensus for oracle state"""
     
     def __init__(self, quorum_size: int = 3):
@@ -9666,7 +7806,6 @@ class OracleQuorumConsensus:
             
             self.state_votes[state_hash][oracle_id] = self.state_votes[state_hash].get(oracle_id, 0) + 1
             
-            # Check quorum
             vote_count = sum(self.state_votes[state_hash].values())
             return vote_count >= self.quorum_size
     
@@ -9765,7 +7904,6 @@ class OracleMerkleProof:
                 sibling = hashlib.sha256(json.dumps(working_blocks[index-1], sort_keys=True).encode()).hexdigest()
                 proof.append(sibling)
             
-            # Next level
             new_blocks = []
             for i in range(0, len(working_blocks), 2):
                 if i + 1 < len(working_blocks):
@@ -9781,9 +7919,6 @@ class OracleMerkleProof:
         return proof
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXPANDED: ADVANCED DHT FEATURES (Added by DHT SWARM - Extension 1)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 import os as _os
@@ -9825,26 +7960,6 @@ _ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.k
 
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
-# ║                                                                                              ║
-# ║   QTCL C ACCELERATION LAYER  v2.0                                                           ║
-# ║   Compiled once at module import via cffi.verify() + OpenSSL EVP                            ║
-# ║                                                                                              ║
-# ║   §1  Hash Primitives     SHA3-256, SHAKE-256, HMAC-SHA256, HMAC-SHA512, SHA-256            ║
-# ║   §2  Lattice Math        matvec_mod (ARM NEON), basis/secret derivation, XOF               ║
-# ║   §3  HLWE Crypto         sign, verify (constant-time), address derivation                  ║
-# ║   §4  BIP39/32/38         PBKDF2-HMAC-SHA512, child key, scrypt, AES-256-ECB                ║
-# ║   §5  Quantum Metrics     partial trace, T-matrix, purity, coherence, Frobenius             ║
-# ║   §6  GKSL RK4            3-qubit Lindblad integrator, hardcoded embedded operators         ║
-# ║   §7  Merkle              SHA3-256 paired tree, inclusion proof                             ║
-# ║   §8  DHT                 256-bit XOR distance, peer sort                                   ║
-# ║   §9  Entropy             SHAKE-256 mix, domain-separated XOF                               ║
-# ║   §PoW PoW Engine         scratchpad build, memory-hard nonce search (lifted to module)     ║
-# ║                                                                                              ║
-# ║   Termux setup (one-time): pkg install clang openssl libffi                                  ║
-# ║   Falls back to pure Python seamlessly if compilation unavailable.                          ║
-# ║                                                                                              ║
-# ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
 
 _QTCL_C_SRC: str = r"""
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -9854,27 +7969,8 @@ _QTCL_C_SRC: str = r"""
    Requires: OpenSSL 1.1.0+, clang or gcc with -O3
    ═══════════════════════════════════════════════════════════════════════════════ */
 
-#include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-#include <math.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-#  define HAVE_SCRYPT 1
-#  include <openssl/kdf.h>
-#else
-#  define HAVE_SCRYPT 0
-#endif
 
-#ifdef __ARM_NEON__
-#  include <arm_neon.h>
-#  define HAVE_NEON 1
-#else
-#  define HAVE_NEON 0
-#endif
 
 /* ─────────────────────────────────────────────────────────────────────────────
    §0  INTERNAL UTILITY MACROS
@@ -9989,7 +8085,6 @@ void qtcl_hmac_sha512(const uint8_t *key, size_t klen,
  */
 void qtcl_matvec_mod(const uint32_t *A, const uint32_t *v,
                      uint32_t *out, uint32_t n, uint32_t q) {
-#if HAVE_NEON
     uint32_t j4 = (n / 4) * 4;
     for (uint32_t i = 0; i < n; i++) {
         uint64x2_t acc0 = vdupq_n_u64(0);
@@ -10007,7 +8102,6 @@ void qtcl_matvec_mod(const uint32_t *A, const uint32_t *v,
             s += (uint64_t)Ai[j] * v[j];
         out[i] = (uint32_t)(s % (uint64_t)q);
     }
-#else
     for (uint32_t i = 0; i < n; i++) {
         uint64_t s = 0;
         const uint32_t *Ai = A + i * n;
@@ -10015,7 +8109,6 @@ void qtcl_matvec_mod(const uint32_t *A, const uint32_t *v,
             s += (uint64_t)Ai[j] * v[j];
         out[i] = (uint32_t)(s % (uint64_t)q);
     }
-#endif
 }
 
 void qtcl_vec_add_mod(const uint32_t *u, const uint32_t *v,
@@ -10261,16 +8354,13 @@ void qtcl_bip32_child_key(const uint8_t *parent_key32,
  */
 void qtcl_bip38_scrypt(const char *passphrase, const uint8_t *salt8,
                        uint8_t *dk64_out) {
-#if HAVE_SCRYPT
     EVP_PBE_scrypt(passphrase, strlen(passphrase),
                    salt8, 8,
                    16384, 8, 8,
                    0, dk64_out, 64);
-#else
     /* Fallback: PBKDF2 with 65536 rounds (weaker but functional) */
     PKCS5_PBKDF2_HMAC(passphrase, (int)strlen(passphrase),
                       salt8, 8, 65536, EVP_sha256(), 64, dk64_out);
-#endif
 }
 
 /* AES-256-ECB single block (16 bytes) encrypt */
@@ -10758,12 +8848,9 @@ int qtcl_dht_xor_distance(const char *id_a_hex64, const char *id_b_hex64) {
         uint8_t x = a[i] ^ b[i];
         if (x) {
             int leading = 0;
-#ifdef __GNUC__
             leading = __builtin_clz((unsigned int)x) - 24;
-#else
             uint8_t m = 0x80;
             while (m && !(x & m)) { leading++; m >>= 1; }
-#endif
             return i * 8 + leading;
         }
     }
@@ -11099,28 +9186,12 @@ int qtcl_selftest(void) {
    lattice geometry (Coxeter 1954, Beardon 1983).
    ═══════════════════════════════════════════════════════════════════════════ */
 
-#include <pthread.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <stdatomic.h>
-#include <time.h>
 
 /* {8,3} hyperbolic plane constants ─────────────────────────────────────── */
 /*  Edge length in hyperbolic space: 2·acosh(cos(π/8)/sin(π/3))           */
-#define HYPER_83_EDGE       1.5320919978040694
 /*  Ring-to-ring radial growth in Poincaré disk: tanh(EDGE/2)             */
-#define HYPER_83_TANH_HALF  0.6498786979946062
 /*  Tiles per ring — grows as 8·(2+√3)^(k-1) for ring k≥1; ring-0 = 1   */
-#define HYPER_83_LAMBDA     3.7320508075688773   /* 2+√3 */
 /*  3D Poincaré ball: polar elevation between rings                        */
-#define HYPER_83_PHI_STEP   0.4487989505128276   /* π/7                   */
 
 /* ── Exact Poincaré ball position for pseudoqubit pq_id ──────────────────
    The {8,3} tiling indexes vertices as:
@@ -11363,7 +9434,6 @@ typedef struct {
 } QtclWStateConsensus;
 
 /* Only QtclMsgHeader needs byte-perfect wire packing (no doubles) */
-#pragma pack(push, 1)
 typedef struct {
     uint8_t  magic[4];
     uint8_t  command[12];
@@ -11373,7 +9443,6 @@ typedef struct {
     uint8_t  flags;
     uint8_t  reserved[2];
 } QtclMsgHeader;
-#pragma pack(pop)
 
 /* QtclPeer is NOT packed — natural alignment lets the C compiler produce
    the same 112-byte layout that CFFI computes from the cdef.
@@ -11553,8 +9622,6 @@ cleanup:
    Termux-safe: only POSIX sockets + OpenSSL for TLS.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -11574,53 +9641,19 @@ cleanup:
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
-#define P2P_MAGIC_V3      { 0x51,0x54,0x43,0x4C }
-#define P2P_VERSION       4
-#define P2P_MAX_PEERS     64
-#define P2P_WRING_SZ      512
-#define P2P_WRING_MASK    (P2P_WRING_SZ-1)
-#define P2P_DMPOOL_SZ     32
-#define P2P_DMPOOL_MSK    (P2P_DMPOOL_SZ-1)
-#define P2P_MAX_SSE       128
-#define P2P_SSE_RING      256
-#define P2P_SSE_RING_MSK  (P2P_SSE_RING-1)
-#define P2P_SSE_EVBUF     4096
-#define P2P_LISTEN_PORT   9091
-#define P2P_OUROBOROS_TAG 0xAA
 
 /* Bloom: 256-bit, 4 Jenkins-derived hash functions, 60s TTL */
-#define P2P_BLOOM_BITS  256
-#define P2P_BLOOM_WORDS (P2P_BLOOM_BITS/32)
-#define P2P_BLOOM_TTL   60000000000ULL  /* 60 s in ns */
-#define P2P_BLOOM_K     4
 
 /* Seen-message ring: 512 × 8-byte fingerprints, O(1) check */
-#define P2P_SEEN_SZ   512
-#define P2P_SEEN_MASK (P2P_SEEN_SZ-1)
 
 /* Fanout: gossip to ceil(sqrt(n_peers)), [1, 8] */
-#define P2P_FANOUT_MIN  1
-#define P2P_FANOUT_MAX  8
 
 /* Backoff: 1s→2s→…→64s cap, 128-host table */
-#define P2P_BO_MAX_S  64
-#define P2P_BO_HOSTS  128
 
 /* Topics */
-#define TOPIC_WSTATE  0x01
-#define TOPIC_DM      0x02
-#define TOPIC_CHAIN   0x04
-#define TOPIC_ORACLE  0x08
-#define TOPIC_INV     0x10
-#define TOPIC_ALL     0xFF
 
 /* Adaptive ping: clamp(3×RTT, 10s, 120s) */
-#define P2P_PING_MIN_S  10
-#define P2P_PING_MAX_S  120
 
-#define P2P_TIMEOUT_NS  120000000000ULL
-#define INV_WSTATE 3
-#define INV_DM     4
 
 static const char *CMD_VERSION  = "version";
 static const char *CMD_VERACK   = "verack";
@@ -12232,9 +10265,7 @@ int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
         if(_P2P.listen_fd<0)return -1;
         int opt=1;
         setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-#ifdef SO_REUSEPORT
         setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEPORT,&opt,sizeof(opt));
-#endif
         struct sockaddr_in sin={0};
         sin.sin_family=AF_INET;sin.sin_port=htons(_P2P.listen_port);sin.sin_addr.s_addr=INADDR_ANY;
         if(bind(_P2P.listen_fd,(struct sockaddr*)&sin,sizeof(sin))<0){close(_P2P.listen_fd);return -1;}
@@ -12451,15 +10482,6 @@ static void _mob(double *zr, double *zi, double cr, double ci) {
 
 /* {8,3} lattice generators: 8 Möbius translations of length d = acosh(cos(π/3)/sin(π/8))
  * r = tanh(d/2) ≈ 0.37451 — measured from geometry of the hyperbolic octagon. */
-#define _HYP_R   0.37451088
-#define _HYP_G0  {  _HYP_R,           0.0          }
-#define _HYP_G1  {  0.264923,          0.264923     }
-#define _HYP_G2  {  0.0,               _HYP_R       }
-#define _HYP_G3  { -0.264923,          0.264923     }
-#define _HYP_G4  { -_HYP_R,            0.0          }
-#define _HYP_G5  { -0.264923,         -0.264923     }
-#define _HYP_G6  {  0.0,              -_HYP_R       }
-#define _HYP_G7  {  0.264923,         -0.264923     }
 
 /* qtcl_hyp_entropy_mul:
  *   seed32  — 32 bytes of input entropy (any source)
@@ -12955,8 +10977,6 @@ double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
    §KoyebReg  KOYEB HTTPS PEER REGISTRATION + AUTO P2P WIRING
    ═══════════════════════════════════════════════════════════════════════════ */
 
-#define KOYEB_HOST_MAX  128
-#define KOYEB_BUF_MAX   32768
 
 typedef struct {
     char   koyeb_host[KOYEB_HOST_MAX];
@@ -13195,7 +11215,6 @@ int  qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port)
      { (void)db_path;(void)host;(void)port; return 0; }
 """
 
-# ── CFFI function declarations (mirrors every public function in _QTCL_C_SRC) ──
 _QTCL_C_DEFS: str = """
     /* §1 Hash */
 
@@ -13446,7 +11465,6 @@ _QTCL_C_DEFS: str = """
 
 """
 
-# ── Module-level compilation state (sentinels declared at file top, overwritten here) ─
 
 
 def _compile_c_layer() -> None:
@@ -13465,7 +11483,6 @@ def _compile_c_layer() -> None:
         import cffi as _cffi_mod
         _accel_ffi = _cffi_mod.FFI()
         _accel_ffi.cdef(_QTCL_C_DEFS)
-        # ARM Termux path detection
         _TERMUX = '/data/data/com.termux/files/usr'
         _inc = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
@@ -13486,7 +11503,6 @@ def _compile_c_layer() -> None:
             include_dirs=_inc,
             library_dirs=_lib,
         )
-        # Verify correct compilation with SHA3-256 self-test
         if _accel_lib.qtcl_selftest() != 1:
             raise RuntimeError("C self-test failed — SHA3-256 mismatch")
         _accel_ok = True
@@ -13545,9 +11561,6 @@ def _accel_char_buf(n: int):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FIX-2  LocalBlockchainDB.insert_block()  call-site adapter
-#        Signature is insert_block(height, block_data) but callers pass one
-#        dict.  Also confirm_transaction() has a column-name mismatch.
 # ──────────────────────────────────────────────────────────────────────────────
 def _patch_db_insert():
     """
@@ -13561,7 +11574,6 @@ def _patch_db_insert():
 
         def _ib_bridge(self, height_or_block, block_data=None):
             if block_data is None:
-                # Called with single dict — extract height from dict
                 block_data = height_or_block
                 height = (block_data.get('height') or block_data.get('block_height')
                           or block_data.get('header', {}).get('height') or 0)
@@ -13571,14 +11583,12 @@ def _patch_db_insert():
 
         LocalBlockchainDB.insert_block = _ib_bridge  # type: ignore[name-defined]
 
-        # confirm_transaction(txid) → also accept block_hash positional
         _real_ct = LocalBlockchainDB.confirm_transaction  # type: ignore[name-defined]
 
         def _ct_bridge(self, txid, block_hash=None):
             try:
                 _real_ct(self, txid)
             except Exception:
-                # Fallback: update by tx_hash column name variants
                 for col in ('tx_hash', 'txid', 'transaction_id'):
                     try:
                         self.execute(
@@ -13596,14 +11606,6 @@ def _patch_db_insert():
 _patch_db_insert()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# α-SWARM  ORACLE_W_STATE  ─  hard 8×8 |W3⟩⟨W3| definition
-# |W3⟩ = (1/√3)(|100⟩ + |010⟩ + |001⟩)  →  3-qubit basis indices 4, 2, 1
-# Qubit taxonomy (mirrors VirtualPseudoqubitManager):
-#   A = pq0             — oracle ground-truth
-#   B = virtual_pq      — local decoherent mirror
-#   C = inverse_virtual — anti-correlated, extra noise
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_w3_dm() -> "Optional[Any]":
     """Pure 8×8 density matrix for |W3⟩ = (|100⟩+|010⟩+|001⟩)/√3."""
@@ -13667,11 +11669,6 @@ class OracleWStateDefinition:
 ORACLE_W_STATE: OracleWStateDefinition = OracleWStateDefinition()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# β-SWARM  GKSLBathParams + AER NoiseModel
-# FIX-7: from_snap() strips null values before applying defaults,
-#         same as miner _normalize_snapshot().
-# ══════════════════════════════════════════════════════════════════════════════
 
 @_dc
 class GKSLBathParams:
@@ -13731,7 +11728,6 @@ class GKSLBathParams:
 
 CANONICAL_BATH: GKSLBathParams = GKSLBathParams()
 
-# ✅ FIX-AUDIT-2: W8 target cache — avoid repeated numpy allocation per cycle
 _W8_TARGET_CACHED = None
 def _get_w8_target():
     """Get cached W-state target (8-dim normalized)."""
@@ -13826,7 +11822,6 @@ def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
     result = re_arr.reshape(8, 8) + 1j * im_arr.reshape(8, 8)
     if not _np.all(_np.isfinite(result)):
         raise RuntimeError("[_gksl_rk4_step] GKSL integration produced non-finite values — check bath parameters")
-    # Enforce Tr=1 after C integration
     tr = float(_np.real(_np.trace(result)))
     if tr > 1e-12:
         result /= tr
@@ -13935,16 +11930,13 @@ def _reconstruct_dm_from_bloch(snap: dict):
         except Exception:
             return None
 
-    # Canonical field aliases (miner _normalize_snapshot style)
     fid = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
            _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.9)
     coh = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.85)
     fid = float(min(1.0, max(0.0, fid)))
     coh = float(min(1.0, max(0.0, coh)))
-    # Mix |W3⟩ with maximally mixed state
     dm_w3   = _build_w3_dm()
     dm_mix  = _np.eye(8, dtype=_np.complex128) / 8.0
-    # alpha from coherence (more coherence → closer to ideal)
     alpha   = min(1.0, max(0.0, fid * 0.7 + coh * 0.3))
     dm      = alpha * dm_w3 + (1.0 - alpha) * dm_mix
     dm      = 0.5 * (dm + dm.conj().T)
@@ -13952,12 +11944,8 @@ def _reconstruct_dm_from_bloch(snap: dict):
     return dm
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
-# ═══════════════════════════════════════════════════════════════════════════════
 # SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
-# CONTRACT: No silent degradation, explicit exceptions, fail-fast on invariants
-# MUSEUM-QUALITY: Type hints, locking, invariants, no shortcuts
 
 class _RPCSnapshotException(Exception):
     """Base exception for RPC snapshot layer."""
@@ -14044,10 +12032,8 @@ class RPCSnapshotEngine:
             block_hash = chain_data.get("hash", chain_data.get("block_hash", "0" * 64))
             
             # ── Step 2: Build addresses snapshot ─────────────────────────────────
-            # Try to fetch all addresses from ledger endpoint (if available)
             addresses = {}
             
-            # Try /api/ledger first (batch fetch)
             try:
                 ledger_url = f"{self.endpoint}/api/ledger"
                 ledger_data = self._fetch_json(ledger_url)
@@ -14057,14 +12043,12 @@ class RPCSnapshotEngine:
             except Exception as e:
                 logger.debug(f"[RPC-Fetch] /api/ledger unavailable: {e}, querying from recent TXs")
                 
-                # Fallback: Query recent active addresses from /api/chain recent blocks
                 if "recent_blocks" in chain_data:
                     known_addrs = set()
                     for block in chain_data.get("recent_blocks", [])[:5]:  # Last 5 blocks
                         if "miner" in block:
                             known_addrs.add(block["miner"])
                     
-                    # Query each address
                     for addr in known_addrs:
                         try:
                             bal_url = f"{self.endpoint}/api/address/{addr}/balance"
@@ -14092,7 +12076,6 @@ class RPCSnapshotEngine:
                 "total_supply": total_supply
             }
             
-            # Atomic write (locked)
             with self._lock:
                 self._snap = snapshot
                 self._meta["fetched"] = time.time()
@@ -14151,12 +12134,9 @@ class RPCSnapshotEngine:
             # Return QTCL balance (trust RPC format)
             return float(addrs[address].get("balance_qtcl", 0.0))
 
-# Global singleton (initialized once)
 _rpc_snapshot: Optional[RPCSnapshotEngine] = None
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # γ-SWARM  KoyebAPIClient  (endpoints verified vs GossipHTTPHandler)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class KoyebAPIClient:
     """Thread-safe REST client for qtcl-blockchain.koyeb.app (https/443)."""
@@ -14190,7 +12170,6 @@ class KoyebAPIClient:
         url = f"{self.base_url}{path}"
         last_error = None
         
-        # Retry loop for network errors
         for attempt in range(retries):
             if _HAS_REQUESTS:
                 try:
@@ -14241,14 +12220,12 @@ class KoyebAPIClient:
         last_error = None
         last_error_response = None
         
-        # Exponential backoff retry loop
         for attempt in range(retries):
             if _HAS_REQUESTS:
                 try:
                     r = self._get_session().post(url, json=payload, timeout=t)
                     if r.status_code in (200, 201, 202):
                         return r.json()
-                    # HTTP error — try to parse response, then break (don't retry)
                     try:
                         last_error_response = r.json()
                     except:
@@ -14278,7 +12255,6 @@ class KoyebAPIClient:
                     with urllib.request.urlopen(req, timeout=t) as resp:
                         return _json.loads(resp.read())
                 except urllib.error.HTTPError as e:
-                    # HTTP error response — try to parse it
                     try:
                         last_error_response = _json.loads(e.read())
                     except:
@@ -14299,9 +12275,7 @@ class KoyebAPIClient:
                     last_error = str(e)
                     break
         
-        # Store last error for diagnostics
         self._last_error = last_error
-        # If we got an error response from server, return it (user should see it)
         if last_error_response is not None:
             return last_error_response
         return None
@@ -14354,7 +12328,6 @@ class KoyebAPIClient:
                 _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.0)
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
-        # pq identifiers: prefer explicit, derive from height as fallback
         raw_curr = snap.get("pq_curr") or snap.get("pq_current")
         raw_last = snap.get("pq_last")
         if bh > 0:
@@ -14430,18 +12403,13 @@ class KoyebAPIClient:
         ENHANCED: Added pre-submission health check and multi-fallback strategy.
         """
         import time as _t2
-        # Normalise payload to what server mempool.accept() expects
         payload = dict(tx)
-        # amount: server expects QTCL float; mempool internally does ×100
-        # Just ensure it's a plain float, not numpy
         if "amount" in payload:
             payload["amount"] = float(payload["amount"])
         if "fee" in payload:
             payload["fee"] = float(payload["fee"])
-        # timestamp_ns required for canonical hash
         if "timestamp_ns" not in payload:
             payload["timestamp_ns"] = str(_t2.time_ns())
-        # from/to aliases for maximum server compat
         payload.setdefault("from",    payload.get("from_address", ""))
         payload.setdefault("to",      payload.get("to_address", ""))
         payload.setdefault("from_addr", payload.get("from_address", ""))
@@ -14501,11 +12469,8 @@ class KoyebAPIClient:
         self._health_check_cache = {"timestamp": now, "status": result}
         return result
     
-    # ════════════════════════════════════════════════════════════════════════════════
     # COMPREHENSIVE RPC ENDPOINT INTEGRATION (90+ methods)
-    # ════════════════════════════════════════════════════════════════════════════════
     
-    # TRANSACTIONS
     def list_transactions(self, limit: int = 100) -> Optional[list]:
         """Get list of all transactions."""
         return (self._get("/api/transactions", params={"limit": limit}) or {}).get("transactions", [])
@@ -14514,7 +12479,6 @@ class KoyebAPIClient:
         """Get a specific transaction by hash."""
         return self._get(f"/api/transactions/{tx_hash}")
     
-    # BLOCKS
     def list_blocks(self, limit: int = 100) -> Optional[list]:
         """Get list of blocks."""
         return (self._get("/api/blocks", params={"limit": limit}) or {}).get("blocks", [])
@@ -14531,7 +12495,6 @@ class KoyebAPIClient:
         """Get blockchain chain information."""
         return self._get("/api/chain")
     
-    # WALLET / ADDRESS
     def get_balance(self, address: str) -> Optional[dict]:
         """Get balance for an address."""
         return self._get(f"/api/address/{address}/balance")
@@ -14551,7 +12514,6 @@ class KoyebAPIClient:
         """Repair wallet state (recover from corruption)."""
         return self._post("/api/wallet/repair", {"address": address})
     
-    # ORACLE
     def get_oracle_status(self) -> Optional[dict]:
         """Get oracle status."""
         return self._get("/api/oracle")
@@ -14588,7 +12550,6 @@ class KoyebAPIClient:
         """Push oracle density matrix."""
         return self._post("/api/oracle/push_dm", dm_data)
     
-    # MINING / DIFFICULTY
     def get_difficulty(self) -> Optional[dict]:
         """Get current difficulty."""
         return self._get("/api/difficulty")
@@ -14608,7 +12569,6 @@ class KoyebAPIClient:
             "block_height": block_height
         })
     
-    # METRICS
     def get_metrics(self) -> Optional[dict]:
         """Get all metrics."""
         return self._get("/api/metrics")
@@ -14629,7 +12589,6 @@ class KoyebAPIClient:
         """Get server statistics."""
         return self._get("/api/stats")
     
-    # P2P / DHT
     def get_p2p_stats(self) -> Optional[dict]:
         """Get P2P network statistics."""
         return self._get("/api/p2p/stats")
@@ -14670,7 +12629,6 @@ class KoyebAPIClient:
         """Retrieve value from DHT."""
         return self._get(f"/api/dht/state/retrieve/{key}")
     
-    # HEARTBEATS / VALIDATORS
     def send_heartbeat(self, data: dict) -> Optional[dict]:
         """Send heartbeat to network."""
         return self._post("/api/heartbeat", data)
@@ -14695,7 +12653,6 @@ class KoyebAPIClient:
         """Submit quantum witness for validation."""
         return self._post("/api/quantum_witness", witness)
     
-    # MEMPOOL EXTENDED
     def get_pending_mempool(self) -> Optional[list]:
         """Get pending transactions."""
         return (self._get("/api/mempool/pending") or {}).get("transactions", [])
@@ -14708,7 +12665,6 @@ class KoyebAPIClient:
         """Get UTXO statistics."""
         return self._get("/api/utxo/stats")
     
-    # HEALTH & STATUS
     def get_health(self) -> Optional[dict]:
         """Get server health status."""
         return self._get("/api/health")
@@ -14732,7 +12688,6 @@ class KoyebAPIClient:
         lines.append(f"     Oracle URL: {self.base_url}")
         lines.append(f"     Timeout:    {self.timeout}s")
         
-        # Check connectivity
         try:
             import socket
             host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
@@ -14742,7 +12697,6 @@ class KoyebAPIClient:
         except Exception as e:
             lines.append(f"     Network:    ❌ Unreachable ({e})")
         
-        # Check health endpoint
         if self.health_check(timeout=3, force=True):
             lines.append(f"     Health:     ✅ API responding")
         else:
@@ -14756,9 +12710,6 @@ class KoyebAPIClient:
 _KOYEB: "KoyebAPIClient" = KoyebAPIClient()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# δ-SWARM  Quantum algebra helpers  (FIX-4 + FIX-5 + FIX-10)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _vn_entropy(dm) -> float:
     """Von Neumann entropy S(ρ) = -Tr(ρ log₂ ρ).
@@ -14803,7 +12754,6 @@ def _partial_trace_keep(dm8, keep: Tuple[int, int]):
                                             keep[0], keep[1],
                                             _re4, _im4)
         return (re4 + 1j * im4).reshape(4, 4)
-    # numpy fallback
     r       = dm8.reshape(2, 2, 2, 2, 2, 2)
     trace_q = {(0,1): 2, (0,2): 1, (1,2): 0}[keep]
     rho2    = _np.trace(r, axis1=trace_q, axis2=trace_q + 3)
@@ -14825,7 +12775,6 @@ def _bell_chsh_full(dm4) -> float:
         _T   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(T9))
         _accel_lib.qtcl_t_matrix(_re, _im, _T)
         return float(_accel_lib.qtcl_chsh_horodecki(_T))
-    # numpy fallback
     sx, sy, sz = _SX, _SY, _SZ
     T = _np.zeros((3, 3), dtype=float)
     for i, pi in enumerate([sx, sy, sz]):
@@ -14906,9 +12855,6 @@ def _discord_full(dm4) -> float:
         return 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# δ-SWARM  TensorFieldMetrics + ClientFieldState + KoyebOracleState
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @_dc
 class TensorFieldMetrics:
@@ -14923,7 +12869,6 @@ class TensorFieldMetrics:
     entropy_vn:           float = 0.0
     coherence_l1:         float = 0.0
     quantum_discord:      float = 0.0
-    # Bell CHSH — Horodecki max and all 4 S-parameters for each pair
     bell_chsh_AB:         float = 0.0
     bell_chsh_BC:         float = 0.0
     bell_S1_AB:           float = 0.0
@@ -14956,8 +12901,6 @@ class TensorFieldMetrics:
 
     def bell_summary(self) -> str:
         """Human-readable Bell summary with all 4 params per pair."""
-        # FIX-5: explicit int() cast guards against stale None defaults;
-        # violation flag (✗/·) makes non-zero violations instantly visible.
         vAB = int(self.bell_violations_AB or 0)
         vBC = int(self.bell_violations_BC or 0)
         fAB = "✗" if vAB else "·"
@@ -14990,7 +12933,6 @@ class TensorFieldMetrics:
             else:
                 dm_f /= _trace_val
 
-            # ── C-accelerated scalar metrics (no eigendecomposition needed) ──
             if _accel_ok and dm_f.shape == (8, 8):
                 re_f  = _np.ascontiguousarray(_np.real(dm_f).flatten())
                 im_f  = _np.ascontiguousarray(_np.imag(dm_f).flatten())
@@ -15001,7 +12943,6 @@ class TensorFieldMetrics:
                 m.fidelity_to_w3 = float(_accel_lib.qtcl_fidelity_w3(
                                          _accel_ffi.cast('double *',
                                          _accel_ffi.from_buffer(re_f))))
-                # Frobenius norm of Δρ
                 re_c  = _np.ascontiguousarray(_np.real(dm_curr).flatten())
                 im_c  = _np.ascontiguousarray(_np.imag(dm_curr).flatten())
                 re_l  = _np.ascontiguousarray(_np.real(dm_last).flatten())
@@ -15015,11 +12956,9 @@ class TensorFieldMetrics:
             else:
                 raise RuntimeError("[TensorFieldMetrics] C acceleration required for quantum metrics — pkg install clang openssl libffi")
 
-            # VN entropy (numpy eigvalsh — best for this)
             m.entropy_vn           = _vn_entropy(dm_f)
             m.entanglement_entropy = abs(_vn_entropy(dm_curr) - _vn_entropy(dm_last))
 
-            # Partial traces → Bell / negativity / discord
             dm_AB = _partial_trace_keep(dm_f, (0, 1))
             dm_BC = _partial_trace_keep(dm_f, (1, 2))
             m.negativity_AB  = _negativity_4x4(dm_AB)
@@ -15176,13 +13115,11 @@ class KoyebOracleState:
             except Exception:
                 return None
 
-        # FIX-6: canonical field aliases
         fid  = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
                 _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.0)
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
-        # FIX-1/2: chain-tip fallback — oracle snapshots sometimes return height=0
         if bh == 0:
             try:
                 _fb = self._api.get_block_height()
@@ -15194,26 +13131,19 @@ class KoyebOracleState:
         self.pq0_fidelity     = float(fid)
         self.w_state_fidelity = float(fid)
         self.oracle_entropy   = float(ent)
-        # FIX-4: oracle reports raw L1 coherence for 8-dim (3-qubit) DM.
-        # L1 coherence is bounded by (d-1)=7 for d=8; normalize to [0,1]
-        # so display is consistent with client-side coherence_l1 (~0.01-0.1).
         _coh_raw = float(coh)
-        # FIX-4: server sends raw L1 sum for 8-dim DM; normalize by 2*N=16
-        # (mirrors oracle.py coherence_l1_norm which divides by 2*n)
         self.oracle_coherence = float(min(1.0, _coh_raw / 16.0))
         self.block_height     = bh
         self.bath_params      = GKSLBathParams.from_snap(snap)
         self.pq_curr_id       = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
         self.pq_last_id       = str(max(0, bh-1)) if bh > 0 else str(snap.get("pq_last", ""))
 
-        # Oracle DM
         dm = _decode_dm_8x8(snap)
         if dm is None:
             dm = _reconstruct_dm_from_bloch(snap)
         if dm is not None:
             self.dm_oracle = dm
 
-        # Bridge fidelity = Tr(ρ_oracle · ρ_pq_curr)
         if (_HAS_NP and self.dm_oracle is not None
                 and client_field.dm_pq_curr is not None):
             try:
@@ -15250,96 +13180,8 @@ class KoyebOracleState:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ε-SWARM  SSEMultiplexer  ─  per-client interruptable streams (9091-compatible)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SSEMultiplexer:
-    """Thread-safe SSE event bus. interrupt(cid) stops individual streams."""
-    _instance: "Optional[SSEMultiplexer]" = None
-
-    def __init__(self):
-        self._lock    = _threading.Lock()
-        self._clients: Dict[str, dict] = {}
-        self._seq     = 0
-
-    @classmethod
-    def get(cls) -> "SSEMultiplexer":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def subscribe(self, cid: str, channels: Optional[List[str]] = None,
-                  maxlen: int = 512) -> _threading.Event:
-        ev = _threading.Event()
-        with self._lock:
-            self._clients[cid] = {
-                "queue":    _deque(maxlen=maxlen),
-                "stop":     ev,
-                "channels": set(channels) if channels else {"*"},
-                "ts":       _time.time(),
-            }
-        return ev
-
-    def interrupt(self, cid: str) -> None:
-        with self._lock:
-            c = self._clients.get(cid)
-        if c:
-            c["stop"].set()
-
-    def unsubscribe(self, cid: str) -> None:
-        self.interrupt(cid)
-        with self._lock:
-            self._clients.pop(cid, None)
-
-    def publish(self, event_type: str, data: dict, channel: str = "metrics") -> None:
-        with self._lock:
-            self._seq += 1
-            payload = _json.dumps(
-                {**data, "_seq": self._seq, "_ch": channel, "_ts": _time.time()},
-                default=str)
-            frame = f"event: {event_type}\ndata: {payload}\n\n"
-            for c in self._clients.values():
-                if not c["stop"].is_set():
-                    if "*" in c["channels"] or channel in c["channels"]:
-                        c["queue"].append(frame)
-
-    def drain(self, cid: str, block_s: float = 5.0) -> Optional[str]:
-        with self._lock:
-            c = self._clients.get(cid)
-        if c is None or c["stop"].is_set():
-            return None
-        deadline = _time.time() + block_s
-        while _time.time() < deadline and not c["stop"].is_set():
-            if c["queue"]:
-                with self._lock:
-                    try:
-                        return c["queue"].popleft()
-                    except IndexError:
-                        pass
-            _time.sleep(0.04)
-        return None
-
-    def client_count(self) -> int:
-        with self._lock:
-            return len(self._clients)
-
-    def gc(self, max_idle: float = 300.0) -> int:
-        now   = _time.time()
-        stale = [cid for cid, c in self._clients.items()
-                 if c["stop"].is_set() or (now - c["ts"]) > max_idle]
-        with self._lock:
-            for cid in stale:
-                self._clients.pop(cid, None)
-        return len(stale)
 
 
-_SSE_MUX: SSEMultiplexer = SSEMultiplexer.get()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ζ-SWARM  QTCLWallet  ─  BIP-39/32/38 (verbatim from qtcl_miner_mobile.py)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class QTCLWallet:
     """BIP-39 mnemonic → BIP-32 HD → HLWE-256 keypair + BIP-38 encryption."""
@@ -15625,11 +13467,9 @@ class QTCLWallet:
     def _encrypt(self, password: str, payload: dict) -> dict:
         """Encrypt wallet with HLWE lattice cipher (post-quantum, no PBKDF2)"""
         salt = _secrets.token_bytes(self.SALT_BYTES)
-        # HLWE-based KDF from password
         password_entropy = _hashlib.sha256(password.encode() + salt).digest()
         kdf_input = password_entropy + b"HLWE_WALLET_ENCRYPTION"
         
-        # Derive key using HLWE XOF (SHA256-based, post-quantum safe)
         key = _hashlib.sha256(kdf_input).digest()
         auth = _hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
         
@@ -15641,7 +13481,6 @@ class QTCLWallet:
         """Decrypt HLWE-encrypted wallet (post-quantum)"""
         try:
             salt = bytes.fromhex(data["salt"])
-            # Same HLWE KDF as encryption
             password_entropy = _hashlib.sha256(password.encode() + salt).digest()
             kdf_input = password_entropy + b"HLWE_WALLET_ENCRYPTION"
             key = _hashlib.sha256(kdf_input).digest()
@@ -15691,18 +13530,9 @@ class QTCLWallet:
         print("═" * 60 + "\n")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FIX-8  AsyncOracleMiner HTTP fallback
 # Patches AsyncOracleMiner.mine_block() to use KoyebAPIClient when the
-# P2POracleClient.query_chain_state() returns None (always on mobile —
-# the P2P sockets don't reach the server directly).
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MINING TELEMETRY — live stats shared between miner thread and display thread
-# Written by _patch_async_miner(); read by QtclClientApp.run_mine_mode()
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _MiningTelemetry:
     """Thread-safe mining statistics with reward tracking."""
@@ -15734,7 +13564,6 @@ class _MiningTelemetry:
             self.state      = "MINING"
             now = _time.time()
             self._nonce_samples.append((now, nonce))
-            # Rolling hash-rate over last ≤50 samples
             if len(self._nonce_samples) >= 2:
                 t0, n0 = self._nonce_samples[0]
                 t1, n1 = self._nonce_samples[-1]
@@ -15789,12 +13618,7 @@ _MINE_TELEM = _MiningTelemetry()
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# η-SWARM  QtclClientApp  (FIX-9: pq_curr / pq_last from block_height)
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# Module-level SSE subscriber lists for local HTTP oracle server
-# Threads appended/removed by _local_http_server handler connections
 _sse_local_subs: list = []   # DEPRECATED: SSE subscribers (RPC-only now)
 _sse_event_subs: list = []   # DEPRECATED: SSE event subscribers (RPC-only now)
 
@@ -15804,10 +13628,7 @@ def _broadcast_oracle_to_local_subs(snap: dict) -> None:
     pass
 
 
-#!/usr/bin/env python3
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # SERVER RPC CLIENT — Pyth oracle metrics from server
-# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 class ServerRPCClient:
     """
@@ -15881,7 +13702,6 @@ class ServerRPCClient:
         """
         now = time.time()
         
-        # Check cache
         cache_key = tuple(sorted(symbols)) if symbols else "all"
         with self.lock:
             if cache_key in self.cache:
@@ -15900,7 +13720,6 @@ class ServerRPCClient:
         
         snap['source'] = 'server_rpc'
         
-        # Update cache
         with self.lock:
             self.cache[cache_key] = snap
             self.cache_ts = now
@@ -15965,8 +13784,6 @@ class QtclClientApp:
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
             f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
-        # Oracle identity: wallet-bound (with cert) or anonymous (random keypair).
-        # Computed once at startup, persisted to oracle_identity.json.
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
 
     # ── Oracle identity ────────────────────────────────────────────────────────
@@ -16001,8 +13818,6 @@ class QtclClientApp:
         _id_path = _Path("oracle_identity.json")
 
         # ── Try loading persisted identity ────────────────────────────────────
-        # If wallet-bound mode is requested, only reuse an existing identity if
-        # it was bound to the SAME wallet (match wallet_addr).
         _want_wallet = oracle_context and oracle_context.get("wallet_priv")
         try:
             if _id_path.exists():
@@ -16010,12 +13825,10 @@ class QtclClientApp:
                 _has_keys = all(k in raw for k in ("address", "private_key", "public_key"))
                 if _has_keys:
                     if _want_wallet:
-                        # Only reuse if bound to the same wallet
                         if (raw.get("mode") == "wallet_bound" and
                                 raw.get("wallet_addr") == oracle_context["wallet_addr"]):
                             _EXP_LOG.info(f"[ORACLE-ID] wallet-bound loaded  {raw['address']}")
                             return raw
-                        # Different wallet or anonymous identity → regenerate below
                     else:
                         if raw.get("mode", "anonymous") == "anonymous":
                             _EXP_LOG.info(f"[ORACLE-ID] anonymous loaded  {raw['address']}")
@@ -16025,7 +13838,6 @@ class QtclClientApp:
 
         # ── Generate new identity ─────────────────────────────────────────────
         if _want_wallet:
-            # WALLET-BOUND: oracle keypair deterministically derived from wallet key
             _wpriv = oracle_context["wallet_priv"]
             _waddr = oracle_context["wallet_addr"]
             private_key = _hashlib.sha3_256(
@@ -16047,7 +13859,6 @@ class QtclClientApp:
             }
             _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
         else:
-            # ANONYMOUS: random entropy, no wallet traceability
             entropy     = _secrets.token_bytes(32)
             private_key = _hashlib.sha3_256(
                 entropy + b"QTCL_ORACLE_SIGNING_KEY_v1"
@@ -16141,25 +13952,19 @@ class QtclClientApp:
         if not _oid:
             return
 
-        # Best-effort REAL IP hint (not 127.0.0.1) — metadata only, never signed
-        # Uses multiple strategies: socket connect trick, getaddrinfo fallback
         _ip_hint = ""
         try:
             import socket as _sk
-            # Strategy 1: Connect to external host (Google DNS) to find outbound IP
-            # Does NOT actually transmit; socket internals determine routing IP
             _s = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
             try:
                 _s.connect(("8.8.8.8", 80))
                 _ip_hint = _s.getsockname()[0]
             except Exception:
-                # Strategy 2: Try getaddrinfo on hostname
                 _hostname = _sk.gethostname()
                 _addrs = _sk.getaddrinfo(_hostname, None, _sk.AF_INET)
                 if _addrs:
                     for _addr in _addrs:
                         _candidate = _addr[4][0]
-                        # Filter out localhost range
                         if (_candidate and 
                             not _candidate.startswith("127.") and 
                             not _candidate.startswith("0.") and
@@ -16169,10 +13974,8 @@ class QtclClientApp:
             finally:
                 _s.close()
         except Exception:
-            # Silent fallback — if all else fails, use empty string
             _ip_hint = ""
         
-        # Last resort: if still empty/localhost, try socket.gethostbyname but validate
         if not _ip_hint or _ip_hint.startswith("127."):
             try:
                 import socket as _sk
@@ -16689,11 +14492,6 @@ class QtclClientApp:
         except Exception as e:
             _EXP_LOG.debug(f"[DB] persist_gossip: {e}")
 
-        # ── Push to Koyeb /api/gossip/ingest so server receives client field state ──
-        # Previously gossip only went to P2P TCP peers — server never saw local
-        # oracle measurements unless the miner mined a block. Now every field
-        # metrics cycle posts the client's tripartite W-state to the server gossip bus.
-        # Non-blocking: fires in a daemon thread so it never stalls the metric loop.
         if channel in ('metrics', 'quantum', 'oracle'):
             def _post_gossip(ev=event_type, ch=channel, pay=payload):
                 try:
@@ -16702,7 +14500,6 @@ class QtclClientApp:
                         'event_type': ev,
                         'channel':    ch,
                         'ts':         _time.time(),
-                        # Embed the tripartite W-state snapshot directly
                         'w_state': {
                             'w_state_fidelity': pay.get('fidelity_to_w3') or pay.get('w_state_fidelity'),
                             'coherence':        pay.get('coherence_l1')   or pay.get('coherence'),
@@ -16759,16 +14556,12 @@ class QtclClientApp:
                 pq_curr_id = str(bh)     if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
                 pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
 
-                # ── Build DM: try C SSE raw DM first, fall back to Bloch reconstruction ─
                 dm_curr = None
-                # Try raw oracle DM from _LOCAL_ORACLE (already parsed as float lists)
                 if sse_age < 30.0:
                     try:
                         re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
                         if _HAS_NP and any(v != 0.0 for v in re_list):
                             import numpy as _npml, math as _math
-                            # Sanitize: replace NaN/inf with 0.0 before array construction
-                            # (C ring buffer can contain uninitialized floats on startup)
                             re_san = [v if _math.isfinite(v) else 0.0 for v in re_list]
                             im_san = [v if _math.isfinite(v) else 0.0 for v in im_list]
                             if any(v != 0.0 for v in re_san):
@@ -16786,11 +14579,7 @@ class QtclClientApp:
                     except Exception:
                         pass
                     # ── Fuse with P2P consensus DM (consensus pool average) ──────
-                    # If peers have contributed measurements, blend the consensus
-                    # DM into our oracle DM: weighted average by consensus_fidelity.
-                    # Weight 0.35 * e^(-age/30): fresh consensus at full weight,
                     # stale consensus fades. RPC-driven consensus provides clean
-                    # quantum coherence across the peer network (no self-feedback).
                     if _HAS_NP and dm_curr is not None and _P2P_NODE is not None:
                         try:
                             cons = _P2P_NODE.get_consensus_dm()
@@ -16803,7 +14592,6 @@ class QtclClientApp:
                                           + 1j * _np.array(im_cs, dtype=_np.complex128)
                                           ).reshape(8, 8)
                                 if _validate_dm_8x8(_dm_cons) and fid_c > 0.5:
-                                    # Consensus fidelity-weighted blend
                                     w_cons = float(fid_c) * 0.35
                                     w_local = 1.0 - w_cons
                                     dm_curr = w_local * dm_curr + w_cons * _dm_cons
@@ -16822,13 +14610,11 @@ class QtclClientApp:
                 if dm_curr is None:
                     dm_curr = _reconstruct_dm_from_bloch(snap)
                 if dm_curr is None or not _validate_dm_8x8(dm_curr):
-                    # Last resort: canonical |W3⟩ maximally mixed state
                     if _HAS_NP:
                         dm_curr = _np.eye(8, dtype=_np.complex128) / 8.0
                     else:
                         continue
 
-                # Final normalization before GKSL — ensures tr=1 exactly
                 if _HAS_NP:
                     _tr0 = float(_np.real(_np.trace(dm_curr)))
                     if _tr0 > 1e-12:
@@ -16896,7 +14682,6 @@ class QtclClientApp:
                 now       = _tw.time()
 
                 if connected and snaps != _last_snap_count:
-                    # New snapshot arrived
                     _last_snap_count = snaps
                     _stale_since = 0.0
                     m = _LOCAL_ORACLE.get_latest_measurement()
@@ -16987,8 +14772,6 @@ class QtclClientApp:
             ok = _P2P_NODE.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
             if ok:
                 _EXP_LOG.info("[CLIENT] 🌐 P2P consensus node started on port 9091")
-                # Wire genesis reset listener to P2P broadcast
-                # Wire GenesisResetListener broadcaster to P2P node
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
                     _GENESIS_RESET_LISTENER._broadcaster = _P2P_NODE
             else:
@@ -17013,7 +14796,6 @@ class QtclClientApp:
             try:
                 bh = int(self.koyeb_state.block_height or 0)
                 self.api.send_heartbeat(self._peer_id, bh)
-                # Upsert self into local DB
                 if self._db:
                     try:
                         _self_ip = _MY_IP or 'localhost'
@@ -17027,7 +14809,6 @@ class QtclClientApp:
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
                     except Exception: pass
-                # Push self measurement to P2P for consensus
                 if _P2P_NODE and _P2P_NODE._started and _accel_ok:
                     m = _LOCAL_ORACLE.get_latest_measurement()
                     if m:
@@ -17074,7 +14855,6 @@ class QtclClientApp:
                                 snap_js = _poj.dumps(data)
                                 snap_hash = __import__('hashlib').sha256(snap_js.encode()).hexdigest()
                                 
-                                # Only ingest if snapshot changed
                                 if snap_hash != _last_snapshot_hash:
                                     try:
                                         _LOCAL_ORACLE._ingest_oracle_frame(snap_js)
@@ -17092,7 +14872,6 @@ class QtclClientApp:
                         except Exception:
                             pass
                         
-                        # Poll every 5 seconds
                         _pot.sleep(5.0)
                         break  # Re-establish connection after snapshot read
                         
@@ -17100,7 +14879,6 @@ class QtclClientApp:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
                 _EXP_LOG.debug(f"[MESH] Peer oracle {host}:{port} lost ({_e}) — retry in {wait}s (RPC)")
                 _pot.sleep(wait)
-                # Stop trying if peer no longer in our DB
                 import sqlite3 as _podb
                 import pathlib as _poplib
                 try:
@@ -17148,7 +14926,6 @@ class QtclClientApp:
                         with _SO(req, timeout=5, context=ssl_ctx) as resp:
                             data = _pj.loads(resp.read().decode('utf-8'))
                             
-                            # Only ingest if we got valid response
                             if data and data.get('ready'):
                                 snap_hash = __import__('hashlib').sha256(
                                     _pj.dumps(data, sort_keys=True).encode()).hexdigest()
@@ -17165,7 +14942,6 @@ class QtclClientApp:
                         if _fail_count % 10 == 0:
                             _EXP_LOG.debug(f"[SNAPSHOT-RPC] GET error ({_re}), retrying...")
                     
-                    # Poll every 300ms (3x per second)
                     self._stop.wait(0.3)
                     
                 except (_SE, OSError, TimeoutError) as _e:
@@ -17198,7 +14974,6 @@ class QtclClientApp:
         
         while not self._stop.is_set():
             try:
-                # Poll events since last timestamp
                 events_url = f"{_oracle_url}/api/events?since={_last_event_ts}&limit=50"
                 req = _KR(events_url, method='GET')
                 req.add_header('Content-Type', 'application/json')
@@ -17216,11 +14991,9 @@ class QtclClientApp:
                             evt_type = evt.get('type', '')
                             evt_ts = evt.get('ts', _ke.time())
                             
-                            # Update watermark
                             if evt_ts > _last_event_ts:
                                 _last_event_ts = evt_ts
                             
-                            # Process peer_joined events for P2P wiring
                             if evt_type == 'peer_joined' and _accel_ok and _P2P_NODE:
                                 try:
                                     pip = evt.get('ip_address', '')
@@ -17228,7 +15001,6 @@ class QtclClientApp:
                                     ppid = evt.get('peer_id', '')
                                     peer_key = f"{pip}:{pport}"
                                     
-                                    # Exclude self
                                     _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
                                     if pip and pip not in _self_ips and peer_key not in _last_peers:
                                         rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
@@ -17245,7 +15017,6 @@ class QtclClientApp:
                     if _fail_count % 10 == 0:
                         _EXP_LOG.debug(f"[EVENTS-RPC] GET error ({_re}), retrying...")
                 
-                # Poll every 350ms (3x per second, staggered from snapshot)
                 self._stop.wait(0.35)
                 
             except (_KE, OSError, TimeoutError) as _e:
@@ -17296,7 +15067,6 @@ class QtclClientApp:
                     if _fail_count % 10 == 0:
                         _EXP_LOG.debug(f"[OURO] GET error — retrying...")
                 
-                # Poll every 400ms
                 self._stop.wait(0.4)
                 
             except (_UE, OSError, TimeoutError) as _e:
@@ -17521,12 +15291,10 @@ class QtclClientApp:
                     self._json_resp(200, {'ok': True})
 
                 elif path in ('/api/oracle/push_dm', '/api/oracle/push_snapshot'):
-                    # Peer oracle pushes its DM frame to us for aggregation
                     if payload and payload.get('density_matrix_hex'):
                         try:
                             import json as _pmj
                             _LOCAL_ORACLE._ingest_oracle_frame(_pmj.dumps(payload))
-                            # Push into C DM pool for consensus
                             if _accel_ok:
                                 try: _accel_lib.qtcl_p2p_trigger_consensus()
                                 except Exception: pass
@@ -17539,7 +15307,6 @@ class QtclClientApp:
                     self._json_resp(200, {'ok': True, 'snapshot_count': _LOCAL_ORACLE.snapshot_count})
 
                 elif path in ('/api/peers/register', '/api/peers/heartbeat'):
-                    # Proxy peer registration — store in local DB + relay to koyeb
                     peer_id  = payload.get('peer_id', '')
                     peer_ip  = self.client_address[0]
                     peer_port = int(payload.get('port') or 9091)
@@ -17562,13 +15329,11 @@ class QtclClientApp:
                                       int(payload.get('block_height',0)),
                                       peer_ip, peer_port))
                         except Exception: pass
-                        # Connect to the registering peer via C P2P
                         if _accel_ok and peer_ip not in ('127.0.0.1','localhost',''):
                             try:
                                 _accel_lib.qtcl_p2p_connect(
                                     peer_ip.encode()+b'\x00', peer_port)
                             except Exception: pass
-                    # Return our oracle state + known peers
                     snap = self._oracle_snapshot()
                     import sqlite3 as _plr
                     import pathlib as _plrpath
@@ -17591,7 +15356,6 @@ class QtclClientApp:
                     })
 
                 elif path in ('/api/gossip/ingest',):
-                    # Receive gossiped block/tx from peers
                     block = payload.get('block')
                     if block:
                         # RPC mode: blocks handled via /api/chain/blocks polling
@@ -17645,12 +15409,6 @@ class QtclClientApp:
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
 
-        # ── Register peer with height=0 (updated after SSE delivers first frame)
-        # Use outbound hardware IP so other miners can actually reach us.
-        # Server also records request.remote_addr as fallback but gossip_url
-        # with the real IP is what gets returned in live_peers to other miners.
-        # gossip_url uses "auto" sentinel — server replaces ip with request.remote_addr
-        # which is the public IP seen by Koyeb, not our private LAN IP
         _my_gossip_url = f"http://auto:9091"
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_gossip_url, self.wallet.address, 0)
@@ -17675,7 +15433,6 @@ class QtclClientApp:
         except Exception as _dme:
             _EXP_LOG.debug(f"[DMPOOL] start: {_dme}")
 
-        # ── Update C koyeb thread with real wallet address now we have it ───
         if _accel_ok:
             try:
                 _khost = b'qtcl-blockchain.koyeb.app\x00'
@@ -17729,23 +15486,8 @@ class QtclClientApp:
         print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
         print(f"  📡 Oracle conn  : {_oracle_conn_status}  │  snapshots={_LOCAL_ORACLE.snapshot_count}")
         print(f"  🗄️  DB           : {self._db_path}")
-        # ══════════════════════════════════════════════════════════════════════
-        # ENTANGLEMENT BOOTSTRAP  (C-accelerated via §Bootstrap)
-        # Mining is gated on establishing quantum ground truth with the oracle.
-        #
-        # Sequence (all hot paths run in C via _accel_lib):
         #  1. RPC DM already flowing via _LOCAL_ORACLE (started at import)
         #     RPC path: LocalOracleEngine._poll_loop() → get_oracle_pq0_bloch()
-        #              → _ingest_oracle_frame() → DM stored in C pool
-        #  2. Wait for qtcl_bootstrap_dm_age_ok(60s) — polls every 0.5s
-        #     P2P fallback: query /api/dht/peers → peer /api/oracle/w-state
-        #  3. qtcl_bootstrap_build_blockfield() — full C pipeline:
-        #     HyperbolicTriangle → tripartite DM → GKSL RK4 → oracle fusion
-        #     → 6 quantum metrics → HMAC sign → PoW seed
-        #  4. qtcl_bootstrap_fidelity_report() → terminal display
-        #  5. koyeb_state.sync() → bridge fidelity confirmed
-        #  6. Mining nonce loop UNLOCKED
-        # ══════════════════════════════════════════════════════════════════════
 
         _kapi_boot = KoyebAPIClient(self.oracle_url)
 
@@ -17798,7 +15540,6 @@ class QtclClientApp:
                 import numpy as _np_m
                 sx = _np_m.array([[0,1],[1,0]], dtype=complex)
                 sy = _np_m.array([[0,-1j],[1j,0]], dtype=complex)
-                # Extend to 8x8 via kron
                 def _op(a,b,c):
                     return _np_m.kron(_np_m.kron(a,b),c)
                 M3 = (_op(sx,sx,sx)
@@ -17820,31 +15561,23 @@ class QtclClientApp:
                 return {}
             try:
                 import numpy as _np_m
-                # ✅ FIX-AUDIT-2: Use cached W8 target instead of recreating
                 _w8_target = _get_w8_target()
                 if _w8_target is None:
-                    # Fallback if cache not initialized
                     _w8_vec = _np_m.zeros(8, dtype=complex)
                     _w8_vec[:] = 1.0 / _np_m.sqrt(8.0)
                     _w8_target = _np_m.outer(_w8_vec, _w8_vec.conj())
                 
-                # W-state fidelity F(ρ, |W8><W8|) = Tr(ρ * W8)
                 w_fidelity = float(_np_m.real(_np_m.trace(dm8 @ _w8_target)))
                 
-                # Von Neumann entropy S(ρ) = -Tr(ρ log₂ ρ)
                 _evals = _np_m.linalg.eigvalsh(dm8)
                 _evals = _np_m.clip(_evals, 1e-15, 1.0)  # avoid log(0)
                 entropy_vn = float(-_np_m.sum(_evals * _np_m.log2(_evals)))
                 
-                # L1 coherence (normalized to [0,1] for W-state in 8D)
                 _off_diag_sum = _np_m.sum(_np_m.abs(dm8 - _np_m.diag(_np_m.diag(dm8))))
                 coherence = float(_off_diag_sum / 7.0)  # max off-diag for W-state
                 
-                # Purity Tr(ρ²)
                 purity = float(_np_m.real(_np_m.trace(dm8 @ dm8)))
                 
-                # Negativity for bipartite (system A: qubits 0, rest: B)
-                # Simplified: just check if any eigenvalue negative after partial transpose
                 try:
                     _rho_pt = dm8.copy()  # placeholder—full PT would be complex
                     _evals_pt = _np_m.linalg.eigvalsh(_rho_pt)
@@ -17868,10 +15601,6 @@ class QtclClientApp:
             Run the full blockfield build in C.
             Returns (oracle_ok, meas_ptr, seed32_bytes, report_str).
             """
-            # Use block height from outer scope — already resolved and validated.
-            # self.client_field.pq_curr_id is "0" until field.build() completes
-            # (after bootstrap), so reading it here would produce pq_curr=0 → degenerate
-            # triangle with zero area, zero distances, and a trivial all-zero DM.
             _bh  = self.koyeb_state.block_height or bh
 
             def _safe_pq_int(val, fallback: int) -> int:
@@ -17881,20 +15610,12 @@ class QtclClientApp:
                     if not v or not v.lstrip('-').isdigit():
                         return fallback
                     n = int(v)
-                    # 0 means uninitialised (only pq0 oracle anchor is legitimately 0,
-                    # and that is always hardcoded as _pq0=0 below — never read from field)
                     return n if n > 0 else fallback
                 except Exception:
                     return fallback
 
-            # Prefer outer-scope pq_curr_id/pq_last_id (already validated block heights)
-            # over self.client_field which hasn't been built yet at bootstrap time.
             _pqc = _safe_pq_int(pq_curr_id, _bh)
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
-            # pq0 = 0: the fixed universal oracle anchor — center of the {8,3}
-            # hyperbolic lattice where oracles permanently reside.  The W-state
-            # tripartite is pq0(oracle) ↔ pq_curr(chain entry) ↔ pq_last(chain exit).
-            # Never change this — it is not a height, it is a lattice address.
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
 
@@ -17916,8 +15637,6 @@ class QtclClientApp:
                         dt, out_m, out_seed,
                     )
                     
-                    # oracle_ok=0 means no oracle DM yet — C used local |W3⟩.
-                    # This is DEGRADED mode, not a failure.  Mining continues.
                     if not oracle_ok:
                         _EXP_LOG.warning(
                             f"[BOOTSTRAP] oracle_ok=0 — no fresh oracle DM; "
@@ -17925,12 +15644,9 @@ class QtclClientApp:
                             f"SSE not connected or DM too old. Mining in degraded mode."
                         )
 
-                    # Mirror DM into Python numpy — explicit indexing avoids cffi
-                    # "slice start must be specified" on struct pointer array fields
                     dm_re_list = [float(out_m.dm_re[i]) for i in range(64)]
                     dm_im_list = [float(out_m.dm_im[i]) for i in range(64)]
                     
-                    # ✅ FIX-METRICS-STRICT: Check if DM struct is all zeros (corruption marker)
                     if all(x == 0.0 for x in dm_re_list) and all(x == 0.0 for x in dm_im_list):
                         raise RuntimeError(
                             f"[BOOTSTRAP] C returned all-zero DM matrix (corruption). "
@@ -17948,8 +15664,6 @@ class QtclClientApp:
                         dm_arr.imag = _np_bs.array(dm_im_list)
                         dm_curr_np = dm_arr.reshape(8, 8)
                         
-                        # ✅ FIX-AGENT-2c: VALIDATE DM BEFORE USING
-                        # Check trace, Hermiticity, eigenvalue positivity
                         _dm_valid = True
                         try:
                             _tr = float(_np_bs.real(_np_bs.trace(dm_curr_np)))
@@ -17971,27 +15685,22 @@ class QtclClientApp:
                             _EXP_LOG.warning("[DM] Corrupted state detected — skipping cycle")
                             return (False, None, bytes(32), "[DM-CORRUPT] State validation failed\n")
                         
-                        # ✅ FIX-AGENT-2e: METRICS VALIDATION — Compare C vs Python
                         _py_metrics = _python_metrics_from_dm(dm_curr_np)
                         if _py_metrics:
-                            # Check if C metrics look corrupted
                             _c_fidelity = float(out_m.w_fidelity)
                             _py_fidelity = _py_metrics.get('w_fidelity', 0.8)
                             _c_entropy = float(out_m.entropy_vn)
                             _py_entropy = _py_metrics.get('entropy_vn', 1.0)
                             
-                            # Expected ranges for W-state
                             _fid_ok = 0.6 <= _c_fidelity <= 1.0
                             _ent_ok = 0.0 <= _c_entropy <= 2.3
                             
                             if not (_fid_ok and _ent_ok):
-                                # Log the error but DON'T RAISE - use Python fallback to continue mining
                                 _EXP_LOG.error(
                                     f"[METRICS] C OUTPUT CORRUPTED: fid={_c_fidelity:.4f} "
                                     f"(expected 0.6-1.0), ent={_c_entropy:.4f} (expected 0.0-2.3 bits). "
                                     f"Using Python fallback instead: fid={_py_fidelity:.4f}, ent={_py_entropy:.4f}"
                                 )
-                                # Continue with Python metrics (mining proceeds)
                         
                         # ✅ SINGLE-PATH MERMIN: Try C RPC, fallback to 0 (no Python path)
                         mermin_val, mermin_viol = 0.0, False
@@ -18009,9 +15718,6 @@ class QtclClientApp:
                             _EXP_LOG.debug("[MERMIN] C function unavailable → 0.0")
                             mermin_val, mermin_viol = 0.0, False
                         
-                        # ✅ FIX-AUDIT-3: GKSL timeout protection
-                        # If evolution hangs or is slow, use cached previous state
-                        # Prevents mining freeze if GKSL integration is stiff
                         dm_last_np = None
                         try:
                             import signal
@@ -18051,22 +15757,14 @@ class QtclClientApp:
                     )
 
                     # ── Rebroadcast DM to P2P network every metric cycle ──────────
-                    # Pushes local DM into P2P pool → triggers consensus recompute.
-                    # Combined with peer contributions, this averages out temporal
-                    # lags: a peer's DM from 10s ago + ours from now = 5s average.
-                    # Ouroboros: our broadcast comes back via self-loop, weighted
-                    # by fidelity²  in _dmpool_compute_consensus().
                     if _P2P_NODE is not None and _P2P_NODE._started:
                         try:
                             m_latest = _LOCAL_ORACLE.get_latest_measurement()
                             if m_latest is not None:
                                 _P2P_NODE.gossip_measurement(m_latest)
-                                # gossip_measurement now calls trigger_consensus()
                         except Exception as _rbce:
                             _EXP_LOG.debug(f"[METRIC] P2P rebroadcast: {_rbce}")
 
-                    # Bridge fidelity: Tr(ρ_oracle · ρ_client) — correct quantum overlap
-                    # ✅ FIX-AGENT-2d: Proper calculation with bounds checking
                     bridge_fid = 0.5  # conservative default
                     if (HAS_NUMPY and dm_curr_np is not None
                             and self.koyeb_state.dm_oracle is not None):
@@ -18074,10 +15772,8 @@ class QtclClientApp:
                             import numpy as _np_bridge
                             dm_o = self.koyeb_state.dm_oracle
                             if dm_o.shape == (8, 8):
-                                # Tr(ρ_oracle · ρ_client) — should be in [0, 1]
                                 _fid_raw = float(_np_bridge.real(_np_bridge.trace(dm_o @ dm_curr_np)))
                                 bridge_fid = float(max(0.0, min(1.0, _fid_raw)))
-                                # Warn if fidelity looks suspicious
                                 if bridge_fid > 0.98:
                                     _EXP_LOG.warning(f"[BRIDGE] Unusually high fidelity: {bridge_fid:.4f}")
                                 if bridge_fid < 0.01:
@@ -18086,13 +15782,10 @@ class QtclClientApp:
                             _EXP_LOG.debug(f"[BRIDGE] Fidelity calc error: {_bfe}")
                             bridge_fid = 0.5  # fallback
 
-                    # Build oracle age for report
                     ts_ns = int(out_m.timestamp_ns)
                     oracle_age = abs(_time.time() - ts_ns / 1e9) if ts_ns else 0.0
 
                     # ── SINGLE-PATH METRIC EXTRACTION: Direct C struct read only ──────
-                    # No fallbacks. If metrics are 0, they are 0 from C.
-                    # (Likely because pq_curr_id/pq_last_id haven't initialized the field yet)
                     _disp_fid    = float(out_m.w_fidelity)
                     _disp_ent    = float(out_m.entropy_vn)
                     _disp_coh    = float(out_m.coherence)
@@ -18106,14 +15799,12 @@ class QtclClientApp:
                     _disp_mermin = float(mermin_val)
                     _disp_bridge = float(bridge_fid)
                     
-                    # Log raw values for debugging (distances 0 = pq_curr/pq_last not initialized)
                     _EXP_LOG.info(
                         f"[METRICS-RAW] d0c={_disp_d0c:.4f} dcl={_disp_dcl:.4f} d0l={_disp_d0l:.4f} "
                         f"area={_disp_area:.4f} mermin={_disp_mermin:+.4f} "
                         f"pqc={_pqc} pql={_pql} (0=uninitialized)"
                     )
 
-                    # Persist to local DB
                     try:
                         import sqlite3 as _sq
                         _conn = _sq.connect(self._db_path)
@@ -18135,8 +15826,6 @@ class QtclClientApp:
                     except Exception as _dbe:
                         _EXP_LOG.debug(f"[DB] Insert: {_dbe}")
 
-                    # ── Clamp all metrics to physically valid ranges before display ──
-                    # MUST run before mermin_str which references _disp_mermin
                     def _clamp(v, lo, hi):
                         try:
                             f = float(v)
@@ -18153,7 +15842,6 @@ class QtclClientApp:
                     _disp_dcl    = _clamp(float(out_m.hyp_dist_cl),   0.0, 10.0)
                     _disp_d0l    = _clamp(float(out_m.hyp_dist_0l),   0.0, 10.0)
                     
-                    # ✅ FIX-METRICS-AREA: Extract triangle_area with robust fallback
                     _disp_area = 0.0
                     try:
                         _area_raw = float(out_m.triangle_area)
@@ -18165,7 +15853,6 @@ class QtclClientApp:
                                 f"[AREA] C struct out of bounds: {_area_raw:.6f} → "
                                 f"computing from distances"
                             )
-                            # Fallback: compute from Gauss-Bonnet with distances
                             if HAS_NUMPY and dm_curr_np is not None:
                                 try:
                                     ang_0c = max(0.0, min(_np.pi / 2.0, _disp_d0c * 0.30))
@@ -18221,20 +15908,16 @@ class QtclClientApp:
                         "  ╚═══════════════════════════════════════════════════════════╝\n"
                     )
 
-                    # Update koyeb_state bridge fidelity with correct value
                     self.koyeb_state.bridge_fidelity = bridge_fid
 
                     return oracle_ok, out_m, bytes([out_seed[i] for i in range(32)]), report_str
 
                 except Exception as _ce:
-                    # C blockfield exception — log and return degraded local W3 measurement
-                    # rather than crashing the mining loop entirely.
                     _EXP_LOG.error(
                         f"[Bootstrap] C blockfield exception: {_ce} — "
                         f"pq0={_pq0} pqc={_pqc} pql={_pql} h={_bh}. "
                         f"Returning degraded local |W3⟩ state; mining continues."
                     )
-                    # Build a minimal degraded report so the caller can display it
                     _deg_report = (
                         "\n  ╔══ BLOCKFIELD STATE [DEGRADED] ═══════════════════════════╗\n"
                         f"  ║  oracle DM  : unavailable — C exception                  ║\n"
@@ -18249,7 +15932,6 @@ class QtclClientApp:
                     return 0, None, _deg_seed, _deg_report
 
             # ── Python-only fallback (C unavailable) ───────────────────────────
-            # Build a degraded seed from block height + oracle SSE fidelity
             import hashlib as _hpy
             _py_fid  = float(_LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0.0))
             _py_seed = _hpy.sha3_256(
@@ -18314,14 +15996,8 @@ class QtclClientApp:
             _MINE_TELEM.mark_idle()
 
             # ── New-block signal — set by background SSE listener ─────────────
-            # Using a threading.Event (not asyncio) because the SSE listener
-            # runs in a separate threading.Thread, not in the asyncio event loop.
-            # The nonce loop checks it via is_set() — O(1), no blocking.
             _new_block_event  = _threading.Event()
             _new_block_height = [0]   # list for mutable capture in nested scope
-            # Must be declared HERE — before _start_block_listener closure captures it.
-            # Defining it inside the except-block below would make Python treat it as
-            # a local in _mine_inline, raising UnboundLocalError on the first .is_set().
             _mining_stopped   = _threading.Event()
 
             def _start_block_listener(oracle_url: str, initial_target: int) -> None:
@@ -18352,7 +16028,6 @@ class QtclClientApp:
                             tip_h = int(data.get('height', 0))
                             _EXP_LOG.info(f"[BLOCK-LISTENER] ✅ RPC poll → {url} tip={tip_h}")
                             
-                            # Initial hello on first successful poll
                             if tip_h > 0 and _last_height == -1:
                                 if _accel_ok:
                                     try:
@@ -18367,7 +16042,6 @@ class QtclClientApp:
                                 _EXP_LOG.info(
                                     f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C abort armed")
                             
-                            # New block detected
                             if tip_h > _last_height:
                                 _last_height = tip_h
                                 if _accel_ok:
@@ -18383,7 +16057,6 @@ class QtclClientApp:
                                 _EXP_LOG.info(
                                     f"[BLOCK-LISTENER] ⚡ h={tip_h} → C abort + Python event fired")
                             
-                            # Poll every 1 second
                             _mining_stopped.wait(1.0)
                             
                     except (_ue.URLError, OSError, TimeoutError, _bls.timeout) as _ble:
@@ -18401,29 +16074,17 @@ class QtclClientApp:
             _block_listener_thread.start()
             _EXP_LOG.info(f"[MINER] 📡 Block SSE listener started → {kapi.base_url}/api/events")
 
-            # Track locally-mined heights to prevent orphaning race
             _last_mined_height = 0
             _last_mined_hash   = "0" * 64
             _mining_lock       = _threading.Lock()
             
             # ──────────────────────────────────────────────────────────────────────
-            # QTCL-PoW v1 — Memory-hard, oracle-bound, GPU/ASIC resistant
-            #
-            # ═══════════════════════════════════════════════════════════════════
-            # CFFI + OPENSSL ACCELERATION
-            # Tries to compile a C extension at startup via cffi.verify().
-            # If clang/openssl unavailable, falls back to pure Python seamlessly.
-            # pkg install clang openssl libffi  (Termux one-time setup)
-            # ═══════════════════════════════════════════════════════════════════
             import struct as _pow_st
 
             _POW_SCRATCHPAD_BYTES = 512 * 1024
             _POW_MIX_ROUNDS       = 64
             _POW_WINDOW_BYTES     = 64
 
-            # ── PoW acceleration: use module-level C layer (compiled once at import) ──
-            # _accel_ok / _accel_lib / _accel_ffi are set by _compile_c_layer() at the
-            # top of this file.  No per-session compilation — mining starts instantly.
             _C_AVAIL = _accel_ok
             _C_LIB   = _accel_lib
             _ffi     = _accel_ffi
@@ -18491,7 +16152,6 @@ class QtclClientApp:
                         if _retries < _max_retries:
                             await _asyncio.sleep(_backoff)
                 
-                # Fallback to genesis if all retries exhausted
                 _EXP_LOG.warning(f"[MINER-SIMPLE] chain_tip retries exhausted, falling back to genesis h=0")
                 return {
                     "block_height": 0,
@@ -18502,7 +16162,6 @@ class QtclClientApp:
                 }
             
             while True:
-                # Get chain tip
                 tip = await _get_chain_tip_with_retry()
                 if tip is None:
                     _EXP_LOG.warning("[MINER-SIMPLE] Chain tip failed, retrying in 0.5s")
@@ -18512,39 +16171,23 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                # Push server tip to C — hot loop self-aborts if this >= miner_target
                 if _accel_ok and oracle_height > 0:
                     try: _accel_lib.qtcl_set_oracle_height(oracle_height)
                     except Exception: pass
-                # Read authoritative difficulty from the server tip.
-                # The server's DifficultyManager sets this; the client must mine to
-                # exactly this many leading hex zeros or the block will be rejected.
                 difficulty_bits = int(
                     tip.get("difficulty_bits") or
                     tip.get("difficulty") or
                     6  # conservative fallback if tip is missing the field
                 )
-                # Clamp to sane range — never allow trivially-easy or impossibly-hard
                 difficulty_bits = int(max(5, min(difficulty_bits, 20)))
                 
-                # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
                 if _accel_ok:
                     try: _accel_lib.qtcl_pow_set_abort(0)
                     except Exception: pass
 
-                # AUTHORITATIVE: server tip is ground truth — always.
-                # The old _last_mined_height > oracle_height guard was the
-                # chain-skip creator: if oracle returned stale h=N-1 after
-                # we accepted h=N, _last_mined_height was N, so target became
-                # N+1 — skipping a height the server hadn't confirmed yet.
-                # Fix: delete that guard entirely. target = oracle_tip + 1.
-                # The post-accept 1.5s sleep + fresh tip sync ensures oracle_height
-                # is current before we start the next nonce search.
                 target_height = oracle_height + 1
                 parent_hash   = oracle_hash
-                # Tell C layer what height we're mining — hot loop self-aborts
-                # the moment oracle_height reaches this value
                 if _accel_ok:
                     try: _accel_lib.qtcl_set_miner_target(target_height)
                     except Exception: pass
@@ -18555,15 +16198,7 @@ class QtclClientApp:
                 miner_addr  = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
 
                 # ── Fetch QTCL-PoW oracle seed (QRNG-injected) ───────────────────
-                # The server mixes 32 bytes of live QRNG entropy (ANU quantum vacuum,
-                # random.org, HU Berlin, etc.) into the W-state density matrix hash
-                # before publishing pow_seed_hex.  This makes the scratchpad contents
-                # unpredictable even to someone with a full copy of the oracle state.
-                # Seed expires in 120s — forces real-time oracle dependency.
                 _seed_fetch_time = _t.time()
-                # ── Fetch PoW seed from LocalOracleEngine (C SSE + BFT consensus) ──
-                # LocalOracleEngine has been receiving oracle DM snapshots via C SSE
-                # since module import.  This is O(1) — no network round trip.
                 _seed_fetch_time = _t.time()
                 try:
                     _w_entropy_seed = _LOCAL_ORACLE.get_pow_seed(
@@ -18578,10 +16213,6 @@ class QtclClientApp:
                         str(int(_t.time()/30)).encode() + parent_hash.encode()
                     ).digest()
 
-                # ── FIX: Capture miner_addr ONCE here — never reassign after solve.
-                # Re-assigning after the nonce loop (from self.wallet.address) creates
-                # a header field mismatch: hash was computed with addr_at_mine_start
-                # but server verifies with addr_at_submit → hash_mismatch every time.
                 _mine_miner_addr = getattr(getattr(self, 'wallet', None), 'address', None)
                 if not _mine_miner_addr:
                     _mine_miner_addr = miner_addr  # outer scope fallback
@@ -18590,14 +16221,9 @@ class QtclClientApp:
                 miner_addr = _mine_miner_addr  # locked — used for hash AND submit
 
                 # ── Build scratchpad ONCE per block (shared across all nonces) ────
-                # Cost: ~1ms to expand 512KB — amortised over millions of nonces.
                 _EXP_LOG.info(f"[MINER-SIMPLE] Building 512KB scratchpad for h={target_height}…")
                 scratchpad = _build_scratchpad(_w_entropy_seed)
                 
-                # ✅ FIX: FETCH MEMPOOL BEFORE MINING + BUILD DETERMINISTIC COINBASE
-                # This ensures merkle_root is committed before nonce loop, preventing
-                # the merkle root / transaction list mismatch that breaks block submission.
-                # Fetch pending user transactions
                 try:
                     _pending_user_txs = kapi.get_mempool() or []
                     _EXP_LOG.info(f"[MINER-SIMPLE] Pre-mining mempool: {len(_pending_user_txs)} pending TX(s)")
@@ -18605,9 +16231,6 @@ class QtclClientApp:
                     _pending_user_txs = []
                     _EXP_LOG.warning(f"[MINER-SIMPLE] Pre-mining mempool fetch failed: {_me}")
                 
-                # Build deterministic coinbase transaction
-                # Uses same formula as server._server_merkle() to ensure hash matches
-                # Height-aware miner reward from canonical schedule
                 try:
                     from globals import TessellationRewardSchedule as _TRS_m
                     _miner_reward_base   = _TRS_m.get_miner_reward_base(target_height)
@@ -18641,7 +16264,6 @@ class QtclClientApp:
                     "version": 1,
                 }
 
-                # Treasury coinbase — slot 1 — always constructed, server enforces it
                 _treasury_cb_id = _hl.sha3_256(
                     json.dumps({
                         "block_height": target_height,
@@ -18663,8 +16285,6 @@ class QtclClientApp:
                     "version": 1,
                 }
                 
-                # Compute merkle root: SHA3-256 binary tree of [coinbase] + user TXs
-                # This EXACTLY mirrors server._server_merkle() computation
                 def _compute_merkle_for_mining(tx_list: list) -> str:
                     """Compute merkle root using server's algorithm."""
                     if not tx_list:
@@ -18685,7 +16305,6 @@ class QtclClientApp:
                                 "version": tx.get("version", 1),
                             }, sort_keys=True)
                         else:
-                            # Regular TX: exclude signature
                             canonical = json.dumps({
                                 k: v for k, v in tx.items()
                                 if k not in ("signature",)
@@ -18702,11 +16321,6 @@ class QtclClientApp:
                         ]
                     return hashes[0]
                 
-                # Commit: merkle_root = hash([coinbase, treasury] + user_txs)
-                # treasury_tx MUST be in merkle — server receives full _block_txs
-                # and recomputes from ALL submitted transactions including treasury.
-                # Excluding treasury caused merkle mismatch warning + treasury not
-                # properly anchored to the block header hash.
                 _block_txs = [_coinbase_tx, _treasury_tx] + _pending_user_txs
                 merkle_root = _compute_merkle_for_mining(_block_txs)
                 
@@ -18723,10 +16337,6 @@ class QtclClientApp:
                 _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
 
                 # ── PoW nonce search: C/OpenSSL if available, Python fallback ───────
-                # C path:  ~500k–2M H/s (OpenSSL SHA3-256, zero-copy from_buffer pinning)
-                # Python path: ~1–3k H/s (struct + memoryview, yields to event loop)
-                #
-                # KEY: scratchpad (512KB) is pinned ONCE via from_buffer — never copied.
                 import struct as _pow_st
                 _YIELD_EVERY  = 2000     # Python burst before async yield
                 _C_CHUNK      = 10_000   # C burst: 10k nonces ≈ 1s at 11kH/s; abort flag kills within 256
@@ -18736,14 +16346,12 @@ class QtclClientApp:
                 hex_zeros     = "0" * difficulty_bits
                 _found        = False
 
-                # Acceleration status goes to log buffer (not stdout) — no bleed into UI
                 _EXP_LOG.info(
                     f"[MINER] {'C/OpenSSL' if _C_AVAIL else 'Python'} PoW  "
                     f"chunk={'%d' % _C_CHUNK if _C_AVAIL else '%d' % _YIELD_EVERY}  "
                     f"h={target_height} diff={difficulty_bits}"
                 )
 
-                # Pre-computed fixed header parts (C path recomputes internally)
                 _ph32 = bytes.fromhex(parent_hash.zfill(64))[:32]
                 _mr32 = bytes.fromhex(merkle_root.zfill(64))[:32]
                 _ma40 = miner_addr.encode()[:40].ljust(40, b"\x00")
@@ -18758,25 +16366,17 @@ class QtclClientApp:
                 _POW_PFX = b"QTCL_POW_v1:"
                 _sha3 = _hl.sha3_256
 
-                # C FFI buffers — allocated ONCE per block, reused for every chunk.
-                # scratchpad uses from_buffer (zero-copy pin into the Python bytes obj).
-                # Only _c_seed is re-pinned when the entropy seed is refreshed.
                 if _C_AVAIL:
                     _c_ph   = _ffi.new("uint8_t[]", _ph32)
                     _c_mr   = _ffi.new("uint8_t[]", _mr32)
                     _c_ma   = _ffi.new("uint8_t[]", _ma40)
                     _c_seed = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
-                    # Zero-copy: pin directly into the existing 512KB Python bytes object.
-                    # This is the fix — never do _ffi.new("uint8_t[]", scratchpad) in a loop.
                     _sp_arr  = bytearray(scratchpad)   # mutable backing store
                     _c_sp    = _ffi.cast("uint8_t *", _ffi.from_buffer(_sp_arr))
                     _c_out   = _ffi.new("uint8_t[32]")
                     _pinned_seed = _w_entropy_seed      # track what's currently pinned
 
                 # ── Chain-advance detector ─────────────────────────────────────
-                # Polls the C SSE ring after each chunk for new_block events.
-                # If another miner solved the current height, we abort immediately
-                # instead of wasting time on a stale block (and hitting entropy TTL).
                 _chain_tip_height = target_height  # our current best known height
 
                 def _poll_new_block() -> bool:
@@ -18789,13 +16389,11 @@ class QtclClientApp:
                     """
                     nonlocal _chain_tip_height
 
-                    # Stage 1: threading.Event (fastest path — set by BlockSSEListener)
                     if _new_block_event.is_set():
                         _ev_h = _new_block_height[0]
                         if _ev_h >= target_height:
                             _new_block_event.clear()
                             _chain_tip_height = _ev_h
-                            # Set C-level abort flag — kills current chunk within 256 nonces
                             if _accel_ok:
                                 try: _accel_lib.qtcl_pow_set_abort(1)
                                 except Exception: pass
@@ -18813,7 +16411,6 @@ class QtclClientApp:
                             _ev_h = int(snap.get('block_height') or snap.get('height') or 0)
                             if _ev_h > 0 and _ev_h >= target_height:
                                 _chain_tip_height = _ev_h
-                                # Update C oracle_height — self-abort in ≤256 nonces
                                 if _accel_ok:
                                     try: _accel_lib.qtcl_set_oracle_height(_ev_h)
                                     except Exception: pass
@@ -18827,7 +16424,6 @@ class QtclClientApp:
 
                 while not _found:
                     if _C_AVAIL:
-                        # Re-pin seed buffer only when entropy actually changed
                         if _w_entropy_seed is not _pinned_seed:
                             _c_seed      = _ffi.new("uint8_t[]", _w_entropy_seed[:32])
                             _pinned_seed = _w_entropy_seed
@@ -18842,7 +16438,6 @@ class QtclClientApp:
                             _c_sp, _c_out,
                         )
                         if result == -2:
-                            # C abort flag — clear immediately so next block mines clean
                             try: _accel_lib.qtcl_pow_set_abort(0)
                             except Exception: pass
                             _EXP_LOG.info(
@@ -18857,13 +16452,11 @@ class QtclClientApp:
                             _found        = True
                             break
                         nonce += _C_CHUNK
-                        # Check SSE for chain advance — abort if another miner won
                         if _poll_new_block():
                             _EXP_LOG.warning(
                                 f"[MINER-SIMPLE] Chain advanced — restarting for h={_chain_tip_height + 1}"
                             )
                             break   # exits while-not-_found → outer loop fetches new tip
-                        # Yield to event loop after each C chunk — keeps UI alive
                         _MINE_TELEM.update_progress(target_height, difficulty_bits,
                                                      nonce, parent_hash)
                         await _asyncio.sleep(0)
@@ -18891,7 +16484,6 @@ class QtclClientApp:
                         if _found:
                             break
 
-                    # Python path also checks new-block signal after every burst
                     if not _found and _poll_new_block():
                         _EXP_LOG.warning(
                             f"[MINER-SIMPLE] Chain advanced (Python path) "
@@ -18899,11 +16491,9 @@ class QtclClientApp:
                         )
                         break
 
-                    # Yield to event loop — keeps UI/display alive
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                     await _asyncio.sleep(0)
 
-                    # Seed + timestamp refresh via LocalOracleEngine
                     if _t.time() - _seed_fetch_time > _REFR_EVERY:
                         try:
                             _new_seed = _LOCAL_ORACLE.get_pow_seed(
@@ -18927,8 +16517,6 @@ class QtclClientApp:
                             _seed_fetch_time = _t.time()
 
 
-                    # HTTP tip poll removed — BlockSSEListener handles chain-advance detection.
-                    # SSE delivers new_block within ~network latency of server commit.
 
                 if not _found:
                     continue  # chain advanced, restart outer loop
@@ -18936,9 +16524,7 @@ class QtclClientApp:
                 _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SOLVED h={target_height} nonce={nonce} hash={block_hash[:16]}…")
 
                 
-                # NOTE: _last_mined_height updated only after oracle confirmation (acceptance branch below)
                 
-                # Record in telemetry
                 solved_block = {
                     "height": target_height,
                     "hash": block_hash,
@@ -18949,13 +16535,7 @@ class QtclClientApp:
                 }
                 _MINE_TELEM.record_block(solved_block)
                 
-                # Submit to oracle/server
                 try:
-                    # miner_addr was locked before the nonce loop — do NOT re-fetch here.
-                    # Re-assigning from self.wallet.address after solve is the PRIMARY
-                    # cause of hash_mismatch: hash was computed with the original
-                    # miner_addr; server verifies using submitted miner_address.
-                    # If they differ → expected != got every single time.
 
                     submit_payload = {
                         "header": {
@@ -18967,18 +16547,8 @@ class QtclClientApp:
                             "miner_address":   miner_addr,   # locked before loop
                             "difficulty_bits": difficulty_bits,
                             "merkle_root":     merkle_root,
-                            # _winning_seed = exact seed used when this nonce was hashed.
-                            # Server decodes, rebuilds 512KB scratchpad, recomputes hash.
                             "w_entropy_hash":  _winning_seed.hex(),
-                            # w_state_fidelity feeds entropy_score + temporal_coherence
-                            # columns which are NUMERIC(5,4) in Postgres — must be in [0,1].
-                            # Source priority:
-                            #   1. client_field.metrics.fidelity_to_w3  — bootstrap DM result
                             #   2. koyeb_state.pq0_fidelity              — oracle API value
-                            #   3. 0.75 safe default
-                            # Never use ORACLE_W_STATE.fidelity — it goes through
-                            # TensorFieldMetrics which can overflow if the GKSL dt is too
-                            # large and the DM diverges.
                             "w_state_fidelity": round(float(min(1.0, max(0.0,
                                 (miner._client_field.metrics.fidelity_to_w3
                                  if (miner._client_field and miner._client_field.metrics
@@ -18995,9 +16565,6 @@ class QtclClientApp:
                         "transactions": _block_txs,
                     }
 
-                    # Rebuild coinbase only if seed changed during mining (different nonce window).
-                    # REMOVED: `or True` — that forced a rebuild every block, producing a new
-                    # tx_id every submission and causing double coinbase in the DB.
                     if _winning_seed != _w_entropy_seed:
                         _winning_cb_id = _hl.sha3_256(
                             json.dumps({
@@ -19018,7 +16585,6 @@ class QtclClientApp:
                             "tx_type": "coinbase",
                             "version": 1,
                         }
-                        # Rebuild treasury coinbase with winning seed
                         _winning_treasury_id = _hl.sha3_256(
                             json.dumps({
                                 "block_height": target_height,
@@ -19039,7 +16605,6 @@ class QtclClientApp:
                             "version": 1,
                         }
                         _winning_txs = [_winning_coinbase, _winning_treasury] + _pending_user_txs
-                        # Recompute merkle with new winning seed (includes treasury)
                         _winning_merkle = _compute_merkle_for_mining(_winning_txs)
                         submit_payload["transactions"] = _winning_txs
                         submit_payload["header"]["merkle_root"] = _winning_merkle
@@ -19047,7 +16612,6 @@ class QtclClientApp:
                     _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
 
                     # ── P2P v2 consensus fields ──────────────────────────────────────
-                    # Gossip our measurement + collect peer consensus before submitting
                     try:
                         _meas = _LOCAL_ORACLE.get_latest_measurement()
                         if _meas:
@@ -19088,14 +16652,10 @@ class QtclClientApp:
                     _MINE_TELEM.mark_submitting()
                     r = kapi._post("/api/submit_block", submit_payload, timeout=20)
                     
-                    # ✅ FIXED: Properly extract and record reward
                     if r is None:
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
-                        # No response — outer loop will re-fetch tip next iteration
                         _MINE_TELEM.mark_idle()
                     elif r.get("status") == "duplicate":
-                        # Block already in DB (submitted by another worker or earlier retry).
-                        # The block WAS accepted — this is not a failure.
                         _EXP_LOG.info(
                             f"[MINER-SIMPLE] ✅ h={target_height} already accepted "
                             f"(duplicate submission, tip={r.get('tip', '?')}) — chain advanced")
@@ -19106,9 +16666,6 @@ class QtclClientApp:
                     elif r.get("error"):
                         error = r.get("error", "unknown error")
                         tip_from_server = r.get("tip", 0)
-                        # Detect "Invalid height: N, expected N+1" where N == target_height
-                        # and expected == target_height+1 — means the block WAS accepted
-                        # (the chain moved on) and this is a late retry hitting the next slot.
                         _is_chain_advanced = (
                             "Invalid height" in error
                             and f"expected {target_height + 1}" in error
@@ -19125,10 +16682,8 @@ class QtclClientApp:
                             _EXP_LOG.warning(f"[MINER-SIMPLE] ❌ REJECTED h={target_height} | {error}")
                             if r.get("details"):
                                 _EXP_LOG.debug(f"[MINER-SIMPLE]    Details: {r.get('details')}")
-                        # Outer loop re-fetches tip — no manual height manipulation needed
                         _MINE_TELEM.mark_idle()
                     elif r.get("status") == "accepted" or r.get("success"):
-                        # Submission accepted — commit height IMMEDIATELY
                         with _mining_lock:
                             _last_mined_height = target_height
                             _last_mined_hash   = block_hash
@@ -19146,7 +16701,6 @@ class QtclClientApp:
                             f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height} | "
                             f"+{reward_qtcl:.2f} QTCL | total={_MINE_TELEM.total_earned_qtcl:.2f}")
 
-                        # ── C P2P block announce → all peers + koyeb gossip ──
                         if _accel_ok:
                             try:
                                 _bh_str = block_hash if isinstance(block_hash,str) else ''
@@ -19169,11 +16723,6 @@ class QtclClientApp:
                                 _accel_lib.qtcl_peerdb_save(_pdb3.encode() + b'\x00')
                             except Exception: pass
 
-                        # Wait for block to propagate to all gunicorn workers
-                        # before fetching tip — prevents mining same height twice.
-                        # No _last_mined_height manipulation needed: the outer loop
-                        # calls get_chain_tip() fresh at the top of every iteration
-                        # and target = server_tip + 1 is always authoritative.
                         await _asyncio.sleep(1.5)
                     elif r.get("block_hash"):
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
@@ -19194,22 +16743,16 @@ class QtclClientApp:
                 except Exception:
                     pass
 
-        # FIX-6: run async mining in a daemon thread so the main thread is FREE
-        # for the interactive menu. _asyncio.run() was blocking startup before.
         _mine_thread = _threading.Thread(
             target=lambda: _asyncio.run(_mine()),
             daemon=True, name="MineAsync"
         )
         _mine_thread.start()
 
-        # Inject koyeb_state + client_field into miner so submit payload is rich
         miner._koyeb_state  = self.koyeb_state   # type: ignore[attr-defined]
         miner._client_field = self.client_field  # type: ignore[attr-defined]
 
         # ── Silence stdout logging during mining — route to ring buffer ───────
-        # Without this, log lines bleed into the input() prompt mid-character.
-        # All INFO/DEBUG from the mining thread is captured and shown in the
-        # dashboard instead of polluting the terminal UI.
         _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
 
         class _BufHandler(_logging.Handler):
@@ -19221,7 +16764,6 @@ class QtclClientApp:
                                                       datefmt="%H:%M:%S"))
         _buf_handler.setLevel(_logging.DEBUG)
 
-        # Redirect root logger — restore on exit
         _root_log    = _logging.getLogger()
         _old_handlers = _root_log.handlers[:]
         _root_log.handlers = [_buf_handler]
@@ -19234,7 +16776,6 @@ class QtclClientApp:
             return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
         def _print_dashboard(force_full: bool = False) -> None:
-            # FRESH METRICS FIX #2: Refresh oracle metrics before display
             self.koyeb_state.refresh_metrics(self.client_field)
             
             ks2  = self.koyeb_state
@@ -19281,7 +16822,6 @@ class QtclClientApp:
                 print(f"     diff    : {lb.get('difficulty', '?')}   "
                       f"ts: {_time.strftime('%H:%M:%S', _time.localtime(lb.get('timestamp', now)))}")
                 print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
-                # Quantum attestation on submission
                 print(f"  ── Quantum Attestation ──────────────────────────────────────")
                 print(f"     pq_curr : {ks2.pq_curr_id}   pq_last: {ks2.pq_last_id}")
                 print(f"     W-fid   : {ks2.pq0_fidelity:.4f}   bridge: {ks2.bridge_fidelity:.4f}   "
@@ -19303,11 +16843,9 @@ class QtclClientApp:
                   f"bridge={ks2.bridge_fidelity:.4f}  "
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
                   f"{'✅' if ks2.connected else '❌'}")
-            # ✅ NEW: Display mining rewards
             print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
             if tel['total_earned_qtcl'] > 0:
                 print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)")
-            # Show reward breakdown when miner address is treasury address
             try:
                 from globals import TessellationRewardSchedule as _TRS_disp
                 _bh_disp = int(self.koyeb_state.block_height or 0)
@@ -19319,7 +16857,6 @@ class QtclClientApp:
                     print(f"  Note    : Mining as treasury address — both coinbases credit same wallet")
             except Exception:
                 pass
-            # SUB-AGENT δ: live balance in dashboard
             try:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
                 if _addr2:
@@ -19336,7 +16873,6 @@ class QtclClientApp:
                       f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
                       f"purity={_cf2(m2.purity,0,1):.4f}  "
                       f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
-            # P2P / consensus status — lazy-init if not yet started
             if _accel_ok and _P2P_NODE is None:
                 try:
                     _da_id = getattr(self, '_peer_id', None) or f"miner_{id(self)}"
@@ -19362,8 +16898,6 @@ class QtclClientApp:
                             _fid_str = f"{_avg_fid:.4f}" if _fids else "N/A"
                             _p2p_rep = f"  avg_lat={_lat_str}  avg_fid={_fid_str}"
                     except Exception: pass
-                    # Better consensus display: if C layer has no consensus yet,
-                    # trigger it and show local oracle fidelity as interim
                     if not _cons2:
                         try: _P2P_NODE.trigger_consensus()
                         except Exception: pass
@@ -19381,9 +16915,6 @@ class QtclClientApp:
                 print(sep)
 
         # ── Foreground interactive loop — non-blocking auto-refresh ──────────
-        # Redraws every _REFRESH_INTERVAL seconds automatically.
-        # 'q' / Ctrl-C quits. Any other key just refreshes immediately.
-        # No blocking input() call — nothing can bleed into the prompt.
         _REFRESH_INTERVAL = 5.0   # seconds between auto-redraws
         import select as _select
 
@@ -19398,7 +16929,6 @@ class QtclClientApp:
         print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
             while not self._stop.is_set() and _mine_thread.is_alive():
-                # Wait up to _REFRESH_INTERVAL for a keypress
                 if _kbhit(_REFRESH_INTERVAL):
                     try:
                         ch = sys.stdin.readline().strip().lower()
@@ -19406,14 +16936,12 @@ class QtclClientApp:
                         break
                     if ch in ("q", "quit", "stop"):
                         break
-                # Auto-redraw (or immediately after a non-quit keypress)
                 _print_dashboard()
         except KeyboardInterrupt:
             pass
         finally:
             miner.stop_mining()
             self._stop.set()
-            # Restore stdout logging handlers
             _root_log.handlers = _old_handlers
             print("\n  🛑 Mining stopped")
 
@@ -19427,7 +16955,6 @@ class QtclClientApp:
         snap    = self.api.get_oracle_pq0_bloch() or {}
         bath    = GKSLBathParams.from_snap(snap)
         bh      = int(snap.get("block_height") or snap.get("height") or 0)
-        # Oracle pq0-bloch endpoint may omit block_height — fall back to chain tip
         if bh == 0:
             try:
                 _fb = self.api.get_block_height()
@@ -19437,8 +16964,6 @@ class QtclClientApp:
                 pass
         pq_curr = str(bh)     if bh > 0 else "0"
         pq_last = str(bh - 1) if bh > 0 else "0"
-        # ✅ FIXED: Proper None checks instead of 'or' with numpy arrays
-        # (numpy arrays have ambiguous truth values)
         dm_curr = _decode_dm_8x8(snap)
         if dm_curr is None:
             dm_curr = _reconstruct_dm_from_bloch(snap)
@@ -19454,8 +16979,6 @@ class QtclClientApp:
         print(f"  ✅ Ready  │  h={bh}  pq={pq_curr}→{pq_next}  bridge_fid={self.koyeb_state.bridge_fidelity:.4f}")
 
         # ── Silence ALL background thread logs during interactive menu ────────
-        # SSE/P2P/Koyeb threads emit INFO continuously; NullHandler absorbs them
-        # without affecting log records — restores cleanly on break or exception.
         _tx_root_log     = _logging.getLogger()
         _tx_old_handlers = _tx_root_log.handlers[:]
         _tx_old_level    = _tx_root_log.level
@@ -19490,7 +17013,6 @@ class QtclClientApp:
                       f"  ({self.wallet.address})")
             elif ch == "4":
                 break
-        # Restore logger handlers — NullHandler gate lifted after menu exits
         _tx_root_log.handlers = _tx_old_handlers
         _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
@@ -19519,18 +17041,14 @@ class QtclClientApp:
         tx_id = _hashlib.sha3_256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
         tx["tx_id"] = tx_id
         
-        # AGENT-β FIX: Import time module for timestamp
         import time as _tw
         
         # ── SIGNATURE GENERATION (COMPREHENSIVE FORMAT) ──────────────────
-        # Generate signature and wrap in JSON for maximum compatibility
         if self.wallet.private_key:
             sig_hex = _hashlib.sha3_256(
                 (tx_id + self.wallet.private_key).encode()
             ).hexdigest()
             
-            # Wrap in JSON format (server-compatible)
-            # This also works if server accepts plain hex (wrapped internally)
             tx["signature"] = _json.dumps({
                 "signature_hex": sig_hex,
                 "method": "sha3_256_with_private_key",
@@ -19539,7 +17057,6 @@ class QtclClientApp:
                 "format": "hlwe_json"
             })
         
-        # Add timestamp_ns for canonical server hash
         tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
@@ -19555,12 +17072,10 @@ class QtclClientApp:
             except Exception:
                 pass
         elif result and result.get("error"):
-            # Server rejected with a reason — show it
             err = result.get("error", "unknown rejection")
             code = result.get("code", "")
             print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
         else:
-            # No response at all — connectivity issue
             print("  ❌ Submission failed — no response from oracle")
             print("")
             print(self.api.get_diagnostics())
@@ -19672,7 +17187,6 @@ class QtclClientApp:
                                            w_state.get("coherence_l1") or 0)))
             pur  = min(1.0, max(0.0, float(w_state.get("purity") or 0)))
 
-            # VN Entropy — server rarely returns it; compute from purity
             _ent_srv = w_state.get("entropy") or w_state.get("von_neumann_entropy")
             if _ent_srv:
                 ent = float(_ent_srv)
@@ -19687,14 +17201,9 @@ class QtclClientApp:
                 except Exception:
                     ent = 0.0
 
-            # Mermin — server returns:
-            #   "M"       → percentage of W3-max (0-100)  ← WRONG to display
-            #   "M_value" → actual Mermin scalar (0-4)    ← USE THIS
             _mobj = (w_state.get("mermin_test") or w_state.get("bell_test") or
                      w_state.get("mermin") or {})
             if isinstance(_mobj, dict):
-                # M_value is the physical Mermin expectation value in [0,4]
-                # M (no suffix) is percentage of W3-optimal — do not confuse them
                 mermin  = float(_mobj.get("M_value") or _mobj.get("mermin_M") or 0)
                 _mq     = bool(_mobj.get("is_quantum") or _mobj.get("quantum") or
                                _mobj.get("mermin_is_quantum") or mermin > 2.0)
@@ -19703,22 +17212,18 @@ class QtclClientApp:
                 mermin = float(_mobj or 0)
                 _mq    = mermin > 2.0
                 _mverd = ""
-            # Clamp to physical range [0, 4] — anything above is a field-name bug
             if mermin > 4.0:
                 mermin = 0.0; _mq = False; _mverd = "(field error — check M_value key)"
 
-            # pq_curr / pq_last — buried in block_field sub-dict
             _bf  = w_state.get("block_field") or {}
             pq_c = str(_bf.get("pq_curr") or w_state.get("pq_curr") or
                        w_state.get("pq_current") or pq0.get("pq_curr") or "?")
             pq_l = str(_bf.get("pq_last") or w_state.get("pq_last") or
                        pq0.get("pq_last") or "?")
 
-            # DM hex
             dm_hex = (w_state.get("density_matrix_hex") or
                       pq0.get("density_matrix_hex") or "—")
 
-            # Oracle identity — server exposes oracle_id not oracle_address
             oracle_addr = (w_state.get("oracle_id") or pq0.get("oracle_id") or
                            w_state.get("oracle_role") or pq0.get("oracle_role") or
                            "koyeb-primary")
@@ -19739,8 +17244,6 @@ class QtclClientApp:
               f"{'  ' + _mverd[:40] if _mverd else ''}")
 
             # ── Density matrix — structured element display ─────────────────
-            # 8×8 complex128 row-major. Each element = 32 hex chars (re16+im16).
-            # Non-zero rows for |W3⟩: rows 1,2,4 only (|001⟩,|010⟩,|100⟩ basis).
             a(HR)
             a("  DENSITY MATRIX  8×8 complex128  (IEEE754 LE, row-major)")
             if dm_hex and dm_hex != "—" and len(dm_hex) == 2048:
@@ -19769,7 +17272,6 @@ class QtclClientApp:
                 a("  (not available — SSE oracle DM not yet received)")
 
             # ── Per-node breakdown ──────────────────────────────────
-            # server key: oracle_measurements (from _gather_oracle_cluster_metrics)
             nodes = (w_state.get("oracle_measurements") or
                      w_state.get("per_node") or w_state.get("nodes") or
                      pq0.get("oracle_measurements") or pq0.get("per_node") or [])
@@ -19787,9 +17289,7 @@ class QtclClientApp:
                     a(f"      id: {nid}")
 
             # ── pq0 Bloch vector ───────────────────────────────────
-            # server returns pq0_bloch_theta (polar) + pq0_bloch_phi (azimuthal)
             import math as _bmath
-            # pq0 endpoint key names: 'theta'/'phi' (primary), 'pq0_bloch_theta' (alt)
             _btheta = (pq0.get("theta") or pq0.get("pq0_bloch_theta") or
                        pq0.get("bloch_theta") or pq0.get("bloch_x"))
             _bphi   = (pq0.get("phi")   or pq0.get("pq0_bloch_phi")   or
@@ -19810,7 +17310,6 @@ class QtclClientApp:
                 bloch_raw = "—"
             pq0_fid = (pq0.get("pq0_oracle_fidelity") or pq0.get("pq0_fidelity") or
                        pq0.get("fidelity") or w_state.get("pq0_oracle_fidelity") or "—")
-            # pq0 tripartite components
             pq0_iv = w_state.get("pq0_IV_fidelity") or pq0.get("pq0_IV_fidelity") or "—"
             pq0_v  = w_state.get("pq0_V_fidelity")  or pq0.get("pq0_V_fidelity")  or "—"
             a(HR)
@@ -19852,8 +17351,6 @@ class QtclClientApp:
             # ── P2P Ouroboros network status ───────────────────────
             a(HR)
             a("  P2P OUROBOROS NETWORK  —  port 9091")
-            # Lazy-init: if _start_threads() was never called (e.g. opened
-            # oracle panel without entering mine mode first), spin up P2P now.
             if _accel_ok and _P2P_NODE is None:
                 try:
                     _lazy_id = getattr(self, '_peer_id', None) or f"oracle_panel_{id(self)}"
@@ -19871,7 +17368,6 @@ class QtclClientApp:
                     n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
                     a(f"  Status         : ✅ RUNNING  protocol=RPC-only  peers={n_peers}  consensus=clean")
                     a(f"  Known peers    : {n_peers}   Connected: {n_conn}   (no SSE broadcast)")
-                    # Consensus DM
                     cons = _P2P_NODE.get_consensus_dm()
                     if cons:
                         _re, _im, _cf, _ch = cons
@@ -19881,7 +17377,6 @@ class QtclClientApp:
                     else:
                         a("  Consensus DM   : ⏳ awaiting peer contributions")
                         a("  Temporal decay : exp(-age/30s) × fid²  weighting active when peers join")
-                    # Peer list with reputation metrics
                     _plist = _P2P_NODE.get_peers()
                     if _plist:
                         a(f"  Active peers   : ({len(_plist)} connected)")
@@ -19900,7 +17395,6 @@ class QtclClientApp:
                     else:
                         a("  Active peers   : none — bootstrap connecting…")
                         a("  Tip: check port 9091 firewall / NAT rules")
-                    # Network aggregate stats
                     if _plist:
                         _all_lats = [p.get('latency_ms',0) for p in _plist if p.get('latency_ms',0) > 0]
                         _all_fids = [p.get('last_fidelity',0) for p in _plist]
@@ -19974,7 +17468,6 @@ class QtclClientApp:
                 break
 
             elif cmd == "l":
-                # Last block detail — full hashes, full tx list
                 tip = last_data[0]
                 height = tip.get("block_height") or tip.get("height") or "?"
                 bh_data = kapi._get(f"/api/blocks/{height}") or tip
@@ -19986,7 +17479,6 @@ class QtclClientApp:
                 print("  Enter=refresh  q=quit")
 
             else:
-                # Refresh
                 print("  ⚛️  Refreshing…", flush=True)
                 last_data = _fetch_all()
                 print(_render(*last_data), flush=True)
@@ -20019,7 +17511,6 @@ class QtclClientApp:
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
                 
-                # ── SWARM-AGENT θ: Enterprise balance fetch with explicit error handling
                 try:
                     bal = self.api.get_balance(self.wallet.address)
                     bal_str = f"{bal:.8f} QTCL"
@@ -20027,19 +17518,15 @@ class QtclClientApp:
                     # Snapshot cache is stale (RPC may be slow)
                     bal_str = f"⚠️  Snapshot stale ({e.age:.1f}s old, TTL={e.ttl}s)"
                 except _InvalidAddress:
-                    # Address not in ledger (shouldn't happen for loaded wallet)
                     bal_str = "❌ Address not in ledger"
                 except _RPCSnapshotException as e:
-                    # Snapshot engine not ready (startup delay)
                     bal_str = f"⏳ RPC initializing: {e}"
                 except Exception as e:
-                    # Unexpected error — fail hard (no silent degradation)
                     logger.critical(f"[INVARIANT] Balance fetch error: {e}")
                     bal_str = f"❌ Critical error: {e}"
                 
                 print(f"\n  💰 Balance : {bal_str}")
                 print(f"  Address  : {self.wallet.address}")
-                # Show wallet file paths for transparency
                 print(f"  Wallet   : {self.wallet.wallet_file}")
                 print(f"  Mnemonic : {self.wallet.mnemonic_file}  (AES-256 encrypted)")
             elif ch == "2":
@@ -20065,7 +17552,6 @@ class QtclClientApp:
                 print(f"  Address    : {self.wallet.address}")
                 print(f"  Public key : {self.wallet.public_key}")
                 print()
-                # AGENT-δ: show wallet file locations explicitly
                 print(f"  ── Storage ─────────────────────────────────────────────────")
                 print(f"  wallet.json       : {self.wallet.wallet_file}")
                 print(f"  wallet_mnemonic   : {self.wallet.mnemonic_file}")
@@ -20119,11 +17605,7 @@ class QtclClientApp:
         else:
             print("  ❌ Recovery failed")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PYTH NETWORK PRICE INTEGRATION — Enterprise Oracle-Signed Price Feeds
-    # ══════════════════════════════════════════════════════════════════════════
 
-    # Terminal colour helpers (no external deps)
     _T_GRN  = "\033[92m"
     _T_RED  = "\033[91m"
     _T_YLW  = "\033[93m"
@@ -20269,8 +17751,6 @@ class QtclClientApp:
             _json.dumps(price_map, sort_keys=True).encode()
         ).hexdigest()
 
-        # Sign: sha256(snap_id‖fetch_time_ns) with this oracle node's private key.
-        # _oracle_id is always present (populated in __init__ via _init_oracle_identity).
         oracle_sig: dict = {}
         oracle_addr: str = ""
         sig_ts_iso:  str = ""
@@ -20299,7 +17779,6 @@ class QtclClientApp:
                     "fetch_ns":    fetch_ns,
                 }
                 sig_ts_iso = oracle_sig["ts_iso"]
-                # Bump local attestation count (best-effort, non-blocking)
                 if self._db is not None:
                     try:
                         self._db.execute(
@@ -20448,7 +17927,6 @@ class QtclClientApp:
             _signed     = bool(_auth_tag and oracle_addr)
 
             if _signed:
-                # Oracle address + mode badge
                 _mode_badge = (f"{self._T_GRN}🔐 wallet-bound{self._T_RST}"
                                if _mode == "wallet_bound"
                                else f"{self._T_YLW}👻 anonymous{self._T_RST}")
@@ -20456,7 +17934,6 @@ class QtclClientApp:
                       f"{self._T_CYN}{self._T_BLD}{oracle_addr}{self._T_RST}"
                       f"  {_mode_badge}")
 
-                # Wallet binding line — only if wallet_bound
                 if _mode == "wallet_bound" and _wallet_bnd:
                     _cv_badge = (f"{self._T_GRN}✔ cert valid{self._T_RST}"
                                  if _cert_valid
@@ -20468,22 +17945,18 @@ class QtclClientApp:
                         print(f"  {self._T_DIM}Cert-tag  {self._T_RST}"
                               f"{self._T_MAG}{_cert['auth_tag'][:40]}{self._T_RST}…")
 
-                # auth_tag — HMAC binding sig→payload
                 print(f"  {self._T_DIM}Auth-tag  {self._T_RST}"
                       f"{self._T_MAG}{_auth_tag[:48]}{self._T_RST}…")
 
-                # HLWE sig prefix + byte count
                 if _sig_full:
                     print(f"  {self._T_DIM}HLWE-sig  {self._T_RST}"
                           f"{self._T_DIM}{_sig_full[:32]}{self._T_RST}…"
                           f"{self._T_DIM}[{len(_sig_full)//2}B]{self._T_RST}")
 
-                # ISO timestamp
                 _ts_display = sig_ts_iso[:23] if sig_ts_iso else t_str
                 print(f"  {self._T_DIM}Signed    {self._T_RST}"
                       f"{self._T_DIM}{_ts_display} UTC{self._T_RST}")
 
-                # Final status line
                 if _mode == "wallet_bound" and _cert_valid:
                     print(f"  {self._T_GRN}✅ Oracle-signed — HLWE-256 wallet-bound attestation ⚛️{self._T_RST}")
                 elif _mode == "wallet_bound" and not _cert_valid:
@@ -20512,7 +17985,6 @@ class QtclClientApp:
                 age    = feed.get("age_seconds",  0.0)
                 status = feed.get("status", "trading").upper()
 
-                # Δ% vs previous fetch
                 prev_p = prev.get(sym)
                 if prev_p and prev_p > 0:
                     delta_pct = (price - prev_p) / prev_p * 100
@@ -20537,7 +18009,6 @@ class QtclClientApp:
                       f"{age_s:>6}  "
                       f"{st_col}{status}{self._T_RST}")
 
-                # Portfolio valuation
                 if sym in portfolio and portfolio[sym] > 0:
                     usd_val = portfolio[sym] * price
                     total_portfolio_usd += usd_val
@@ -20621,7 +18092,6 @@ class QtclClientApp:
             
             t0   = _time.time()
             
-            # Retry logic for uninitialized oracle
             snap = None
             retry_count = 0
             max_retries = 3
@@ -20637,7 +18107,6 @@ class QtclClientApp:
                         _time.sleep(base_delay_s * (2 ** retry_count))
                     continue
                 
-                # Check if feeds are empty (oracle initializing)
                 feeds = snap.get("feeds", {})
                 hermes_ok = snap.get("hermes_ok", False)
                 
@@ -20665,20 +18134,17 @@ class QtclClientApp:
             
             refresh_count += 1
             
-            # Build prev snapshot from last run
             prev_snap_prices = {s: f.get("price_usd", 0)
                                 for s, f in (snap.get("feeds") or {}).items()
                                 if s in prev_prices}
             prev_snap_prices.update({s: p for s, p in prev_prices.items()
                                      if s not in prev_snap_prices})
             
-            # Clear screen for clean redraw
             print("\033[2J\033[H", end="")   # ANSI clear
             _draw_header()
             print(f"  {self._T_DIM}Refresh #{refresh_count}   watchlist: {', '.join(watch_syms)}{self._T_RST}")
             _draw_table(snap, prev_prices, portfolio, elapsed)
             
-            # Store this run's prices for next delta
             prev_prices = {
                 s: f.get("price_usd", 0)
                 for s, f in (snap.get("feeds") or {}).items()
@@ -20687,9 +18153,6 @@ class QtclClientApp:
             return True
 
         # ── Silence ALL background thread logs during market explorer ─────────
-        # Same NullHandler gate used by mine mode and transact mode — SSE/P2P
-        # threads emit INFO continuously; absorb them without dropping records.
-        # Restored unconditionally in finally whether we exit via q / Ctrl+C / exc.
         _me_root_log     = _logging.getLogger()
         _me_old_handlers = _me_root_log.handlers[:]
         _me_old_level    = _me_root_log.level
@@ -20698,7 +18161,6 @@ class QtclClientApp:
 
         try:
             if mode == "a":
-                # ── Auto-refresh: fire once immediately, then wait interval ───
                 while not _stop_event.is_set():
                     ok = _do_refresh()
                     if not ok:
@@ -20733,7 +18195,6 @@ class QtclClientApp:
         
         ✅ DISPLAYS MENU IMMEDIATELY (lazy loads oracle data)
         """
-        # ✅ SHOW MENU IMMEDIATELY (don't wait for oracle)
         print()
         print("╔══════════════════════════════════════════════════════════════╗")
         print("║                                                              ║")
@@ -20759,8 +18220,6 @@ class QtclClientApp:
             print(f"  👻 Oracle: {_oid['address']} (anonymous — no wallet binding)")
         print()
 
-        # Broadcast registration to P2P (non-blocking — DB may not be ready yet,
-        # but oracle_registry INSERT is best-effort anyway)
         _threading.Thread(target=self._broadcast_oracle_registration,
                           daemon=True, name="OracleRegBoot").start()
         print("  ┌──────────────────────────────────────────────────────────┐")
@@ -20784,14 +18243,8 @@ class QtclClientApp:
         else:               self.run_mine_mode()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# θ-SWARM  main()  (replaces original stub — intentional name shadowing)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# EMBEDDED PYTH HERMES ORACLE — Standalone Client Oracle
-# ════════════════════════════════════════════════════════════════════════════════
 def main() -> None:  # noqa: F811
     """
     QTCL Client entrypoint.
@@ -20838,7 +18291,6 @@ def main() -> None:  # noqa: F811
             except Exception: pass
         return
 
-    # ✅ Initialize QtclClientApp with timeout protection
     try:
         print("⚛️  QTCL Client initializing...", flush=True)
         
@@ -20853,8 +18305,6 @@ def main() -> None:  # noqa: F811
         url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
 
         # ── Wallet existence check ────────────────────────────────────────────
-        # If wallet.json doesn't exist, ALWAYS prompt for creation
-        # (independent of oracle registration choice)
         from pathlib import Path as _PathLib
         _wallet_file = _PathLib.home() / "qtcl-miner" / "data" / "wallet.json"
         if not _wallet_file.exists():
@@ -20885,7 +18335,6 @@ def main() -> None:  # noqa: F811
                     _tmp_create_wallet = QTCLWallet()
                     _new_addr = _tmp_create_wallet.create(_new_pw)
                     print(f"  ✅ Wallet created: {_new_addr}")
-                    # Clear password from memory
                     _new_pw = "0" * len(_new_pw)
                 except (EOFError, KeyboardInterrupt):
                     print("  ⚠  Wallet creation skipped — continuing as guest")
@@ -20893,9 +18342,6 @@ def main() -> None:  # noqa: F811
                     print(f"  ❌ Wallet creation error: {_cwe} — continuing as guest")
 
         # ── Oracle mode prompt ────────────────────────────────────────────────
-        # Running as a signing oracle is optional.  No oracle mode = normal
-        # anonymous client; oracle mode = wallet-bound identity, your price
-        # attestations carry a cert traceable to your QTCL wallet.
         oracle_context = None
         print()
         print("  ┌──────────────────────────────────────────────────────────┐")
@@ -20925,7 +18371,6 @@ def main() -> None:  # noqa: F811
                         "wallet_pub":  _tmp_wallet.public_key,
                     }
                     print(f"  ✅ Oracle bound to wallet: {_tmp_wallet.address}")
-                    # Scrub password from memory (best-effort)
                     _pw_oi = "0" * len(_pw_oi)
                     del _pw_oi
                 else:
@@ -20946,7 +18391,6 @@ def main() -> None:  # noqa: F811
         print(f"❌ Initialization error: {e}")
         return
 
-    # ✅ Dispatch modes (only initialize resources for selected mode)
     if   args.mine:                 app.run_mine_mode()
     elif args.transact:             app.run_transact_mode()
     elif args.wallet:               app.run_wallet_mode()
