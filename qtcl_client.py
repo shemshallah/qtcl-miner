@@ -5,7 +5,39 @@ import logging as _suppress_logging
 for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# ARM NEON / CFFI COMPILATION HARDENING (Termux ARM64 compatibility)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+import os as _os
+import sys as _sys
 
+# Force CFFI to NOT compile C extensions on ARM64 (Termux lacks proper arm_neon.h headers)
+# Fallback to pure Python implementations instead
+if _sys.platform.startswith('linux') and _os.getenv('PREFIX', '').endswith('termux'):
+    _os.environ.setdefault('ZIGGURAT_USE_PURE_PYTHON', '1')
+    _os.environ.setdefault('CFFI_NO_COMPILE', '1')
+    _os.environ.setdefault('CRYPTOGRAPHY_DONT_BUILD_EXT', '1')
+    # Disable inline assembly for NEON intrinsics
+    _os.environ['CFLAGS'] = _os.environ.get('CFLAGS', '').replace('-march=armv8-a+simd', '-march=armv8-a')
+    import warnings
+    warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*arm_neon.*')
+    print("[STARTUP] 🛡️  ARM64 hardening: CFFI/NEON compilation disabled, pure Python mode active", file=_sys.stderr)
+
+# Preemptively catch and log CFFI compilation errors
+_original_import = __builtins__.__import__
+
+def _import_with_cffi_fallback(name, *args, **kwargs):
+    """Wrap __import__ to gracefully degrade when CFFI compilation fails."""
+    try:
+        return _original_import(name, *args, **kwargs)
+    except Exception as e:
+        if 'uint64x2_t' in str(e) or 'arm_neon' in str(e) or 'vdupq_n_u64' in str(e):
+            # NEON compilation error - skip problematic module
+            _suppress_logging.getLogger('qtcl.client').warning(f"[STARTUP] Skipped CFFI {name} due to ARM NEON: {str(e)[:60]}")
+            raise ImportError(f"CFFI module {name} not available (ARM NEON incompatible); using pure Python fallback") from None
+        raise
+
+__builtins__.__import__ = _import_with_cffi_fallback
 
 
 import os
@@ -13631,6 +13663,13 @@ class QtclClientApp:
         self._peer_id      = (
             f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
+        
+        # ── Client configuration (used by RPC daemon threads) ─────────────────
+        self._cfg = {
+            "server_url": self.oracle_url,
+            "oracle_context": oracle_context or {},
+            "peer_id": self._peer_id,
+        }
 
     # ── Oracle identity ────────────────────────────────────────────────────────
 
