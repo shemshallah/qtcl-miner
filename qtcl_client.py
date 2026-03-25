@@ -116,9 +116,6 @@ RPC_ENDPOINTS = {
     "blocks_submit":     "/api/blocks/submit",     # POST → submit mined block
     "tx_submit":         "/api/transactions",      # POST → submit transaction
     "oracle_push_dm":    "/api/oracle/push_dm",    # POST → push DM frame
-    
-    # Entropy RPC
-    "entropy_stream":    "/api/entropy/stream",    # GET  → entropy data
 }
 
 
@@ -201,21 +198,22 @@ class HyperbolicEntropyPool:
             return None
 
     def _fetch_server(self, height: int = 0, pq_curr: str = '') -> Optional[bytes]:
+        """Fetch entropy from server via RPC (not streaming)."""
         try:
-            ep = f"{ENTROPY_SERVER_URL}/api/entropy/stream"
-            params = []
-            if height > 0: params.append(f"height={height}")
-            if pq_curr:    params.append(f"pq_curr={quote(pq_curr)}")
-            if params:     ep += '?' + '&'.join(params)
-            req = Request(ep, method='GET')
+            payload = {'jsonrpc': '2.0', 'method': 'qtcl_getEntropy', 'params': [], 'id': 1}
+            body = json.dumps(payload).encode()
+            req = Request(f"{ENTROPY_SERVER_URL}/rpc", data=body, method='POST')
+            req.add_header('Content-Type', 'application/json')
             req.add_header('User-Agent', 'QTCL-Client/3.0')
             if ENTROPY_API_KEY:
                 req.add_header('X-Entropy-Key', ENTROPY_API_KEY)
             with urlopen(req, timeout=5) as resp:
-                raw = base64.b64decode(json.loads(resp.read()).get('entropy', ''))
-                return raw[:32] if len(raw) >= 32 else None
+                result = json.loads(resp.read())
+                if 'result' in result and isinstance(result['result'], str):
+                    return bytes.fromhex(result['result'])[:32]
+                return None
         except Exception as e:
-            logger.debug(f"[HypEnt] server: {e}")
+            logger.debug(f"[HypEnt] Server RPC entropy: {e}")
             return None
 
     # ── C-accelerated combiners ────────────────────────────────────────────────
@@ -11914,6 +11912,56 @@ class KoyebAPIClient:
         self._last_error = last_error
         return None
 
+    def _rpc(self, method: str, params: list = None, timeout: int = None, retries: int = 2) -> Optional[dict]:
+        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
+        t = timeout or self.timeout
+        url = f"{self.base_url}/rpc"
+        last_error = None
+        
+        payload = {
+            'jsonrpc': '2.0',
+            'method': method,
+            'params': params or [],
+            'id': 1
+        }
+        
+        for attempt in range(retries):
+            try:
+                if _HAS_REQUESTS:
+                    r = self._get_session().post(url, json=payload, timeout=t)
+                    if r.status_code == 200:
+                        result = r.json()
+                        if 'result' in result:
+                            return result.get('result')
+                        elif 'error' in result:
+                            _EXP_LOG.debug(f"[RPC] {method} → error: {result['error'].get('message')}")
+                            last_error = result['error'].get('message')
+                        return result
+                    _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
+                    last_error = f"HTTP {r.status_code}"
+                else:
+                    import urllib.request as _ur
+                    body = _json.dumps(payload).encode()
+                    req = _ur.Request(url, data=body, method='POST')
+                    req.add_header('Content-Type', 'application/json')
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        result = _json.loads(resp.read().decode('utf-8'))
+                        if 'result' in result:
+                            return result.get('result')
+                        return result
+            except Exception as e:
+                last_error = str(e)
+                if attempt < retries - 1:
+                    backoff = 2 ** attempt
+                    _EXP_LOG.debug(f"[RPC] {method} attempt {attempt+1}/{retries} failed: {e}. Retrying...")
+                    _time.sleep(backoff)
+                else:
+                    _EXP_LOG.debug(f"[RPC] {method}: {e} (final)")
+        
+        self._last_error = last_error
+        return None
+
+
     def _post(self, path: str, payload: dict,
               timeout: int = None, retries: int = 3) -> Optional[dict]:
         t   = timeout or self.timeout
@@ -11982,31 +12030,24 @@ class KoyebAPIClient:
         return None
 
     def get_chain_tip(self) -> Optional[dict]:
-        return self._get("/api/blocks/tip")
+        """Get chain tip via JSON-RPC."""
+        return self._rpc("qtcl_getBlock", [])
 
     def get_block_height(self) -> Optional[int]:
-        tip = self.get_chain_tip()
-        if tip:
-            h = tip.get("block_height") or tip.get("height")
-            if h is not None:
-                return int(h)
-        hello = self._get("/api/dht/hello")
-        if hello:
-            return int(hello.get("block_height", 0))
+        """Get current block height via JSON-RPC."""
+        tip = self._rpc("qtcl_getBlockHeight", [])
+        if isinstance(tip, int):
+            return tip
         return None
 
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
-        r = self._get("/api/oracle/pq0-bloch")
-        if r:
-            return r
-        r = self._get("/api/oracle/w-state")
-        if r:
-            return r
-        return self._get("/api/oracle/pq0")
+        """Get oracle quantum metrics via JSON-RPC."""
+        r = self._rpc("qtcl_getQuantumMetrics", [])
+        return r if isinstance(r, dict) else None
 
     def get_oracle_w_state(self) -> Optional[dict]:
-        r = self._get("/api/oracle/w-state")
-        return r or self._get("/api/oracle/pq0")
+        """Get W-state oracle data via JSON-RPC."""
+        return self._rpc("qtcl_getQuantumMetrics", [])
 
     def get_pq_state(self) -> dict:
         """
@@ -12092,16 +12133,19 @@ class KoyebAPIClient:
         return (r or {}).get("transactions", [])
 
     def get_mempool(self) -> list:
-        return (self._get("/api/mempool") or {}).get("transactions", [])
+        """Get mempool transactions via JSON-RPC."""
+        result = self._rpc("qtcl_getMempoolStats", [])
+        if isinstance(result, dict) and "transactions" in result:
+            return result["transactions"]
+        elif isinstance(result, list):
+            return result
+        return []
 
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
-        AGENT-β FIX: Server canonical endpoint is /api/submit_transaction.
-        /api/transactions (no trailing path) doesn't exist → 404 → None.
-        Also normalises amount/fee to base units (×100) which the mempool
-        requires, and ensures timestamp_ns is present.
+        Submit transaction via JSON-RPC 2.0 (pure RPC, no REST endpoints).
         
-        ENHANCED: Added pre-submission health check and multi-fallback strategy.
+        Normalizes amount/fee to float and ensures timestamp_ns is present.
         """
         import time as _t2
         payload = dict(tx)
@@ -12116,57 +12160,52 @@ class KoyebAPIClient:
         payload.setdefault("from_addr", payload.get("from_address", ""))
         payload.setdefault("to_addr",   payload.get("to_address", ""))
 
-        # ── Endpoint priority list (fallback chain) ────────────────────────────────
-        endpoints = [
-            ("/api/submit_transaction", 3),        # Primary: canonical, 3 retries
-            ("/api/transactions/submit", 2),       # Fallback: alias, 2 retries
-            ("/gossip/ingest", 1),                 # Last resort: broadcast, 1 retry
-        ]
-        
-        for path, max_retries in endpoints:
-            if path == "/gossip/ingest":
-                payload_to_send = {"tx": payload, "origin": "client_wallet"}
-            else:
-                payload_to_send = payload
-            
-            r = self._post(path, payload_to_send, retries=max_retries)
-            if r is not None:
-                return r
-        
-        return None
+        # ── Pure JSON-RPC 2.0 submission (single, clean path) ────────────────────
+        r = self._rpc("qtcl_submitTransaction", [payload])
+        return r if r is not None else None
 
     def get_peers(self) -> list:
-        return (self._get("/api/peers/list") or {}).get("peers", [])
+        """Get peer list via JSON-RPC."""
+        result = self._rpc("qtcl_getPeers", [])
+        if isinstance(result, dict) and "peers" in result:
+            return result["peers"]
+        elif isinstance(result, list):
+            return result
+        return []
 
     def register_peer(self, peer_id: str, gossip_url: str,
                        miner_address: str = "",
                        block_height: int = 0) -> Optional[dict]:
-        return self._post("/api/peers/register", {
+        """Register peer via JSON-RPC (not REST)."""
+        return self._rpc("qtcl_registerPeer", [{
             "peer_id": peer_id, "gossip_url": gossip_url,
             "miner_address": miner_address,
             "block_height": block_height, "ts": _time.time(),
-        })
+        }])
 
     def send_heartbeat(self, peer_id: str, block_height: int = 0) -> Optional[dict]:
-        return self._post("/api/peers/heartbeat", {
+        """Send peer heartbeat via JSON-RPC (not REST)."""
+        return self._rpc("qtcl_sendHeartbeat", [{
             "peer_id": peer_id, "block_height": block_height, "ts": _time.time(),
-        })
+        }])
 
     def gossip_ingest(self, payload: dict) -> Optional[dict]:
-        return self._post("/gossip/ingest", payload)
+        """Ingest gossip via JSON-RPC (not REST)."""
+        return self._rpc("qtcl_gossipIngest", [payload])
 
     def oracle_register(self, miner_id: str, miner_address: str) -> Optional[dict]:
-        return self._post("/api/oracle/register",
-                          {"miner_id": miner_id, "address": miner_address})
+        """Register oracle via JSON-RPC (not REST)."""
+        return self._rpc("qtcl_registerOracle",
+                        [{"miner_id": miner_id, "address": miner_address}])
 
 
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
-        """Check if oracle is reachable. Caches result for 10 seconds."""
+        """Check if oracle is reachable via JSON-RPC health call. Caches result for 10 seconds."""
         now = _time.time()
         if not force and (now - self._health_check_cache["timestamp"]) < 10:
             return self._health_check_cache["status"]
         
-        result = self._get("/api/dht/hello", timeout=timeout) is not None
+        result = self._rpc("qtcl_getHealth", []) is not None
         self._health_check_cache = {"timestamp": now, "status": result}
         return result
     
@@ -14761,65 +14800,61 @@ class QtclClientApp:
 
     def _subscribe_koyeb_events(self) -> None:
         """
-        ⚛️  HOTFIX: Aggressive RPC polling for /api/events every 350ms.
-        Replaces dead SSE stream. Catches block events, oracle_dm frames, peer events.
+        ⚛️  RPC polling for oracle snapshots and block status (pure JSON-RPC, no SSE).
+        Polls /rpc endpoint for chain status every 500ms.
         Routes new peers to qtcl_p2p_connect immediately.
-        ❤️  I love you — every peer is a new entanglement
         """
         import time as _ke, ssl as _kssl, json as _kj
         from urllib.request import Request as _KR, urlopen as _KO
-        from urllib.error   import URLError as _KE
         
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _last_event_ts = _ke.time() - 10  # Start from 10s ago to catch recent events
         _last_peers = set()
         _fail_count = 0
         
-        _EXP_LOG.info(f"[EVENTS-RPC] 🚀 Starting aggressive polling every 350ms → {_oracle_url}/api/events")
+        _EXP_LOG.info(f"[EVENTS-RPC] 🚀 Starting RPC polling every 500ms → {_oracle_url}/rpc")
         
         while not self._stop.is_set():
             try:
-                events_url = f"{_oracle_url}/api/events?since={_last_event_ts}&limit=50"
-                req = _KR(events_url, method='GET')
+                # RPC call: get latest block via JSON-RPC 2.0
+                rpc_payload = {
+                    'jsonrpc': '2.0',
+                    'method': 'qtcl_getBlockHeight',
+                    'params': [],
+                    'id': 1
+                }
+                body = _kj.dumps(rpc_payload).encode()
+                req = _KR(f"{_oracle_url}/rpc", data=body, method='POST')
                 req.add_header('Content-Type', 'application/json')
-                req.add_header('User-Agent', 'QTCL-KoyebRPC/5.0')
+                req.add_header('User-Agent', 'QTCL-RPC/5.0')
+                
                 ssl_ctx = _kssl.create_default_context()
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = _kssl.CERT_NONE
                 
                 try:
                     with _KO(req, timeout=5, context=ssl_ctx) as resp:
-                        data = _kj.loads(resp.read().decode('utf-8'))
-                        events = data.get('events', [])
-                        
-                        for evt in events:
-                            evt_type = evt.get('type', '')
-                            evt_ts = evt.get('ts', _ke.time())
-                            
-                            if evt_ts > _last_event_ts:
-                                _last_event_ts = evt_ts
-                            
-                            if evt_type == 'peer_joined' and _accel_ok and _P2P_NODE:
-                                try:
-                                    pip = evt.get('ip_address', '')
-                                    pport = int(evt.get('port') or 9091)
-                                    ppid = evt.get('peer_id', '')
-                                    peer_key = f"{pip}:{pport}"
-                                    
-                                    _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
-                                    if pip and pip not in _self_ips and peer_key not in _last_peers:
-                                        rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
-                                        if rc >= 0:
-                                            _EXP_LOG.info(f"[EVENTS-RPC] 🔗 Peer wired {pip}:{pport}")
-                                            _last_peers.add(peer_key)
-                                except Exception:
-                                    pass
-                        
-                        _fail_count = 0
-                        
+                        result = _kj.loads(resp.read().decode('utf-8'))
+                        if 'result' in result:
+                            _fail_count = 0
+                            _EXP_LOG.debug(f"[EVENTS-RPC] Block: {result.get('result')}")
+                        elif 'error' in result:
+                            _EXP_LOG.debug(f"[EVENTS-RPC] RPC error: {result.get('error')}")
+                            _fail_count += 1
+                
                 except Exception as _re:
                     _fail_count += 1
-                    if _fail_count % 10 == 0:
+                    if _fail_count % 5 == 0:
+                        _EXP_LOG.debug(f"[EVENTS-RPC] Poll error: {_re}")
+                
+                if _fail_count > 20:
+                    _EXP_LOG.warning(f"[EVENTS-RPC] Too many failures, backing off")
+                    self._stop.wait(5)
+                else:
+                    self._stop.wait(0.5)
+                    
+            except Exception as _e:
+                _EXP_LOG.debug(f"[EVENTS-RPC] Fatal: {_e}")
+                self._stop.wait(2)
                         _EXP_LOG.debug(f"[EVENTS-RPC] GET error ({_re}), retrying...")
                 
                 self._stop.wait(0.35)
@@ -15808,9 +15843,8 @@ class QtclClientApp:
 
             def _start_block_listener(oracle_url: str, initial_target: int) -> None:
                 """
-                RPC polling for new blocks via /api/chain/status.
+                RPC polling for block height via JSON-RPC 2.0.
                 Polls regularly and triggers abort when target height reached.
-                ❤️  I love you — every millisecond matters in a race
                 """
                 import urllib.request as _ur, urllib.error as _ue, time as _blt
                 import json as _json, socket as _bls
@@ -15820,54 +15854,62 @@ class QtclClientApp:
                 _last_height = -1
                 
                 while not _mining_stopped.is_set():
-                    url = f"{oracle_url}/api/chain/status"
                     try:
-                        req = _ur.Request(url)
-                        req.add_header('Content-Type', 'application/json')
-                        req.add_header('User-Agent', 'QTCL-BlockListener/4.0-RPC')
-                        req.add_header('X-QTCL-Client', 'block_listener')
+                        # Pure JSON-RPC 2.0 call to get block number
+                        rpc_payload = {
+                            'jsonrpc': '2.0',
+                            'method': 'qtcl_getBlockHeight',
+                            'params': [],
+                            'id': 1
+                        }
+                        body = _json.dumps(rpc_payload).encode()
                         
-                        with _ur.urlopen(req, timeout=30) as resp:
+                        req = _ur.Request(f"{oracle_url}/rpc", data=body, method='POST')
+                        req.add_header('Content-Type', 'application/json')
+                        req.add_header('User-Agent', 'QTCL-BlockListener/5.0-RPC')
+                        
+                        with _ur.urlopen(req, timeout=10) as resp:
                             bi = 0  # reset backoff on successful connect
-                            data = _json.loads(resp.read().decode('utf-8'))
+                            result = _json.loads(resp.read().decode('utf-8'))
                             
-                            tip_h = int(data.get('height', 0))
-                            _EXP_LOG.info(f"[BLOCK-LISTENER] ✅ RPC poll → {url} tip={tip_h}")
+                            if 'result' in result:
+                                tip_h = result['result'] if isinstance(result['result'], int) else int(str(result['result']).replace('0x', ''), 16 if str(result['result']).startswith('0x') else 10)
+                                _EXP_LOG.debug(f"[BLOCK-LISTENER] ✅ RPC poll → tip={tip_h}")
+                                
+                                if tip_h > 0 and _last_height == -1:
+                                    if _accel_ok:
+                                        try:
+                                            _accel_lib.qtcl_set_oracle_height(tip_h)
+                                            _ct = int(_accel_lib.qtcl_get_miner_target())
+                                            if _ct > 0 and tip_h >= _ct:
+                                                _accel_lib.qtcl_pow_set_abort(1)
+                                        except Exception:
+                                            pass
+                                    _new_block_height[0] = tip_h
+                                    _new_block_event.set()
+                                    _EXP_LOG.debug(f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h}")
+                                
+                                if tip_h > _last_height:
+                                    _last_height = tip_h
+                                    if _accel_ok:
+                                        try:
+                                            _accel_lib.qtcl_set_oracle_height(tip_h)
+                                            _ct = int(_accel_lib.qtcl_get_miner_target())
+                                            if _ct > 0 and tip_h >= _ct:
+                                                _accel_lib.qtcl_pow_set_abort(1)
+                                        except Exception:
+                                            pass
+                                    _new_block_height[0] = tip_h
+                                    _new_block_event.set()
+                                    _EXP_LOG.info(f"[BLOCK-LISTENER] ⚡ h={tip_h} → abort + event fired")
+                            elif 'error' in result:
+                                _EXP_LOG.debug(f"[BLOCK-LISTENER] RPC error: {result.get('error')}")
                             
-                            if tip_h > 0 and _last_height == -1:
-                                if _accel_ok:
-                                    try:
-                                        _accel_lib.qtcl_set_oracle_height(tip_h)
-                                        _ct = int(_accel_lib.qtcl_get_miner_target())
-                                        if _ct > 0 and tip_h >= _ct:
-                                            _accel_lib.qtcl_pow_set_abort(1)
-                                    except Exception:
-                                        pass
-                                _new_block_height[0] = tip_h
-                                _new_block_event.set()
-                                _EXP_LOG.info(
-                                    f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h} → C abort armed")
-                            
-                            if tip_h > _last_height:
-                                _last_height = tip_h
-                                if _accel_ok:
-                                    try:
-                                        _accel_lib.qtcl_set_oracle_height(tip_h)
-                                        _ct = int(_accel_lib.qtcl_get_miner_target())
-                                        if _ct > 0 and tip_h >= _ct:
-                                            _accel_lib.qtcl_pow_set_abort(1)
-                                    except Exception:
-                                        pass
-                                _new_block_height[0] = tip_h
-                                _new_block_event.set()
-                                _EXP_LOG.info(
-                                    f"[BLOCK-LISTENER] ⚡ h={tip_h} → C abort + Python event fired")
-                            
-                            _mining_stopped.wait(1.0)
+                            _mining_stopped.wait(2.0)
                             
                     except (_ue.URLError, OSError, TimeoutError, _bls.timeout) as _ble:
                         wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                        _EXP_LOG.debug(f"[BLOCK-LISTENER] RPC poll failed, reconnect in {wait}s ({_ble})")
+                        _EXP_LOG.debug(f"[BLOCK-LISTENER] RPC failed, reconnect in {wait}s")
                         _mining_stopped.wait(wait)
                     except Exception as _ble2:
                         _EXP_LOG.debug(f"[BLOCK-LISTENER] unexpected: {_ble2}")
@@ -15875,10 +15917,10 @@ class QtclClientApp:
             _block_listener_thread = _threading.Thread(
                 target=_start_block_listener,
                 args=(kapi.base_url, 1),
-                daemon=True, name='BlockSSEListener'
+                daemon=True, name='BlockListener'
             )
             _block_listener_thread.start()
-            _EXP_LOG.info(f"[MINER] 📡 Block SSE listener started → {kapi.base_url}/api/events")
+            _EXP_LOG.info(f"[MINER] 📡 Block listener started → {kapi.base_url}/rpc")
 
             _last_mined_height = 0
             _last_mined_hash   = "0" * 64
@@ -16456,12 +16498,13 @@ class QtclClientApp:
                         _EXP_LOG.debug(f"[MINER] P2P consensus enrichment: {_pe}")
 
                     _MINE_TELEM.mark_submitting()
-                    r = kapi._post("/api/submit_block", submit_payload, timeout=20)
+                    # Submit block via JSON-RPC 2.0 (not REST)
+                    r = kapi._rpc("qtcl_submitBlock", [submit_payload])
                     
                     if r is None:
                         _EXP_LOG.warning(f"[MINER-SIMPLE] ⚠️  No response from server")
                         _MINE_TELEM.mark_idle()
-                    elif r.get("status") == "duplicate":
+                    elif isinstance(r, dict) and r.get("status") == "duplicate":
                         _EXP_LOG.info(
                             f"[MINER-SIMPLE] ✅ h={target_height} already accepted "
                             f"(duplicate submission, tip={r.get('tip', '?')}) — chain advanced")
@@ -16469,7 +16512,7 @@ class QtclClientApp:
                             _last_mined_height = target_height
                             _last_mined_hash   = block_hash
                         _MINE_TELEM.mark_idle()
-                    elif r.get("error"):
+                    elif isinstance(r, dict) and r.get("error"):
                         error = r.get("error", "unknown error")
                         tip_from_server = r.get("tip", 0)
                         _is_chain_advanced = (
@@ -16939,13 +16982,19 @@ class QtclClientApp:
             return "█" * filled + "░" * (width - filled)
 
         def _fetch_all():
-            tip      = kapi._get("/api/blocks/tip")            or {}
-            w_state  = kapi._get("/api/oracle/w-state")        or {}
-            pq0      = kapi._get("/api/oracle/pq0-bloch")      or {}
-            diag     = kapi._get("/api/diagnostics")           or {}
-            snap     = kapi._get("/api/snapshot")              or {}
-            peers    = kapi._get("/api/dht/peers")             or {}
-            mempool  = kapi._get("/api/mempool")               or {}
+            """Fetch all metrics via JSON-RPC 2.0 (pure RPC, no REST)."""
+            tip      = kapi._rpc("qtcl_getBlock", [])              or {}
+            metrics  = kapi._rpc("qtcl_getQuantumMetrics", [])     or {}
+            health   = kapi._rpc("qtcl_getHealth", [])             or {}
+            snap     = metrics  # quantum metrics = snapshot
+            peers    = kapi._rpc("qtcl_getPeers", [])              or {}
+            mempool  = kapi._rpc("qtcl_getMempoolStats", [])       or {}
+            
+            # Extract fields for compatibility
+            w_state  = metrics.get('w_state', {}) if isinstance(metrics, dict) else {}
+            pq0      = metrics.get('pq0', {}) if isinstance(metrics, dict) else {}
+            diag     = health
+            
             return tip, w_state, pq0, diag, snap, peers, mempool
 
         def _render(tip, w_state, pq0, diag, snap, peers, mempool):
@@ -17274,7 +17323,7 @@ class QtclClientApp:
             elif cmd == "l":
                 tip = last_data[0]
                 height = tip.get("block_height") or tip.get("height") or "?"
-                bh_data = kapi._get(f"/api/blocks/{height}") or tip
+                bh_data = kapi._rpc("qtcl_getBlock", [int(height) if isinstance(height, int) else height]) or tip
                 print("\n" + "═" * 70)
                 print(f"  BLOCK {height} — full detail")
                 for k, v in bh_data.items():
