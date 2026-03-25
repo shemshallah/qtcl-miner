@@ -3505,23 +3505,7 @@ def _dm_pool_daemon(db_path: str) -> None:
             _dm_pool_snap_consensus(db_path)
             _last_snap = now
 
-        # 3. Ouroboros self-reinforcement + P2P rebroadcast
-        if now - _last_reinforce >= _reinforce_interval:
-            try:
-                if _LOCAL_ORACLE.snapshot_count > 0:
-                    dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
-                    if age < 60.0 and any(v != 0.0 for v in dm_re):
-                        # Inject into C bootstrap + trigger consensus
-                        if _accel_ok:
-                            try:
-                                re_c = _accel_ffi.new('double[64]', dm_re)
-                                im_c = _accel_ffi.new('double[64]', dm_im)
-                                _accel_lib.qtcl_bootstrap_ingest_dm(re_c, im_c)
-                                _accel_lib.qtcl_p2p_trigger_consensus()
-                            except Exception: pass
-                        # RPC mode: no SSE broadcast needed (peers poll /api/oracle/snapshot)
-            except Exception: pass
-            _last_reinforce = now
+        # 3. RPC polling handles consensus triggers - no daemon self-loop
 
         _DM_POOL_DAEMON_STOP.wait(0.5)
 
@@ -12023,8 +12007,7 @@ static void *_p2p_peer_thread(void *arg){
                 }
                 pthread_mutex_unlock(&_P2P.peers_lock);
             }
-            char sb[1024]; int sn=_wstate_json(m,sb,sizeof(sb),0);
-            if(sn>0)_sse_bcast("wstate",TOPIC_WSTATE,sb,sn);
+            /* wstate JSON generation removed — RPC-only model, no SSE broadcast */
             if(_P2P.callback)_P2P.callback(3,m,sizeof(*m));
         } else if(!strcmp(cmd,"dmpool")&&pl>=(int)sizeof(QtclDMPoolEntry)){
             const QtclDMPoolEntry *de=(const QtclDMPoolEntry*)rb;
@@ -12035,9 +12018,7 @@ static void *_p2p_peer_thread(void *arg){
             }
             if(_P2P.callback)_P2P.callback(7,de,sizeof(*de));
         } else if(!strcmp(cmd,"ssesub")){
-            uint8_t top=(pl>=1)?rb[0]:TOPIC_ALL;
-            c->is_sse_subscriber=1;
-            _sse_accept(c->fd,c->host,top);
+            /* SSE subscription requests ignored — RPC-only consensus model */
             pthread_mutex_lock(&_P2P.peers_lock);
             c->active=0;c->fd=-1;
             _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;
@@ -12045,8 +12026,7 @@ static void *_p2p_peer_thread(void *arg){
             return NULL;
         } else if(!strcmp(cmd,"chain_rst")){
             if(_P2P.callback)_P2P.callback(8,rb,(size_t)pl);
-            char sb[256]; int sn=snprintf(sb,sizeof(sb),"{\"event\":\"chain_reset\",\"new_height\":0}");
-            if(sn>0)_sse_bcast("chain_reset",TOPIC_CHAIN,sb,sn);
+            /* chain_reset broadcast removed — RPC-only model, no SSE */
         } else if(!strcmp(cmd,"getaddr")){
             pthread_mutex_lock(&_P2P.peers_lock);
             uint8_t ab[P2P_MAX_PEERS*70];int off=0;
@@ -12104,7 +12084,9 @@ static void *_accept_thread(void *arg){
             if(tp)topics=(uint8_t)strtoul(tp+7,NULL,10);
             else{const char *cp=strstr(hb,"channels=");if(cp)topics=(uint8_t)atoi(cp+9);}
             if(strstr(hb,"/events")){
-                _sse_accept(cfd,rh,topics);
+                /* SSE not supported — RPC-only consensus model */
+                const char *na="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 41\r\n\r\nSSE disabled (RPC-only consensus model)";
+                if(write(cfd,na,strlen(na))<0){};close(cfd);
             } else if(strstr(hb,"/gossip")){
                 /* POST /gossip — JSON chain_reset or wstate ingestion */
                 const char *body=strstr(hb,"\r\n\r\n");
@@ -12198,7 +12180,7 @@ static void *_ping_thread(void *arg){
 int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
     memset(&_P2P,0,sizeof(_P2P));
     pthread_mutex_init(&_P2P.peers_lock,NULL);
-    pthread_mutex_init(&_P2P.sse_lock,NULL);
+    /* sse_lock removed — RPC-only consensus model */
     pthread_mutex_init(&_P2P.consensus_lock,NULL);
     pthread_mutex_init(&_P2P.self_lock,NULL);
     pthread_mutex_init(&_P2P.bloom_lock,NULL);
@@ -12208,7 +12190,7 @@ int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
     _P2P.listen_port=listen_port?listen_port:P2P_LISTEN_PORT;
     _P2P.max_peers=(max_peers>P2P_MAX_PEERS)?P2P_MAX_PEERS:max_peers;
     for(int i=0;i<P2P_MAX_PEERS;i++)_P2P.peers[i].fd=-1;
-    for(int i=0;i<P2P_MAX_SSE;i++){_P2P.sse_subs[i].fd=-1;_P2P.sse_subs[i].active=0;}
+    /* sse_subs initialization removed — RPC-only model */
     size_t hl=strlen(node_id_hex);
     if(hl>=32)_hex_to_bytes(node_id_hex,_P2P.node_id,16);
     else{uint8_t t[32]={0};qtcl_sha3_256((const uint8_t*)node_id_hex,hl,t);memcpy(_P2P.node_id,t,16);}
@@ -12290,9 +12272,7 @@ void qtcl_p2p_shutdown(void){
     pthread_mutex_lock(&_P2P.peers_lock);
     for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].fd>=0) shutdown(_P2P.peers[i].fd,SHUT_RDWR);
     pthread_mutex_unlock(&_P2P.peers_lock);
-    pthread_mutex_lock(&_P2P.sse_lock);
-    for(int i=0;i<P2P_MAX_SSE;i++) if(_P2P.sse_subs[i].active&&_P2P.sse_subs[i].fd>=0){_P2P.sse_subs[i].active=0;close(_P2P.sse_subs[i].fd);}
-    pthread_mutex_unlock(&_P2P.sse_lock);
+    /* SSE subscriber shutdown removed — RPC-only model */
 }
 
 int qtcl_p2p_send_wstate(const QtclWStateMeasurement *m){
@@ -12364,7 +12344,7 @@ void qtcl_p2p_broadcast_chain_reset(uint32_t new_h,const char *genesis_hex){
         if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)
             _send(_P2P.peers[i].fd,"chain_rst",p,pl,0);
     pthread_mutex_unlock(&_P2P.peers_lock);
-    _sse_bcast("chain_reset",TOPIC_CHAIN,p,(int)pl);
+    /* SSE broadcast removed — RPC-only model, uses P2P gossip only */
 }
 
 void qtcl_p2p_send_inv(uint8_t t,const uint8_t *h32){
