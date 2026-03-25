@@ -17592,29 +17592,21 @@ class QtclClientApp:
                                 )
                                 # Continue with Python metrics (mining proceeds)
                         
-                        # ✅ FIX-METRICS-MERMIN: Try C RPC first, Python fallback
+                        # ✅ SINGLE-PATH MERMIN: Try C RPC, fallback to 0 (no Python path)
                         mermin_val, mermin_viol = 0.0, False
                         if _accel_ok and hasattr(_accel_lib, 'qtcl_mermin_w3'):
                             try:
-                                # Call C Mermin function via RPC
                                 dm_re_c = _accel_ffi.new('double[64]', dm_re_list)
                                 dm_im_c = _accel_ffi.new('double[64]', dm_im_list)
                                 mermin_val = float(_accel_lib.qtcl_mermin_w3(dm_re_c, dm_im_c))
                                 mermin_viol = abs(mermin_val) > 2.0
-                                if _np_bs.isfinite(mermin_val):
-                                    _EXP_LOG.debug(
-                                        f"[MERMIN] C RPC: {mermin_val:+.4f} "
-                                        f"{'VIOLATED' if mermin_viol else 'classical'}"
-                                    )
-                                else:
-                                    _EXP_LOG.warning(f"[MERMIN] C returned non-finite: {mermin_val} → Python fallback")
-                                    mermin_val, mermin_viol, _ = _mermin_w3(dm_curr_np)
+                                _EXP_LOG.info(f"[MERMIN] C: {mermin_val:+.4f} ({'✓' if mermin_viol else '✗'})")
                             except Exception as _cme:
-                                _EXP_LOG.debug(f"[MERMIN] C RPC failed: {_cme} → Python fallback")
-                                mermin_val, mermin_viol, _ = _mermin_w3(dm_curr_np)
+                                _EXP_LOG.warning(f"[MERMIN] C RPC failed: {_cme} → 0.0")
+                                mermin_val, mermin_viol = 0.0, False
                         else:
-                            # C function unavailable — Python only
-                            mermin_val, mermin_viol, _ = _mermin_w3(dm_curr_np)
+                            _EXP_LOG.debug("[MERMIN] C function unavailable → 0.0")
+                            mermin_val, mermin_viol = 0.0, False
                         
                         # ✅ FIX-AUDIT-3: GKSL timeout protection
                         # If evolution hangs or is slow, use cached previous state
@@ -17697,108 +17689,50 @@ class QtclClientApp:
                     ts_ns = int(out_m.timestamp_ns)
                     oracle_age = abs(_time.time() - ts_ns / 1e9) if ts_ns else 0.0
 
-                    # ── Clamp all metrics to physically valid ranges FIRST ──
-                    # Must run before DB insert and blockfield display
-                    def _clamp(v, lo, hi):
-                        try:
-                            f = float(v)
-                            return f if (lo <= f <= hi and _np.isfinite(f)) else 0.0
-                        except Exception:
-                            return 0.0
-                    _disp_fid    = _clamp(float(out_m.w_fidelity),    0.0, 1.0)
-                    _disp_ent    = _clamp(float(out_m.entropy_vn),    0.0, 3.0)
-                    _disp_coh    = _clamp(float(out_m.coherence),     0.0, 1.0)
-                    _disp_disc   = _clamp(float(out_m.discord),       0.0, 3.0)
-                    _disp_pur    = _clamp(float(out_m.purity),        0.0, 1.0)
-                    _disp_neg    = _clamp(float(out_m.negativity),    0.0, 0.5)
-                    _disp_d0c    = _clamp(float(out_m.hyp_dist_0c),   0.0, 10.0)
-                    _disp_dcl    = _clamp(float(out_m.hyp_dist_cl),   0.0, 10.0)
-                    _disp_d0l    = _clamp(float(out_m.hyp_dist_0l),   0.0, 10.0)
+                    # ── SINGLE-PATH METRIC EXTRACTION: Direct C struct read only ──────
+                    # No fallbacks. If metrics are 0, they are 0 from C.
+                    # (Likely because pq_curr_id/pq_last_id haven't initialized the field yet)
+                    _disp_fid    = float(out_m.w_fidelity)
+                    _disp_ent    = float(out_m.entropy_vn)
+                    _disp_coh    = float(out_m.coherence)
+                    _disp_disc   = float(out_m.discord)
+                    _disp_pur    = float(out_m.purity)
+                    _disp_neg    = float(out_m.negativity)
+                    _disp_d0c    = float(out_m.hyp_dist_0c)
+                    _disp_dcl    = float(out_m.hyp_dist_cl)
+                    _disp_d0l    = float(out_m.hyp_dist_0l)
+                    _disp_area   = float(out_m.triangle_area)
+                    _disp_mermin = float(mermin_val)
+                    _disp_bridge = float(bridge_fid)
                     
-                    # ✅ FIX-METRICS-AREA: Extract triangle_area with robust fallback
-                    _disp_area = 0.0
-                    try:
-                        _area_raw = float(out_m.triangle_area)
-                        if _np.isfinite(_area_raw) and 0.0 <= _area_raw <= 12.57:
-                            _disp_area = _area_raw
-                            _EXP_LOG.debug(f"[AREA] From C struct: {_disp_area:.4f} rad")
-                        else:
-                            _EXP_LOG.warning(
-                                f"[AREA] C struct out of bounds: {_area_raw:.6f} → "
-                                f"computing from distances"
-                            )
-                            # Fallback: compute from Gauss-Bonnet with distances
-                            if HAS_NUMPY and dm_curr_np is not None:
-                                try:
-                                    ang_0c = max(0.0, min(_np.pi / 2.0, _disp_d0c * 0.30))
-                                    ang_cl = max(0.0, min(_np.pi / 2.0, _disp_dcl * 0.30))
-                                    ang_0l = max(0.0, min(_np.pi / 2.0, _disp_d0l * 0.30))
-                                    _disp_area = max(0.0, min(12.57, _np.pi - (ang_0c + ang_cl + ang_0l)))
-                                    _EXP_LOG.debug(f"[AREA] Computed from distances: {_disp_area:.4f} rad")
-                                except Exception as _af:
-                                    _EXP_LOG.debug(f"[AREA] Fallback computation failed: {_af}")
-                                    _disp_area = 0.0
-                    except (AttributeError, TypeError, ValueError) as _ae:
-                        _EXP_LOG.debug(f"[AREA] C struct extraction failed ({_ae}) → fallback")
-                        _disp_area = 0.0
-                    except Exception as _ue:
-                        _EXP_LOG.error(f"[AREA] Unexpected error: {_ue}")
-                        _disp_area = 0.0
-                    
-                    _disp_mermin = _clamp(mermin_val,                 -4.0, 4.0)
-                    _disp_bridge = _clamp(bridge_fid,                 0.0, 1.0)
+                    # Log raw values for debugging (distances 0 = pq_curr/pq_last not initialized)
+                    _EXP_LOG.info(
+                        f"[METRICS-RAW] d0c={_disp_d0c:.4f} dcl={_disp_dcl:.4f} d0l={_disp_d0l:.4f} "
+                        f"area={_disp_area:.4f} mermin={_disp_mermin:+.4f} "
+                        f"pqc={_pqc} pql={_pql} (0=uninitialized)"
+                    )
 
                     # Persist to local DB
                     try:
                         import sqlite3 as _sq
                         _conn = _sq.connect(self._db_path)
-                        # ✅ FIX-METRICS-DB: Ensure schema has new columns
-                        try:
-                            _conn.execute("ALTER TABLE wstate_measurements ADD COLUMN hyp_triangle_area REAL DEFAULT 0.0;")
-                            _conn.execute("ALTER TABLE wstate_measurements ADD COLUMN mermin_value REAL DEFAULT 0.0;")
-                            _conn.execute("ALTER TABLE wstate_measurements ADD COLUMN mermin_violated INTEGER DEFAULT 0;")
-                            _conn.commit()
-                        except Exception:
-                            pass  # Columns may already exist
-                        
-                        # Insert with new metrics (attempt with new columns, fallback to old schema)
-                        try:
-                            _conn.execute("""
-                                INSERT OR REPLACE INTO wstate_measurements
-                                (node_id_hex, pq_curr_id, pq_last_id,
-                                 fidelity_to_w3, entropy_vn, coherence_l1,
-                                 quantum_discord, purity, negativity_AB,
-                                 hyp_triangle_area, mermin_value, mermin_violated,
-                                 block_height, recorded_at)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                            """, (
-                                self._peer_id, str(_pqc), str(_pql),
-                                float(out_m.w_fidelity),  float(out_m.entropy_vn),
-                                float(out_m.coherence),   float(out_m.discord),
-                                float(out_m.purity),      float(out_m.negativity),
-                                _disp_area,               _disp_mermin,            (1 if mermin_viol else 0),
-                                _bh, _time.time(),
-                            ))
-                        except Exception as _db_new:
-                            # Fallback to old schema if new columns don't exist
-                            _EXP_LOG.debug(f"[DB] New schema failed ({_db_new}) → fallback to old schema")
-                            _conn.execute("""
-                                INSERT OR REPLACE INTO wstate_measurements
-                                (node_id_hex, pq_curr_id, pq_last_id,
-                                 fidelity_to_w3, entropy_vn, coherence_l1,
-                                 quantum_discord, purity, negativity_AB,
-                                 block_height, recorded_at)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                            """, (
-                                self._peer_id, str(_pqc), str(_pql),
-                                float(out_m.w_fidelity),  float(out_m.entropy_vn),
-                                float(out_m.coherence),   float(out_m.discord),
-                                float(out_m.purity),      float(out_m.negativity),
-                                _bh, _time.time(),
-                            ))
+                        _conn.execute("""
+                            INSERT OR REPLACE INTO wstate_measurements
+                            (node_id_hex, pq_curr_id, pq_last_id,
+                             fidelity_to_w3, entropy_vn, coherence_l1,
+                             quantum_discord, purity, negativity_AB,
+                             block_height, recorded_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            self._peer_id, str(_pqc), str(_pql),
+                            float(out_m.w_fidelity),  float(out_m.entropy_vn),
+                            float(out_m.coherence),   float(out_m.discord),
+                            float(out_m.purity),      float(out_m.negativity),
+                            _bh, _time.time(),
+                        ))
                         _conn.commit(); _conn.close()
                     except Exception as _dbe:
-                        _EXP_LOG.debug(f"[Bootstrap] DB: {_dbe}")
+                        _EXP_LOG.debug(f"[DB] Insert: {_dbe}")
 
                     # ── Clamp all metrics to physically valid ranges before display ──
                     # MUST run before mermin_str which references _disp_mermin
@@ -18190,7 +18124,7 @@ class QtclClientApp:
                     6  # conservative fallback if tip is missing the field
                 )
                 # Clamp to sane range — never allow trivially-easy or impossibly-hard
-                difficulty_bits = max(5.25, min(difficulty_bits, 20.0))
+                difficulty_bits = int(max(5, min(difficulty_bits, 20)))
                 
                 # Clear stale signals and reset C abort flag at start of each iteration
                 _new_block_event.clear()
