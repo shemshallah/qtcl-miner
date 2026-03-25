@@ -14028,26 +14028,101 @@ class RPCSnapshotEngine:
                 _EXP_LOG.debug(f"[RPC-Poll] Fetch error: {e}")
     
     def _fetch(self) -> None:
-        """SWARM-AGENT γ: Fetch snapshot from RPC (atomic update)."""
-        url = f"{self.endpoint}/api/state/snapshot"
+        """
+        SWARM-AGENT γ: Build snapshot from REAL working endpoints.
+        
+        Fetches:
+          1. /api/chain → block height, hash, validation status
+          2. /api/wallet → iterate known addresses or fetch ledger
+          3. /api/address/{addr}/balance → individual address state
+        """
         try:
-            with _urllib_request.urlopen(url, timeout=10) as r:
-                data = _json.loads(r.read())
+            # ── Step 1: Get chain height & latest block ────────────────────────
+            chain_url = f"{self.endpoint}/api/chain"
+            chain_data = self._fetch_json(chain_url)
+            block_height = int(chain_data.get("height", chain_data.get("chain_height", 0)))
+            block_hash = chain_data.get("hash", chain_data.get("block_hash", "0" * 64))
             
-            # Validate structure
-            if not all(k in data for k in ["block_height", "block_hash", "addresses"]):
-                raise ValueError("Invalid snapshot structure")
+            # ── Step 2: Build addresses snapshot ─────────────────────────────────
+            # Try to fetch all addresses from ledger endpoint (if available)
+            addresses = {}
             
-            # Atomic write
+            # Try /api/ledger first (batch fetch)
+            try:
+                ledger_url = f"{self.endpoint}/api/ledger"
+                ledger_data = self._fetch_json(ledger_url)
+                if isinstance(ledger_data, dict) and "addresses" in ledger_data:
+                    addresses = ledger_data["addresses"]
+                    logger.debug(f"[RPC-Fetch] Ledger: {len(addresses)} addresses")
+            except Exception as e:
+                logger.debug(f"[RPC-Fetch] /api/ledger unavailable: {e}, querying from recent TXs")
+                
+                # Fallback: Query recent active addresses from /api/chain recent blocks
+                if "recent_blocks" in chain_data:
+                    known_addrs = set()
+                    for block in chain_data.get("recent_blocks", [])[:5]:  # Last 5 blocks
+                        if "miner" in block:
+                            known_addrs.add(block["miner"])
+                    
+                    # Query each address
+                    for addr in known_addrs:
+                        try:
+                            bal_url = f"{self.endpoint}/api/address/{addr}/balance"
+                            bal_data = self._fetch_json(bal_url)
+                            if "balance" in bal_data:
+                                addresses[addr] = {
+                                    "balance_qtcl": float(bal_data.get("balance", 0.0)),
+                                    "nonce": int(bal_data.get("transaction_count", 0)),
+                                    "address": addr
+                                }
+                        except:
+                            pass  # Skip addresses we can't fetch
+            
+            # ── Step 3: Get oracle fidelity from chain ────────────────────────────
+            oracle_fidelity = float(chain_data.get("oracle_fidelity", 0.7957))
+            total_supply = float(chain_data.get("total_supply", 0.0))
+            
+            # ── Step 4: Build final snapshot ──────────────────────────────────────
+            snapshot = {
+                "block_height": block_height,
+                "block_hash": block_hash,
+                "timestamp": int(time.time()),
+                "addresses": addresses,  # dict of {address: {balance_qtcl, nonce, ...}}
+                "oracle_fidelity": oracle_fidelity,
+                "total_supply": total_supply
+            }
+            
+            # Atomic write (locked)
             with self._lock:
-                self._snap = data
-                self._meta["fetched"] = _time.time()
+                self._snap = snapshot
+                self._meta["fetched"] = time.time()
                 self._meta["count"] += 1
             
-            _EXP_LOG.debug(f"[RPC-Fetch] Height={data['block_height']}, {len(data['addresses'])} addrs")
+            logger.info(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
         
         except Exception as e:
+            with self._lock:
+                self._meta["errors"] += 1
+            logger.error(f"[RPC-Fetch] ❌ Failed: {e}")
             raise _RPCUnreachable(self.endpoint, str(e))
+    
+    def _fetch_json(self, url: str, timeout: int = 10) -> dict:
+        """
+        Fetch JSON from URL using urllib (no external deps).
+        
+        Raises:
+            URLError, HTTPError: Network/HTTP errors
+            ValueError: Invalid JSON
+        """
+        try:
+            with urlopen(url, timeout=timeout) as r:
+                if r.status != 200:
+                    raise ValueError(f"HTTP {r.status}")
+                data = json.loads(r.read().decode("utf-8"))
+                return data
+        except Exception as e:
+            logger.debug(f"[RPC-Fetch-JSON] {url} → {e}")
+            raise
     
     def get_balance(self, address: str) -> float:
         """
