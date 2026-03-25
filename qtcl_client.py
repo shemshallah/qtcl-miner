@@ -1822,14 +1822,60 @@ class LocalOracleEngine:
                 return
         except Exception:
             return
+
+        # Extract oracle state fields from the data
+        _frame_h = int(data.get('block_height') or data.get('height') or 0)
+        _ts_ns = int(data.get('timestamp_ns') or data.get('timestamp') or time.time() * 1e9)
+
+        # Build oracle state dict with all canonical fields
+        oracle_state_new = {
+            'w_state_fidelity': float(data.get('w_state_fidelity') or data.get('fidelity') or 0.0),
+            'coherence_l1': float(data.get('coherence_l1') or data.get('coherence') or 0.0),
+            'purity': float(data.get('purity') or 0.0),
+            'negativity': float(data.get('negativity') or 0.0),
+            'entropy_vn': float(data.get('entropy_vn') or data.get('entropy') or 0.0),
+            'discord': float(data.get('discord') or 0.0),
+            'block_height': _frame_h,
+            'timestamp_ns': _ts_ns,
+            'density_matrix_hex': dm_hex,
+            'dm_hex': dm_hex,
+            'pq0': int(data.get('pq0') or 0),
+            'pq_curr': int(data.get('pq_curr') or data.get('pq') or 0),
+            'pq_last': int(data.get('pq_last') or 0),
+        }
+
         with self._dm_lock:
             self._dm_re = dm_re_new
             self._dm_im = dm_im_new
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
-        _frame_h = int(data.get('block_height') or data.get('height') or 0)
-        # Dead code block removed (condition was always False)
+
+        with self._oracle_state_lock:
+            self._oracle_state = oracle_state_new
+
+    def get_oracle_state(self) -> Optional[dict]:
+        """Return current oracle state snapshot from server RPC data.
+
+        Returns a dict with fields:
+        - w_state_fidelity: float
+        - coherence_l1: float  
+        - purity: float
+        - negativity: float
+        - entropy_vn: float
+        - discord: float
+        - block_height: int
+        - timestamp_ns: int
+        - density_matrix_hex: str
+        - pq0, pq_curr, pq_last: int
+
+        Returns None if no oracle data has been received yet.
+        """
+        with self._oracle_state_lock:
+            if not self._oracle_state:
+                return None
+            return dict(self._oracle_state)
+
     def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
         """Dual-path broadcast after every successful measure():
         """
@@ -10058,28 +10104,60 @@ def _compile_c_layer() -> None:
         _TERMUX = '/data/data/com.termux/files/usr'
         _inc = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
         _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
-        
+
         # Detect aarch64 (Android/Termux) and use generic CPU flag for max compatibility
         _is_aarch64 = _plat.machine() in ('aarch64', 'arm64')
-        _march_flag = ['-mcpu=generic'] if _is_aarch64 else ['-march=native']
-        
-        _accel_lib = _accel_ffi.verify(
-            _QTCL_C_SRC,
-            libraries=(['ssl', 'crypto', 'sqlite3']
-                        if __import__('shutil').which('sqlite3') is not None or
-                           __import__('os').path.exists('/usr/lib/x86_64-linux-gnu/libsqlite3.so') or
-                           __import__('os').path.exists('/data/data/com.termux/files/usr/lib/libsqlite3.so') or
-                           __import__('os').path.exists('/usr/lib/libsqlite3.so')
-                        else ['ssl', 'crypto']),
-            extra_compile_args=[
-                '-O3'] + _march_flag + ['-ffast-math', '-funroll-loops',
-                '-DOPENSSL_NO_DEPRECATED',
-                '-Wno-unused-function', '-Wno-unused-variable',
-                '-Wno-unreachable-code',   # CFFI check stubs are intentionally dead
-            ],
-            include_dirs=_inc,
-            library_dirs=_lib,
-        )
+        _is_arm = _plat.machine().startswith('arm')
+
+        # Build compile args - on aarch64, NEVER use -mfpu (it's not supported)
+        # NEON is always available on aarch64, no flag needed
+        _compile_args = [
+            '-O3', '-ffast-math', '-funroll-loops',
+            '-DOPENSSL_NO_DEPRECATED',
+            '-Wno-unused-function', '-Wno-unused-variable',
+            '-Wno-unreachable-code',   # CFFI check stubs are intentionally dead
+        ]
+
+        if _is_aarch64:
+            # aarch64: Use generic CPU, no -mfpu flag (not supported)
+            # NEON is implicit on aarch64
+            _compile_args.extend(['-mcpu=generic'])
+        elif _is_arm:
+            # 32-bit ARM: Use native with NEON if available
+            _compile_args.extend(['-march=native', '-mfpu=neon', '-mfloat-abi=hard'])
+        else:
+            # x86/x64: Use native
+            _compile_args.extend(['-march=native'])
+
+        # Also set environment to prevent cffi from adding problematic flags
+        import os as _os_env
+        _old_cflags = _os_env.environ.get('CFLAGS', '')
+        if _is_aarch64:
+            # Filter out any -mfpu flags from CFLAGS on aarch64
+            _filtered_cflags = ' '.join([f for f in _old_cflags.split() if not f.startswith('-mfpu')])
+            _os_env.environ['CFLAGS'] = _filtered_cflags
+
+        try:
+            _accel_lib = _accel_ffi.verify(
+                _QTCL_C_SRC,
+                libraries=(['ssl', 'crypto', 'sqlite3']
+                            if __import__('shutil').which('sqlite3') is not None or
+                               __import__('os').path.exists('/usr/lib/x86_64-linux-gnu/libsqlite3.so') or
+                               __import__('os').path.exists('/data/data/com.termux/files/usr/lib/libsqlite3.so') or
+                               __import__('os').path.exists('/usr/lib/libsqlite3.so')
+                            else ['ssl', 'crypto']),
+                extra_compile_args=_compile_args,
+                include_dirs=_inc,
+                library_dirs=_lib,
+            )
+        finally:
+            # Restore original CFLAGS
+            if _is_aarch64:
+                if _old_cflags:
+                    _os_env.environ['CFLAGS'] = _old_cflags
+                else:
+                    _os_env.environ.pop('CFLAGS', None)
+
         _log.info(
             "⚡ QTCL C acceleration active  "
             "(§PoW §Lattice §HLWE §BIP §Metrics §GKSL §Merkle §DHT §Entropy "
@@ -10100,16 +10178,7 @@ def _compile_c_layer() -> None:
                 f"For full acceleration on Termux: pkg install clang openssl libffi sqlite"
             )
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
-# ── Start LocalOracleEngine SSE listener now that C is confirmed available ────
-if False:
-    try:
-        _LOCAL_ORACLE.start()
-    except RuntimeError as _restart_err:
-        import logging as _rl
-        _rl.getLogger(__name__).warning(
-            f"[ACCEL] LocalOracleEngine start failed: {_restart_err}"
-        )
-# ── Convenience helpers for tight-loop C buffer allocation ────────────────────
+
 def _accel_vec_buf(n: int):
     """Allocate a uint32[n] cffi buffer. Only call if False."""
     return _accel_ffi.new(f'uint32_t[{n}]')
