@@ -17057,25 +17057,18 @@ class QtclClientApp:
         class _Handler(_hs.BaseHTTPRequestHandler):
             def log_message(self, *a): pass  # suppress default logging
 
-            def _json_resp(self, code, obj):
-                body = _hj.dumps(obj, separators=(',',':')).encode()
+            def _json_resp(self, code: int, obj: dict) -> None:
+                """Send JSON response with Content-Length and full broken-connection guard."""
+                body = _hj.dumps(obj, separators=(',', ':'), default=str).encode()
                 self.send_response(code)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
                 self.send_header('Access-Control-Allow-Origin', '*')
                 try:
-                    self.end_headers(); self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass  # peer disconnected before response — harmless
-
-            def _json_resp(self, status: int, data: dict) -> None:
-                """Send JSON response."""
-                import json as _jr
-                self.send_response(status)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(_jr.dumps(data, default=str).encode())
 
             def _oracle_snapshot(self):
                 """Build full oracle snapshot dict from local SSE state."""
@@ -17134,33 +17127,21 @@ class QtclClientApp:
 
                 # ── /api/snapshot (RPC) — JSON oracle snapshot (was SSE)
                 elif path in ('/api/snapshot/sse', '/api/snapshot'):
-                    # Return latest snapshot as JSON, not SSE stream
                     snap = self._oracle_snapshot()
-                    resp_json = json.dumps({
-                        'status': 'ok',
-                        'snapshot': snap,
-                        'timestamp': time.time()
+                    self._json_resp(200, {
+                        'status':    'ok',
+                        'snapshot':  snap,
+                        'timestamp': time.time(),
                     })
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(resp_json.encode())
 
-                # ── /api/events (RPC) — JSON events (was SSE)
+                # ── /api/events (RPC) — JSON chain status (SSE fully removed)
                 elif path == '/api/events':
-                    # Return current chain status as JSON
                     snap = self._oracle_snapshot()
-                    resp_json = json.dumps({
-                        'type': 'chain_status',
+                    self._json_resp(200, {
+                        'type':       'chain_status',
                         'tip_height': snap.get('block_height', 0),
-                        'timestamp': time.time()
+                        'timestamp':  time.time(),
                     })
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(resp_json.encode())
 
                 # ── Oracle state endpoints ────────────────────────────────────
                 elif path in ('/api/oracle/w-state', '/api/oracle/pq0-bloch',
@@ -17232,7 +17213,7 @@ class QtclClientApp:
                     self.send_header('Content-Length', '9')
                     try:
                         self.end_headers(); self.wfile.write(b'Not Found')
-                    except (BrokenPipeError, ConnectionResetError): pass
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError): pass
 
             def do_POST(self):
                 clen = int(self.headers.get('Content-Length', 0))
@@ -17333,7 +17314,7 @@ class QtclClientApp:
                     self.send_header('Content-Length', '9')
                     try:
                         self.end_headers(); self.wfile.write(b'Not Found')
-                    except (BrokenPipeError, ConnectionResetError): pass
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError): pass
 
         try:
             class _ReuseServer(_ss.TCPServer):
@@ -17345,6 +17326,13 @@ class QtclClientApp:
                         self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
                     except AttributeError: pass
                     super().server_bind()
+                def handle_error(self, request, client_address):
+                    import sys as _sys
+                    exc = _sys.exc_info()[1]
+                    if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                                        ConnectionAbortedError)):
+                        return  # client hung up mid-response — not an error
+                    _EXP_LOG.debug(f"[HTTP-9091] handler error from {client_address}: {exc}")
 
             with _ReuseServer(('0.0.0.0', 9091), _Handler) as srv:
                 _EXP_LOG.info("[HTTP-9091] ✅ Local HTTP server on 0.0.0.0:9091 (/health /events /gossip)")
@@ -17973,8 +17961,12 @@ class QtclClientApp:
             # Using a threading.Event (not asyncio) because the SSE listener
             # runs in a separate threading.Thread, not in the asyncio event loop.
             # The nonce loop checks it via is_set() — O(1), no blocking.
-            _new_block_event = _threading.Event()
+            _new_block_event  = _threading.Event()
             _new_block_height = [0]   # list for mutable capture in nested scope
+            # Must be declared HERE — before _start_block_listener closure captures it.
+            # Defining it inside the except-block below would make Python treat it as
+            # a local in _mine_inline, raising UnboundLocalError on the first .is_set().
+            _mining_stopped   = _threading.Event()
 
             def _start_block_listener(oracle_url: str, initial_target: int) -> None:
                 """
@@ -18045,8 +18037,6 @@ class QtclClientApp:
                     except Exception as _ble2:
                         _EXP_LOG.debug(f"[BLOCK-LISTENER] unexpected: {_ble2}")
                         _mining_stopped.wait(3)
-
-                        _mining_stopped = _threading.Event()   # signals listener thread to exit
             _block_listener_thread = _threading.Thread(
                 target=_start_block_listener,
                 args=(kapi.base_url, 1),
