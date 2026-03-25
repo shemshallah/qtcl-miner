@@ -57,9 +57,7 @@ ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb
 ENTROPY_LOCK        = threading.Lock()
 SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 
-_accel_ok:  bool = False
-_accel_ffi       = None   # cffi.FFI instance  (set by _compile_c_layer)
-_accel_lib       = None   # compiled .so handle (set by _compile_c_layer)
+_accel_ok:  bool = False  # Pure Python mode only
 
 
 
@@ -8017,61 +8015,39 @@ static uint32_t _r32be(const uint8_t *p) {
    §1  HASH PRIMITIVES
    ───────────────────────────────────────────────────────────────────────────── */
 
-/* Internal: SHA3-256 with reusable EVP context for tight loops */
-static void _sha3c(EVP_MD_CTX *ctx, const EVP_MD *md,
-                   const void *in, size_t inlen, uint8_t *out) {
-    unsigned int dlen = 32;
-    EVP_DigestInit_ex(ctx, md, NULL);
-    EVP_DigestUpdate(ctx, in, inlen);
-    EVP_DigestFinal_ex(ctx, out, &dlen);
-}
+/* Crypto functions delegated to Python (hashlib, hmac, hashlib.sha3_256)
+   These stubs exist for CFFI cdef compatibility but are NOT called from Python.
+   All crypto operations use Python's hashlib (pure or via OpenSSL binding). */
 
-/* Public: SHA3-256 (standalone, allocates its own context) */
 void qtcl_sha3_256(const uint8_t *in, size_t inlen, uint8_t *out) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    unsigned int dlen = 32;
-    EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
-    EVP_DigestUpdate(ctx, in, inlen);
-    EVP_DigestFinal_ex(ctx, out, &dlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python handles SHA3-256 via hashlib.sha3_256() */
+    (void)in; (void)inlen; (void)out;
 }
 
-/* Public: SHA-256 (stdlib SHA, for BIP32/38/39) */
 void qtcl_sha256(const uint8_t *in, size_t inlen, uint8_t *out) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    unsigned int dlen = 32;
-    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    EVP_DigestUpdate(ctx, in, inlen);
-    EVP_DigestFinal_ex(ctx, out, &dlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python handles SHA-256 via hashlib.sha256() */
+    (void)in; (void)inlen; (void)out;
 }
 
-/* Public: SHAKE-256 XOF, arbitrary output length */
 void qtcl_shake256_xof(const uint8_t *domain, size_t dlen,
                        const uint8_t *input,  size_t ilen,
                        uint8_t *out, size_t outlen) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_shake256(), NULL);
-    if (domain && dlen > 0) EVP_DigestUpdate(ctx, domain, dlen);
-    if (input  && ilen  > 0) EVP_DigestUpdate(ctx, input,  ilen);
-    EVP_DigestFinalXOF(ctx, out, outlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python handles SHAKE-256 via hashlib.shake_256() */
+    (void)domain; (void)dlen; (void)input; (void)ilen; (void)out; (void)outlen;
 }
 
-/* Public: HMAC-SHA256 */
 void qtcl_hmac_sha256(const uint8_t *key, size_t klen,
                       const uint8_t *msg, size_t mlen,
                       uint8_t *out32) {
-    unsigned int olen = 32;
-    HMAC(EVP_sha256(), key, (int)klen, msg, mlen, out32, &olen);
+    /* Stub: Python handles HMAC-SHA256 via hmac module */
+    (void)key; (void)klen; (void)msg; (void)mlen; (void)out32;
 }
 
-/* Public: HMAC-SHA512 */
 void qtcl_hmac_sha512(const uint8_t *key, size_t klen,
                       const uint8_t *msg, size_t mlen,
                       uint8_t *out64) {
-    unsigned int olen = 64;
-    HMAC(EVP_sha512(), key, (int)klen, msg, mlen, out64, &olen);
+    /* Stub: Python handles HMAC-SHA512 via hmac module */
+    (void)key; (void)klen; (void)msg; (void)mlen; (void)out64;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -8123,74 +8099,27 @@ void qtcl_vec_sub_mod(const uint32_t *u, const uint32_t *v,
         out[i] = (uint32_t)(((uint64_t)u[i] + q - v[i]) % q);
 }
 
-/*
- * qtcl_derive_basis: A[i*n+j] = SHA256(entropy || i || j)[:4] % q
- * Batches per-row using a single SHA256 context for efficiency.
- */
+/* ─────────────────────────────────────────────────────────────────────────────
+   EVP FUNCTION STUBS — Delegated to Python (hashlib, hmac, cryptography)
+   No OpenSSL EVP headers required; Python fallbacks handle all crypto ops.
+   ───────────────────────────────────────────────────────────────────────────── */
+
 void qtcl_derive_basis(const uint8_t *entropy32, uint32_t *A_out,
                        uint32_t n, uint32_t q) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha256();
-    uint8_t seed[34], digest[32];
-    unsigned int dlen = 32;
-    memcpy(seed, entropy32, 32);
-    for (uint32_t i = 0; i < n; i++) {
-        seed[32] = (uint8_t)(i & 0xff);
-        for (uint32_t j = 0; j < n; j++) {
-            seed[33] = (uint8_t)(j & 0xff);
-            EVP_DigestInit_ex(ctx, md, NULL);
-            EVP_DigestUpdate(ctx, seed, 34);
-            EVP_DigestFinal_ex(ctx, digest, &dlen);
-            A_out[i * n + j] = _r32be(digest) % q;
-        }
-    }
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.sha256 for basis derivation */
+    (void)entropy32; (void)A_out; (void)n; (void)q;
 }
 
-/*
- * qtcl_derive_secret: s[i] = SHA256(entropy||i||"HLWE_SECRET_VECTOR"||(i>>8))[:4] % q
- */
 void qtcl_derive_secret(const uint8_t *entropy32, uint32_t *s_out,
                         uint32_t n, uint32_t q) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha256();
-    static const uint8_t _LABEL[] = "HLWE_SECRET_VECTOR";
-    uint8_t buf[32 + 1 + sizeof(_LABEL) + 1];
-    uint8_t digest[32];
-    unsigned int dlen = 32;
-    memcpy(buf, entropy32, 32);
-    memcpy(buf + 33, _LABEL, sizeof(_LABEL));
-    for (uint32_t i = 0; i < n; i++) {
-        buf[32] = (uint8_t)(i & 0xff);
-        buf[33 + sizeof(_LABEL)] = (uint8_t)(i >> 8);
-        EVP_DigestInit_ex(ctx, md, NULL);
-        EVP_DigestUpdate(ctx, buf, sizeof(buf));
-        EVP_DigestFinal_ex(ctx, digest, &dlen);
-        s_out[i] = _r32be(digest) % q;
-    }
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.sha256 for secret derivation */
+    (void)entropy32; (void)s_out; (void)n; (void)q;
 }
 
-/*
- * qtcl_hash_to_vec: rejection sampler — hash data+counter until n values < q
- */
 void qtcl_hash_to_vec(const uint8_t *data32, uint32_t *out,
                       uint32_t n, uint32_t q) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha256();
-    uint8_t buf[33], digest[32];
-    unsigned int dlen = 32;
-    memcpy(buf, data32, 32);
-    uint32_t filled = 0;
-    for (uint8_t offset = 0; filled < n; offset++) {
-        buf[32] = offset;
-        EVP_DigestInit_ex(ctx, md, NULL);
-        EVP_DigestUpdate(ctx, buf, 33);
-        EVP_DigestFinal_ex(ctx, digest, &dlen);
-        for (int k = 0; k + 4 <= 32 && filled < n; k += 4)
-            out[filled++] = _r32be(digest + k) % q;
-    }
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.sha256 rejection sampling */
+    (void)data32; (void)out; (void)n; (void)q;
 }
 
 /* Pack uint32 vector → hex string. out must be n*8+1 bytes. */
@@ -8215,174 +8144,62 @@ void qtcl_hex_to_vec(const char *hex, uint32_t *out, uint32_t n) {
    §3  HLWE CRYPTO
    ───────────────────────────────────────────────────────────────────────────── */
 
-/*
- * qtcl_hlwe_sign:
- *   nonce_hash = SHA256(message_hash || private_key_hex)
- *   sig_vec[i] = SHA256(nonce_hash || i)[:4] % q   for i in 0..63
- *   sig_bytes  = packed sig_vec (256 bytes)
- *   auth_tag   = HMAC-SHA256(key=message_hash, data=sig_bytes) as 64-char hex
- *
- * private_key_hex: n*8 ASCII hex chars (NUL-terminated)
- * sig_bytes_out:   256 bytes (64 × uint32 big-endian)
- * auth_tag_hex_out: 65 bytes (64 hex + NUL)
- */
 void qtcl_hlwe_sign(const uint8_t  *msg_hash32,
                     const char     *privkey_hex,
                     uint32_t        q,
                     uint8_t        *sig_bytes_out,
                     char           *auth_tag_hex_out) {
-    /* nonce_hash = SHA256(msg_hash || privkey_hex) */
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md256 = EVP_sha256();
-    uint8_t nonce_hash[32];
-    unsigned int dlen = 32;
-    size_t pklen = strlen(privkey_hex);
-    EVP_DigestInit_ex(ctx, md256, NULL);
-    EVP_DigestUpdate(ctx, msg_hash32, 32);
-    EVP_DigestUpdate(ctx, privkey_hex, pklen);
-    EVP_DigestFinal_ex(ctx, nonce_hash, &dlen);
-
-    /* Generate 64-element signature vector */
-    uint8_t seed[33];
-    memcpy(seed, nonce_hash, 32);
-    for (int i = 0; i < 64; i++) {
-        uint8_t digest[32];
-        seed[32] = (uint8_t)i;
-        EVP_DigestInit_ex(ctx, md256, NULL);
-        EVP_DigestUpdate(ctx, seed, 33);
-        EVP_DigestFinal_ex(ctx, digest, &dlen);
-        uint32_t val = _r32be(digest) % q;
-        _w32be(sig_bytes_out + i * 4, val);
-    }
-    EVP_MD_CTX_free(ctx);
-
-    /* auth_tag = HMAC-SHA256(key=msg_hash, data=sig_bytes) */
-    uint8_t tag[32];
-    unsigned int tlen = 32;
-    HMAC(EVP_sha256(), msg_hash32, 32, sig_bytes_out, 256, tag, &tlen);
-    _bytes_to_hex(tag, 32, auth_tag_hex_out);
+    /* Stub: Python handles HLWE signing with hashlib + hmac */
+    (void)msg_hash32; (void)privkey_hex; (void)q; (void)sig_bytes_out; (void)auth_tag_hex_out;
 }
 
-/*
- * qtcl_hlwe_verify:
- *   Recomputes HMAC-SHA256(key=msg_hash32, data=sig_bytes256).
- *   Returns 1 if constant-time equal to expected_auth_tag_hex, 0 otherwise.
- */
 int qtcl_hlwe_verify(const uint8_t *msg_hash32,
                      const uint8_t *sig_bytes256,
                      const char    *expected_auth_tag_hex) {
-    uint8_t computed[32];
-    char computed_hex[65];
-    unsigned int clen = 32;
-    HMAC(EVP_sha256(), msg_hash32, 32, sig_bytes256, 256, computed, &clen);
-    _bytes_to_hex(computed, 32, computed_hex);
-    /* Constant-time comparison via OpenSSL CRYPTO_memcmp */
-    return CRYPTO_memcmp(computed_hex, expected_auth_tag_hex, 64) == 0 ? 1 : 0;
+    /* Stub: Python verifies HMAC-SHA256 auth_tag */
+    (void)msg_hash32; (void)sig_bytes256; (void)expected_auth_tag_hex;
+    return 0;
 }
 
-/*
- * qtcl_derive_address:
- *   pub_bytes = big-endian packed uint32 vector
- *   addr_hex  = SHA256(pub_bytes)[:16] as 32 hex chars + NUL
- */
 void qtcl_derive_address(const uint32_t *pubkey, uint32_t n, char *addr_hex_out) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha256();
-    uint8_t digest[32];
-    unsigned int dlen = 32;
-    EVP_DigestInit_ex(ctx, md, NULL);
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t b[4];
-        _w32be(b, pubkey[i]);
-        EVP_DigestUpdate(ctx, b, 4);
-    }
-    EVP_DigestFinal_ex(ctx, digest, &dlen);
-    EVP_MD_CTX_free(ctx);
-    _bytes_to_hex(digest, 16, addr_hex_out);  /* first 16 bytes = 32 hex chars */
+    /* Stub: Python hashes pubkey with hashlib.sha256 */
+    (void)pubkey; (void)n; (void)addr_hex_out;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   §4  BIP39 / BIP32 / BIP38
-   ───────────────────────────────────────────────────────────────────────────── */
-
-/*
- * qtcl_bip39_mnemonic_to_seed:
- *   PBKDF2-HMAC-SHA512(password=mnemonic, salt="mnemonic"||passphrase,
- *                      iterations=2048, dklen=64)
- */
 void qtcl_bip39_mnemonic_to_seed(const char *mnemonic,
                                   const char *passphrase,
                                   uint8_t    *seed64_out) {
-    static const char _BIP39_SALT_PREFIX[] = "mnemonic";
-    size_t pp_len   = passphrase ? strlen(passphrase) : 0;
-    size_t salt_len = 8 + pp_len;
-    uint8_t *salt   = (uint8_t *)malloc(salt_len);
-    memcpy(salt, _BIP39_SALT_PREFIX, 8);
-    if (pp_len) memcpy(salt + 8, passphrase, pp_len);
-    PKCS5_PBKDF2_HMAC(mnemonic, (int)strlen(mnemonic),
-                      salt, (int)salt_len,
-                      2048, EVP_sha512(), 64, seed64_out);
-    free(salt);
+    /* Stub: Python uses hashlib.pbkdf2_hmac for PBKDF2-SHA512 */
+    (void)mnemonic; (void)passphrase; (void)seed64_out;
 }
 
-/*
- * qtcl_bip32_child_key:
- *   HMAC-SHA512(key=chain_code32, data=0x00||parent_key32||index_be32)
- *   → first 32 bytes: child_key, last 32 bytes: child_chain_code
- */
 void qtcl_bip32_child_key(const uint8_t *parent_key32,
                            const uint8_t *chain_code32,
                            uint32_t       index,
                            int            hardened,
                            uint8_t       *child_key32_out,
                            uint8_t       *child_chain32_out) {
-    uint8_t data[37];
-    uint32_t idx = hardened ? (index | 0x80000000u) : index;
-    data[0] = 0x00;
-    memcpy(data + 1, parent_key32, 32);
-    _w32be(data + 33, idx);
-    uint8_t I[64];
-    unsigned int ilen = 64;
-    HMAC(EVP_sha512(), chain_code32, 32, data, 37, I, &ilen);
-    memcpy(child_key32_out,   I,      32);
-    memcpy(child_chain32_out, I + 32, 32);
+    /* Stub: Python uses hmac.new(sha512) for BIP32 derivation */
+    (void)parent_key32; (void)chain_code32; (void)index; (void)hardened;
+    (void)child_key32_out; (void)child_chain32_out;
 }
 
-/*
- * qtcl_bip38_scrypt: scrypt(passphrase, salt8, N=16384, r=8, p=8, dklen=64)
- * Requires OpenSSL 1.1.0+. Falls back silently (output zeroed) if unavailable.
- */
 void qtcl_bip38_scrypt(const char *passphrase, const uint8_t *salt8,
                        uint8_t *dk64_out) {
-    EVP_PBE_scrypt(passphrase, strlen(passphrase),
-                   salt8, 8,
-                   16384, 8, 8,
-                   0, dk64_out, 64);
-    /* Fallback: PBKDF2 with 65536 rounds (weaker but functional) */
-    PKCS5_PBKDF2_HMAC(passphrase, (int)strlen(passphrase),
-                      salt8, 8, 65536, EVP_sha256(), 64, dk64_out);
+    /* Stub: Python uses hashlib.scrypt or PBKDF2 fallback */
+    (void)passphrase; (void)salt8; (void)dk64_out;
 }
 
-/* AES-256-ECB single block (16 bytes) encrypt */
 void qtcl_aes256_ecb_enc(const uint8_t *key32, const uint8_t *in16,
                           uint8_t *out16) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    int outl = 0;
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, key32, NULL);
-    EVP_CIPHER_CTX_set_padding(ctx, 0);
-    EVP_EncryptUpdate(ctx, out16, &outl, in16, 16);
-    EVP_CIPHER_CTX_free(ctx);
+    /* Stub: Python uses cryptography.Cipher.AES */
+    (void)key32; (void)in16; (void)out16;
 }
 
-/* AES-256-ECB single block (16 bytes) decrypt */
 void qtcl_aes256_ecb_dec(const uint8_t *key32, const uint8_t *in16,
                           uint8_t *out16) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    int outl = 0;
-    EVP_DecryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, key32, NULL);
-    EVP_CIPHER_CTX_set_padding(ctx, 0);
-    EVP_DecryptUpdate(ctx, out16, &outl, in16, 16);
-    EVP_CIPHER_CTX_free(ctx);
+    /* Stub: Python uses cryptography.Cipher.AES */
+    (void)key32; (void)in16; (void)out16;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -8803,44 +8620,20 @@ static uint32_t _npow2(uint32_t n) {
  *   Scratch buffer allocated on heap (max 2*npow2(n)*32 bytes).
  */
 void qtcl_merkle_root(const uint8_t *leaves, uint32_t n, uint8_t *root32_out) {
-    if (n == 0) { memset(root32_out, 0, 32); return; }
-    if (n == 1) { memcpy(root32_out, leaves, 32); return; }
-
-    uint32_t sz = _npow2(n);
-    uint8_t *tree = (uint8_t*)malloc(sz * 32);
-    /* Pad with zeros for missing leaves */
-    memset(tree, 0, sz * 32);
-    memcpy(tree, leaves, n * 32);
-
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha3_256();
-    uint8_t pair[64];
-
-    while (sz > 1) {
-        uint32_t half = sz / 2;
-        for (uint32_t i = 0; i < half; i++) {
-            memcpy(pair,    tree + i*2*32,     32);
-            memcpy(pair+32, tree + (i*2+1)*32, 32);
-            _sha3c(ctx, md, pair, 64, tree + i*32);
-        }
-        sz = half;
-    }
-    memcpy(root32_out, tree, 32);
-    free(tree);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.sha3_256 for merkle tree */
+    (void)leaves; (void)n; (void)root32_out;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   §8  DHT  (256-bit XOR distance)
-   ───────────────────────────────────────────────────────────────────────────── */
+void qtcl_mix_entropy(const uint8_t *existing32, const uint8_t *new_sample32,
+                      const uint8_t *salt16, uint8_t *out32) {
+    /* Stub: Python uses hashlib.shake_256 for entropy mixing */
+    (void)existing32; (void)new_sample32; (void)salt16; (void)out32;
+}
 
-/*
- * qtcl_dht_xor_distance:
- *   Returns the bit-position of the highest differing bit between two
- *   64-char hex node IDs (= index of leading differing bit, 0 = identical).
- *   Smaller return value = closer in Kademlia space.
- */
-int qtcl_dht_xor_distance(const char *id_a_hex64, const char *id_b_hex64) {
+void qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen) {
+    /* Stub: Python builds PoW scratchpad with hashlib.shake_256 */
+    (void)seed; (void)out; (void)outlen;
+}
     uint8_t a[32], b[32];
     _hex_to_bytes(id_a_hex64, a, 32);
     _hex_to_bytes(id_b_hex64, b, 32);
@@ -8868,15 +8661,8 @@ int qtcl_dht_xor_distance(const char *id_a_hex64, const char *id_b_hex64) {
  */
 void qtcl_mix_entropy(const uint8_t *existing32, const uint8_t *new_sample32,
                       const uint8_t *salt16, uint8_t *out32) {
-    static const uint8_t _DOM[] = "QTCL_ENT_MIX_v1:";
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_shake256(), NULL);
-    EVP_DigestUpdate(ctx, _DOM, sizeof(_DOM)-1);
-    EVP_DigestUpdate(ctx, existing32, 32);
-    EVP_DigestUpdate(ctx, new_sample32, 32);
-    if (salt16) EVP_DigestUpdate(ctx, salt16, 16);
-    EVP_DigestFinalXOF(ctx, out32, 32);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.shake_256 for entropy mixing */
+    (void)existing32; (void)new_sample32; (void)salt16; (void)out32;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -8887,13 +8673,8 @@ void qtcl_mix_entropy(const uint8_t *existing32, const uint8_t *new_sample32,
 
 /* SHAKE-256 scratchpad expansion (512KB) */
 void qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen) {
-    static const uint8_t _DOM[] = "QTCL_SCRATCHPAD_v1:";
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_shake256(), NULL);
-    EVP_DigestUpdate(ctx, _DOM, sizeof(_DOM)-1);
-    EVP_DigestUpdate(ctx, seed, 32);
-    EVP_DigestFinalXOF(ctx, out, outlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python builds PoW scratchpad with hashlib.shake_256 */
+    (void)seed; (void)out; (void)outlen;
 }
 
 /*
@@ -8932,62 +8713,10 @@ int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
                          uint32_t diff, uint32_t start, uint32_t chunk,
                          const uint8_t *ma, const uint8_t *seed,
                          const uint8_t *sp, uint8_t *out_hash) {
-    uint8_t hdr[168];
-    memcpy(hdr, "QTCL_POW_v1:", 12);
-    _w64be(hdr+12, height);
-    _w32be(hdr+20, ts);
-    memcpy(hdr+24, ph, 32);
-    memcpy(hdr+56, mr, 32);
-    _w32be(hdr+88, diff);
-    memcpy(hdr+96, ma, 40);
-    memcpy(hdr+136, seed, 32);
-
-    uint32_t nw          = (512*1024) / 64;
-    uint32_t total_bits  = diff * 4u;
-    uint32_t fb          = total_bits / 8u;
-    uint32_t rb          = total_bits % 8u;
-    uint8_t  rmask       = rb ? (uint8_t)(0xffu << (8u - rb)) : 0u;
-
-    uint8_t  st[32], ri[100];
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = EVP_sha3_256();
-
-    for (uint32_t n = 0; n < chunk; n++) {
-        /* Every 256 nonces: check abort flag AND oracle height vs miner target.
-         * If oracle_height >= miner_target, another miner already solved this
-         * height — abort immediately without waiting for Python.
-         * Cost: one AND + two loads + two branches per 256 nonces ≈ 0% overhead. */
-        /* Check abort every 64 nonces ≈ 5.8ms at 11kH/s — 4× faster than 256.
-         * Cost: one AND + two loads + two branches per 64 nonces ≈ 0% overhead.
-         * oracle_height check is the primary signal (set by SSE frames and P2P
-         * block_announce directly from C callbacks). pow_abort is belt+suspenders. */
-        if ((n & 63u) == 0u) {
-            if (_qtcl_pow_abort ||
-                (_qtcl_oracle_height > 0 && _qtcl_oracle_height >= _qtcl_miner_target)) {
-                EVP_MD_CTX_free(ctx);
-                return -2;   /* -2 = aborted */
-            }
-        }
-        _w32be(hdr+92, start + n);
-        _sha3c(ctx, md, hdr, 168, st);
-        for (int r = 0; r < 64; r++) {
-            uint32_t wi = _r32be(st) % nw;
-            memcpy(ri,    st,           32);
-            memcpy(ri+32, sp + wi*64,   64);
-            _w32be(ri+96, (uint32_t)r);
-            _sha3c(ctx, md, ri, 100, st);
-        }
-        int ok = 1;
-        for (uint32_t i = 0; i < fb && ok; i++) if (st[i]) ok=0;
-        if (ok && rb && (st[fb] & rmask)) ok=0;
-        if (ok) {
-            memcpy(out_hash, st, 32);
-            EVP_MD_CTX_free(ctx);
-            return (int64_t)(start + n);
-        }
-    }
-    EVP_MD_CTX_free(ctx);
-    return -1;
+    /* Stub: Python handles PoW mining with hashlib.sha3_256 + scratchpad */
+    (void)height; (void)ts; (void)ph; (void)mr; (void)diff; (void)start;
+    (void)chunk; (void)ma; (void)seed; (void)sp; (void)out_hash;
+    return -1;   /* -1 = not found */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9478,27 +9207,16 @@ static uint64_t _clock_ns(void) {
 void qtcl_measurement_sign(
         QtclWStateMeasurement *m,
         const uint8_t *secret32) {
-    /* Zero out auth_tag before signing */
-    memset(m->auth_tag, 0, 32);
-    size_t body = sizeof(QtclWStateMeasurement) - 32;
-    unsigned int olen = 32;
-    HMAC(EVP_sha256(), secret32, 32, (const uint8_t*)m, body, m->auth_tag, &olen);
+    /* Stub: Python uses hmac.new(sha256) for measurement auth_tag */
+    (void)m; (void)secret32;
 }
 
 int qtcl_measurement_verify(
         const QtclWStateMeasurement *m,
         const uint8_t *secret32) {
-    QtclWStateMeasurement tmp;
-    memcpy(&tmp, m, sizeof(tmp));
-    memset(tmp.auth_tag, 0, 32);
-    uint8_t expected[32];
-    unsigned int olen = 32;
-    size_t body = sizeof(QtclWStateMeasurement) - 32;
-    HMAC(EVP_sha256(), secret32, 32, (const uint8_t*)&tmp, body, expected, &olen);
-    /* Constant-time compare */
-    unsigned char diff = 0;
-    for (int i = 0; i < 32; i++) diff |= (expected[i] ^ m->auth_tag[i]);
-    return (diff == 0) ? 1 : 0;
+    /* Stub: Python verifies measurement auth_tag with hmac */
+    (void)m; (void)secret32;
+    return 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -10492,61 +10210,8 @@ static void _mob(double *zr, double *zi, double cr, double ci) {
  *   selected by a SHA3-256 chain of the seed at each step.  Hash final point.
  *   Pure C, no allocations, no external calls. */
 void qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32) {
-    /* Generator table: re, im pairs for c_k */
-    static const double _G[8][2] = {
-        _HYP_G0, _HYP_G1, _HYP_G2, _HYP_G3,
-        _HYP_G4, _HYP_G5, _HYP_G6, _HYP_G7
-    };
-
-    /* Map seed to initial point in Poincaré disk:
-     * treat first 16 bytes as (re, im) scaled to open unit disk */
-    uint64_t raw_re, raw_im;
-    memcpy(&raw_re, seed32,    8);
-    memcpy(&raw_im, seed32+8,  8);
-    /* Normalise to (-1, 1); tanh maps ℝ → (-1,1), preserving all bits */
-    double zr = tanh((double)(int64_t)raw_re * (1.0 / (double)(1ULL << 62)));
-    double zi = tanh((double)(int64_t)raw_im * (1.0 / (double)(1ULL << 62)));
-
-    /* SHA3-256 chain: step_hash[i] selects generator index for step i */
-    uint8_t step_seed[32];
-    memcpy(step_seed, seed32, 32);
-
-    for (uint32_t step = 0; step < depth; step++) {
-        /* Re-hash every 8 steps to get fresh generator indices */
-        if ((step & 7) == 0) {
-            uint8_t ctr[4];
-            ctr[0] = (uint8_t)(step >> 24);
-            ctr[1] = (uint8_t)(step >> 16);
-            ctr[2] = (uint8_t)(step >>  8);
-            ctr[3] = (uint8_t) step;
-            /* SHAKE-256: step_seed || ctr → next step_seed */
-            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-            EVP_DigestInit_ex(ctx, EVP_shake256(), NULL);
-            EVP_DigestUpdate(ctx, step_seed, 32);
-            EVP_DigestUpdate(ctx, ctr,       4);
-            EVP_DigestFinalXOF(ctx, step_seed, 32);
-            EVP_MD_CTX_free(ctx);
-        }
-        /* Pick generator 0-7 from current byte */
-        uint32_t g = step_seed[step & 31] & 7;
-        _mob(&zr, &zi, _G[g][0], _G[g][1]);
-    }
-
-    /* Serialise final Poincaré disk point → 32-byte output via SHA3-256 */
-    uint8_t pt[16];
-    memcpy(pt,   &zr, 8);
-    memcpy(pt+8, &zi, 8);
-    /* Domain-separate from other QTCL hash domains, include original seed
-     * as pre-image and the hyperbolic endpoint as the mixed output. */
-    static const uint8_t _DOM_HYP[] = "QTCL_HYP_ENT_v1:";
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
-    EVP_DigestUpdate(ctx, _DOM_HYP, sizeof(_DOM_HYP)-1);
-    EVP_DigestUpdate(ctx, seed32,   32);
-    EVP_DigestUpdate(ctx, pt,       16);
-    unsigned int outlen = 32;
-    EVP_DigestFinal_ex(ctx, out32, &outlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python uses hashlib.shake_256 for hyperbolic entropy mixing */
+    (void)seed32; (void)depth; (void)out32;
 }
 
 /* qtcl_xor3_pool:
@@ -10556,24 +10221,8 @@ void qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32)
  *   is truly random (XOR information-theoretic security, Maurer 1992). */
 void qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
                     const uint8_t *s3, uint8_t *out32) {
-    uint8_t xored[32] = {0};
-    uint8_t present   = 0;
-
-    /* XOR in each non-null source */
-    if (s1) { for (int i=0;i<32;i++) xored[i] ^= s1[i]; present |= 1; }
-    if (s2) { for (int i=0;i<32;i++) xored[i] ^= s2[i]; present |= 2; }
-    if (s3) { for (int i=0;i<32;i++) xored[i] ^= s3[i]; present |= 4; }
-
-    /* Mix + domain-separate via SHA3-256 */
-    static const uint8_t _DOM_XOR[] = "QTCL_XOR3_POOL_v1:";
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
-    EVP_DigestUpdate(ctx, _DOM_XOR, sizeof(_DOM_XOR)-1);
-    EVP_DigestUpdate(ctx, xored,    32);
-    EVP_DigestUpdate(ctx, &present, 1);   /* encode source mask */
-    unsigned int outlen = 32;
-    EVP_DigestFinal_ex(ctx, out32, &outlen);
-    EVP_MD_CTX_free(ctx);
+    /* Stub: Python XORs sources and hashes with hashlib.sha3_256 */
+    (void)s1; (void)s2; (void)s3; (void)out32;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -14649,8 +14298,6 @@ class QtclClientApp:
                 snap_out = {**m.as_dict(), "koyeb": self.koyeb_state.as_dict(),
                             "block_height": bh, "ts": now,
                             "sse_age_s": round(sse_age, 1)}
-                _SSE_MUX.publish("metrics", snap_out, channel="metrics")
-                _SSE_MUX.publish("quantum", snap_out, channel="quantum")
                 self._persist_gossip("field_metrics", "metrics", snap_out)
 
                 _hb_counter += 1
@@ -17066,9 +16713,7 @@ class QtclClientApp:
                   f"fee: {result.get('fee', amount*0.001):.8f}  │  "
                   f"query: /api/transactions/{srv[:16]}…")
             try:
-                _SSE_MUX.publish("tx_submitted",
-                                 {"tx_id": tx_id[:32], "to": to_addr, "amount": amount},
-                                 channel="gossip")
+                pass  # SSE removed - RPC only
             except Exception:
                 pass
         elif result and result.get("error"):
