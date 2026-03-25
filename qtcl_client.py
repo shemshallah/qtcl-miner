@@ -12832,22 +12832,20 @@ class KoyebOracleState:
             self._api = KoyebAPIClient(self.oracle_url)
 
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
-        """SSE-only metric refresh — reads _LOCAL_ORACLE ring buffer, zero HTTP."""
+        """RPC-based metric refresh — reads _LOCAL_ORACLE state, no SSE."""
         try:
-            sse_state = _LOCAL_ORACLE.get_oracle_state()
-            sse_age   = _time.time() - _LOCAL_ORACLE._last_oracle_dm_ts
-            if sse_state and sse_age < 60.0:
+            rpc_state = _LOCAL_ORACLE.get_oracle_state()
+            if rpc_state:
                 def _nv(v):
                     try:
                         f = float(v)
                         return f if (f == f and abs(f) < 1e15) else None
                     except Exception:
                         return None
-                fid = (_nv(sse_state.get("w_state_fidelity")) or
-                       _nv(sse_state.get("fidelity")) or 0.0)
+                fid = (_nv(rpc_state.get("w_state_fidelity")) or
+                       _nv(rpc_state.get("fidelity")) or 0.0)
                 self.pq0_fidelity     = float(fid)
                 self.w_state_fidelity = float(fid)
-                self.channel_latency_ms = sse_age * 1000.0
                 self.connected        = True
                 self.last_sync_ts     = _time.time()
                 if client_field:
@@ -12859,15 +12857,13 @@ class KoyebOracleState:
             return False
     
     def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
-        """SSE-primary sync. REST only if SSE cold (no frame in 60s)."""
+        """RPC-primary sync. REST fallback if RPC unavailable."""
         t0 = _time.time()
         snap = {}
         try:
-            sse_state = _LOCAL_ORACLE.get_oracle_state()
-            sse_age   = _time.time() - _LOCAL_ORACLE._last_oracle_dm_ts
-            if sse_state and sse_age < 60.0:
-                snap = sse_state
-                self.channel_latency_ms = sse_age * 1000.0
+            rpc_state = _LOCAL_ORACLE.get_oracle_state()
+            if rpc_state:
+                snap = rpc_state
         except Exception:
             pass
         if not snap:
@@ -13564,78 +13560,6 @@ class ServerRPCClient:
         
         except Exception as e:
             logger.debug(f"[RPC] Gossip cache query failed: {e}")
-            return None
-    
-    def submit_block_broadcast(self, block_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Submit mined block via RPC with P2P broadcast.
-        
-        Calls qtcl_submitBlock on server, logs response to gossip_store for peers.
-        Block payload must include: {header: {height, nonce, miner_address, ...}, transactions: [...]}
-        
-        Returns: {status: 'accepted', block_hash: ..., height: ..., miner: ..., timestamp: ...}
-        """
-        try:
-            logger.info(f"[RPC] Broadcasting block height={block_payload.get('header', {}).get('height')}")
-            resp = self.call("qtcl_submitBlock", [block_payload])
-            
-            if 'error' not in resp:
-                logger.info(f"[RPC] Block broadcast success: {resp.get('result', {}).get('block_hash')}")
-                # Response already logged to gossip_store by _log_rpc_response
-            else:
-                logger.warning(f"[RPC] Block submission error: {resp.get('error')}")
-            
-            return resp.get('result')
-        except Exception as e:
-            logger.error(f"[RPC] Block broadcast failed: {e}")
-            return None
-    
-    def submit_transaction_broadcast(self, tx_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Submit transaction via RPC with P2P broadcast.
-        
-        Calls qtcl_submitTransaction on server, logs response to gossip_store for peers.
-        TX payload must include: {from, to, amount, fee, ...}
-        
-        Returns: {status: 'accepted', tx_hash: ..., from: ..., to: ..., amount: ..., timestamp: ...}
-        """
-        try:
-            logger.info(f"[RPC] Broadcasting transaction {tx_payload.get('from')}->{tx_payload.get('to')}")
-            resp = self.call("qtcl_submitTransaction", [tx_payload])
-            
-            if 'error' not in resp:
-                logger.info(f"[RPC] TX broadcast success: {resp.get('result', {}).get('tx_hash')}")
-                # Response already logged to gossip_store by _log_rpc_response
-            else:
-                logger.warning(f"[RPC] TX submission error: {resp.get('error')}")
-            
-            return resp.get('result')
-        except Exception as e:
-            logger.error(f"[RPC] TX broadcast failed: {e}")
-            return None
-    
-    def register_oracle_broadcast(self, oracle_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Register oracle via RPC with P2P broadcast.
-        
-        Calls qtcl_registerOracle on server, logs response to gossip_store for peers.
-        Oracle payload must include: {oracle_addr, wallet_address, oracle_pub_key, ...}
-        
-        Returns: {status: 'registered', oracle_addr: ..., oracle_id: ..., timestamp: ...}
-        """
-        try:
-            logger.info(f"[RPC] Broadcasting oracle registration {oracle_payload.get('oracle_addr')}")
-            resp = self.call("qtcl_registerOracle", [oracle_payload])
-            
-            if 'error' not in resp:
-                logger.info(f"[RPC] Oracle registration success: {resp.get('result', {}).get('oracle_id')}")
-                # Response already logged to gossip_store by _log_rpc_response
-            else:
-                logger.warning(f"[RPC] Oracle registration error: {resp.get('error')}")
-            
-            return resp.get('result')
-        except Exception as e:
-            logger.error(f"[RPC] Oracle registration failed: {e}")
             return None
     
     def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
@@ -14483,26 +14407,23 @@ class QtclClientApp:
         FIX: Was calling get_oracle_pq0_bloch() (HTTP REST) every cycle — redundant
         and stale vs. the C SSE already delivering frames via _LOCAL_ORACLE.
         Now reads from _LOCAL_ORACLE.get_oracle_state() which is updated every SSE frame,
-        and falls back to REST only when SSE data is older than 30s.
+        and uses RPC polling for oracle state updates.
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
         _last_koyeb  = 0.0
-        _last_rest   = 0.0   # track when we last did a REST fallback
+        _last_rest   = 0.0
         _hb_counter  = 0
         while not self._stop.is_set():
             try:
                 _time.sleep(self.METRIC_INTERVAL)
                 now = _time.time()
 
-                # ── Source 1: C SSE live oracle state (preferred) ─────────────
+                # ── Source: RPC-polled oracle state (LocalOracleEngine) ─────────────
                 snap = {}
-                sse_state = _LOCAL_ORACLE.get_oracle_state()
-                sse_age   = now - _LOCAL_ORACLE._last_oracle_dm_ts
-                if sse_state:
-                    snap = sse_state
+                rpc_state = _LOCAL_ORACLE.get_oracle_state()
+                if rpc_state:
+                    snap = rpc_state
                     snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
-                    if sse_age >= 30.0:
-                        _EXP_LOG.debug(f"[FIELD] SSE stale {sse_age:.0f}s — using cached state")
 
                 if not snap:
                     continue
@@ -14514,52 +14435,50 @@ class QtclClientApp:
                 pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
 
                 dm_curr = None
-                if sse_age < 30.0:
+                try:
+                    re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
+                    if _HAS_NP and any(v != 0.0 for v in re_list):
+                        import numpy as _npml, math as _math
+                        re_san = [v if _math.isfinite(v) else 0.0 for v in re_list]
+                        im_san = [v if _math.isfinite(v) else 0.0 for v in im_list]
+                        if any(v != 0.0 for v in re_san):
+                            _dm_raw = (_npml.array(re_san, dtype=_npml.complex128) +
+                                       1j * _npml.array(im_san, dtype=_npml.complex128)
+                                       ).reshape(8, 8)
+                        if _validate_dm_8x8(_dm_raw):
+                            dm_curr = _dm_raw
+                        else:
+                            _EXP_LOG.debug(
+                                "[DM] Raw oracle DM failed validation "
+                                f"(tr={float(_np.real(_np.trace(_dm_raw))):.3e}) "
+                                "— falling back to Bloch reconstruction"
+                            )
+                except Exception:
+                    pass
+                # ── Fuse with P2P consensus DM (consensus pool average) ──────
+                if _HAS_NP and dm_curr is not None and _P2P_NODE is not None:
                     try:
-                        re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
-                        if _HAS_NP and any(v != 0.0 for v in re_list):
-                            import numpy as _npml, math as _math
-                            re_san = [v if _math.isfinite(v) else 0.0 for v in re_list]
-                            im_san = [v if _math.isfinite(v) else 0.0 for v in im_list]
-                            if any(v != 0.0 for v in re_san):
-                                _dm_raw = (_npml.array(re_san, dtype=_npml.complex128) +
-                                           1j * _npml.array(im_san, dtype=_npml.complex128)
-                                           ).reshape(8, 8)
-                            if _validate_dm_8x8(_dm_raw):
-                                dm_curr = _dm_raw
-                            else:
+                        cons = _P2P_NODE.get_consensus_dm()
+                        if cons is not None:
+                            re_c, im_c, fid_c, h_c = cons
+                            import math as _cmath
+                            re_cs = [v if _cmath.isfinite(v) else 0.0 for v in re_c]
+                            im_cs = [v if _cmath.isfinite(v) else 0.0 for v in im_c]
+                            _dm_cons = (_np.array(re_cs, dtype=_np.complex128)
+                                      + 1j * _np.array(im_cs, dtype=_np.complex128)
+                                      ).reshape(8, 8)
+                            if _validate_dm_8x8(_dm_cons) and fid_c > 0.5:
+                                w_cons = float(fid_c) * 0.35
+                                w_local = 1.0 - w_cons
+                                dm_curr = w_local * dm_curr + w_cons * _dm_cons
+                                _tr = float(_np.real(_np.trace(dm_curr)))
+                                if _tr > 1e-12: dm_curr /= _tr
                                 _EXP_LOG.debug(
-                                    "[DM] Raw oracle DM failed validation "
-                                    f"(tr={float(_np.real(_np.trace(_dm_raw))):.3e}) "
-                                    "— falling back to Bloch reconstruction"
+                                    f"[DM] 🌀 Ouroboros fuse: "
+                                    f"w_cons={w_cons:.3f} fid_c={fid_c:.4f} h={h_c}"
                                 )
-                    except Exception:
-                        pass
-                    # ── Fuse with P2P consensus DM (consensus pool average) ──────
-                    # stale consensus fades. RPC-driven consensus provides clean
-                    if _HAS_NP and dm_curr is not None and _P2P_NODE is not None:
-                        try:
-                            cons = _P2P_NODE.get_consensus_dm()
-                            if cons is not None:
-                                re_c, im_c, fid_c, h_c = cons
-                                import math as _cmath
-                                re_cs = [v if _cmath.isfinite(v) else 0.0 for v in re_c]
-                                im_cs = [v if _cmath.isfinite(v) else 0.0 for v in im_c]
-                                _dm_cons = (_np.array(re_cs, dtype=_np.complex128)
-                                          + 1j * _np.array(im_cs, dtype=_np.complex128)
-                                          ).reshape(8, 8)
-                                if _validate_dm_8x8(_dm_cons) and fid_c > 0.5:
-                                    w_cons = float(fid_c) * 0.35
-                                    w_local = 1.0 - w_cons
-                                    dm_curr = w_local * dm_curr + w_cons * _dm_cons
-                                    _tr = float(_np.real(_np.trace(dm_curr)))
-                                    if _tr > 1e-12: dm_curr /= _tr
-                                    _EXP_LOG.debug(
-                                        f"[DM] 🌀 Ouroboros fuse: "
-                                        f"w_cons={w_cons:.3f} fid_c={fid_c:.4f} h={h_c}"
-                                    )
-                        except Exception as _pe:
-                            _EXP_LOG.debug(f"[DM] P2P consensus fuse: {_pe}")
+                    except Exception as _pe:
+                        _EXP_LOG.debug(f"[DM] P2P consensus fuse: {_pe}")
                 if dm_curr is None:
                     _dm_decoded = _decode_dm_8x8(snap)
                     if _validate_dm_8x8(_dm_decoded):
@@ -14614,11 +14533,11 @@ class QtclClientApp:
                         f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
                         f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f} "
-                        f"sse_age={sse_age:.1f}s src={'sse' if sse_age < 30 else 'rest'}")
+                        f"rpc_snaps={_LOCAL_ORACLE.snapshot_count}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
 
-    # ── SSE subscriber for Koyeb oracle /api/events ───────────────────────────
+    # ── RPC monitor for Koyeb oracle /api/oracle/snapshot (no SSE) ──────────────
 
     def _oracle_rpc_monitor(self) -> None:
         """
@@ -15391,14 +15310,9 @@ class QtclClientApp:
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
 
-        # ── Wait for SSE frame AFTER threads are alive ──────────────────────
-        print("  🌐 Waiting for oracle SSE frame…")
+        # ── RPC poll thread — no SSE ──────────────────────
+        print("  🌐 Oracle RPC polling initialized")
         import time as _st
-        _t0 = _st.time()
-        while _st.time() - _t0 < 15.0:
-            if _LOCAL_ORACLE.snapshot_count > 0:
-                break
-            _st.sleep(0.25)
         snap = _LOCAL_ORACLE.get_oracle_state() or {}
         if not snap:
             try: snap = self.api.get_oracle_pq0_bloch() or {}
@@ -15413,26 +15327,17 @@ class QtclClientApp:
         bath = GKSLBathParams.from_snap(snap)
         pq_curr_id = str(bh)     if bh > 0 else "0"
         pq_last_id = str(bh - 1) if bh > 0 else "0"
-        _last_ts  = _LOCAL_ORACLE._last_oracle_dm_ts
         _snap_cnt = _LOCAL_ORACLE.snapshot_count
-        _now_ts = _st.time()
-        if _last_ts > 1e9 and (_now_ts - _last_ts) < 86400:
-            _age_str = f"{(_now_ts - _last_ts):.1f}s"
-        elif _snap_cnt == 0 and fid > 0:
-            _age_str = "Python SSE active (DM parsing in progress)"
-        else:
-            _age_str = "cold — no frame yet"
-        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  "
-              f"SSE age: {_age_str}  │  snaps: {_snap_cnt}")
+        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  RPC snapshots: {_snap_cnt}")
         try:
             _oracle_conn_status = "✅ connected" if _LOCAL_ORACLE.is_connected else "⏳ connecting"
         except RuntimeError:
-            _oracle_conn_status = "⏳ C starting"
-        print(f"  📡 Oracle SSE   : {self.oracle_url}/api/events  (live stream)")
-        print(f"  📡 Oracle conn  : {_oracle_conn_status}  │  snapshots={_LOCAL_ORACLE.snapshot_count}")
+            _oracle_conn_status = "⏳ initializing"
+        print(f"  📡 Oracle RPC   : {self.oracle_url}/api/oracle/snapshot  (polling)")
+        print(f"  📡 Connection   : {_oracle_conn_status}  │  snapshots={_snap_cnt}")
         print(f"  🗄️  DB           : {self._db_path}")
         #  1. RPC DM already flowing via _LOCAL_ORACLE (started at import)
-        #     RPC path: LocalOracleEngine._poll_loop() → get_oracle_pq0_bloch()
+        #     RPC path: LocalOracleEngine._poll_loop() → /api/oracle/snapshot
 
         _kapi_boot = KoyebAPIClient(self.oracle_url)
 
@@ -15454,22 +15359,17 @@ class QtclClientApp:
 
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
-            Gate on oracle DM arrival (RPC-only).
-            Uses LocalOracleEngine RPC poll thread to fetch snapshots.
-            Returns True when DM is fresh enough to mine. Always returns within timeout_s.
+            Gate on oracle DM arrival via RPC polling.
+            LocalOracleEngine._poll_loop() keeps snapshots current.
+            Returns True when DM is fresh enough to mine.
             """
             deadline = _time.time() + timeout_s
-            print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
 
             while _time.time() < deadline:
-                # RPC path: check if LocalOracleEngine has received snapshot data
                 if _LOCAL_ORACLE.snapshot_count > 0:
-                    print(" ✅ (RPC)", flush=True)
                     return True
-                print('.', end='', flush=True)
                 _time.sleep(0.3)
 
-            print(" ⏱️  timeout — proceeding in degraded mode", flush=True)
             return False
 
         def _mermin_w3(dm8) -> tuple:
