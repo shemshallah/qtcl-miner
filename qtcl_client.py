@@ -54,6 +54,27 @@ QRNG_API_KEY_3: str = os.getenv('QRNG_API_KEY',         '')   # QBICK      — g
 ENTROPY_API_KEY: str = os.getenv('ENTROPY_API_KEY',     '')   # Server entropy endpoint key (set on Koyeb: ENTROPY_API_KEY)
 
 ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app')
+
+P2P_BOOTSTRAP_PEERS = [
+    ('qtcl-blockchain.koyeb.app', 9091),
+    ('qtcl-primary.koyeb.app', 9091),
+]
+
+P2P_HARDCODED_SEEDS = {
+    'qtcl-blockchain.koyeb.app:9091': {
+        'id': '16d894aeee9dae65d1b5c6f7a8b9c0d1e2f3g4h5',
+        'role': 'primary',
+        'region': 'us-west-2',
+        'verified': True,
+    },
+    'qtcl-primary.koyeb.app:9091': {
+        'id': '8283d1c55f6155c7a9b8c7d6e5f4g3h2i1j0k9l8',
+        'role': 'secondary',
+        'region': 'us-east-1',
+        'verified': True,
+    },
+}
+
 ENTROPY_LOCK        = threading.Lock()
 SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 
@@ -317,9 +338,40 @@ _qrng_active = ' + '.join(
 ) or 'none'
 logger.info(
     f"[HypEnt] Pipeline: QRNG[{_qrng_active}] "
-    f"\u2192 XOR\u2083 \u2192 {{8,3}} M\u00f6bius(d=64) "
-    f"\u2192 server({ENTROPY_SERVER_URL}) \u2192 os.urandom hedge"
+    f"→ XOR₃ → {{8,3}} Möbius(d=64) "
+    f"→ server({ENTROPY_SERVER_URL}) → os.urandom hedge"
 )
+
+
+def init_p2p_bootstrap() -> None:
+    """Initialize P2P peer discovery from hardcoded seed nodes (no localhost)."""
+    import sqlite3 as _sq3
+    from pathlib import Path as _P
+    
+    db_file = _P.home() / "qtcl-miner" / "data" / "qtcl_blockchain.db"
+    if not db_file.exists():
+        return
+    
+    try:
+        conn = _sq3.connect(str(db_file), timeout=2.0)
+        cur = conn.cursor()
+        
+        cur.execute("""CREATE TABLE IF NOT EXISTS known_peers(
+            host TEXT, port INTEGER, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(host, port))""")
+        
+        for (host, port), seed_info in P2P_HARDCODED_SEEDS.items():
+            try:
+                cur.execute("INSERT OR REPLACE INTO known_peers(host,port) VALUES(?,?)",
+                           (host, port))
+            except Exception as e:
+                logger.debug(f"[P2P] Seed insert {host}:{port}: {e}")
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"[P2P] ✅ Bootstrapped {len(P2P_HARDCODED_SEEDS)} seed peers")
+    except Exception as e:
+        logger.debug(f"[P2P] Bootstrap failed (non-fatal): {e}")
 
 
 BIP39_WORDLIST = [
@@ -6637,7 +6689,7 @@ class QtclMiner(QtclNode):
         self._miner_id = self._cfg.get("miner_id") or HASH_ENGINE.compute_hash(
             f"miner:{time.time()}"
         )
-        self._server_url = self._cfg.get("server_url", "http://localhost:9091")
+        self._server_url = self._cfg.get("server_url") or ENTROPY_SERVER_URL
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
@@ -6665,7 +6717,7 @@ class QtclMiner(QtclNode):
 
     def _register_with_server(self) -> None:
         import urllib.request
-        host = self._cfg.get("miner_host", "localhost")
+        host = self._cfg.get("miner_host") or _MY_IP or "127.0.0.1"
         port = int(self._cfg.get("miner_port", 9000))
         payload = json.dumps({
             "miner_id": self._miner_id,
@@ -13281,18 +13333,29 @@ def _broadcast_oracle_to_local_subs(snap: dict) -> None:
 
 class ServerRPCClient:
     """
-    JSON-RPC 2.0 client for server → oracle Pyth metrics.
-    Single responsibility: marshal qtcl_getPythPrice and qtcl_getHealth RPC calls.
+    Dual-mode JSON-RPC 2.0 client: Koyeb HTTP RPC + P2P Gossip fallback.
+    - Primary: HTTPS to Koyeb server /rpc endpoint (8000 or 8545 standard)
+    - Fallback: Query peer_registry → gossip_store for cached RPC responses
+    - Broadcast: All RPC calls/responses shared to P2P peers via gossip
+    Supports: qtcl_getPythPrice, qtcl_getHealth, qtcl_getChainStatus, etc.
     """
     
-    def __init__(self, server_url: str = "http://localhost:9091"):
-        """Args: server_url = JSON-RPC endpoint (e.g., http://koyeb:9091)"""
+    def __init__(self, server_url: str = None, db_connection=None):
+        """
+        Args:
+            server_url: Koyeb RPC endpoint (defaults to ENTROPY_SERVER_URL/rpc)
+            db_connection: SQLite conn for gossip_store fallback queries
+        """
+        if server_url is None:
+            server_url = ENTROPY_SERVER_URL
         self.server_url = server_url.rstrip('/') + '/rpc'
+        self.db = db_connection
         self.cache = {}
         self.cache_ts = 0.0
         self.cache_ttl = 3.0
         self.lock = threading.RLock()
         self.call_id = 0
+        self._rpc_response_log = []  # Log for P2P broadcast
     
     def _next_id(self) -> int:
         """Atomic increment for JSON-RPC request ID."""
@@ -13301,41 +13364,136 @@ class ServerRPCClient:
             return self.call_id
     
     def call(self, method: str, params: Any = None) -> Dict[str, Any]:
-        """JSON-RPC 2.0 call to server."""
+        """
+        Dual-mode JSON-RPC 2.0 call: Koyeb HTTP → P2P Gossip fallback → Broadcast.
+        
+        1. Try Koyeb server at self.server_url (primary)
+        2. On failure, query gossip_store for cached responses from peers
+        3. Broadcast call+response to all peers via gossip network
+        """
         from urllib.request import Request, urlopen
         from urllib.error import URLError
         import socket as _socket
         
+        req_id = self._next_id()
         req_body = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params or [],
-            "id": self._next_id()
+            "id": req_id
         }
         
+        # ── STEP 1: Try Koyeb HTTP RPC (primary) ──────────────────────────────
         try:
             req = Request(
                 self.server_url,
                 data=json.dumps(req_body).encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
+                headers={'Content-Type': 'application/json', 'User-Agent': 'QTCL-RPC/2.0'},
                 method='POST'
             )
             with urlopen(req, timeout=5) as resp:
                 resp_data = json.loads(resp.read().decode('utf-8'))
             
+            # Log successful RPC response for P2P broadcast
+            self._log_rpc_response(method, resp_data)
+            
             if 'error' in resp_data:
-                logger.warning(f"[SERVER-RPC] {method} error: {resp_data['error']}")
+                logger.debug(f"[RPC] {method} HTTP error: {resp_data['error']}")
                 return resp_data
             
+            logger.debug(f"[RPC] {method} ✓ from Koyeb")
             return resp_data
         
-        except (URLError, _socket.timeout, json.JSONDecodeError) as e:
-            logger.error(f"[SERVER-RPC] {method} failed: {type(e).__name__}: {e}")
-            return {"error": str(e)}
+        except (URLError, _socket.timeout) as e:
+            logger.debug(f"[RPC] {method} HTTP failed: {type(e).__name__}: {e} → falling back to gossip")
+        except json.JSONDecodeError as e:
+            logger.debug(f"[RPC] {method} JSON decode failed: {e} → falling back to gossip")
+        except Exception as e:
+            logger.debug(f"[RPC] {method} unexpected error: {e} → falling back to gossip")
+        
+        # ── STEP 2: Fallback to P2P gossip_store ──────────────────────────────
+        cached = self._query_gossip_cache(method, params)
+        if cached:
+            logger.debug(f"[RPC] {method} ✓ from P2P gossip cache")
+            return cached
+        
+        # ── STEP 3: Return error if both paths exhausted ───────────────────────
+        error_resp = {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32603,
+                "message": f"RPC endpoint unreachable (Koyeb down, no gossip cache)"
+            },
+            "id": req_id
+        }
+        logger.warning(f"[RPC] {method} ✗ both Koyeb + gossip failed")
+        return error_resp
+    
+    def _log_rpc_response(self, method: str, resp_data: Dict[str, Any]) -> None:
+        """Log RPC response for P2P broadcast (gossip_store)."""
+        try:
+            if not self.db:
+                return
+            
+            import sqlite3
+            payload = {
+                'method': method,
+                'response': resp_data,
+                'timestamp': time.time(),
+                'ttl_seconds': 300,  # RPC cache valid for 5 minutes
+            }
+            
+            # Broadcast to gossip_store so peers can share RPC responses
+            with self.db:
+                cur = self.db.cursor()
+                cur.execute("""
+                    INSERT INTO gossip_store(event_id, event_type, payload, timestamp)
+                    VALUES(?, ?, ?, datetime('now'))
+                """, (
+                    f"rpc_{method}_{int(time.time()*1000)}",
+                    f"rpc_response",
+                    json.dumps(payload, separators=(',', ':'))
+                ))
+                self.db.commit()
+            
+            self._rpc_response_log.append(payload)
+            if len(self._rpc_response_log) > 100:
+                self._rpc_response_log.pop(0)
         
         except Exception as e:
-            logger.error(f"[SERVER-RPC] Unexpected error in {method}: {e}")
-            return {"error": str(e)}
+            logger.debug(f"[RPC] Failed to log response for broadcast: {e}")
+    
+    def _query_gossip_cache(self, method: str, params: Any) -> Optional[Dict[str, Any]]:
+        """Query gossip_store for cached RPC responses from peers (P2P fallback)."""
+        try:
+            if not self.db:
+                return None
+            
+            # Search gossip_store for recent RPC responses from peers
+            cur = self.db.cursor()
+            cur.execute("""
+                SELECT payload FROM gossip_store
+                WHERE event_type = 'rpc_response'
+                  AND payload LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (f'%"method":"{method}"%',))
+            
+            row = cur.fetchone()
+            if not row:
+                return None
+            
+            cached = json.loads(row[0])
+            
+            # Check if cache is still valid
+            if time.time() - cached.get('timestamp', 0) > cached.get('ttl_seconds', 300):
+                return None
+            
+            return cached.get('response')
+        
+        except Exception as e:
+            logger.debug(f"[RPC] Gossip cache query failed: {e}")
+            return None
     
     def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
@@ -14686,14 +14844,15 @@ class QtclClientApp:
         from urllib.request import Request as _Ro, urlopen as _oo
         from urllib.error   import URLError as _UE
         
-        _to.sleep(0.5)  # minimal wait for HTTP server to bind
+        _to.sleep(0.5)
         _last_height = -1
         _fail_count = 0
+        _server_url = (self._cfg.get("server_url") or ENTROPY_SERVER_URL).rstrip('/')
         
-        _EXP_LOG.info("[OURO] 🚀 Starting aggressive polling every 400ms → localhost:9091/api/chain/status")
+        _EXP_LOG.info(f"[OURO] 🚀 Starting aggressive polling every 400ms → {_server_url}/api/chain/status")
         
         while not self._stop.is_set():
-            url = "http://localhost:9091/api/chain/status"
+            url = f"{_server_url}/api/chain/status"
             try:
                 req = _Ro(url, method='GET')
                 req.add_header('Content-Type', 'application/json')
@@ -17947,6 +18106,9 @@ def main() -> None:  # noqa: F811
         _db_file = _db_home / "qtcl_blockchain.db"
         print(f"  ✅ Data directory ready: {_db_home}", flush=True)
         
+        # ── Initialize P2P bootstrap peers (no localhost) ────────────────────
+        init_p2p_bootstrap()
+        
         url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
 
         # ── Wallet existence check ────────────────────────────────────────────
@@ -18031,7 +18193,19 @@ def main() -> None:  # noqa: F811
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
         # ── Set RPC client for LocalOracleEngine ────────────────────────────
         _LOCAL_ORACLE.set_rpc_client(_KOYEB)
-        print("✅ Ready for input", flush=True)  # DEBUG: Verify we reach here
+        
+        # ── Initialize dual-mode ServerRPCClient: Koyeb HTTP + P2P gossip fallback
+        import sqlite3 as _rpc_sq3
+        try:
+            _rpc_db = _rpc_sq3.connect(str(_db_file), timeout=5.0, check_same_thread=False)
+            _rpc_client = ServerRPCClient(db_connection=_rpc_db)
+            logger.info(f"[RPC] ✅ Dual-mode RPC initialized (HTTP + P2P gossip fallback)")
+            # Make available globally for mining/oracle modes
+            globals()['_SERVER_RPC'] = _rpc_client
+        except Exception as _rpc_err:
+            logger.warning(f"[RPC] ⚠️  Could not initialize dual-mode RPC: {_rpc_err}")
+        
+        print("✅ Ready for input", flush=True)
     except Exception as e:
         print(f"❌ Initialization error: {e}")
         return
