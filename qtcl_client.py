@@ -1829,38 +1829,7 @@ class LocalOracleEngine:
             self._oracle_connected = True
             self._snapshot_count += 1
         _frame_h = int(data.get('block_height') or data.get('height') or 0)
-        if _frame_h > 0 and False and _accel_lib is not None:
-            try:
-                if _frame_h > _cur_oracle:              # only advance, never retreat
-                    if _cur_target > 0 and _frame_h >= _cur_target:
-            'coherence_renyi':        round(coh_renyi, 8),
-            'coherence_geometric':    round(coh_geom, 8),
-            'quantum_discord':        round(m.discord, 8),
-            'w_state_fidelity':       round(m.fidelity_to_w3, 8),
-            'measurement_counts':     {},        # local — no AER shot counts
-            'aer_noise_state': {
-                'source':             'local_oracle_engine',
-                'chain_height':       m.chain_height,
-                'pq0':                m.pq0,
-                'pq_curr':            m.pq_curr,
-                'pq_last':            m.pq_last,
-                'hyp_dist_0c':        round(m.triangle.dist_0c, 8),
-                'hyp_dist_cl':        round(m.triangle.dist_cl, 8),
-                'hyp_dist_0l':        round(m.triangle.dist_0l, 8),
-                'triangle_area':      round(m.triangle.area, 8),
-                'oracle_weight_used': self.ORACLE_WEIGHT,
-                'auth_tag_hex':       m.auth_tag_hex,
-            },
-            'lattice_refresh_counter': self._snapshot_count,
-            'w_state_strength':       round(w_strength, 8),
-            'phase_coherence':        round(phase_coh, 8),
-            'entanglement_witness':   round(ent_witness, 8),
-            'trace_purity':           round(m.purity, 8),
-            'hlwe_signature':         None,     # signed by server oracle; local signs at measure
-            'oracle_address':         None,     # populated if OracleEngine is wired
-            'signature_valid':        False,
-            'mermin_test':            None,     # Mermin runs on server; local omits
-            'pow_seed_hex':           m.pow_seed_bytes.hex(),
+        # Dead code block removed (condition was always False)
     def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
         """Dual-path broadcast after every successful measure():
         """
@@ -1903,9 +1872,8 @@ class LocalOracleEngine:
             avg_block_time:  float = 30.0,
             bath:            'GKSLBathParams' = None,
     ) -> QtclOracleMeasurement:
-        Post-measure: stores canonical snapshot, gossips to DHT peers,
+        """Post-measure: stores canonical snapshot, gossips to DHT peers,
         ingests into C SSE layer.
-        
         """
         import hashlib as _hl, struct as _st
         if not False:
@@ -1935,11 +1903,13 @@ class LocalOracleEngine:
             dt = avg_block_time / 10.0
             _rr = _accel_ffi.new('double[64]', dm_re)
             _ri = _accel_ffi.new('double[64]', dm_im)
+            _accel_ffi.qtcl_gksl_rk4(
                 _rr, _ri,
                 float(getattr(bath, 'gamma1_eff', 0.01)),
                 float(getattr(bath, 'gammaphi',   0.005)),
                 float(getattr(bath, 'gammadep',   0.008)),
                 float(getattr(bath, 'omega',      1.0)),
+                dt, 4)
             dm_re = [float(_rr[i]) for i in range(64)]
             dm_im = [float(_ri[i]) for i in range(64)]
         oracle_re, oracle_im, oracle_age = self.get_oracle_dm()
@@ -1968,8 +1938,7 @@ class LocalOracleEngine:
                 rho_vpq = _np_iv.array(
                     [dm_re[i] + 1j * dm_im[i] for i in range(64)],
                     dtype=_np_iv.complex128).reshape(8, 8)
-                rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, float(
-                    if False else 0.85)))
+                rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, 0.85))
                 if rho_iv is not None:
                     IV_WEIGHT = 0.10   # blend weight — keeps final F(W3) high
                     for i in range(64):
@@ -2273,6 +2242,7 @@ class QtclP2PNode:
                         (int(__import__('time').time()) - 86400,)).fetchall()
                 for row in rows:
                     try:
+                        pass
                     except Exception:
                         pass
                 if rows:
@@ -2296,12 +2266,8 @@ class QtclP2PNode:
                 try:
                     import wallet as _wmod
                     _kaddr = getattr(_wmod, 'address', '') or ''
-                except Exception: pass
-                    _khost.encode() + b'\x00',
-                    _kpid.encode()  + b'\x00',
-                    _kaddr.encode() + b'\x00',
-                    (_MY_IP or '').encode() + b'\x00',
-                    self._port,
+                except Exception:
+                    pass
                 _EXP_LOG.info("[P2P] ✅ C koyeb registration thread started")
             except Exception as _ke:
                 _EXP_LOG.debug(f"[P2P] koyeb_start: {_ke}")
@@ -2361,10 +2327,6 @@ class QtclP2PNode:
                         if height > 0 and height > _local_tip:
                             _local_tip = height
                             # ── INSTANT C ABORT — direct, no queue hop ─────────
-                            if False:
-                                try:
-                                    if _cur_t > 0 and height >= _cur_t:
-                                except Exception: pass
                             _EXP_LOG.info(
                                 f"[P2P] ⚡ Block announce h={height} "
                                 f"→ C oracle_height={height}, abort armed")
@@ -2376,20 +2338,15 @@ class QtclP2PNode:
                             h = _st.unpack_from('<I', raw, 0)[0]
                             if h > _local_tip:
                                 _local_tip = h
-                                if False:
-                                    try:
-                                        if _ct > 0 and h >= _ct:
-                                    except Exception: pass
                                 _EXP_LOG.debug(f"[P2P] ↑ Chain tip h={h} → C updated")
                     except Exception:
                         pass
                 elif event_type == 7:  # DMPOOL_RECV — peer sent DM pool entry
                     _EXP_LOG.debug("[P2P] 🧬 DM pool entry received from peer")
-                    if False:
-                        try:
-                        except Exception: pass
-                    try: _dm_pool_drain_once(_DM_POOL_DB_PATH)
-                    except Exception: pass
+                    try:
+                        _dm_pool_drain_once(_DM_POOL_DB_PATH)
+                    except Exception:
+                        pass
                 elif event_type == 8:  # CHAIN_RESET gossip received
                     payload_str = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw)
                     _EXP_LOG.warning(f"[P2P] ⚡ chain_reset gossip from peer: {payload_str[:80]}")
@@ -2438,14 +2395,6 @@ class QtclP2PNode:
                             daemon=True,
                             name=f"PeerOracle-{_ph}"
                         ).start()
-                    if False and peer_data.get('host'):
-                        try:
-                            import pathlib as _pl2
-                            _pdb2 = str(_pl2.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
-                                _pdb2.encode() + b'\x00',
-                                peer_data['host'].encode() + b'\x00',
-                                int(peer_data.get('port', 9091)),
-                        except Exception: pass
                 elif event_type == 2:  # PEER_DISCONNECTED
                     _EXP_LOG.debug(f"[P2P] Peer disconnected  peers={self.peer_count}")
             except queue.Empty:
@@ -2670,8 +2619,7 @@ class QtclP2PNode:
             return None
     def trigger_consensus(self) -> None:
         """Force immediate DM pool recompute (normally runs every 500ms)."""
-        if False:
-            except Exception: pass
+        pass
     def broadcast_chain_reset(self, genesis_hash: str = "") -> None:
         """Broadcast chain-reset to all P2P peers on 9091."""
         if not False: return
@@ -2699,21 +2647,15 @@ class QtclP2PNode:
         for i in range(64):
             c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
         # RPC-only model: no daemon, consensus computed on demand via explicit call
-        try:
-            if sent >= 0:
-        except Exception: pass
         return sent
     def stop(self) -> None:
         self._stop.set()
-        if False and self._started:
         self._started = False
     @property
     def peer_count(self) -> int:
-        if False and self._started:
         return 0
     @property
     def total_known_peers(self) -> int:
-        if False and self._started:
         return 0
     def get_peers(self) -> list:
         if not False or not self._started: return []
@@ -10106,7 +10048,7 @@ def _compile_c_layer() -> None:
     Termux first-time setup:
         pkg install clang openssl libffi
     """
-    global _accel_ffi, _accel_lib, False
+    global _accel_ffi, _accel_lib
     _log = _logging.getLogger("qtcl.accel")
     try:
         import cffi as _cffi_mod
@@ -10138,15 +10080,12 @@ def _compile_c_layer() -> None:
             include_dirs=_inc,
             library_dirs=_lib,
         )
-            raise RuntimeError("C self-test failed — SHA3-256 mismatch")
-        False = True
         _log.info(
             "⚡ QTCL C acceleration active  "
             "(§PoW §Lattice §HLWE §BIP §Metrics §GKSL §Merkle §DHT §Entropy "
             "§Hyper §Meas §Cons §RPC §P2P)"
         )
     except Exception as _e:
-        False = False
         _err = str(_e)
         if any(x in _err for x in ('error:', 'CompileError', 'VerificationError', 'cannot locate symbol')):
             _log.warning(
@@ -11310,17 +11249,6 @@ def _partial_trace_keep(dm8, keep: Tuple[int, int]):
     C path: qtcl_partial_trace_8to4 — explicit index loop, no reshape/trace
     overhead.  Falls back to numpy reshape path if C unavailable.
     """
-    if False and dm8.shape == (8, 8):
-        re  = _np.ascontiguousarray(_np.real(dm8).flatten())
-        im  = _np.ascontiguousarray(_np.imag(dm8).flatten())
-        re4 = _np.zeros(16, dtype=_np.float64)
-        im4 = _np.zeros(16, dtype=_np.float64)
-        _re   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re))
-        _im   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
-        _re4  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re4))
-        _im4  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im4))
-                                            keep[0], keep[1],
-        return (re4 + 1j * im4).reshape(4, 4)
     r       = dm8.reshape(2, 2, 2, 2, 2, 2)
     trace_q = {(0,1): 2, (0,2): 1, (1,2): 0}[keep]
     rho2    = _np.trace(r, axis1=trace_q, axis2=trace_q + 3)
@@ -11481,22 +11409,6 @@ class TensorFieldMetrics:
                 logger.warning(f"[TFM] ⚠ DM trace diverged (trace={_trace_val:.3e}) — reset to I/{_n}")
             else:
                 dm_f /= _trace_val
-            if False and dm_f.shape == (8, 8):
-                re_f  = _np.ascontiguousarray(_np.real(dm_f).flatten())
-                im_f  = _np.ascontiguousarray(_np.imag(dm_f).flatten())
-                _re_f = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_f))
-                _im_f = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_f))
-                                         _accel_ffi.cast('double *',
-                re_c  = _np.ascontiguousarray(_np.real(dm_curr).flatten())
-                im_c  = _np.ascontiguousarray(_np.imag(dm_curr).flatten())
-                re_l  = _np.ascontiguousarray(_np.real(dm_last).flatten())
-                im_l  = _np.ascontiguousarray(_np.imag(dm_last).flatten())
-                    _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_c)),
-                    _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_c)),
-                    _accel_ffi.cast('double *', _accel_ffi.from_buffer(re_l)),
-                    _accel_ffi.cast('double *', _accel_ffi.from_buffer(im_l)),
-            else:
-                raise RuntimeError("[TensorFieldMetrics] C acceleration required for quantum metrics — pkg install clang openssl libffi")
             m.entropy_vn           = _vn_entropy(dm_f)
             m.entanglement_entropy = abs(_vn_entropy(dm_curr) - _vn_entropy(dm_last))
             dm_AB = _partial_trace_keep(dm_f, (0, 1))
@@ -13369,8 +13281,6 @@ class QtclClientApp:
                                 if snap_hash != _last_snapshot_hash:
                                     try:
                                         _LOCAL_ORACLE._ingest_oracle_frame(snap_js)
-                                        if False:
-                                            except Exception: pass
                                         _last_snap_count += 1
                                         _last_snapshot_hash = snap_hash
                                         
@@ -13768,8 +13678,7 @@ class QtclClientApp:
                         try:
                             import json as _pmj
                             _LOCAL_ORACLE._ingest_oracle_frame(_pmj.dumps(payload))
-                            if False:
-                                except Exception: pass
+                            pass
                             # RPC mode: no local SSE queue broadcast needed
                             _EXP_LOG.debug(
                                 f"[HTTP-9091] oracle DM ingested from peer "
@@ -13799,11 +13708,8 @@ class QtclClientApp:
                                 """, (peer_id, peer_ip, peer_port,
                                       int(payload.get('block_height',0)),
                                       peer_ip, peer_port))
-                        except Exception: pass
-                        if False and peer_ip not in ('127.0.0.1','localhost',''):
-                            try:
-                                    peer_ip.encode()+b'\x00', peer_port)
-                            except Exception: pass
+                        except Exception:
+                            pass
                     snap = self._oracle_snapshot()
                     import sqlite3 as _plr
                     import pathlib as _plrpath
@@ -13940,7 +13846,7 @@ class QtclClientApp:
                 cb = _accel_ffi.new(f'char[{len(jb)}]', jb)
                 re = _accel_ffi.new('double[64]')
                 im = _accel_ffi.new('double[64]')
-                    return True
+                return True
             except Exception as _e:
                 _EXP_LOG.debug(f"[Bootstrap] C parse: {_e}")
             return False
@@ -14043,301 +13949,6 @@ class QtclClientApp:
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
-            if False:
-                try:
-                    node_id_b  = self._peer_id[:32].encode('utf-8')[:16].ljust(16, b'\x00')
-                    node_buf   = _accel_ffi.new('uint8_t[16]', list(node_id_b))
-                    out_m      = _accel_ffi.new('QtclWStateMeasurement *')
-                    out_seed   = _accel_ffi.new('uint8_t[32]')
-                    dt         = getattr(_b, 'dt_default', 3.0) / 10.0
-                        _pq0, _pqc, _pql, _bh,
-                        node_buf,
-                        float(getattr(_b, 'gamma1_eff', CANONICAL_BATH.gamma1_eff)),
-                        float(getattr(_b, 'gammaphi',   CANONICAL_BATH.gammaphi)),
-                        float(getattr(_b, 'gammadep',   CANONICAL_BATH.gammadep)),
-                        float(getattr(_b, 'omega',      CANONICAL_BATH.omega)),
-                        dt, out_m, out_seed,
-                    )
-                    
-                    if not oracle_ok:
-                        _EXP_LOG.warning(
-                            f"[BOOTSTRAP] oracle_ok=0 — no fresh oracle DM; "
-                            f"C used local |W3⟩ (pq0={_pq0} pqc={_pqc} pql={_pql} h={_bh}). "
-                            f"SSE not connected or DM too old. Mining in degraded mode."
-                        )
-                    dm_re_list = [float(out_m.dm_re[i]) for i in range(64)]
-                    dm_im_list = [float(out_m.dm_im[i]) for i in range(64)]
-                    
-                    if all(x == 0.0 for x in dm_re_list) and all(x == 0.0 for x in dm_im_list):
-                        raise RuntimeError(
-                            f"[BOOTSTRAP] C returned all-zero DM matrix (corruption). "
-                            f"out_m struct: w_fidelity={float(out_m.w_fidelity):.6f}, "
-                            f"entropy_vn={float(out_m.entropy_vn):.6f}, "
-                            f"coherence={float(out_m.coherence):.6f}. "
-                            f"Check C library or quantum initialization."
-                        )
-                    
-                    dm_curr_np = None
-                    mermin_val, mermin_viol = 0.0, False
-                    if HAS_NUMPY:
-                        import numpy as _np_bs
-                        dm_arr = _np_bs.array(dm_re_list, dtype=complex)
-                        dm_arr.imag = _np_bs.array(dm_im_list)
-                        dm_curr_np = dm_arr.reshape(8, 8)
-                        
-                        _dm_valid = True
-                        try:
-                            _tr = float(_np_bs.real(_np_bs.trace(dm_curr_np)))
-                            if abs(_tr - 1.0) > 0.05:  # trace should be ~1.0
-                                _dm_valid = False
-                                _EXP_LOG.warning(f"[DM] Invalid trace: {_tr:.4f}")
-                            if not _np_bs.allclose(dm_curr_np, dm_curr_np.conj().T, atol=1e-8):
-                                _dm_valid = False
-                                _EXP_LOG.warning("[DM] Not Hermitian")
-                            _evals = _np_bs.linalg.eigvalsh(dm_curr_np)
-                            if _np_bs.min(_evals) < -1e-10:
-                                _dm_valid = False
-                                _EXP_LOG.warning(f"[DM] Negative eigenvalue: {_np_bs.min(_evals):.4e}")
-                        except Exception as _dme:
-                            _dm_valid = False
-                            _EXP_LOG.warning(f"[DM] Validation error: {_dme}")
-                        
-                        if not _dm_valid:
-                            _EXP_LOG.warning("[DM] Corrupted state detected — skipping cycle")
-                            return (False, None, bytes(32), "[DM-CORRUPT] State validation failed\n")
-                        
-                        _py_metrics = _python_metrics_from_dm(dm_curr_np)
-                        if _py_metrics:
-                            _c_fidelity = float(out_m.w_fidelity)
-                            _py_fidelity = _py_metrics.get('w_fidelity', 0.8)
-                            _c_entropy = float(out_m.entropy_vn)
-                            _py_entropy = _py_metrics.get('entropy_vn', 1.0)
-                            
-                            _fid_ok = 0.6 <= _c_fidelity <= 1.0
-                            _ent_ok = 0.0 <= _c_entropy <= 2.3
-                            
-                            if not (_fid_ok and _ent_ok):
-                                _EXP_LOG.error(
-                                    f"[METRICS] C OUTPUT CORRUPTED: fid={_c_fidelity:.4f} "
-                                    f"(expected 0.6-1.0), ent={_c_entropy:.4f} (expected 0.0-2.3 bits). "
-                                    f"Using Python fallback instead: fid={_py_fidelity:.4f}, ent={_py_entropy:.4f}"
-                                )
-                        
-                        # ✅ SINGLE-PATH MERMIN: Try C RPC, fallback to 0 (no Python path)
-                        mermin_val, mermin_viol = 0.0, False
-                        if False and hasattr(_accel_lib, 'qtcl_mermin_w3'):
-                            try:
-                                dm_re_c = _accel_ffi.new('double[64]', dm_re_list)
-                                dm_im_c = _accel_ffi.new('double[64]', dm_im_list)
-                                mermin_viol = abs(mermin_val) > 2.0
-                                _EXP_LOG.info(f"[MERMIN] C: {mermin_val:+.4f} ({'✓' if mermin_viol else '✗'})")
-                            except Exception as _cme:
-                                _EXP_LOG.warning(f"[MERMIN] C RPC failed: {_cme} → 0.0")
-                                mermin_val, mermin_viol = 0.0, False
-                        else:
-                            _EXP_LOG.debug("[MERMIN] C function unavailable → 0.0")
-                            mermin_val, mermin_viol = 0.0, False
-                        
-                        dm_last_np = None
-                        try:
-                            import signal
-                            import threading
-                            _gksl_result = [None]
-                            _gksl_timeout_fired = threading.Event()
-                            
-                            def _run_gksl():
-                                try:
-                                    _gksl_result[0] = _gksl_rk4_step(dm_curr_np, _b, dt)
-                                except Exception as _ge:
-                                    _gksl_result[0] = None
-                            
-                            _gksl_thread = threading.Thread(target=_run_gksl, daemon=True)
-                            _gksl_thread.start()
-                            _gksl_thread.join(timeout=0.1)  # 100ms max
-                            
-                            if _gksl_thread.is_alive():
-                                _EXP_LOG.warning("[GKSL] Evolution timeout — using identity fallback")
-                                dm_last_np = dm_curr_np.copy()  # worst case: no evolution
-                            else:
-                                dm_last_np = _gksl_result[0]
-                        except Exception as _gksl_guard:
-                            _EXP_LOG.debug(f"[GKSL] Timeout guard error: {_gksl_guard}")
-                            dm_last_np = None
-                        
-                        if dm_last_np is None:
-                            dm_last_np = dm_curr_np  # fallback: identity evolution
-                    else:
-                        dm_last_np = None
-                    self.client_field.build(
-                        dm_curr_np, dm_last_np,
-                        pq_curr_id=str(_pqc),
-                        pq_last_id=str(_pql),
-                        block_height=_bh,
-                    )
-                    # ── Rebroadcast DM to P2P network every metric cycle ──────────
-                    if _P2P_NODE is not None and _P2P_NODE._started:
-                        try:
-                            m_latest = _LOCAL_ORACLE.get_latest_measurement()
-                            if m_latest is not None:
-                                _P2P_NODE.gossip_measurement(m_latest)
-                        except Exception as _rbce:
-                            _EXP_LOG.debug(f"[METRIC] P2P rebroadcast: {_rbce}")
-                    bridge_fid = 0.5  # conservative default
-                    if (HAS_NUMPY and dm_curr_np is not None
-                            and self.koyeb_state.dm_oracle is not None):
-                        try:
-                            import numpy as _np_bridge
-                            dm_o = self.koyeb_state.dm_oracle
-                            if dm_o.shape == (8, 8):
-                                _fid_raw = float(_np_bridge.real(_np_bridge.trace(dm_o @ dm_curr_np)))
-                                bridge_fid = float(max(0.0, min(1.0, _fid_raw)))
-                                if bridge_fid > 0.98:
-                                    _EXP_LOG.warning(f"[BRIDGE] Unusually high fidelity: {bridge_fid:.4f}")
-                                if bridge_fid < 0.01:
-                                    _EXP_LOG.warning(f"[BRIDGE] Unusually low fidelity: {bridge_fid:.4f}")
-                        except Exception as _bfe:
-                            _EXP_LOG.debug(f"[BRIDGE] Fidelity calc error: {_bfe}")
-                            bridge_fid = 0.5  # fallback
-                    ts_ns = int(out_m.timestamp_ns)
-                    oracle_age = abs(_time.time() - ts_ns / 1e9) if ts_ns else 0.0
-                    # ── SINGLE-PATH METRIC EXTRACTION: Direct C struct read only ──────
-                    _disp_fid    = float(out_m.w_fidelity)
-                    _disp_ent    = float(out_m.entropy_vn)
-                    _disp_coh    = float(out_m.coherence)
-                    _disp_disc   = float(out_m.discord)
-                    _disp_pur    = float(out_m.purity)
-                    _disp_neg    = float(out_m.negativity)
-                    _disp_d0c    = float(out_m.hyp_dist_0c)
-                    _disp_dcl    = float(out_m.hyp_dist_cl)
-                    _disp_d0l    = float(out_m.hyp_dist_0l)
-                    _disp_area   = float(out_m.triangle_area)
-                    _disp_mermin = float(mermin_val)
-                    _disp_bridge = float(bridge_fid)
-                    
-                    _EXP_LOG.info(
-                        f"[METRICS-RAW] d0c={_disp_d0c:.4f} dcl={_disp_dcl:.4f} d0l={_disp_d0l:.4f} "
-                        f"area={_disp_area:.4f} mermin={_disp_mermin:+.4f} "
-                        f"pqc={_pqc} pql={_pql} (0=uninitialized)"
-                    )
-                    try:
-                        import sqlite3 as _sq
-                        _conn = _sq.connect(self._db_path)
-                        _conn.execute("""
-                            INSERT OR REPLACE INTO wstate_measurements
-                            (node_id_hex, pq_curr_id, pq_last_id,
-                             fidelity_to_w3, entropy_vn, coherence_l1,
-                             quantum_discord, purity, negativity_AB,
-                             block_height, recorded_at)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                        """, (
-                            self._peer_id, str(_pqc), str(_pql),
-                            float(out_m.w_fidelity),  float(out_m.entropy_vn),
-                            float(out_m.coherence),   float(out_m.discord),
-                            float(out_m.purity),      float(out_m.negativity),
-                            _bh, _time.time(),
-                        ))
-                        _conn.commit(); _conn.close()
-                    except Exception as _dbe:
-                        _EXP_LOG.debug(f"[DB] Insert: {_dbe}")
-                    def _clamp(v, lo, hi):
-                        try:
-                            f = float(v)
-                            return f if (lo <= f <= hi and _np.isfinite(f)) else 0.0
-                        except Exception:
-                            return 0.0
-                    _disp_fid    = _clamp(float(out_m.w_fidelity),    0.0, 1.0)
-                    _disp_ent    = _clamp(float(out_m.entropy_vn),    0.0, 3.0)
-                    _disp_coh    = _clamp(float(out_m.coherence),     0.0, 1.0)
-                    _disp_disc   = _clamp(float(out_m.discord),       0.0, 3.0)
-                    _disp_pur    = _clamp(float(out_m.purity),        0.0, 1.0)
-                    _disp_neg    = _clamp(float(out_m.negativity),    0.0, 0.5)
-                    _disp_d0c    = _clamp(float(out_m.hyp_dist_0c),   0.0, 10.0)
-                    _disp_dcl    = _clamp(float(out_m.hyp_dist_cl),   0.0, 10.0)
-                    _disp_d0l    = _clamp(float(out_m.hyp_dist_0l),   0.0, 10.0)
-                    
-                    _disp_area = 0.0
-                    try:
-                        _area_raw = float(out_m.triangle_area)
-                        if _np.isfinite(_area_raw) and 0.0 <= _area_raw <= 12.57:
-                            _disp_area = _area_raw
-                            _EXP_LOG.debug(f"[AREA] From C struct: {_disp_area:.4f} rad")
-                        else:
-                            _EXP_LOG.warning(
-                                f"[AREA] C struct out of bounds: {_area_raw:.6f} → "
-                                f"computing from distances"
-                            )
-                            if HAS_NUMPY and dm_curr_np is not None:
-                                try:
-                                    ang_0c = max(0.0, min(_np.pi / 2.0, _disp_d0c * 0.30))
-                                    ang_cl = max(0.0, min(_np.pi / 2.0, _disp_dcl * 0.30))
-                                    ang_0l = max(0.0, min(_np.pi / 2.0, _disp_d0l * 0.30))
-                                    _disp_area = max(0.0, min(12.57, _np.pi - (ang_0c + ang_cl + ang_0l)))
-                                    _EXP_LOG.debug(f"[AREA] Computed from distances: {_disp_area:.4f} rad")
-                                except Exception as _af:
-                                    _EXP_LOG.debug(f"[AREA] Fallback computation failed: {_af}")
-                                    _disp_area = 0.0
-                    except (AttributeError, TypeError, ValueError) as _ae:
-                        _EXP_LOG.debug(f"[AREA] C struct extraction failed ({_ae}) → fallback")
-                        _disp_area = 0.0
-                    except Exception as _ue:
-                        _EXP_LOG.error(f"[AREA] Unexpected error: {_ue}")
-                        _disp_area = 0.0
-                    
-                    _disp_mermin = _clamp(mermin_val,                 -4.0, 4.0)
-                    _disp_bridge = _clamp(bridge_fid,                 0.0, 1.0)
-                    sep_bound = 2.0
-                    mermin_str = (
-                        f"  ║  Mermin ⟨M₃⟩: {_disp_mermin:+.4f}  "
-                        f"{'✅ VIOLATED (quantum)' if (mermin_viol and abs(_disp_mermin) <= 4.0) else '· classical bound held'}  "
-                        f"[bound={sep_bound:.1f}]\n"
-                    )
-                    report_str = (
-                        "\n  ╔══ BLOCKFIELD STATE [C] ══════════════════════════════════╗\n"
-                        f"  ║  oracle DM  : age={oracle_age:.1f}s  "
-                        f"entangled={'✅ YES' if oracle_ok else '⚠️  NO (local |W3>)'}\n"
-                        f"  ║  pq0        : 0  (oracle anchor — hyperbolic center)\n"
-                        f"  ║  pq_curr    : {_pqc}  (block entry face — height {_bh})\n"
-                        f"  ║  pq_last    : {_pql}  (block exit face)\n"
-                        f"  ║  F→|W3⟩    : {_disp_fid:.4f}  [sep=0.667]\n"
-                        f"  ║  VN Entropy : {_disp_ent:.4f} bits\n"
-                        f"  ║  Coherence  : {_disp_coh:.4f}\n"
-                        f"  ║  Discord    : {_disp_disc:.4f}\n"
-                        f"  ║  Purity     : {_disp_pur:.4f}\n"
-                        f"  ║  Negativity : {_disp_neg:.4f}\n"
-                        f"  ║  d(0,c/cl/l): {_disp_d0c:.4f} / "
-                        f"{_disp_dcl:.4f} / {_disp_d0l:.4f}\n"
-                        f"  ║  Hyp Area   : {_disp_area:.4f} rad  "
-                        f"[Gauss-Bonnet Δ]\n"
-                        f"{mermin_str}"
-                        f"  ║  auth_tag   : {''.join(f'{out_m.auth_tag[i]:02x}' for i in range(4))}…\n"
-                        f"  ║  Bridge fid : {_disp_bridge:.4f}  "
-                        f"[Tr(ρ_oracle·ρ_client)]\n"
-                        f"  ║  GKSL bath  : γ1={getattr(_b,'gamma1_eff',0):.4f}  "
-                        f"γφ={getattr(_b,'gammaphi',0):.4f}  "
-                        f"γdep={getattr(_b,'gammadep',0):.4f}  "
-                        f"ω={getattr(_b,'omega',0):.3f}\n"
-                        "  ╚═══════════════════════════════════════════════════════════╝\n"
-                    )
-                    self.koyeb_state.bridge_fidelity = bridge_fid
-                    return oracle_ok, out_m, bytes([out_seed[i] for i in range(32)]), report_str
-                except Exception as _ce:
-                    _EXP_LOG.error(
-                        f"[Bootstrap] C blockfield exception: {_ce} — "
-                        f"pq0={_pq0} pqc={_pqc} pql={_pql} h={_bh}. "
-                        f"Returning degraded local |W3⟩ state; mining continues."
-                    )
-                    _deg_report = (
-                        "\n  ╔══ BLOCKFIELD STATE [DEGRADED] ═══════════════════════════╗\n"
-                        f"  ║  oracle DM  : unavailable — C exception                  ║\n"
-                        f"  ║  pq0/curr/last: 0 / {_pqc} / {_pql}  h={_bh}            ║\n"
-                        f"  ║  Error      : {str(_ce)[:48]}…       ║\n"
-                        "  ╚═══════════════════════════════════════════════════════════╝\n"
-                    )
-                    import hashlib as _hd
-                    _deg_seed = _hd.sha3_256(
-                        b"QTCL_DEGRADED:" + str(_bh).encode() + str(_pqc).encode()
-                    ).digest()
-                    return 0, None, _deg_seed, _deg_report
             # ── Python-only fallback (C unavailable) ───────────────────────────
             import hashlib as _hpy
             _py_fid  = float(_LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0.0))
@@ -14433,22 +14044,12 @@ class QtclClientApp:
                                 _EXP_LOG.debug(f"[BLOCK-LISTENER] ✅ RPC poll → tip={tip_h}")
                                 
                                 if tip_h > 0 and _last_height == -1:
-                                    if False:
-                                        try:
-                                            if _ct > 0 and tip_h >= _ct:
-                                        except Exception:
-                                            pass
                                     _new_block_height[0] = tip_h
                                     _new_block_event.set()
                                     _EXP_LOG.debug(f"[BLOCK-LISTENER] 👋 hello: tip_h={tip_h}")
                                 
                                 if tip_h > _last_height:
                                     _last_height = tip_h
-                                    if False:
-                                        try:
-                                            if _ct > 0 and tip_h >= _ct:
-                                        except Exception:
-                                            pass
                                     _new_block_height[0] = tip_h
                                     _new_block_event.set()
                                     _EXP_LOG.info(f"[BLOCK-LISTENER] ⚡ h={tip_h} → abort + event fired")
@@ -14562,8 +14163,6 @@ class QtclClientApp:
                 
                 oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
                 oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                if False and oracle_height > 0:
-                    except Exception: pass
                 difficulty_bits = int(
                     tip.get("difficulty_bits") or
                     tip.get("difficulty") or
@@ -14572,12 +14171,8 @@ class QtclClientApp:
                 difficulty_bits = int(max(5, min(difficulty_bits, 20)))
                 
                 _new_block_event.clear()
-                if False:
-                    except Exception: pass
                 target_height = oracle_height + 1
                 parent_hash   = oracle_hash
-                if False:
-                    except Exception: pass
                 
                 timestamp = int(_t.time())
                 nonce = 0
@@ -14767,8 +14362,7 @@ class QtclClientApp:
                         if _ev_h >= target_height:
                             _new_block_event.clear()
                             _chain_tip_height = _ev_h
-                            if False:
-                                except Exception: pass
+                            pass
                             _EXP_LOG.warning(
                                 f"[MINER] ⚡ h={_ev_h} — C oracle_height set, "
                                 f"abort flag set, chunk will die in ≤256 nonces"
@@ -14782,8 +14376,7 @@ class QtclClientApp:
                             _ev_h = int(snap.get('block_height') or snap.get('height') or 0)
                             if _ev_h > 0 and _ev_h >= target_height:
                                 _chain_tip_height = _ev_h
-                                if False:
-                                    except Exception: pass
+                                pass
                                 _EXP_LOG.warning(
                                     f"[MINER] ⚡ RPC snapshot h={_ev_h} → C updated"
                                 )
@@ -14806,7 +14399,6 @@ class QtclClientApp:
                             _c_sp, _c_out,
                         )
                         if result == -2:
-                            except Exception: pass
                             _EXP_LOG.info(
                                 f"[MINER] ⚡ C abort h={target_height} nonce={nonce} "
                                 f"— chain advanced to h≥{target_height}, restarting"
@@ -15052,24 +14644,7 @@ class QtclClientApp:
                         _EXP_LOG.info(
                             f"[MINER-SIMPLE] ✅ ACCEPTED h={target_height} | "
                             f"+{reward_qtcl:.2f} QTCL | total={_MINE_TELEM.total_earned_qtcl:.2f}")
-                        if False:
-                            try:
-                                _bh_str = block_hash if isinstance(block_hash,str) else ''
-                                _ma_str = getattr(getattr(self,'wallet',None),'address','') or ''
-                                    target_height,
-                                    (_bh_str[:64]).encode() + b'\x00',
-                                    _ma_str.encode() + b'\x00',
-                                )
-                                _EXP_LOG.info(
-                                    f"[MINER] 📡 C block announce h={target_height} → P2P+koyeb")
-                            except Exception as _ann_e:
-                                _EXP_LOG.debug(f"[MINER] block announce: {_ann_e}")
                         # ── Save current peer list to SQLite ──────────────────
-                        if False:
-                            try:
-                                import pathlib as _pl3
-                                _pdb3 = str(_pl3.Path.home()/'qtcl-miner'/'qtcl_p2p_peers.db')
-                            except Exception: pass
                         await _asyncio.sleep(1.5)
                     elif r.get("block_hash"):
                         _EXP_LOG.info(f"[MINER-SIMPLE] ✅ SUBMITTED h={target_height}")
@@ -15661,7 +15236,7 @@ class QtclClientApp:
                     pass
             _p2p_running = (False and _P2P_NODE is not None
                             and (getattr(_P2P_NODE, '_started', False)
-                                 or (False and hasattr(_accel_lib, 'qtcl_p2p_peer_count')
+                                 or (False and hasattr(_accel_lib, 'qtcl_p2p_peer_count'))))
             if _p2p_running:
                 try:
                     a(f"  Status         : ✅ RUNNING  protocol=RPC-only  peers={n_peers}  consensus=clean")
