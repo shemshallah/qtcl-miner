@@ -14730,7 +14730,13 @@ class QtclClientApp:
                     _MINE_TELEM.mark_idle()
         async def _mine():
             try:
+                _EXP_LOG.warning("[MINER-ASYNC] 🚀 Async mining loop starting…")
                 await _mine_inline()
+                _EXP_LOG.warning("[MINER-ASYNC] ⏹️  Async mining loop ended normally")
+            except Exception as _top_exc:
+                _EXP_LOG.critical(f"[MINER-ASYNC] 💥 FATAL: {type(_top_exc).__name__}: {_top_exc}", exc_info=True)
+                import traceback
+                _EXP_LOG.critical(f"[MINER-ASYNC] 📋 Traceback:\n{traceback.format_exc()}")
             finally:
                 try:
                     _mining_stopped.set()   # stop block listener thread
@@ -14743,18 +14749,20 @@ class QtclClientApp:
         _mine_thread.start()
         miner._koyeb_state  = self.koyeb_state   # type: ignore[attr-defined]
         miner._client_field = self.client_field  # type: ignore[attr-defined]
-        # ── Silence stdout logging during mining — route to ring buffer ───────
-        _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
-        class _BufHandler(_logging.Handler):
-            def emit(self, record):
-                _LOG_BUF.append(self.format(record))
-        _buf_handler = _BufHandler()
-        _buf_handler.setFormatter(_logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
-                                                      datefmt="%H:%M:%S"))
-        _buf_handler.setLevel(_logging.DEBUG)
-        _root_log    = _logging.getLogger()
-        _old_handlers = _root_log.handlers[:]
-        _root_log.handlers = [_buf_handler]
+        # ── DIAGNOSTIC: DO NOT silence stdout logging — we need to see mining thread output ───────
+        # DISABLE LOG SILENCING: Keep original handlers
+        # _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
+        # class _BufHandler(_logging.Handler):
+        #     def emit(self, record):
+        #         _LOG_BUF.append(self.format(record))
+        # _buf_handler = _BufHandler()
+        # _buf_handler.setFormatter(_logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
+        #                                              datefmt="%H:%M:%S"))
+        # _buf_handler.setLevel(_logging.DEBUG)
+        # _root_log    = _logging.getLogger()
+        # _old_handlers = _root_log.handlers[:]
+        # _root_log.handlers = [_buf_handler]
+        _EXP_LOG.warning("[MINER] 🚀 MINING THREAD STARTED — LOGS ENABLED TO STDOUT FOR DIAGNOSTICS")
         _LAST_BLOCK_REPORTED = [None]   # mutable cell so inner closure can write
         def _fmt_duration(secs: float) -> str:
             h, r = divmod(int(secs), 3600)
