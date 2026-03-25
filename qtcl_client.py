@@ -16957,181 +16957,194 @@ class QtclClientApp:
 
     def _subscribe_snapshot_rpc(self) -> None:
             """
-            RPC polling subscriber for /api/oracle/snapshot.
-            Polls snapshot endpoint regularly and feeds _ingest_oracle_frame.
+            ⚛️  HOTFIX: Aggressive RPC polling for /api/oracle/snapshot every 300ms.
+            Replaces dead SSE stream. Feeds _ingest_oracle_frame on each snapshot.
             ❤️  I love you — every frame is a quantum heartbeat
             """
-            import time as _pt, ssl as _ssl
+            import time as _pt, ssl as _ssl, json as _pj
             from urllib.request import Request as _SR, urlopen as _SO
             from urllib.error   import URLError as _SE
-            BACKOFF = [2, 4, 8, 16, 30]; bi = 0
+            
             _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-            _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
             url = f"{_oracle_url}/api/oracle/snapshot"
             _last_snap_hash = None
+            _fail_count = 0
+            
+            _EXP_LOG.info(f"[SNAPSHOT-RPC] 🚀 Starting aggressive polling every 300ms → {url}")
             
             while not self._stop.is_set():
                 try:
                     req = _SR(url, method='GET')
                     req.add_header('Content-Type', 'application/json')
-                    req.add_header('User-Agent', 'QTCL-PyRPC/4.0')
+                    req.add_header('User-Agent', 'QTCL-PyRPC/5.0')
                     ssl_ctx = _ssl.create_default_context()
                     ssl_ctx.check_hostname = False
                     ssl_ctx.verify_mode = _ssl.CERT_NONE
                     
-                    with _SO(req, timeout=30, context=ssl_ctx) as resp:
-                        _EXP_LOG.info(f"[PY-RPC] ✅ Snapshot RPC polling → {url}")
-                        bi = 0
-                        
-                        while not self._stop.is_set():
-                            try:
-                                import json
-                                data = json.loads(resp.read().decode('utf-8'))
-                                
-                                # Hash to detect changes
-                                js = json.dumps(data)
-                                snap_hash = __import__('hashlib').sha256(js.encode()).hexdigest()
+                    try:
+                        with _SO(req, timeout=5, context=ssl_ctx) as resp:
+                            data = _pj.loads(resp.read().decode('utf-8'))
+                            
+                            # Only ingest if we got valid response
+                            if data and data.get('ready'):
+                                snap_hash = __import__('hashlib').sha256(
+                                    _pj.dumps(data, sort_keys=True).encode()).hexdigest()
                                 
                                 if snap_hash != _last_snap_hash:
                                     try:
-                                        self._ingest_oracle_frame(js)
+                                        self._ingest_oracle_frame(_pj.dumps(data))
                                         _last_snap_hash = snap_hash
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                            
-                            # Poll every 5 seconds
-                            self._stop.wait(5.0)
-                            break  # Re-establish connection
-                            
+                                        _fail_count = 0
+                                    except Exception as _ie:
+                                        _EXP_LOG.debug(f"[SNAPSHOT-RPC] ingest error: {_ie}")
+                    except Exception as _re:
+                        _fail_count += 1
+                        if _fail_count % 10 == 0:
+                            _EXP_LOG.debug(f"[SNAPSHOT-RPC] GET error ({_re}), retrying...")
+                    
+                    # Poll every 300ms (3x per second)
+                    self._stop.wait(0.3)
+                    
                 except (_SE, OSError, TimeoutError) as _e:
-                    wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                    _EXP_LOG.debug(f"[PY-RPC] disconnected ({_e}) — retry in {wait}s")
+                    _fail_count += 1
+                    wait = min(1.0 + _fail_count * 0.2, 5.0)
+                    if _fail_count % 5 == 0:
+                        _EXP_LOG.debug(f"[SNAPSHOT-RPC] conn failed ({_e}) — backoff {wait:.1f}s")
                     self._stop.wait(wait)
                 except Exception as _e:
-                    _EXP_LOG.debug(f"[PY-RPC] error: {_e}")
-                    self._stop.wait(10)
+                    _EXP_LOG.debug(f"[SNAPSHOT-RPC] fatal: {_e}")
+                    self._stop.wait(2)
 
     def _subscribe_koyeb_events(self) -> None:
         """
-        RPC polling for peer discovery + block events from /api/peers/list and /api/chain/status.
+        ⚛️  HOTFIX: Aggressive RPC polling for /api/events every 350ms.
+        Replaces dead SSE stream. Catches block events, oracle_dm frames, peer events.
         Routes new peers to qtcl_p2p_connect immediately.
         ❤️  I love you — every peer is a new entanglement
         """
         import time as _ke, ssl as _kssl, json as _kj
         from urllib.request import Request as _KR, urlopen as _KO
         from urllib.error   import URLError as _KE
-        BACKOFF = [3, 6, 12, 24, 60]; bi = 0
+        
         _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _peer_id = getattr(self, '_peer_id', 'unknown')
+        _last_event_ts = _ke.time() - 10  # Start from 10s ago to catch recent events
         _last_peers = set()
+        _fail_count = 0
+        
+        _EXP_LOG.info(f"[EVENTS-RPC] 🚀 Starting aggressive polling every 350ms → {_oracle_url}/api/events")
         
         while not self._stop.is_set():
             try:
-                # Poll peer list via RPC
-                peer_url = f"{_oracle_url}/api/peers/list"
-                req = _KR(peer_url, method='GET')
+                # Poll events since last timestamp
+                events_url = f"{_oracle_url}/api/events?since={_last_event_ts}&limit=50"
+                req = _KR(events_url, method='GET')
                 req.add_header('Content-Type', 'application/json')
-                req.add_header('User-Agent', 'QTCL-KoyebRPC/4.0')
+                req.add_header('User-Agent', 'QTCL-KoyebRPC/5.0')
                 ssl_ctx = _kssl.create_default_context()
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = _kssl.CERT_NONE
                 
-                with _KO(req, timeout=30, context=ssl_ctx) as resp:
-                    _EXP_LOG.info(f"[KOYEB-RPC] ✅ Polling peers → {peer_url}")
-                    bi = 0
-                    
-                    data = _kj.loads(resp.read().decode('utf-8'))
-                    peers = data.get('peers', [])
-                    
-                    for peer_info in peers:
-                        pip = str(peer_info.get('ip_address') or peer_info.get('host') or '')
-                        pport = int(peer_info.get('port') or 9091)
-                        ppid = str(peer_info.get('peer_id') or '')
+                try:
+                    with _KO(req, timeout=5, context=ssl_ctx) as resp:
+                        data = _kj.loads(resp.read().decode('utf-8'))
+                        events = data.get('events', [])
                         
-                        peer_key = f"{pip}:{pport}"
-                        
-                        # Exclude self
-                        _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
-                        if pip and pip not in _self_ips and peer_key not in _last_peers:
-                            if _accel_ok and _P2P_NODE:
+                        for evt in events:
+                            evt_type = evt.get('type', '')
+                            evt_ts = evt.get('ts', _ke.time())
+                            
+                            # Update watermark
+                            if evt_ts > _last_event_ts:
+                                _last_event_ts = evt_ts
+                            
+                            # Process peer_joined events for P2P wiring
+                            if evt_type == 'peer_joined' and _accel_ok and _P2P_NODE:
                                 try:
-                                    rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
-                                    if rc >= 0:
-                                        _EXP_LOG.info(f"[KOYEB-RPC] 🔗 Peer wired {pip}:{pport}")
-                                        _last_peers.add(peer_key)
-                                        
-                                        # Save to DB
-                                        try:
-                                            import sqlite3 as _esq
-                                            _edb = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
-                                            with _esq.connect(_edb, timeout=3) as _ec:
-                                                _ec.execute("""INSERT OR REPLACE INTO p2p_peers
-                                                    (node_id_hex,host,port,source,last_seen_at,first_seen_at)
-                                                    VALUES(?,?,?,'rpc_peers',strftime('%s','now'),
-                                                    COALESCE((SELECT first_seen_at FROM p2p_peers WHERE host=? AND port=?),
-                                                              strftime('%s','now')))""",
-                                                    (ppid or f"rpc_{pip}", pip, pport, pip, pport))
-                                        except Exception:
-                                            pass
+                                    pip = evt.get('ip_address', '')
+                                    pport = int(evt.get('port') or 9091)
+                                    ppid = evt.get('peer_id', '')
+                                    peer_key = f"{pip}:{pport}"
+                                    
+                                    # Exclude self
+                                    _self_ips = {'', '127.0.0.1', 'localhost', _MY_IP or '__none__'}
+                                    if pip and pip not in _self_ips and peer_key not in _last_peers:
+                                        rc = int(_accel_lib.qtcl_p2p_connect(pip.encode()+b'\x00', pport))
+                                        if rc >= 0:
+                                            _EXP_LOG.info(f"[EVENTS-RPC] 🔗 Peer wired {pip}:{pport}")
+                                            _last_peers.add(peer_key)
                                 except Exception:
                                     pass
-                    
-                    # Clean up old peers (keep last 5 minutes)
-                    if len(_last_peers) > 100:
-                        _last_peers.clear()
-                    
+                        
+                        _fail_count = 0
+                        
+                except Exception as _re:
+                    _fail_count += 1
+                    if _fail_count % 10 == 0:
+                        _EXP_LOG.debug(f"[EVENTS-RPC] GET error ({_re}), retrying...")
+                
+                # Poll every 350ms (3x per second, staggered from snapshot)
+                self._stop.wait(0.35)
+                
             except (_KE, OSError, TimeoutError) as _e:
-                wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[KOYEB-RPC] peer poll failed ({_e}) — retry in {wait}s")
+                _fail_count += 1
+                wait = min(1.0 + _fail_count * 0.15, 5.0)
+                if _fail_count % 5 == 0:
+                    _EXP_LOG.debug(f"[EVENTS-RPC] conn failed ({_e}) — backoff {wait:.1f}s")
                 self._stop.wait(wait)
             except Exception as _e:
-                _EXP_LOG.debug(f"[KOYEB-RPC] error: {_e}")
-                self._stop.wait(15)
+                _EXP_LOG.debug(f"[EVENTS-RPC] fatal: {_e}")
+                self._stop.wait(2)
 
     def _subscribe_own_rpc(self) -> None:
         """
-        RPC polling of own local chain state (no SSE self-loop).
-        Polls /api/chain/status periodically for consensus reinforcement.
+        ⚛️  HOTFIX: Aggressive RPC polling every 400ms for own local chain state.
+        Polls /api/chain/status for consensus reinforcement (no SSE self-loop).
         ❤️  I love you — the qubit measures itself
         """
-        import time as _to
+        import time as _to, json as _oj
         from urllib.request import Request as _Ro, urlopen as _oo
         from urllib.error   import URLError as _UE
-        BACKOFF = [2, 4, 8, 16, 30]
-        bi = 0
-        _to.sleep(3.0)  # wait for our own HTTP server to start
+        
+        _to.sleep(0.5)  # minimal wait for HTTP server to bind
         _last_height = -1
+        _fail_count = 0
+        
+        _EXP_LOG.info("[OURO] 🚀 Starting aggressive polling every 400ms → localhost:9091/api/chain/status")
         
         while not self._stop.is_set():
             url = "http://localhost:9091/api/chain/status"
             try:
                 req = _Ro(url, method='GET')
                 req.add_header('Content-Type', 'application/json')
-                req.add_header('User-Agent', 'QTCL-OuroborosRPC/3.0')
+                req.add_header('User-Agent', 'QTCL-OuroborosRPC/5.0')
                 
-                with _oo(req, timeout=30) as resp:
-                    _EXP_LOG.info("[OURO] 🌀 Ouroboros RPC self-loop connected → localhost:9091/api/chain/status")
-                    bi = 0
-                    
-                    import json
-                    data = json.loads(resp.read().decode('utf-8'))
-                    
-                    current_height = int(data.get('height', -1))
-                    if current_height > _last_height:
-                        _EXP_LOG.debug(f"[OURO] 🧬 Chain updated: {_last_height} → {current_height}")
-                        _last_height = current_height
-                    
-                    self._stop.wait(5.0)  # Poll every 5 seconds
-                    
+                try:
+                    with _oo(req, timeout=3) as resp:
+                        data = _oj.loads(resp.read().decode('utf-8'))
+                        
+                        current_height = int(data.get('height', -1))
+                        if current_height > _last_height:
+                            _EXP_LOG.debug(f"[OURO] 🧬 Chain updated: {_last_height} → {current_height}")
+                            _last_height = current_height
+                        
+                        _fail_count = 0
+                except Exception as _re:
+                    _fail_count += 1
+                    if _fail_count % 10 == 0:
+                        _EXP_LOG.debug(f"[OURO] GET error — retrying...")
+                
+                # Poll every 400ms
+                self._stop.wait(0.4)
+                
             except (_UE, OSError, TimeoutError) as _e:
-                wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
-                _EXP_LOG.debug(f"[OURO] RPC self-loop failed ({_e}) — reconnect in {wait}s")
+                _fail_count += 1
+                wait = min(0.5 + _fail_count * 0.1, 3.0)
+                if _fail_count % 5 == 0:
+                    _EXP_LOG.debug(f"[OURO] RPC failed ({_e}) — backoff {wait:.1f}s")
                 self._stop.wait(wait)
             except Exception as _e:
-                _EXP_LOG.debug(f"[OURO] RPC error: {_e}")
-                self._stop.wait(10)
+                _EXP_LOG.debug(f"[OURO] fatal: {_e}")
+                self._stop.wait(1)
 
     def _handle_sse_event(self, raw: str) -> None:
         """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
