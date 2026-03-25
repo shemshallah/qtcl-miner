@@ -14159,84 +14159,6 @@ class QtclClientApp:
                     state = _hl.sha3_256(state + scratchpad[ws:ws+_POW_WINDOW_BYTES] +
                                          _pow_st.pack('>I', rnd)).digest()
                 return state.hex()
-            
-            # ══════════════════════════════════════════════════════════════════════
-            # GENESIS BOOTSTRAP: Ensure genesis block exists in DB before mining
-            # ══════════════════════════════════════════════════════════════════════
-            async def _ensure_genesis_block_exists(kapi_ref):
-                """
-                CRITICAL BOOTSTRAP FIX: Auto-create genesis block if missing.
-                
-                When server DB is empty on fresh deploy, /api/blocks/tip returns
-                fallback {height: 0} but NO actual genesis block exists in blocks table.
-                Mining loop would then try to mine h=1 on non-existent h=0 record.
-                
-                Solution: Check if genesis exists; create deterministically if missing.
-                """
-                try:
-                    # Query server for current state
-                    _genesis_check = kapi_ref.get_chain_tip()
-                    _tip_h = int(_genesis_check.get('block_height') or _genesis_check.get('height') or 0)
-                    
-                    _EXP_LOG.info(f"[GENESIS-BOOTSTRAP] Chain tip h={_tip_h}")
-                    
-                    # If height is 0 AND parent_hash is fallback, genesis doesn't exist
-                    _fallback_hash = "0" * 64
-                    _parent_is_fallback = str(_genesis_check.get('parent_hash', _fallback_hash)) == _fallback_hash and \
-                                         str(_genesis_check.get('block_hash', _fallback_hash)) == _fallback_hash
-                    
-                    if _tip_h == 0 and _parent_is_fallback:
-                        _EXP_LOG.warning(
-                            "[GENESIS-BOOTSTRAP] ⚠️  Genesis missing! Creating canonical genesis block h=0…"
-                        )
-                        # Forge deterministic genesis
-                        _gen_cb = _forge_genesis_coinbase()
-                        _gen_block = {
-                            "height": 0,
-                            "prev_hash": "0" * 64,
-                            "parent_hash": "0" * 64,
-                            "block_hash": None,  # will compute
-                            "hash": None,
-                            "merkle_root": HASH_ENGINE.merkle_root([_gen_cb["tx_hash"]]),
-                            "timestamp": 1_700_000_000,
-                            "difficulty": 1,
-                            "difficulty_bits": 6,
-                            "miner_id": NULL_COINBASE_ADDRESS,
-                            "miner_address": NULL_COINBASE_ADDRESS,
-                            "tx_count": 1,
-                            "nonce": 0,
-                            "data": {"genesis": True, "coinbase_tx": _gen_cb},
-                        }
-                        # Canonical deterministic hash
-                        _canonical = json.dumps(
-                            {k:v for k,v in _gen_block.items() if k not in ("hash", "block_hash")},
-                            sort_keys=True, separators=(',',':')
-                        ).encode()
-                        _gen_hash = hashlib.sha3_256(_canonical).hexdigest()
-                        _gen_block["hash"] = _gen_hash
-                        _gen_block["block_hash"] = _gen_hash
-                        
-                        try:
-                            self.db.insert_block(0, _gen_block)
-                            _EXP_LOG.info(
-                                f"[GENESIS-BOOTSTRAP] ✅ Genesis created  h=0  hash={_gen_hash[:24]}…"
-                            )
-                            return True
-                        except Exception as _ge:
-                            _EXP_LOG.warning(f"[GENESIS-BOOTSTRAP] Genesis insert failed: {_ge} (may already exist)")
-                            return True  # Continue anyway — genesis likely exists in DB
-                    else:
-                        _EXP_LOG.debug(f"[GENESIS-BOOTSTRAP] Genesis OK at h={_tip_h}")
-                        return True
-                        
-                except Exception as _ex:
-                    _EXP_LOG.warning(f"[GENESIS-BOOTSTRAP] Non-fatal error: {_ex}")
-                    return True  # Continue mining even if bootstrap fails
-            
-            # Run genesis bootstrap ONCE before mining loop
-            _EXP_LOG.info("[GENESIS-BOOTSTRAP] Running pre-mining genesis check…")
-            await _ensure_genesis_block_exists(kapi)
-            
             async def _get_chain_tip_with_retry():
                 """Get chain tip with exponential backoff, fallback to genesis"""
                 tip = None
@@ -14271,6 +14193,40 @@ class QtclClientApp:
                 }
             
             while True:
+                # ════════════════════════════════════════════════════════════════════
+                # GENESIS BOOTSTRAP: FIRST THING IN MINING LOOP
+                # ════════════════════════════════════════════════════════════════════
+                _EXP_LOG.warning("[MINER-SIMPLE] 🌱 CHECKING/CREATING GENESIS BLOCK (h=0)")
+                try:
+                    # Check local DB
+                    _local_gen = self.db.get_block(0)
+                    if not _local_gen:
+                        _EXP_LOG.warning("[MINER-SIMPLE] ❌ Genesis missing from local DB — CREATING NOW")
+                        try:
+                            _cb = _forge_genesis_coinbase()
+                            _gen = {
+                                "height": 0,
+                                "prev_hash": "0"*64,
+                                "parent_hash": "0"*64,
+                                "merkle_root": HASH_ENGINE.merkle_root([_cb["tx_hash"]]),
+                                "timestamp": 1700000000,
+                                "difficulty": 1,
+                                "nonce": 0,
+                                "data": {"genesis": True, "coinbase_tx": _cb},
+                            }
+                            _canonical = json.dumps({k:v for k,v in _gen.items() if k!="hash"}, sort_keys=True, separators=(',',':')).encode()
+                            _h = hashlib.sha3_256(_canonical).hexdigest()
+                            _gen["hash"] = _h
+                            _gen["block_hash"] = _h
+                            self.db.insert_block(0, _gen)
+                            _EXP_LOG.warning(f"[MINER-SIMPLE] ✅ GENESIS CREATED: h=0 hash={_h[:24]}…")
+                        except Exception as _ge:
+                            _EXP_LOG.error(f"[MINER-SIMPLE] ❌ Genesis creation failed: {_ge}")
+                    else:
+                        _EXP_LOG.debug(f"[MINER-SIMPLE] ✅ Genesis OK: h=0 hash={_local_gen.get('hash','?')[:16]}…")
+                except Exception as _gen_err:
+                    _EXP_LOG.error(f"[MINER-SIMPLE] Genesis check error: {_gen_err}")
+                
                 tip = await _get_chain_tip_with_retry()
                 if tip is None:
                     _EXP_LOG.warning("[MINER-SIMPLE] Chain tip failed, retrying in 0.5s")
@@ -14286,56 +14242,6 @@ class QtclClientApp:
                     6  # conservative fallback if tip is missing the field
                 )
                 difficulty_bits = int(max(5, min(difficulty_bits, 20)))
-                
-                # ══════════════════════════════════════════════════════════════════════
-                # GENESIS VALIDATION: Detect and handle missing genesis in DB
-                # ══════════════════════════════════════════════════════════════════════
-                if oracle_height == 0 and oracle_hash == "0" * 64:
-                    # Chain tip is the fallback (no blocks in DB), check if genesis actually exists
-                    _EXP_LOG.info("[MINER-SIMPLE] 🔍 Chain tip is fallback (h=0), validating genesis existence…")
-                    try:
-                        _local_genesis = self.db.get_block(0)
-                        if not _local_genesis:
-                            _EXP_LOG.warning("[MINER-SIMPLE] ❌ Genesis missing from local DB! Creating it now…")
-                            # Create genesis deterministically
-                            _gen_cb = _forge_genesis_coinbase()
-                            _gen_block = {
-                                "height": 0,
-                                "prev_hash": "0" * 64,
-                                "parent_hash": "0" * 64,
-                                "block_hash": None,
-                                "hash": None,
-                                "merkle_root": HASH_ENGINE.merkle_root([_gen_cb["tx_hash"]]),
-                                "timestamp": 1_700_000_000,
-                                "difficulty": 1,
-                                "difficulty_bits": 6,
-                                "miner_id": NULL_COINBASE_ADDRESS,
-                                "miner_address": NULL_COINBASE_ADDRESS,
-                                "tx_count": 1,
-                                "nonce": 0,
-                                "data": {"genesis": True, "coinbase_tx": _gen_cb},
-                            }
-                            _canonical = json.dumps(
-                                {k:v for k,v in _gen_block.items() if k not in ("hash", "block_hash")},
-                                sort_keys=True, separators=(',',':')
-                            ).encode()
-                            _gen_hash = hashlib.sha3_256(_canonical).hexdigest()
-                            _gen_block["hash"] = _gen_hash
-                            _gen_block["block_hash"] = _gen_hash
-                            
-                            try:
-                                self.db.insert_block(0, _gen_block)
-                                _EXP_LOG.info(f"[MINER-SIMPLE] ✅ Genesis created locally  h=0  hash={_gen_hash[:24]}…")
-                                # Update local reference for this iteration
-                                oracle_hash = _gen_hash
-                            except Exception as _ge2:
-                                _EXP_LOG.error(f"[MINER-SIMPLE] Genesis creation failed: {_ge2}")
-                                # Fall through — attempt mining anyway with fallback hash
-                        else:
-                            _EXP_LOG.debug(f"[MINER-SIMPLE] Genesis exists locally: h=0 hash={_local_genesis.get('hash', '?')[:24]}…")
-                            oracle_hash = _local_genesis.get('block_hash') or _local_genesis.get('hash', "0" * 64)
-                    except Exception as _ge3:
-                        _EXP_LOG.warning(f"[MINER-SIMPLE] Genesis check failed: {_ge3} (continuing with fallback)")
                 
                 _new_block_event.clear()
                 target_height = oracle_height + 1
