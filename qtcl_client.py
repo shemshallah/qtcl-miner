@@ -32,7 +32,6 @@ import logging as _suppress_logging
 for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
-
 # ════════════════════════════════════════════════════════════════════════════════════
 # HLWE CRYPTOGRAPHIC SYSTEM (Post-Quantum, Self-Contained, 1,263 lines)
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -82,9 +81,6 @@ from typing import Dict, Any, Optional, List, Tuple, Callable, Union, Set
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-from urllib.parse import quote, urlencode
 from collections import deque, defaultdict
 from pathlib import Path
 import base64
@@ -144,8 +140,6 @@ SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 _accel_ok:  bool = False
 _accel_ffi       = None   # cffi.FFI instance  (set by _compile_c_layer)
 _accel_lib       = None   # compiled .so handle (set by _compile_c_layer)
-
-
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # HYPERBOLIC ENTROPY POOL
@@ -331,7 +325,6 @@ class HyperbolicEntropyPool:
         h.update(out32)
         return h.digest(size)
 
-
 # Singleton — initialised once at first call
 _ENTROPY_POOL: Optional[HyperbolicEntropyPool] = None
 _ENTROPY_POOL_LOCK = threading.Lock()
@@ -344,11 +337,9 @@ def _get_pool() -> HyperbolicEntropyPool:
                 _ENTROPY_POOL = HyperbolicEntropyPool()
     return _ENTROPY_POOL
 
-
 def get_mining_entropy(size: int = 32) -> bytes:
     """Mining entropy — two-pass hyperbolic quantum pool, never blocks."""
     return _get_pool().get(size=size)
-
 
 def get_system_entropy(height: int = 0, pq_curr: str = '') -> bytes:
     """System entropy for HLWE keygen / mnemonics — same pool, height-aware."""
@@ -362,7 +353,6 @@ def get_system_entropy(height: int = 0, pq_curr: str = '') -> bytes:
         SYSTEM_ENTROPY_CACHE['data']      = result
         SYSTEM_ENTROPY_CACHE['timestamp'] = now
         return result
-
 
 _qrng_active = ' + '.join(
     n for n, k in [('random.org', QRNG_API_KEY_1),
@@ -880,7 +870,6 @@ class HLWEEngine:
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 # BIP32 HIERARCHICAL DETERMINISTIC KEY DERIVATION
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-
 
 # ════════════════════════════════════════════════════════════════════════════════════
 # EMBEDDED PYTH HERMES ORACLE WITH HLWE SIGNING
@@ -1655,7 +1644,6 @@ __all__ = [
     'get_index_by_word',
 ]
 
-
 # ════════════════════════════════════════════════════════════════════════════════════
 # HLWE INTEGRATION HOOKS FOR QtclMiner
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -1686,8 +1674,6 @@ def _get_hlwe_wallet_manager():
 # ════════════════════════════════════════════════════════════════════════════════════
 # QTCL CLIENT IMPLEMENTATION (Full Original, 11,089 lines)
 # ════════════════════════════════════════════════════════════════════════════════════
-
-
 
 # ════════════════════════════════════════════════════════════════════════════════
 # QTCL P2P v2 — C-BACKED DISTRIBUTED QUANTUM STATE NETWORK
@@ -1780,7 +1766,6 @@ class HyperbolicTriangle:
             'ball_last': list(self.ball_last),
         }
 
-
 @dataclass
 class QtclOracleMeasurement:
     """Full local oracle measurement — the core gossip object.
@@ -1818,7 +1803,6 @@ class QtclOracleMeasurement:
     def dm_re_bytes(self) -> bytes:
         import struct
         return struct.pack(f'>{len(self.dm_re)}d', *self.dm_re)
-
 
 class LocalOracleEngine:
     """RPC-polled Oracle DM → Measurement pipeline with full snapshot lifecycle.
@@ -1864,11 +1848,6 @@ class LocalOracleEngine:
         # RPC API client reference (set externally)
         self._rpc_client = None
 
-    def set_rpc_client(self, client):
-        """Set the RPC API client for polling (KoyebAPIClient instance)."""
-        self._rpc_client = client
-        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC client configured — polling will commence")
-
     def start(self) -> None:
         """Start RPC poll thread for oracle snapshots.
         Idempotent: safe to call again after a deferred-start at import time.
@@ -1879,8 +1858,6 @@ class LocalOracleEngine:
             return
         self._stop.clear()
         _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC poll thread started → {self.ORACLE_URL}")
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name='OracleRPC-Poll')
         self._poll_thread.start()
 
         # ── Boot: immediate P2P peer discovery + DM broadcast kickoff ─────────
@@ -1925,8 +1902,7 @@ class LocalOracleEngine:
         # Step 1: Peer discovery from Koyeb — populate P2P before first broadcast
         try:
             import json as _bj
-            from urllib.request import Request as _BR, urlopen as _BU
-            oracle_url = f"https://{self.ORACLE_HOST}"
+                        oracle_url = f"https://{self.ORACLE_HOST}"
             payload = _bj.dumps({
                 'node_id':      'boot_discovery',
                 'port':         9091,
@@ -1990,43 +1966,6 @@ class LocalOracleEngine:
 
         # Step 4: Boot sequence complete — RPC polling thread now handles oracle updates
         _EXP_LOG.debug("[BOOT-P2P] boot sequence complete")
-
-    def _poll_loop(self) -> None:
-        """Poll RPC endpoint for oracle snapshots (no SSE, no C buffer)."""
-        import json as _j, time as _plt
-        
-        _pstart = _plt.time()
-        _warned = False
-        _last_poll = 0.0
-        
-        while not self._stop.is_set():
-            # Wait for RPC client to be configured
-            if not self._rpc_client:
-                _plt.sleep(0.5)
-                continue
-            
-            _now = _plt.time()
-            
-            # Warn after 15s of no snapshots
-            if not _warned and (_now - _pstart) > 15.0:
-                if self._snapshot_count == 0:
-                    _EXP_LOG.warning("[LOCAL-ORACLE] ⚠️  No RPC snapshot data after 15s — retrying")
-                _warned = True
-            
-            # Poll at configured interval (1.0s default)
-            if (_now - _last_poll) >= self.RPC_POLL_INTERVAL:
-                try:
-                    snap_data = self._rpc_client.get_oracle_pq0_bloch()
-                    if snap_data:
-                        # Convert snapshot dict to JSON string and ingest
-                        json_str = _j.dumps(snap_data)
-                        self._ingest_oracle_frame(json_str)
-                        _last_poll = _now
-                except Exception as _e:
-                    _EXP_LOG.debug(f"[LOCAL-ORACLE] RPC poll error: {_e}")
-            
-            _plt.sleep(0.1)  # Soft polling interval between RPC attempts
-
 
     def _ingest_oracle_frame(self, json_str: str) -> None:
         """Parse RPC JSON snapshot → update internal oracle DM + _oracle_state.
@@ -2495,10 +2434,8 @@ class LocalOracleEngine:
             'latest_w_fidelity':  snap.get('w_state_fidelity') if snap else None,
         }
 
-
 # ─── Module-level singleton ──────────────────────────────────────────────────
 _LOCAL_ORACLE: LocalOracleEngine = LocalOracleEngine()
-
 
 class WStateConsensus:
     """BFT median consensus over peer W-state measurements.
@@ -2629,7 +2566,6 @@ class WStateConsensus:
             'chain_height':      max(m.chain_height for m in all_ms),
             'pow_seed':          pow_seed,
         }
-
 
 class QtclP2PNode:
     """Thin Python lifecycle manager over the C P2P library.
@@ -2959,8 +2895,7 @@ class QtclP2PNode:
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
 
         # Track hosts already connected this cycle to avoid double-connect
         _connected_this_cycle: set = set()
@@ -2979,8 +2914,7 @@ class QtclP2PNode:
                 def _push_dm_async(_h=host, _p=port):
                     try:
                         import json as _cpj, struct as _cps
-                        from urllib.request import Request as _CpR, urlopen as _CpU
-                        state = _LOCAL_ORACLE.get_oracle_state()
+                                                state = _LOCAL_ORACLE.get_oracle_state()
                         dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
                         if age < 60.0 and any(v != 0.0 for v in dm_re):
                             dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
@@ -3055,8 +2989,7 @@ class QtclP2PNode:
 
         def _fetch_koyeb_peers():
             """POST to koyeb peer_exchange + peers/list. Returns raw peer dicts."""
-            from urllib.request import Request as _Rq, urlopen as _uo
-            peers = []
+                        peers = []
             # /api/p2p/peer_exchange
             try:
                 payload = _pj.dumps({
@@ -3143,8 +3076,7 @@ class QtclP2PNode:
                                 'gossip_url':   f"http://auto:{self._port}",
                                 'block_height': n_connected,
                             }).encode()
-                            from urllib.request import Request as _ArRq, urlopen as _ArUo
-                            _arr = _ArRq(f"{_oracle_url}/api/peers/register",
+                                                        _arr = _ArRq(f"{_oracle_url}/api/peers/register",
                                          data=_ann,
                                          headers={'Content-Type':'application/json',
                                                   'User-Agent':'QTCL-P2P/3.0'},
@@ -3281,7 +3213,6 @@ class QtclP2PNode:
             })
         return peers
 
-
 # ── Module-level singletons ──────────────────────────────────────────────────
 _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
@@ -3353,7 +3284,6 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
                          VALUES(?,?,strftime('%s','now'))""", (host, int(port) or 9091))
     except Exception as _e:
         _EXP_LOG.debug(f"[PEERDB] upsert: {_e}")
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DM POOL PERSISTENCE DAEMON
@@ -3519,7 +3449,6 @@ def _dm_pool_daemon(db_path: str) -> None:
 
         _DM_POOL_DAEMON_STOP.wait(0.5)
 
-
 def start_dm_pool_daemon(db_path: str = _DM_POOL_DB_PATH) -> _dpt.Thread:
     """Start the passive DM pool persistence daemon. Returns the thread."""
     _DM_POOL_DAEMON_STOP.clear()
@@ -3529,7 +3458,6 @@ def start_dm_pool_daemon(db_path: str = _DM_POOL_DB_PATH) -> _dpt.Thread:
     _EXP_LOG.info("[DMPOOL] ✅ Passive DM pool daemon started")
     return t
 
-
 # ── Hardware IP detection — used by P2P registration and gossip_url ──────────
 def _get_hardware_ip() -> str:
     """Return the outbound LAN/WAN IP of this machine.
@@ -3538,8 +3466,7 @@ def _get_hardware_ip() -> str:
     Falls back through multiple methods; returns '' on total failure.
     ❤️  I love you — every miner deserves to be found
     """
-    import socket as _ips
-    # Method 1: outbound UDP probe (most reliable, works behind NAT)
+        # Method 1: outbound UDP probe (most reliable, works behind NAT)
     try:
         s = _ips.socket(_ips.AF_INET, _ips.SOCK_DGRAM)
         s.settimeout(0)
@@ -3592,7 +3519,6 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.setLevel(level)
     return logger
 
-
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class LifecycleState(enum.Enum):
@@ -3603,12 +3529,10 @@ class LifecycleState(enum.Enum):
     STOPPED  = "stopped"
     ERROR    = "error"
 
-
 class NodeType(enum.Enum):
     SERVER = "server"
     ORACLE = "oracle"
     MINER  = "miner"
-
 
 # ── Payloads / dataclasses ────────────────────────────────────────────────────
 
@@ -3624,7 +3548,6 @@ class StatusPayload:
     def to_dict(self) -> dict:
         return asdict(self)
 
-
 @dataclass
 class MetricsPayload:
     component: str
@@ -3636,7 +3559,6 @@ class MetricsPayload:
     def to_dict(self) -> dict:
         return asdict(self)
 
-
 @dataclass
 class HealthPayload:
     component: str
@@ -3647,7 +3569,6 @@ class HealthPayload:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
 
 # ── LifecycleMixin ────────────────────────────────────────────────────────────
 
@@ -3721,7 +3642,6 @@ class LifecycleMixin:
         self.stop()
         return False
 
-
 # ── QueryInterface ────────────────────────────────────────────────────────────
 
 class QueryInterface:
@@ -3784,7 +3704,6 @@ class QueryInterface:
         if not hasattr(self, "_gauges"):
             self._gauges: Dict[str, float] = {}
         self._gauges[name] = value
-
 
 # ── ComponentBase ─────────────────────────────────────────────────────────────
 
@@ -3874,7 +3793,6 @@ class ComponentBase(LifecycleMixin, QueryInterface):
 
     def __str__(self) -> str:
         return self.name
-
 
 # ── HashEngine ────────────────────────────────────────────────────────────────
 
@@ -3971,9 +3889,7 @@ class HashEngine:
         next_nibble = int(h[whole], 16) if len(h) > whole else 0
         return next_nibble < nibble_threshold
 
-
 HASH_ENGINE = HashEngine()
-
 
 # ── ConfigManager ─────────────────────────────────────────────────────────────
 
@@ -4079,7 +3995,6 @@ class ConfigManager:
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not None
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Β :: LocalBlockchainDB
 # Consolidates all _local_db_* functions (8 funcs) → one class
@@ -4094,7 +4009,6 @@ except ImportError:
     HAS_PSYCOPG = False
     psycopg = None  # type: ignore
     ConnectionPool = None  # type: ignore
-
 
 class LocalBlockchainDB:
     """Local SQLite blockchain database - replaces psycopg version
@@ -4829,7 +4743,6 @@ class LocalBlockchainDB:
             'db_path': str(self.db_path),
         }
 
-
 def compress(data: bytes) -> bytes:
     if HAS_ZSTD:
         return zstd.compress(data, 3)
@@ -4840,7 +4753,6 @@ def compress(data: bytes) -> bytes:
         import zlib
         return zlib.compress(data, 6)
 
-
 def decompress(data: bytes) -> bytes:
     if HAS_ZSTD:
         return zstd.decompress(data)
@@ -4850,7 +4762,6 @@ def decompress(data: bytes) -> bytes:
     except ImportError:
         import zlib
         return zlib.decompress(data)
-
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # GENESIS-RESET SUBSYSTEM v3.1
@@ -4868,12 +4779,10 @@ _PRESERVE_TABLES: frozenset = frozenset({
     'wallet_keys', 'identity', 'settings', 'config', 'hlwe_keys', 'bip39_seeds',
 })
 
-
 def _get_local_chain_height(db: "LocalBlockchainDB") -> int:
     """Thread-safe local height query — 0 on any error."""
     try:    return int(db.get_chain_height() or 0)
     except: return 0
-
 
 def _forge_genesis_coinbase(miner_address: str = NULL_COINBASE_ADDRESS) -> dict:
     """
@@ -4893,7 +4802,6 @@ def _forge_genesis_coinbase(miner_address: str = NULL_COINBASE_ADDRESS) -> dict:
         json.dumps(body, sort_keys=True, separators=(',', ':')).encode()
     ).hexdigest()
     return body
-
 
 def _forge_and_store_genesis_block(
     db: "LocalBlockchainDB",
@@ -4922,7 +4830,6 @@ def _forge_and_store_genesis_block(
         logger.warning(f"[RESET] genesis insert (may exist): {_e}")
     return genesis
 
-
 def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
     """
     Self-discovering DELETE wipe — hits every table NOT in _PRESERVE_TABLES.
@@ -4946,7 +4853,6 @@ def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
     except Exception as _e:
         logger.error(f"[RESET] ❌ Nuclear wipe failed: {_e}")
         return False
-
 
 def _broadcast_reset_to_peers(
     genesis_block: dict,
@@ -5005,7 +4911,6 @@ def _broadcast_reset_to_peers(
 
     threading.Thread(target=_fire, daemon=True, name='ChainReset-Broadcast').start()
 
-
 def _check_and_handle_chain_reset(
     server_height: int,
     db:            "LocalBlockchainDB",
@@ -5052,7 +4957,6 @@ def _check_and_handle_chain_reset(
         logger.info(f"[RESET] 🚀 Complete  genesis={genesis['hash'][:24]}…")
         return True
 
-
 class GenesisResetListener:
     """
     Non-blocking background SSE consumer watching for 'chain_reset' gossip.
@@ -5094,8 +4998,7 @@ class GenesisResetListener:
 
     def _listen_loop(self) -> None:
         """RPC-only polling for chain_reset events. No SSE."""
-        import urllib.request as _ur, urllib.error as _ue
-        backoff_idx = 0
+                backoff_idx = 0
         last_height = -1
         
         while not self._stop.is_set():
@@ -5168,9 +5071,7 @@ class GenesisResetListener:
             else:
                 logger.info("[GRL] chain_reset received — already at genesis")
 
-
 _GENESIS_RESET_LISTENER = GenesisResetListener()  # module-level singleton
-
 
 @dataclass
 class SnapshotRecord:
@@ -5195,7 +5096,6 @@ class SnapshotRecord:
             d["data"] = bytes.fromhex(d["data"])
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
-
 @dataclass
 class SnapshotDiff:
     added_blocks: int
@@ -5204,7 +5104,6 @@ class SnapshotDiff:
     token_delta: Dict[str, int]
     height_a: int
     height_b: int
-
 
 class SnapshotManager(ComponentBase):
     """
@@ -5381,7 +5280,6 @@ class SnapshotManager(ComponentBase):
             "latest_snapshot_size": latest.size_bytes if latest else 0,
         }
 
-
 # ── SSEBroadcaster ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -5394,7 +5292,6 @@ class SSEClient:
 
     def accepts(self, event_type: str) -> bool:
         return not self.filters or event_type in self.filters
-
 
 class SSEBroadcaster(ComponentBase):
     """
@@ -5563,9 +5460,7 @@ class SSEBroadcaster(ComponentBase):
 
     def push_snapshot_to_server(self, server_url: str, snapshot: SnapshotRecord) -> bool:
         """HTTP POST snapshot to server SSE endpoint."""
-        import urllib.request
-        import urllib.error
-        payload = json.dumps({
+                        payload = json.dumps({
             "height": snapshot.height,
             "checksum": snapshot.checksum,
             "data": snapshot.data.hex(),
@@ -5590,14 +5485,10 @@ class SSEBroadcaster(ComponentBase):
             "events_broadcast": self._counters.get("events_broadcast", 0),
         }
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Ε :: RequestHandler + RegistryManager
 # Consolidates _handle_* (11) + *register* (5-6) → 2 classes
 # ═══════════════════════════════════════════════════════════════════════════════
-
-import urllib.parse
-
 
 @dataclass
 class HTTPResponse:
@@ -5644,7 +5535,6 @@ class HTTPResponse:
     @staticmethod
     def server_error(message: str = "Internal server error") -> "HTTPResponse":
         return HTTPResponse(500, {"error": message})
-
 
 class RequestHandler(ComponentBase):
     """
@@ -5904,7 +5794,6 @@ class RequestHandler(ComponentBase):
             return "Path must start with /"
         return None
 
-
 # ── RegistryManager ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -5913,7 +5802,6 @@ class RegistrationResult:
     node_id: str
     token: str = ""
     error_msg: str = ""
-
 
 class RegistryManager(ComponentBase):
     """
@@ -6056,7 +5944,6 @@ class RegistryManager(ComponentBase):
         except Exception:
             return {}
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Ζ :: UnifiedVerifier + QuantumMetrics
 # Consolidates *verify* (5) + *fidelity* + *measure* (10) → 2 classes
@@ -6068,7 +5955,6 @@ try:
 except ImportError:
     HAS_NUMPY = False
     np = None  # type: ignore
-
 
 @dataclass
 class VerificationResult:
@@ -6082,7 +5968,6 @@ class VerificationResult:
 
     def __bool__(self) -> bool:
         return self.valid
-
 
 class UnifiedVerifier(ComponentBase):
     """
@@ -6265,7 +6150,6 @@ class UnifiedVerifier(ComponentBase):
         if existing and existing.get("status") == "confirmed":
             return True
         return False
-
 
 # ── QuantumMetrics ────────────────────────────────────────────────────────────
 
@@ -6500,7 +6384,6 @@ class QuantumMetrics(ComponentBase):
         U, S, Vh = np.linalg.svd(matrix, full_matrices=False)
         return S, U.T, Vh
 
-
 def _embed_operator(
     op: "np.ndarray", qubit_index: int, n_qubits: int
 ) -> "np.ndarray":
@@ -6512,7 +6395,6 @@ def _embed_operator(
     for o in ops[1:]:
         result = np.kron(result, o)
     return result
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Η :: QuantumOpsLibrary + RotationOrchestrator
@@ -6791,7 +6673,6 @@ class QuantumOpsLibrary:
             [0, 0, 0, np.exp(1j * theta)],
         ], dtype=complex)
 
-
 # ── RotationOrchestrator ──────────────────────────────────────────────────────
 
 @dataclass
@@ -6813,7 +6694,6 @@ class RotationAngles:
             "level_metadata": self.level_metadata,
         }
         return d
-
 
 class RotationOrchestrator(ComponentBase):
     """
@@ -6996,7 +6876,6 @@ class RotationOrchestrator(ComponentBase):
             matrix[i, i + 1] = 0.1
             matrix[i + 1, i] = 0.1
         return matrix
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Θ :: QuantumStateEvolutionMachine
@@ -7218,7 +7097,6 @@ class QuantumStateEvolutionMachine(ComponentBase):
                 "state_dim": 2 ** self.n_qubits,
             }
 
-
 class CrossCouplingResolver(ComponentBase):
     """
     Multi-body quantum interaction resolver.
@@ -7303,7 +7181,6 @@ class CrossCouplingResolver(ComponentBase):
             result[i] = new_val
         return result
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Θ :: QtclNode — Master Wiring Layer
 # QtclServer + QtclMiner entrypoints
@@ -7311,8 +7188,6 @@ class CrossCouplingResolver(ComponentBase):
 
 import argparse
 import http.server
-import socketserver
-
 
 class QtclNode(ComponentBase):
     """
@@ -7472,7 +7347,6 @@ class QtclNode(ComponentBase):
     def _handle_shutdown(self, signum: int, frame: Any) -> None:
         self.log.info(f"[{self.name}] received signal {signum}, shutting down")
         self._shutdown_event.set()
-
 
 class QtclServer(QtclNode):
     """
@@ -7712,7 +7586,6 @@ class QtclServer(QtclNode):
             except Exception as exc:
                 self.log.error(f"[{self.name}] block production error: {exc}\n{traceback.format_exc()}")
 
-
 class QtclMiner(QtclNode):
     """
     Miner entrypoint. Subscribes to SSE snapshots, mines blocks.
@@ -7759,8 +7632,7 @@ class QtclMiner(QtclNode):
         super().on_stop()
 
     def _register_with_server(self) -> None:
-        import urllib.request
-        host = self._cfg.get("miner_host", "localhost")
+                host = self._cfg.get("miner_host", "localhost")
         port = int(self._cfg.get("miner_port", 9000))
         payload = json.dumps({
             "miner_id": self._miner_id,
@@ -7783,62 +7655,8 @@ class QtclMiner(QtclNode):
 
     def _start_rpc_poller(self) -> None:
         """Start RPC-only polling thread (no SSE)"""
-        self._rpc_poller_thread = threading.Thread(
-            target=self._rpc_poller_loop,
-            daemon=True,
-            name="QtclMiner/RPCPoller",
-        )
         self._rpc_poller_thread.start()
 
-    def _rpc_poller_loop(self) -> None:
-        """RPC polling loop for chain status (no SSE fallback)"""
-        import urllib.request
-        rpc_url = f"{self._server_url}/api/chain/status"
-        retry_delay = 2.0
-        last_height = -1
-        
-        while not self._stop_event.is_set():
-            try:
-                req = urllib.request.Request(
-                    rpc_url,
-                    headers={"Content-Type": "application/json"},
-                    method="GET"
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    retry_delay = 2.0
-                    
-                    # Check for new blocks
-                    height = int(data.get("height", 0))
-                    if height > last_height:
-                        # Fetch block data via RPC
-                        try:
-                            block_data = self._rpc_get_block(height)
-                            if block_data:
-                                self._pending_blocks.put_nowait(block_data)
-                                last_height = height
-                        except queue.Full:
-                            self._pending_blocks.get_nowait()
-                            if block_data:
-                                self._pending_blocks.put_nowait(block_data)
-                                last_height = height
-                    
-                    # Poll snapshot separately
-                    try:
-                        snapshot = self._rpc_get_snapshot()
-                        if snapshot:
-                            self._apply_rpc_snapshot(snapshot)
-                    except Exception:
-                        pass  # Snapshot fetch optional
-                    
-                    self._stop_event.wait(5.0)  # Poll every 5 seconds
-                    
-            except Exception as exc:
-                if not self._stop_event.is_set():
-                    self.log.warning(f"[{self.name}] RPC poll failed: {exc}, retrying in {retry_delay}s")
-                    self._stop_event.wait(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 30.0)
-    
     def _rpc_get_block(self, height: int) -> Optional[Dict]:
         """Fetch block data via RPC /api/block/{height}"""
         try:
@@ -7883,8 +7701,7 @@ class QtclMiner(QtclNode):
             self.log.warning(f"[{self.name}] snapshot apply failed: {exc}")
 
     def _send_heartbeat(self) -> None:
-        import urllib.request
-        payload = json.dumps({
+                payload = json.dumps({
             "node_id": self._miner_id,
             "type": "miner",
         }).encode()
@@ -7910,8 +7727,7 @@ class QtclMiner(QtclNode):
     def _mining_loop(self) -> None:
         difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        import urllib.request
-        while not self._stop_event.is_set():
+                while not self._stop_event.is_set():
             try:
                 # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
                 if _RESET_PERFORMED.is_set():
@@ -8030,7 +7846,6 @@ class QtclMiner(QtclNode):
                 self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
                 self._stop_event.wait(2.0)
 
-
 class QtclOracle(QtclNode):
     """Oracle node: observes chain, emits oracle events, syncs with server."""
 
@@ -8047,11 +7862,6 @@ class QtclOracle(QtclNode):
         )
         self.bootstrap.bootstrap_node("oracle")
         self._stop_event.clear()
-        self._watch_thread = threading.Thread(
-            target=self._oracle_watch_loop,
-            daemon=True,
-            name="QtclOracle/Watch",
-        )
         self._watch_thread.start()
 
     def on_stop(self) -> None:
@@ -8099,7 +7909,6 @@ class QtclOracle(QtclNode):
             self.log.warning(
                 f"[{self.name}] invalid block at height {height}: {vr.errors}"
             )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CLI Entrypoints
@@ -8160,7 +7969,6 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     return parser
 
-
 def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) -> None:
     if args.db_dsn:
         cfg_manager.set("db_dsn", args.db_dsn)
@@ -8172,9 +7980,6 @@ def apply_cli_overrides(cfg_manager: ConfigManager, args: argparse.Namespace) ->
         cfg_manager.set("n_qubits", args.n_qubits)
     if args.difficulty:
         cfg_manager.set("difficulty", args.difficulty)
-
-
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIX SWARM ADDITIONS — Classes missing from initial refactor
@@ -8205,7 +8010,6 @@ class QtclConstants:
     GOSSIP_FAN_OUT: int = 3
 
 CONSTANTS = QtclConstants()
-
 
 # ── LatticeSnapshot dataclass ─────────────────────────────────────────────────
 
@@ -8261,7 +8065,6 @@ class LatticeSnapshot:
             field_vector=field,
             checksum=payload.get("checksum", ""),
         )
-
 
 # ── QuantumLattice ────────────────────────────────────────────────────────────
 
@@ -8352,7 +8155,6 @@ class QuantumLattice:
         norm = np.linalg.norm(self._state)
         if norm > 1e-15:
             self._state /= norm
-
 
 # ── LatticeController ─────────────────────────────────────────────────────────
 
@@ -8563,7 +8365,6 @@ class LatticeController(ComponentBase):
         except Exception:
             return {}
 
-
 # ── EntanglementLineageTracker ────────────────────────────────────────────────
 
 class EntanglementLineageTracker(ComponentBase):
@@ -8728,7 +8529,6 @@ class EntanglementLineageTracker(ComponentBase):
                 "height_count": len(self._by_height),
             }
 
-
 # ── QuantumCircuitCache ───────────────────────────────────────────────────────
 
 class QuantumCircuitCache(ComponentBase):
@@ -8816,7 +8616,6 @@ class QuantumCircuitCache(ComponentBase):
             "hits": self._hits,
             "misses": self._misses,
         }
-
 
 # ── AdaptiveTimeoutManager ────────────────────────────────────────────────────
 
@@ -8911,7 +8710,6 @@ class AdaptiveTimeoutManager(ComponentBase):
             "tracked_peers": len(self._peer_ema),
             "avg_timeout": sum(self.get_all_timeouts().values()) / max(len(self._peer_ema), 1),
         }
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Ζ :: ORACLE EVENT EMITTER + TOKEN LEDGER + DB FIXES
@@ -9023,7 +8821,6 @@ class OracleEventEmitter(ComponentBase):
                 "subscriber_count": sum(len(s) for s in self._subscriptions.values()),
                 "event_types": list(self._subscriptions.keys()),
             }
-
 
 # ── TokenLedger ───────────────────────────────────────────────────────────────
 
@@ -9197,7 +8994,6 @@ class TokenLedger(ComponentBase):
             "transfers": self._counters.get("transfers", 0),
         }
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Η :: ADDITIONAL GATE OPS + DHTRouter EXTENSIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9213,7 +9009,6 @@ def _swap_gate() -> "np.ndarray":
         [0, 0, 0, 1],
     ], dtype=complex)
 
-
 def _iswap_gate() -> "np.ndarray":
     """iSWAP gate: swaps with phase."""
     return np.array([
@@ -9223,7 +9018,6 @@ def _iswap_gate() -> "np.ndarray":
         [0, 0,  0,  1],
     ], dtype=complex)
 
-
 def _controlled_phase(theta: float) -> "np.ndarray":
     """Controlled-Phase (CZ-like) gate."""
     return np.array([
@@ -9232,7 +9026,6 @@ def _controlled_phase(theta: float) -> "np.ndarray":
         [0, 0, 1, 0],
         [0, 0, 0, np.exp(1j * theta)],
     ], dtype=complex)
-
 
 def _rank_peers(peers: List["PeerInfo"], local_id: str) -> List["PeerInfo"]:
     """
@@ -9247,14 +9040,12 @@ def _rank_peers(peers: List["PeerInfo"], local_id: str) -> List["PeerInfo"]:
         return recency / latency
     return sorted(peers, key=score, reverse=True)
 
-
 def _peer_reliability_score(peer: "PeerInfo") -> float:
     """Heuristic reliability: recency * (1/latency)."""
     latency = max(peer.latency_ms, 0.1)
     age = time.time() - peer.last_seen
     recency = max(0.0, 1.0 - age / 300.0)
     return recency / latency
-
 
 def _request_peer_list(
     peer: "PeerInfo", timeout: float = 5.0
@@ -9263,8 +9054,7 @@ def _request_peer_list(
     MISSING from BootstrapManager.
     Request full peer list from known peer via TCP.
     """
-    import socket
-    import json
+        import json
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -9284,7 +9074,6 @@ def _request_peer_list(
     except Exception:
         return []
 
-
 def _get_event_history(
     clients_lock: threading.RLock,
     event_log: deque,
@@ -9296,7 +9085,6 @@ def _get_event_history(
     """
     with clients_lock:
         return list(event_log)[-limit:]
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AGENT Θ :: UPDATED ENTRYPOINTS — QtclNode, QtclOracle, psycopg v3 pool fix
@@ -9391,7 +9179,6 @@ def make_updated_init_components(node_self) -> None:
         ] if c is not None
     ]
 
-
 class QtclOracleV2(ComponentBase):
     """
     Updated QtclOracle with OracleEventEmitter + full oracle.py coverage.
@@ -9434,9 +9221,6 @@ class QtclOracleV2(ComponentBase):
             f"oracle:{time.time()}".encode()
         ).hexdigest()
         self._stop_event.clear()
-        self._watch_thread = threading.Thread(
-            target=self._oracle_watch_loop, daemon=True, name="QtclOracle/Watch"
-        )
         self._watch_thread.start()
         self.log.info(f"[{self.name}] oracle {self._oracle_id[:12]}… started")
 
@@ -9541,7 +9325,6 @@ class QtclOracleV2(ComponentBase):
         padded_n = new_sample.ljust(max_len, b'\x00')
         xored = bytes(a ^ b for a, b in zip(padded_e, padded_n))
         return hashlib.sha256(xored).digest()
-
 
 # ── psycopg v3 pool fix: corrected _init_pool and _get_conn ──────────────────
 
@@ -9663,7 +9446,6 @@ class OracleQuorumConsensus:
                     return state_hash
         return None
 
-
 class OracleStateHistory:
     """Immutable history of oracle states"""
     
@@ -9696,7 +9478,6 @@ class OracleStateHistory:
         """Get recent states"""
         with self.lock:
             return [s for ts, s in self.history[-limit:]]
-
 
 class OracleMerkleProof:
     """Merkle proof generation for oracle state"""
@@ -9755,11 +9536,9 @@ class OracleMerkleProof:
         
         return proof
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXPANDED: ADVANCED DHT FEATURES (Added by DHT SWARM - Extension 1)
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 import os as _os
 import json as _json
@@ -9769,7 +9548,6 @@ import hashlib as _hashlib
 import threading as _threading
 import sqlite3 as _sqlite3
 import secrets as _secrets
-import asyncio as _asyncio
 import logging as _logging
 from collections import deque as _deque
 from dataclasses import dataclass as _dc, field as _field
@@ -9784,8 +9562,7 @@ except ImportError:
     _HAS_NP = False
 
 try:
-    import requests as _requests
-    _HAS_REQUESTS = True
+        _HAS_REQUESTS = True
 except ImportError:
     _requests = None
     _HAS_REQUESTS = False
@@ -9797,8 +9574,6 @@ except ImportError:
 
 _EXP_LOG = _logging.getLogger("qtcl.client.expansion")
 _ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
-
-
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                                              ║
@@ -11066,7 +10841,6 @@ int qtcl_selftest(void) {
     return (memcmp(h, _REF, 4) == 0) ? 1 : 0;
 }
 
-
 /* ═══════════════════════════════════════════════════════════════════════════
    §Hyper — {8,3} HYPERBOLIC GEOMETRY  ·  Poincaré Ball Mapping
    Museum-grade implementation of the hyperbolic tiling that underlies
@@ -11284,7 +11058,6 @@ void qtcl_fuse_oracle_dm(
         out_im[i] = lw*local_im[i] + w*oracle_im[i];
     }
 }
-
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §Meas — MEASUREMENT STRUCTS, SIGNING, VERIFICATION
@@ -11530,7 +11303,6 @@ cleanup:
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §P2P — QTCL CUSTOM PROTOCOL v4 — OUROBOROS · EPIDEMIC GOSSIP · BLOOM
@@ -12921,10 +12693,8 @@ double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
         }
     }
 
-
     return tr_re;
 }
-
 
 /* ═══════════════════════════════════════════════════════════════════════════
    §KoyebReg  KOYEB HTTPS PEER REGISTRATION + AUTO P2P WIRING
@@ -12943,8 +12713,7 @@ typedef struct {
     pthread_t thread;
 } _KoyebCtx;
 
-static _KoyebCtx _KOYEB = {0};
-static pthread_t _koyeb_hb_tid;
+static _KoyebCtx static pthread_t _koyeb_hb_tid;
 
 /* forward decl so helpers can reference qtcl_p2p_connect defined earlier */
 int qtcl_p2p_connect(const char *host, uint16_t port);
@@ -13423,7 +13192,6 @@ _QTCL_C_DEFS: str = """
 
 # ── Module-level compilation state (sentinels declared at file top, overwritten here) ─
 
-
 def _compile_c_layer() -> None:
     """
     Compile the QTCL C acceleration layer once at module import.
@@ -13486,7 +13254,6 @@ def _compile_c_layer() -> None:
                 f"For full acceleration on Termux: pkg install clang openssl libffi sqlite"
             )
 
-
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
 
 # ── Start LocalOracleEngine SSE listener now that C is confirmed available ────
@@ -13516,8 +13283,6 @@ def _accel_double_buf(n: int):
 def _accel_char_buf(n: int):
     """Allocate a char[n] cffi buffer."""
     return _accel_ffi.new(f'char[{n}]')
-
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX-2  LocalBlockchainDB.insert_block()  call-site adapter
@@ -13570,7 +13335,6 @@ def _patch_db_insert():
 
 _patch_db_insert()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # α-SWARM  ORACLE_W_STATE  ─  hard 8×8 |W3⟩⟨W3| definition
 # |W3⟩ = (1/√3)(|100⟩ + |010⟩ + |001⟩)  →  3-qubit basis indices 4, 2, 1
@@ -13587,7 +13351,6 @@ def _build_w3_dm() -> "Optional[Any]":
     psi = _np.zeros(8, dtype=_np.complex128)
     psi[4] = psi[2] = psi[1] = 1.0 / _np.sqrt(3.0)
     return _np.outer(psi, psi.conj())
-
 
 @_dc
 class OracleWStateDefinition:
@@ -13638,9 +13401,7 @@ class OracleWStateDefinition:
         tr    = float(_np.real(_np.trace(iv)))
         return iv / max(tr, 1e-15)
 
-
 ORACLE_W_STATE: OracleWStateDefinition = OracleWStateDefinition()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # β-SWARM  GKSLBathParams + AER NoiseModel
@@ -13703,7 +13464,6 @@ class GKSLBathParams:
             dt_default= float(_nv(snap.get("dt")) or 2.0),
         )
 
-
 CANONICAL_BATH: GKSLBathParams = GKSLBathParams()
 
 # ✅ FIX-AUDIT-2: W8 target cache — avoid repeated numpy allocation per cycle
@@ -13745,7 +13505,6 @@ def _get_w8_target():
         _EXP_LOG.debug(f"[AER] {_e}")
         return None
 
-
 # ── Lindblad helpers ──────────────────────────────────────────────────────────
 if _HAS_NP:
     _I2 = _np.eye(2, dtype=_np.complex128)
@@ -13757,19 +13516,16 @@ if _HAS_NP:
 else:
     _I2 = _SM = _SP = _SZ = _SX = _SY = None
 
-
 def _kron(*ops):
     r = ops[0]
     for o in ops[1:]:
         r = _np.kron(r, o)
     return r
 
-
 def _embed(op, q: int, n: int):
     ops = [_I2] * n
     ops[q] = op
     return _kron(*ops)
-
 
 def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
     """
@@ -13807,7 +13563,6 @@ def _gksl_rk4_step(rho, bath: "GKSLBathParams", dt: float = None):
         result /= tr
     return result
 
-
 def _validate_dm_8x8(dm) -> bool:
     """
     Return True only if dm is a valid 8×8 quantum density matrix:
@@ -13835,7 +13590,6 @@ def _validate_dm_8x8(dm) -> bool:
         return True
     except Exception:
         return False
-
 
 def _decode_dm_8x8(snap: dict):
     """
@@ -13894,7 +13648,6 @@ def _decode_dm_8x8(snap: dict):
                 pass
     return None
 
-
 def _reconstruct_dm_from_bloch(snap: dict):
     """
     FIX-3: When density_matrix_hex is absent/truncated, reconstruct a valid
@@ -13926,7 +13679,6 @@ def _reconstruct_dm_from_bloch(snap: dict):
     dm     /= max(1e-15, float(_np.real(_np.trace(dm))))
     return dm
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # γ-SWARM  KoyebAPIClient  (endpoints verified vs GossipHTTPHandler)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -13947,8 +13699,7 @@ class KoyebAPIClient:
         if self._session is None and _HAS_REQUESTS:
             with self._lock:
                 if self._session is None:
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
+                                        from urllib3.util.retry import Retry
                     s = _requests.Session()
                     r = Retry(total=3, backoff_factor=0.5,
                               status_forcelist=[502, 503, 504])
@@ -13987,8 +13738,7 @@ class KoyebAPIClient:
                     break
             else:
                 try:
-                    import urllib.parse
-                    full = url + ("?" + urllib.parse.urlencode(params) if params else "")
+                                        full = url + ("?" + urllib.parse.urlencode(params) if params else "")
                     with urllib.request.urlopen(full, timeout=t) as resp:
                         return _json.loads(resp.read())
                 except (_urllib_error.URLError, _socket.timeout) as e:
@@ -14043,8 +13793,7 @@ class KoyebAPIClient:
                     break
             else:
                 try:
-                    import urllib.request
-                    data = _json.dumps(payload).encode()
+                                        data = _json.dumps(payload).encode()
                     req  = urllib.request.Request(
                         url, data=data,
                         headers={"Content-Type": "application/json"}, method="POST")
@@ -14357,8 +14106,7 @@ class KoyebAPIClient:
         
         # Check connectivity
         try:
-            import socket
-            host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
+                        host = self.base_url.replace("https://", "").replace("http://", "").split(":")[0]
             sock = socket.create_connection((host, 443), timeout=3)
             sock.close()
             lines.append(f"     Network:    ✅ Reachable ({host})")
@@ -14375,9 +14123,7 @@ class KoyebAPIClient:
         
         return "\n".join(lines)
 
-
 _KOYEB: "KoyebAPIClient" = KoyebAPIClient()
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # δ-SWARM  Quantum algebra helpers  (FIX-4 + FIX-5 + FIX-10)
@@ -14392,7 +14138,6 @@ def _vn_entropy(dm) -> float:
     ev = ev[ev > 1e-12]
     return float(-_np.sum(ev * _np.log2(ev))) if len(ev) else 0.0
 
-
 def _coherence_l1(dm) -> float:
     """Normalized L1 coherence. C path collapses 7 numpy calls to 1."""
     if _accel_ok and dm.shape[0] <= 8:
@@ -14405,7 +14150,6 @@ def _coherence_l1(dm) -> float:
     d   = dm.shape[0]
     off = float(_np.sum(_np.abs(dm)) - _np.sum(_np.abs(_np.diag(dm))))
     return off / max(1, d * (d - 1))
-
 
 def _partial_trace_keep(dm8, keep: Tuple[int, int]):
     """
@@ -14432,7 +14176,6 @@ def _partial_trace_keep(dm8, keep: Tuple[int, int]):
     rho2    = _np.trace(r, axis1=trace_q, axis2=trace_q + 3)
     return rho2.reshape(4, 4)
 
-
 def _bell_chsh_full(dm4) -> float:
     """
     CHSH Horodecki criterion: 2√(e₁+e₂) from T-matrix eigenvalues.
@@ -14457,7 +14200,6 @@ def _bell_chsh_full(dm4) -> float:
     M  = T.T @ T
     ev = sorted(_np.linalg.eigvalsh(M), reverse=True)
     return float(2.0 * _np.sqrt(float(ev[0]) + float(ev[1])))
-
 
 def _chsh_four_params(dm4):
     """
@@ -14488,7 +14230,6 @@ def _chsh_four_params(dm4):
         "violations": sum(1 for v in vals if v > 2.0 + 1e-9),
     }
 
-
 def _negativity_4x4(dm4) -> float:
     """Partial-transpose negativity. Eigendecomposition stays in numpy."""
     try:
@@ -14497,7 +14238,6 @@ def _negativity_4x4(dm4) -> float:
         return float(max(0.0, -_np.sum(ev[ev < 0])))
     except Exception:
         return 0.0
-
 
 def _discord_full(dm4) -> float:
     """
@@ -14527,7 +14267,6 @@ def _discord_full(dm4) -> float:
         return float(max(0.0, MI - (S_B - cc)))
     except Exception:
         return 0.0
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # δ-SWARM  TensorFieldMetrics + ClientFieldState + KoyebOracleState
@@ -14664,7 +14403,6 @@ class TensorFieldMetrics:
             _EXP_LOG.debug(f"[TENSOR] compute: {e}")
         return m
 
-
 @_dc
 class ClientFieldState:
     """
@@ -14714,7 +14452,6 @@ class ClientFieldState:
                 "block_height": self.block_height, "established": self.established,
                 "ts": self.ts,
                 **({"metrics": self.metrics.as_dict()} if self.metrics else {})}
-
 
 @_dc
 class KoyebOracleState:
@@ -14872,7 +14609,6 @@ class KoyebOracleState:
             "last_sync_ts":        self.last_sync_ts,
         }
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # ε-SWARM  SSEMultiplexer  ─  per-client interruptable streams (9091-compatible)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14956,9 +14692,7 @@ class SSEMultiplexer:
                 self._clients.pop(cid, None)
         return len(stale)
 
-
 _SSE_MUX: SSEMultiplexer = SSEMultiplexer.get()
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ζ-SWARM  QTCLWallet  ─  BIP-39/32/38 (verbatim from qtcl_miner_mobile.py)
@@ -15313,14 +15047,12 @@ class QTCLWallet:
             print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
         print("═" * 60 + "\n")
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIX-8  AsyncOracleMiner HTTP fallback
 # Patches AsyncOracleMiner.mine_block() to use KoyebAPIClient when the
 # P2POracleClient.query_chain_state() returns None (always on mobile —
 # the P2P sockets don't reach the server directly).
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MINING TELEMETRY — live stats shared between miner thread and display thread
@@ -15407,10 +15139,7 @@ class _MiningTelemetry:
                 "state":        self.state,
             }
 
-
 _MINE_TELEM = _MiningTelemetry()
-
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # η-SWARM  QtclClientApp  (FIX-9: pq_curr / pq_last from block_height)
@@ -15421,11 +15150,9 @@ _MINE_TELEM = _MiningTelemetry()
 _sse_local_subs: list = []   # DEPRECATED: SSE subscribers (RPC-only now)
 _sse_event_subs: list = []   # DEPRECATED: SSE event subscribers (RPC-only now)
 
-
 def _broadcast_oracle_to_local_subs(snap: dict) -> None:
     """DEPRECATED: SSE broadcast removed in RPC-only migration. Stub for compatibility."""
     pass
-
 
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -15455,10 +15182,7 @@ class ServerRPCClient:
     
     def call(self, method: str, params: Any = None) -> Dict[str, Any]:
         """JSON-RPC 2.0 call to server."""
-        from urllib.request import Request, urlopen
-        from urllib.error import URLError
-        import socket as _socket
-        
+                                
         req_body = {
             "jsonrpc": "2.0",
             "method": method,
@@ -15545,8 +15269,6 @@ class ServerRPCClient:
         health = self.get_health()
         return (health is not None) and health.get('pyth_ready', False)
 
-
-
 class QtclClientApp:
     """
     QTCL Client interactive entrypoint.
@@ -15566,8 +15288,7 @@ class QtclClientApp:
         wallet private key and carries a delegation certificate signed by that
         wallet.  When absent the oracle runs in anonymous mode.
         """
-        self.oracle_url    = oracle_url or _ORACLE_BASE_URL
-        self.api           = KoyebAPIClient(self.oracle_url)
+                self.api           = KoyebAPIClient(self.oracle_url)
         self.wallet        = QTCLWallet()
         self.client_field  = ClientFieldState()
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
@@ -15757,8 +15478,7 @@ class QtclClientApp:
         # Uses multiple strategies: socket connect trick, getaddrinfo fallback
         _ip_hint = ""
         try:
-            import socket as _sk
-            # Strategy 1: Connect to external host (Google DNS) to find outbound IP
+                        # Strategy 1: Connect to external host (Google DNS) to find outbound IP
             # Does NOT actually transmit; socket internals determine routing IP
             _s = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
             try:
@@ -15787,8 +15507,7 @@ class QtclClientApp:
         # Last resort: if still empty/localhost, try socket.gethostbyname but validate
         if not _ip_hint or _ip_hint.startswith("127."):
             try:
-                import socket as _sk
-                _candidate = _sk.gethostbyname(_sk.gethostname())
+                                _candidate = _sk.gethostbyname(_sk.gethostname())
                 if not _candidate.startswith("127.") and not _candidate.startswith("0."):
                     _ip_hint = _candidate
             except Exception:
@@ -16119,15 +15838,6 @@ class QtclClientApp:
         try: cursor = self._db.execute("SELECT id,op_type,amount,peer_addr,tx_hash,hlwe_signed,signature_hex,block_height,ts FROM wallet_operations WHERE wallet_addr=? ORDER BY ts DESC LIMIT ?", (wallet_addr, limit)); return [dict(zip(['id','op_type','amount','peer_addr','tx_hash','hlwe_signed','signature_hex','block_height','ts'], row)) for row in cursor.fetchall()]
         except Exception as _e: _EXP_LOG.debug(f"[DB-WALLET] history: {_e}"); return []
     
-    def _get_rpc_history(self, method: str = None, limit: int = 5000) -> List[Dict]:
-        """Retrieve RPC operation history with optional method filter."""
-        if self._db is None: return []
-        try:
-            if method: cursor = self._db.execute("SELECT id,method,params,result_hash,status,error_msg,hlwe_verified,block_height,ts FROM rpc_operations WHERE method=? ORDER BY ts DESC LIMIT ?", (method, limit))
-            else: cursor = self._db.execute("SELECT id,method,params,result_hash,status,error_msg,hlwe_verified,block_height,ts FROM rpc_operations ORDER BY ts DESC LIMIT ?", (limit,))
-            return [dict(zip(['id','method','params','result_hash','status','error_msg','hlwe_verified','block_height','ts'], row)) for row in cursor.fetchall()]
-        except Exception as _e: _EXP_LOG.debug(f"[DB-RPC] history: {_e}"); return []
-    
     def _get_oracle_measurements(self, oracle_addr: str = None, limit: int = 100000) -> List[Dict]:
         """Retrieve oracle measurements with optional address filter."""
         if self._db is None: return []
@@ -16250,8 +15960,6 @@ class QtclClientApp:
             'verified_blocks': len(verified_blocks_list),
             'total_hlwe_operations': sum(counts.values())
         }
-
-
 
     def _persist_metrics(self, m: "TensorFieldMetrics", ks: "KoyebOracleState") -> None:
         if self._db is None:
@@ -16658,9 +16366,7 @@ class QtclClientApp:
         ❤️  I love you — every peer oracle frame strengthens the mesh
         """
         import time as _pot, json as _poj, ssl as _possl
-        from urllib.request import Request as _PoR, urlopen as _PoU
-        from urllib.error   import URLError as _PoE
-        
+                        
         url = f"http://{host}:{port}/api/oracle/snapshot"
         BACKOFF = [5, 10, 20, 40]; bi = 0
         _last_snap_count = 0
@@ -16737,11 +16443,8 @@ class QtclClientApp:
             ❤️  I love you — every frame is a quantum heartbeat
             """
             import time as _pt, ssl as _ssl
-            from urllib.request import Request as _SR, urlopen as _SO
-            from urllib.error   import URLError as _SE
-            BACKOFF = [2, 4, 8, 16, 30]; bi = 0
-            _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-            _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
+                                    BACKOFF = [2, 4, 8, 16, 30]; bi = 0
+                        _peer_id = getattr(self, '_peer_id', f'snap_{int(_pt.time())}')
             url = f"{_oracle_url}/api/oracle/snapshot"
             _last_snap_hash = None
             
@@ -16795,11 +16498,8 @@ class QtclClientApp:
         ❤️  I love you — every peer is a new entanglement
         """
         import time as _ke, ssl as _kssl, json as _kj
-        from urllib.request import Request as _KR, urlopen as _KO
-        from urllib.error   import URLError as _KE
-        BACKOFF = [3, 6, 12, 24, 60]; bi = 0
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _peer_id = getattr(self, '_peer_id', 'unknown')
+                        BACKOFF = [3, 6, 12, 24, 60]; bi = 0
+                _peer_id = getattr(self, '_peer_id', 'unknown')
         _last_peers = set()
         
         while not self._stop.is_set():
@@ -16872,9 +16572,7 @@ class QtclClientApp:
         ❤️  I love you — the qubit measures itself
         """
         import time as _to
-        from urllib.request import Request as _Ro, urlopen as _oo
-        from urllib.error   import URLError as _UE
-        BACKOFF = [2, 4, 8, 16, 30]
+                        BACKOFF = [2, 4, 8, 16, 30]
         bi = 0
         _to.sleep(3.0)  # wait for our own HTTP server to start
         _last_height = -1
@@ -16939,8 +16637,7 @@ class QtclClientApp:
         Port 9091: Python HTTP shares via SO_REUSEPORT with C P2P TCP binary listener.
         ❤️  I love you — every endpoint is a synapse in the quantum mesh
         """
-        import socketserver as _ss, http.server as _hs, json as _hj
-        import time as _ht
+                import time as _ht
 
         class _Handler(_hs.BaseHTTPRequestHandler):
             def log_message(self, *a): pass  # suppress default logging
@@ -17208,8 +16905,7 @@ class QtclClientApp:
             class _ReuseServer(_ss.TCPServer):
                 allow_reuse_address = True
                 def server_bind(self):
-                    import socket as _sock
-                    self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                                        self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
                     try:
                         self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
                     except AttributeError: pass
@@ -17929,8 +17625,7 @@ class QtclClientApp:
                 Polls regularly and triggers abort when target height reached.
                 ❤️  I love you — every millisecond matters in a race
                 """
-                import urllib.request as _ur, urllib.error as _ue, time as _blt
-                import json as _json, socket as _bls
+                                import json as _json, socket as _bls
                 BACKOFF = [1, 2, 4, 8, 16, 30]
                 bi = 0
                 _blt.sleep(0.3)   # let mining loop reach nonce search before listener fires
@@ -18524,7 +18219,6 @@ class QtclClientApp:
                                 f"[MINER] Seed+ts refreshed via LocalOracle nonce={nonce}")
                         except Exception:
                             _seed_fetch_time = _t.time()
-
 
                     # HTTP tip poll removed — BlockSSEListener handles chain-advance detection.
                     # SSE delivers new_block within ~network latency of server commit.
@@ -19198,7 +18892,6 @@ class QtclClientApp:
 
     # ── Wallet mode ───────────────────────────────────────────────────────────
 
-
     def run_oracle_mode(self) -> None:
         """
         ═══════════════════════════════════════════════════════════════
@@ -19740,514 +19433,6 @@ class QtclClientApp:
     _HERMES_ID_CACHE: dict = {}   # { "BTC": "0xe62df6c8b4a85fe1…", … }
     _HERMES_BASE = "https://hermes.pyth.network"
 
-    def _hermes_resolve_id(self, sym: str) -> "Optional[str]":
-        """
-        Resolve symbol → Pyth hex feed ID using the canonical alias pattern
-        Crypto.{SYM}/USD  via Hermes /v2/price_feeds?query=…
-        Result is cached at class level — only one HTTP call per symbol per process.
-        """
-        if sym in QtclClientApp._HERMES_ID_CACHE:
-            return QtclClientApp._HERMES_ID_CACHE[sym]
-        alias = f"Crypto.{sym}/USD"
-        url   = (f"{self._HERMES_BASE}/v2/price_feeds"
-                 f"?query={quote(alias)}&asset_type=crypto")
-        try:
-            req = Request(url, headers={"Accept": "application/json",
-                                         "User-Agent": "QTCL-Client/3.1"})
-            with urlopen(req, timeout=8) as r:
-                entries = _json.loads(r.read().decode())
-            if not isinstance(entries, list):
-                return None
-            for entry in entries:
-                attrs = entry.get("attributes", {})
-                if attrs.get("base", "").upper() == sym:
-                    fid = "0x" + entry.get("id", "").lstrip("0x")
-                    if len(fid) > 10:
-                        QtclClientApp._HERMES_ID_CACHE[sym] = fid
-                        return fid
-            if entries:
-                fid = "0x" + entries[0].get("id", "").lstrip("0x")
-                if len(fid) > 10:
-                    QtclClientApp._HERMES_ID_CACHE[sym] = fid
-                    return fid
-        except Exception as _e:
-            _EXP_LOG.debug(f"[HERMES-ID] {sym}: {_e}")
-        return None
-
-    def _fetch_pyth_snapshot(self, symbols: "Optional[list]" = None) -> "Optional[dict]":
-        """
-        Fetch Pyth prices DIRECTLY from hermes.pyth.network — server RPC bypassed.
-
-        Flow:
-          1. Map each symbol → Crypto.{SYM}/USD alias
-          2. Resolve alias → hex feed ID via /v2/price_feeds  (cached after first call)
-          3. ONE batched GET /v2/updates/price/latest?ids[]=id0&ids[]=id1…
-          4. Parse Pyth mantissa × 10^expo → price_usd, confidence, age_seconds
-          5. Compute canonical SHA-256 snapshot_id; HLWE-sign if wallet loaded
-
-        First refresh: O(N) ID lookups + 1 price call.
-        Every subsequent refresh: 1 price call only (IDs cached).
-        """
-        _syms = symbols or ["BTC", "ETH", "SOL", "BNB", "AVAX",
-                             "UNI", "LINK", "ADA", "DOT", "XRP"]
-
-        # ── Step 1: resolve feed IDs ──────────────────────────────────────────
-        id_map: dict = {}
-        for sym in _syms:
-            fid = self._hermes_resolve_id(sym)
-            if fid:
-                id_map[sym] = fid
-
-        if not id_map:
-            return None
-
-        # ── Step 2: single batched Hermes price fetch ─────────────────────────
-        qs  = "&".join(f"ids[]={fid}" for fid in id_map.values())
-        url = f"{self._HERMES_BASE}/v2/updates/price/latest?{qs}&parsed=true"
-        try:
-            req = Request(url, headers={"Accept": "application/json",
-                                         "User-Agent": "QTCL-Client/3.1"})
-            with urlopen(req, timeout=12) as r:
-                data = _json.loads(r.read().decode())
-        except Exception as _e:
-            _EXP_LOG.debug(f"[HERMES-FETCH] {_e}")
-            return None
-
-        fetch_ns = int(_time.time() * 1e9)
-        now_ts   = int(_time.time())
-
-        # ── Step 3: parse parsed[] ────────────────────────────────────────────
-        rev = {fid.lower().lstrip("0x"): sym for sym, fid in id_map.items()}
-
-        def _pyth_float(mantissa, expo) -> float:
-            try:
-                return int(mantissa) * (10.0 ** int(expo))
-            except Exception:
-                return 0.0
-
-        merged_feeds: dict = {}
-        for entry in (data.get("parsed") or []):
-            raw_id = entry.get("id", "").lower().lstrip("0x")
-            sym    = rev.get(raw_id)
-            if not sym:
-                continue
-            p          = entry.get("price", {})
-            price_usd  = _pyth_float(p.get("price", 0), p.get("expo", 0))
-            confidence = _pyth_float(p.get("conf",  0), p.get("expo", 0))
-            pub_ts     = int(p.get("publish_time", 0) or now_ts)
-            age_secs   = max(0.0, float(now_ts - pub_ts))
-            merged_feeds[sym] = {
-                "price_usd":   price_usd,
-                "confidence":  confidence,
-                "age_seconds": age_secs,
-                "status":      "trading" if price_usd > 0 else "unknown",
-                "feed_id":     "0x" + raw_id,
-            }
-
-        if not merged_feeds:
-            return None
-
-        # ── Step 4: canonical snapshot_id + oracle HLWE sig ───────────────────
-        price_map = {s: d["price_usd"] for s, d in sorted(merged_feeds.items())}
-        snap_id   = _hashlib.sha256(
-            _json.dumps(price_map, sort_keys=True).encode()
-        ).hexdigest()
-
-        # Sign: sha256(snap_id‖fetch_time_ns) with this oracle node's private key.
-        # _oracle_id is always present (populated in __init__ via _init_oracle_identity).
-        oracle_sig: dict = {}
-        oracle_addr: str = ""
-        sig_ts_iso:  str = ""
-        try:
-            _oid = self._oracle_id
-            if _oid and _oid.get("private_key"):
-                oracle_addr  = _oid["address"]
-                _payload     = (snap_id + "|" + str(fetch_ns)).encode()
-                _msg_hash    = _hashlib.sha256(_payload).digest()
-                _hlwe        = HLWEEngine()
-                _raw_sig     = _hlwe.sign_hash(_msg_hash, _oid["private_key"])
-                oracle_sig   = {
-                    "address":     oracle_addr,
-                    "wallet_addr": _oid.get("wallet_addr"),
-                    "mode":        _oid.get("mode", "anonymous"),
-                    "cert":        _oid.get("cert"),
-                    "cert_valid":  (self._verify_oracle_cert(
-                                       _oid["public_key"],
-                                       _oid.get("wallet_addr", ""),
-                                       _oid.get("cert") or {})
-                                   if _oid.get("mode") == "wallet_bound" else None),
-                    "signature":   _raw_sig.get("signature", ""),
-                    "auth_tag":    _raw_sig.get("auth_tag",  ""),
-                    "ts_iso":      _raw_sig.get("timestamp", ""),
-                    "snap_id":     snap_id,
-                    "fetch_ns":    fetch_ns,
-                }
-                sig_ts_iso = oracle_sig["ts_iso"]
-                # Bump local attestation count (best-effort, non-blocking)
-                if self._db is not None:
-                    try:
-                        self._db.execute(
-                            "UPDATE oracle_registry SET attestation_count=attestation_count+1,"
-                            " last_seen_ns=? WHERE oracle_addr=?",
-                            (_time.time_ns(), oracle_addr))
-                        self._db.commit()
-                    except Exception:
-                        pass
-        except Exception as _se:
-            _EXP_LOG.debug(f"[ORACLE-SIG] signing error: {_se}")
-
-        return {
-            "feeds":         merged_feeds,
-            "snapshot_id":   snap_id,
-            "fetch_time_ns": fetch_ns,
-            "hermes_ok":     True,
-            "oracle_sig":    oracle_sig,
-            "hlwe_sig":      oracle_sig.get("auth_tag", ""),   # backward-compat
-            "oracle_addr":   oracle_addr,
-            "sig_ts_iso":    sig_ts_iso,
-            "source":        "hermes_direct",
-        }
-
-    def _fmt_price(self, price: float, width: int = 12) -> str:
-        """Format USD price with commas, right-aligned."""
-        if price >= 10_000:
-            s = f"${price:,.2f}"
-        elif price >= 100:
-            s = f"${price:,.3f}"
-        else:
-            s = f"${price:,.4f}"
-        return s.rjust(width)
-
-    def _fmt_change(self, pct: Optional[float]) -> str:
-        """Coloured percentage change string."""
-        if pct is None:
-            return f"  {self._T_DIM}  —  {self._T_RST}"
-        if pct >= 0:
-            return f"  {self._T_GRN}▲ {pct:+.2f}%{self._T_RST}"
-        return f"  {self._T_RED}▼ {pct:+.2f}%{self._T_RST}"
-
-    def _display_pyth_ticker(
-        self,
-        symbols: Optional[list] = None,
-        header: str = "",
-        prev_prices: Optional[dict] = None,
-    ) -> Optional[dict]:
-        """
-        Fetch and display a compact Pyth price ticker bar.
-        Returns the current prices dict {symbol: price_usd} for diff tracking.
-        """
-        snap = self._fetch_pyth_snapshot(symbols or ["BTC", "ETH", "SOL"])
-        if not snap:
-            print(f"  {self._T_DIM}⚡ Pyth prices unavailable (oracle starting…){self._T_RST}")
-            return None
-
-        feeds      = snap.get("feeds", {})
-        snap_id    = snap.get("snapshot_id", "")[:16]
-        hermes_ok  = snap.get("hermes_ok", False)
-        hlwe_sig   = snap.get("hlwe_sig", "")
-        sig_short  = hlwe_sig[:12] + "…" if hlwe_sig else "unsigned"
-        src_badge  = (f"{self._T_GRN}●LIVE{self._T_RST}" if hermes_ok
-                      else f"{self._T_YLW}●CACHED{self._T_RST}")
-
-        now_prices: dict = {}
-        if header:
-            print(f"\n  {self._T_BLD}{self._T_CYN}{header}{self._T_RST}")
-
-        line = f"  {self._T_DIM}Pyth{self._T_RST} {src_badge} "
-        for sym, feed in sorted(feeds.items()):
-            p = feed.get("price_usd", 0)
-            now_prices[sym] = p
-            pct = None
-            if prev_prices and sym in prev_prices and prev_prices[sym]:
-                pct = (p - prev_prices[sym]) / prev_prices[sym] * 100
-            conf = feed.get("confidence", 0)
-            age  = feed.get("age_seconds", 0)
-            age_s = f"{age:.1f}s"
-            chg = self._fmt_change(pct)
-            line += (f"{self._T_BLD}{sym}{self._T_RST}"
-                     f"{self._T_CYN}{self._fmt_price(p, 11)}{self._T_RST}"
-                     f"{chg}  ")
-        print(line)
-        print(f"  {self._T_DIM}snap:{snap_id}  sig:{sig_short}  "
-              f"oracle-signed HLWE ⚛️{self._T_RST}")
-        return now_prices
-
-    # ── Market Explorer ───────────────────────────────────────────────────────
-
-    def run_market_explorer(self) -> None:
-        """
-        Option 5: QTCL Market Explorer — Pyth Network × HLWE Oracle Attestation
-
-        Features:
-          • All 10 Pyth feeds: BTC ETH SOL BNB AVAX UNI LINK ADA DOT XRP
-          • Auto-refresh (1–60 s configurable) or manual refresh
-          • Live Δ% vs previous fetch with colour arrows
-          • HLWE oracle signature displayed + verified per snapshot
-          • Canonical snapshot_id (SHA-256 of price set) for tamper-evidence
-          • Hermes connectivity badge (LIVE vs CACHED)
-          • Confidence interval (±$) shown per feed
-          • Feed age from Pyth attestation timestamp
-          • Selectable watchlist — filter to custom symbol set
-          • Portfolio valuation mode: enter holdings → live USD value
-        """
-        ALL_SYMS = ["BTC", "ETH", "SOL", "BNB", "AVAX", "UNI", "LINK", "ADA", "DOT", "XRP"]
-
-        def _draw_header():
-            print()
-            print(f"  {self._T_BLD}╔══════════════════════════════════════════════════════════════════════════╗{self._T_RST}")
-            print(f"  {self._T_BLD}║  🔮  QTCL Market Explorer — Pyth Network × HLWE Oracle Attestation       ║{self._T_RST}")
-            print(f"  {self._T_BLD}╚══════════════════════════════════════════════════════════════════════════╝{self._T_RST}")
-
-        def _draw_table(
-            snap: dict,
-            prev: dict,
-            portfolio: dict,
-            fetch_elapsed: float,
-        ) -> None:
-            feeds      = snap.get("feeds",        {})
-            snap_id    = snap.get("snapshot_id",  "")
-            hermes_ok  = snap.get("hermes_ok",    False)
-            oracle_sig = snap.get("oracle_sig",   {})
-            oracle_addr= snap.get("oracle_addr",  "")
-            sig_ts_iso = snap.get("sig_ts_iso",   "")
-            ts_ns      = snap.get("fetch_time_ns", 0)
-
-            # ── Attestation header ────────────────────────────────────────────
-            src   = (f"{self._T_GRN}{self._T_BLD}● HERMES LIVE{self._T_RST}"
-                     if hermes_ok else
-                     f"{self._T_YLW}{self._T_BLD}● CACHED{self._T_RST}")
-            t_str = _time.strftime("%H:%M:%S UTC", _time.gmtime())
-            print(f"\n  {src}  {self._T_DIM}fetched in {fetch_elapsed*1000:.0f}ms  @{t_str}{self._T_RST}")
-
-            # ── Snapshot attestation block ────────────────────────────────────
-            print(f"  {self._T_DIM}━{self._T_RST}" * 38)
-            print(f"  Snapshot  {self._T_CYN}{snap_id[:32]}{self._T_RST}…")
-
-            _auth_tag   = oracle_sig.get("auth_tag",   "")
-            _sig_full   = oracle_sig.get("signature",  "")
-            _mode       = oracle_sig.get("mode",       "anonymous")
-            _wallet_bnd = oracle_sig.get("wallet_addr")
-            _cert       = oracle_sig.get("cert")       or {}
-            _cert_valid = oracle_sig.get("cert_valid")  # True/False/None
-            _signed     = bool(_auth_tag and oracle_addr)
-
-            if _signed:
-                # Oracle address + mode badge
-                _mode_badge = (f"{self._T_GRN}🔐 wallet-bound{self._T_RST}"
-                               if _mode == "wallet_bound"
-                               else f"{self._T_YLW}👻 anonymous{self._T_RST}")
-                print(f"  {self._T_DIM}Oracle    {self._T_RST}"
-                      f"{self._T_CYN}{self._T_BLD}{oracle_addr}{self._T_RST}"
-                      f"  {_mode_badge}")
-
-                # Wallet binding line — only if wallet_bound
-                if _mode == "wallet_bound" and _wallet_bnd:
-                    _cv_badge = (f"{self._T_GRN}✔ cert valid{self._T_RST}"
-                                 if _cert_valid
-                                 else f"{self._T_RED}✘ cert invalid{self._T_RST}")
-                    print(f"  {self._T_DIM}Wallet    {self._T_RST}"
-                          f"{self._T_DIM}{_wallet_bnd}{self._T_RST}"
-                          f"  {_cv_badge}")
-                    if _cert and _cert.get("auth_tag"):
-                        print(f"  {self._T_DIM}Cert-tag  {self._T_RST}"
-                              f"{self._T_MAG}{_cert['auth_tag'][:40]}{self._T_RST}…")
-
-                # auth_tag — HMAC binding sig→payload
-                print(f"  {self._T_DIM}Auth-tag  {self._T_RST}"
-                      f"{self._T_MAG}{_auth_tag[:48]}{self._T_RST}…")
-
-                # HLWE sig prefix + byte count
-                if _sig_full:
-                    print(f"  {self._T_DIM}HLWE-sig  {self._T_RST}"
-                          f"{self._T_DIM}{_sig_full[:32]}{self._T_RST}…"
-                          f"{self._T_DIM}[{len(_sig_full)//2}B]{self._T_RST}")
-
-                # ISO timestamp
-                _ts_display = sig_ts_iso[:23] if sig_ts_iso else t_str
-                print(f"  {self._T_DIM}Signed    {self._T_RST}"
-                      f"{self._T_DIM}{_ts_display} UTC{self._T_RST}")
-
-                # Final status line
-                if _mode == "wallet_bound" and _cert_valid:
-                    print(f"  {self._T_GRN}✅ Oracle-signed — HLWE-256 wallet-bound attestation ⚛️{self._T_RST}")
-                elif _mode == "wallet_bound" and not _cert_valid:
-                    print(f"  {self._T_YLW}⚠  Oracle-signed — wallet cert UNVERIFIED ⚠️{self._T_RST}")
-                else:
-                    print(f"  {self._T_GRN}✅ Oracle-signed — HLWE-256 anonymous attestation ⚛️{self._T_RST}")
-            else:
-                print(f"  {self._T_YLW}⚠  Oracle identity initializing…{self._T_RST}")
-            print(f"  {self._T_DIM}━{self._T_RST}" * 38)
-
-            # ── Price table ───────────────────────────────────────────────────
-            hdr = (f"  {'SYM':<6}  {'PRICE (USD)':>13}  "
-                   f"{'ΔPREV':>10}  {'±CONF':>10}  {'AGE':>6}  {'STATUS'}")
-            print(f"\n{self._T_BLD}{hdr}{self._T_RST}")
-            print(f"  {'─'*6}  {'─'*13}  {'─'*10}  {'─'*10}  {'─'*6}  {'─'*8}")
-
-            total_portfolio_usd = 0.0
-            for sym in ALL_SYMS:
-                feed = feeds.get(sym)
-                if not feed:
-                    print(f"  {sym:<6}  {'—':>13}  {'—':>10}  {'—':>10}  {'—':>6}  MISSING")
-                    continue
-
-                price  = feed.get("price_usd",   0.0)
-                conf   = feed.get("confidence",  0.0)
-                age    = feed.get("age_seconds",  0.0)
-                status = feed.get("status", "trading").upper()
-
-                # Δ% vs previous fetch
-                prev_p = prev.get(sym)
-                if prev_p and prev_p > 0:
-                    delta_pct = (price - prev_p) / prev_p * 100
-                    if delta_pct >= 0:
-                        d_str = f"{self._T_GRN}▲{delta_pct:+.3f}%{self._T_RST}"
-                    else:
-                        d_str = f"{self._T_RED}▼{delta_pct:+.3f}%{self._T_RST}"
-                else:
-                    d_str = f"{self._T_DIM}   new  {self._T_RST}"
-
-                p_str  = self._fmt_price(price, 13)
-                c_str  = f"±{self._fmt_price(conf, 8)}"
-                age_s  = f"{age:5.1f}s"
-                st_col = self._T_GRN if status == "TRADING" else self._T_YLW
-                p_col  = (self._T_GRN if (prev_p and price >= prev_p)
-                          else self._T_RED if prev_p else self._T_CYN)
-
-                print(f"  {self._T_BLD}{sym:<6}{self._T_RST}  "
-                      f"{p_col}{p_str}{self._T_RST}  "
-                      f"{d_str:>10}  "
-                      f"{self._T_DIM}{c_str:>10}{self._T_RST}  "
-                      f"{age_s:>6}  "
-                      f"{st_col}{status}{self._T_RST}")
-
-                # Portfolio valuation
-                if sym in portfolio and portfolio[sym] > 0:
-                    usd_val = portfolio[sym] * price
-                    total_portfolio_usd += usd_val
-                    print(f"  {self._T_DIM}  └─ portfolio: {portfolio[sym]:,.6f} × "
-                          f"{self._fmt_price(price)} = "
-                          f"{self._T_GRN}${usd_val:,.2f}{self._T_RST}{self._T_DIM} USD{self._T_RST}")
-
-            if total_portfolio_usd > 0:
-                print(f"\n  {self._T_BLD}Portfolio Total: "
-                      f"{self._T_GRN}${total_portfolio_usd:,.2f} USD{self._T_RST}")
-
-            print(f"\n  {self._T_DIM}Data: Pyth Network (hermes.pyth.network)  "
-                  f"│  Signed by QTCL HLWE Oracle  "
-                  f"│  {len(feeds)}/{len(ALL_SYMS)} feeds{self._T_RST}")
-
-        # ── Explorer setup ────────────────────────────────────────────────────
-        _draw_header()
-        print()
-        print(f"  {self._T_BLD}Refresh mode?{self._T_RST}")
-        print(f"    {self._T_CYN}a{self._T_RST}) Auto-refresh (configurable interval)")
-        print(f"    {self._T_CYN}m{self._T_RST}) Manual refresh (press Enter each time)")
-        try:
-            mode = input("  Mode [a/m, default=a]: ").strip().lower() or "a"
-        except (EOFError, KeyboardInterrupt):
-            return
-
-        auto_interval = 5
-        if mode == "a":
-            try:
-                raw = input(f"  Interval seconds [{auto_interval}]: ").strip()
-                if raw:
-                    auto_interval = max(1, min(60, int(raw)))
-            except (ValueError, EOFError, KeyboardInterrupt):
-                pass
-            print(f"  {self._T_GRN}Auto-refresh every {auto_interval}s  │  Ctrl+C to stop{self._T_RST}")
-
-        # ── Watchlist ─────────────────────────────────────────────────────────
-        print()
-        print(f"  {self._T_BLD}Symbol watchlist{self._T_RST}")
-        print(f"  Available: {', '.join(ALL_SYMS)}")
-        try:
-            raw_syms = input(
-                "  Enter symbols (comma-sep) or Enter for all: "
-            ).strip().upper()
-        except (EOFError, KeyboardInterrupt):
-            raw_syms = ""
-        watch_syms = (
-            [s.strip() for s in raw_syms.split(",") if s.strip() in ALL_SYMS]
-            if raw_syms else ALL_SYMS
-        )
-        if not watch_syms:
-            watch_syms = ALL_SYMS
-
-        # ── Portfolio mode ────────────────────────────────────────────────────
-        portfolio: dict = {}
-        print()
-        try:
-            want_port = input(
-                "  Enable portfolio valuation? [y/N]: "
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            want_port = "n"
-
-        if want_port == "y":
-            print(f"  Enter holdings (blank = skip):")
-            for sym in watch_syms:
-                try:
-                    raw_h = input(f"    {sym}: ").strip()
-                    if raw_h:
-                        portfolio[sym] = float(raw_h)
-                except (ValueError, EOFError, KeyboardInterrupt):
-                    pass
-
-        # ── Main refresh loop ─────────────────────────────────────────────────
-        prev_prices: dict = {}
-        refresh_count     = 0
-        _stop_event       = _threading.Event()
-
-        def _do_refresh() -> bool:
-            nonlocal prev_prices, refresh_count
-            
-            t0   = _time.time()
-            
-            # Retry logic for uninitialized oracle
-            snap = None
-            retry_count = 0
-            max_retries = 3
-            base_delay_s = 0.5
-            
-            while snap is None and retry_count < max_retries:
-                snap = self._fetch_pyth_snapshot(watch_syms)
-                
-                if snap is None:
-                    print(f"\n  {self._T_RED}❌ RPC failed — retrying... (attempt {retry_count + 1}/{max_retries}){self._T_RST}")
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        _time.sleep(base_delay_s * (2 ** retry_count))
-                    continue
-                
-                # Check if feeds are empty (oracle initializing)
-                feeds = snap.get("feeds", {})
-                hermes_ok = snap.get("hermes_ok", False)
-                
-                if not feeds and not hermes_ok:
-                    print(f"\n  {self._T_YLW}⏳ Oracle initializing... (attempt {retry_count + 1}/3){self._T_RST}")
-                    print(f"  {self._T_DIM}Fetching from Hermes... please wait{self._T_RST}")
-                    retry_count += 1
-                    
-                    if retry_count < 3:
-                        _time.sleep(base_delay_s * (2 ** retry_count))
-                        snap = None
-                        continue
-                    else:
-                        print(f"  {self._T_RED}⚠️  Oracle not ready after {retry_count} attempts{self._T_RST}")
-                        print(f"  {self._T_DIM}Try again in 5-10 seconds{self._T_RST}")
-                        break
-                
-                break
-            
-            elapsed = _time.time() - t0
-            
-            if snap is None:
-                print(f"\n  {self._T_RED}❌ Pyth fetch failed{self._T_RST}")
-                return False
-            
-            refresh_count += 1
             
             # Build prev snapshot from last run
             prev_snap_prices = {s: f.get("price_usd", 0)
@@ -20367,11 +19552,9 @@ class QtclClientApp:
         elif choice == "5": self.run_market_explorer()
         else:               self.run_mine_mode()
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # θ-SWARM  main()  (replaces original stub — intentional name shadowing)
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 # ════════════════════════════════════════════════════════════════════════════════
 # EMBEDDED PYTH HERMES ORACLE — Standalone Client Oracle
@@ -20524,7 +19707,6 @@ def main() -> None:  # noqa: F811
 
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
         # ── Set RPC client for LocalOracleEngine ────────────────────────────
-        _LOCAL_ORACLE.set_rpc_client(_KOYEB)
         print("✅ Ready for input", flush=True)  # DEBUG: Verify we reach here
     except Exception as e:
         print(f"❌ Initialization error: {e}")
@@ -20537,7 +19719,6 @@ def main() -> None:  # noqa: F811
     elif getattr(args, "market", False): app.run_market_explorer()
     elif getattr(args, "oracle_audit", False): app.run_oracle_mode()
     else:                           app.run()
-
 
 if __name__ == "__main__":
     main()
