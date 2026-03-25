@@ -2254,6 +2254,8 @@ class LocalOracleEngine:
         C acceleration is REQUIRED — raises RuntimeError if unavailable.
         Post-measure: stores canonical snapshot, gossips to DHT peers,
         ingests into C SSE layer.
+        
+        Computes: hyperbolic triangle area, Mermin ⟨M₃⟩ nonlocality witness.
         """
         import hashlib as _hl, struct as _st
         if not _accel_ok:
@@ -2373,6 +2375,14 @@ class LocalOracleEngine:
                 lam = dm_re[i*9] / tr
                 if lam > 1e-15: ent -= lam * math.log2(lam)
         disc = float(max(0.0, min(3.0, ent * (1.0 - pur) * 0.5)))
+        
+        # Mermin ⟨M₃⟩ nonlocality witness (3-qubit entanglement certification)
+        mermin_val = 0.0
+        try:
+            mermin_val = float(_accel_lib.qtcl_mermin_w3(_dr, _di))
+            mermin_val = max(-4.0, min(4.0, mermin_val))  # clamp to physical range
+        except Exception:
+            mermin_val = 0.0
 
         # Build and sign QtclWStateMeasurement struct
         m_c = _accel_ffi.new('QtclWStateMeasurement *')
@@ -12079,10 +12089,6 @@ static void *_accept_thread(void *arg){
             !memcmp(pk,"HEAD",4)||!memcmp(pk,"OPTI",4)));
         if(http){
             char hb[2048]={0}; recv(cfd,hb,sizeof(hb)-1,0);
-            uint8_t topics=TOPIC_ALL;
-            const char *tp=strstr(hb,"topics=");
-            if(tp)topics=(uint8_t)strtoul(tp+7,NULL,10);
-            else{const char *cp=strstr(hb,"channels=");if(cp)topics=(uint8_t)atoi(cp+9);}
             if(strstr(hb,"/events")){
                 /* SSE not supported — RPC-only consensus model */
                 const char *na="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 41\r\n\r\nSSE disabled (RPC-only consensus model)";
