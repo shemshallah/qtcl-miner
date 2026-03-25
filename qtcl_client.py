@@ -13842,6 +13842,57 @@ class KoyebAPIClient:
             return int(hello.get("block_height", 0))
         return None
 
+    # ── MEMPOOL INTEGRATION ────────────────────────────────────────────────────
+    
+    def get_mempool_txs(self, limit: int = 100) -> Optional[list]:
+        """Get pending transactions from mempool (highest fee rate first)."""
+        return (self._get("/api/mempool/txs", params={"limit": limit}) or {}).get("txs", [])
+    
+    def get_mempool_stats(self) -> Optional[dict]:
+        """Get mempool statistics (size, fees, etc)."""
+        return self._get("/api/mempool/stats")
+    
+    def get_mempool_fee_rate(self) -> Optional[dict]:
+        """Get current mempool fee rate estimate."""
+        return self._get("/api/mempool/fee_rate")
+    
+    def submit_tx_to_mempool(self, tx: dict) -> Optional[dict]:
+        """Submit transaction to mempool (same as submit_transaction)."""
+        return self.submit_transaction(tx)
+    
+    # ── HERMES PYTH ORACLE INTEGRATION ────────────────────────────────────────
+    
+    def fetch_hermes_prices(self, symbols: Optional[List[str]] = None) -> Optional[dict]:
+        """
+        Fetch Pyth prices directly from hermes.pyth.network (server-side oracle).
+        
+        Symbols: BTC, ETH, SOL, BNB, AVAX, UNI, LINK, ADA, DOT, XRP, ATOM, MATIC
+        
+        Returns: {
+            "snapshot_id": "sha256…",
+            "timestamp": 1234567890,
+            "hermes_ok": true,
+            "feeds": {
+                "BTC": {"price_usd": 95000.50, "confidence": 50.0, "age_seconds": 2},
+                "ETH": {"price_usd": 3400.25, "confidence": 20.0, "age_seconds": 2},
+                …
+            }
+        }
+        """
+        # Call server's aggregated Hermes endpoint (orchestrates the fetch)
+        return self._get("/api/pyth/prices", 
+                        params={"symbols": ",".join(symbols or [
+                            "BTC", "ETH", "SOL", "BNB", "AVAX", "UNI", "LINK", "ADA", "DOT", "XRP"
+                        ])})
+    
+    def get_pyth_snapshot(self) -> Optional[dict]:
+        """Get latest Pyth oracle snapshot from server (Hermes-backed)."""
+        r = self._get("/api/oracle/snapshot")
+        if r:
+            return r
+        # Fallback: fetch prices directly
+        return self.fetch_hermes_prices()
+    
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
         r = self._get("/api/oracle/pq0-bloch")
         if r:
@@ -14097,6 +14148,229 @@ class KoyebAPIClient:
         self._health_check_cache = {"timestamp": now, "status": result}
         return result
     
+    # ── CRITICAL MISSING ENDPOINTS ────────────────────────────────────────────────
+    
+    # TRANSACTIONS
+    def list_transactions(self, limit: int = 100) -> Optional[list]:
+        """Get list of all transactions."""
+        return (self._get("/api/transactions", params={"limit": limit}) or {}).get("transactions", [])
+    
+    def get_transaction(self, tx_hash: str) -> Optional[dict]:
+        """Get a specific transaction by hash."""
+        return self._get(f"/api/transactions/{tx_hash}")
+    
+    # BLOCKS
+    def list_blocks(self, limit: int = 100) -> Optional[list]:
+        """Get list of blocks."""
+        return (self._get("/api/blocks", params={"limit": limit}) or {}).get("blocks", [])
+    
+    def get_block_by_height(self, height: int) -> Optional[dict]:
+        """Get block by height."""
+        return self._get(f"/api/blocks/height/{height}")
+    
+    def get_block_transactions(self, height: int) -> Optional[list]:
+        """Get transactions in a specific block."""
+        return (self._get(f"/api/blocks/height/{height}/transactions") or {}).get("transactions", [])
+    
+    def get_chain_info(self) -> Optional[dict]:
+        """Get blockchain chain information."""
+        return self._get("/api/chain")
+    
+    # WALLET / ADDRESS
+    def get_balance(self, address: str) -> Optional[dict]:
+        """Get balance for an address."""
+        return self._get(f"/api/address/{address}/balance")
+    
+    def get_address_earned(self, address: str) -> Optional[dict]:
+        """Get total earned by an address (mining rewards)."""
+        return self._get(f"/api/address/{address}/earned")
+    
+    def get_nonce(self, address: str) -> Optional[int]:
+        """Get nonce for an address (transaction counter)."""
+        r = self._get(f"/api/nonce/{address}")
+        if r and "nonce" in r:
+            return int(r["nonce"])
+        return None
+    
+    def repair_wallet(self, address: str) -> Optional[dict]:
+        """Repair wallet state (recover from corruption)."""
+        return self._post("/api/wallet/repair", {"address": address})
+    
+    # ORACLE
+    def get_oracle_status(self) -> Optional[dict]:
+        """Get oracle status."""
+        return self._get("/api/oracle")
+    
+    def get_oracle_identity(self) -> Optional[dict]:
+        """Get this node's oracle identity."""
+        return self._get("/api/oracle/identity")
+    
+    def get_oracle_peers(self) -> Optional[list]:
+        """Get list of oracle peers."""
+        return (self._get("/api/oracle/peers") or {}).get("peers", [])
+    
+    def get_oracle_registry(self) -> Optional[list]:
+        """Get full oracle registry."""
+        return (self._get("/api/oracle/registry") or {}).get("oracles", [])
+    
+    def get_oracle_registry_entry(self, oracle_addr: str) -> Optional[dict]:
+        """Get oracle registry entry by address."""
+        return self._get(f"/api/oracle/registry/{oracle_addr}")
+    
+    def submit_oracle_registry(self, oracle_data: dict) -> Optional[dict]:
+        """Submit oracle registration."""
+        return self._post("/api/oracle/registry/submit", oracle_data)
+    
+    def get_oracle_dual(self) -> Optional[dict]:
+        """Get oracle dual-consensus state."""
+        return self._get("/api/oracle/dual")
+    
+    def push_oracle_snapshot(self, snapshot: dict) -> Optional[dict]:
+        """Push oracle snapshot to server."""
+        return self._post("/api/oracle/push_snapshot", snapshot)
+    
+    def push_oracle_dm(self, dm_data: dict) -> Optional[dict]:
+        """Push oracle density matrix."""
+        return self._post("/api/oracle/push_dm", dm_data)
+    
+    # MINING / DIFFICULTY
+    def get_difficulty(self) -> Optional[dict]:
+        """Get current difficulty."""
+        return self._get("/api/difficulty")
+    
+    def set_difficulty(self, difficulty: float) -> Optional[dict]:
+        """Set difficulty."""
+        return self._post("/api/difficulty/set", {"difficulty": difficulty})
+    
+    def adjust_difficulty(self, adjustment: float) -> Optional[dict]:
+        """Adjust difficulty by factor."""
+        return self._post("/api/difficulty/adjust", {"adjustment": adjustment})
+    
+    def build_mining_transactions(self, miner_addr: str, block_height: int) -> Optional[dict]:
+        """Build candidate transactions for mining."""
+        return self._post("/api/mining/build-transactions", {
+            "miner_address": miner_addr,
+            "block_height": block_height
+        })
+    
+    # METRICS
+    def get_metrics(self) -> Optional[dict]:
+        """Get all metrics."""
+        return self._get("/api/metrics")
+    
+    def get_metrics_all(self) -> Optional[dict]:
+        """Get comprehensive metrics."""
+        return self._get("/api/metrics/all")
+    
+    def get_lattice_metrics(self) -> Optional[dict]:
+        """Get lattice controller metrics."""
+        return self._get("/api/lattice/metrics")
+    
+    def get_entropy_stats(self) -> Optional[dict]:
+        """Get entropy/QRNG statistics."""
+        return self._get("/api/entropy/stats")
+    
+    def get_stats(self) -> Optional[dict]:
+        """Get server statistics."""
+        return self._get("/api/stats")
+    
+    # P2P / DHT
+    def get_p2p_stats(self) -> Optional[dict]:
+        """Get P2P network statistics."""
+        return self._get("/api/p2p/stats")
+    
+    def get_p2p_peers(self) -> Optional[list]:
+        """Get P2P peer list."""
+        return (self._get("/api/p2p/peers") or {}).get("peers", [])
+    
+    def p2p_peer_exchange(self, peer_info: dict) -> Optional[dict]:
+        """Peer exchange protocol."""
+        return self._post("/api/p2p/peer_exchange", peer_info)
+    
+    def p2p_discovery(self) -> Optional[dict]:
+        """Discover peers on network."""
+        return self._get("/api/p2p/discovery")
+    
+    def dht_add_peer(self, peer: dict) -> Optional[dict]:
+        """Add peer to DHT."""
+        return self._post("/api/dht/add-peer", peer)
+    
+    def dht_lookup(self, target_id: str) -> Optional[dict]:
+        """DHT lookup for target."""
+        return self._get(f"/api/dht/lookup/{target_id}")
+    
+    def dht_node_info(self) -> Optional[dict]:
+        """Get local DHT node info."""
+        return self._get("/api/dht/node")
+    
+    def dht_stats(self) -> Optional[dict]:
+        """Get DHT statistics."""
+        return self._get("/api/dht/stats")
+    
+    def dht_store(self, key: str, value: str) -> Optional[dict]:
+        """Store value in DHT."""
+        return self._post("/api/dht/state/store", {"key": key, "value": value})
+    
+    def dht_retrieve(self, key: str) -> Optional[dict]:
+        """Retrieve value from DHT."""
+        return self._get(f"/api/dht/state/retrieve/{key}")
+    
+    # HEARTBEATS / VALIDATORS
+    def send_heartbeat(self, data: dict) -> Optional[dict]:
+        """Send heartbeat to network."""
+        return self._post("/api/heartbeat", data)
+    
+    def register_validator(self, validator_data: dict) -> Optional[dict]:
+        """Register as validator."""
+        return self._post("/api/validators/register", validator_data)
+    
+    def list_validators(self) -> Optional[list]:
+        """Get list of validators."""
+        return (self._get("/api/validators") or {}).get("validators", [])
+    
+    def submit_attestation(self, attestation: dict) -> Optional[dict]:
+        """Submit validator attestation."""
+        return self._post("/api/attestations", attestation)
+    
+    def get_finality(self) -> Optional[dict]:
+        """Get finality checkpoint."""
+        return self._get("/api/finality")
+    
+    def submit_quantum_witness(self, witness: dict) -> Optional[dict]:
+        """Submit quantum witness for validation."""
+        return self._post("/api/quantum_witness", witness)
+    
+    # MEMPOOL EXTENDED
+    def get_pending_mempool(self) -> Optional[list]:
+        """Get pending transactions."""
+        return (self._get("/api/mempool/pending") or {}).get("transactions", [])
+    
+    def get_mempool_tx(self, tx_hash: str) -> Optional[dict]:
+        """Get specific mempool transaction."""
+        return self._get(f"/api/mempool/tx/{tx_hash}")
+    
+    def get_utxo_stats(self) -> Optional[dict]:
+        """Get UTXO statistics."""
+        return self._get("/api/utxo/stats")
+
+    # ── STREAMING & HEALTH ────────────────────────────────────────────────────────
+    
+    def get_health(self) -> Optional[dict]:
+        """Get server health status."""
+        return self._get("/api/health")
+    
+    def list_miners(self, limit: int = 100) -> Optional[list]:
+        """Get list of active miners."""
+        return (self._get("/api/miners", params={"limit": limit}) or {}).get("miners", [])
+    
+    def get_miners_debug(self) -> Optional[dict]:
+        """Get miner debug information."""
+        return self._get("/api/miners/debug")
+    
+    def send_miners_heartbeat(self, miner_data: dict) -> Optional[dict]:
+        """Send heartbeat as miner."""
+        return self._post("/api/miners/heartbeat", miner_data)
+
     def get_diagnostics(self) -> str:
         """Return a human-readable diagnostic report."""
         lines = []
@@ -14480,6 +14754,30 @@ class KoyebOracleState:
         if self._api is None:
             self._api = KoyebAPIClient(self.oracle_url)
 
+    def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[dict]:
+        """
+        Fetch Pyth oracle prices from server (Hermes-backed).
+        
+        Server handles the https://hermes.pyth.network fetch.
+        Client just calls local server's /api/pyth/prices endpoint.
+        
+        Returns: {
+            "snapshot_id": "sha256…",
+            "timestamp": 1234567890,
+            "hermes_ok": true,
+            "feeds": {
+                "BTC": {"price_usd": 95000.50, "confidence": 50.0, "age_seconds": 2},
+                "ETH": {"price_usd": 3400.25, "confidence": 20.0, "age_seconds": 2},
+                …
+            }
+        }
+        """
+        try:
+            return self._api.fetch_hermes_prices(symbols)
+        except Exception as e:
+            _logging.debug(f"[HERMES] price fetch failed: {e}")
+            return None
+    
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
         """SSE-only metric refresh — reads _LOCAL_ORACLE ring buffer, zero HTTP."""
         try:
@@ -19123,6 +19421,29 @@ class QtclClientApp:
                 tx_fee  = tx.get("fee") or "?"
                 tx_sig  = tx.get("signature") or tx.get("sig") or "—"
                 tx_wit  = (tx.get("witness") or {}).get("proof") or "—"
+            
+            # ── Pyth Hermes Oracle Prices ──────────────────────────
+            a(HR)
+            a("  📊 PYTH HERMES ORACLE PRICES")
+            try:
+                prices_snap = kapi.fetch_hermes_prices()
+                if prices_snap and "feeds" in prices_snap:
+                    feeds = prices_snap.get("feeds", {})
+                    hermes_ok = prices_snap.get("hermes_ok", False)
+                    snap_ts = prices_snap.get("timestamp", "?")
+                    a(f"  Status: {'✅ LIVE' if hermes_ok else '⚠️  STALE'}  Snapshot: {snap_ts}")
+                    for sym in ["BTC", "ETH", "SOL", "BNB", "AVAX"]:
+                        feed = feeds.get(sym, {})
+                        price = feed.get("price_usd", "?")
+                        conf = feed.get("confidence", "?")
+                        age = feed.get("age_seconds", "?")
+                        if price != "?":
+                            a(f"  {sym:6s} ${price:12.2f}  ±${conf:8.2f}  age:{age:3}s")
+                else:
+                    a("  (Hermes prices not available)")
+            except Exception as _he:
+                a(f"  (Hermes fetch error: {str(_he)[:50]})")
+            
                 a(f"  TX  {tx_id}")
                 a(f"      {tx_from}")
                 a(f"    → {tx_to}  amt={tx_amt}  fee={tx_fee}")
