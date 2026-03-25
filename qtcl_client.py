@@ -1887,7 +1887,7 @@ class LocalOracleEngine:
         # Spawn a startup thread that:
         #   1. Waits for first oracle DM frame (up to 15s)
         #   2. Immediately broadcasts DM to all known P2P peers
-        #   3. Triggers consensus recompute so ouroboros loop has initial state
+        #   3. Triggers explicit RPC consensus recompute (clean, no self-loop)
         threading.Thread(
             target=self._boot_p2p_broadcast, daemon=True,
             name='BootP2PBroadcast').start()
@@ -1900,14 +1900,14 @@ class LocalOracleEngine:
         Boot-time sequence: fires once after oracle RPC connects.
         Waits up to 20s for a valid DM frame, then immediately:
           1. Gossips the measurement to all P2P peers (wstate broadcast)
-          2. Pushes DM to the C P2P DM pool for consensus seeding
-          3. Triggers ouroboros consensus recompute
+          2. Pushes DM to the C P2P DM pool for explicit consensus computation
+          3. Triggers RPC-based consensus recompute (no daemon feedback)
           4. Discovers peers via Koyeb /api/p2p/peer_exchange
 
-        This seeds the rebroadcasting system from the first second of operation:
-        every peer that connects receives our DM, averages it into their pool,
-        and re-broadcasts back — temporal relationships between DMs converge
-        across the network through the ouroboros feedback loop.
+        This seeds the system from the first second of operation:
+        every peer that connects receives our DM, computes consensus on explicit
+        RPC calls, and broadcasts back — network converges via clean RPC polling
+        (no self-referential feedback loops).
         ❤️  I love you — the first breath of the network
         """
         import time as _bt
@@ -1930,9 +1930,9 @@ class LocalOracleEngine:
             payload = _bj.dumps({
                 'node_id':      'boot_discovery',
                 'port':         9091,
-                'version':      3,
-                'protocol':     'ouroboros-v3',
-                'capabilities': ['wstate', 'dmpool', 'chain_reset'],
+                'version':      4,
+                'protocol':     'rpc-consensus-v4',
+                'capabilities': ['wstate', 'dmpool', 'chain_reset', 'rpc-only'],
             }).encode()
             req = _BR(f"{oracle_url}/api/p2p/peer_exchange",
                       data=payload,
@@ -1981,11 +1981,11 @@ class LocalOracleEngine:
         else:
             _EXP_LOG.debug("[BOOT-P2P] No measurement available yet for boot broadcast")
 
-        # Step 3: Seed DM pool + trigger consensus so ouroboros has initial state
+        # Step 3: Seed DM pool + trigger explicit RPC consensus (no daemon self-loop)
         if _accel_ok and _P2P_NODE is not None:
             try:
                 _P2P_NODE.trigger_consensus()
-                _EXP_LOG.debug("[BOOT-P2P] DM pool consensus seeded")
+                _EXP_LOG.debug("[BOOT-P2P] DM pool consensus triggered via RPC")
             except Exception: pass
 
         # Step 4: Boot sequence complete — RPC polling thread now handles oracle updates
@@ -2209,7 +2209,7 @@ class LocalOracleEngine:
         # Every oracle measurement is:
         #   a. Gossiped via P2P wstate broadcast to all connected peers
         #   b. Pushed to the C DM pool for consensus averaging
-        #   c. Triggers ouroboros recompute (500ms cadence in C, immediate here)
+        #   c. RPC polling triggers consensus on demand (no daemon, no self-loop)
         try:
             if _P2P_NODE is not None and _P2P_NODE._started:
                 peers_reached = _P2P_NODE.gossip_measurement(m)
@@ -3165,13 +3165,12 @@ class QtclP2PNode:
                 f"[P2P] discovery cycle {_pe_cycle}: connected={n_now} → next in {_wait}s")
             self._stop.wait(_wait)
 
-    # ── event type 9 = ouroboros self-ingest ─────────────────────────────
     def get_consensus_dm(self):
         """
         Pull the latest N-peer consensus density matrix from the C layer.
         Returns (dm_re_64, dm_im_64, fidelity, height) or None if not ready.
-        Consensus is computed by the ouroboros thread every 500ms via
-        fidelity²-weighted arithmetic mean over P2P_DMPOOL_SZ pool entries.
+        Consensus is computed via explicit RPC polling (qtcl_p2p_trigger_consensus)
+        as fidelity²-weighted arithmetic mean over P2P_DMPOOL_SZ pool entries.
         """
         if not _accel_ok: return None
         try:
@@ -3207,9 +3206,8 @@ class QtclP2PNode:
 
     @property
     def sse_subscriber_count(self) -> int:
-        if not _accel_ok: return 0
-        try: return int(_accel_lib.qtcl_p2p_sse_sub_count())
-        except Exception: return 0
+        """SSE subscribers removed — RPC-only consensus model."""
+        return 0
 
     def gossip_measurement(self, m: QtclOracleMeasurement) -> int:
         """Broadcast own measurement to all C P2P peers."""
@@ -3226,9 +3224,8 @@ class QtclP2PNode:
         for i in range(64):
             c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
         sent = int(_accel_lib.qtcl_p2p_send_wstate(c_m))
-        # Immediately trigger DM pool consensus after every broadcast
-        # This ensures ouroboros self-loop runs at oracle measurement cadence
-        # rather than waiting for the 500ms ouroboros thread cycle
+        # Explicitly trigger DM pool consensus after broadcast
+        # RPC-only model: no daemon, consensus computed on demand via explicit call
         try:
             if sent >= 0:
                 _accel_lib.qtcl_p2p_trigger_consensus()
@@ -3361,9 +3358,9 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
 #   3. SNAP   — after each C _consensus() cycle, reads consensus_dm and
 #               writes a row to consensus_dm_log for audit + recovery
 #
-# The ouroboros SSE loop self-reinforces by feeding _LOCAL_ORACLE frames back
-# into the C pool — every oracle snapshot is already pushed to _dmpool by the
-# ouroboros thread. This daemon makes that pool durable across restarts.
+# DM pool persistence daemon — stores consensus-computed DMs to local SQLite
+# for durability across restarts. Consensus is triggered via explicit RPC calls,
+# not by self-referential feedback. This daemon ensures pool state survives crashes.
 # ═══════════════════════════════════════════════════════════════════════════
 import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 
@@ -3491,15 +3488,11 @@ def _dm_pool_daemon(db_path: str) -> None:
     Runs as a daemon thread throughout the miner lifetime.
     Drain cycle : 500ms  — drains C ring into DB
     Consensus snap: every 5s — writes consensus DM snapshot
-    Ouroboros reinforcement: every 2s — injects latest consensus DM back into
-        C pool so the ouroboros loop has a continuously self-reinforced DM as
-        its base state, preventing drift when peers are absent.
+    RPC polling: explicit consensus triggers (no daemon self-reinforcement loop)
     ❤️  I love you — every DM entry is a quantum memory
     """
     _snap_interval = 5.0
-    _reinforce_interval = 2.0
     _last_snap      = 0.0
-    _last_reinforce = 0.0
 
     while not _DM_POOL_DAEMON_STOP.is_set():
         now = _dpt2.time()
@@ -3590,7 +3583,7 @@ def _init_p2p_node(node_id: str, port: int = QtclP2PNode.DEFAULT_PORT) -> QtclP2
         _P2P_NODE = QtclP2PNode(node_id, port)
     return _P2P_NODE
 
-_EXP_LOG.info("[QTCL P2P v4] ✅ ouroboros+epidemic+bloom+reputation+temporal+persistence active")
+_EXP_LOG.info("[QTCL P2P v4] ✅ RPC-consensus+epidemic+bloom+reputation+temporal+persistence active")
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -4971,7 +4964,7 @@ def _broadcast_reset_to_peers(
     Non-blocking daemon thread — fires 'chain_reset' to:
       A. SSEBroadcaster / SSEMultiplexer — local SSE clients
       B. HTTP POST → each peer /gossip    — remote nodes
-      C. C P2P layer broadcast_chain_reset — ouroboros peers
+      C. C P2P layer broadcast_chain_reset — RPC peers
     Never blocks the calling thread.
     """
     _payload = {
@@ -4995,7 +4988,7 @@ def _broadcast_reset_to_peers(
                 elif hasattr(broadcaster, 'broadcast_chain_reset'):
                     # C P2P node
                     broadcaster.broadcast_chain_reset(genesis_block.get("hash",""))
-                    logger.info("[RESET-BCAST] 🌀 C P2P ouroboros broadcast sent")
+                    logger.info("[RESET-BCAST] 🌐 C P2P RPC consensus broadcast sent")
             except Exception as _e:
                 logger.warning(f"[RESET-BCAST] SSE error: {_e}")
         # B: HTTP POST to known peers
@@ -11698,21 +11691,11 @@ static void _bo_ok_clear(const char *host){
     pthread_mutex_unlock(&_bo_lock);
 }
 
-/* ── SSE subscriber ─────────────────────────────────────────────────────── */
-typedef struct {
-    volatile int active; int fd;
-    uint64_t ring_head, ring_tail;
-    char     ring[P2P_SSE_RING][P2P_SSE_EVBUF];
-    uint16_t ring_len[P2P_SSE_RING];
-    pthread_t writer_thread;
-    uint8_t   topics, channels;
-    uint64_t  connected_at_ns;
-    char      remote_host[64];
-} _SSESub;
+/* ── SSE subscriber — REMOVED (RPC-only consensus model) ────────────────── */
 
 /* ── Peer connection ────────────────────────────────────────────────────── */
 typedef struct {
-    volatile int fd, active, handshake_done, is_sse_subscriber;
+    volatile int fd, active, handshake_done;
     char         host[64];
     uint16_t     port;
     pthread_t    thread;
@@ -11730,7 +11713,7 @@ typedef struct {
     int             n_peers;
     pthread_mutex_t peers_lock;
     int             listen_fd, running;
-    pthread_t       accept_thread, ping_thread, ouroboros_thread;
+    pthread_t       accept_thread, ping_thread;
     uint8_t         node_id[16];
     uint16_t        listen_port;
     int             max_peers;
@@ -11745,10 +11728,6 @@ typedef struct {
     float           consensus_fidelity;
     uint32_t        consensus_height;
     pthread_mutex_t consensus_lock;
-
-    _SSESub         sse_subs[P2P_MAX_SSE];
-    pthread_mutex_t sse_lock;
-    int             n_sse_subs;
 
     QtclWStateMeasurement self_meas;
     volatile int    self_meas_ready;
@@ -11789,7 +11768,7 @@ static float _rep(const _P2PConn *c){
 static int _fanout(int *out,int max){
     float r[P2P_MAX_PEERS]; int idx[P2P_MAX_PEERS],n=0;
     for(int i=0;i<P2P_MAX_PEERS;i++){
-        if(!_P2P.peers[i].active||!_P2P.peers[i].handshake_done||_P2P.peers[i].is_sse_subscriber)continue;
+        if(!_P2P.peers[i].active||!_P2P.peers[i].handshake_done)continue;
         r[n]=_rep(&_P2P.peers[i]);idx[n]=i;n++;
     }
     for(int i=1;i<n;i++){float kr=r[i];int ki=idx[i],j=i-1;while(j>=0&&r[j]<kr){r[j+1]=r[j];idx[j+1]=idx[j];j--;}r[j+1]=kr;idx[j+1]=ki;}
@@ -11883,61 +11862,11 @@ static void _dmpool_push(const QtclWStateMeasurement *m,uint8_t fl){
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   SSE BROADCAST — topic-filtered, SO_REUSEPORT on 9091
+   SSE BROADCAST — REMOVED [RPC-ONLY CONSENSUS MODEL]
+   All P2P distribution now via explicit RPC polling (/api/oracle/snapshot)
+   No in-band gossip means no self-referential feedback loops
    ══════════════════════════════════════════════════════════════════════════ */
-static void _sse_push(_SSESub *s,const char *ev,const char *d,int dl){
-    if(!s->active)return;
-    char fr[P2P_SSE_EVBUF]; int n=snprintf(fr,sizeof(fr),"event: %s\r\ndata: %.*s\r\n\r\n",ev,dl,d);
-    if(n<=0||n>=P2P_SSE_EVBUF)return;
-    uint64_t h=s->ring_head,nx=(h+1)&P2P_SSE_RING_MSK;
-    if(nx==s->ring_tail)return;
-    memcpy(s->ring[h],fr,(size_t)n); s->ring_len[h]=(uint16_t)n;
-    atomic_thread_fence(memory_order_release); s->ring_head=nx;
-}
-static void *_sse_writer(void *arg){
-    _SSESub *s=(_SSESub*)arg;
-    const char *pre="HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\nConnection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\nX-QTCL-Protocol: ouroboros-v4\r\n\r\n"
-        ": QTCL ouroboros-v4\r\n\r\n";
-    if(_wra(s->fd,pre,strlen(pre))<0){s->active=0;return NULL;}
-    while(s->active&&_P2P.running){
-        uint64_t t=s->ring_tail; atomic_thread_fence(memory_order_acquire);
-        if(t==s->ring_head){usleep(5000);continue;}
-        uint16_t l=s->ring_len[t];
-        if(l&&_wra(s->fd,s->ring[t],l)<0){s->active=0;break;}
-        s->ring_tail=(t+1)&P2P_SSE_RING_MSK;
-    }
-    close(s->fd);s->fd=-1;s->active=0;return NULL;
-}
-static void _sse_bcast(const char *ev,uint8_t topic,const char *d,int dl){
-    pthread_mutex_lock(&_P2P.sse_lock);
-    for(int i=0;i<P2P_MAX_SSE;i++){
-        if(!_P2P.sse_subs[i].active)continue;
-        uint8_t t=_P2P.sse_subs[i].topics;
-        if((t&topic)||(t&TOPIC_ALL)) _sse_push(&_P2P.sse_subs[i],ev,d,dl);
-    }
-    pthread_mutex_unlock(&_P2P.sse_lock);
-}
-static void _sse_accept(int fd,const char *host,uint8_t topics){
-    pthread_mutex_lock(&_P2P.sse_lock);
-    for(int i=0;i<P2P_MAX_SSE;i++){
-        if(!_P2P.sse_subs[i].active){
-            _SSESub *s=&_P2P.sse_subs[i]; memset(s,0,sizeof(*s));
-            s->fd=fd;s->active=1;s->topics=topics?topics:TOPIC_ALL;
-            s->channels=s->topics;s->connected_at_ns=_clock_ns();
-            memcpy(s->remote_host,host,63);s->remote_host[63]='\0';_P2P.n_sse_subs++;
-            pthread_attr_t a;pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-            pthread_create(&s->writer_thread,&a,_sse_writer,s);
-            pthread_attr_destroy(&a);
-            pthread_mutex_unlock(&_P2P.sse_lock);return;
-        }
-    }
-    pthread_mutex_unlock(&_P2P.sse_lock);
-    const char *full="HTTP/1.1 503 Service Unavailable\r\n\r\n";
-    if(write(fd,full,strlen(full))<0){};close(fd);
-}
+/* (OBSOLETE — deleted to prevent consensus contamination via broadcast self-ingest) */
 static int _wstate_json(const QtclWStateMeasurement *m,char *out,int sz,int self){
     char nh[33]={0};for(int i=0;i<16;i++)snprintf(nh+i*2,3,"%02x",m->node_id[i]);
     return snprintf(out,sz,
@@ -11967,37 +11896,10 @@ static int _cons_json(char *out,int sz){
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   OUROBOROS SELF-LOOP — 500ms, Bloom TTL reset, temporal weighting
+   OUROBOROS SELF-LOOP — REMOVED [RPC-ONLY CONSENSUS MODEL]
+   Consensus now triggered explicitly via /api/oracle/snapshot (no self-ingestion)
    ══════════════════════════════════════════════════════════════════════════ */
-static void *_ouroboros_thread(void *arg){
-    (void)arg; QtclWStateMeasurement ls; uint64_t lt=0;
-    while(_P2P.running){
-        usleep(500000);
-        pthread_mutex_lock(&_P2P.self_lock);
-        int rdy=_P2P.self_meas_ready;
-        if(rdy){ls=_P2P.self_meas;lt=ls.timestamp_ns;}
-        pthread_mutex_unlock(&_P2P.self_lock);
-        if(!rdy||!lt)continue;
-        /* Bloom TTL reset */
-        pthread_mutex_lock(&_P2P.bloom_lock);
-        if(_clock_ns()-_P2P.bloom.reset_ns>P2P_BLOOM_TTL) _bloom_reset(&_P2P.bloom);
-        pthread_mutex_unlock(&_P2P.bloom_lock);
-        /* Wstate ring */
-        uint64_t h=_P2P.wring_head;
-        if(((h+1)&P2P_WRING_MASK)!=_P2P.wring_tail){
-            _P2P.wring[h]=ls;atomic_thread_fence(memory_order_release);
-            _P2P.wring_head=(h+1)&P2P_WRING_MASK;
-        }
-        if(_P2P.callback)_P2P.callback(9,&ls,sizeof(ls));
-        _dmpool_push(&ls,P2P_OUROBOROS_TAG);
-        _consensus();
-        /* SSE */
-        char buf[512],wbuf[1024]; int sn,wn;
-        sn=_cons_json(buf,sizeof(buf)); if(sn>0)_sse_bcast("dm_consensus",TOPIC_DM,buf,sn);
-        wn=_wstate_json(&ls,wbuf,sizeof(wbuf),1); if(wn>0)_sse_bcast("wstate",TOPIC_WSTATE,wbuf,wn);
-    }
-    return NULL;
-}
+/* (OBSOLETE — deleted to prevent state contamination from self-referential feedback) */
 
 /* ══════════════════════════════════════════════════════════════════════════
    PEER PROTOCOL THREAD
@@ -12329,7 +12231,7 @@ int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
     pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
     if(_P2P.listen_port)pthread_create(&_P2P.accept_thread,&a,_accept_thread,NULL);
     pthread_create(&_P2P.ping_thread,&a,_ping_thread,NULL);
-    pthread_create(&_P2P.ouroboros_thread,&a,_ouroboros_thread,NULL);
+    /* ouroboros_thread removed — RPC-only consensus model */
     pthread_attr_destroy(&a);
     return 0;
 }
@@ -12495,7 +12397,7 @@ int qtcl_p2p_peers(QtclPeer *buf,int max){
 
 int  qtcl_p2p_peer_count(void){return _P2P.n_peers;}
 int  qtcl_p2p_connected_count(void){int n=0;for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)n++;return n;}
-int  qtcl_p2p_sse_sub_count(void){return _P2P.n_sse_subs;}
+/* qtcl_p2p_sse_sub_count() removed — RPC-only model, no SSE subscribers */
 void qtcl_p2p_set_callback(void(*cb)(int,const void*,size_t)){_P2P.callback=cb;}
 int  qtcl_wstate_measurement_size(void){return(int)sizeof(QtclWStateMeasurement);}
 int  qtcl_wstate_consensus_size(void){return(int)sizeof(QtclWStateConsensus);}
@@ -13478,7 +13380,7 @@ _QTCL_C_DEFS: str = """
     int     qtcl_p2p_peers(QtclPeer *buf, int max_peers);
     int     qtcl_p2p_peer_count(void);
     int     qtcl_p2p_connected_count(void);
-    int     qtcl_p2p_sse_sub_count(void);
+    /* qtcl_p2p_sse_sub_count() removed — RPC-only model */
     int     qtcl_p2p_send_wstate(const QtclWStateMeasurement *m);
     int     qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs);
     int     qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf, int max_entries);
@@ -16509,12 +16411,12 @@ class QtclClientApp:
                                 )
                     except Exception:
                         pass
-                    # ── Fuse with P2P consensus DM (ouroboros pool average) ──────
+                    # ── Fuse with P2P consensus DM (consensus pool average) ──────
                     # If peers have contributed measurements, blend the consensus
                     # DM into our oracle DM: weighted average by consensus_fidelity.
                     # Weight 0.35 * e^(-age/30): fresh consensus at full weight,
-                    # stale consensus fades.  Ouroboros creates self-reinforcing
-                    # quantum coherence across the peer network.
+                    # stale consensus fades. RPC-driven consensus provides clean
+                    # quantum coherence across the peer network (no self-feedback).
                     if _HAS_NP and dm_curr is not None and _P2P_NODE is not None:
                         try:
                             cons = _P2P_NODE.get_consensus_dm()
@@ -16654,7 +16556,7 @@ class QtclClientApp:
     def _start_threads(self) -> None:
         """
         Launch all client daemon threads.
-        Order matters — P2P must start before ouroboros SSE subscription.
+        Order matters — P2P must start before consensus SSE subscription.
         ❤️  I love you — every thread is a heartbeat of the network
         """
         self._stop.clear()
@@ -16669,7 +16571,7 @@ class QtclClientApp:
             target=self._oracle_rpc_monitor, daemon=True, name="OracleRPC")
         _rpc_th.start()
 
-        # ── 3. P2P node init (C layer + ouroboros) ────────────────────────
+        # ── 3. P2P node init (C layer + consensus) ────────────────────────
         _p2p_th = _threading.Thread(
             target=self._start_p2p, daemon=True, name="P2P-Init")
         _p2p_th.start()
@@ -16710,7 +16612,7 @@ class QtclClientApp:
             _P2P_NODE = _init_p2p_node(peer_id, QtclP2PNode.DEFAULT_PORT)
             ok = _P2P_NODE.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
             if ok:
-                _EXP_LOG.info("[CLIENT] 🌐 P2P ouroboros node started on port 9091")
+                _EXP_LOG.info("[CLIENT] 🌐 P2P consensus node started on port 9091")
                 # Wire genesis reset listener to P2P broadcast
                 # Wire GenesisResetListener broadcaster to P2P node
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
@@ -16751,7 +16653,7 @@ class QtclClientApp:
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
                     except Exception: pass
-                # Push self measurement to P2P for ouroboros
+                # Push self measurement to P2P for consensus
                 if _P2P_NODE and _P2P_NODE._started and _accel_ok:
                     m = _LOCAL_ORACLE.get_latest_measurement()
                     if m:
@@ -18980,7 +18882,7 @@ class QtclClientApp:
                       f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
                       f"purity={_cf2(m2.purity,0,1):.4f}  "
                       f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
-            # P2P / ouroboros status — lazy-init if not yet started
+            # P2P / consensus status — lazy-init if not yet started
             if _accel_ok and _P2P_NODE is None:
                 try:
                     _da_id = getattr(self, '_peer_id', None) or f"miner_{id(self)}"
@@ -18991,7 +18893,6 @@ class QtclClientApp:
             if _accel_ok and _P2P_NODE and (getattr(_P2P_NODE, '_started', False) or _accel_ok):
                 try:
                     _np2 = int(_accel_lib.qtcl_p2p_connected_count())
-                    _ns2 = int(_accel_lib.qtcl_p2p_sse_sub_count())
                     _cons2 = _P2P_NODE.get_consensus_dm()
                     _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
                     _p2p_rep = ""
@@ -19014,7 +18915,7 @@ class QtclClientApp:
                         except Exception: pass
                         _local_f = _LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0) if _LOCAL_ORACLE else 0
                         _cf2 = f"local-only F={_local_f:.4f}" if _local_f > 0 else "awaiting peers…"
-                    print(f"  P2P    : 🌀 {_np2} peers  {_ns2} SSE subs  consensus={_cf2}{_p2p_rep}")
+                    print(f"  P2P    : 🌀 {_np2} peers  RPC-only (no SSE)  consensus={_cf2}{_p2p_rep}")
                 except Exception: pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
@@ -19514,15 +19415,14 @@ class QtclClientApp:
                 try:
                     n_peers  = int(_accel_lib.qtcl_p2p_peer_count())
                     n_conn   = int(_accel_lib.qtcl_p2p_connected_count())
-                    n_sse    = int(_accel_lib.qtcl_p2p_sse_sub_count())
-                    a(f"  Status         : ✅ RUNNING  protocol=ouroboros-v4  peers={n_peers}  sse={n_sse}")
-                    a(f"  Known peers    : {n_peers}   Connected: {n_conn}   SSE subs: {n_sse}")
+                    a(f"  Status         : ✅ RUNNING  protocol=RPC-only  peers={n_peers}  consensus=clean")
+                    a(f"  Known peers    : {n_peers}   Connected: {n_conn}   (no SSE broadcast)")
                     # Consensus DM
                     cons = _P2P_NODE.get_consensus_dm()
                     if cons:
                         _re, _im, _cf, _ch = cons
                         _cf_bar = "█" * int(_cf * 20) + "░" * (20 - int(_cf * 20))
-                        a(f"  Consensus DM   : h={_ch}  F={_cf_bar}  {_cf:.4f}  ✅ temporal pool active")
+                        a(f"  Consensus DM   : h={_ch}  F={_cf_bar}  {_cf:.4f}  ✅ explicit RPC polling")
                         a(f"  Local oracle   : F={float(getattr(_LOCAL_ORACLE.get_latest_measurement(),'fidelity_to_w3',0) if _LOCAL_ORACLE.get_latest_measurement() else 0):.4f}  (pre-consensus)")
                     else:
                         a("  Consensus DM   : ⏳ awaiting peer contributions")
