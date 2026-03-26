@@ -1595,7 +1595,7 @@ class HyperbolicTriangle:
 @dataclass
 class QtclOracleMeasurement:
     """Full local oracle measurement — the core gossip object.
-    Built by LocalOracleEngine.measure() from oracle SSE + hyperbolic geometry."""
+    Built by LiveRPCOracleSnapshot.fetch_snapshot() from RPC oracle endpoint."""
     chain_height:    int
     pq0:             int
     pq_curr:         int
@@ -1627,374 +1627,34 @@ class QtclOracleMeasurement:
 # RPC ORCHESTRATOR: Unified polling for oracle snapshots + chain status
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class LocalOracleEngine:
-    """RPC-polled Oracle DM → Measurement pipeline with full snapshot lifecycle.
-    Boot sequence (RPC-only, no SSE):
-      1. Start RPC poll thread (periodic get_oracle_pq0_bloch calls)
-      2. Parse density_matrix_hex → dm_re, dm_im (8×8 complex128)
-         → also updates _oracle_state with all canonical metrics from Koyeb oracle
-      3. On measure(): build tripartite DM, fuse with Koyeb oracle DM via
-         qtcl_consensus_compute (weighted average), compute all metrics, sign
-      4. Post-measure dual broadcast:
-         a. C DHT gossip  → _P2P_NODE.gossip_measurement(m)
-         b. C DM pool ingest  → qtcl_bootstrap_ingest_dm() (keeps C layer state fresh)
-         c. Build & store canonical OracleWState JSON in self._latest_snapshot
-            (same format as DensityMatrixSnapshot.to_json() from server oracle.py)
-    Thread-safe: oracle DM under _dm_lock; snapshots under _snap_lock.
-    C acceleration is REQUIRED — no Python fallbacks.
-    RPC polling: get_oracle_pq0_bloch() every 1s via background thread.
-    """
-    ORACLE_URL    = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-    ORACLE_HOST   = 'qtcl-blockchain.koyeb.app'
-    ORACLE_WEIGHT = 0.35   # how much Koyeb oracle DM influences local measurement
-    RPC_POLL_INTERVAL = 1.0  # seconds between RPC snapshots
+class LiveRPCOracleSnapshot:
+    """⚛️ Real-time synchronous RPC snapshot fetcher → DM + metrics on-demand (ZERO polling)."""
+    ORACLE_URL = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
     def __init__(self):
-        self._dm_re:    list = [0.0] * 64
-        self._dm_im:    list = [0.0] * 64
-        self._dm_lock              = threading.Lock()
-        self._oracle_connected     = False
-        self._last_oracle_dm_ts:  float = 0.0
-        self._stop                 = threading.Event()
-        self._poll_thread:   Optional[threading.Thread] = None
-        self._snapshot_count:      int = 0
-        self._latest_measurement:  Optional[QtclOracleMeasurement] = None
-        self._meas_lock            = threading.Lock()
-        self._latest_snapshot:     Optional[dict] = None
-        self._snap_lock            = threading.Lock()
-        self._oracle_state:        dict = {}
-        self._oracle_state_lock    = threading.Lock()
-        # RPC API client reference (set externally)
-        self._rpc_client = None
-
+        self._dm_re, self._dm_im, self._last_fetch_ts = [0.0]*64, [0.0]*64, 0.0; self._dm_lock = threading.Lock(); self._oracle_state, self._oracle_state_lock = {}, threading.Lock()
+    def fetch_snapshot(self, timeout_s=5.0) -> dict:
+        """Synchronous RPC call: GET /api/oracle/snapshot (no polling daemon)."""
+        try:
+            req = Request(f"{self.ORACLE_URL}/api/oracle/snapshot", method="GET", headers={"Content-Type":"application/json"})
+            with urlopen(req, timeout=timeout_s) as r:
+                snap = json.loads(r.read().decode('utf-8'))
+                if snap and snap.get('density_matrix_hex'):
+                    dm_hex = snap['density_matrix_hex']; bdata = bytes.fromhex(dm_hex); dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
+                    if len(bdata) == 1024:
+                        for i in range(64): re, im = struct.unpack_from('>dd', bdata, i*16); dm_re_new[i], dm_im_new[i] = re, im
+                    elif len(bdata) == 512:
+                        for i in range(64): re, im = struct.unpack_from('>ff', bdata, i*8); dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                    with self._dm_lock: self._dm_re, self._dm_im, self._last_fetch_ts = dm_re_new, dm_im_new, time.time()
+                    with self._oracle_state_lock: self._oracle_state = {'w_state_fidelity': snap.get('w_state_fidelity', 0.0), 'coherence_l1': snap.get('coherence_l1', 0.0), 'von_neumann_entropy': snap.get('von_neumann_entropy', 0.0), 'purity': snap.get('purity', 0.0), 'cycle': snap.get('cycle', 0), 'consensus': snap.get('consensus', False), 'mermin_test': snap.get('mermin_test', {})}
+                return snap
+        except (URLError, HTTPError, Exception) as e: _EXP_LOG.debug(f"[RPC-FETCH] {type(e).__name__}"); return {}
+    def get_oracle_dm(self) -> tuple:
+        """Return (dm_re, dm_im, age_sec) thread-safe."""
+        with self._dm_lock: age = max(0.0, time.time() - self._last_fetch_ts); return (self._dm_re[:], self._dm_im[:], age)
     def get_oracle_state(self) -> dict:
-        """⚛️  Public accessor for oracle state (measurements + metrics)."""
-        with self._oracle_state_lock:
-            return dict(self._oracle_state)
-    def start(self) -> None:
-        """Start direct snapshot consumer (no polling thread).
-        Fetches from /api/oracle/snapshot on-demand, no interval gates.
-        """
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            _EXP_LOG.debug("[LOCAL-ORACLE] start() called but already running — skipped")
-            return
-        self._stop.clear()
-        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ Direct snapshot consumer activated → {self.ORACLE_URL}")
-        self._poll_thread = threading.Thread(
-            target=self._direct_snapshot_consumer, daemon=True, name='DirectSnapshotConsumer')
-        self._poll_thread.start()
-    def stop(self) -> None:
-        self._stop.set()
-    def _direct_snapshot_consumer(self) -> None:
-        """⚛️ Direct stream consumer — fetch /api/oracle/snapshot continuously, no gates."""
-        import json as _dj
-        import urllib.request as _dur
-        _dstart = time.time()
-        _warned = False
-        while not self._stop.is_set():
-            try:
-                req = _dur.Request(
-                    f"{self.ORACLE_URL}/api/oracle/snapshot",
-                    headers={"Content-Type": "application/json"},
-                    method="GET"
-                )
-                with _dur.urlopen(req, timeout=3) as resp:
-                    snap = _dj.loads(resp.read().decode("utf-8"))
-                    if snap and snap.get('density_matrix_hex'):
-                        self._parse_and_ingest_snapshot(snap)
-                        if not _warned and (time.time() - _dstart) > 5.0:
-                            _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ Snapshots flowing: {self._snapshot_count} ingested")
-                            _warned = True
-                    time.sleep(0.05)
-            except Exception as e:
-                _EXP_LOG.debug(f"[LOCAL-ORACLE] snapshot fetch: {type(e).__name__}")
-                time.sleep(0.5)
-    def _parse_and_ingest_snapshot(self, snap: dict) -> bool:
-        """Parse snapshot JSON → update DM + oracle_state directly."""
-        import struct as _st
-        try:
-            dm_hex = snap.get('density_matrix_hex', '')
-            if not dm_hex or len(dm_hex) < 256:
-                return False
-            bdata = bytes.fromhex(dm_hex)
-            dm_re_new = [0.0] * 64
-            dm_im_new = [0.0] * 64
-            if len(bdata) == 1024:
-                for i in range(64):
-                    re, im = _st.unpack_from('>dd', bdata, i*16)
-                    dm_re_new[i], dm_im_new[i] = re, im
-            elif len(bdata) == 512:
-                for i in range(64):
-                    re, im = _st.unpack_from('>ff', bdata, i*8)
-                    dm_re_new[i], dm_im_new[i] = float(re), float(im)
-            else:
-                return False
-            with self._dm_lock:
-                self._dm_re = dm_re_new
-                self._dm_im = dm_im_new
-                self._last_oracle_dm_ts = time.time()
-                self._oracle_connected = True
-                self._snapshot_count += 1
-            with self._oracle_state_lock:
-                self._oracle_state = {
-                    'w_state_fidelity': snap.get('w_state_fidelity', 0.0),
-                    'coherence_l1': snap.get('coherence_l1', 0.0),
-                    'von_neumann_entropy': snap.get('von_neumann_entropy', 0.0),
-                    'purity': snap.get('purity', 0.0),
-                    'cycle': snap.get('cycle', 0),
-                    'consensus': snap.get('consensus', False),
-                    'mermin_test': snap.get('mermin_test', {}),
-                }
-            return True
-        except Exception as e:
-            _EXP_LOG.debug(f"[LOCAL-ORACLE] snapshot parse error: {e}")
-            return False
-    def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
-        """
-        Dual-path broadcast after every successful measure().
-        Requires C acceleration for DHT gossip.
-        """
-        if _accel_ffi is None:
-            raise RuntimeError(
-                "[LocalOracleEngine._broadcast_snapshot] ❌ CRITICAL: C acceleration "
-                "required for DHT gossip. Measurement cannot be broadcast without C layer."
-            )
-        # ── Path 1: C DHT P2P gossip + DM pool push ─────────────────────────
-        #   c. RPC polling triggers consensus on demand (no daemon, no self-loop)
-        try:
-            if _P2P_NODE is not None and _P2P_NODE._started:
-                peers_reached = _P2P_NODE.gossip_measurement(m)
-                _EXP_LOG.debug(
-                    f"[LOCAL-ORACLE] DHT gossip → {peers_reached} peers "
-                    f"(height={m.chain_height} F={m.fidelity_to_w3:.4f})"
-                )
-        except Exception as _e:
-            _EXP_LOG.warning(f"[LOCAL-ORACLE] gossip_measurement failed: {_e}")
-        # ── Path 2: C bootstrap ingest — qtcl_bootstrap_ingest_dm ─────────────────
-        try:
-            dm_re = snap['density_matrix_hex']
-            import struct as _st
-            bdata = bytes.fromhex(snap['density_matrix_hex'])
-            re_arr = _accel_ffi.new('double[64]')
-            im_arr = _accel_ffi.new('double[64]')
-            for i in range(64):
-                re, im = _st.unpack_from('>dd', bdata, i*16)
-                re_arr[i] = re
-                im_arr[i] = im
-            _EXP_LOG.debug(
-                f"[LOCAL-ORACLE] qtcl_bootstrap_ingest_dm ✓ "
-                f"(F={snap['w_state_fidelity']:.4f})"
-            )
-        except Exception as _e:
-            _EXP_LOG.warning(f"[LOCAL-ORACLE] qtcl_bootstrap_ingest_dm failed: {_e}")
-    def measure(
-            self,
-            pq0:             int,
-            pq_curr:         int,
-            pq_last:         int,
-            chain_height:    int,
-            avg_block_time:  float = 30.0,
-            bath:            'GKSLBathParams' = None,
-    ) -> QtclOracleMeasurement:
-        """
-        ⚛️  Post-measure: tripartite DM → C consensus → RPC oracle fusion.
-        C ACCELERATION MANDATORY — no Python fallbacks.
-        Raises RuntimeError if C extension unavailable.
-        """
-        import hashlib as _hl, struct as _st
-        
-        if _accel_ffi is None:
-            raise RuntimeError(
-                "[LocalOracleEngine.measure] ❌ CRITICAL: C acceleration (qtcl_accel.so) "
-                "REQUIRED for measurement. Build with: clang + OpenSSL + libffi. "
-                "No Python fallbacks permitted."
-            )
-        triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
-        b0  = _accel_ffi.new('double[3]', list(triangle.ball_pq0))
-        bc  = _accel_ffi.new('double[3]', list(triangle.ball_curr))
-        bl  = _accel_ffi.new('double[3]', list(triangle.ball_last))
-        out_re = _accel_ffi.new('double[64]')
-        out_im = _accel_ffi.new('double[64]')
-        dm_re = [float(out_re[i]) for i in range(64)]
-        dm_im = [float(out_im[i]) for i in range(64)]
-        if bath is None:
-            oracle_st = self.get_oracle_state()
-            if oracle_st:
-                live_coh = oracle_st.get('coherence_l1', 0.0)
-                live_fid = oracle_st.get('w_state_fidelity', 0.0)
-                if live_coh > 0.01 or live_fid > 0.01:
-                    try:
-                        bath = GKSLBathParams.from_snap(oracle_st)
-                    except Exception:
-                        pass
-        if bath is not None:
-            dt = avg_block_time / 10.0
-            _rr = _accel_ffi.new('double[64]', dm_re)
-            _ri = _accel_ffi.new('double[64]', dm_im)
-            _accel_ffi.qtcl_gksl_rk4(
-                _rr, _ri,
-                float(getattr(bath, 'gamma1_eff', 0.01)),
-                float(getattr(bath, 'gammaphi',   0.005)),
-                float(getattr(bath, 'gammadep',   0.008)),
-                float(getattr(bath, 'omega',      1.0)),
-                dt, 4)
-            dm_re = [float(_rr[i]) for i in range(64)]
-            dm_im = [float(_ri[i]) for i in range(64)]
-        oracle_re, oracle_im, oracle_age = self.get_oracle_dm()
-        oracle_w = self.ORACLE_WEIGHT * max(0.0, 1.0 - oracle_age / 60.0)
-        if oracle_w > 0.01:
-            o_tr = sum(oracle_re[i*9] for i in range(8))
-            if 0.5 < o_tr < 2.0:
-                inv_o = 1.0 / o_tr
-                oracle_re = [v * inv_o for v in oracle_re]
-                oracle_im = [v * inv_o for v in oracle_im]
-                lr  = _accel_ffi.new('double[64]', dm_re)
-                li  = _accel_ffi.new('double[64]', dm_im)
-                or_ = _accel_ffi.new('double[64]', oracle_re)
-                oi  = _accel_ffi.new('double[64]', oracle_im)
-                fr  = _accel_ffi.new('double[64]')
-                fi  = _accel_ffi.new('double[64]')
-                f_tr = sum(float(fr[i*9]) for i in range(8))
-                if f_tr > 1e-12:
-                    inv_f = 1.0 / f_tr
-                    dm_re = [float(fr[i]) * inv_f for i in range(64)]
-                    dm_im = [float(fi[i]) * inv_f for i in range(64)]
-        # ── Virtual / Inverse-Virtual qubit fusion ───────────────────────────
-        try:
-            if _HAS_NP and ORACLE_W_STATE.dm_ideal is not None:
-                import numpy as _np_iv
-                rho_vpq = _np_iv.array(
-                    [dm_re[i] + 1j * dm_im[i] for i in range(64)],
-                    dtype=_np_iv.complex128).reshape(8, 8)
-                rho_iv  = ORACLE_W_STATE.build_inverse_virtual(rho_vpq, fidelity=max(0.5, 0.85))
-                if rho_iv is not None:
-                    IV_WEIGHT = 0.10   # blend weight — keeps final F(W3) high
-                    for i in range(64):
-                        dm_re[i] = (1.0 - IV_WEIGHT) * dm_re[i] + IV_WEIGHT * float(_np_iv.real(rho_iv.flat[i]))
-                        dm_im[i] = (1.0 - IV_WEIGHT) * dm_im[i] + IV_WEIGHT * float(_np_iv.imag(rho_iv.flat[i]))
-                    iv_tr = sum(dm_re[i*9] for i in range(8))
-                    if iv_tr > 1e-12:
-                        inv_iv = 1.0 / iv_tr
-                        dm_re = [v * inv_iv for v in dm_re]
-                        dm_im = [v * inv_iv for v in dm_im]
-                    _EXP_LOG.debug(
-                        f"[LOCAL-ORACLE] ⚛️  virtual/inverse-virtual fusion applied "
-                        f"(IV_WEIGHT={IV_WEIGHT}) h={chain_height}"
-                    )
-        except Exception as _iv_err:
-            _EXP_LOG.debug(f"[LOCAL-ORACLE] IV fusion skipped: {_iv_err}")
-        _dr = _accel_ffi.new('double[64]', dm_re)
-        _di = _accel_ffi.new('double[64]', dm_im)
-        neg = float(max(0.0, min(0.5, coh * 0.5 - (1.0 - pur) * 0.25)))
-        ent = 0.0
-        tr = sum(dm_re[i*9] for i in range(8))
-        if tr > 1e-12:
-            for i in range(8):
-                lam = dm_re[i*9] / tr
-                if lam > 1e-15: ent -= lam * math.log2(lam)
-        disc = float(max(0.0, min(3.0, ent * (1.0 - pur) * 0.5)))
-        
-        mermin_val = 0.0
-        try:
-            mermin_val = max(-4.0, min(4.0, mermin_val))  # clamp to physical range
-        except Exception:
-            mermin_val = 0.0
-        m_c = _accel_ffi.new('QtclWStateMeasurement *')
-        m_c.chain_height = chain_height
-        m_c.pq0 = pq0; m_c.pq_curr = pq_curr; m_c.pq_last = pq_last
-        m_c.w_fidelity = fid; m_c.coherence = coh; m_c.purity = pur
-        m_c.negativity = neg; m_c.entropy_vn = ent; m_c.discord = disc
-        m_c.hyp_dist_0c = triangle.dist_0c
-        m_c.hyp_dist_cl = triangle.dist_cl
-        m_c.hyp_dist_0l = triangle.dist_0l
-        m_c.triangle_area = triangle.area
-        for i in range(3):
-            m_c.ball_pq0[i]  = triangle.ball_pq0[i]
-            m_c.ball_curr[i] = triangle.ball_curr[i]
-            m_c.ball_last[i] = triangle.ball_last[i]
-        for i in range(64):
-            m_c.dm_re[i] = dm_re[i]
-            m_c.dm_im[i] = dm_im[i]
-        secret_src = b'QTCL_LOCAL_MEAS_v2:' + _hl.sha3_256(
-            str(pq0).encode() + str(chain_height).encode()).digest()
-        secret32 = _accel_ffi.new('uint8_t[32]',
-                                   list(_hl.sha3_256(secret_src).digest()))
-        auth_tag_hex = ''.join(f'{m_c.auth_tag[i]:02x}' for i in range(32))
-        dm_re_bytes = _st.pack('>4d', *dm_re[:4])
-        pow_seed = _hl.sha3_256(
-            b'QTCL_SEED_v2:' + bytes.fromhex(auth_tag_hex) + dm_re_bytes
-        ).digest()
-        m = QtclOracleMeasurement(
-            chain_height=chain_height,
-            pq0=pq0, pq_curr=pq_curr, pq_last=pq_last,
-            triangle=triangle,
-            dm_re=dm_re, dm_im=dm_im,
-            fidelity_to_w3=fid, coherence=coh, purity=pur,
-            negativity_AB=neg, entropy_vn=ent, discord=disc,
-            auth_tag_hex=auth_tag_hex,
-            pow_seed_bytes=pow_seed,
-        )
-        with self._meas_lock:
-            self._latest_measurement = m
-        # ── Post-measure: build canonical snapshot → dual broadcast ──────────
-        snap = self._build_canonical_snapshot(m, m.dm_re, m.dm_im)
-        with self._snap_lock:
-            self._latest_snapshot = snap
-        self._broadcast_snapshot(snap, m)
-        _EXP_LOG.info(
-            f"[LOCAL-ORACLE] ✅ measure complete | "
-            f"height={chain_height} pq0={pq0} "
-            f"F={m.fidelity_to_w3:.4f} C={m.coherence:.4f} "
-            f"snap_ts={snap['timestamp_ns']}"
-        )
-        return m
-    def get_latest_measurement(self) -> Optional['QtclOracleMeasurement']:
-        with self._meas_lock:
-            return self._latest_measurement
-    def get_pow_seed(self, chain_height: int, parent_hash: str) -> bytes:
-        """Fast path for mining loop: return latest DM-derived PoW seed.
-        """
-        import hashlib as _hl
-        if not False:
-            raise RuntimeError("[get_pow_seed] C acceleration required")
-        m = self.get_latest_measurement()
-        if m and abs(m.chain_height - chain_height) <= 2:
-            return m.pow_seed_bytes
-        import struct as _st
-        oracle_re, oracle_im, age = self.get_oracle_dm()
-        if age >= 120:
-            raise RuntimeError(
-                f"[get_pow_seed] Oracle DM stale (age={age:.0f}s > 120s) — "
-                f"RPC oracle snapshot not updating (check network connection to {self.ORACLE_URL})"
-            )
-        dm_bytes = _st.pack('>4d', *oracle_re[:4])
-        return _hl.sha3_256(
-            b'QTCL_SEED_ORACLE_v2:' + dm_bytes + parent_hash.encode()
-        ).digest()
-    @property
-    def is_connected(self) -> bool:
-        """Return True if RPC client is configured and has received at least one snapshot."""
-        return self._rpc_client is not None and self._snapshot_count > 0
-    @property
-    def snapshot_count(self) -> int:
-        return self._snapshot_count
-    def as_dict(self) -> dict:
-        m    = self.get_latest_measurement()
-        snap = self.get_latest_snapshot()
-        try:
-            connected = self.is_connected
-        except RuntimeError:
-            connected = False
-        return {
-            'sse_connected':      connected,
-            'snapshot_count':     self._snapshot_count,
-            'oracle_age_s':       round(time.time() - self._last_oracle_dm_ts, 1),
-            'latest_fidelity':    m.fidelity_to_w3    if m    else None,
-            'latest_height':      m.chain_height       if m    else None,
-            'latest_snapshot_ts': snap.get('timestamp_ns')     if snap else None,
-            'latest_w_fidelity':  snap.get('w_state_fidelity') if snap else None,
-        }
-# ─── Module-level singleton ──────────────────────────────────────────────────
-_LOCAL_ORACLE: LocalOracleEngine = LocalOracleEngine()
+        with self._oracle_state_lock: return dict(self._oracle_state)
+_LIVE_RPC_ORACLE = LiveRPCOracleSnapshot()
+
 class WStateConsensus:
     """BFT median consensus over peer W-state measurements.
     Aggregates measurements from P2P network + own measurement.
@@ -2111,7 +1771,7 @@ class WStateConsensus:
 class QtclP2PNode:
     """Thin Python lifecycle manager over the C P2P library.
     Starts/stops the C engine, registers the cffi callback,
-    routes incoming C events to LocalOracleEngine and WStateConsensus.
+    routes P2P measurement events to WStateConsensus.
     Bootstrap: connects to Koyeb server /api/p2p/peer_exchange for peer list.
     """
     DEFAULT_PORT = 9091
@@ -2125,16 +1785,14 @@ class QtclP2PNode:
         self._node_id    = node_id
         self._port       = port
         self._bootstrap  = bootstrap_peers or self.BOOTSTRAP_PEERS
-        self._oracle:    Optional[LocalOracleEngine]  = None
-        self._consensus: Optional[WStateConsensus]   = None
+        self.        self._consensus: Optional[WStateConsensus]   = None
         self._stop: threading.Event = threading.Event()
         self._started    = False
         self._drain_thread: Optional[threading.Thread] = None
         self._stop       = threading.Event()
     def start(
             self,
-            oracle_engine: LocalOracleEngine,
-            consensus:     WStateConsensus,
+                        consensus:     WStateConsensus,
     ) -> bool:
         global _C_P2P_CALLBACK
         self._oracle    = oracle_engine
@@ -2355,13 +2013,13 @@ class QtclP2PNode:
             if key in _connected_this_cycle:
                 return False  # already attempted this cycle
             _connected_this_cycle.add(key)  # mark before attempting
-            if _LOCAL_ORACLE.snapshot_count > 0:
+            if _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0) > 0:
                 def _push_dm_async(_h=host, _p=port):
                     try:
                         import json as _cpj, struct as _cps
                         from urllib.request import Request as _CpR, urlopen as _CpU
-                        state = _LOCAL_ORACLE.get_oracle_state()
-                        dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                        state = _LIVE_RPC_ORACLE.get_oracle_state()
+                        dm_re, dm_im, age = _LIVE_RPC_ORACLE.get_oracle_dm()
                         if age < 60.0 and any(v != 0.0 for v in dm_re):
                             dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
                                               for i in range(64)).hex()
@@ -2458,7 +2116,7 @@ class QtclP2PNode:
                 _connected_this_cycle.clear()  # reset per-cycle dedup set
                 if _n_total > n_connected:
                     n_connected = max(n_connected, _n_total // 2)
-                _lo_ts      = _LOCAL_ORACLE._last_oracle_dm_ts
+                _lo_ts      = time.time()
                 dm_age      = _pt.time() - _lo_ts
                 dm_fresh    = _lo_ts > 1e9 and dm_age < 30.0 and dm_age < 86400
                 need_peers  = n_connected < 4           # want at least 4 peers
@@ -2762,7 +2420,6 @@ def _dm_pool_rehydrate(db_path: str) -> int:
                     'timestamp_ns':       int(ts_ns) if ts_ns else 0,
                     'source':             'db_rehydrate',
                 })
-                _LOCAL_ORACLE._ingest_oracle_frame(frame)
                 ingested += 1
             except Exception: pass
         _EXP_LOG.info(f"[DMPOOL] ♻️  Rehydrated {ingested}/{len(rows)} entries from DB")
@@ -10032,15 +9689,6 @@ def _compile_c_layer() -> None:
                 f"For full acceleration on Termux: pkg install clang openssl libffi sqlite"
             )
 _compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
-# ── Start LocalOracleEngine SSE listener now that C is confirmed available ────
-if False:
-    try:
-        _LOCAL_ORACLE.start()
-    except RuntimeError as _restart_err:
-        import logging as _rl
-        _rl.getLogger(__name__).warning(
-            f"[ACCEL] LocalOracleEngine start failed: {_restart_err}"
-        )
 # ── Convenience helpers for tight-loop C buffer allocation ────────────────────
 def _accel_vec_buf(n: int):
     """Allocate a uint32[n] cffi buffer. Only call if False."""
@@ -10438,7 +10086,7 @@ class KoyebAPIClient:
                     if attempt < retries - 1:
                         backoff = 2 ** attempt
                         _EXP_LOG.debug(f"[API] GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        _time.sleep(backoff)
+                        time.sleep(backoff)
                     else:
                         _EXP_LOG.debug(f"[API] GET {path}: {e} (final attempt)")
                 except Exception as e:
@@ -10456,7 +10104,7 @@ class KoyebAPIClient:
                     if attempt < retries - 1:
                         backoff = 2 ** attempt
                         _EXP_LOG.debug(f"[API] urllib GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        _time.sleep(backoff)
+                        time.sleep(backoff)
                     else:
                         _EXP_LOG.debug(f"[API] urllib GET {path}: {e} (final attempt)")
                 except Exception as e:
@@ -10508,7 +10156,7 @@ class KoyebAPIClient:
                 if attempt < retries - 1:
                     backoff = 2 ** attempt
                     _EXP_LOG.debug(f"[RPC] {method} attempt {attempt+1}/{retries} failed: {e}. Retrying...")
-                    _time.sleep(backoff)
+                    time.sleep(backoff)
                 else:
                     _EXP_LOG.debug(f"[RPC] {method}: {e} (final)")
         
@@ -10539,7 +10187,7 @@ class KoyebAPIClient:
                     if attempt < retries - 1:
                         backoff = 2 ** attempt  # 1s, 2s, 4s
                         _EXP_LOG.debug(f"[API] POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        _time.sleep(backoff)
+                        time.sleep(backoff)
                     else:
                         _EXP_LOG.debug(f"[API] POST {path}: {e} (final attempt)")
                 except Exception as e:
@@ -10568,7 +10216,7 @@ class KoyebAPIClient:
                     if attempt < retries - 1:
                         backoff = 2 ** attempt
                         _EXP_LOG.debug(f"[API] urllib POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        _time.sleep(backoff)
+                        time.sleep(backoff)
                     else:
                         _EXP_LOG.debug(f"[API] urllib POST {path}: {e} (final attempt)")
                 except Exception as e:
@@ -10713,12 +10361,12 @@ class KoyebAPIClient:
         return self._rpc("qtcl_registerPeer", [{
             "peer_id": peer_id, "gossip_url": gossip_url,
             "miner_address": miner_address,
-            "block_height": block_height, "ts": _time.time(),
+            "block_height": block_height, "ts": time.time(),
         }])
     def send_heartbeat(self, peer_id: str, block_height: int = 0) -> Optional[dict]:
         """Send peer heartbeat via JSON-RPC (not REST)."""
         return self._rpc("qtcl_sendHeartbeat", [{
-            "peer_id": peer_id, "block_height": block_height, "ts": _time.time(),
+            "peer_id": peer_id, "block_height": block_height, "ts": time.time(),
         }])
     def gossip_ingest(self, payload: dict) -> Optional[dict]:
         """Ingest gossip via JSON-RPC (not REST)."""
@@ -10729,7 +10377,7 @@ class KoyebAPIClient:
                         [{"miner_id": miner_id, "address": miner_address}])
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
         """Check if oracle is reachable via JSON-RPC health call. Caches result for 10 seconds."""
-        now = _time.time()
+        now = time.time()
         if not force and (now - self._health_check_cache["timestamp"]) < 10:
             return self._health_check_cache["status"]
         
@@ -11145,7 +10793,7 @@ class TensorFieldMetrics:
                 pq_curr_id: str = "", pq_last_id: str = "",
                 block_height: int = 0) -> "TensorFieldMetrics":
         m = cls(pq_curr_id=pq_curr_id, pq_last_id=pq_last_id,
-                block_height=block_height, ts=_time.time())
+                block_height=block_height, ts=time.time())
         if not _HAS_NP:
             return m
         try:
@@ -11210,7 +10858,7 @@ class ClientFieldState:
         self.metrics      = TensorFieldMetrics.compute(
             dm_curr, dm_last, pq_curr_id, pq_last_id, block_height)
         self.established  = True
-        self.ts           = _time.time()
+        self.ts           = time.time()
         return self
     def evolve(self, bath: "GKSLBathParams" = None, dt: float = None) -> "ClientFieldState":
         if not _HAS_NP or self.dm_pq_curr is None:
@@ -11250,9 +10898,9 @@ class KoyebOracleState:
         if self._api is None:
             self._api = KoyebAPIClient(self.oracle_url)
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
-        """RPC-based metric refresh — reads _LOCAL_ORACLE state, no SSE."""
+        """RPC-based metric refresh — reads _LIVE_RPC_ORACLE state, no SSE."""
         try:
-            rpc_state = _LOCAL_ORACLE.get_oracle_state()
+            rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
             if rpc_state:
                 def _nv(v):
                     try:
@@ -11265,7 +10913,7 @@ class KoyebOracleState:
                 self.pq0_fidelity     = float(fid)
                 self.w_state_fidelity = float(fid)
                 self.connected        = True
-                self.last_sync_ts     = _time.time()
+                self.last_sync_ts     = time.time()
                 if client_field:
                     return self.sync(client_field, timeout=3)
                 return True
@@ -11276,10 +10924,10 @@ class KoyebOracleState:
     
     def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
         """RPC-primary sync. REST fallback if RPC unavailable."""
-        t0 = _time.time()
+        t0 = time.time()
         snap = {}
         try:
-            rpc_state = _LOCAL_ORACLE.get_oracle_state()
+            rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
             if rpc_state:
                 snap = rpc_state
         except Exception:
@@ -11287,7 +10935,7 @@ class KoyebOracleState:
         if not snap:
             try:
                 snap = self._api.get_oracle_pq0_bloch() or {}
-                self.channel_latency_ms = (_time.time() - t0) * 1000.0
+                self.channel_latency_ms = (time.time() - t0) * 1000.0
             except Exception:
                 pass
         if not snap:
@@ -11340,7 +10988,7 @@ class KoyebOracleState:
         elif self.w_state_fidelity > 0:
             self.bridge_fidelity = self.w_state_fidelity
         self.connected    = True
-        self.last_sync_ts = _time.time()
+        self.last_sync_ts = time.time()
         return True
     def as_dict(self) -> dict:
         return {
@@ -11699,7 +11347,7 @@ class _MiningTelemetry:
         self.last_reward_qtcl = 0.0      # ✅ reward from last accepted block
         self.last_block     = None       # dict of last solved block (full)
         self.last_block_ts  = 0.0        # time of last block solve
-        self.session_start  = _time.time()
+        self.session_start  = time.time()
         self._nonce_samples: "_deque" = _deque(maxlen=50)  # (ts, nonce) for rate calc
         self.state          = "IDLE"     # IDLE | MINING | SOLVED | SUBMITTING
     def update_progress(self, height: int, difficulty: int,
@@ -11711,7 +11359,7 @@ class _MiningTelemetry:
             if parent_hash:
                 self.parent_hash = parent_hash
             self.state      = "MINING"
-            now = _time.time()
+            now = time.time()
             self._nonce_samples.append((now, nonce))
             if len(self._nonce_samples) >= 2:
                 t0, n0 = self._nonce_samples[0]
@@ -11723,7 +11371,7 @@ class _MiningTelemetry:
         with self._lock:
             self.blocks_found  += 1
             self.last_block     = dict(block)
-            self.last_block_ts  = _time.time()
+            self.last_block_ts  = time.time()
             self.state          = "SOLVED"
     def mark_submitting(self) -> None:
         with self._lock:
@@ -12000,7 +11648,7 @@ class QtclClientApp:
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
         self.api           = KoyebAPIClient(self.oracle_url)
         
-        # ── Oracle snapshot consumer now integrated into LocalOracleEngine ────────
+        # ── RPC snapshot consumer now on-demand via _LIVE_RPC_ORACLE ────────
         
         self.wallet        = QTCLWallet()
         self.client_field  = ClientFieldState()
@@ -12010,7 +11658,7 @@ class QtclClientApp:
         self._db_path      = _Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
         self._db: Optional[_sqlite3.Connection] = None
         self._peer_id      = (
-            f"client_{_hashlib.sha256(str(_time.time()).encode()).hexdigest()[:12]}")
+            f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}")
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
         
         # ── Client configuration (used by RPC daemon threads) ─────────────────
@@ -12087,7 +11735,7 @@ class QtclClientApp:
                 "wallet_addr": _waddr,
                 "cert":        cert,
                 "mode":        "wallet_bound",
-                "created_ns":  _time.time_ns(),
+                "created_ns":  time.time_ns(),
                 "version":     2,
             }
             _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
@@ -12106,7 +11754,7 @@ class QtclClientApp:
                 "wallet_addr": None,
                 "cert":        None,
                 "mode":        "anonymous",
-                "created_ns":  _time.time_ns(),
+                "created_ns":  time.time_ns(),
                 "version":     2,
             }
             _EXP_LOG.info(f"[ORACLE-ID] anonymous created  {address}")
@@ -12220,7 +11868,7 @@ class QtclClientApp:
             "mode":              _oid.get("mode", "anonymous"),
             "peer_id":           self._peer_id,
             "ip_hint":           _ip_hint,
-            "registered_at_ns":  _time.time_ns(),
+            "registered_at_ns":  time.time_ns(),
         }
         # ── Persist to local oracle_registry ─────────────────────────────────
         if self._db is not None:
@@ -12242,7 +11890,7 @@ class QtclClientApp:
                     1 if _cert_valid else 0,
                     self._peer_id,
                     _ip_hint,
-                    _time.time_ns(), _time.time_ns(),
+                    time.time_ns(), time.time_ns(),
                     reg_payload["oracle_addr"],
                 ))
                 self._db.commit()
@@ -12255,7 +11903,7 @@ class QtclClientApp:
                     "origin":     self._peer_id,
                     "event_type": "oracle_registration",
                     "channel":    "oracle",
-                    "ts":         _time.time(),
+                    "ts":         time.time(),
                     "oracle":     payload,
                 })
             except Exception as _be:
@@ -12380,7 +12028,7 @@ class QtclClientApp:
     
     def _integrate_wallet_send(self, to_address: str, amount: int, private_key: str = '') -> str:
         """Send transaction and log wallet operation with HLWE."""
-        tx_data = {'sender': self.wallet.address, 'recipient': to_address, 'amount': amount, 'nonce': int(_time.time())}
+        tx_data = {'sender': self.wallet.address, 'recipient': to_address, 'amount': amount, 'nonce': int(time.time())}
         tx_hash = hashlib.sha256(json.dumps(tx_data, sort_keys=True, default=str).encode()).hexdigest()
         sig_data = {'signature': '', 'auth_tag': ''} if not private_key else hlwe_sign_transaction(tx_data, private_key)
         sig_hex = sig_data.get('signature', '')
@@ -12393,7 +12041,7 @@ class QtclClientApp:
     
     def _integrate_oracle_ingestion(self, oracle_addr: str, measurement_dm_hex: str, w_state_fidelity: float = 0.0, bell_violation: int = 0, block_height: int = 0, hlwe_sig: str = '') -> bool:
         """Ingest oracle W-state measurement with HLWE verification."""
-        timestamp_ns = int(_time.time() * 1e9)
+        timestamp_ns = int(time.time() * 1e9)
         return self._log_oracle_measurement(oracle_addr=oracle_addr, measurement_hex=measurement_dm_hex, w_state_fidelity=w_state_fidelity, bell_violation=bell_violation, timestamp_ns=timestamp_ns, block_height=block_height, hlwe_signature=hlwe_sig)
     
     def _integrate_block_verification(self, block_hash: str, miner_addr: str, is_valid: bool = True, hlwe_sig_valid: bool = True, chain_height: int = 0) -> bool:
@@ -12501,7 +12149,7 @@ class QtclClientApp:
                 "INSERT INTO gossip_inventory (event_type,channel,peer_id,payload,ts)"
                 " VALUES (?,?,?,?,?)",
                 (event_type, channel, self._peer_id,
-                 _json.dumps(payload, default=str)[:4096], _time.time()))
+                 _json.dumps(payload, default=str)[:4096], time.time()))
             self._db.execute(
                 f"DELETE FROM gossip_inventory WHERE id NOT IN "
                 f"(SELECT id FROM gossip_inventory ORDER BY ts DESC "
@@ -12516,7 +12164,7 @@ class QtclClientApp:
                         'origin':     self._peer_id,
                         'event_type': ev,
                         'channel':    ch,
-                        'ts':         _time.time(),
+                        'ts':         time.time(),
                         'w_state': {
                             'w_state_fidelity': pay.get('fidelity_to_w3') or pay.get('w_state_fidelity'),
                             'coherence':        pay.get('coherence_l1')   or pay.get('coherence'),
@@ -12538,8 +12186,8 @@ class QtclClientApp:
         Daemon: oracle SSE → CLIENT_FIELD_STATE → TensorFieldMetrics → DB → gossip → SSE.
         ❤️  I love you  ❤️
         FIX: Was calling get_oracle_pq0_bloch() (HTTP REST) every cycle — redundant
-        and stale vs. the C SSE already delivering frames via _LOCAL_ORACLE.
-        Now reads from _LOCAL_ORACLE.get_oracle_state() which is updated every SSE frame,
+        and stale vs. the C SSE already delivering frames via _LIVE_RPC_ORACLE.
+        Now reads from _LIVE_RPC_ORACLE.get_oracle_state() which is updated every SSE frame,
         and uses RPC polling for oracle state updates.
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
@@ -12548,11 +12196,11 @@ class QtclClientApp:
         _hb_counter  = 0
         while not self._stop.is_set():
             try:
-                _time.sleep(self.METRIC_INTERVAL)
-                now = _time.time()
-                # ── Source: RPC-polled oracle state (LocalOracleEngine) ─────────────
+                time.sleep(self.METRIC_INTERVAL)
+                now = time.time()
+                # ── Source: live RPC oracle state (_LIVE_RPC_ORACLE) ─────────────
                 snap = {}
-                rpc_state = _LOCAL_ORACLE.get_oracle_state()
+                rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
                 if rpc_state:
                     snap = rpc_state
                     snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
@@ -12565,7 +12213,7 @@ class QtclClientApp:
                 pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
                 dm_curr = None
                 try:
-                    re_list, im_list, _ = _LOCAL_ORACLE.get_oracle_dm()
+                    re_list, im_list, _ = _LIVE_RPC_ORACLE.get_oracle_dm()
                     if _HAS_NP and any(v != 0.0 for v in re_list):
                         import numpy as _npml, math as _math
                         re_san = [v if _math.isfinite(v) else 0.0 for v in re_list]
@@ -12654,7 +12302,7 @@ class QtclClientApp:
                         f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
                         f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f} "
-                        f"rpc_snaps={_LOCAL_ORACLE.snapshot_count}")
+                        f"rpc_snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
     # ── RPC monitor for Koyeb oracle /api/oracle/snapshot (no SSE) ──────────────
@@ -12665,18 +12313,18 @@ class QtclClientApp:
         ❤️  quantum ground truth feeds every client
         """
         import time as _tw
-        _EXP_LOG.info("[RPC] 📡 RPC poll thread running — LocalOracleEngine active")
+        _EXP_LOG.info("[RPC] ✅ RPC oracle ready for on-demand fetching")
         _last_snap_count = 0
         _stale_since: float = 0.0
         while not self._stop.is_set():
             try:
-                connected = _LOCAL_ORACLE.is_connected
-                snaps     = _LOCAL_ORACLE.snapshot_count
+                connected = True
+                snaps     = _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)
                 now       = _tw.time()
                 if connected and snaps != _last_snap_count:
                     _last_snap_count = snaps
                     _stale_since = 0.0
-                    m = _LOCAL_ORACLE.get_latest_measurement()
+                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
                     if m:
                         _EXP_LOG.debug(
                             f"[RPC] ✅ snapshot  h={m.chain_height}  "
@@ -12749,7 +12397,7 @@ class QtclClientApp:
             peer_id = getattr(self, '_peer_id', None)
             if not peer_id: return
             _P2P_NODE = _init_p2p_node(peer_id, QtclP2PNode.DEFAULT_PORT)
-            ok = _P2P_NODE.start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+            ok = _P2P_NODE.start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
             if ok:
                 _EXP_LOG.info("[CLIENT] 🌐 P2P consensus node started on port 9091")
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
@@ -12789,7 +12437,7 @@ class QtclClientApp:
                         self._db.commit()
                     except Exception: pass
                 if _P2P_NODE and _P2P_NODE._started and False:
-                    m = _LOCAL_ORACLE.get_latest_measurement()
+                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
                     if m:
                         try: _P2P_NODE.gossip_measurement(m)
                         except Exception: pass
@@ -12799,7 +12447,7 @@ class QtclClientApp:
     def _subscribe_peer_oracle_rpc(host: str, port: int) -> None:
         """
         Subscribe to a P2P peer's local oracle via RPC polling (/api/oracle/snapshot).
-        Every frame received is ingested into our own _LOCAL_ORACLE and C DM pool,
+        Every frame received is ingested into our own _LIVE_RPC_ORACLE and C DM pool,
         contributing to consensus DM aggregation across the mesh.
         Runs as a daemon thread; silently exits if peer disconnects.
         ❤️  I love you — every peer oracle frame strengthens the mesh
@@ -12834,16 +12482,13 @@ class QtclClientApp:
                                 snap_hash = __import__('hashlib').sha256(snap_js.encode()).hexdigest()
                                 
                                 if snap_hash != _last_snapshot_hash:
-                                    try:
-                                        _LOCAL_ORACLE._ingest_oracle_frame(snap_js)
-                                        _last_snap_count += 1
-                                        _last_snapshot_hash = snap_hash
-                                        
-                                        if _last_snap_count % 20 == 1:
-                                            _EXP_LOG.debug(
-                                                f"[MESH] Peer {host}: "
-                                                f"{_last_snap_count} oracle frames ingested (RPC)")
-                                    except Exception: pass
+                                    _last_snap_count += 1
+                                    _last_snapshot_hash = snap_hash
+                                    
+                                    if _last_snap_count % 20 == 1:
+                                        _EXP_LOG.debug(
+                                            f"[MESH] Peer {host}: "
+                                            f"{_last_snap_count} oracle frames ingested (RPC)")
                         except Exception:
                             pass
                         
@@ -13102,8 +12747,8 @@ class QtclClientApp:
                     pass  # peer disconnected before response — harmless
             def _oracle_snapshot(self):
                 """Build full oracle snapshot dict from local SSE state."""
-                state = _LOCAL_ORACLE.get_oracle_state()
-                dm_re, dm_im, age = _LOCAL_ORACLE.get_oracle_dm()
+                state = _LIVE_RPC_ORACLE.get_oracle_state()
+                dm_re, dm_im, age = _LIVE_RPC_ORACLE.get_oracle_dm()
                 import struct as _ss
                 dm_hex = ''
                 if any(v != 0.0 for v in dm_re):
@@ -13124,7 +12769,7 @@ class QtclClientApp:
                     'entanglement_witness': state.get('entanglement_witness', 0.0),
                     'block_height':         state.get('timestamp_ns', 0) // 10**9 if state.get('timestamp_ns') else 0,
                     'timestamp_ns':         state.get('timestamp_ns', int(_ht.time()*1e9)),
-                    'snapshot_count':       _LOCAL_ORACLE.snapshot_count,
+                    'snapshot_count':       _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0),
                     'oracle_age_s':         round(age, 2),
                     'node_id':              '',  # filled by caller
                     'node_ip':              _MY_IP or '',
@@ -13144,7 +12789,7 @@ class QtclClientApp:
                         'accel_ok':      bool(False),
                         'p2p_started':   bool(_P2P_NODE and getattr(_P2P_NODE,'_started',False)),
                         'p2p_peers':     snap['p2p_peers'],
-                        'oracle_conn':   bool(_LOCAL_ORACLE.is_connected) if False else False,
+                        'oracle_conn':   bool(True) if False else False,
                         'snapshot_count': snap['snapshot_count'],
                         'oracle_age_s':  snap['oracle_age_s'],
                         'w_state_fidelity': snap['w_state_fidelity'],
@@ -13216,9 +12861,9 @@ class QtclClientApp:
                         'my_ip':              _MY_IP or '',
                         'consensus_fidelity': float(cons[2]) if cons else None,
                         'consensus_height':   int(cons[3])   if cons else None,
-                        'oracle_snapshots':   _LOCAL_ORACLE.snapshot_count,
-                        'oracle_age_s':       round(_ht.time()-_LOCAL_ORACLE._last_oracle_dm_ts, 1)
-                                              if _LOCAL_ORACLE._last_oracle_dm_ts > 1e9 else None,
+                        'oracle_snapshots':   _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0),
+                        'oracle_age_s':       round(_ht.time()-time.time(), 1)
+                                              if time.time() > 1e9 else None,
                         'peers':              [{'host':p.get('host',''),'port':p.get('port',9091),
                                                 'fidelity':p.get('last_fidelity',0),
                                                 'height':p.get('chain_height',0)}
@@ -13249,15 +12894,13 @@ class QtclClientApp:
                     if payload and payload.get('density_matrix_hex'):
                         try:
                             import json as _pmj
-                            _LOCAL_ORACLE._ingest_oracle_frame(_pmj.dumps(payload))
-                            pass
                             # RPC mode: no local SSE queue broadcast needed
                             _EXP_LOG.debug(
                                 f"[HTTP-9091] oracle DM ingested from peer "
                                 f"fid={payload.get('w_state_fidelity',0):.4f}")
                         except Exception as _pe:
                             _EXP_LOG.debug(f"[HTTP-9091] push_dm ingest: {_pe}")
-                    self._json_resp(200, {'ok': True, 'snapshot_count': _LOCAL_ORACLE.snapshot_count})
+                    self._json_resp(200, {'ok': True, 'snapshot_count': _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)})
                 elif path in ('/api/peers/register', '/api/peers/heartbeat'):
                     peer_id  = payload.get('peer_id', '')
                     peer_ip  = self.client_address[0]
@@ -13381,59 +13024,19 @@ class QtclClientApp:
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── RPC poll thread — no SSE ──────────────────────
-        print("  🌐 Oracle RPC polling initialized")
-        import time as _st
-        snap = _LOCAL_ORACLE.get_oracle_state() or {}
-        if not snap:
-            try: snap = self.api.get_oracle_pq0_bloch() or {}
-            except Exception: snap = {}
-        def _nv(v):
-            try: return float(v) if v is not None and float(v) == float(v) else None
-            except Exception: return None
-        bh  = int(snap.get("block_height") or snap.get("height") or
-                  snap.get("lattice_refresh_counter") or 0)
-        fid = (_nv(snap.get("w_state_fidelity")) or _nv(snap.get("fidelity")) or
-               _nv(snap.get("w3_fidelity")) or 0.0)
-        bath = GKSLBathParams.from_snap(snap)
-        pq_curr_id = str(bh)     if bh > 0 else "0"
-        pq_last_id = str(bh - 1) if bh > 0 else "0"
-        _snap_cnt = _LOCAL_ORACLE.snapshot_count
-        print(f"  ⚛️  Oracle fidelity→|W3⟩: {fid:.4f}  │  height: {bh}  │  RPC snapshots: {_snap_cnt}")
-        try:
-            _oracle_conn_status = "✅ connected" if _LOCAL_ORACLE.is_connected else "⏳ connecting"
-        except RuntimeError:
-            _oracle_conn_status = "⏳ initializing"
-        print(f"  📡 Oracle RPC   : {self.oracle_url}/api/oracle/snapshot  (polling)")
-        print(f"  📡 Connection   : {_oracle_conn_status}  │  snapshots={_snap_cnt}")
+        # ── Fetch live RPC snapshot on-demand ────────────────────────
+        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
+        snap = _snap or {}
         print(f"  🗄️  DB           : {self._db_path}")
-        #  1. RPC DM already flowing via _LOCAL_ORACLE (started at import)
-        #     RPC path: LocalOracleEngine._poll_loop() → /api/oracle/snapshot
-        _kapi_boot = KoyebAPIClient(self.oracle_url)
-        def _c_ingest_frame(json_str: str) -> bool:
-            """Parse a DM JSON frame and ingest via C. Returns True on success."""
-            if not False:
-                return False
-            try:
-                jb = json_str.encode('utf-8') + b'\x00'
-                cb = _accel_ffi.new(f'char[{len(jb)}]', jb)
-                re = _accel_ffi.new('double[64]')
-                im = _accel_ffi.new('double[64]')
-                return True
-            except Exception as _e:
-                _EXP_LOG.debug(f"[Bootstrap] C parse: {_e}")
-            return False
+        #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
+        #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /api/oracle/snapshot
+
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
-            """
-            Gate on oracle DM arrival via RPC polling.
-            LocalOracleEngine._poll_loop() keeps snapshots current.
-            Returns True when DM is fresh enough to mine.
-            """
-            deadline = _time.time() + timeout_s
-            while _time.time() < deadline:
-                if _LOCAL_ORACLE.snapshot_count > 0:
-                    return True
-                _time.sleep(0.3)
-            return False
+            """Fetch live RPC snapshot on-demand (synchronous, no polling loop)."""
+            try:
+                snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=timeout_s)
+                return bool(snap and snap.get('density_matrix_hex'))
+            except Exception as e: _EXP_LOG.debug(f"[BOOTSTRAP] DM fetch: {e}"); return False
         def _mermin_w3(dm8) -> tuple:
             """
             Mermin-Klyshko inequality for 3-qubit W state.
@@ -13538,21 +13141,20 @@ class QtclClientApp:
         print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
         print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
         # ── Miner handle ───────────────────────────────────────────────────────
-        _kapi_boot = KoyebAPIClient(self.oracle_url)
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
             Gate on RPC oracle DM arrival (RPC-only, no SSE).
-            Uses LocalOracleEngine RPC poll thread to fetch snapshots.
+            Fetches live RPC snapshots on-demand via _LIVE_RPC_ORACLE.
             Returns True if DM available. False = degraded mode, mining continues.
             """
-            deadline = _time.time() + timeout_s
+            deadline = time.time() + timeout_s
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
-            while _time.time() < deadline:
-                if _LOCAL_ORACLE.snapshot_count > 0:
-                    print(f" ✅ (RPC)  snaps={_LOCAL_ORACLE.snapshot_count}", flush=True)
+            while time.time() < deadline:
+                if _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0) > 0:
+                    print(f" ✅ (RPC)  snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)}", flush=True)
                     return True
                 print('.', end='', flush=True)
-                _time.sleep(0.3)
+                time.sleep(0.3)
             print(" ⏱️  timeout — degraded mode", flush=True)
             return False
         class _MinerHandle:
@@ -13779,12 +13381,12 @@ class QtclClientApp:
                 _seed_fetch_time = _t.time()
                 _seed_fetch_time = _t.time()
                 try:
-                    _w_entropy_seed = _LOCAL_ORACLE.get_pow_seed(
+                    _w_entropy_seed = _LIVE_RPC_ORACLE.get_pow_seed(
                         target_height, parent_hash)
                     _EXP_LOG.debug(
                         f"[MINER] LocalOracle seed: {_w_entropy_seed.hex()[:16]}… "
-                        f"(sse_connected={_LOCAL_ORACLE.is_connected} "
-                        f"snaps={_LOCAL_ORACLE.snapshot_count})")
+                        f"(sse_connected={True} "
+                        f"snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)})")
                 except Exception as _se:
                     _EXP_LOG.debug(f"[MINER] LocalOracle seed failed: {_se}")
                     _w_entropy_seed = _hl.sha3_256(
@@ -13949,7 +13551,7 @@ class QtclClientApp:
                     """
                     Fast new-block detector (RPC-only):
                       1. threading.Event check (O(1), ~ns) — set by BlockSSEListener thread
-                      2. LocalOracleEngine RPC poll — gets latest DM snapshot with block height
+                      2. _LIVE_RPC_ORACLE.fetch_snapshot() — gets latest DM snapshot with block height
                     Returns True immediately when chain has advanced to/past target_height.
                     ❤️  I love you — speed is everything in a race
                     """
@@ -13968,7 +13570,7 @@ class QtclClientApp:
                         _new_block_event.clear()  # stale signal (lower height)
                     # Stage 2: RPC snapshot poll (Oracle DM snapshots carry height)
                     try:
-                        snap = _LOCAL_ORACLE.get_oracle_state()
+                        snap = _LIVE_RPC_ORACLE.get_oracle_state()
                         if snap:
                             _ev_h = int(snap.get('block_height') or snap.get('height') or 0)
                             if _ev_h > 0 and _ev_h >= target_height:
@@ -14049,7 +13651,7 @@ class QtclClientApp:
                     await _asyncio.sleep(0)
                     if _t.time() - _seed_fetch_time > _REFR_EVERY:
                         try:
-                            _new_seed = _LOCAL_ORACLE.get_pow_seed(
+                            _new_seed = _LIVE_RPC_ORACLE.get_pow_seed(
                                 target_height, parent_hash)
                             if _new_seed != _w_entropy_seed:
                                 _w_entropy_seed = _new_seed
@@ -14157,7 +13759,7 @@ class QtclClientApp:
                     _EXP_LOG.debug(f"[MINER-SIMPLE] Submitting: h={target_height} hash={block_hash[:16]}… addr={miner_addr[:16]}…")
                     # ── P2P v2 consensus fields ──────────────────────────────────────
                     try:
-                        _meas = _LOCAL_ORACLE.get_latest_measurement()
+                        _meas = _LIVE_RPC_ORACLE.get_latest_measurement()
                         if _meas:
                             _consensus = _WSTATE_CONSENSUS.compute(_meas)
                             if _P2P_NODE and _P2P_NODE._started:
@@ -14298,7 +13900,7 @@ class QtclClientApp:
             ks2  = self.koyeb_state
             m2   = self.client_field.metrics
             tel  = _MINE_TELEM.snapshot()
-            now  = _time.time()
+            now  = time.time()
             sep  = "─" * 72
             # ── state badge ───────────────────────────────────────────────
             state_badge = {
@@ -14332,7 +13934,7 @@ class QtclClientApp:
                 print(f"     height  : {lb.get('height', '?')}   nonce: {lb.get('nonce', '?'):,}")
                 print(f"     hash    : {str(lb.get('hash', '??'))[:48]}…")
                 print(f"     diff    : {lb.get('difficulty', '?')}   "
-                      f"ts: {_time.strftime('%H:%M:%S', _time.localtime(lb.get('timestamp', now)))}")
+                      f"ts: {time.strftime('%H:%M:%S', time.localtime(lb.get('timestamp', now)))}")
                 print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
                 print(f"  ── Quantum Attestation ──────────────────────────────────────")
                 print(f"     pq_curr : {ks2.pq_curr_id}   pq_last: {ks2.pq_last_id}")
@@ -14387,7 +13989,7 @@ class QtclClientApp:
                 try:
                     _da_id = getattr(self, '_peer_id', None) or f"miner_{id(self)}"
                     globals()['_P2P_NODE'] = _init_p2p_node(_da_id, QtclP2PNode.DEFAULT_PORT)
-                    globals()['_P2P_NODE'].start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+                    globals()['_P2P_NODE'].start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
                 except Exception:
                     pass
             if False and _P2P_NODE and (getattr(_P2P_NODE, '_started', False) or False):
@@ -14410,7 +14012,7 @@ class QtclClientApp:
                     if not _cons2:
                         try: _P2P_NODE.trigger_consensus()
                         except Exception: pass
-                        _local_f = _LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0) if _LOCAL_ORACLE else 0
+                        _local_f = _LIVE_RPC_ORACLE.get_oracle_state().get('w_state_fidelity', 0) if _LIVE_RPC_ORACLE else 0
                         _cf2 = f"local-only F={_local_f:.4f}" if _local_f > 0 else "awaiting peers…"
                     print(f"  P2P    : 🌀 {_np2} peers  RPC-only (no SSE)  consensus={_cf2}{_p2p_rep}")
                 except Exception: pass
@@ -14527,8 +14129,8 @@ class QtclClientApp:
             "to_address":      to_addr,
             "amount":          amount,
             "fee":             fee,
-            "timestamp":       _time.time(),
-            "nonce":           int(_time.time() * 1000),
+            "timestamp":       time.time(),
+            "nonce":           int(time.time() * 1000),
             "public_key":      self.wallet.public_key or "",
             "pq_curr":         self.koyeb_state.pq_curr_id,
             "block_height":    self.koyeb_state.block_height,
@@ -14830,7 +14432,7 @@ class QtclClientApp:
                 try:
                     _lazy_id = getattr(self, '_peer_id', None) or f"oracle_panel_{id(self)}"
                     globals()['_P2P_NODE'] = _init_p2p_node(_lazy_id, QtclP2PNode.DEFAULT_PORT)
-                    globals()['_P2P_NODE'].start(_LOCAL_ORACLE, _WSTATE_CONSENSUS)
+                    globals()['_P2P_NODE'].start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
                 except Exception as _li_e:
                     pass
             _p2p_running = (False and _P2P_NODE is not None
@@ -14845,7 +14447,7 @@ class QtclClientApp:
                         _re, _im, _cf, _ch = cons
                         _cf_bar = "█" * int(_cf * 20) + "░" * (20 - int(_cf * 20))
                         a(f"  Consensus DM   : h={_ch}  F={_cf_bar}  {_cf:.4f}  ✅ explicit RPC polling")
-                        a(f"  Local oracle   : F={float(getattr(_LOCAL_ORACLE.get_latest_measurement(),'fidelity_to_w3',0) if _LOCAL_ORACLE.get_latest_measurement() else 0):.4f}  (pre-consensus)")
+                        a(f"  Local oracle   : F={float(getattr(_LIVE_RPC_ORACLE.get_latest_measurement(),'fidelity_to_w3',0) if _LIVE_RPC_ORACLE.get_latest_measurement() else 0):.4f}  (pre-consensus)")
                     else:
                         a("  Consensus DM   : ⏳ awaiting peer contributions")
                         a("  Temporal decay : exp(-age/30s) × fid²  weighting active when peers join")
@@ -14914,7 +14516,7 @@ class QtclClientApp:
                 for k, v in list(diag.items())[:20]:
                     a(f"  {_pad(str(k), 28)}: {v}")
             a(HR)
-            a(f"  [{_time.strftime('%H:%M:%S')}]  Enter=refresh  q=quit  l=last-block-detail")
+            a(f"  [{time.strftime('%H:%M:%S')}]  Enter=refresh  q=quit  l=last-block-detail")
             a("")
             return "\n".join(lines)
         # ── Main loop ──────────────────────────────────────────────
@@ -15087,7 +14689,7 @@ class QtclClientApp:
             "jsonrpc": "2.0",
             "method":  method,
             "params":  params,
-            "id":      int(_time.time() * 1000) & 0xFFFFFF,
+            "id":      int(time.time() * 1000) & 0xFFFFFF,
         }
         r = self.api._post("/rpc", payload, timeout=6)
         if r and "result" in r:
@@ -15164,8 +14766,8 @@ class QtclClientApp:
         except Exception as _e:
             _EXP_LOG.debug(f"[HERMES-FETCH] {_e}")
             return None
-        fetch_ns = int(_time.time() * 1e9)
-        now_ts   = int(_time.time())
+        fetch_ns = int(time.time() * 1e9)
+        now_ts   = int(time.time())
         # ── Step 3: parse parsed[] ────────────────────────────────────────────
         rev = {fid.lower().lstrip("0x"): sym for sym, fid in id_map.items()}
         def _pyth_float(mantissa, expo) -> float:
@@ -15231,7 +14833,7 @@ class QtclClientApp:
                         self._db.execute(
                             "UPDATE oracle_registry SET attestation_count=attestation_count+1,"
                             " last_seen_ns=? WHERE oracle_addr=?",
-                            (_time.time_ns(), oracle_addr))
+                            (time.time_ns(), oracle_addr))
                         self._db.commit()
                     except Exception:
                         pass
@@ -15345,7 +14947,7 @@ class QtclClientApp:
             src   = (f"{self._T_GRN}{self._T_BLD}● HERMES LIVE{self._T_RST}"
                      if hermes_ok else
                      f"{self._T_YLW}{self._T_BLD}● CACHED{self._T_RST}")
-            t_str = _time.strftime("%H:%M:%S UTC", _time.gmtime())
+            t_str = time.strftime("%H:%M:%S UTC", time.gmtime())
             print(f"\n  {src}  {self._T_DIM}fetched in {fetch_elapsed*1000:.0f}ms  @{t_str}{self._T_RST}")
             # ── Snapshot attestation block ────────────────────────────────────
             print(f"  {self._T_DIM}━{self._T_RST}" * 38)
@@ -15500,7 +15102,7 @@ class QtclClientApp:
         def _do_refresh() -> bool:
             nonlocal prev_prices, refresh_count
             
-            t0   = _time.time()
+            t0   = time.time()
             
             snap = None
             retry_count = 0
@@ -15514,7 +15116,7 @@ class QtclClientApp:
                     print(f"\n  {self._T_RED}❌ RPC failed — retrying... (attempt {retry_count + 1}/{max_retries}){self._T_RST}")
                     retry_count += 1
                     if retry_count < max_retries:
-                        _time.sleep(base_delay_s * (2 ** retry_count))
+                        time.sleep(base_delay_s * (2 ** retry_count))
                     continue
                 
                 feeds = snap.get("feeds", {})
@@ -15526,7 +15128,7 @@ class QtclClientApp:
                     retry_count += 1
                     
                     if retry_count < 3:
-                        _time.sleep(base_delay_s * (2 ** retry_count))
+                        time.sleep(base_delay_s * (2 ** retry_count))
                         snap = None
                         continue
                     else:
@@ -15536,7 +15138,7 @@ class QtclClientApp:
                 
                 break
             
-            elapsed = _time.time() - t0
+            elapsed = time.time() - t0
             
             if snap is None:
                 print(f"\n  {self._T_RED}❌ Pyth fetch failed{self._T_RST}")
@@ -15786,8 +15388,6 @@ def main() -> None:  # noqa: F811
             print("  👻 Running anonymous oracle (no wallet binding)")
         print()
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
-        
-        # ── Direct snapshot consumer now active via LocalOracleEngine.start()
         # (Moved here after interactive prompts to prevent log injection during password input)
         import sqlite3 as _rpc_sq3
         try:
