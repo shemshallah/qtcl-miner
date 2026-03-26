@@ -93,6 +93,25 @@ P2P_HARDCODED_SEEDS = {
 }
 ENTROPY_LOCK        = threading.Lock()
 SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
+# ═════════════════════════════════════════════════════════════════════════════════
+# CANONICAL DATA DIRECTORY — single source of truth for all DB paths
+# Detects repo root from this file's location, falls back to ~/qtcl-miner
+# DB always lives at <repo_root>/data/qtcl_blockchain.db
+# ═════════════════════════════════════════════════════════════════════════════════
+def _detect_repo_root() -> Path:
+    """Detect repo root: directory containing this file (qtcl_client.py)."""
+    _this = Path(__file__).resolve().parent
+    # Verify it looks like the repo (has qtcl_client.py)
+    if (_this / 'qtcl_client.py').exists():
+        return _this
+    # Fallback: ~/qtcl-miner
+    return Path.home() / 'qtcl-miner'
+
+_REPO_ROOT: Path = _detect_repo_root()
+_DATA_DIR:  Path = _REPO_ROOT / 'data'
+_DB_PATH:   Path = _DATA_DIR / 'qtcl_blockchain.db'
+# Ensure data directory exists at import time
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
 _C_LIB=None
 try:
     import ctypes
@@ -2953,9 +2972,9 @@ class LocalBlockchainDB:
         self._pool_min = pool_min
         self._pool_max = pool_max
         
-        self.db_dir = Path.home() / 'qtcl-miner' / 'data'
+        self.db_dir = _DATA_DIR
         self.db_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.db_dir / 'qtcl_blockchain.db'
+        self.db_path = _DB_PATH
         
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
         self.conn.row_factory = sqlite3.Row
@@ -3317,6 +3336,87 @@ class LocalBlockchainDB:
                 cursor.execute(_tbl_sql)
             except Exception:
                 pass
+        # ── Server-mirrored tables (from SQL patches) ──────────────────────────
+        _server_mirror_tables = [
+            # wallet_addresses — mirrors server PostgreSQL wallet_addresses table
+            # Used for local balance cache, miner reward tracking, treasury visibility
+            """CREATE TABLE IF NOT EXISTS wallet_addresses (
+                address             TEXT    PRIMARY KEY,
+                wallet_fingerprint  TEXT    NOT NULL DEFAULT '',
+                public_key          TEXT    NOT NULL DEFAULT '',
+                balance             INTEGER NOT NULL DEFAULT 0,
+                transaction_count   INTEGER NOT NULL DEFAULT 0,
+                address_type        TEXT    NOT NULL DEFAULT 'receiving',
+                balance_at_height   INTEGER NOT NULL DEFAULT 0,
+                balance_updated_at  INTEGER NOT NULL DEFAULT 0,
+                last_used_at        INTEGER NOT NULL DEFAULT 0,
+                created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )""",
+            # quantum_metrics — mirrors server quantum_metrics for local dashboard
+            """CREATE TABLE IF NOT EXISTS quantum_metrics (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp                   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                engine                      TEXT    DEFAULT 'QTCL-QE v8.0',
+                heartbeat_running           INTEGER DEFAULT 0,
+                heartbeat_pulse_count       INTEGER DEFAULT 0,
+                lattice_operations          INTEGER DEFAULT 0,
+                w_state_coherence_avg       REAL    DEFAULT 0.0,
+                w_state_fidelity_avg        REAL    DEFAULT 0.0,
+                w_state_entanglement        REAL    DEFAULT 0.0,
+                noise_kappa                 REAL    DEFAULT 0.08,
+                noise_fidelity_preservation REAL    DEFAULT 0.99,
+                bell_quantum_fraction       REAL    DEFAULT 0.0,
+                bell_s_chsh_mean            REAL    DEFAULT 0.0,
+                created_at                  INTEGER DEFAULT (strftime('%s','now'))
+            )""",
+            # schema_migrations — tracks applied schema versions for idempotent upgrades
+            """CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     TEXT    PRIMARY KEY,
+                applied_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                description TEXT    DEFAULT ''
+            )""",
+            # sync_state — tracks chain sync progress (IBD bookmark)
+            """CREATE TABLE IF NOT EXISTS sync_state (
+                key         TEXT    PRIMARY KEY,
+                value       TEXT    NOT NULL DEFAULT '',
+                updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )""",
+        ]
+        for _tbl_sql in _server_mirror_tables:
+            try:
+                cursor.execute(_tbl_sql)
+            except Exception:
+                pass
+        # ── Transaction table expansion (server-compatible columns) ───────────
+        _tx_new_cols = [
+            "ALTER TABLE transactions ADD COLUMN block_hash        TEXT    DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN transaction_index INTEGER DEFAULT 0",
+            "ALTER TABLE transactions ADD COLUMN tx_type           TEXT    DEFAULT 'transfer'",
+            "ALTER TABLE transactions ADD COLUMN quantum_state_hash TEXT   DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN commitment_hash   TEXT    DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN metadata          TEXT    DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN created_at        INTEGER DEFAULT 0",
+            "ALTER TABLE transactions ADD COLUMN updated_at        INTEGER DEFAULT 0",
+            "ALTER TABLE transactions ADD COLUMN finalized_at      INTEGER DEFAULT 0",
+            "ALTER TABLE transactions ADD COLUMN w_proof           TEXT    DEFAULT ''",
+        ]
+        for _alter in _tx_new_cols:
+            try:
+                cursor.execute(_alter)
+            except Exception:
+                pass  # column already exists
+        # ── Blocks table expansion (merkle_root, block_hash alias) ────────────
+        _block_new_cols = [
+            "ALTER TABLE blocks ADD COLUMN merkle_root        TEXT    DEFAULT ''",
+            "ALTER TABLE blocks ADD COLUMN block_hash_alias   TEXT    DEFAULT ''",
+            "ALTER TABLE blocks ADD COLUMN tx_count           INTEGER DEFAULT 0",
+            "ALTER TABLE blocks ADD COLUMN synced_from_server INTEGER DEFAULT 0",
+        ]
+        for _alter in _block_new_cols:
+            try:
+                cursor.execute(_alter)
+            except Exception:
+                pass
         # Indexes for extended tables
         _extended_indexes = [
             "CREATE INDEX IF NOT EXISTS idx_wallet_ops_addr   ON wallet_operations (wallet_addr, ts DESC)",
@@ -3326,12 +3426,30 @@ class LocalBlockchainDB:
             "CREATE INDEX IF NOT EXISTS idx_hlwe_sig_hash     ON hlwe_signatures (content_hash)",
             "CREATE INDEX IF NOT EXISTS idx_dm_pool_height    ON dm_pool (chain_height DESC)",
             "CREATE INDEX IF NOT EXISTS idx_tfm_height        ON tensor_field_metrics (block_height DESC)",
+            # Server-mirror indexes
+            "CREATE INDEX IF NOT EXISTS idx_wallet_addr_type  ON wallet_addresses (address_type)",
+            "CREATE INDEX IF NOT EXISTS idx_wallet_addr_bal   ON wallet_addresses (balance DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_qmetrics_ts       ON quantum_metrics (timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_type           ON transactions (tx_type)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_block_hash     ON transactions (block_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_tx_height         ON transactions (block_height DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_blocks_hash       ON blocks (hash)",
+            "CREATE INDEX IF NOT EXISTS idx_blocks_parent     ON blocks (parent_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_blocks_miner      ON blocks (miner_address)",
         ]
         for _eidx in _extended_indexes:
             try:
                 cursor.execute(_eidx)
             except Exception:
                 pass
+        # Record schema version
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO schema_migrations (version, description)
+                VALUES ('v2.0_chain_sync', 'Added wallet_addresses, quantum_metrics, schema_migrations, sync_state, expanded tx/block columns')
+            """)
+        except Exception:
+            pass
         self.conn.commit()
     
     # ========= Interface-compatible query methods =========
@@ -3755,6 +3873,276 @@ class LocalBlockchainDB:
             'total_blocks': stats.get('total_blocks'),
             'db_path': str(self.db_path),
         }
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # INITIAL BLOCK DOWNLOAD (IBD) — Bitcoin-style canonical chain rebuild
+    #
+    # On startup (or when local chain is behind server), fetch every block
+    # from genesis to tip via qtcl_getBlockRange RPC in 100-block batches.
+    # Each block is validated for parent_hash continuity and persisted to
+    # local SQLite. Transactions are stored alongside their parent block.
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def sync_chain_from_server(self, kapi: "KoyebAPIClient",
+                                progress_cb: "Optional[Callable]" = None) -> int:
+        """Initial Block Download — fetch all blocks from server, genesis to tip.
+
+        Like Bitcoin's IBD: walks the chain from genesis, verifying parent_hash
+        linkage at every step. Stores blocks + transactions in local SQLite.
+
+        Args:
+            kapi: KoyebAPIClient with _rpc() method
+            progress_cb: optional callback(current_height, server_height) for UI
+
+        Returns:
+            Number of new blocks synced (0 if already up-to-date)
+        """
+        import json as _json_sync
+
+        # 1. Get server tip height
+        tip = kapi._rpc("qtcl_getBlockHeight", [])
+        if not isinstance(tip, dict):
+            logger.warning("[IBD] Failed to get server tip — skipping sync")
+            return 0
+        server_height = int(tip.get("height", 0))
+        server_tip_hash = str(tip.get("tip_hash", "0" * 64))
+
+        # 2. Get local chain height
+        local_height = self.get_chain_height()
+
+        if local_height >= server_height:
+            logger.debug(f"[IBD] Local chain up-to-date: local={local_height} server={server_height}")
+            return 0
+
+        logger.info(
+            f"[IBD] Chain sync needed: local={local_height} server={server_height} "
+            f"({server_height - local_height} blocks behind)"
+        )
+
+        # 3. Validate existing chain tip matches server's view
+        #    If local tip hash doesn't match server's block at that height,
+        #    we need to reorg (wipe and re-sync from genesis)
+        if local_height > 0:
+            local_tip = self.get_latest_block()
+            if local_tip:
+                local_tip_hash = local_tip.get('hash', '')
+                # Verify server agrees with our tip
+                server_block_at_local = kapi._rpc("qtcl_getBlock", [local_height])
+                if isinstance(server_block_at_local, dict):
+                    server_hash_at_local = str(
+                        server_block_at_local.get('block_hash') or
+                        server_block_at_local.get('hash', '')
+                    )
+                    if server_hash_at_local and local_tip_hash and server_hash_at_local != local_tip_hash:
+                        logger.warning(
+                            f"[IBD] Chain fork detected at h={local_height}: "
+                            f"local={local_tip_hash[:16]}… server={server_hash_at_local[:16]}… "
+                            f"— wiping local chain for clean resync"
+                        )
+                        self._wipe_for_resync()
+                        local_height = 0
+
+        # 4. Fetch blocks in batches of 100 (qtcl_getBlockRange)
+        synced = 0
+        start_height = local_height + 1 if local_height > 0 else 0
+        expected_parent = None
+
+        # Get parent hash for continuity check
+        if start_height > 0:
+            prev_block = self.get_block(start_height - 1)
+            if prev_block:
+                expected_parent = prev_block.get('hash', '')
+
+        batch_size = 100
+        cursor = self.conn.cursor()
+
+        while start_height <= server_height:
+            end_height = min(start_height + batch_size - 1, server_height)
+
+            # Try batch fetch first
+            batch = kapi._rpc("qtcl_getBlockRange", [start_height, end_height])
+            blocks = []
+            if isinstance(batch, dict) and 'blocks' in batch:
+                blocks = batch['blocks']
+            else:
+                # Fallback: fetch one at a time
+                for h in range(start_height, end_height + 1):
+                    blk = kapi._rpc("qtcl_getBlock", [h])
+                    if isinstance(blk, dict):
+                        blocks.append(blk)
+                    else:
+                        logger.warning(f"[IBD] Failed to fetch block h={h} — stopping sync")
+                        break
+
+            if not blocks:
+                logger.warning(f"[IBD] No blocks returned for range [{start_height}, {end_height}]")
+                break
+
+            for blk in blocks:
+                h = int(blk.get('height') or blk.get('block_height', 0))
+                blk_hash = str(blk.get('block_hash') or blk.get('hash', ''))
+                parent = str(blk.get('parent_hash') or blk.get('previous_hash', '0' * 64))
+
+                # Validate parent_hash continuity (skip for genesis)
+                if h > 0 and expected_parent and parent != expected_parent:
+                    logger.error(
+                        f"[IBD] CHAIN BREAK at h={h}: "
+                        f"expected parent={expected_parent[:16]}… got={parent[:16]}…"
+                    )
+                    break
+
+                # Persist block
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO blocks
+                        (height, hash, parent_hash, timestamp, nonce, difficulty,
+                         miner_address, pq_curr, pq_last, w_state_fidelity,
+                         merkle_root, tx_count, synced_from_server, data)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    """, (
+                        h,
+                        blk_hash,
+                        parent,
+                        int(blk.get('timestamp_s') or blk.get('timestamp', 0)),
+                        int(blk.get('nonce', 0)),
+                        int(blk.get('difficulty_bits') or blk.get('difficulty', 5)),
+                        str(blk.get('miner_address', '')),
+                        int(blk.get('pq_curr', h)),
+                        int(blk.get('pq_last', max(0, h - 1))),
+                        float(blk.get('w_state_fidelity', 0.0)),
+                        str(blk.get('merkle_root', '')),
+                        int(blk.get('tx_count', 0)),
+                        _json_sync.dumps(blk),
+                    ))
+
+                    # Persist transactions if present
+                    txs = blk.get('transactions', [])
+                    for tx in txs:
+                        tx_id = str(tx.get('tx_id') or tx.get('tx_hash', ''))
+                        if not tx_id:
+                            continue
+                        try:
+                            cursor.execute("""
+                                INSERT OR REPLACE INTO transactions
+                                (txid, block_height, from_addr, to_addr, amount,
+                                 fee, timestamp, status, block_hash,
+                                 transaction_index, tx_type, quantum_state_hash,
+                                 w_proof, metadata)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                tx_id,
+                                h,
+                                str(tx.get('from_addr', '')),
+                                str(tx.get('to_addr', '')),
+                                int(tx.get('amount', 0)),
+                                float(tx.get('fee', 0)),
+                                int(blk.get('timestamp_s') or blk.get('timestamp', 0)),
+                                str(tx.get('status', 'confirmed')),
+                                blk_hash,
+                                int(tx.get('tx_index', 0)),
+                                str(tx.get('tx_type', 'transfer')),
+                                str(tx.get('w_proof', '')),
+                                str(tx.get('w_proof', '')),
+                                str(tx.get('metadata', '')),
+                            ))
+                        except Exception as _tx_err:
+                            logger.debug(f"[IBD] TX insert h={h} tx={tx_id[:16]}…: {_tx_err}")
+
+                    # Update wallet_addresses for coinbase txs
+                    for tx in txs:
+                        if str(tx.get('tx_type', '')).lower() == 'coinbase':
+                            to_addr = str(tx.get('to_addr', ''))
+                            amount = int(tx.get('amount', 0))
+                            if to_addr and amount > 0:
+                                try:
+                                    cursor.execute("""
+                                        INSERT INTO wallet_addresses
+                                            (address, balance, balance_at_height, address_type)
+                                        VALUES (?, ?, ?, 'mining')
+                                        ON CONFLICT(address) DO UPDATE SET
+                                            balance = wallet_addresses.balance + excluded.balance,
+                                            balance_at_height = excluded.balance_at_height
+                                    """, (to_addr, amount, h))
+                                except Exception:
+                                    pass
+
+                    synced += 1
+                    expected_parent = blk_hash
+
+                except Exception as _blk_err:
+                    logger.error(f"[IBD] Block insert h={h}: {_blk_err}")
+                    break
+
+            # Commit batch
+            try:
+                self.conn.commit()
+            except Exception as _ce:
+                logger.error(f"[IBD] Batch commit error: {_ce}")
+
+            # Progress callback
+            if progress_cb:
+                try:
+                    progress_cb(start_height + len(blocks) - 1, server_height)
+                except Exception:
+                    pass
+
+            start_height = end_height + 1
+
+            # Brief yield to avoid blocking
+            if synced % 500 == 0 and synced > 0:
+                logger.info(f"[IBD] Progress: {synced} blocks synced, at h={start_height - 1}")
+
+        # 5. Update sync_state bookmark
+        try:
+            final_height = self.get_chain_height()
+            self.execute("""
+                INSERT OR REPLACE INTO sync_state (key, value, updated_at)
+                VALUES ('last_sync_height', ?, ?)
+            """, (str(final_height), int(time.time())))
+            self.execute("""
+                INSERT OR REPLACE INTO sync_state (key, value, updated_at)
+                VALUES ('last_sync_ts', ?, ?)
+            """, (str(int(time.time())), int(time.time())))
+        except Exception:
+            pass
+
+        logger.info(
+            f"[IBD] Chain sync complete: synced {synced} blocks, "
+            f"local height now {self.get_chain_height()}"
+        )
+        return synced
+
+    def _wipe_for_resync(self) -> None:
+        """Wipe blocks and transactions for clean chain resync (preserves wallet/config)."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM blocks")
+            cursor.execute("DELETE FROM transactions")
+            cursor.execute("DELETE FROM wallet_addresses")
+            cursor.execute("DELETE FROM sync_state")
+            self.conn.commit()
+            logger.info("[IBD] Local chain wiped for clean resync")
+        except Exception as e:
+            logger.error(f"[IBD] Wipe failed: {e}")
+
+    def sync_wallet_balance(self, kapi: "KoyebAPIClient", address: str) -> Optional[float]:
+        """Sync a single wallet balance from server via RPC."""
+        result = kapi._rpc("qtcl_getBalance", [address])
+        if isinstance(result, dict) and "balance" in result:
+            balance_qtcl = float(result["balance"])
+            balance_base = int(balance_qtcl * 100)
+            try:
+                self.execute("""
+                    INSERT INTO wallet_addresses (address, balance, address_type)
+                    VALUES (?, ?, 'mining')
+                    ON CONFLICT(address) DO UPDATE SET
+                        balance = ?,
+                        balance_updated_at = ?
+                """, (address, balance_base, balance_base, int(time.time())))
+            except Exception:
+                pass
+            return balance_qtcl
+        return None
 def compress(data: bytes) -> bytes:
     if HAS_ZSTD:
         return zstd.compress(data, 3)
@@ -10450,8 +10838,24 @@ class KoyebAPIClient:
             return last_error_response
         return None
     def get_chain_tip(self) -> Optional[dict]:
-        """Get chain tip via JSON-RPC."""
-        return self._rpc("qtcl_getBlock", [])
+        """Get chain tip via JSON-RPC (qtcl_getBlockHeight).
+        
+        Returns normalised dict with aliases the mining loop expects:
+          height, block_height, tip_hash, block_hash, hash, ts
+        """
+        r = self._rpc("qtcl_getBlockHeight", [])
+        if not isinstance(r, dict):
+            return None
+        h = int(r.get("height", 0))
+        th = str(r.get("tip_hash", "0" * 64))
+        return {
+            "height":       h,
+            "block_height": h,
+            "tip_hash":     th,
+            "block_hash":   th,
+            "hash":         th,
+            "ts":           r.get("ts"),
+        }
     def get_block_height(self) -> Optional[int]:
         """Get current block height via JSON-RPC."""
         tip = self._rpc("qtcl_getBlockHeight", [])
@@ -11014,6 +11418,12 @@ class TensorFieldMetrics:
                 dm_f /= _trace_val
             m.entropy_vn           = _vn_entropy(dm_f)
             m.entanglement_entropy = abs(_vn_entropy(dm_curr) - _vn_entropy(dm_last))
+            # ── W3 fidelity, purity, coherence, field_density ────────────
+            m.fidelity_to_w3 = ORACLE_W_STATE.fidelity_with(dm_f)
+            m.purity         = float(min(1.0, max(0.0, _np.real(_np.trace(dm_f @ dm_f)))))
+            m.coherence_l1   = _coherence_l1(dm_f)
+            diff_dm          = dm_curr - dm_last
+            m.field_density  = float(_np.linalg.norm(diff_dm, 'fro'))
             dm_AB = _partial_trace_keep(dm_f, (0, 1))
             dm_BC = _partial_trace_keep(dm_f, (1, 2))
             m.negativity_AB  = _negativity_4x4(dm_AB)
@@ -13557,7 +13967,8 @@ class QtclClientApp:
                 while _retries < _max_retries:
                     try:
                         tip = kapi.get_chain_tip()
-                        if tip and (tip.get("block_height") or tip.get("height")):
+                        # height=0 is valid (genesis) — use 'is not None' not truthiness
+                        if tip and (tip.get("block_height") is not None or tip.get("height") is not None):
                             return tip
                         _retries += 1
                         if _retries < _max_retries:
@@ -13627,7 +14038,7 @@ class QtclClientApp:
                 difficulty_bits = int(
                     tip.get("difficulty_bits") or
                     tip.get("difficulty") or
-                    6  # conservative fallback if tip is missing the field
+                    5  # conservative fallback if tip is missing the field
                 )
                 difficulty_bits = int(max(5, min(difficulty_bits, 20)))
                 
