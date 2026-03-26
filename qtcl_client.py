@@ -2044,14 +2044,13 @@ class QtclP2PNode:
                         if age < 60.0 and any(v != 0.0 for v in dm_re):
                             dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
                                               for i in range(64)).hex()
-                            _push = _cpj.dumps({**state, 'density_matrix_hex': dm_hex,
-                                                'node_ip': _MY_IP or ''}).encode()
-                            _pr = _CpR(f"http://{_h}:{_p}/api/oracle/push_dm",
-                                       data=_push,
-                                       headers={'Content-Type':'application/json',
-                                                'User-Agent':'QTCL-MeshNode/4.0'},
-                                       method='POST')
-                            _CpU(_pr, timeout=3).close()
+                            snap = {**state, 'density_matrix_hex': dm_hex, 'node_ip': _MY_IP or ''}
+                            # Broadcast via RPC instead of REST /api/oracle/push_dm
+                            try:
+                                if hasattr(_LIVE_RPC_ORACLE, '_rpc_client') and _LIVE_RPC_ORACLE._rpc_client:
+                                    _LIVE_RPC_ORACLE._rpc_client.call("qtcl_broadcastSnapshot", snap)
+                            except Exception:
+                                pass
                     except Exception: pass
                 _threading.Thread(target=_push_dm_async, daemon=True).start()
             if not False: return False
@@ -2108,27 +2107,12 @@ class QtclP2PNode:
             from urllib.request import Request as _Rq, urlopen as _uo
             peers = []
             try:
-                payload = _pj.dumps({
-                    'node_id':    self._node_id,
-                    'port':       self._port,
-                    'gossip_url': f"http://auto:{self._port}",  # server replaces with remote_addr
-                    'version':    3,
-                    'capabilities': ['wstate','dmpool','sse'],
-                }).encode()
-                req = _Rq(f"{_oracle_url}/api/p2p/peer_exchange",
-                          data=payload,
-                          headers={'Content-Type':'application/json',
-                                   'User-Agent':'QTCL-P2P/3.0'},
-                          method='POST')
-                with _uo(req, timeout=12) as r:
-                    peers += _pj.loads(r.read().decode()).get('peers', [])
-            except Exception: pass
-            try:
-                req2 = _Rq(f"{_oracle_url}/api/peers/list", method='GET')
-                req2.add_header('User-Agent', 'QTCL-P2P/3.0')
-                with _uo(req2, timeout=10) as r:
-                    peers += _pj.loads(r.read().decode()).get('peers', [])
-            except Exception: pass
+                # Use RPC: qtcl_getPeers instead of REST /api/peers/list
+                rpc_resp = self._rpc_client.call("qtcl_getPeers", {"limit": 50}) if hasattr(self, '_rpc_client') else None
+                if rpc_resp and "result" in rpc_resp:
+                    peers += rpc_resp["result"] if isinstance(rpc_resp["result"], list) else []
+            except Exception:
+                pass
             return peers
         _pe_cycle = 0
         while not self._stop.is_set():
@@ -2177,15 +2161,12 @@ class QtclP2PNode:
                                 'port':         self._port,
                                 'gossip_url':   f"http://auto:{self._port}",
                                 'block_height': n_connected,
-                            }).encode()
-                            from urllib.request import Request as _ArRq, urlopen as _ArUo
-                            _arr = _ArRq(f"{_oracle_url}/api/peers/register",
-                                         data=_ann,
-                                         headers={'Content-Type':'application/json',
-                                                  'User-Agent':'QTCL-P2P/3.0'},
-                                         method='POST')
-                            with _ArUo(_arr, timeout=6): pass
-                        except Exception: pass
+                            })
+                            # Register peer via RPC instead of REST /api/peers/register
+                            if hasattr(self, '_rpc_client') and self._rpc_client:
+                                self._rpc_client.call("qtcl_registerPeer", _ann)
+                        except Exception:
+                            pass
                     _EXP_LOG.debug(
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
