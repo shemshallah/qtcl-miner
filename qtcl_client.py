@@ -10616,7 +10616,7 @@ class RPCSnapshotEngine:
                 self._meta["fetched"] = time.time()
                 self._meta["count"] += 1
             
-            logger.debug(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
+            logger.info(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
         
         except Exception as e:
             with self._lock:
@@ -12319,15 +12319,15 @@ class QtclClientApp:
             "oracle_context": oracle_context or {},
             "peer_id": self._peer_id,
         }
-    # ── Oracle identity ────────────────────────────────────────────────────────
+    # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
-        """Lazy LocalBlockchainDB instance (for mining loop compatibility)."""
+        """Return already-initialized sqlite3 connection (qtcl_blockchain.db)."""
         if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._db = LocalBlockchainDB(name='qtcl')
+            self._init_db()
         return self._db
     
+    # ── Oracle identity ────────────────────────────────────────────────────────
     def _init_oracle_identity(self, oracle_context: dict = None) -> dict:
         """
         Initialise the oracle signing identity for this node/client.
@@ -12588,207 +12588,13 @@ class QtclClientApp:
         except Exception: pass
     
     def _init_db(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = _sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=10)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.execute("PRAGMA cache_size=-64000")
-        self._db.execute("PRAGMA temp_store=MEMORY")
-        _EXP_LOG.info(f"[DB] Initialized at {self._db_path}")
-        
-        # ──── STEP 1: Detect old schema (missing chain_height) ────────────────
-        is_old = False
+        """Initialize blockchain database (LocalBlockchainDB, not raw sqlite3)."""
         try:
-            cursor = self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            existing_tables = {row[0] for row in cursor.fetchall()}
-            if existing_tables:
-                for test_table in ['dm_pool','p2p_peers','consensus_dm_log']:
-                    if test_table in existing_tables:
-                        cursor = self._db.execute(f"PRAGMA table_info({test_table})")
-                        cols = {row[1] for row in cursor.fetchall()}
-                        if 'chain_height' not in cols:
-                            is_old = True
-                            _EXP_LOG.info(f"[DB] Old schema detected: {test_table} lacks chain_height")
-                            break
-        except Exception as _ods: _EXP_LOG.debug(f"[DB] Old schema detect: {_ods}")
-        
-        # ──── STEP 2: Drop old tables if schema is stale ─────────────────────
-        if is_old:
-            _EXP_LOG.info("[DB] Clearing old schema for migration")
-            for table in ['dm_pool','consensus_dm_log','p2p_peers','tensor_field_metrics','gossip_inventory','oracle_registry']:
-                try: self._db.execute(f"DROP TABLE IF EXISTS {table}")
-                except Exception: pass
-            self._db.commit()
-        
-        # ──── STEP 3: Create all canonical tables ────────────────────────────
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS dm_pool (
-                id              INTEGER  PRIMARY KEY AUTOINCREMENT,
-                dm_hex          TEXT     NOT NULL,
-                fidelity        REAL     NOT NULL DEFAULT 0.0,
-                purity          REAL     NOT NULL DEFAULT 0.0,
-                chain_height    INTEGER  NOT NULL DEFAULT 0,
-                source_id_hex   TEXT     NOT NULL DEFAULT '',
-                flags           INTEGER  NOT NULL DEFAULT 0,
-                timestamp_ns    INTEGER  NOT NULL DEFAULT 0,
-                ingested_at     INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_dm_pool_height ON dm_pool (chain_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_dm_pool_fidelity ON dm_pool (fidelity DESC);
-            CREATE INDEX IF NOT EXISTS idx_dm_pool_ts ON dm_pool (timestamp_ns DESC);
-            
-            CREATE TABLE IF NOT EXISTS consensus_dm_log (
-                id              INTEGER  PRIMARY KEY AUTOINCREMENT,
-                chain_height    INTEGER  NOT NULL DEFAULT 0,
-                consensus_dm_hex TEXT    NOT NULL,
-                fidelity        REAL     NOT NULL DEFAULT 0.0,
-                pool_size       INTEGER  NOT NULL DEFAULT 0,
-                computed_at     INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_cdm_height ON consensus_dm_log (chain_height DESC);
-            
-            CREATE TABLE IF NOT EXISTS p2p_peers (
-                node_id_hex         TEXT     PRIMARY KEY,
-                host                TEXT     NOT NULL,
-                port                INTEGER  NOT NULL DEFAULT 9091,
-                services            INTEGER  NOT NULL DEFAULT 1,
-                protocol_version    INTEGER  NOT NULL DEFAULT 3,
-                chain_height        INTEGER  NOT NULL DEFAULT 0,
-                last_fidelity       REAL     NOT NULL DEFAULT 0.0,
-                latency_ms          REAL     NOT NULL DEFAULT 0.0,
-                ban_score           INTEGER  NOT NULL DEFAULT 0,
-                source              TEXT     NOT NULL DEFAULT 'peer_exchange',
-                first_seen_at       INTEGER  NOT NULL DEFAULT (strftime('%s','now')),
-                last_seen_at        INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_p2p_peers_host ON p2p_peers (host, port);
-            CREATE INDEX IF NOT EXISTS idx_p2p_peers_seen ON p2p_peers (last_seen_at DESC);
-            
-            CREATE TABLE IF NOT EXISTS tensor_field_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pq_curr_id TEXT DEFAULT '', pq_last_id TEXT DEFAULT '',
-                fidelity_to_w3 REAL DEFAULT 0, entropy_vn REAL DEFAULT 0,
-                coherence_l1 REAL DEFAULT 0, quantum_discord REAL DEFAULT 0,
-                bell_chsh_AB REAL DEFAULT 0, bell_chsh_BC REAL DEFAULT 0,
-                bell_violations INTEGER DEFAULT 0,
-                bell_S1_AB REAL DEFAULT 0, bell_S2_AB REAL DEFAULT 0,
-                bell_S3_AB REAL DEFAULT 0, bell_S4_AB REAL DEFAULT 0,
-                bell_S1_BC REAL DEFAULT 0, bell_S2_BC REAL DEFAULT 0,
-                bell_S3_BC REAL DEFAULT 0, bell_S4_BC REAL DEFAULT 0,
-                purity REAL DEFAULT 0, negativity_AB REAL DEFAULT 0,
-                negativity_BC REAL DEFAULT 0, field_density REAL DEFAULT 0,
-                entanglement_entropy REAL DEFAULT 0,
-                oracle_fidelity REAL DEFAULT 0, oracle_coherence REAL DEFAULT 0,
-                bridge_fidelity REAL DEFAULT 0, channel_latency_ms REAL DEFAULT 0,
-                block_height INTEGER DEFAULT 0, ts REAL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_tfm_ts ON tensor_field_metrics(ts DESC);
-            
-            CREATE TABLE IF NOT EXISTS gossip_inventory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL, channel TEXT DEFAULT 'gossip',
-                peer_id TEXT DEFAULT '', payload TEXT DEFAULT '{}', ts REAL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_gi_ts ON gossip_inventory(ts DESC);
-            
-            CREATE TABLE IF NOT EXISTS oracle_registry (
-                oracle_addr       TEXT PRIMARY KEY,
-                wallet_addr       TEXT NOT NULL DEFAULT '',
-                oracle_pubkey     TEXT NOT NULL DEFAULT '',
-                cert_json         TEXT NOT NULL DEFAULT '{}',
-                mode              TEXT NOT NULL DEFAULT 'anonymous',
-                cert_valid        INTEGER NOT NULL DEFAULT 0,
-                peer_id           TEXT NOT NULL DEFAULT '',
-                ip_hint           TEXT NOT NULL DEFAULT '',
-                first_seen_ns     INTEGER NOT NULL DEFAULT 0,
-                last_seen_ns      INTEGER NOT NULL DEFAULT 0,
-                attestation_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_or_wallet ON oracle_registry(wallet_addr);
-            CREATE INDEX IF NOT EXISTS idx_or_seen ON oracle_registry(last_seen_ns DESC);
-            
-            CREATE TABLE IF NOT EXISTS hlwe_signatures (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_hash    TEXT NOT NULL,
-                signature_hex   TEXT NOT NULL,
-                public_key      TEXT NOT NULL,
-                verified        INTEGER NOT NULL DEFAULT 0,
-                algorithm       TEXT NOT NULL DEFAULT 'hlwe_128',
-                created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_hlwe_sig_content ON hlwe_signatures(content_hash);
-            CREATE INDEX IF NOT EXISTS idx_hlwe_sig_verified ON hlwe_signatures(verified);
-            CREATE INDEX IF NOT EXISTS idx_hlwe_sig_ts ON hlwe_signatures(created_at DESC);
-            
-            CREATE TABLE IF NOT EXISTS wallet_operations (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_addr     TEXT NOT NULL,
-                op_type         TEXT NOT NULL,
-                amount          INTEGER DEFAULT 0,
-                peer_addr       TEXT DEFAULT '',
-                tx_hash         TEXT DEFAULT '',
-                hlwe_signed     INTEGER NOT NULL DEFAULT 1,
-                signature_hex   TEXT DEFAULT '',
-                block_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_wallet_op_addr ON wallet_operations(wallet_addr);
-            CREATE INDEX IF NOT EXISTS idx_wallet_op_type ON wallet_operations(op_type);
-            CREATE INDEX IF NOT EXISTS idx_wallet_op_height ON wallet_operations(block_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_wallet_op_ts ON wallet_operations(ts DESC);
-            
-            CREATE TABLE IF NOT EXISTS rpc_operations (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                method          TEXT NOT NULL,
-                params          TEXT DEFAULT '',
-                result_hash     TEXT DEFAULT '',
-                status          TEXT NOT NULL DEFAULT 'pending',
-                error_msg       TEXT DEFAULT '',
-                hlwe_verified   INTEGER NOT NULL DEFAULT 0,
-                block_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_rpc_method ON rpc_operations(method);
-            CREATE INDEX IF NOT EXISTS idx_rpc_status ON rpc_operations(status);
-            CREATE INDEX IF NOT EXISTS idx_rpc_verified ON rpc_operations(hlwe_verified);
-            CREATE INDEX IF NOT EXISTS idx_rpc_height ON rpc_operations(block_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_rpc_ts ON rpc_operations(ts DESC);
-            
-            CREATE TABLE IF NOT EXISTS oracle_measurements (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                oracle_addr     TEXT NOT NULL,
-                measurement_hex TEXT NOT NULL,
-                w_state_fidelity REAL DEFAULT 0.0,
-                bell_violation  INTEGER DEFAULT 0,
-                timestamp_ns    INTEGER NOT NULL DEFAULT 0,
-                block_height    INTEGER NOT NULL DEFAULT 0,
-                hlwe_signature  TEXT DEFAULT '',
-                attestation_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_oracle_meas_addr ON oracle_measurements(oracle_addr);
-            CREATE INDEX IF NOT EXISTS idx_oracle_meas_height ON oracle_measurements(block_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_oracle_meas_ts ON oracle_measurements(timestamp_ns DESC);
-            
-            CREATE TABLE IF NOT EXISTS block_verification (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_hash      TEXT NOT NULL UNIQUE,
-                miner_addr      TEXT NOT NULL,
-                verified        INTEGER NOT NULL DEFAULT 0,
-                hlwe_sig_valid  INTEGER NOT NULL DEFAULT 0,
-                chain_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_block_ver_hash ON block_verification(block_hash);
-            CREATE INDEX IF NOT EXISTS idx_block_ver_miner ON block_verification(miner_addr);
-            CREATE INDEX IF NOT EXISTS idx_block_ver_height ON block_verification(chain_height DESC);
-            CREATE INDEX IF NOT EXISTS idx_block_ver_verified ON block_verification(verified);
-            CREATE INDEX IF NOT EXISTS idx_block_ver_ts ON block_verification(ts DESC);
-        """)
-        self._db.commit()
-        
-        # ──── STEP 4: Verify & patch missing columns gracefully ───────────────
-        self._verify_db_schema()
-        _EXP_LOG.info("[DB] 🟢 Schema initialization complete")
+            self._db = LocalBlockchainDB(name='qtcl')
+            logger.info(f"[DB] ✅ LocalBlockchainDB initialized")
+        except Exception as e:
+            logger.error(f"[DB] ❌ Failed: {e}")
+            raise
     
     def _log_hlwe_signature(self, content_hash: str, signature_hex: str, public_key: str, verified: int = 1, algorithm: str = 'hlwe_128') -> bool:
         """Log HLWE signature verification to database."""
@@ -14015,22 +13821,12 @@ class QtclClientApp:
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
-            # ── Python-only fallback (C unavailable) ───────────────────────────
-            import hashlib as _hpy
-            _py_fid  = float(_LOCAL_ORACLE.get_oracle_state().get('w_state_fidelity', 0.0))
-            _py_seed = _hpy.sha3_256(
-                b"QTCL_PY_FALLBACK:" + str(_bh).encode() +
-                str(_pqc).encode() + str(_py_fid).encode()
-            ).digest()
-            _py_report = (
-                "\n  ╔══ BLOCKFIELD STATE [PYTHON-ONLY] ══════════════════════════╗\n"
-                f"  ║  C accel  : unavailable                                    ║\n"
-                f"  ║  oracle F : {_py_fid:.4f}   h={_bh}                         ║\n"
-                f"  ║  pq0/curr : 0 / {_pqc} / {_pql}                             ║\n"
-                f"  ║  seed     : {_py_seed.hex()[:16]}…                          ║\n"
-                "  ╚═══════════════════════════════════════════════════════════════╝\n"
+            # ── NO FALLBACK — RPC SNAPSHOT REQUIRED ───────────────────────
+            raise RuntimeError(
+                "[BLOCKFIELD] ❌ RPC oracle snapshot unavailable. "
+                f"Server returned no density_matrix_hex at height {_bh}. "
+                "Check that /api/oracle/snapshot is returning valid W-state data."
             )
-            return 0, None, _py_seed, _py_report
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
         _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
