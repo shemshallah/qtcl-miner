@@ -15961,6 +15961,16 @@ class QtclClientApp:
         elif choice == "4": self.run_oracle_mode()
         elif choice == "5": self.run_market_explorer()
         else:               self.run_mine_mode()
+def _silent_getpass(prompt: str) -> str:
+    """Temporarily suppress all loggers during getpass to prevent log injection."""
+    root_logger = logging.getLogger()
+    old_level = root_logger.level
+    root_logger.setLevel(logging.CRITICAL)
+    try:
+        return getpass.getpass(prompt)
+    finally:
+        root_logger.setLevel(old_level)
+
 def main() -> None:  # noqa: F811
     """
     QTCL Client entrypoint.
@@ -16036,8 +16046,8 @@ def main() -> None:  # noqa: F811
             if _create_wallet_ans != "n":
                 print()
                 try:
-                    _new_pw  = getpass.getpass("  New wallet password: ").strip()
-                    _new_pw2 = getpass.getpass("  Confirm password   : ").strip()
+                    _new_pw  = _silent_getpass("  New wallet password: ").strip()
+                    _new_pw2 = _silent_getpass("  Confirm password   : ").strip()
                     if _new_pw != _new_pw2:
                         print("  ❌ Passwords don't match — using defaults")
                         _new_pw = "default_qtcl_password"
@@ -16074,7 +16084,7 @@ def main() -> None:  # noqa: F811
             print()
             _tmp_wallet = QTCLWallet()
             try:
-                _pw_oi = getpass.getpass("  Wallet password: ")
+                _pw_oi = _silent_getpass("  Wallet password: ")
                 if _tmp_wallet.load(_pw_oi):
                     oracle_context = {
                         "wallet_addr": _tmp_wallet.address,
@@ -16098,6 +16108,7 @@ def main() -> None:  # noqa: F811
         _LOCAL_ORACLE.set_rpc_client(_KOYEB)
         
         # ── Initialize dual-mode ServerRPCClient: Koyeb HTTP + P2P gossip fallback
+        # (Moved here after interactive prompts to prevent log injection during password input)
         import sqlite3 as _rpc_sq3
         try:
             _rpc_db = _rpc_sq3.connect(str(_db_file), timeout=5.0, check_same_thread=False)
