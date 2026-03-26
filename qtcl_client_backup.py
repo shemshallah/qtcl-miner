@@ -1652,22 +1652,20 @@ class LiveRPCOracleSnapshot:
     def __init__(self):
         self._dm_re, self._dm_im, self._last_fetch_ts = [0.0]*64, [0.0]*64, 0.0; self._dm_lock = threading.Lock(); self._oracle_state, self._oracle_state_lock = {}, threading.Lock()
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous RPC call: qtcl_getQuantumMetrics (RPC-ONLY, no REST)."""
+        """Synchronous RPC call: GET /api/oracle/snapshot (no polling daemon)."""
         try:
-            # 🔄 RPC: Use qtcl_getQuantumMetrics instead of REST /api/oracle/snapshot
-            snap = self._rpc_oracle._rpc("qtcl_getQuantumMetrics", []) if hasattr(self._rpc_oracle, '_rpc') else {}
-            if not isinstance(snap, dict):
-                snap = {}
-            
-            if snap and snap.get('density_matrix_hex'):
-                dm_hex = snap['density_matrix_hex']; bdata = bytes.fromhex(dm_hex); dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                if len(bdata) == 1024:
-                    for i in range(64): re, im = struct.unpack_from('>dd', bdata, i*16); dm_re_new[i], dm_im_new[i] = re, im
-                elif len(bdata) == 512:
-                    for i in range(64): re, im = struct.unpack_from('>ff', bdata, i*8); dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                with self._dm_lock: self._dm_re, self._dm_im, self._last_fetch_ts = dm_re_new, dm_im_new, time.time()
-                with self._oracle_state_lock: self._oracle_state = {'w_state_fidelity': snap.get('w_state_fidelity', 0.0), 'coherence_l1': snap.get('coherence_l1', 0.0), 'von_neumann_entropy': snap.get('von_neumann_entropy', 0.0), 'purity': snap.get('purity', 0.0), 'cycle': snap.get('cycle', 0), 'consensus': snap.get('consensus', False), 'mermin_test': snap.get('mermin_test', {})}
-            return snap
+            req = Request(f"{self.ORACLE_URL}/api/oracle/snapshot", method="GET", headers={"Content-Type":"application/json"})
+            with urlopen(req, timeout=timeout_s) as r:
+                snap = json.loads(r.read().decode('utf-8'))
+                if snap and snap.get('density_matrix_hex'):
+                    dm_hex = snap['density_matrix_hex']; bdata = bytes.fromhex(dm_hex); dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
+                    if len(bdata) == 1024:
+                        for i in range(64): re, im = struct.unpack_from('>dd', bdata, i*16); dm_re_new[i], dm_im_new[i] = re, im
+                    elif len(bdata) == 512:
+                        for i in range(64): re, im = struct.unpack_from('>ff', bdata, i*8); dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                    with self._dm_lock: self._dm_re, self._dm_im, self._last_fetch_ts = dm_re_new, dm_im_new, time.time()
+                    with self._oracle_state_lock: self._oracle_state = {'w_state_fidelity': snap.get('w_state_fidelity', 0.0), 'coherence_l1': snap.get('coherence_l1', 0.0), 'von_neumann_entropy': snap.get('von_neumann_entropy', 0.0), 'purity': snap.get('purity', 0.0), 'cycle': snap.get('cycle', 0), 'consensus': snap.get('consensus', False), 'mermin_test': snap.get('mermin_test', {})}
+                return snap
         except (URLError, HTTPError, Exception) as e: _EXP_LOG.debug(f"[RPC-FETCH] {type(e).__name__}"); return {}
     def get_oracle_dm(self) -> tuple:
         """Return (dm_re, dm_im, age_sec) thread-safe."""
@@ -4376,11 +4374,16 @@ class GenesisResetListener:
         
         while not self._stop.is_set():
             try:
-                # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC instead of REST
-                tip = self._rpc("qtcl_getBlockHeight", [])
-                if isinstance(tip, dict):
-                    current_height = int(tip.get('height', -1))
-                    genesis_hash = tip.get('tip_hash', '0' * 64)
+                # RPC poll: /api/chain/status returns current height
+                url = f"{self._server_url}/api/chain/status"
+                req = _ur.Request(url, method='GET')
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-GenesisResetListener/3.1-RPC')
+                
+                with _ur.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    current_height = int(data.get('height', -1))
+                    genesis_hash = data.get('genesis_hash', '')
                     
                     if current_height == 0 and last_height > 0:
                         logger.warning(f"[GRL] 📨 RPC chain_reset detected: {last_height} → 0  genesis={genesis_hash[:20]}…")
@@ -6233,12 +6236,15 @@ class QtclMiner(QtclNode):
                     continue
                 # ── Server chain-tip probe: detect server-side genesis wipe ──────
                 try:
-                    # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC instead of REST /api/chain/tip
-                    tip = self._rpc("qtcl_getBlockHeight", [])
-                    if isinstance(tip, dict):
-                        _srv_h = int(tip.get('height') or 0)
-                    else:
-                        _srv_h = 0
+                    _tip_req = Request(f"{self._server_url}/api/chain/tip", method='GET')
+                    _tip_req.add_header('User-Agent', 'QTCL-Client/3.1')
+                    with urlopen(_tip_req, timeout=5) as _tr:
+                        _tip_data = json.loads(_tr.read())
+                    _srv_h = int(
+                        _tip_data.get('height') or
+                        _tip_data.get('chain_height') or
+                        _tip_data.get('block_height') or 0
+                    )
                     if _check_and_handle_chain_reset(
                         server_height=_srv_h, db=self.db,
                         server_url=self._server_url,
@@ -10918,14 +10924,9 @@ class KoyebAPIClient:
             return float(result["balance"])
         return None
     def get_address_history(self, address: str, limit: int = 50) -> list:
-        # 🔄 RPC-ONLY: Use qtcl_getEvents with address filter instead of REST
-        result = self._rpc("qtcl_getEvents", [])
-        if isinstance(result, dict) and "transactions" in result:
-            txs = result["transactions"]
-            # Filter by address
-            filtered = [tx for tx in txs if tx.get('from_address') == address or tx.get('to_address') == address]
-            return filtered[:limit]
-        return []
+        r = self._get(f"/api/address/{address}/history",
+                      params={"limit": limit})
+        return (r or {}).get("transactions", [])
     def get_mempool(self) -> list:
         """Get mempool transactions via JSON-RPC."""
         result = self._rpc("qtcl_getMempoolStats", [])
@@ -10997,125 +10998,83 @@ class KoyebAPIClient:
     # COMPREHENSIVE RPC ENDPOINT INTEGRATION (90+ methods)
     
     def list_transactions(self, limit: int = 100) -> Optional[list]:
-        """Get list of all transactions via RPC."""
-        # 🔄 RPC-ONLY: Use qtcl_getEvents to fetch recent transactions
-        result = self._rpc("qtcl_getEvents", [])
-        if isinstance(result, dict) and "events" in result:
-            return result["events"][:limit]
-        return []
+        """Get list of all transactions."""
+        return (self._get("/api/transactions", params={"limit": limit}) or {}).get("transactions", [])
     
     def get_transaction(self, tx_hash: str) -> Optional[dict]:
-        """Get a specific transaction by hash via RPC."""
-        # 🔄 RPC-ONLY: Use qtcl_getTransaction RPC
-        return self._rpc("qtcl_getTransaction", [tx_hash])
+        """Get a specific transaction by hash."""
+        return self._get(f"/api/transactions/{tx_hash}")
     
     def list_blocks(self, limit: int = 100) -> Optional[list]:
-        """Get list of blocks via RPC."""
-        # 🔄 RPC: Use qtcl_getBlockRange to fetch blocks
-        result = self._rpc("qtcl_getBlockRange", [0, limit])
-        if isinstance(result, dict) and "blocks" in result:
-            return result["blocks"]
-        return []
+        """Get list of blocks."""
+        return (self._get("/api/blocks", params={"limit": limit}) or {}).get("blocks", [])
     
     def get_block_by_height(self, height: int) -> Optional[dict]:
-        """Get block by height via RPC."""
-        # 🔄 RPC: Use qtcl_getBlock
-        return self._rpc("qtcl_getBlock", [height])
+        """Get block by height."""
+        return self._get(f"/api/blocks/height/{height}")
     
     def get_block_transactions(self, height: int) -> Optional[list]:
-        """Get transactions in a specific block via RPC."""
-        # 🔄 RPC: Fetch block and extract transactions
-        block = self._rpc("qtcl_getBlock", [height])
-        if isinstance(block, dict) and "transactions" in block:
-            return block["transactions"]
-        return []
+        """Get transactions in a specific block."""
+        return (self._get(f"/api/blocks/height/{height}/transactions") or {}).get("transactions", [])
     
     def get_chain_info(self) -> Optional[dict]:
-        """Get blockchain chain information via RPC."""
-        # 🔄 RPC: Use qtcl_getBlockHeight for tip info
-        return self._rpc("qtcl_getBlockHeight", [])
+        """Get blockchain chain information."""
+        return self._get("/api/chain")
     
     def get_balance_detail(self, address: str) -> Optional[dict]:
         """Get detailed balance info for an address via JSON-RPC."""
         return self._rpc("qtcl_getBalance", [address])
     
     def get_address_earned(self, address: str) -> Optional[dict]:
-        """Get total earned by an address (mining rewards) via RPC."""
-        # 🔄 RPC: Use qtcl_getEvents to filter coinbase transactions
-        result = self._rpc("qtcl_getEvents", [])
-        if isinstance(result, dict) and "events" in result:
-            earned = 0.0
-            for event in result["events"]:
-                if event.get('to_address') == address and event.get('type') == 'coinbase':
-                    earned += float(event.get('amount', 0))
-            return {"address": address, "earned": earned}
-        return {"address": address, "earned": 0.0}
+        """Get total earned by an address (mining rewards)."""
+        return self._get(f"/api/address/{address}/earned")
     
     def get_nonce(self, address: str) -> Optional[int]:
-        """Get nonce for an address (transaction counter) via RPC."""
-        # 🔄 RPC: Use qtcl_getEvents to count transactions from address
-        result = self._rpc("qtcl_getEvents", [])
-        if isinstance(result, dict) and "events" in result:
-            count = sum(1 for e in result["events"] if e.get('from_address') == address)
-            return count
+        """Get nonce for an address (transaction counter)."""
+        r = self._get(f"/api/nonce/{address}")
+        if r and "nonce" in r:
+            return int(r["nonce"])
         return None
     
     def repair_wallet(self, address: str) -> Optional[dict]:
-        """Repair wallet state (recover from corruption) via RPC."""
-        # 🔄 RPC: Not implemented in RPC (wallet repair is server-side, can submit transaction)
-        return {"status": "wallet_repair_not_available_via_rpc", "address": address}
+        """Repair wallet state (recover from corruption)."""
+        return self._post("/api/wallet/repair", {"address": address})
     
     def get_oracle_status(self) -> Optional[dict]:
-        """Get oracle status via RPC."""
-        # 🔄 RPC: Use qtcl_getHealth for system status
-        return self._rpc("qtcl_getHealth", [])
+        """Get oracle status."""
+        return self._get("/api/oracle")
     
     def get_oracle_identity(self) -> Optional[dict]:
-        """Get this node's oracle identity via RPC."""
-        # 🔄 RPC: Use qtcl_getOracleRegistry to find self
-        return self._rpc("qtcl_getOracleRegistry", [])
+        """Get this node's oracle identity."""
+        return self._get("/api/oracle/identity")
     
     def get_oracle_peers(self) -> Optional[list]:
-        """Get list of oracle peers via RPC."""
-        # 🔄 RPC: Use qtcl_getPeers
-        result = self._rpc("qtcl_getPeers", [])
-        if isinstance(result, dict) and "peers" in result:
-            return result["peers"]
-        return []
+        """Get list of oracle peers."""
+        return (self._get("/api/oracle/peers") or {}).get("peers", [])
     
     def get_oracle_registry(self) -> Optional[list]:
-        """Get full oracle registry via RPC."""
-        # 🔄 RPC: Use qtcl_getOracleRegistry
-        result = self._rpc("qtcl_getOracleRegistry", [])
-        if isinstance(result, dict) and "oracles" in result:
-            return result["oracles"]
-        return []
+        """Get full oracle registry."""
+        return (self._get("/api/oracle/registry") or {}).get("oracles", [])
     
     def get_oracle_registry_entry(self, oracle_addr: str) -> Optional[dict]:
-        """Get oracle registry entry by address via RPC."""
-        # 🔄 RPC: Use qtcl_getOracleRecord
-        return self._rpc("qtcl_getOracleRecord", [oracle_addr])
+        """Get oracle registry entry by address."""
+        return self._get(f"/api/oracle/registry/{oracle_addr}")
     
     def submit_oracle_registry(self, oracle_data: dict) -> Optional[dict]:
-        """Submit oracle registration via RPC."""
-        # 🔄 RPC: Use qtcl_submitOracleReg
-        return self._rpc("qtcl_submitOracleReg", [oracle_data])
+        """Submit oracle registration."""
+        return self._post("/api/oracle/registry/submit", oracle_data)
     
     def get_oracle_dual(self) -> Optional[dict]:
-        """Get oracle dual-consensus state via RPC."""
-        # 🔄 RPC: Use qtcl_getQuantumMetrics (oracle state)
-        return self._rpc("qtcl_getQuantumMetrics", [])
+        """Get oracle dual-consensus state."""
+        return self._get("/api/oracle/dual")
     
     def push_oracle_snapshot(self, snapshot: dict) -> Optional[dict]:
-        """Push oracle snapshot to server via RPC."""
-        # 🔄 RPC-ONLY: Snapshots are broadcast via RPC, not pushed (server polls)
-        # Store locally in measurement cache instead
-        return {"status": "snapshot_stored_locally", "broadcast": False}
+        """Push oracle snapshot to server."""
+        return self._post("/api/oracle/push_snapshot", snapshot)
     
     def push_oracle_dm(self, dm_data: dict) -> Optional[dict]:
-        """Push oracle density matrix via RPC."""
-        # 🔄 RPC-ONLY: DM pushed via RPC quantum metrics update
-        return {"status": "dm_queued_for_rpc_broadcast"}
+        """Push oracle density matrix."""
+        return self._post("/api/oracle/push_dm", dm_data)
     
     def get_difficulty(self) -> Optional[dict]:
         """Get current difficulty."""
@@ -13034,36 +12993,47 @@ class QtclClientApp:
         Launch all client daemon threads.
         Order matters — P2P must start before consensus SSE subscription.
         ❤️  I love you — every thread is a heartbeat of the network
+        
+        CRITICAL: Stagger thread startup with 100ms delays to prevent
+        simultaneous RPC pool contention during initialization.
         """
+        import time as _st
         self._stop.clear()
         # ── 1. Oracle metric loop ──────────────────────────────────────────
         self._metric_th = _threading.Thread(
             target=self._metric_loop, daemon=True, name="ClientMetrics")
         self._metric_th.start()
+        _st.sleep(0.1)  # ← Stagger: prevent simultaneous pool grabs
         # ── 2. Oracle RPC health monitor ──────────────────────────────────
         _rpc_th = _threading.Thread(
             target=self._oracle_rpc_monitor, daemon=True, name="OracleRPC")
         _rpc_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 3. P2P node init (C layer + consensus) ────────────────────────
         _p2p_th = _threading.Thread(
             target=self._start_p2p, daemon=True, name="P2P-Init")
         _p2p_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 4. Local 9091 health + gossip HTTP server ─────────────────────
         _http_th = _threading.Thread(
             target=self._local_http_server, daemon=True, name="LocalHTTP-9091")
         _http_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 5. Heartbeat loop — registers peer + sends keepalives ─────────
         _hb_th = _threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 6. Ouroboros RPC subscription to own chain state ──────────────────
         _ouro_th = _threading.Thread(
             target=self._subscribe_own_rpc, daemon=True, name="Ouroboros-RPC")
         _ouro_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 7. Python /api/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 8. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
@@ -13245,6 +13215,9 @@ class QtclClientApp:
                         if _http_err.code >= 500:
                             try:
                                 error_body = _http_err.read().decode('utf-8', errors='replace')[:100]
+                                # STRIP HTML tags to prevent pollution: <...> → [TAG]
+                                import re as _re_html
+                                error_body = _re_html.sub(r'<[^>]+>', '[TAG]', error_body)
                                 _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} → {error_body}")
                             except:
                                 _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code}")
@@ -13847,12 +13820,14 @@ class QtclClientApp:
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
         _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
-        print(_report, flush=True)
+        # _SILENT_MINE: suppress mining report spam in loop
+        # print(_report, flush=True)
         self.koyeb_state.sync(self.client_field, timeout=6)
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
-        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
-        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
-        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
+        # Oracle stats silent in loop — check logs if needed
+        # print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
+        # print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
+        # print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
@@ -14634,10 +14609,9 @@ class QtclClientApp:
             return
         if not tx_hash:
             return
-        # 🔄 RPC-ONLY: Use qtcl_getTransaction RPC instead of REST
-        r = self.api._rpc("qtcl_getTransaction", [tx_hash])
+        r = self.api._get(f"/api/transactions/{tx_hash}")
         print("\n" + "─" * 58)
-        if r and isinstance(r, dict):
+        if r:
             print(f"  Status  : {r.get('status','?').upper()}")
             print(f"  Hash    : {r.get('tx_hash', tx_hash)[:42]}")
             print(f"  Amount  : {r.get('amount_qtcl', r.get('amount', '?'))} QTCL")
