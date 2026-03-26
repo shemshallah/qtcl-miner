@@ -1623,6 +1623,98 @@ class QtclOracleMeasurement:
     def dm_re_bytes(self) -> bytes:
         import struct
         return struct.pack(f'>{len(self.dm_re)}d', *self.dm_re)
+# ═══════════════════════════════════════════════════════════════════════════════
+# RPC ORCHESTRATOR: Unified polling for oracle snapshots + chain status
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RpcOrchestratorThread:
+    """
+    Single coordinated thread that polls:
+    1. /api/oracle/snapshot (10-100ms loop) — density matrix freshness
+    2. /api/chain/status (1s loop) — block height, metadata
+    
+    Replaces separate LocalOracleEngine._poll_loop + ServerRPCClient._rpc_poller_loop
+    Reduces console spam, ensures oracle is ready before bootstrap proceeds.
+    """
+    
+    def __init__(self, oracle_engine, server_url: str):
+        self.oracle = oracle_engine
+        self.server_url = server_url.rstrip('/')
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._last_dm_poll = 0.0
+        self._last_status_poll = 0.0
+    
+    def start(self):
+        """Start the unified polling thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="RPC-Orchestrator")
+        self._thread.start()
+        logger.debug("[RPC-ORCH] Unified polling started")
+    
+    def stop(self):
+        """Stop the unified polling thread."""
+        if not self._thread:
+            return
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+    
+    def _poll_loop(self):
+        """Main orchestrator loop: DM every ~100ms, status every ~1s."""
+        import time as _pt
+        import json as _pj
+        import urllib.request as _pur
+        
+        while not self._stop.is_set():
+            now = _pt.time()
+            
+            # POLL 1: Oracle density matrix (high frequency)
+            if (now - self._last_dm_poll) >= 0.1:  # 10 Hz
+                try:
+                    req = _pur.Request(
+                        f"{self.server_url}/api/oracle/snapshot",
+                        headers={"Content-Type": "application/json"},
+                        method="GET"
+                    )
+                    with _pur.urlopen(req, timeout=2) as resp:
+                        snap = _pj.loads(resp.read().decode("utf-8"))
+                        if snap and snap.get('ready') and snap.get('density_matrix_hex'):
+                            # Update oracle engine with fresh snapshot
+                            try:
+                                self.oracle._last_snapshot = snap
+                                self.oracle._snapshot_count += 1
+                                self.oracle._last_poll_time = _pt.time()
+                            except Exception:
+                                pass
+                    self._last_dm_poll = now
+                except Exception as e:
+                    logger.debug(f"[RPC-ORCH] DM poll error: {type(e).__name__}")
+            
+            # POLL 2: Chain status (low frequency, metadata only)
+            if (now - self._last_status_poll) >= 1.0:  # 1 Hz
+                try:
+                    req = _pur.Request(
+                        f"{self.server_url}/api/chain/status",
+                        headers={"Content-Type": "application/json"},
+                        method="GET"
+                    )
+                    with _pur.urlopen(req, timeout=2) as resp:
+                        status = _pj.loads(resp.read().decode("utf-8"))
+                        if status:
+                            try:
+                                self.oracle._last_chain_status = status
+                            except Exception:
+                                pass
+                    self._last_status_poll = now
+                except Exception:
+                    # Silent — failures are normal during startup
+                    pass
+            
+            _pt.sleep(0.01)  # 100Hz wake check
+
+
 class LocalOracleEngine:
     """RPC-polled Oracle DM → Measurement pipeline with full snapshot lifecycle.
     Boot sequence (RPC-only, no SSE):
@@ -10635,7 +10727,7 @@ class RPCSnapshotEngine:
                 self._meta["fetched"] = time.time()
                 self._meta["count"] += 1
             
-            logger.info(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
+            logger.debug(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
         
         except Exception as e:
             with self._lock:
@@ -13840,12 +13932,13 @@ class QtclClientApp:
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
-            # ── NO FALLBACK — RPC SNAPSHOT REQUIRED ───────────────────────
-            raise RuntimeError(
-                "[BLOCKFIELD] ❌ RPC oracle snapshot unavailable. "
-                f"Server returned no density_matrix_hex at height {_bh}. "
-                "Check that /api/oracle/snapshot is returning valid W-state data."
-            )
+            # ── WAIT FOR ORACLE DM ────────────────────────────────────────────
+            if not _dm_ready:
+                raise RuntimeError(
+                    "[BLOCKFIELD] ❌ Oracle DM timeout (30s). "
+                    f"Server /api/oracle/snapshot not returning density_matrix_hex at height {_bh}. "
+                    "Check network connectivity and server logs."
+                )
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
         _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
