@@ -1799,47 +1799,70 @@ class LocalOracleEngine:
                     _EXP_LOG.debug(f"[LOCAL-ORACLE] RPC poll error: {_e}")
             
             _plt.sleep(0.1)  # Soft polling interval between RPC attempts
-    def _ingest_oracle_frame(self, json_str: str) -> None:
+    def _ingest_oracle_frame(self, json_str: str) -> bool:
         """Parse RPC JSON snapshot → update internal oracle DM + _oracle_state.
-        _oracle_state mirrors the canonical field set from OracleWState/DensityMatrixSnapshot
-        so the GKSL bath can couple to live Koyeb coherence/fidelity.
+        Returns True if successfully ingested, False if rejected.
+        STRICT: density_matrix_hex is REQUIRED. No fallbacks.
         """
         import json as _j, struct as _st
-        data = _j.loads(json_str)
-        dm_hex = (data.get('density_matrix_hex') or
-                  data.get('dm_hex') or
-                  data.get('w_state', {}).get('density_matrix_hex') or '')
-        if not dm_hex or len(dm_hex) < 128:
-            return
+        try:
+            data = _j.loads(json_str)
+        except Exception as e:
+            _EXP_LOG.error(f"[LOCAL-ORACLE] ❌ STRICT: JSON parse error: {e}")
+            return False
+        
+        dm_hex = data.get('density_matrix_hex', '')
+        if not dm_hex or len(dm_hex) < 256:
+            _EXP_LOG.warning(
+                f"[LOCAL-ORACLE] ❌ STRICT: RPC density_matrix_hex missing or too short "
+                f"(provided {len(dm_hex)} chars, need ≥256). Frame rejected."
+            )
+            return False
+        
         dm_re_new = [0.0] * 64
         dm_im_new = [0.0] * 64
         try:
             bdata = bytes.fromhex(dm_hex)
-            if len(bdata) == 1024:       # complex128: 128 × 8 bytes
+            
+            if len(bdata) == 1024:
                 for i in range(64):
                     re, im = _st.unpack_from('>dd', bdata, i*16)
-                    dm_re_new[i] = re; dm_im_new[i] = im
-            elif len(bdata) == 512:      # complex64: 128 × 4 bytes
+                    dm_re_new[i] = re
+                    dm_im_new[i] = im
+            elif len(bdata) == 512:
                 for i in range(64):
                     re, im = _st.unpack_from('>ff', bdata, i*8)
-                    dm_re_new[i] = float(re); dm_im_new[i] = float(im)
+                    dm_re_new[i] = float(re)
+                    dm_im_new[i] = float(im)
             else:
-                return
-        except Exception:
-            return
+                _EXP_LOG.warning(
+                    f"[LOCAL-ORACLE] ❌ STRICT: DM hex decoding failed — wrong size "
+                    f"(got {len(bdata)} bytes, expected 512 or 1024). Frame rejected."
+                )
+                return False
+                
+        except Exception as e:
+            _EXP_LOG.error(f"[LOCAL-ORACLE] ❌ DM hex decode error: {e}")
+            return False
+        
         with self._dm_lock:
             self._dm_re = dm_re_new
             self._dm_im = dm_im_new
             self._last_oracle_dm_ts = time.time()
             self._oracle_connected = True
             self._snapshot_count += 1
-        _frame_h = int(data.get('block_height') or data.get('height') or 0)
-        # Dead code block removed (condition was always False)
+        
+        return True
     def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
-        """Dual-path broadcast after every successful measure():
         """
-        if not False:
-            raise RuntimeError("[LocalOracleEngine._broadcast_snapshot] C required for broadcast")
+        Dual-path broadcast after every successful measure().
+        Requires C acceleration for DHT gossip.
+        """
+        if _accel_ffi is None:
+            raise RuntimeError(
+                "[LocalOracleEngine._broadcast_snapshot] ❌ CRITICAL: C acceleration "
+                "required for DHT gossip. Measurement cannot be broadcast without C layer."
+            )
         # ── Path 1: C DHT P2P gossip + DM pool push ─────────────────────────
         #   c. RPC polling triggers consensus on demand (no daemon, no self-loop)
         try:
@@ -1877,14 +1900,18 @@ class LocalOracleEngine:
             avg_block_time:  float = 30.0,
             bath:            'GKSLBathParams' = None,
     ) -> QtclOracleMeasurement:
-        """Post-measure: stores canonical snapshot, gossips to DHT peers,
-        ingests into C SSE layer.
+        """
+        ⚛️  Post-measure: tripartite DM → C consensus → RPC oracle fusion.
+        C ACCELERATION MANDATORY — no Python fallbacks.
+        Raises RuntimeError if C extension unavailable.
         """
         import hashlib as _hl, struct as _st
-        if not False:
+        
+        if _accel_ffi is None:
             raise RuntimeError(
-                "[LocalOracleEngine.measure] C acceleration required — "
-                "build qtcl_accel.so (clang + openssl + libffi)"
+                "[LocalOracleEngine.measure] ❌ CRITICAL: C acceleration (qtcl_accel.so) "
+                "REQUIRED for measurement. Build with: clang + OpenSSL + libffi. "
+                "No Python fallbacks permitted."
             )
         triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
         b0  = _accel_ffi.new('double[3]', list(triangle.ball_pq0))
@@ -5992,11 +6019,11 @@ class QtclMiner(QtclNode):
         )
         self._rpc_poller_thread.start()
     def _rpc_poller_loop(self) -> None:
-        """RPC polling loop for chain status (no SSE fallback)"""
+        """RPC polling loop — strict 5s cycle, NO RETRY BACKOFF."""
         import urllib.request
         rpc_url = f"{self._server_url}/api/chain/status"
-        retry_delay = 2.0
         last_height = -1
+        poll_fail_count = 0
         
         while not self._stop_event.is_set():
             try:
@@ -6005,38 +6032,37 @@ class QtclMiner(QtclNode):
                     headers={"Content-Type": "application/json"},
                     method="GET"
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                    retry_delay = 2.0
+                    poll_fail_count = 0
                     
                     height = int(data.get("height", 0))
                     if height > last_height:
-                        # Fetch block data via RPC
                         try:
                             block_data = self._rpc_get_block(height)
                             if block_data:
-                                self._pending_blocks.put_nowait(block_data)
-                                last_height = height
-                        except queue.Full:
-                            self._pending_blocks.get_nowait()
-                            if block_data:
-                                self._pending_blocks.put_nowait(block_data)
-                                last_height = height
+                                try:
+                                    self._pending_blocks.put_nowait(block_data)
+                                    last_height = height
+                                except queue.Full:
+                                    pass
+                        except Exception:
+                            pass
                     
-                    try:
-                        snapshot = self._rpc_get_snapshot()
-                        if snapshot:
+                    snapshot = self._rpc_get_snapshot()
+                    if snapshot:
+                        try:
                             self._apply_rpc_snapshot(snapshot)
-                    except Exception:
-                        pass  # Snapshot fetch optional
+                        except Exception as apply_err:
+                            self.log.debug(f"[{self.name}] Snapshot apply failed: {apply_err}")
                     
-                    self._stop_event.wait(5.0)  # Poll every 5 seconds
+                    self._stop_event.wait(5.0)
                     
             except Exception as exc:
-                if not self._stop_event.is_set():
-                    self.log.warning(f"[{self.name}] RPC poll failed: {exc}, retrying in {retry_delay}s")
-                    self._stop_event.wait(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 30.0)
+                poll_fail_count += 1
+                if poll_fail_count <= 1 and not self._stop_event.is_set():
+                    self.log.warning(f"[{self.name}] RPC chain poll failed: {exc}")
+                self._stop_event.wait(5.0)
     
     def _rpc_get_block(self, height: int) -> Optional[Dict]:
         """Fetch block data via RPC /api/block/{height}"""
@@ -6052,7 +6078,9 @@ class QtclMiner(QtclNode):
             return None
     
     def _rpc_get_snapshot(self) -> Optional[Dict]:
-        """Fetch oracle snapshot via RPC /api/oracle/snapshot"""
+        """Fetch oracle snapshot via RPC /api/oracle/snapshot — STRICT RPC ONLY.
+        If DM missing or invalid, logs error and returns None (no fallback).
+        """
         try:
             req = urllib.request.Request(
                 f"{self._server_url}/api/oracle/snapshot",
@@ -6060,26 +6088,17 @@ class QtclMiner(QtclNode):
                 method="GET"
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return None
-        try:
-            height = snap_data.get("height", 0)
-            local_height = self.db.get_chain_height()
-            if height > local_height:
-                raw = bytes.fromhex(snap_data.get("data", ""))
-                if raw:
-                    snap_record = SnapshotRecord(
-                        height=height,
-                        timestamp=snap_data.get("timestamp", time.time()),
-                        checksum=snap_data.get("checksum", ""),
-                        data=raw,
-                        size_bytes=len(raw),
+                data = json.loads(resp.read().decode("utf-8"))
+                if not data or not data.get('density_matrix_hex'):
+                    self.log.debug(
+                        f"[{self.name}] RPC snapshot missing density_matrix_hex — "
+                        f"rejecting (RPC server may be broken)"
                     )
-                    self.snapshot_mgr.apply_snapshot(snap_record, self.db)
-                    self.log.info(f"[{self.name}] applied SSE snapshot height={height}")
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] snapshot apply failed: {exc}")
+                    return None
+                return data
+        except Exception as e:
+            self.log.debug(f"[{self.name}] RPC snapshot fetch failed: {e}")
+            return None
     def _send_heartbeat(self) -> None:
         import urllib.request
         payload = json.dumps({
@@ -14892,12 +14911,6 @@ class QtclClientApp:
                 except Exception: pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
-            # ── Buffered log tail (replaces stdout bleed) ─────────────────────
-            if _LOG_BUF:
-                print("  ── Recent log ──────────────────────────────────────────────")
-                for _line in list(_LOG_BUF):
-                    print(f"  {_line}")
-                print(sep)
         # ── Foreground interactive loop — non-blocking auto-refresh ──────────
         _REFRESH_INTERVAL = 5.0   # seconds between auto-redraws
         import select as _select
