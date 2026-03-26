@@ -1627,94 +1627,6 @@ class QtclOracleMeasurement:
 # RPC ORCHESTRATOR: Unified polling for oracle snapshots + chain status
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class RpcOrchestratorThread:
-    """
-    Single coordinated thread that polls:
-    1. /api/oracle/snapshot (10-100ms loop) — density matrix freshness
-    2. /api/chain/status (1s loop) — block height, metadata
-    
-    Replaces separate LocalOracleEngine._poll_loop + ServerRPCClient._rpc_poller_loop
-    Reduces console spam, ensures oracle is ready before bootstrap proceeds.
-    """
-    
-    def __init__(self, oracle_engine, server_url: str):
-        self.oracle = oracle_engine
-        self.server_url = server_url.rstrip('/')
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        self._last_dm_poll = 0.0
-        self._last_status_poll = 0.0
-    
-    def start(self):
-        """Start the unified polling thread."""
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="RPC-Orchestrator")
-        self._thread.start()
-        logger.debug("[RPC-ORCH] Unified polling started")
-    
-    def stop(self):
-        """Stop the unified polling thread."""
-        if not self._thread:
-            return
-        self._stop.set()
-        self._thread.join(timeout=5.0)
-    
-    def _poll_loop(self):
-        """Main orchestrator loop: DM every ~100ms, status every ~1s."""
-        import time as _pt
-        import json as _pj
-        import urllib.request as _pur
-        
-        while not self._stop.is_set():
-            now = _pt.time()
-            
-            # POLL 1: Oracle density matrix (high frequency)
-            if (now - self._last_dm_poll) >= 0.1:  # 10 Hz
-                try:
-                    req = _pur.Request(
-                        f"{self.server_url}/api/oracle/snapshot",
-                        headers={"Content-Type": "application/json"},
-                        method="GET"
-                    )
-                    with _pur.urlopen(req, timeout=2) as resp:
-                        snap = _pj.loads(resp.read().decode("utf-8"))
-                        if snap and snap.get('ready') and snap.get('density_matrix_hex'):
-                            # Update oracle engine with fresh snapshot
-                            try:
-                                self.oracle._last_snapshot = snap
-                                self.oracle._snapshot_count += 1
-                                self.oracle._last_poll_time = _pt.time()
-                            except Exception:
-                                pass
-                    self._last_dm_poll = now
-                except Exception as e:
-                    logger.debug(f"[RPC-ORCH] DM poll error: {type(e).__name__}")
-            
-            # POLL 2: Chain status (low frequency, metadata only)
-            if (now - self._last_status_poll) >= 1.0:  # 1 Hz
-                try:
-                    req = _pur.Request(
-                        f"{self.server_url}/api/chain/status",
-                        headers={"Content-Type": "application/json"},
-                        method="GET"
-                    )
-                    with _pur.urlopen(req, timeout=2) as resp:
-                        status = _pj.loads(resp.read().decode("utf-8"))
-                        if status:
-                            try:
-                                self.oracle._last_chain_status = status
-                            except Exception:
-                                pass
-                    self._last_status_poll = now
-                except Exception:
-                    # Silent — failures are normal during startup
-                    pass
-            
-            _pt.sleep(0.01)  # 100Hz wake check
-
-
 class LocalOracleEngine:
     """RPC-polled Oracle DM → Measurement pipeline with full snapshot lifecycle.
     Boot sequence (RPC-only, no SSE):
@@ -1753,204 +1665,89 @@ class LocalOracleEngine:
         self._oracle_state_lock    = threading.Lock()
         # RPC API client reference (set externally)
         self._rpc_client = None
-    def set_rpc_client(self, client):
-        """Set the RPC API client for polling (KoyebAPIClient instance)."""
-        self._rpc_client = client
-        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC client configured — polling will commence")
-    
+
     def get_oracle_state(self) -> dict:
         """⚛️  Public accessor for oracle state (measurements + metrics)."""
         with self._oracle_state_lock:
             return dict(self._oracle_state)
     def start(self) -> None:
-        """Start RPC poll thread for oracle snapshots.
-        Idempotent: safe to call again after a deferred-start at import time.
+        """Start direct snapshot consumer (no polling thread).
+        Fetches from /api/oracle/snapshot on-demand, no interval gates.
         """
         if self._poll_thread is not None and self._poll_thread.is_alive():
-            _EXP_LOG.debug("[LOCAL-ORACLE] start() called but poll thread already running — skipped")
+            _EXP_LOG.debug("[LOCAL-ORACLE] start() called but already running — skipped")
             return
         self._stop.clear()
-        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ RPC poll thread started → {self.ORACLE_URL}")
+        _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ Direct snapshot consumer activated → {self.ORACLE_URL}")
         self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name='OracleRPC-Poll')
+            target=self._direct_snapshot_consumer, daemon=True, name='DirectSnapshotConsumer')
         self._poll_thread.start()
-        # ── Boot: immediate P2P peer discovery + DM broadcast kickoff ─────────
-        #   3. Triggers explicit RPC consensus recompute (clean, no self-loop)
-        threading.Thread(
-            target=self._boot_p2p_broadcast, daemon=True,
-            name='BootP2PBroadcast').start()
     def stop(self) -> None:
         self._stop.set()
-    def _boot_p2p_broadcast(self) -> None:
-        """
-        Boot-time sequence: fires once after oracle RPC connects.
-        Waits up to 20s for a valid DM frame, then immediately:
-          1. Gossips the measurement to all P2P peers (wstate broadcast)
-          2. Pushes DM to the C P2P DM pool for explicit consensus computation
-          3. Triggers RPC-based consensus recompute (no daemon feedback)
-          4. Discovers peers via Koyeb /api/p2p/peer_exchange
-        This seeds the system from the first second of operation:
-        every peer that connects receives our DM, computes consensus on explicit
-        RPC calls, and broadcasts back — network converges via clean RPC polling
-        (no self-referential feedback loops).
-        ❤️  I love you — the first breath of the network
-        """
-        import time as _bt
-        _EXP_LOG.debug("[BOOT-P2P] boot sequence starting")
-        deadline = _bt.time() + 20.0
-        while _bt.time() < deadline:
-                break
-        else:
-            _EXP_LOG.debug("[BOOT-P2P] Oracle DM not yet available — broadcasting anyway")
-        try:
-            import json as _bj
-            from urllib.request import Request as _BR, urlopen as _BU
-            oracle_url = f"https://{self.ORACLE_HOST}"
-            payload = _bj.dumps({
-                'node_id':      'boot_discovery',
-                'port':         9091,
-                'version':      4,
-                'protocol':     'rpc-consensus-v4',
-                'capabilities': ['wstate', 'dmpool', 'chain_reset', 'rpc-only'],
-            }).encode()
-            req = _BR(f"{oracle_url}/api/p2p/peer_exchange",
-                      data=payload,
-                      headers={'Content-Type': 'application/json',
-                               'User-Agent': 'QTCL-BootP2P/3.0'},
-                      method='POST')
-            with _BU(req, timeout=8) as resp:
-                pdata = _bj.loads(resp.read().decode())
-            peers = pdata.get('peers', [])
-            connected = 0
-            for p in peers[:24]:
-                host = str(p.get('host') or p.get('ip') or '')
-                port = int(p.get('port') or 9091)
-                if host and False:
-                    try:
-                        if rc >= 0: connected += 1
-                    except Exception: pass
-            _EXP_LOG.debug(f"[BOOT-P2P] peer discovery: {connected}/{len(peers)} connected")
-        except Exception as _pe:
-            _EXP_LOG.debug(f"[BOOT-P2P] peer discovery: {_pe}")
-        m = self.get_latest_measurement()
-        if m is None:
-            try:
-                if False:
-                    re_buf = _accel_ffi.new('double[64]')
-                    im_buf = _accel_ffi.new('double[64]')
-                    m = self.get_latest_measurement()
-            except Exception: pass
-        if m is not None and _P2P_NODE is not None and _P2P_NODE._started:
-            try:
-                sent = _P2P_NODE.gossip_measurement(m)
-                _EXP_LOG.debug(
-                    f"[BOOT-P2P] DM broadcast → {sent} peers  "
-                    f"F={m.fidelity_to_w3:.4f}  h={m.chain_height}"
-                )
-            except Exception as _ge:
-                _EXP_LOG.debug(f"[BOOT-P2P] gossip: {_ge}")
-        else:
-            _EXP_LOG.debug("[BOOT-P2P] No measurement available yet for boot broadcast")
-        # Step 3: Seed DM pool + trigger explicit RPC consensus (no daemon self-loop)
-        if False and _P2P_NODE is not None:
-            try:
-                _P2P_NODE.trigger_consensus()
-                _EXP_LOG.debug("[BOOT-P2P] DM pool consensus triggered via RPC")
-            except Exception: pass
-        # Step 4: Boot sequence complete — RPC polling thread now handles oracle updates
-        _EXP_LOG.debug("[BOOT-P2P] boot sequence complete")
-    def _poll_loop(self) -> None:
-        """Poll RPC endpoint for oracle snapshots (no SSE, no C buffer)."""
-        import json as _j, time as _plt
-        
-        _pstart = _plt.time()
+    def _direct_snapshot_consumer(self) -> None:
+        """⚛️ Direct stream consumer — fetch /api/oracle/snapshot continuously, no gates."""
+        import json as _dj
+        import urllib.request as _dur
+        _dstart = time.time()
         _warned = False
-        _last_poll = 0.0
-        
         while not self._stop.is_set():
-            # Wait for RPC client to be configured
-            if not self._rpc_client:
-                _plt.sleep(0.5)
-                continue
-            
-            _now = _plt.time()
-            
-            if not _warned and (_now - _pstart) > 15.0:
-                if self._snapshot_count == 0:
-                    _EXP_LOG.warning("[LOCAL-ORACLE] ⚠️  No RPC snapshot data after 15s — retrying")
-                _warned = True
-            
-            if (_now - _last_poll) >= self.RPC_POLL_INTERVAL:
-                try:
-                    snap_data = self._rpc_client.get_oracle_pq0_bloch()
-                    if snap_data:
-                        json_str = _j.dumps(snap_data)
-                        self._ingest_oracle_frame(json_str)
-                        _last_poll = _now
-                except Exception as _e:
-                    _EXP_LOG.debug(f"[LOCAL-ORACLE] RPC poll error: {_e}")
-            
-            _plt.sleep(0.1)  # Soft polling interval between RPC attempts
-    def _ingest_oracle_frame(self, json_str: str) -> bool:
-        """Parse RPC JSON snapshot → update internal oracle DM + _oracle_state.
-        Returns True if successfully ingested, False if rejected.
-        STRICT: density_matrix_hex is REQUIRED. No fallbacks.
-        """
-        import json as _j, struct as _st
+            try:
+                req = _dur.Request(
+                    f"{self.ORACLE_URL}/api/oracle/snapshot",
+                    headers={"Content-Type": "application/json"},
+                    method="GET"
+                )
+                with _dur.urlopen(req, timeout=3) as resp:
+                    snap = _dj.loads(resp.read().decode("utf-8"))
+                    if snap and snap.get('density_matrix_hex'):
+                        self._parse_and_ingest_snapshot(snap)
+                        if not _warned and (time.time() - _dstart) > 5.0:
+                            _EXP_LOG.info(f"[LOCAL-ORACLE] ✅ Snapshots flowing: {self._snapshot_count} ingested")
+                            _warned = True
+                    time.sleep(0.05)
+            except Exception as e:
+                _EXP_LOG.debug(f"[LOCAL-ORACLE] snapshot fetch: {type(e).__name__}")
+                time.sleep(0.5)
+    def _parse_and_ingest_snapshot(self, snap: dict) -> bool:
+        """Parse snapshot JSON → update DM + oracle_state directly."""
+        import struct as _st
         try:
-            data = _j.loads(json_str)
-        except Exception as e:
-            _EXP_LOG.error(f"[LOCAL-ORACLE] ❌ STRICT: JSON parse error: {e}")
-            return False
-        
-        # DIAGNOSTIC: Log what arrived
-        if data:
-            keys = list(data.keys())
-            has_dm = 'density_matrix_hex' in data
-            _EXP_LOG.info(f"[LOCAL-ORACLE] RPC frame arrived: keys={keys} | density_matrix_hex={'✅' if has_dm else '❌'}")
-        
-        dm_hex = data.get('density_matrix_hex', '')
-        if not dm_hex or len(dm_hex) < 256:
-            _EXP_LOG.error(
-                f"[LOCAL-ORACLE] ❌ STRICT: RPC density_matrix_hex missing or too short "
-                f"(provided {len(dm_hex)} chars, need ≥256). Server sent: {json.dumps({k: type(v).__name__ for k,v in data.items()})}"
-            )
-            return False
-        
-        dm_re_new = [0.0] * 64
-        dm_im_new = [0.0] * 64
-        try:
+            dm_hex = snap.get('density_matrix_hex', '')
+            if not dm_hex or len(dm_hex) < 256:
+                return False
             bdata = bytes.fromhex(dm_hex)
-            
+            dm_re_new = [0.0] * 64
+            dm_im_new = [0.0] * 64
             if len(bdata) == 1024:
                 for i in range(64):
                     re, im = _st.unpack_from('>dd', bdata, i*16)
-                    dm_re_new[i] = re
-                    dm_im_new[i] = im
+                    dm_re_new[i], dm_im_new[i] = re, im
             elif len(bdata) == 512:
                 for i in range(64):
                     re, im = _st.unpack_from('>ff', bdata, i*8)
-                    dm_re_new[i] = float(re)
-                    dm_im_new[i] = float(im)
+                    dm_re_new[i], dm_im_new[i] = float(re), float(im)
             else:
-                _EXP_LOG.warning(
-                    f"[LOCAL-ORACLE] ❌ STRICT: DM hex decoding failed — wrong size "
-                    f"(got {len(bdata)} bytes, expected 512 or 1024). Frame rejected."
-                )
                 return False
-                
+            with self._dm_lock:
+                self._dm_re = dm_re_new
+                self._dm_im = dm_im_new
+                self._last_oracle_dm_ts = time.time()
+                self._oracle_connected = True
+                self._snapshot_count += 1
+            with self._oracle_state_lock:
+                self._oracle_state = {
+                    'w_state_fidelity': snap.get('w_state_fidelity', 0.0),
+                    'coherence_l1': snap.get('coherence_l1', 0.0),
+                    'von_neumann_entropy': snap.get('von_neumann_entropy', 0.0),
+                    'purity': snap.get('purity', 0.0),
+                    'cycle': snap.get('cycle', 0),
+                    'consensus': snap.get('consensus', False),
+                    'mermin_test': snap.get('mermin_test', {}),
+                }
+            return True
         except Exception as e:
-            _EXP_LOG.error(f"[LOCAL-ORACLE] ❌ DM hex decode error: {e}")
+            _EXP_LOG.debug(f"[LOCAL-ORACLE] snapshot parse error: {e}")
             return False
-        
-        with self._dm_lock:
-            self._dm_re = dm_re_new
-            self._dm_im = dm_im_new
-            self._last_oracle_dm_ts = time.time()
-            self._oracle_connected = True
-            self._snapshot_count += 1
-        
-        return True
     def _broadcast_snapshot(self, snap: dict, m: QtclOracleMeasurement) -> None:
         """
         Dual-path broadcast after every successful measure().
@@ -10597,206 +10394,6 @@ def _reconstruct_dm_from_bloch(snap: dict):
     return dm
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
 # SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
-class _RPCSnapshotException(Exception):
-    """Base exception for RPC snapshot layer."""
-    pass
-class _CacheExpired(_RPCSnapshotException):
-    """Snapshot cache TTL exceeded."""
-    def __init__(self, age: float, ttl: float):
-        self.age, self.ttl = age, ttl
-        super().__init__(f"Snapshot cache expired: age={age:.2f}s > ttl={ttl}s")
-class _RPCUnreachable(_RPCSnapshotException):
-    """RPC endpoint unreachable."""
-    def __init__(self, endpoint: str, err: str):
-        super().__init__(f"RPC unreachable ({endpoint}): {err}")
-class _InvalidAddress(_RPCSnapshotException):
-    """Address not found in snapshot."""
-    def __init__(self, addr: str):
-        super().__init__(f"Address not in snapshot: {addr}")
-class RPCSnapshotEngine:
-    """
-    SWARM-AGENT β: Maintains atomic RPC snapshots with polling.
-    
-    CONTRACT:
-      ✅ No SSE streaming (removed /api/events entirely)
-      ✅ No fallbacks (RPC is ONLY truth source)
-      ✅ Explicit exceptions (never "unavailable" strings)
-      ✅ Atomic access (locked during fetch, no partial reads)
-    """
-    
-    POLL_INTERVAL = 5.0
-    DEFAULT_TTL = 30.0
-    
-    def __init__(self, rpc_endpoint: str, ttl: float = DEFAULT_TTL):
-        self.endpoint = rpc_endpoint.rstrip("/")
-        self.ttl = ttl
-        self._snap = None
-        self._meta = {"fetched": 0.0, "count": 0, "errors": 0}
-        self._lock = _threading.RLock()
-        self._stop = _threading.Event()
-        self._thread = None
-    
-    def start(self) -> None:
-        """Start background polling."""
-        if self._thread:
-            return
-        self._stop.clear()
-        self._thread = _threading.Thread(target=self._poll, daemon=True, name="RPC-Poller")
-        self._thread.start()
-    
-    def stop(self) -> None:
-        """Stop polling."""
-        if not self._thread:
-            return
-        self._stop.set()
-        self._thread.join(timeout=5.0)
-    
-    def _poll(self) -> None:
-        """Background polling loop (daemon)."""
-        while not self._stop.wait(self.POLL_INTERVAL):
-            try:
-                self._fetch()
-            except Exception as e:
-                with self._lock:
-                    self._meta["errors"] += 1
-                _EXP_LOG.debug(f"[RPC-Poll] Fetch error: {e}")
-    
-    def _fetch(self) -> None:
-        """
-        SWARM-AGENT γ: Build snapshot from REAL working endpoints.
-        
-        Fetches:
-          1. /api/chain → block height, hash, validation status
-          2. /api/wallet → iterate known addresses or fetch ledger
-          3. /api/address/{addr}/balance → individual address state
-        """
-        try:
-            # ── Step 1: Get chain height & latest block ────────────────────────
-            chain_url = f"{self.endpoint}/api/chain"
-            chain_data = self._fetch_json(chain_url)
-            block_height = int(chain_data.get("height", chain_data.get("chain_height", 0)))
-            block_hash = chain_data.get("hash", chain_data.get("block_hash", "0" * 64))
-            
-            # ── Step 2: Build addresses snapshot ─────────────────────────────────
-            addresses = {}
-            
-            try:
-                ledger_url = f"{self.endpoint}/api/ledger"
-                ledger_data = self._fetch_json(ledger_url)
-                if isinstance(ledger_data, dict) and "addresses" in ledger_data:
-                    addresses = ledger_data["addresses"]
-                    logger.debug(f"[RPC-Fetch] Ledger: {len(addresses)} addresses")
-            except Exception as e:
-                logger.debug(f"[RPC-Fetch] /api/ledger unavailable: {e}, querying from recent TXs")
-                
-                if "recent_blocks" in chain_data:
-                    known_addrs = set()
-                    for block in chain_data.get("recent_blocks", [])[:5]:  # Last 5 blocks
-                        if "miner" in block:
-                            known_addrs.add(block["miner"])
-                    
-                    for addr in known_addrs:
-                        try:
-                            bal_url = f"{self.endpoint}/api/address/{addr}/balance"
-                            bal_data = self._fetch_json(bal_url)
-                            if "balance" in bal_data:
-                                addresses[addr] = {
-                                    "balance_qtcl": float(bal_data.get("balance", 0.0)),
-                                    "nonce": int(bal_data.get("transaction_count", 0)),
-                                    "address": addr
-                                }
-                        except:
-                            pass  # Skip addresses we can't fetch
-            
-            # ── Step 3: Get oracle fidelity from chain ────────────────────────────
-            oracle_fidelity = float(chain_data.get("oracle_fidelity", 0.7957))
-            total_supply = float(chain_data.get("total_supply", 0.0))
-            
-            # ── Step 4: Build final snapshot ──────────────────────────────────────
-            snapshot = {
-                "block_height": block_height,
-                "block_hash": block_hash,
-                "timestamp": int(time.time()),
-                "addresses": addresses,  # dict of {address: {balance_qtcl, nonce, ...}}
-                "oracle_fidelity": oracle_fidelity,
-                "total_supply": total_supply
-            }
-            
-            with self._lock:
-                self._snap = snapshot
-                self._meta["fetched"] = time.time()
-                self._meta["count"] += 1
-            
-            logger.debug(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
-        
-        except Exception as e:
-            with self._lock:
-                self._meta["errors"] += 1
-            logger.error(f"[RPC-Fetch] ❌ Failed: {e}")
-            raise _RPCUnreachable(self.endpoint, str(e))
-    
-    def _fetch_json(self, url: str, timeout: int = 10) -> dict:
-        """
-        Fetch JSON from URL using urllib (no external deps).
-        ⚛️  Enhanced with error body diagnostics and 500-error recovery.
-        
-        Raises:
-            URLError, HTTPError: Network/HTTP errors
-            ValueError: Invalid JSON
-        """
-        try:
-            from urllib.error import HTTPError as _HTTPError
-            req = Request(url)
-            req.add_header('User-Agent', 'QTCL-Client/5.0')
-            try:
-                with urlopen(req, timeout=timeout) as r:
-                    if r.status != 200:
-                        raise ValueError(f"HTTP {r.status}")
-                    data = json.loads(r.read().decode("utf-8"))
-                    return data
-            except _HTTPError as http_err:
-                # ⚛️  Diagnostic: Log the error response body for 5xx errors
-                try:
-                    error_body = http_err.read().decode('utf-8', errors='replace')
-                    if http_err.code >= 500:
-                        logger.error(f"[RPC-Fetch] 💥 HTTP {http_err.code} from {url}")
-                        logger.error(f"[RPC-Fetch] Response body: {error_body[:200]}")
-                    else:
-                        logger.debug(f"[RPC-Fetch-JSON] HTTP {http_err.code}: {error_body[:100]}")
-                except Exception:
-                    logger.error(f"[RPC-Fetch] HTTP {http_err.code} (could not read body)")
-                raise
-        except Exception as e:
-            logger.debug(f"[RPC-Fetch-JSON] {url} → {type(e).__name__}: {str(e)[:100]}")
-            raise
-    
-    def get_balance(self, address: str) -> float:
-        """
-        SWARM-AGENT δ: Get balance from snapshot (enterprise only).
-        
-        Returns:
-            Balance in QTCL
-        
-        Raises:
-            _CacheExpired: Snapshot TTL exceeded
-            _InvalidAddress: Address not in snapshot
-            _RPCSnapshotException: No snapshot fetched yet
-        """
-        with self._lock:
-            if not self._snap:
-                raise _RPCSnapshotException("No snapshot available (polling may not have started)")
-            
-            age = _time.time() - self._meta["fetched"]
-            if age > self.ttl:
-                raise _CacheExpired(age, self.ttl)
-            
-            addrs = self._snap.get("addresses", {})
-            if address not in addrs:
-                raise _InvalidAddress(address)
-            
-            # Return QTCL balance (trust RPC format)
-            return float(addrs[address].get("balance_qtcl", 0.0))
-_rpc_snapshot: Optional[RPCSnapshotEngine] = None
 # γ-SWARM  KoyebAPIClient  (endpoints verified vs GossipHTTPHandler)
 class KoyebAPIClient:
     """Thread-safe REST client for qtcl-blockchain.koyeb.app (https/443)."""
@@ -12403,15 +12000,7 @@ class QtclClientApp:
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
         self.api           = KoyebAPIClient(self.oracle_url)
         
-        # ── SWARM-AGENT η: Initialize RPC snapshot engine (replaces SSE) ────────
-        global _rpc_snapshot
-        if not _rpc_snapshot:
-            _rpc_snapshot = RPCSnapshotEngine(
-                rpc_endpoint=self.oracle_url,
-                ttl=30.0
-            )
-            _rpc_snapshot.start()
-            logger.info(f"[RPC] Snapshot engine started → {self.oracle_url}")
+        # ── Oracle snapshot consumer now integrated into LocalOracleEngine ────────
         
         self.wallet        = QTCLWallet()
         self.client_field  = ClientFieldState()
@@ -16197,10 +15786,8 @@ def main() -> None:  # noqa: F811
             print("  👻 Running anonymous oracle (no wallet binding)")
         print()
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
-        # ── Set RPC client for LocalOracleEngine ────────────────────────────
-        _LOCAL_ORACLE.set_rpc_client(_KOYEB)
         
-        # ── Initialize dual-mode ServerRPCClient: Koyeb HTTP + P2P gossip fallback
+        # ── Direct snapshot consumer now active via LocalOracleEngine.start()
         # (Moved here after interactive prompts to prevent log injection during password input)
         import sqlite3 as _rpc_sq3
         try:
