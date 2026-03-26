@@ -12993,36 +12993,47 @@ class QtclClientApp:
         Launch all client daemon threads.
         Order matters — P2P must start before consensus SSE subscription.
         ❤️  I love you — every thread is a heartbeat of the network
+        
+        CRITICAL: Stagger thread startup with 100ms delays to prevent
+        simultaneous RPC pool contention during initialization.
         """
+        import time as _st
         self._stop.clear()
         # ── 1. Oracle metric loop ──────────────────────────────────────────
         self._metric_th = _threading.Thread(
             target=self._metric_loop, daemon=True, name="ClientMetrics")
         self._metric_th.start()
+        _st.sleep(0.1)  # ← Stagger: prevent simultaneous pool grabs
         # ── 2. Oracle RPC health monitor ──────────────────────────────────
         _rpc_th = _threading.Thread(
             target=self._oracle_rpc_monitor, daemon=True, name="OracleRPC")
         _rpc_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 3. P2P node init (C layer + consensus) ────────────────────────
         _p2p_th = _threading.Thread(
             target=self._start_p2p, daemon=True, name="P2P-Init")
         _p2p_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 4. Local 9091 health + gossip HTTP server ─────────────────────
         _http_th = _threading.Thread(
             target=self._local_http_server, daemon=True, name="LocalHTTP-9091")
         _http_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 5. Heartbeat loop — registers peer + sends keepalives ─────────
         _hb_th = _threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 6. Ouroboros RPC subscription to own chain state ──────────────────
         _ouro_th = _threading.Thread(
             target=self._subscribe_own_rpc, daemon=True, name="Ouroboros-RPC")
         _ouro_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 7. Python /api/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
+        _st.sleep(0.1)  # ← Stagger
         # ── 8. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
