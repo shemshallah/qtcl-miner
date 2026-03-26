@@ -12232,6 +12232,70 @@ class ServerRPCClient:
             logger.debug(f"[RPC] Gossip cache query failed: {e}")
             return None
     
+    def get_latest_dm_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Fetch latest density matrix snapshot from server /rpc endpoint (non-blocking)."""
+        resp = self.call("qtcl_getLatestDMSnapshot", [])
+        if resp and "result" in resp:
+            return resp["result"]
+        return None
+    
+    def get_dm_snapshots(self, limit: int = 10) -> Optional[Dict[str, Any]]:
+        """Fetch last N DM snapshots from server."""
+        resp = self.call("qtcl_getLatestDMSnapshots", {"limit": min(limit, 100)})
+        if resp and "result" in resp:
+            return resp["result"]
+        return None
+    
+    def persist_dm_snapshot_local(self, snapshot: Dict[str, Any]) -> bool:
+        """Persist DM snapshot to local SQLite dm_pool for P2P mesh distribution."""
+        try:
+            if not self.db:
+                return False
+            
+            import json
+            cur = self.db.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS dm_pool (
+                id INTEGER PRIMARY KEY,
+                timestamp_ns INTEGER,
+                oracle_id INTEGER,
+                density_matrix_hex TEXT,
+                purity REAL,
+                w_state_fidelity REAL,
+                von_neumann_entropy REAL,
+                coherence_l1 REAL,
+                hlwe_signature TEXT,
+                signature_valid INTEGER,
+                oracle_address TEXT,
+                aer_noise_state TEXT,
+                measurement_counts TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            
+            cur.execute("""INSERT INTO dm_pool (
+                timestamp_ns, oracle_id, density_matrix_hex, purity, w_state_fidelity,
+                von_neumann_entropy, coherence_l1, hlwe_signature, signature_valid,
+                oracle_address, aer_noise_state, measurement_counts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                snapshot.get('timestamp_ns'),
+                snapshot.get('oracle_id'),
+                snapshot.get('density_matrix_hex', ''),
+                snapshot.get('purity'),
+                snapshot.get('w_state_fidelity'),
+                snapshot.get('von_neumann_entropy'),
+                snapshot.get('coherence_l1'),
+                json.dumps(snapshot.get('hlwe_signature')),
+                1 if snapshot.get('signature_valid') else 0,
+                snapshot.get('oracle_address'),
+                json.dumps(snapshot.get('aer_noise_state', {})),
+                json.dumps(snapshot.get('measurement_counts', {}))
+            ))
+            self.db.commit()
+            logger.debug(f"[RPC] ✅ DM snapshot persisted to local dm_pool")
+            return True
+        except Exception as e:
+            logger.debug(f"[RPC] Local DM persist failed: {e}")
+            return False
+    
     def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch Pyth price snapshot from server.
