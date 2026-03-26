@@ -13101,15 +13101,11 @@ class QtclClientApp:
         _hb_th = _threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
-        # ── 6. Ouroboros RPC subscription to own chain state ──────────────────
-        _ouro_th = _threading.Thread(
-            target=self._subscribe_own_rpc, daemon=True, name="Ouroboros-RPC")
-        _ouro_th.start()
-        # ── 7. Python /api/oracle/snapshot RPC polling ───────────────────────
+        # ── 6. Python /api/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
-        # ── 8. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
+        # ── 7. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
         _koyeb_ev_th.start()
@@ -13377,56 +13373,6 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[EVENTS-RPC] fatal: {_e}")
                 self._stop.wait(2)
-    def _subscribe_own_rpc(self) -> None:
-        """
-        ⚛️  HOTFIX: Aggressive RPC polling every 400ms for own local chain state.
-        Polls /api/chain/status for consensus reinforcement (no SSE self-loop).
-        ❤️  I love you — the qubit measures itself
-        """
-        import time as _to, json as _oj
-        from urllib.request import Request as _Ro, urlopen as _oo
-        from urllib.error   import URLError as _UE
-        
-        _to.sleep(0.5)
-        _last_height = -1
-        _fail_count = 0
-        _server_url = (self._cfg.get("server_url") or ENTROPY_SERVER_URL).rstrip('/')
-        
-        _EXP_LOG.info(f"[OURO] 🚀 Starting aggressive polling every 400ms → {_server_url}/api/chain/status")
-        
-        while not self._stop.is_set():
-            url = f"{_server_url}/api/chain/status"
-            try:
-                req = _Ro(url, method='GET')
-                req.add_header('Content-Type', 'application/json')
-                req.add_header('User-Agent', 'QTCL-OuroborosRPC/5.0')
-                
-                try:
-                    with _oo(req, timeout=3) as resp:
-                        data = _oj.loads(resp.read().decode('utf-8'))
-                        
-                        current_height = int(data.get('height', -1))
-                        if current_height > _last_height:
-                            _EXP_LOG.debug(f"[OURO] 🧬 Chain updated: {_last_height} → {current_height}")
-                            _last_height = current_height
-                        
-                        _fail_count = 0
-                except Exception as _re:
-                    _fail_count += 1
-                    if _fail_count % 10 == 0:
-                        _EXP_LOG.debug(f"[OURO] GET error — retrying...")
-                
-                self._stop.wait(0.4)
-                
-            except (_UE, OSError, TimeoutError) as _e:
-                _fail_count += 1
-                wait = min(0.5 + _fail_count * 0.1, 3.0)
-                if _fail_count % 5 == 0:
-                    _EXP_LOG.debug(f"[OURO] RPC failed ({_e}) — backoff {wait:.1f}s")
-                self._stop.wait(wait)
-            except Exception as _e:
-                _EXP_LOG.debug(f"[OURO] fatal: {_e}")
-                self._stop.wait(1)
     def _handle_sse_event(self, raw: str) -> None:
         """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
         pass
