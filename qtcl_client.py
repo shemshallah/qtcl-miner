@@ -1811,11 +1811,17 @@ class LocalOracleEngine:
             _EXP_LOG.error(f"[LOCAL-ORACLE] ❌ STRICT: JSON parse error: {e}")
             return False
         
+        # DIAGNOSTIC: Log what arrived
+        if data:
+            keys = list(data.keys())
+            has_dm = 'density_matrix_hex' in data
+            _EXP_LOG.info(f"[LOCAL-ORACLE] RPC frame arrived: keys={keys} | density_matrix_hex={'✅' if has_dm else '❌'}")
+        
         dm_hex = data.get('density_matrix_hex', '')
         if not dm_hex or len(dm_hex) < 256:
-            _EXP_LOG.warning(
+            _EXP_LOG.error(
                 f"[LOCAL-ORACLE] ❌ STRICT: RPC density_matrix_hex missing or too short "
-                f"(provided {len(dm_hex)} chars, need ≥256). Frame rejected."
+                f"(provided {len(dm_hex)} chars, need ≥256). Server sent: {json.dumps({k: type(v).__name__ for k,v in data.items()})}"
             )
             return False
         
@@ -6089,15 +6095,28 @@ class QtclMiner(QtclNode):
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+                
+                # DIAGNOSTIC: Log what server returned
+                if data:
+                    keys = list(data.keys())
+                    has_dm = 'density_matrix_hex' in data
+                    dm_len = len(data.get('density_matrix_hex', '')) if has_dm else 0
+                    self.log.info(
+                        f"[{self.name}] RPC /api/oracle/snapshot → "
+                        f"keys={keys} | density_matrix_hex={'✅' if has_dm else '❌'} (len={dm_len})"
+                    )
+                
                 if not data or not data.get('density_matrix_hex'):
-                    self.log.debug(
-                        f"[{self.name}] RPC snapshot missing density_matrix_hex — "
-                        f"rejecting (RPC server may be broken)"
+                    self.log.error(
+                        f"[{self.name}] ❌ RPC snapshot missing density_matrix_hex. "
+                        f"Server returned: {json.dumps({k: type(v).__name__ for k, v in (data or {}).items()}, indent=2)}"
                     )
                     return None
                 return data
         except Exception as e:
-            self.log.debug(f"[{self.name}] RPC snapshot fetch failed: {e}")
+            self.log.error(f"[{self.name}] ❌ RPC snapshot fetch failed: {e}")
+            import traceback
+            self.log.error(traceback.format_exc())
             return None
     def _send_heartbeat(self) -> None:
         import urllib.request
