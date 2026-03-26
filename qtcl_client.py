@@ -13204,6 +13204,9 @@ class QtclClientApp:
                         if _http_err.code >= 500:
                             try:
                                 error_body = _http_err.read().decode('utf-8', errors='replace')[:100]
+                                # STRIP HTML tags to prevent pollution: <...> → [TAG]
+                                import re as _re_html
+                                error_body = _re_html.sub(r'<[^>]+>', '[TAG]', error_body)
                                 _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} → {error_body}")
                             except:
                                 _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code}")
@@ -13806,12 +13809,14 @@ class QtclClientApp:
         # ── Execute ────────────────────────────────────────────────────────────
         _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
         _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
-        print(_report, flush=True)
+        # _SILENT_MINE: suppress mining report spam in loop
+        # print(_report, flush=True)
         self.koyeb_state.sync(self.client_field, timeout=6)
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
-        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
-        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
-        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
+        # Oracle stats silent in loop — check logs if needed
+        # print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
+        # print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
+        # print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
