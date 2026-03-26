@@ -10616,7 +10616,7 @@ class RPCSnapshotEngine:
                 self._meta["fetched"] = time.time()
                 self._meta["count"] += 1
             
-            logger.info(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
+            logger.debug(f"[RPC-Fetch] ✅ Height={block_height}, {len(addresses)} addrs, fid={oracle_fidelity:.4f}")
         
         except Exception as e:
             with self._lock:
@@ -12320,6 +12320,14 @@ class QtclClientApp:
             "peer_id": self._peer_id,
         }
     # ── Oracle identity ────────────────────────────────────────────────────────
+    @property
+    def db(self):
+        """Lazy LocalBlockchainDB instance (for mining loop compatibility)."""
+        if self._db is None:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = LocalBlockchainDB(name='qtcl')
+        return self._db
+    
     def _init_oracle_identity(self, oracle_context: dict = None) -> dict:
         """
         Initialise the oracle signing identity for this node/client.
