@@ -10513,27 +10513,12 @@ class KoyebAPIClient:
     def get_gksl_bath(self) -> "GKSLBathParams":
         snap = self.get_oracle_pq0_bloch()
         return GKSLBathParams.from_snap(snap) if snap else CANONICAL_BATH
-    def get_balance(self, address: str) -> float:
-        """
-        SWARM-AGENT ζ: RPC snapshot only — no HTTP cascade, no fallbacks.
-        CONTRACT:
-          ✅ Uses global RPC snapshot engine (atomic, 30s TTL)
-          ✅ Raises explicit exceptions (never returns None/"unavailable")
-          ✅ No fallbacks (RPC is ONLY truth source)
-          ✅ Museum-quality enterprise code (fail-fast, invariant-checked)
-        Returns:
-            Balance in QTCL
-        Raises:
-            _CacheExpired: Snapshot TTL exceeded
-            _InvalidAddress: Address not in snapshot
-            _RPCSnapshotException: No snapshot fetched yet (usually startup)
-        """
-        global _rpc_snapshot
-        if not _rpc_snapshot:
-            raise _RPCSnapshotException(
-                "RPC snapshot engine not initialized (must call app.start())"
-            )
-        return _rpc_snapshot.get_balance(address)
+    def get_balance(self, address: str) -> Optional[float]:
+        """Pure JSON-RPC 2.0 balance query — calls qtcl_getBalance on server."""
+        result = self._rpc("qtcl_getBalance", [address])
+        if isinstance(result, dict) and "balance" in result:
+            return float(result["balance"])
+        return None
     def get_address_history(self, address: str, limit: int = 50) -> list:
         r = self._get(f"/api/address/{address}/history",
                       params={"limit": limit})
@@ -10632,9 +10617,9 @@ class KoyebAPIClient:
         """Get blockchain chain information."""
         return self._get("/api/chain")
     
-    def get_balance(self, address: str) -> Optional[dict]:
-        """Get balance for an address."""
-        return self._get(f"/api/address/{address}/balance")
+    def get_balance_detail(self, address: str) -> Optional[dict]:
+        """Get detailed balance info for an address via JSON-RPC."""
+        return self._rpc("qtcl_getBalance", [address])
     
     def get_address_earned(self, address: str) -> Optional[dict]:
         """Get total earned by an address (mining rewards)."""
@@ -12312,12 +12297,12 @@ class QtclClientApp:
             return None
     
     def _integrate_wallet_balance_query(self, address: str = None) -> int:
-        """Query wallet balance and log RPC operation."""
+        """Query wallet balance via JSON-RPC and log operation."""
         addr = address or self.wallet.address
         try:
-            balance = self.api.get_wallet_balance(addr)
+            balance = self.api.get_balance(addr)
             self._log_rpc_operation(method='get_balance', params=f'address={addr}', result_hash=str(balance), status='success', hlwe_verified=1)
-            return balance or 0
+            return int(balance or 0)
         except Exception as _e:
             self._log_rpc_operation(method='get_balance', params=f'address={addr}', status='failed', error_msg=str(_e))
             return 0
@@ -14250,7 +14235,7 @@ class QtclClientApp:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
                 if _addr2:
                     _bal = self.api.get_balance(_addr2)
-                    _bal_s = f"{_bal:.8f} QTCL" if _bal is not None else "unavailable"
+                    _bal_s = f"{_bal:.8f} QTCL" if _bal is not None else "RPC unavailable"
                     print(f"  Balance : {_bal_s}  ({_addr2[:24]}…)")
             except Exception:
                 pass
@@ -14321,7 +14306,6 @@ class QtclClientApp:
         finally:
             miner.stop_mining()
             self._stop.set()
-            _root_log.handlers = _old_handlers
             print("\n  🛑 Mining stopped")
     # ── Transact mode ─────────────────────────────────────────────────────────
     def run_transact_mode(self) -> None:
@@ -14385,7 +14369,7 @@ class QtclClientApp:
             elif ch == "2": self._query_tx()
             elif ch == "3":
                 bal = self.api.get_balance(self.wallet.address)
-                print(f"\n  💰 {f'{bal:.8f} QTCL' if bal is not None else 'unavailable'}"
+                print(f"\n  💰 {f'{bal:.8f} QTCL' if bal is not None else 'RPC unavailable'}"
                       f"  ({self.wallet.address})")
             elif ch == "4":
                 break
@@ -14853,23 +14837,12 @@ class QtclClientApp:
                 
                 try:
                     bal = self.api.get_balance(self.wallet.address)
-                    # ── CRITICAL: bal can be None if blockchain not synced ──────────────
                     if bal is None:
-                        bal_str = "⏳ Blockchain syncing..."
-                    elif isinstance(bal, (int, float)):
-                        bal_str = f"{float(bal):.8f} QTCL"
+                        bal_str = "RPC unavailable"
                     else:
-                        bal_str = f"❌ Invalid balance type: {type(bal).__name__}"
-                except _CacheExpired as e:
-                    # Snapshot cache is stale (RPC may be slow)
-                    bal_str = f"⚠️  Snapshot stale ({e.age:.1f}s old, TTL={e.ttl}s)"
-                except _InvalidAddress:
-                    bal_str = "❌ Address not in ledger"
-                except _RPCSnapshotException as e:
-                    bal_str = f"⏳ RPC initializing: {e}"
+                        bal_str = f"{float(bal):.8f} QTCL"
                 except Exception as e:
-                    logger.critical(f"[INVARIANT] Balance fetch error: {e}")
-                    bal_str = f"❌ Critical error: {e}"
+                    bal_str = f"RPC error: {e}"
                 
                 print(f"\n  💰 Balance : {bal_str}")
                 print(f"  Address  : {self.wallet.address}")
