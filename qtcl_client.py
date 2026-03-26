@@ -6021,7 +6021,6 @@ class QtclMiner(QtclNode):
         super().__init__(config_path=config_path, node_type="miner", name="QtclMiner")
         self._miner_id: str = ""
         self._server_url: str = ""
-        self._rpc_poller_thread: Optional[threading.Thread] = None
         self._mining_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pending_blocks: queue.Queue = queue.Queue(maxsize=64)
@@ -6034,7 +6033,6 @@ class QtclMiner(QtclNode):
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
-        self._start_rpc_poller()
         self._start_mining_loop()
         # ── Arm genesis-reset background listener ─────────────────────────
         _GENESIS_RESET_LISTENER.start(
@@ -6048,8 +6046,6 @@ class QtclMiner(QtclNode):
         logger.info(f"[MINER] 👂 GenesisResetListener armed → {self._server_url}")
     def on_stop(self) -> None:
         self._stop_event.set()
-        if self._rpc_poller_thread:
-            self._rpc_poller_thread.join(timeout=5)
         if self._mining_thread:
             self._mining_thread.join(timeout=5)
         super().on_stop()
@@ -6075,108 +6071,9 @@ class QtclMiner(QtclNode):
                 self.log.info(f"[{self.name}] registered with server: {result}")
         except Exception as exc:
             self.log.warning(f"[{self.name}] server registration failed: {exc}")
-    def _start_rpc_poller(self) -> None:
-        """Start RPC-only polling thread (no SSE)"""
-        self._rpc_poller_thread = threading.Thread(
-            target=self._rpc_poller_loop,
-            daemon=True,
-            name="QtclMiner/RPCPoller",
-        )
-        self._rpc_poller_thread.start()
-    def _rpc_poller_loop(self) -> None:
-        """RPC polling loop — strict 5s cycle, NO RETRY BACKOFF."""
-        import urllib.request
-        rpc_url = f"{self._server_url}/api/chain/status"
-        last_height = -1
-        poll_fail_count = 0
-        
-        while not self._stop_event.is_set():
-            try:
-                req = urllib.request.Request(
-                    rpc_url,
-                    headers={"Content-Type": "application/json"},
-                    method="GET"
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    poll_fail_count = 0
-                    
-                    height = int(data.get("height", 0))
-                    if height > last_height:
-                        try:
-                            block_data = self._rpc_get_block(height)
-                            if block_data:
-                                try:
-                                    self._pending_blocks.put_nowait(block_data)
-                                    last_height = height
-                                except queue.Full:
-                                    pass
-                        except Exception:
-                            pass
-                    
-                    snapshot = self._rpc_get_snapshot()
-                    if snapshot:
-                        try:
-                            self._apply_rpc_snapshot(snapshot)
-                        except Exception as apply_err:
-                            self.log.debug(f"[{self.name}] Snapshot apply failed: {apply_err}")
-                    
-                    self._stop_event.wait(5.0)
-                    
-            except Exception as exc:
-                poll_fail_count += 1
-                if poll_fail_count <= 1 and not self._stop_event.is_set():
-                    self.log.warning(f"[{self.name}] RPC chain poll failed: {exc}")
-                self._stop_event.wait(5.0)
-    
-    def _rpc_get_block(self, height: int) -> Optional[Dict]:
-        """Fetch block data via RPC /api/block/{height}"""
-        try:
-            req = urllib.request.Request(
-                f"{self._server_url}/api/block/{height}",
-                headers={"Content-Type": "application/json"},
-                method="GET"
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return None
-    
-    def _rpc_get_snapshot(self) -> Optional[Dict]:
-        """Fetch oracle snapshot via RPC /api/oracle/snapshot — STRICT RPC ONLY.
-        If DM missing or invalid, logs error and returns None (no fallback).
-        """
-        try:
-            req = urllib.request.Request(
-                f"{self._server_url}/api/oracle/snapshot",
-                headers={"Content-Type": "application/json"},
-                method="GET"
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                
-                # DIAGNOSTIC: Log what server returned
-                if data:
-                    keys = list(data.keys())
-                    has_dm = 'density_matrix_hex' in data
-                    dm_len = len(data.get('density_matrix_hex', '')) if has_dm else 0
-                    self.log.info(
-                        f"[{self.name}] RPC /api/oracle/snapshot → "
-                        f"keys={keys} | density_matrix_hex={'✅' if has_dm else '❌'} (len={dm_len})"
-                    )
-                
-                if not data or not data.get('density_matrix_hex'):
-                    self.log.error(
-                        f"[{self.name}] ❌ RPC snapshot missing density_matrix_hex. "
-                        f"Server returned: {json.dumps({k: type(v).__name__ for k, v in (data or {}).items()}, indent=2)}"
-                    )
-                    return None
-                return data
-        except Exception as e:
-            self.log.error(f"[{self.name}] ❌ RPC snapshot fetch failed: {e}")
-            import traceback
-            self.log.error(traceback.format_exc())
-            return None
+
+
+
     def _send_heartbeat(self) -> None:
         import urllib.request
         payload = json.dumps({
@@ -6193,6 +6090,7 @@ class QtclMiner(QtclNode):
             urllib.request.urlopen(req, timeout=5).close()
         except Exception:
             pass
+
     def _start_mining_loop(self) -> None:
         self._mining_thread = threading.Thread(
             target=self._mining_loop,
@@ -12778,20 +12676,7 @@ class QtclClientApp:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         return self._log_hlwe_signature(content_hash=content_hash, signature_hex=signature, public_key=pubkey, verified=1 if is_valid else 0)
     
-    def _integrate_rpc_poll_snapshot(self) -> Optional[Dict]:
-        """Fetch oracle snapshot via RPC and log operation."""
-        try:
-            req = _ur.Request(f"{self.oracle_url}/api/oracle/snapshot", headers={"Content-Type": "application/json"}, method="GET")
-            with _ur.urlopen(req, timeout=10) as resp:
-                snapshot = _json.loads(resp.read().decode("utf-8"))
-                snapshot_hash = hashlib.sha256(_json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
-                block_height = snapshot.get('block_height', 0)
-                self._log_rpc_operation(method='get_oracle_snapshot', result_hash=snapshot_hash, status='success', hlwe_verified=1, block_height=block_height)
-                return snapshot
-        except Exception as _e:
-            self._log_rpc_operation(method='get_oracle_snapshot', status='failed', error_msg=str(_e))
-            return None
-    
+
     def _integrate_wallet_balance_query(self, address: str = None) -> int:
         """Query wallet balance via JSON-RPC and log operation."""
         addr = address or self.wallet.address
