@@ -13764,15 +13764,28 @@ class QtclClientApp:
                          max(0, bh - 1) if bh else '')
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
-        #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
-        #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /api/oracle/snapshot
 
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
-            """Fetch live RPC snapshot on-demand (synchronous, no polling loop)."""
+            """Gate on oracle DM arrival via simple REST call."""
+            print("  🔗 Fetching oracle snapshot…", flush=True)
             try:
-                snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=timeout_s)
-                return bool(snap and snap.get('density_matrix_hex'))
-            except Exception as e: _EXP_LOG.debug(f"[BOOTSTRAP] DM fetch: {e}"); return False
+                kapi = KoyebAPIClient()
+                print(f"  🔗 Calling RPC qtcl_getQuantumMetrics...", flush=True)
+                snap = kapi.get_oracle_pq0_bloch()
+                print(f"  🔗 Got response: type={type(snap)}", flush=True)
+                if snap:
+                    dm_hex = snap.get('density_matrix_hex', '')
+                    lattice = snap.get('lattice', {})
+                    w_state = snap.get('w_state', {})
+                    print(f"  🔗 dm_hex len={len(dm_hex)}, lattice cycle={lattice.get('cycle', 0)}, w_state fid={w_state.get('fidelity', 0)}", flush=True)
+                    if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
+                        print("  ✅ Oracle DM acquired!", flush=True)
+                        return True
+            except Exception as e:
+                print(f"  🔗 Exception: {type(e).__name__}: {e}", flush=True)
+            print("  ❌ degraded mode", flush=True)
+            return False
+        
         def _mermin_w3(dm8) -> tuple:
             """
             Mermin-Klyshko inequality for 3-qubit W state.
