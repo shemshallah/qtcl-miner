@@ -1670,56 +1670,50 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """
-        Synchronous fetch via HTTP POST (simulates curl -X POST).
-        Extracts snapshot data and block_height from the JSON-RPC response.
+        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getQuantumMetrics.
+        
+        Direct HTTP POST to server.py RPC endpoint.
+        Returns empty dict on any error (fail-safe for RPC hangs).
         """
         try:
-            # 1. Clean URL (Remove port if present to use Koyeb's standard ingress)
-            url = self.ORACLE_URL
-            if '://' in url:
-                scheme, rest = url.split('://', 1)
-                host = rest.split('/', 1)[0].split(':', 1)[0]
-                url = f"{scheme}://{host}"
-            
-            # 2. Prepare payload
-            import json
-            payload = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "qtcl_getOracleSnapshot",
-                "params": [],
-                "id": 1
-            }).encode('utf-8')
-
-            # 3. Execute request (Pure urllib - zero dependency, identical to curl)
-            from urllib.request import Request, urlopen
-            req = Request(
-                f"{url}/rpc/oracle/snapshots",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            
-            with urlopen(req, timeout=timeout_s) as resp:
-                raw_data = resp.read().decode('utf-8')
-                resp_json = json.loads(raw_data)
+            session = self._get_session()
+            if not session:
+                # Fallback: urllib
+                import json
+                from urllib.request import Request, urlopen
+                from urllib.error import URLError
                 
-                # 4. Extract data from the result container
-                # Structure: {"result": {"snapshot": {...}, "block_height": X}}
-                res = resp_json.get("result", {})
-                if not isinstance(res, dict):
-                    return {}
+                payload = json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "qtcl_getQuantumMetrics",
+                    "params": [],
+                    "id": 1
+                }).encode('utf-8')
                 
-                snap = res.get("snapshot", {})
-                if isinstance(snap, dict):
-                    # Ensure block_height is available in the top-level snap for the miner
-                    snap['block_height'] = res.get('block_height', 0)
-                    return snap
-            
-            return {}
-        except Exception as e:
-            # Fallback logging (silent in production, debug in dev)
-            return {}
+                req = Request(
+                    f"{self.ORACLE_URL}/rpc",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                
+                with urlopen(req, timeout=timeout_s) as resp:
+                    resp_data = json.loads(resp.read().decode('utf-8'))
+                    snap = resp_data.get("result", {}) if "result" in resp_data else {}
+            else:
+                # Use requests session
+                resp = session.post(
+                    f"{self.ORACLE_URL}/rpc",
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "qtcl_getQuantumMetrics",
+                        "params": [],
+                        "id": 1
+                    },
+                    timeout=timeout_s
+                )
+                resp.raise_for_status()
+                snap = resp.json().get("result", {}) if "result" in resp.json() else {}
             
             if not isinstance(snap, dict):
                 snap = {}
@@ -6116,61 +6110,38 @@ class QtclMiner(QtclNode):
         self._register_with_server()
         self._stop_event.clear()
         
-        # ── INITIAL SYNC: Ensure we have the latest chain tip before starting ──
-        logger.info("[MINER] 🔄 Synchronizing with server tip before mining...")
-        try:
-            kapi = KoyebAPIClient(server_url=self._server_url)
-            tip_rpc = kapi._rpc("qtcl_getBlockHeight", [])
-            if isinstance(tip_rpc, dict) and 'height' in tip_rpc:
-                srv_h = int(tip_rpc['height'])
-                local_h = self.db.get_chain_height()
-                if srv_h > local_h:
-                    logger.info(f"[MINER] Syncing {srv_h - local_h} blocks from server...")
-                    self.sync_chain_from_server(kapi)
-        except Exception as e:
-            logger.warning(f"[MINER] Initial sync failed: {e}")
-
         # ── CRITICAL: Bootstrap oracle snapshot before mining ────────────────
         # Fetch RPC oracle snapshot, extract DM, reconstruct tripartite W-state
         logger.info("[MINER] ⚙️  Bootstrapping oracle snapshot for W-state reconstruction...")
         _oracle_ready = False
-        _snapshot_height = 0
-        for attempt in range(20):
+        for attempt in range(10):
             try:
                 snap = _LIVE_RPC_ORACLE.fetch_snapshot()
                 if snap and snap.get('density_matrix_hex'):
                     dm_hex = snap.get('density_matrix_hex', '')
                     if dm_hex and len(dm_hex) > 32:  # valid DM data
-                        _snapshot_height = snap.get('block_height', 0)
                         pq0 = snap.get('pq0', 0)
-                        if isinstance(pq0, dict): pq0 = pq0.get('oracle', 0)
                         pq_curr = snap.get('pq_curr', 0)
                         pq_last = snap.get('pq_last', 0)
                         # ── Reconstruct tripartite W-state ──────────────────────
                         try:
-                            # Re-verify and align height if snapshot is ahead
-                            if _snapshot_height > self.db.get_chain_height():
-                                logger.info(f"[MINER] 🔐 Snapshot height {_snapshot_height} ahead of local tip. Reconstructing...")
-                                kapi = KoyebAPIClient(server_url=self._server_url)
-                                self._sync_chain_to_height(kapi, _snapshot_height)
-
-                            triangle = HyperbolicTriangle.compute(int(pq0), int(pq_curr), int(pq_last))
+                            triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
                             logger.info(
-                                f"[MINER] ✅ Oracle snapshot locked | height={_snapshot_height} | "
+                                f"[MINER] ✅ Oracle snapshot locked | "
                                 f"pq0={pq0} pq_curr={pq_curr} pq_last={pq_last} | "
-                                f"DM ready"
+                                f"DM ready (cycle={snap.get('cycle', 0)})"
                             )
                             _oracle_ready = True
                             break
                         except Exception as e:
                             logger.warning(f"[MINER] W-state reconstruction failed: {e}")
                     else:
-                        logger.debug(f"[MINER] Oracle snapshot incomplete (attempt {attempt+1}/20)")
+                        logger.debug(f"[MINER] Oracle snapshot incomplete (attempt {attempt+1}/10)")
                 else:
-                    logger.debug(f"[MINER] Waiting for oracle snapshot (attempt {attempt+1}/20)...")
+                    logger.debug(f"[MINER] Waiting for oracle snapshot (attempt {attempt+1}/10)...")
             except Exception as e:
                 logger.debug(f"[MINER] Oracle bootstrap error: {e}")
-            time.sleep(1.0)
+            time.sleep(0.5)
         
         if not _oracle_ready:
             logger.warning("[MINER] ⚠️  Oracle snapshot bootstrap timeout — starting in degraded mode")
@@ -6243,171 +6214,9 @@ class QtclMiner(QtclNode):
     def _mining_loop(self) -> None:
         difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        
+        import urllib.request
         while not self._stop_event.is_set():
             try:
-                # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
-                if _RESET_PERFORMED.is_set():
-                    _RESET_PERFORMED.clear()
-                    logger.warning("[MINING] ⚡ genesis-reset signal — restarting from h=0")
-                    self._stop_event.wait(0.5)
-                    continue
-
-                # ── Server chain-tip probe: detect server-side genesis wipe ──────
-                try:
-                    # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC
-                    kapi = KoyebAPIClient(server_url=self._server_url)
-                    tip = kapi._rpc("qtcl_getBlockHeight", [])
-                    if isinstance(tip, dict):
-                        _srv_h = int(tip.get('height') or 0)
-                    else:
-                        _srv_h = 0
-                    if _check_and_handle_chain_reset(
-                        server_height=_srv_h, db=self.db,
-                        server_url=self._server_url,
-                        miner_address=getattr(self,'_miner_id', NULL_COINBASE_ADDRESS),
-                        broadcaster=getattr(self,'broadcaster', None),
-                        peers=(list(self.db.get_known_peers())
-                               if hasattr(self.db,'get_known_peers') else []),
-                    ):
-                        logger.info("[MINING] ↩ Chain reset — restarting from genesis")
-                        self._stop_event.wait(1.0); continue
-                except Exception as _rce:
-                    logger.debug(f"[MINING] chain-tip probe (non-fatal): {_rce}")
-                
-                # Fetch latest block from DB (source of truth for mining)
-                latest_block = self.db.get_latest_block()
-                
-                # If no blocks, we must mine genesis or wait for sync
-                if not latest_block:
-                    logger.info("[MINING] 🐣 No blocks found — mining genesis...")
-                    prev_hash = "0" * 64
-                    height = 0
-                else:
-                    prev_hash = latest_block.get("hash") or latest_block.get("block_hash", "0" * 64)
-                    height = latest_block.get("height", 0) + 1
-
-                pending_txs = self.db.get_pending_transactions(limit=50)
-                tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
-                merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
-                
-                evo_metrics: Dict = {}
-                if self.quantum_evo and self.quantum_evo.is_running():
-                    pre_hash = HASH_ENGINE.compute_hash(f"{height}:{prev_hash}")
-                    try:
-                        evo_metrics = self.quantum_evo.evolve(
-                            block_hash=pre_hash, height=height
-                        )
-                    except Exception as exc:
-                        self.log.warning(f"[{self.name}] quantum evo failed: {exc}")
-                
-                block_template = {
-                    "height": height,
-                    "prev_hash": prev_hash,
-                    "merkle_root": merkle_root,
-                    "timestamp": int(time.time()),
-                    "difficulty": difficulty,
-                    "miner_id": self._miner_id,
-                    "tx_count": len(pending_txs),
-                    "nonce": 0,
-                    "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
-                }
-                
-                # ── PROOF OF WORK ────────────────────────────────────────────────
-                nonce = 0
-                batch_size = 50000 
-                solved = False
-                block_hash = ""
-                
-                # Start mining this block
-                logger.info(f"[MINING] ⛏️ Starting h={height} | diff={difficulty} | parent={prev_hash[:16]}...")
-                _MINE_TELEM.update_progress(height, int(difficulty), 0, prev_hash)
-                
-                while not solved and not self._stop_event.is_set():
-                    # Check for chain updates every batch
-                    if nonce > 0 and nonce % batch_size == 0:
-                        # Check if someone else mined this block
-                        kapi = KoyebAPIClient(server_url=self._server_url)
-                        remote_tip = kapi._rpc("qtcl_getBlockHeight", [])
-                        if isinstance(remote_tip, dict) and int(remote_tip.get('height', -1)) >= height:
-                            logger.info(f"[MINING] 📢 Height {height} already mined by someone else, skipping...")
-                            break
-                        
-                        _MINE_TELEM.update_progress(height, int(difficulty), nonce, prev_hash)
-                    
-                    # Manual unrolling of the inner loop for extreme performance
-                    # Use a localized dict to avoid lookups
-                    blk_pow = dict(block_template)
-                    prefix = "0" * int(difficulty)
-                    frac = difficulty - int(difficulty)
-                    threshold = int(round(frac * 16)) if frac > 0.001 else 16
-
-                    # OPTIMIZATION: Cache hashing engine compute function
-                    compute_fn = HASH_ENGINE.compute_block_hash
-                    
-                    for _ in range(10000):
-                        blk_pow["nonce"] = nonce
-                        h = compute_fn(blk_pow)
-                        
-                        if h.startswith(prefix):
-                            if threshold >= 16:
-                                solved = True
-                                block_hash = h
-                                break
-                            elif int(h[len(prefix)], 16) < threshold:
-                                solved = True
-                                block_hash = h
-                                break
-                        nonce += 1
-                    
-                    # Small sleep to allow other threads to run
-                    time.sleep(0.0001)
-                
-                if not solved:
-                    continue 
-
-                block_template["nonce"] = nonce
-                block_template["hash"] = block_hash
-                _MINE_TELEM.record_block(block_template)
-                
-                logger.info(f"[MINING] 🏆 Block {height} solved! Hash: {block_hash[:16]}... Nonce: {nonce}")
-                
-                self.db.insert_block(block_template)
-                self.db.increment_miner_blocks(self._miner_id)
-                
-                # Store quantum state
-                if self.quantum_evo and HAS_NUMPY:
-                    sv = self.quantum_evo.get_state()
-                    if sv is not None:
-                        self.db.insert_qubit_state(
-                            block_height=height,
-                            qubit_id=hash(block_hash)%65536,
-                            state_data={
-                                "block_hash": block_hash,
-                                "state_vector": sv.tobytes(),
-                                "metrics": evo_metrics,
-                                "evolution_seed": block_hash[:16],
-                                "timestamp": time.time(),
-                            }
-                        )
-                
-                _MINE_TELEM.mark_submitting()
-                # ── SUBMIT VIA RPC ───────────────────────────────────────────────
-                try:
-                    kapi = KoyebAPIClient(server_url=self._server_url)
-                    res = kapi._rpc("qtcl_submitBlock", [block_template])
-                    if res and (res.get("status") == "accepted" or res.get("success")):
-                        logger.info(f"[MINING] ✅ Block {height} accepted by server")
-                        _MINE_TELEM.record_submission(height, 50.0)
-                    else:
-                        logger.warning(f"[MINING] ❌ Block {height} rejected: {res}")
-                except Exception as sub_err:
-                    logger.error(f"[MINING] Block submission error: {sub_err}")
-                
-                self._stop_event.wait(0.01)
-            except Exception as exc:
-                self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
-                self._stop_event.wait(1.0)
                 # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
                 if _RESET_PERFORMED.is_set():
                     _RESET_PERFORMED.clear()
@@ -14085,9 +13894,52 @@ class QtclClientApp:
             - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
+            import urllib.request as _ur, urllib.error as _ure
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
+            
+            # ══════════════════════════════════════════════════════════════════════
+            # DIRECT RPC CLIENT (pure urllib, no requests library, no fallbacks)
+            # ══════════════════════════════════════════════════════════════════════
+            class _DirectRPC:
+                def __init__(self, base_url):
+                    self.base_url = base_url.rstrip('/')
+                    self.timeout = 10
+                
+                def _call(self, method: str, params: list = None) -> dict:
+                    url = f"{self.base_url}/rpc"
+                    payload = {'jsonrpc': '2.0', 'method': method, 'params': params or [], 'id': 1}
+                    body = _j.dumps(payload).encode('utf-8')
+                    req = _ur.Request(url, data=body, headers={'Content-Type': 'application/json'}, method='POST')
+                    with _ur.urlopen(req, timeout=self.timeout) as resp:
+                        return _j.loads(resp.read().decode('utf-8'))
+                
+                def get_block_height(self) -> tuple:
+                    result = self._call('qtcl_getBlockHeight', [])
+                    if 'result' in result:
+                        r = result['result']
+                        h = int(r.get('height', 0))
+                        th = str(r.get('tip_hash', '0' * 64))
+                        return (h, th)
+                    raise RuntimeError(f"RPC error: {result.get('error', result)}")
+                
+                def get_block(self, height: int) -> dict:
+                    result = self._call('qtcl_getBlock', [height])
+                    if 'result' in result:
+                        return result['result']
+                    raise RuntimeError(f"RPC error: {result.get('error', result)}")
+                
+                def get_mempool(self) -> list:
+                    try:
+                        result = self._call('qtcl_getMempool', [])
+                        if 'result' in result:
+                            return result['result'] if isinstance(result['result'], list) else []
+                    except Exception:
+                        pass
+                    return []
+            
+            _direct_rpc = _DirectRPC(ENTROPY_SERVER_URL)
             
             # ══════════════════════════════════════════════════════════════════════
             # SUBMISSION PIPELINE — Single RPC Path, Exponential Backoff
@@ -14203,33 +14055,66 @@ class QtclClientApp:
             while True:  # Main mining loop (restart on chain advance)
                 try:
                     # ──────────────────────────────────────────────────────────────
-                    # STAGE 1: Get chain tip
+                    # STAGE 1: Get chain tip via DIRECT RPC (2-call atomic fetch)
                     # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.debug("[MINER] Getting chain tip…")
-                    tip = None
+                    _EXP_LOG.debug("[MINER] STAGE 1: Fetching chain tip via direct RPC…")
+                    
+                    oracle_height = None
+                    oracle_hash = None
+                    difficulty_bits = None
+                    pq_curr_id = None
+                    pq_last_id = None
+                    
+                    # Call 1: Get height + tip_hash (4 retries)
                     for _retry in range(4):
                         try:
-                            tip = kapi.get_chain_tip()
-                            if tip and (tip.get("block_height") is not None or tip.get("height") is not None):
-                                break
+                            oracle_height, oracle_hash = _direct_rpc.get_block_height()
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got height={oracle_height}, tip={oracle_hash[:16]}…")
+                            break
                         except Exception as e:
-                            _EXP_LOG.debug(f"[MINER] Chain tip retry {_retry+1}/4: {e}")
-                            await _asyncio.sleep(0.5 * (2 ** _retry))
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: get_block_height attempt {_retry+1}/4: {e}")
+                            if _retry < 3:
+                                await _asyncio.sleep(0.5 * (2 ** _retry))
+                            else:
+                                raise RuntimeError(f"get_block_height failed after 4 attempts: {e}")
                     
-                    if tip is None:
-                        _EXP_LOG.warning("[MINER] Chain tip failed, retrying in 0.5s")
+                    if oracle_height is None:
+                        _EXP_LOG.warning("[MINER] STAGE 1: oracle_height is None, retrying in 0.5s")
                         _MINE_TELEM.mark_idle()
                         await _asyncio.sleep(0.5)
                         continue
                     
-                    oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
-                    oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                    difficulty_bits = int(tip.get("difficulty_bits") or tip.get("difficulty") or 5)
+                    # Call 2: Get full block to extract difficulty + quantum state (2 retries)
+                    tip_block = None
+                    for _retry in range(2):
+                        try:
+                            tip_block = _direct_rpc.get_block(oracle_height)
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got block h={oracle_height}")
+                            break
+                        except Exception as e:
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: get_block({oracle_height}) attempt {_retry+1}/2: {e}")
+                            if _retry < 1:
+                                await _asyncio.sleep(1.0)
+                            else:
+                                raise RuntimeError(f"get_block({oracle_height}) failed after 2 attempts: {e}")
+                    
+                    if tip_block is None:
+                        _EXP_LOG.warning("[MINER] STAGE 1: tip_block is None, retrying in 0.5s")
+                        _MINE_TELEM.mark_idle()
+                        await _asyncio.sleep(0.5)
+                        continue
+                    
+                    # Extract critical fields from block
+                    difficulty_bits = int(tip_block.get('difficulty_bits', tip_block.get('difficulty', 5)))
                     difficulty_bits = int(max(5, min(difficulty_bits, 20)))
+                    pq_curr_id = int(tip_block.get('pq_curr', oracle_height))
+                    pq_last_id = int(tip_block.get('pq_last', max(0, oracle_height - 1)))
+                    
+                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} pq_curr={pq_curr_id} pq_last={pq_last_id}")
                     
                     target_height = oracle_height + 1
                     parent_hash = oracle_hash
-                    timestamp = int(_t.time())
+                    timestamp = int(tip_block.get('timestamp', tip_block.get('timestamp_s', int(_t.time()))))
                     miner_addr = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
                     
                     # ──────────────────────────────────────────────────────────────
@@ -14248,9 +14133,9 @@ class QtclClientApp:
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
                     # ──────────────────────────────────────────────────────────────
                     
-                    # Fetch pending transactions from mempool
+                    # Fetch pending transactions from RPC
                     try:
-                        _pending_user_txs = kapi.get_mempool() or []
+                        _pending_user_txs = _direct_rpc.get_mempool()
                     except Exception as e:
                         _pending_user_txs = []
                         _EXP_LOG.debug(f"[MINER] Mempool fetch failed: {e}")
