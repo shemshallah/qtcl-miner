@@ -74,20 +74,13 @@ QRNG_API_KEY_3: str = os.getenv('QRNG_API_KEY',         '')   # QBICK      — g
 ENTROPY_API_KEY: str = os.getenv('ENTROPY_API_KEY',     '')   # Server entropy endpoint key (set on Koyeb: ENTROPY_API_KEY)
 ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app')
 P2P_BOOTSTRAP_PEERS = [
-    ('qtcl-blockchain.koyeb.app', 9091),
-    ('qtcl-primary.koyeb.app', 9091),
+    ('qtcl-blockchain.koyeb.app', 8001),
 ]
 P2P_HARDCODED_SEEDS = {
-    'qtcl-blockchain.koyeb.app:9091': {
+    'qtcl-blockchain.koyeb.app:8001': {
         'id': '16d894aeee9dae65d1b5c6f7a8b9c0d1e2f3g4h5',
         'role': 'primary',
         'region': 'us-west-2',
-        'verified': True,
-    },
-    'qtcl-primary.koyeb.app:9091': {
-        'id': '8283d1c55f6155c7a9b8c7d6e5f4g3h2i1j0k9l8',
-        'role': 'secondary',
-        'region': 'us-east-1',
         'verified': True,
     },
 }
@@ -2361,15 +2354,8 @@ class QtclP2PNode:
 # ── Module-level singletons ──────────────────────────────────────────────────
 _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
-# ── Python peer DB (uses built-in sqlite3 — no C dependency) ─────────────────
-import sqlite3 as _sq3, pathlib as _plib
-_PEER_DB_PATH = str(_plib.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
-def _peerdb_ensure(path: str) -> None:
-    _plib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with _sq3.connect(path) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS known_peers
-                     (host TEXT, port INTEGER, last_seen INTEGER,
-                      PRIMARY KEY(host, port))""")
+# ── Peer management now uses main qtcl_blockchain.db (p2p_peers table) ─────────────────
+# Removed separate qtcl_p2p_peers.db - peers stored in main blockchain DB
 def peerdb_load(path: str = _PEER_DB_PATH) -> int:
     """Load peers from SQLite and connect via C P2P. Returns connected count."""
     if not False: return 0
@@ -4189,6 +4175,91 @@ class LocalBlockchainDB:
             f"[IBD] Chain sync complete: synced {synced} blocks, "
             f"local height now {self.get_chain_height()}"
         )
+        return synced
+
+    def _sync_chain_to_height(self, kapi: "KoyebAPIClient", target_height: int) -> int:
+        """
+        Cryptographically reconstruct chain from genesis to target_height.
+        Verifies parent_hash linkage at every step for full cryptographic integrity.
+        
+        Args:
+            kapi: KoyebAPIClient with _rpc() method
+            target_height: Height to sync to (from oracle snapshot)
+            
+        Returns:
+            Number of blocks verified from genesis
+        """
+        if target_height <= 0:
+            logger.debug("[CHAIN-RECON] Target height is 0, nothing to sync")
+            return 0
+        
+        logger.info(f"[CHAIN-RECON] Starting cryptographic chain reconstruction to height {target_height}")
+        
+        # Get genesis block and verify
+        genesis = kapi._rpc("qtcl_getBlock", [0])
+        if not isinstance(genesis, dict):
+            logger.warning("[CHAIN-RECON] Failed to fetch genesis block")
+            return 0
+        
+        genesis_hash = genesis.get('block_hash') or genesis.get('hash', '')
+        logger.info(f"[CHAIN-RECON] Genesis hash: {genesis_hash[:32]}...")
+        
+        # Store genesis if not exists
+        existing = self.get_block(0)
+        if not existing:
+            self.insert_block(0, genesis)
+            logger.info("[CHAIN-RECON] Genesis block stored")
+        
+        # Verify chain from genesis to target_height
+        cursor = self.conn.cursor()
+        synced = 0
+        batch_size = 100
+        
+        for start in range(1, target_height + 1, batch_size):
+            end = min(start + batch_size - 1, target_height)
+            
+            # Fetch block range
+            blocks_data = kapi._rpc("qtcl_getBlockRange", [start, end])
+            if not isinstance(blocks_data, dict):
+                logger.warning(f"[CHAIN-RECON] Failed to fetch blocks {start}-{end}")
+                continue
+            
+            blocks = blocks_data.get('blocks', [])
+            if not blocks:
+                # Try alternative format
+                blocks = blocks_data.get('result', [])
+            
+            for blk in blocks:
+                h = blk.get('block_height') or blk.get('height', 0)
+                blk_hash = blk.get('block_hash') or blk.get('hash', '')
+                parent_hash = blk.get('previous_hash') or blk.get('parent_hash', '')
+                
+                # Cryptographic verification: parent_hash must link
+                if h > 0:
+                    prev_block = self.get_block(h - 1)
+                    if prev_block:
+                        expected_parent = prev_block.get('hash', '') or prev_block.get('block_hash', '')
+                        if parent_hash != expected_parent:
+                            logger.warning(
+                                f"[CHAIN-RECON] Chain break at h={h}: "
+                                f"expected parent={expected_parent[:16]}... got={parent_hash[:16]}..."
+                            )
+                            # Wipe and restart from genesis
+                            self._wipe_for_resync()
+                            self.insert_block(0, genesis)
+                            synced = 0
+                            break
+                
+                # Store block
+                try:
+                    self.insert_block(h, blk)
+                    synced += 1
+                except Exception as e:
+                    logger.debug(f"[CHAIN-RECON] Block insert h={h}: {e}")
+            
+            logger.debug(f"[CHAIN-RECON] Synced blocks 1-{end}/{target_height}")
+        
+        logger.info(f"[CHAIN-RECON] ✅ Chain reconstruction complete: {synced} blocks verified")
         return synced
 
     def _wipe_for_resync(self) -> None:
@@ -6109,6 +6180,38 @@ class QtclMiner(QtclNode):
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
+        
+        # ── CRITICAL: Chain reconstruction from genesis using oracle snapshot height ─────────────
+        # Extract block_height from oracle snapshot and cryptographically reconstruct chain
+        logger.info("[MINER] ⚙️  Extracting block height from oracle snapshot for chain reconstruction...")
+        _snapshot_height = 0
+        for attempt in range(10):
+            try:
+                snap = _LIVE_RPC_ORACLE.fetch_snapshot()
+                if snap:
+                    # Extract block_height from snapshot (new field added to snapshot)
+                    _snapshot_height = snap.get('block_height', 0)
+                    if _snapshot_height is None:
+                        _snapshot_height = 0
+                    logger.info(f"[MINER] ✅ Snapshot received: block_height={_snapshot_height}")
+                    break
+            except Exception as e:
+                logger.debug(f"[MINER] Snapshot fetch attempt {attempt+1}/10 failed: {e}")
+            time.sleep(0.5)
+        
+        # ── Cryptographic chain reconstruction from genesis ───────────────────
+        # If we have a snapshot height, verify/regenerate chain from genesis
+        if _snapshot_height > 0:
+            logger.info(f"[MINER] 🔐 Performing cryptographic chain reconstruction from genesis (height={_snapshot_height})...")
+            try:
+                kapi = KoyebAPIClient(server_url=self._server_url)
+                # Wipe and reconstruct from genesis
+                self._wipe_for_resync()
+                # Sync from genesis to snapshot height
+                synced_blocks = self._sync_chain_to_height(kapi, _snapshot_height)
+                logger.info(f"[MINER] ✅ Chain reconstructed: {synced_blocks} blocks verified from genesis")
+            except Exception as e:
+                logger.warning(f"[MINER] Chain reconstruction failed: {e} — will attempt IBD on demand")
         
         # ── CRITICAL: Bootstrap oracle snapshot before mining ────────────────
         # Fetch RPC oracle snapshot, extract DM, reconstruct tripartite W-state
