@@ -2350,8 +2350,10 @@ class QtclP2PNode:
 # ── Module-level singletons ──────────────────────────────────────────────────
 _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
-# ── Peer management now uses main qtcl_blockchain.db (p2p_peers table) ─────────────────
-# Removed separate qtcl_p2p_peers.db - peers stored in main blockchain DB
+
+# ── Peer management uses main qtcl_blockchain.db (p2p_peers table) ─────────────────
+_PEER_DB_PATH = str(_plib.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+
 def peerdb_load(path: str = _PEER_DB_PATH) -> int:
     """Load peers from SQLite and connect via C P2P. Returns connected count."""
     if not False: return 0
