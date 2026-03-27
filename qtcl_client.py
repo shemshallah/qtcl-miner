@@ -11709,13 +11709,17 @@ class KoyebOracleState:
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
+        th   = str(snap.get("tip_hash") or snap.get("block_hash") or snap.get("hash") or "0" * 64)
+        _EXP_LOG.debug(f"[KoyebOracleState.sync] snap keys: {list(snap.keys())}")
+        _EXP_LOG.debug(f"[KoyebOracleState.sync] extracted bh={bh}, tip_hash={th[:32]}...")
         if bh == 0:
             try:
                 _fb = self._api.get_block_height()
                 if _fb and int(_fb) > 0:
                     bh = int(_fb)
-            except Exception:
-                pass
+                    _EXP_LOG.debug(f"[KoyebOracleState.sync] fallback get_block_height returned {bh}")
+            except Exception as e:
+                _EXP_LOG.debug(f"[KoyebOracleState.sync] fallback get_block_height failed: {e}")
         self.pq0_fidelity     = float(fid)
         self.w_state_fidelity = float(fid)
         self.oracle_entropy   = float(ent)
@@ -13796,9 +13800,29 @@ class QtclClientApp:
         # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
         bh = int(snap.get('block_height') or snap.get('height') or
                  self.koyeb_state.block_height or 0)
+        th = str(snap.get('tip_hash') or snap.get('block_hash') or snap.get('hash') or "0" * 64)
         pq_curr_id = str(snap.get('pq_curr') or snap.get('pq_curr_id') or bh or '')
         pq_last_id = str(snap.get('pq_last') or snap.get('pq_last_id') or
                          max(0, bh - 1) if bh else '')
+        
+        # ── SYNC CHAIN FROM SERVER ─────────────────────────────────────────────
+        print(f"  🔗 Syncing chain from server (height={bh}, tip_hash={th[:16]}…)", flush=True)
+        if bh > 0:
+            try:
+                kapi = KoyebAPIClient(timeout=15)
+                synced = 0
+                for h in range(0, min(bh + 1, 50)):  # Sync up to 50 blocks
+                    try:
+                        block = kapi.get_block_by_height(h)
+                        if block and isinstance(block, dict):
+                            self._db.insert_block(block.get('height', h), block)
+                            synced += 1
+                    except Exception:
+                        pass
+                print(f"  🔗 Synced {synced} blocks from server", flush=True)
+            except Exception as e:
+                _EXP_LOG.debug(f"[CHAIN-SYNC] Failed: {e}")
+        
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
