@@ -6327,7 +6327,8 @@ class QtclMiner(QtclNode):
                     # Check for chain updates every batch
                     if nonce > 0 and nonce % batch_size == 0:
                         # Check if someone else mined this block
-                        remote_tip = self._rpc("qtcl_getBlockHeight", [])
+                        kapi = KoyebAPIClient(server_url=self._server_url)
+                        remote_tip = kapi._rpc("qtcl_getBlockHeight", [])
                         if isinstance(remote_tip, dict) and int(remote_tip.get('height', -1)) >= height:
                             logger.info(f"[MINING] 📢 Height {height} already mined by someone else, skipping...")
                             break
@@ -6341,9 +6342,12 @@ class QtclMiner(QtclNode):
                     frac = difficulty - int(difficulty)
                     threshold = int(round(frac * 16)) if frac > 0.001 else 16
 
-                    for _ in range(5000):
+                    # OPTIMIZATION: Cache hashing engine compute function
+                    compute_fn = HASH_ENGINE.compute_block_hash
+                    
+                    for _ in range(10000):
                         blk_pow["nonce"] = nonce
-                        h = HASH_ENGINE.compute_block_hash(blk_pow)
+                        h = compute_fn(blk_pow)
                         
                         if h.startswith(prefix):
                             if threshold >= 16:
@@ -6357,7 +6361,7 @@ class QtclMiner(QtclNode):
                         nonce += 1
                     
                     # Small sleep to allow other threads to run
-                    time.sleep(0.001)
+                    time.sleep(0.0001)
                 
                 if not solved:
                     continue 
@@ -6400,10 +6404,10 @@ class QtclMiner(QtclNode):
                 except Exception as sub_err:
                     logger.error(f"[MINING] Block submission error: {sub_err}")
                 
-                self._stop_event.wait(0.1)
+                self._stop_event.wait(0.01)
             except Exception as exc:
                 self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
-                self._stop_event.wait(2.0)
+                self._stop_event.wait(1.0)
                 # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
                 if _RESET_PERFORMED.is_set():
                     _RESET_PERFORMED.clear()
