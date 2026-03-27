@@ -6033,6 +6033,43 @@ class QtclMiner(QtclNode):
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
+        
+        # ── CRITICAL: Bootstrap oracle snapshot before mining ────────────────
+        # Fetch RPC oracle snapshot, extract DM, reconstruct tripartite W-state
+        logger.info("[MINER] ⚙️  Bootstrapping oracle snapshot for W-state reconstruction...")
+        _oracle_ready = False
+        for attempt in range(10):
+            try:
+                snap = _LIVE_RPC_ORACLE.fetch_snapshot()
+                if snap and snap.get('density_matrix_hex'):
+                    dm_hex = snap.get('density_matrix_hex', '')
+                    if dm_hex and len(dm_hex) > 32:  # valid DM data
+                        pq0 = snap.get('pq0', 0)
+                        pq_curr = snap.get('pq_curr', 0)
+                        pq_last = snap.get('pq_last', 0)
+                        # ── Reconstruct tripartite W-state ──────────────────────
+                        try:
+                            triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
+                            logger.info(
+                                f"[MINER] ✅ Oracle snapshot locked | "
+                                f"pq0={pq0} pq_curr={pq_curr} pq_last={pq_last} | "
+                                f"DM ready (cycle={snap.get('cycle', 0)})"
+                            )
+                            _oracle_ready = True
+                            break
+                        except Exception as e:
+                            logger.warning(f"[MINER] W-state reconstruction failed: {e}")
+                    else:
+                        logger.debug(f"[MINER] Oracle snapshot incomplete (attempt {attempt+1}/10)")
+                else:
+                    logger.debug(f"[MINER] Waiting for oracle snapshot (attempt {attempt+1}/10)...")
+            except Exception as e:
+                logger.debug(f"[MINER] Oracle bootstrap error: {e}")
+            time.sleep(0.5)
+        
+        if not _oracle_ready:
+            logger.warning("[MINER] ⚠️  Oracle snapshot bootstrap timeout — starting in degraded mode")
+        
         self._start_mining_loop()
         # ── Arm genesis-reset background listener ─────────────────────────
         _GENESIS_RESET_LISTENER.start(
@@ -11922,6 +11959,9 @@ class _MiningTelemetry:
     def mark_idle(self) -> None:
         with self._lock:
             self.state = "IDLE"
+    def mark_mining(self) -> None:
+        with self._lock:
+            self.state = "MINING"
     def snapshot(self) -> dict:
         """Lock-free snapshot for display with rewards."""
         with self._lock:
