@@ -4321,15 +4321,14 @@ def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
 def _broadcast_reset_to_peers(
     genesis_block: dict,
     server_url:    str    = "",
-    broadcaster:   object = None,
     peers:         list   = None,
 ) -> None:
     """
-    Non-blocking daemon thread — fires 'chain_reset' to:
-      A. SSEBroadcaster / SSEMultiplexer — local SSE clients
-      B. HTTP POST → each peer /gossip    — remote nodes
-      C. C P2P layer broadcast_chain_reset — RPC peers
+    Non-blocking daemon thread — fires chain reset via:
+      • HTTP POST → each peer /gossip    — remote nodes
+      • C P2P layer broadcast_chain_reset — RPC peers
     Never blocks the calling thread.
+    (SSE broadcast removed — use RPC instead)
     """
     _payload = {
         "event": "chain_reset", "new_height": 0,
@@ -4339,19 +4338,6 @@ def _broadcast_reset_to_peers(
         "broadcast_ts": time.time(), "origin": server_url or "local",
     }
     def _fire() -> None:
-        if broadcaster is not None:
-            try:
-                if   hasattr(broadcaster, 'broadcast'):
-                    reached = broadcaster.broadcast('chain_reset', _payload)
-                    logger.info(f"[RESET-BCAST] 📡 SSE → {reached} local clients")
-                elif hasattr(broadcaster, 'publish'):
-                    broadcaster.publish('chain_reset', _payload, channel='control')
-                    logger.info("[RESET-BCAST] 📡 SSE mux → channel:control")
-                elif hasattr(broadcaster, 'broadcast_chain_reset'):
-                    broadcaster.broadcast_chain_reset(genesis_block.get("hash",""))
-                    logger.info("[RESET-BCAST] 🌐 C P2P RPC consensus broadcast sent")
-            except Exception as _e:
-                logger.warning(f"[RESET-BCAST] SSE error: {_e}")
         _peers = peers or []
         ok, fail = 0, 0
         for peer in _peers:
@@ -4374,7 +4360,6 @@ def _check_and_handle_chain_reset(
     db:            "LocalBlockchainDB",
     server_url:    str    = "",
     miner_address: str    = NULL_COINBASE_ADDRESS,
-    broadcaster:   object = None,
     peers:         list   = None,
 ) -> bool:
     """
@@ -4384,9 +4369,10 @@ def _check_and_handle_chain_reset(
     Sequence under _RESET_LOCK (no TOCTOU races):
       1. Nuclear-wipe (DELETE all non-key tables, schema intact)
       2. Forge + store canonical genesis block (null coinbase, h=0)
-      3. Broadcast CHAIN_RESET to SSE + all known peers + C P2P
+      3. Broadcast CHAIN_RESET to all known peers via RPC
       4. Set _RESET_PERFORMED → mining loop restarts from genesis
     Returns True if reset performed, False otherwise.
+    (SSE broadcast removed — use RPC instead)
     """
     if server_height != 0: return False
     if _get_local_chain_height(db) == 0: return False
@@ -4401,12 +4387,9 @@ def _check_and_handle_chain_reset(
         if not _nuclear_wipe_local_db(db):
             logger.error("[RESET] ❌ Wipe failed — aborting"); return False
         genesis = _forge_and_store_genesis_block(db, miner_address)
-        all_broadcaster = broadcaster
-        if all_broadcaster is None and _P2P_NODE is not None and _P2P_NODE._started:
-            all_broadcaster = _P2P_NODE
         _broadcast_reset_to_peers(
             genesis_block=genesis, server_url=server_url,
-            broadcaster=all_broadcaster, peers=peers or [],
+            peers=peers or [],
         )
         _RESET_PERFORMED.set()
         logger.info(f"[RESET] 🚀 Complete  genesis={genesis['hash'][:24]}…")
@@ -4427,13 +4410,12 @@ class GenesisResetListener:
         self._server_url: str  = ""
         self._miner_addr: str  = NULL_COINBASE_ADDRESS
         self._peers: list      = []
-        self._broadcaster      = None
     def start(self, db: "LocalBlockchainDB", server_url: str,
               miner_address: str = NULL_COINBASE_ADDRESS,
-              peers: list = None, broadcaster: object = None) -> None:
+              peers: list = None) -> None:
         self._db = db; self._server_url = server_url
         self._miner_addr = miner_address; self._peers = peers or []
-        self._broadcaster = broadcaster; self._stop.clear()
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._listen_loop, daemon=True, name='GenesisResetListener',
         )
@@ -4473,7 +4455,7 @@ class GenesisResetListener:
                                 _check_and_handle_chain_reset(
                                     server_height=0, db=self._db,
                                     server_url=self._server_url, miner_address=self._miner_addr,
-                                    broadcaster=self._broadcaster, peers=self._peers,
+                                    peers=self._peers,
                                 )
                     
                     last_height = current_height
@@ -5845,14 +5827,12 @@ class QtclNode(ComponentBase):
             dht=self.dht,
         )
         self.snapshot_mgr = SnapshotManager(db=self.db, config=self.config)
-        self.broadcaster = None  # Not used - SSE on shared HTTP port
         self.registry = RegistryManager(db=self.db)
         self.verifier = UnifiedVerifier(db=self.db)
         self.request_handler = RequestHandler(
             db=self.db,
             snapshot_mgr=self.snapshot_mgr,
             registry=self.registry,
-            broadcaster=self.broadcaster,
             verifier=self.verifier,
         )
         n_qubits = int(self._cfg.get("n_qubits", 8))
@@ -5862,7 +5842,7 @@ class QtclNode(ComponentBase):
         self._component_order = [
             c for c in [
                 self.db, self.dht, self.bootstrap,
-                self.snapshot_mgr, self.broadcaster,
+                self.snapshot_mgr,
                 self.registry, self.verifier, self.request_handler,
                 self.quantum_evo, self.metrics,
             ] if c is not None
