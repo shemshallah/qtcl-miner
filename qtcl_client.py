@@ -14056,9 +14056,15 @@ class QtclClientApp:
             try:
                 kapi = KoyebAPIClient()
                 snap = kapi.get_oracle_pq0_bloch()
-                if snap and (snap.get('density_matrix_hex') or snap.get('lattice', {}).get('cycle', 0) > 0):
-                    print(" ✅", flush=True)
-                    return True
+                _EXP_LOG.debug(f"[DM-WAIT] Got snap: keys={list(snap.keys()) if snap else 'None'}")
+                if snap:
+                    dm_hex = snap.get('density_matrix_hex', '')
+                    lattice = snap.get('lattice', {})
+                    w_state = snap.get('w_state', {})
+                    _EXP_LOG.debug(f"[DM-WAIT] dm_hex={len(dm_hex)} lattice={bool(lattice)} w_state={bool(w_state)}")
+                    if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
+                        print(" ✅", flush=True)
+                        return True
             except Exception as e:
                 _EXP_LOG.debug(f"[DM-WAIT] {e}")
             print(" ❌ degraded mode", flush=True)
