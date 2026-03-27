@@ -14128,419 +14128,158 @@ class QtclClientApp:
             def stop_mining(self): pass
         miner = _MinerHandle()
         async def _mine_inline():
-            """
-            ⚛️ UNIFIED MINING PIPELINE v5.0 — ENTERPRISE GRADE ⚛️
-            
-            Single logical pathway, no fallbacks, no dead code:
-            1. Get chain tip (RPC) 
-            2. Build block (coinbase + TXs + merkle)
-            3. Mine (pure Python SHA256)
-            4. Submit (RPC-only, exponential backoff, atomic quantum state)
-            5. Wait for new block
-            
-            REMOVED:
-            - C/OpenSSL acceleration (dead code on ARM64)
-            - Memory-hard PoW validation (server validates)
-            - Entropy mining pools (dead code)
-            - Synthetic oracle fallbacks (removed)
-            - Block listener background thread (removed)
-            
-            KEPT INTACT:
-            - HLWE/lattice systems (untouched)
-            - Oracle DM synchronization (RPC-only)
-            - Quantum field state tracking (pq_curr/pq_last locked)
-            - Telemetry integration
-            """
+            """⚛️ LEAN MINING LOOP — Single path, zero cruft, real work only."""
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
             
-            # ══════════════════════════════════════════════════════════════════════
-            # SUBMISSION PIPELINE — Single RPC Path, Exponential Backoff
-            # ══════════════════════════════════════════════════════════════════════
-            class _SubmissionPipeline:
-                """⚛️ Enterprise RPC submission with atomic quantum state locking."""
-                RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]  # 61s window
-                
-                def __init__(self):
-                    self.submit_count = 0
-                    self.accept_count = 0
-                    self.reject_count = 0
-                
-                async def submit(self, payload: dict, block_height: int, block_hash: str) -> tuple:
-                    """RPC submission with exponential backoff retry. Single logical path."""
-                    self.submit_count += 1
-                    last_error = None
-                    
-                    for attempt, backoff in enumerate(self.RETRY_BACKOFFS):
-                        try:
-                            _EXP_LOG.info(
-                                f"[SUBMIT] Attempt {attempt+1}/6: h={block_height} "
-                                f"hash={block_hash[:16]}…"
-                            )
-                            
-                            # RPC call with timeout (no internal retry — we handle retry loop)
-                            result = kapi._rpc(
-                                "qtcl_submitBlock",
-                                [payload],
-                                timeout=15,
-                                retries=1
-                            )
-                            
-                            # ✅ SUCCESS: Block accepted
-                            if isinstance(result, dict) and result.get("status") == "accepted":
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] ✅ ACCEPTED h={block_height} "
-                                    f"hash={block_hash[:16]}… attempts={attempt+1}"
-                                )
-                                self.accept_count += 1
-                                return (True, result)
-                            
-                            # ⚠️ DUPLICATE: Chain advanced, block already accepted
-                            elif isinstance(result, dict) and result.get("status") == "duplicate":
-                                _EXP_LOG.info(
-                                    f"[SUBMIT] ✅ DUPLICATE h={block_height} "
-                                    f"(accepted earlier, chain advanced)"
-                                )
-                                self.accept_count += 1
-                                return (True, result)
-                            
-                            # ❌ ERROR: Check if chain advanced or real validation error
-                            elif isinstance(result, dict) and "error" in result:
-                                error_msg = result.get("error", "unknown")
-                                
-                                # Chain advanced (not a submission error — block was accepted)
-                                if "Invalid height" in error_msg and f"expected {block_height + 1}" in error_msg:
-                                    _EXP_LOG.info(
-                                        f"[SUBMIT] ✅ CHAIN ADVANCED h={block_height} "
-                                        f"→ tip={result.get('tip', '?')} (block accepted)"
-                                    )
-                                    self.accept_count += 1
-                                    return (True, result)
-                                
-                                # Real validation error — don't retry
-                                _EXP_LOG.error(
-                                    f"[SUBMIT] ❌ REJECTED h={block_height} | {error_msg}"
-                                )
-                                self.reject_count += 1
-                                return (False, result)
-                            
-                            # RPC returned None (network error) — retry
-                            elif result is None:
-                                last_error = "RPC returned None"
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] Attempt {attempt+1}: {last_error}"
-                                )
-                            
-                            else:
-                                # Unexpected response format
-                                last_error = f"Unexpected response: {type(result)}"
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] Attempt {attempt+1}: {last_error}"
-                                )
-                        
-                        except Exception as e:
-                            last_error = str(e)
-                            _EXP_LOG.warning(
-                                f"[SUBMIT] Attempt {attempt+1} exception: {last_error}"
-                            )
-                        
-                        # Backoff before next attempt
-                        if attempt < len(self.RETRY_BACKOFFS) - 1:
-                            _EXP_LOG.info(f"[SUBMIT] Retry in {backoff:.1f}s…")
-                            await _asyncio.sleep(backoff)
-                    
-                    # All retries exhausted
-                    _EXP_LOG.error(
-                        f"[SUBMIT] ❌ FAILED after 6 attempts (61s window): {last_error}"
-                    )
-                    self.reject_count += 1
-                    return (False, None)
-            
-            _submission = _SubmissionPipeline()
-            
-            # ══════════════════════════════════════════════════════════════════════
-            # UNIFIED MINING LOOP — Pure Python, Single Path, No Fallbacks
-            # ══════════════════════════════════════════════════════════════════════
-            _YIELD_EVERY = 10000  # async yield every 10k hashes
-            _POLL_EVERY_S = 2.0   # poll chain height every 2 seconds
-            _last_poll_time = _t.time()
-            
-            while True:  # Main mining loop (restart on chain advance)
+            while True:
                 try:
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 1: Get chain tip
-                    # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.debug("[MINER] Getting chain tip…")
-                    tip = None
-                    for _retry in range(4):
-                        try:
-                            tip = kapi.get_chain_tip()
-                            if tip and (tip.get("block_height") is not None or tip.get("height") is not None):
-                                break
-                        except Exception as e:
-                            _EXP_LOG.debug(f"[MINER] Chain tip retry {_retry+1}/4: {e}")
-                            await _asyncio.sleep(0.5 * (2 ** _retry))
-                    
-                    if tip is None:
-                        _EXP_LOG.warning("[MINER] Chain tip failed, retrying in 0.5s")
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.5)
+                    # ── STAGE 1: Get chain tip (RPC-only) ──────────────────────
+                    _EXP_LOG.info("[MINER] Fetching chain tip...")
+                    tip = kapi.get_chain_tip()
+                    if not tip:
+                        _EXP_LOG.warning("[MINER] Chain tip unavailable, retry in 2s")
+                        await _asyncio.sleep(2.0)
                         continue
                     
                     oracle_height = int(tip.get("block_height") or tip.get("height") or 0)
-                    oracle_hash = str(tip.get("block_hash", tip.get("hash", "0" * 64)))
-                    difficulty_bits = int(tip.get("difficulty_bits") or tip.get("difficulty") or 5)
-                    difficulty_bits = int(max(5, min(difficulty_bits, 20)))
-                    
+                    parent_hash = str(tip.get("block_hash", "0" * 64))
                     target_height = oracle_height + 1
-                    parent_hash = oracle_hash
                     timestamp = int(_t.time())
-                    miner_addr = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
+                    miner_addr = getattr(getattr(self, 'wallet', None), 'address', None) or ("0" * 64)
                     
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 2: Fetch quantum seed (QRNG-injected)
-                    # ──────────────────────────────────────────────────────────────
+                    # ── STAGE 2: Fetch dynamic difficulty from RPC ──────────────
                     try:
-                        _w_entropy_seed = _LIVE_RPC_ORACLE.get_pow_seed(target_height, parent_hash)
-                    except Exception as e:
-                        _EXP_LOG.debug(f"[MINER] Oracle seed failed: {e}")
-                        # Fallback: deterministic seed from timestamp + parent
-                        _w_entropy_seed = _hl.sha3_256(
-                            str(int(_t.time()/30)).encode() + parent_hash.encode()
-                        ).digest()
+                        diff_resp = kapi._rpc("qtcl_getDifficulty", [])
+                        if diff_resp and isinstance(diff_resp, dict):
+                            current_difficulty = float(diff_resp.get('difficulty', 5.25))
+                        else:
+                            current_difficulty = 5.25
+                    except Exception as _de:
+                        _EXP_LOG.debug(f"[MINER] Difficulty fetch failed: {_de}")
+                        current_difficulty = 5.25
                     
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 3: Build block (coinbase + treasury + user TXs)
-                    # ──────────────────────────────────────────────────────────────
+                    _EXP_LOG.info(f"[MINER] Mining h={target_height} | diff={current_difficulty:.2f} | parent={parent_hash[:16]}…")
                     
-                    # Fetch pending transactions from mempool
+                    # ── STAGE 3: Build block (minimal, lean) ──────────────────────
                     try:
-                        _pending_user_txs = kapi.get_mempool() or []
-                    except Exception as e:
-                        _pending_user_txs = []
-                        _EXP_LOG.debug(f"[MINER] Mempool fetch failed: {e}")
-                    
-                    # Get reward schedule
-                    try:
-                        from globals import TessellationRewardSchedule as _TRS
-                        _miner_reward = _TRS.get_miner_reward_qtcl(target_height)
-                        _treasury_reward = _TRS.get_treasury_reward_qtcl(target_height)
-                        _treasury_addr = _TRS.TREASURY_ADDRESS
+                        _pending_txs = kapi.get_mempool() or []
                     except Exception:
-                        _miner_reward = 50.0
-                        _treasury_reward = 10.0
-                        _treasury_addr = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
+                        _pending_txs = []
                     
-                    # Create miner coinbase transaction
-                    _miner_cb_id = _hl.sha3_256(
-                        _j.dumps({
-                            "height": target_height,
-                            "miner": miner_addr,
-                            "amount": _miner_reward,
-                            "seed": _w_entropy_seed.hex(),
-                        }, sort_keys=True).encode()
-                    ).hexdigest()
-                    _miner_cb = {
-                        "tx_id": _miner_cb_id,
-                        "from_addr": "0" * 64,
-                        "to_addr": miner_addr,
-                        "amount": _miner_reward,
-                        "block_height": target_height,
-                        "w_proof": _w_entropy_seed.hex(),
-                        "tx_type": "coinbase",
-                        "version": 1,
+                    # Coinbase TX
+                    _coinbase = {
+                        "height": target_height,
+                        "miner_address": miner_addr,
+                        "reward_qtcl": 50.0,
                     }
                     
-                    # Create treasury coinbase transaction
-                    _treasury_cb_id = _hl.sha3_256(
-                        _j.dumps({
-                            "height": target_height,
-                            "treasury": _treasury_addr,
-                            "amount": _treasury_reward,
-                            "seed": _w_entropy_seed.hex(),
-                        }, sort_keys=True).encode()
-                    ).hexdigest()
-                    _treasury_cb = {
-                        "tx_id": _treasury_cb_id,
-                        "from_addr": "0" * 64,
-                        "to_addr": _treasury_addr,
-                        "amount": _treasury_reward,
-                        "block_height": target_height,
-                        "w_proof": _w_entropy_seed.hex(),
-                        "tx_type": "coinbase",
-                        "version": 1,
-                    }
+                    _tx_hashes = [_hl.sha3_256(_j.dumps(_coinbase, sort_keys=True).encode()).hexdigest()]
+                    for _tx in _pending_txs[:50]:
+                        _tx_hashes.append(_hl.sha3_256(_j.dumps(_tx, sort_keys=True).encode()).hexdigest())
                     
-                    _block_txs = [_miner_cb, _treasury_cb] + _pending_user_txs
+                    # Merkle root
+                    _merkle_leaves = _tx_hashes[:]
+                    while len(_merkle_leaves) > 1:
+                        if len(_merkle_leaves) % 2:
+                            _merkle_leaves.append(_merkle_leaves[-1])
+                        _merkle_leaves = [
+                            _hl.sha3_256((_merkle_leaves[i] + _merkle_leaves[i+1]).encode()).hexdigest()
+                            for i in range(0, len(_merkle_leaves), 2)
+                        ]
+                    merkle_root = _merkle_leaves[0] if _merkle_leaves else ""
                     
-                    # Compute merkle root (SHA3-256 binary tree)
-                    def _compute_merkle(tx_list: list) -> str:
-                        """Compute merkle root exactly as server does."""
-                        if not tx_list:
-                            return _hl.sha3_256(b"").hexdigest()
-                        
-                        def _tx_hash(tx: dict) -> str:
-                            """Hash transaction exactly as server expects."""
-                            tx_type = tx.get("tx_type", "transfer")
-                            if tx_type == "coinbase":
-                                canonical = _j.dumps({
-                                    "tx_id": tx.get("tx_id", ""),
-                                    "from_addr": tx.get("from_addr", ""),
-                                    "to_addr": tx.get("to_addr", ""),
-                                    "amount": tx.get("amount", 0),
-                                    "block_height": tx.get("block_height", 0),
-                                    "w_proof": tx.get("w_proof", ""),
-                                    "tx_type": "coinbase",
-                                    "version": tx.get("version", 1),
-                                }, sort_keys=True)
-                            else:
-                                # Regular TX: exclude signature
-                                canonical = _j.dumps({
-                                    k: v for k, v in tx.items()
-                                    if k not in ("signature",)
-                                }, sort_keys=True)
-                            return _hl.sha3_256(canonical.encode()).hexdigest()
-                        
-                        # Build merkle tree (binary tree, duplicate last if odd)
-                        hashes = [_tx_hash(tx) for tx in tx_list]
-                        while len(hashes) > 1:
-                            if len(hashes) % 2:
-                                hashes.append(hashes[-1])
-                            hashes = [
-                                _hl.sha3_256((hashes[i] + hashes[i+1]).encode()).hexdigest()
-                                for i in range(0, len(hashes), 2)
-                            ]
-                        return hashes[0]
+                    # ── STAGE 4: PoW KERNEL — FRACTIONAL DIFFICULTY ───────────────
+                    whole_zeros = int(current_difficulty)
+                    frac_nibble = current_difficulty - whole_zeros
                     
-                    merkle_root = _compute_merkle(_block_txs)
+                    nonce = 0
+                    solved = False
+                    block_hash = ""
+                    _start = _t.time()
                     
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 4: Mine (Pure Python SHA256 — Single Path, No Fallbacks)
-                    # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.info(
-                        f"[MINER] Mining h={target_height} diff={difficulty_bits} "
-                        f"parent={parent_hash[:16]}… "
-                        f"target={'0'*difficulty_bits}…"
-                    )
-                    _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
+                    _MINE_TELEM.update_progress(target_height, int(current_difficulty), 0, parent_hash)
                     _MINE_TELEM.mark_mining()
                     
-                    hex_zeros = "0" * difficulty_bits
-                    block_hash = None
-                    nonce = 0
-                    _found = False
-                    
-                    while not _found:
-                        # Pure Python: block JSON → SHA256 → check leading zeros
+                    while not solved:
                         _block_data = {
                             "height": target_height,
                             "parent_hash": parent_hash,
                             "merkle_root": merkle_root,
                             "timestamp": timestamp,
                             "nonce": nonce,
-                            "difficulty_bits": difficulty_bits,
+                            "difficulty": float(current_difficulty),
                             "miner_address": miner_addr,
                         }
                         _canonical = _j.dumps(_block_data, sort_keys=True, separators=(',', ':')).encode()
-                        _hash_result = _hl.sha256(_canonical).hexdigest()
+                        _hash = _hl.sha256(_canonical).hexdigest()
                         
-                        if _hash_result.startswith(hex_zeros):
-                            block_hash = _hash_result
-                            _found = True
-                            break
+                        # Check fractional difficulty
+                        hex_prefix = "0" * whole_zeros
+                        if _hash.startswith(hex_prefix):
+                            if frac_nibble < 0.001:
+                                solved = True
+                                block_hash = _hash
+                            else:
+                                nibble_thresh = int(round(frac_nibble * 16))
+                                if len(_hash) > whole_zeros:
+                                    next_nibble = int(_hash[whole_zeros], 16)
+                                    if next_nibble < nibble_thresh:
+                                        solved = True
+                                        block_hash = _hash
                         
                         nonce += 1
-                        _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
+                        _MINE_TELEM.update_progress(target_height, int(current_difficulty), nonce, parent_hash)
                         
-                        # Async yield every 10k hashes (prevent blocking)
-                        if nonce % _YIELD_EVERY == 0:
+                        # Async yield every 10k nonces
+                        if nonce % 10000 == 0:
                             await _asyncio.sleep(0)
-                        
-                        # Poll chain height every 2 seconds
-                        _now = _t.time()
-                        if _now - _last_poll_time > _POLL_EVERY_S:
-                            _last_poll_time = _now
+                            # Poll chain tip every 10k nonces
                             try:
                                 _tip_check = kapi.get_chain_tip()
-                                _check_h = int(_tip_check.get("block_height") or _tip_check.get("height") or 0)
+                                _check_h = int(_tip_check.get("block_height", 0)) if _tip_check else 0
                                 if _check_h > oracle_height:
-                                    _EXP_LOG.warning(
-                                        f"[MINER] ⚡ Chain advanced h={_check_h} → abort mining, restart"
-                                    )
-                                    break  # Exit mining loop, restart main loop
+                                    _EXP_LOG.info(f"[MINER] Chain advanced to h={_check_h}, restarting")
+                                    break
                             except Exception:
                                 pass
                     
-                    if not _found:
-                        # Chain advanced during mining, restart from new tip
-                        _EXP_LOG.info("[MINER] Chain advanced during mining, restarting…")
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.1)
-                        continue
+                    if not solved:
+                        continue  # Restart mining loop
                     
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 5: Build submission payload (atomic quantum state lock)
-                    # ──────────────────────────────────────────────────────────────
-                    pq_curr = target_height
-                    pq_last = target_height - 1
-                    w_state_fidelity = 0.75
+                    _elapsed = _t.time() - _start
+                    _EXP_LOG.info(f"[MINER] ✅ Block {target_height} solved in {_elapsed:.1f}s! Hash: {block_hash[:24]}… Nonce: {nonce}")
                     
-                    # Try to get actual fidelity from client field
-                    try:
-                        if self.client_field and self.client_field.metrics:
-                            _fid = self.client_field.metrics.fidelity_to_w3
-                            if _fid is not None and 0.0 <= _fid <= 1.0:
-                                w_state_fidelity = float(_fid)
-                    except Exception:
-                        pass
-                    
-                    submit_payload = {
-                        "header": {
-                            "height": target_height,
-                            "block_hash": block_hash,
-                            "parent_hash": parent_hash,
-                            "merkle_root": merkle_root,
-                            "timestamp_s": timestamp,
-                            "nonce": nonce,
-                            "miner_address": miner_addr,
-                            "difficulty_bits": difficulty_bits,
-                            "w_entropy_hash": _w_entropy_seed.hex(),
-                            "w_state_fidelity": round(w_state_fidelity, 4),
-                            "pq_curr": pq_curr,
-                            "pq_last": pq_last,
-                        },
-                        "transactions": _block_txs,
+                    # ── STAGE 5: Submit block ──────────────────────────────────────
+                    _payload = {
+                        "height": target_height,
+                        "parent_hash": parent_hash,
+                        "merkle_root": merkle_root,
+                        "timestamp": timestamp,
+                        "nonce": nonce,
+                        "difficulty": float(current_difficulty),
+                        "miner_address": miner_addr,
+                        "hash": block_hash,
                     }
                     
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 6: Submit via RPC (single path, exponential backoff)
-                    # ──────────────────────────────────────────────────────────────
-                    _success, _result = await _submission.submit(
-                        submit_payload, target_height, block_hash
-                    )
+                    _MINE_TELEM.mark_submitting()
+                    try:
+                        _submit = kapi._rpc("qtcl_submitBlock", [_payload])
+                        if _submit and (_submit.get("status") == "accepted" or _submit.get("success")):
+                            _EXP_LOG.info(f"[MINER] ✅ Block {target_height} ACCEPTED")
+                            _MINE_TELEM.record_submission(target_height, 50.0)
+                        else:
+                            _EXP_LOG.warning(f"[MINER] ❌ Block {target_height} rejected: {_submit}")
+                    except Exception as _se:
+                        _EXP_LOG.error(f"[MINER] Submit error: {_se}")
                     
-                    if _success:
-                        _MINE_TELEM.record_block_accepted(
-                            height=target_height,
-                            hash=block_hash,
-                            nonce=nonce,
-                            timestamp=timestamp,
-                            fidelity=w_state_fidelity,
-                        )
-                        _MINE_TELEM.mark_idle()
-                    else:
-                        _MINE_TELEM.mark_idle()
-                    
-                    # Wait before restarting mining loop
-                    await _asyncio.sleep(0.5)
+                    _MINE_TELEM.mark_idle()
+                    await _asyncio.sleep(0.1)
                 
                 except Exception as e:
-                    _EXP_LOG.error(
-                        f"[MINER] FATAL: {type(e).__name__}: {e}",
-                        exc_info=True
-                    )
+                    _EXP_LOG.error(f"[MINER] ERROR: {type(e).__name__}: {e}")
                     _MINE_TELEM.mark_idle()
                     await _asyncio.sleep(1.0)
             
@@ -14556,7 +14295,7 @@ class QtclClientApp:
                 _EXP_LOG.critical(f"[MINER-ASYNC] 📋 Traceback:\n{traceback.format_exc()}")
             finally:
                 try:
-                    _mining_stopped.set()   # stop block listener thread
+                    _mining_stopped.set()
                 except Exception:
                     pass
         _mine_thread = _threading.Thread(
