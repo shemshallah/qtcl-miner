@@ -13898,6 +13898,7 @@ class QtclClientApp:
             - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
+            import urllib.request as _ur
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
