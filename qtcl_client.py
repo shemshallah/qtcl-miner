@@ -1928,18 +1928,14 @@ class QtclP2PNode:
                 _EXP_LOG.debug(f"[P2P] Bootstrap {host}:{port} failed: {_e}")
         try:
             import sqlite3 as _p2p_rsq
-            _p2p_rdb = __import__('pathlib').Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db'
+            _p2p_rdb = __import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
             if _p2p_rdb.exists():
                 with _p2p_rsq.connect(str(_p2p_rdb)) as _rc:
                     _rc.row_factory = _p2p_rsq.Row
-                    rows = _rc.execute("""SELECT host, port FROM known_peers
-                        WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 32""",
-                        (int(__import__('time').time()) - 86400,)).fetchall()
-                for row in rows:
-                    try:
-                        pass
-                    except Exception:
-                        pass
+                    rows = _rc.execute("""SELECT host, port FROM p2p_peers
+                        WHERE last_seen_at > datetime('now', '-1 day')
+                        AND ban_score < 100
+                        ORDER BY chain_height DESC LIMIT 32""").fetchall()
                 if rows:
                     _EXP_LOG.info(f"[P2P] ↩ Reconnecting to {len(rows)} known peers from DB")
         except Exception as _pe:
@@ -1970,7 +1966,7 @@ class QtclP2PNode:
         if False:
             try:
                 import pathlib as _pl
-                _pdb = str(_pl.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
+                _pdb = str(_pl.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
                 if n > 0:
                     _EXP_LOG.info(f"[P2P] ✅ Loaded {n} peers from SQLite DB → connecting")
             except Exception as _dbe:
