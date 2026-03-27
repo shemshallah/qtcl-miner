@@ -14038,7 +14038,7 @@ class QtclClientApp:
             
             return (True, _meas, _pow_seed, _report)
         # ── Execute ────────────────────────────────────────────────────────────
-        _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
+        _dm_ready  = _wait_for_oracle_dm(timeout_s=30.0)
         _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
         print(_report, flush=True)
         self.koyeb_state.sync(self.client_field, timeout=6)
@@ -14052,22 +14052,23 @@ class QtclClientApp:
             Gate on oracle DM arrival via simple REST call.
             Returns True if DM available. False = degraded mode, mining continues.
             """
-            print("  🔗 Fetching oracle snapshot…", end='', flush=True)
+            print("  🔗 Fetching oracle snapshot…", flush=True)
             try:
                 kapi = KoyebAPIClient()
+                print(f"  🔗 Calling RPC qtcl_getQuantumMetrics...", flush=True)
                 snap = kapi.get_oracle_pq0_bloch()
-                _EXP_LOG.debug(f"[DM-WAIT] Got snap: keys={list(snap.keys()) if snap else 'None'}")
+                print(f"  🔗 Got response: type={type(snap)}, keys={list(snap.keys()) if isinstance(snap, dict) else 'N/A'}", flush=True)
                 if snap:
                     dm_hex = snap.get('density_matrix_hex', '')
                     lattice = snap.get('lattice', {})
                     w_state = snap.get('w_state', {})
-                    _EXP_LOG.debug(f"[DM-WAIT] dm_hex={len(dm_hex)} lattice={bool(lattice)} w_state={bool(w_state)}")
+                    print(f"  🔗 dm_hex len={len(dm_hex)}, lattice={lattice}, w_state={w_state}", flush=True)
                     if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
-                        print(" ✅", flush=True)
+                        print("  ✅ Oracle DM acquired!", flush=True)
                         return True
             except Exception as e:
-                _EXP_LOG.debug(f"[DM-WAIT] {e}")
-            print(" ❌ degraded mode", flush=True)
+                print(f"  🔗 Exception: {type(e).__name__}: {e}", flush=True)
+            print("  ❌ degraded mode", flush=True)
             return False
         class _MinerHandle:
             """Thin handle so the post-loop code (miner._koyeb_state etc.) still works."""
