@@ -13794,9 +13794,7 @@ class QtclClientApp:
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── Wait for oracle snapshot FIRST, then sync chain ─────────────────────
-        # ── Fetch live RPC snapshot on-demand ───────────────────────────────
-        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
-        snap = _snap or {}
+        # NO early fetch - only fetch inside _wait_oracle_dm after snapshot succeeds
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
@@ -13825,7 +13823,7 @@ class QtclClientApp:
                             th = str(snap.get('tip_hash') or snap.get('block_hash') or snap.get('hash') or "0" * 64)
                             pq_curr_id = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
                             pq_last_id = str(max(0, bh - 1)) if bh > 0 else str(snap.get("pq_last", ""))
-                            print(f"  🔗 Syncing chain from server (height={bh}, tip_hash={th[:16]}…, pq={pq_curr_id}→{pq_last_id})", flush=True)
+                            print(f"  🔗 Chain info: height={bh}, tip_hash={th[:16]}…, pq={pq_curr_id}→{pq_last_id}", flush=True)
                             if bh > 0:
                                 try:
                                     synced = 0
