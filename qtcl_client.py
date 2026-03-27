@@ -133,15 +133,15 @@ except Exception as e:
 # ═════════════════════════════════════════════════════════════════════════════════
 RPC_ENDPOINTS = {
     # Core Chain RPC
-    "chain_status":      "/api/chain/status",      # GET  → height, hash, difficulty
+    "chain_status":      "/rpc/chain/status",      # GET  → height, hash, difficulty
     "chain_tip":         "/api/chain/tip",         # GET  → latest block info
     "block_fetch":       "/api/block/{height}",    # GET  → block data at height
     "blocks_tip":        "/api/blocks/tip",        # GET  → current tip
     
     # Oracle RPC
-    "oracle_snapshot":   "/api/oracle/snapshot",   # GET  → oracle state snapshot
-    "oracle_w_state":    "/api/oracle/w-state",    # GET  → W-state quantum data
-    "oracle_pq0":        "/api/oracle/pq0",        # GET  → PQ0 qubit state
+    "oracle_snapshot":   "/rpc/oracle/snapshot",   # GET  → oracle state snapshot
+    "oracle_w_state":    "/rpc/oracle/w-state",    # GET  → W-state quantum data
+    "oracle_pq0":        "/rpc/oracle/pq0",        # GET  → PQ0 qubit state
     
     # Wallet / Balance RPC
     "wallet_balance":    "/api/wallet",            # GET  → wallet state
@@ -159,7 +159,7 @@ RPC_ENDPOINTS = {
     # Mining RPC
     "blocks_submit":     "/api/blocks/submit",     # POST → submit mined block
     "tx_submit":         "/api/transactions",      # POST → submit transaction
-    "oracle_push_dm":    "/api/oracle/push_dm",    # POST → push DM frame
+    "oracle_push_dm":    "/rpc/oracle/push_dm",    # POST → push DM frame
 }
 class HyperbolicEntropyPool:
     """
@@ -2141,7 +2141,7 @@ class QtclP2PNode:
                             dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
                                               for i in range(64)).hex()
                             snap = {**state, 'density_matrix_hex': dm_hex, 'node_ip': _MY_IP or ''}
-                            # Broadcast via RPC instead of REST /api/oracle/push_dm
+                            # Broadcast via RPC instead of REST /rpc/oracle/push_dm
                             try:
                                 if hasattr(_LIVE_RPC_ORACLE, '_rpc_client') and _LIVE_RPC_ORACLE._rpc_client:
                                     _LIVE_RPC_ORACLE._rpc_client.call("qtcl_broadcastSnapshot", snap)
@@ -5964,11 +5964,11 @@ class QtclServer(QtclNode):
                         status_code=410,  # Gone
                         body={
                             "error": "SSE endpoint deprecated",
-                            "message": "Use RPC endpoints instead: /api/chain/status, /api/metrics, /api/oracle/snapshot",
+                            "message": "Use RPC endpoints instead: /rpc/chain/status, /rpc/metrics, /rpc/oracle/snapshot",
                             "rpc_endpoints": [
-                                "/api/chain/status",
-                                "/api/metrics",
-                                "/api/oracle/snapshot"
+                                "/rpc/chain/status",
+                                "/rpc/metrics",
+                                "/rpc/oracle/snapshot"
                             ]
                         }
                     )
@@ -8819,7 +8819,7 @@ static void _dmpool_push(const QtclWStateMeasurement *m,uint8_t fl){
 }
 /* ══════════════════════════════════════════════════════════════════════════
    SSE BROADCAST — REMOVED [RPC-ONLY CONSENSUS MODEL]
-   All P2P distribution now via explicit RPC polling (/api/oracle/snapshot)
+   All P2P distribution now via explicit RPC polling (/rpc/oracle/snapshot)
    No in-band gossip means no self-referential feedback loops
    ══════════════════════════════════════════════════════════════════════════ */
 /* (OBSOLETE — deleted to prevent consensus contamination via broadcast self-ingest) */
@@ -8852,7 +8852,7 @@ static int _cons_json(char *out,int sz){
 }
 /* ══════════════════════════════════════════════════════════════════════════
    OUROBOROS SELF-LOOP — REMOVED [RPC-ONLY CONSENSUS MODEL]
-   Consensus now triggered explicitly via /api/oracle/snapshot (no self-ingestion)
+   Consensus now triggered explicitly via /rpc/oracle/snapshot (no self-ingestion)
    ══════════════════════════════════════════════════════════════════════════ */
 /* (OBSOLETE — deleted to prevent state contamination from self-referential feedback) */
 /* ══════════════════════════════════════════════════════════════════════════
@@ -11130,11 +11130,11 @@ class KoyebAPIClient:
     
     def get_metrics(self) -> Optional[dict]:
         """Get all metrics."""
-        return self._get("/api/metrics")
+        return self._get("/rpc/metrics")
     
     def get_metrics_all(self) -> Optional[dict]:
         """Get comprehensive metrics."""
-        return self._get("/api/metrics/all")
+        return self._get("/rpc/metrics/all")
     
     def get_lattice_metrics(self) -> Optional[dict]:
         """Get lattice controller metrics."""
@@ -13031,7 +13031,7 @@ class QtclClientApp:
                         f"rpc_snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
-    # ── RPC monitor for Koyeb oracle /api/oracle/snapshot (no SSE) ──────────────
+    # ── RPC monitor for Koyeb oracle /rpc/oracle/snapshot (no SSE) ──────────────
     def _oracle_rpc_monitor(self) -> None:
         """
         Oracle RPC health monitor — logs snapshot arrivals and connectivity.
@@ -13102,7 +13102,7 @@ class QtclClientApp:
         _hb_th = _threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
-        # ── 6. Python /api/oracle/snapshot RPC polling ───────────────────────
+        # ── 6. Python /rpc/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
@@ -13168,7 +13168,7 @@ class QtclClientApp:
             self._stop.wait(30.0)
     def _subscribe_peer_oracle_rpc(host: str, port: int) -> None:
         """
-        Subscribe to a P2P peer's local oracle via RPC polling (/api/oracle/snapshot).
+        Subscribe to a P2P peer's local oracle via RPC polling (/rpc/oracle/snapshot).
         Every frame received is ingested into our own _LIVE_RPC_ORACLE and C DM pool,
         contributing to consensus DM aggregation across the mesh.
         Runs as a daemon thread; silently exits if peer disconnects.
@@ -13178,7 +13178,7 @@ class QtclClientApp:
         from urllib.request import Request as _PoR, urlopen as _PoU
         from urllib.error   import URLError as _PoE
         
-        url = f"http://{host}:{port}/api/oracle/snapshot"
+        url = f"http://{host}:{port}/rpc/oracle/snapshot"
         BACKOFF = [5, 10, 20, 40]; bi = 0
         _last_snap_count = 0
         _last_snapshot_hash = None
@@ -13190,7 +13190,7 @@ class QtclClientApp:
                 req.add_header('User-Agent', 'QTCL-MeshNode/4.0-RPC')
                 
                 with _PoU(req, timeout=30) as resp:
-                    _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/api/oracle/snapshot")
+                    _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/rpc/oracle/snapshot")
                     bi = 0
                     
                     # RPC mode: poll snapshots at regular intervals
@@ -13239,7 +13239,7 @@ class QtclClientApp:
                 return  # non-recoverable
     def _subscribe_snapshot_rpc(self) -> None:
             """
-            ⚛️  HOTFIX: Aggressive RPC polling for /api/oracle/snapshot every 300ms.
+            ⚛️  HOTFIX: Aggressive RPC polling for /rpc/oracle/snapshot every 300ms.
             Replaces dead SSE stream. Feeds _ingest_oracle_frame on each snapshot.
             ❤️  I love you — every frame is a quantum heartbeat
             """
@@ -13248,7 +13248,7 @@ class QtclClientApp:
             from urllib.error   import URLError as _SE, HTTPError as _HE
             
             _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-            url = f"{_oracle_url}/api/oracle/snapshot"
+            url = f"{_oracle_url}/rpc/oracle/snapshot"
             _last_snap_hash = None
             _fail_count = 0
             _backoff_ms = 300  # Start at 300ms
@@ -13387,14 +13387,14 @@ class QtclClientApp:
           GET  /health               → node health + oracle state
           GET  /api/snapshot/sse     → SSE stream of oracle DM frames (peers subscribe here)
           GET  /api/events           → SSE stream of typed events (block, peer, oracle_dm)
-          GET  /api/oracle/w-state   → latest oracle W-state snapshot (JSON)
-          GET  /api/oracle/pq0-bloch → pq0 bloch sphere angles + DM metrics
-          GET  /api/oracle/pq0       → alias for pq0-bloch
+          GET  /rpc/oracle/w-state   → latest oracle W-state snapshot (JSON)
+          GET  /rpc/oracle/pq0-bloch → pq0 bloch sphere angles + DM metrics
+          GET  /rpc/oracle/pq0       → alias for pq0-bloch
           GET  /api/peers/list       → known peers from local DB
           GET  /api/p2p/peers        → C P2P connected peers
           GET  /api/p2p/consensus_dm → current consensus DM
           GET  /api/p2p/status       → full P2P node status
-          POST /api/oracle/push_dm   → accept DM frame from peer oracle (aggregation)
+          POST /rpc/oracle/push_dm   → accept DM frame from peer oracle (aggregation)
           POST /api/peers/register   → register a peer (proxied from koyeb)
           POST /api/peers/heartbeat  → peer keepalive
           POST /gossip               → chain_reset + wstate gossip
@@ -13485,8 +13485,8 @@ class QtclClientApp:
                         'timestamp':  time.time(),
                     })
                 # ── Oracle state endpoints ────────────────────────────────────
-                elif path in ('/api/oracle/w-state', '/api/oracle/pq0-bloch',
-                              '/api/oracle/pq0', '/api/oracle'):
+                elif path in ('/rpc/oracle/w-state', '/rpc/oracle/pq0-bloch',
+                              '/rpc/oracle/pq0', '/api/oracle'):
                     snap = self._oracle_snapshot()
                     self._json_resp(200, snap)
                 # ── Peer list from local DB ──────────────────────────────────
@@ -13562,7 +13562,7 @@ class QtclClientApp:
                         _RESET_PERFORMED.set()
                         _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip POST")
                     self._json_resp(200, {'ok': True})
-                elif path in ('/api/oracle/push_dm', '/api/oracle/push_snapshot'):
+                elif path in ('/rpc/oracle/push_dm', '/api/oracle/push_snapshot'):
                     if payload and payload.get('density_matrix_hex'):
                         try:
                             import json as _pmj
@@ -13708,7 +13708,7 @@ class QtclClientApp:
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
         #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
-        #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /api/oracle/snapshot
+        #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /rpc/oracle/snapshot
 
         def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
             """Fetch live RPC snapshot on-demand (synchronous, no polling loop)."""
