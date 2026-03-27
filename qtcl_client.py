@@ -1663,9 +1663,10 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getQuantumMetrics.
+        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getOracleSnapshot.
         
         Direct HTTP POST to server.py RPC endpoint.
+        Uses /rpc/oracle/snapshots which returns block_height for chain reconstruction.
         Returns empty dict on any error (fail-safe for RPC hangs).
         """
         try:
@@ -1678,13 +1679,13 @@ class LiveRPCOracleSnapshot:
                 
                 payload = json.dumps({
                     "jsonrpc": "2.0",
-                    "method": "qtcl_getQuantumMetrics",
+                    "method": "qtcl_getOracleSnapshot",
                     "params": [],
                     "id": 1
                 }).encode('utf-8')
                 
                 req = Request(
-                    f"{self.ORACLE_URL}/rpc",
+                    f"{self.ORACLE_URL}/rpc/oracle/snapshots",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -1692,21 +1693,24 @@ class LiveRPCOracleSnapshot:
                 
                 with urlopen(req, timeout=timeout_s) as resp:
                     resp_data = json.loads(resp.read().decode('utf-8'))
-                    snap = resp_data.get("result", {}) if "result" in resp_data else {}
+                    # The /rpc/oracle/snapshots returns result.snapshot for the actual snapshot data
+                    snap = resp_data.get("result", {}).get("snapshot", {}) if "result" in resp_data else {}
             else:
                 # Use requests session
                 resp = session.post(
-                    f"{self.ORACLE_URL}/rpc",
+                    f"{self.ORACLE_URL}/rpc/oracle/snapshots",
                     json={
                         "jsonrpc": "2.0",
-                        "method": "qtcl_getQuantumMetrics",
+                        "method": "qtcl_getOracleSnapshot",
                         "params": [],
                         "id": 1
                     },
                     timeout=timeout_s
                 )
                 resp.raise_for_status()
-                snap = resp.json().get("result", {}) if "result" in resp.json() else {}
+                resp_json = resp.json()
+                # Extract snapshot from result.snapshot
+                snap = resp_json.get("result", {}).get("snapshot", {}) if "result" in resp_json else {}
             
             if not isinstance(snap, dict):
                 snap = {}
