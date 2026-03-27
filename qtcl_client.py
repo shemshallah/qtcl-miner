@@ -72,7 +72,7 @@ QRNG_API_KEY_1: str = os.getenv('RANDOM_ORG_KEY',       '')   # random.org — g
 QRNG_API_KEY_2: str = os.getenv('ANU_API_KEY',          '')   # ANU QRNG   — get at: quantumnumbers.anu.edu.au
 QRNG_API_KEY_3: str = os.getenv('QRNG_API_KEY',         '')   # QBICK      — get at: qbck.io
 ENTROPY_API_KEY: str = os.getenv('ENTROPY_API_KEY',     '')   # Server entropy endpoint key (set on Koyeb: ENTROPY_API_KEY)
-ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app:8500')
+ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app')
 P2P_BOOTSTRAP_PEERS = [
     ('qtcl-blockchain.koyeb.app', 8500),
     ('qtcl-primary.koyeb.app', 8500),
@@ -1651,7 +1651,7 @@ class LiveRPCOracleSnapshot:
     ⚛️ Real-time synchronous RPC snapshot fetcher → DM + metrics on-demand.
     Uses direct HTTP POST to oracle JSON-RPC endpoint, no SSE, no polling loops.
     """
-    ORACLE_URL = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app:8500')
+    ORACLE_URL = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
     
     def __init__(self):
         self._dm_re = [0.0] * 64
@@ -2068,7 +2068,7 @@ class QtclP2PNode:
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app:8500')
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
         _connected_this_cycle: set = set()
         def _connect_peer(host, port):
@@ -7302,7 +7302,7 @@ try:
 except ImportError:
     import Queue as _queue  # type: ignore
 _EXP_LOG = _logging.getLogger("qtcl.client.expansion")
-_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app:8500")
+_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
 _QTCL_C_SRC: str = r"""
 /* ═══════════════════════════════════════════════════════════════════════════════
    QTCL Acceleration Layer v2.0  —  Single Translation Unit
@@ -13254,7 +13254,7 @@ class QtclClientApp:
             from urllib.request import Request as _SR, urlopen as _SO
             from urllib.error   import URLError as _SE, HTTPError as _HE
             
-            _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app:8500')
+            _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
             url = f"{_oracle_url}/api/oracle/snapshot"
             _last_snap_hash = None
             _fail_count = 0
@@ -13327,7 +13327,7 @@ class QtclClientApp:
         import time as _ke, ssl as _kssl, json as _kj
         from urllib.request import Request as _KR, urlopen as _KO
         
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app:8500')
+        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
         _last_peers = set()
         _fail_count = 0
         
