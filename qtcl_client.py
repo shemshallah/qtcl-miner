@@ -1670,68 +1670,56 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getOracleSnapshot.
-        
-        Direct HTTP POST to server.py RPC endpoint.
-        Uses /rpc/oracle/snapshots without port to let Koyeb handle routing.
-        Returns empty dict on any error (fail-safe for RPC hangs).
+        """
+        Synchronous fetch via HTTP POST (simulates curl -X POST).
+        Extracts snapshot data and block_height from the JSON-RPC response.
         """
         try:
-            # Clean URL: ensure no port is specified to let Koyeb handle SSL/Routing
-            base_url = self.ORACLE_URL.split(':', 1)[0]
-            if '://' in base_url and ':' in base_url.split('://', 1)[1]:
-                # has port, remove it
-                scheme, rest = base_url.split('://', 1)
-                host = rest.split(':', 1)[0]
+            # 1. Clean URL (Remove port if present to use Koyeb's standard ingress)
+            url = self.ORACLE_URL
+            if '://' in url:
+                scheme, rest = url.split('://', 1)
+                host = rest.split('/', 1)[0].split(':', 1)[0]
                 url = f"{scheme}://{host}"
-            else:
-                url = self.ORACLE_URL
+            
+            # 2. Prepare payload
+            import json
+            payload = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "qtcl_getOracleSnapshot",
+                "params": [],
+                "id": 1
+            }).encode('utf-8')
 
-            session = self._get_session()
-            if not session:
-                # Fallback: urllib
-                import json
-                from urllib.request import Request, urlopen
+            # 3. Execute request (Pure urllib - zero dependency, identical to curl)
+            from urllib.request import Request, urlopen
+            req = Request(
+                f"{url}/rpc/oracle/snapshots",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            
+            with urlopen(req, timeout=timeout_s) as resp:
+                raw_data = resp.read().decode('utf-8')
+                resp_json = json.loads(raw_data)
                 
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_getOracleSnapshot",
-                    "params": [],
-                    "id": 1
-                }).encode('utf-8')
+                # 4. Extract data from the result container
+                # Structure: {"result": {"snapshot": {...}, "block_height": X}}
+                res = resp_json.get("result", {})
+                if not isinstance(res, dict):
+                    return {}
                 
-                req = Request(
-                    f"{url}/rpc/oracle/snapshots",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                
-                with urlopen(req, timeout=timeout_s) as resp:
-                    resp_data = json.loads(resp.read().decode('utf-8'))
-                    snap_container = resp_data.get("result", {})
-                    snap = snap_container.get("snapshot", {}) if isinstance(snap_container, dict) else {}
-                    # Inject height into snap for easier extraction
-                    if isinstance(snap, dict) and isinstance(snap_container, dict):
-                        snap['block_height'] = snap_container.get('block_height', 0)
-            else:
-                # Use requests session
-                resp = session.post(
-                    f"{url}/rpc/oracle/snapshots",
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "qtcl_getOracleSnapshot",
-                        "params": [],
-                        "id": 1
-                    },
-                    timeout=timeout_s
-                )
-                resp.raise_for_status()
-                resp_json = resp.json()
-                snap_container = resp_json.get("result", {})
-                snap = snap_container.get("snapshot", {}) if isinstance(snap_container, dict) else {}
-                if isinstance(snap, dict) and isinstance(snap_container, dict):
-                    snap['block_height'] = snap_container.get('block_height', 0)
+                snap = res.get("snapshot", {})
+                if isinstance(snap, dict):
+                    # Ensure block_height is available in the top-level snap for the miner
+                    snap['block_height'] = res.get('block_height', 0)
+                    return snap
+            
+            return {}
+        except Exception as e:
+            # Fallback logging (silent in production, debug in dev)
+            return {}
             
             if not isinstance(snap, dict):
                 snap = {}
