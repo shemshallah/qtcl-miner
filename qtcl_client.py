@@ -6320,7 +6320,6 @@ class QtclMiner(QtclNode):
     def _mining_loop(self) -> None:
         difficulty = float(self._cfg.get("difficulty", 5.25))
         snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        import urllib.request
         
         # ── INITIAL SYNC: Ensure we have the latest chain tip before starting ──
         logger.info("[MINING] 🔄 Synchronizing with server tip before mining...")
@@ -6344,10 +6343,12 @@ class QtclMiner(QtclNode):
                     logger.warning("[MINING] ⚡ genesis-reset signal — restarting from h=0")
                     self._stop_event.wait(0.5)
                     continue
+
                 # ── Server chain-tip probe: detect server-side genesis wipe ──────
                 try:
-                    # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC instead of REST /api/chain/tip
-                    tip = self._rpc("qtcl_getBlockHeight", [])
+                    # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC
+                    kapi = KoyebAPIClient(server_url=self._server_url)
+                    tip = kapi._rpc("qtcl_getBlockHeight", [])
                     if isinstance(tip, dict):
                         _srv_h = int(tip.get('height') or 0)
                     else:
@@ -6370,7 +6371,6 @@ class QtclMiner(QtclNode):
                 
                 # If no blocks, we must mine genesis or wait for sync
                 if not latest_block:
-                    # Check if we should mine genesis (height 0)
                     logger.info("[MINING] 🐣 No blocks found — mining genesis...")
                     prev_hash = "0" * 64
                     height = 0
@@ -6392,11 +6392,11 @@ class QtclMiner(QtclNode):
                     except Exception as exc:
                         self.log.warning(f"[{self.name}] quantum evo failed: {exc}")
                 
-                block = {
+                block_template = {
                     "height": height,
                     "prev_hash": prev_hash,
                     "merkle_root": merkle_root,
-                    "timestamp": time.time(),
+                    "timestamp": int(time.time()),
                     "difficulty": difficulty,
                     "miner_id": self._miner_id,
                     "tx_count": len(pending_txs),
@@ -6404,63 +6404,66 @@ class QtclMiner(QtclNode):
                     "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
                 }
                 
-                # Update telemetry before PoW
-                _MINE_TELEM.update_progress(height, int(difficulty), 0, prev_hash)
-                
                 # ── PROOF OF WORK ────────────────────────────────────────────────
-                # This loop satisfies the "tearing through nonces" requirement
-                # We do it in small batches to allow telemetry updates
                 nonce = 0
-                batch_size = 5000 # Do 5k hashes between progress updates
+                batch_size = 25000 # Increased batch size for performance
                 solved = False
                 block_hash = ""
                 
+                # Start mining this block
+                logger.info(f"[MINING] ⛏️ Starting h={height} | diff={difficulty} | parent={prev_hash[:16]}...")
+                _MINE_TELEM.update_progress(height, int(difficulty), 0, prev_hash)
+                
                 while not solved and not self._stop_event.is_set():
                     # Check for chain updates every batch
-                    if nonce % batch_size == 0 and nonce > 0:
+                    if nonce > 0 and nonce % batch_size == 0:
                         # Check if someone else mined this block
-                        remote_tip = self._rpc("qtcl_getBlockHeight", [])
+                        kapi = KoyebAPIClient(server_url=self._server_url)
+                        remote_tip = kapi._rpc("qtcl_getBlockHeight", [])
                         if isinstance(remote_tip, dict) and int(remote_tip.get('height', -1)) >= height:
                             logger.info(f"[MINING] 📢 Height {height} already mined by someone else, skipping...")
                             break
                         
                         _MINE_TELEM.update_progress(height, int(difficulty), nonce, prev_hash)
                     
-                    # Proof of work calculation
-                    block["nonce"] = nonce
-                    h = HASH_ENGINE.compute_block_hash(block)
-                    
-                    # Check difficulty
-                    whole = int(difficulty)
-                    frac = difficulty - whole
-                    prefix = "0" * whole
-                    
-                    if h.startswith(prefix):
-                        if frac < 0.001:
-                            solved = True
-                            block_hash = h
-                        else:
-                            nibble_threshold = int(round(frac * 16))
-                            next_nibble = int(h[whole], 16) if len(h) > whole else 0
-                            if next_nibble < nibble_threshold:
+                    # Core PoW Inner Loop - satisfy "tearing through nonces"
+                    # We do a mini-batch inside for even more speed
+                    for _ in range(100):
+                        block_template["nonce"] = nonce
+                        h = HASH_ENGINE.compute_block_hash(block_template)
+                        
+                        # Check difficulty
+                        whole = int(difficulty)
+                        frac = difficulty - whole
+                        prefix = "0" * whole
+                        
+                        if h.startswith(prefix):
+                            if frac < 0.001:
                                 solved = True
                                 block_hash = h
-                    
-                    if not solved:
+                                break
+                            else:
+                                nibble_threshold = int(round(frac * 16))
+                                next_nibble = int(h[whole], 16) if len(h) > whole else 0
+                                if next_nibble < nibble_threshold:
+                                    solved = True
+                                    block_hash = h
+                                    break
                         nonce += 1
                 
                 if not solved:
-                    continue # Skip to next loop iteration (likely chain update)
+                    continue 
 
-                block["nonce"] = nonce
-                block["hash"] = block_hash
-                _MINE_TELEM.record_block(block)
+                block_template["nonce"] = nonce
+                block_template["hash"] = block_hash
+                _MINE_TELEM.record_block(block_template)
                 
                 logger.info(f"[MINING] 🏆 Block {height} solved! Hash: {block_hash[:16]}... Nonce: {nonce}")
                 
-                self.db.insert_block(block)
+                self.db.insert_block(block_template)
                 self.db.increment_miner_blocks(self._miner_id)
                 
+                # Store quantum state
                 if self.quantum_evo and HAS_NUMPY:
                     sv = self.quantum_evo.get_state()
                     if sv is not None:
@@ -6479,11 +6482,11 @@ class QtclMiner(QtclNode):
                 _MINE_TELEM.mark_submitting()
                 # ── SUBMIT VIA RPC ───────────────────────────────────────────────
                 try:
-                    # 🔄 RPC-ONLY: Use qtcl_submitBlock RPC
-                    res = self._rpc("qtcl_submitBlock", [block])
+                    kapi = KoyebAPIClient(server_url=self._server_url)
+                    res = kapi._rpc("qtcl_submitBlock", [block_template])
                     if res and (res.get("status") == "accepted" or res.get("success")):
                         logger.info(f"[MINING] ✅ Block {height} accepted by server")
-                        _MINE_TELEM.record_submission(height, 50.0) # Assume 50 QTCL reward
+                        _MINE_TELEM.record_submission(height, 50.0)
                     else:
                         logger.warning(f"[MINING] ❌ Block {height} rejected: {res}")
                 except Exception as sub_err:
@@ -6492,15 +6495,9 @@ class QtclMiner(QtclNode):
                 if height > 0 and height % snap_interval == 0:
                     try:
                         snap = self.snapshot_mgr.create_snapshot(height)
-                        # Use RPC for snapshot push if possible, or leave as REST if required
-                        # self.broadcaster.push_snapshot_to_server(self._server_url, snap)
                     except Exception as exc:
-                        self.log.warning(f"[{self.name}] snapshot push failed: {exc}")
+                        self.log.warning(f"[{self.name}] snapshot failed: {exc}")
                 
-                self.log.info(
-                    f"[{self.name}] mined block {height} "
-                    f"hash={block_hash[:12]}… nonce={nonce}"
-                )
                 self._stop_event.wait(0.1)
             except Exception as exc:
                 self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
