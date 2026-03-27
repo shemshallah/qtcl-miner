@@ -13618,8 +13618,7 @@ class QtclClientApp:
                     if ev == 'chain_reset' and int(payload.get('new_height', -1)) == 0:
                         _RESET_PERFORMED.set()
                         _EXP_LOG.warning("[HTTP-8500] ⚡ chain_reset via /gossip POST")
-                                f"[HTTP-8500] oracle DM ingested from peer "
-                            _EXP_LOG.debug(f"[HTTP-8500] push_dm ingest: {_pe}")
+                    _EXP_LOG.debug(f"[HTTP-8500] push_dm ingest")
                     peer_port = int(payload.get('port') or 8500)
                     if peer_id and peer_ip not in ('', '127.0.0.1', 'localhost'):
                         import sqlite3 as _prq
