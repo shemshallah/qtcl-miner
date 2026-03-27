@@ -14049,7 +14049,7 @@ class QtclClientApp:
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
-            Gate on oracle DM arrival via direct REST API polling.
+            Gate on oracle DM arrival via direct RPC polling.
             Returns True if DM available. False = degraded mode, mining continues.
             """
             deadline = time.time() + timeout_s
@@ -14058,9 +14058,15 @@ class QtclClientApp:
             while time.time() < deadline:
                 try:
                     snap = kapi.get_oracle_pq0_bloch()
-                    if snap and snap.get('cycle', 0) > 0:
-                        print(f" ✅ (REST)  cycle={snap.get('cycle', 0)}", flush=True)
-                        return True
+                    if snap:
+                        lattice = snap.get('lattice', {})
+                        cycle = lattice.get('cycle', 0)
+                        w_state = snap.get('w_state', {})
+                        fidelity = w_state.get('fidelity', 0.0)
+                        dm_hex = snap.get('density_matrix_hex', '')
+                        if cycle > 0 or (fidelity > 0) or (dm_hex and len(dm_hex) > 32):
+                            print(f" ✅ (RPC)  cycle={cycle} fid={fidelity:.4f}", flush=True)
+                            return True
                 except Exception as e:
                     _EXP_LOG.debug(f"[DM-WAIT] {e}")
                 print('.', end='', flush=True)
