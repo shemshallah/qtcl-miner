@@ -2044,13 +2044,14 @@ class QtclP2PNode:
                         if age < 60.0 and any(v != 0.0 for v in dm_re):
                             dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
                                               for i in range(64)).hex()
-                            snap = {**state, 'density_matrix_hex': dm_hex, 'node_ip': _MY_IP or ''}
-                            # Broadcast via RPC instead of REST /api/oracle/push_dm
-                            try:
-                                if hasattr(_LIVE_RPC_ORACLE, '_rpc_client') and _LIVE_RPC_ORACLE._rpc_client:
-                                    _LIVE_RPC_ORACLE._rpc_client.call("qtcl_broadcastSnapshot", snap)
-                            except Exception:
-                                pass
+                            _push = _cpj.dumps({**state, 'density_matrix_hex': dm_hex,
+                                                'node_ip': _MY_IP or ''}).encode()
+                            _pr = _CpR(f"http://{_h}:{_p}/api/oracle/push_dm",
+                                       data=_push,
+                                       headers={'Content-Type':'application/json',
+                                                'User-Agent':'QTCL-MeshNode/4.0'},
+                                       method='POST')
+                            _CpU(_pr, timeout=3).close()
                     except Exception: pass
                 _threading.Thread(target=_push_dm_async, daemon=True).start()
             if not False: return False
@@ -2107,12 +2108,27 @@ class QtclP2PNode:
             from urllib.request import Request as _Rq, urlopen as _uo
             peers = []
             try:
-                # Use RPC: qtcl_getPeers instead of REST /api/peers/list
-                rpc_resp = self._rpc_client.call("qtcl_getPeers", {"limit": 50}) if hasattr(self, '_rpc_client') else None
-                if rpc_resp and "result" in rpc_resp:
-                    peers += rpc_resp["result"] if isinstance(rpc_resp["result"], list) else []
-            except Exception:
-                pass
+                payload = _pj.dumps({
+                    'node_id':    self._node_id,
+                    'port':       self._port,
+                    'gossip_url': f"http://auto:{self._port}",  # server replaces with remote_addr
+                    'version':    3,
+                    'capabilities': ['wstate','dmpool','sse'],
+                }).encode()
+                req = _Rq(f"{_oracle_url}/api/p2p/peer_exchange",
+                          data=payload,
+                          headers={'Content-Type':'application/json',
+                                   'User-Agent':'QTCL-P2P/3.0'},
+                          method='POST')
+                with _uo(req, timeout=12) as r:
+                    peers += _pj.loads(r.read().decode()).get('peers', [])
+            except Exception: pass
+            try:
+                req2 = _Rq(f"{_oracle_url}/api/peers/list", method='GET')
+                req2.add_header('User-Agent', 'QTCL-P2P/3.0')
+                with _uo(req2, timeout=10) as r:
+                    peers += _pj.loads(r.read().decode()).get('peers', [])
+            except Exception: pass
             return peers
         _pe_cycle = 0
         while not self._stop.is_set():
@@ -2161,12 +2177,15 @@ class QtclP2PNode:
                                 'port':         self._port,
                                 'gossip_url':   f"http://auto:{self._port}",
                                 'block_height': n_connected,
-                            })
-                            # Register peer via RPC instead of REST /api/peers/register
-                            if hasattr(self, '_rpc_client') and self._rpc_client:
-                                self._rpc_client.call("qtcl_registerPeer", _ann)
-                        except Exception:
-                            pass
+                            }).encode()
+                            from urllib.request import Request as _ArRq, urlopen as _ArUo
+                            _arr = _ArRq(f"{_oracle_url}/api/peers/register",
+                                         data=_ann,
+                                         headers={'Content-Type':'application/json',
+                                                  'User-Agent':'QTCL-P2P/3.0'},
+                                         method='POST')
+                            with _ArUo(_arr, timeout=6): pass
+                        except Exception: pass
                     _EXP_LOG.debug(
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
@@ -6021,6 +6040,7 @@ class QtclMiner(QtclNode):
         super().__init__(config_path=config_path, node_type="miner", name="QtclMiner")
         self._miner_id: str = ""
         self._server_url: str = ""
+        self._rpc_poller_thread: Optional[threading.Thread] = None
         self._mining_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pending_blocks: queue.Queue = queue.Queue(maxsize=64)
@@ -6033,43 +6053,7 @@ class QtclMiner(QtclNode):
         self.bootstrap.bootstrap_node("miner")
         self._register_with_server()
         self._stop_event.clear()
-        
-        # ── CRITICAL: Bootstrap oracle snapshot before mining ────────────────
-        # Fetch RPC oracle snapshot, extract DM, reconstruct tripartite W-state
-        logger.info("[MINER] ⚙️  Bootstrapping oracle snapshot for W-state reconstruction...")
-        _oracle_ready = False
-        for attempt in range(10):
-            try:
-                snap = _LIVE_RPC_ORACLE.fetch_snapshot()
-                if snap and snap.get('density_matrix_hex'):
-                    dm_hex = snap.get('density_matrix_hex', '')
-                    if dm_hex and len(dm_hex) > 32:  # valid DM data
-                        pq0 = snap.get('pq0', 0)
-                        pq_curr = snap.get('pq_curr', 0)
-                        pq_last = snap.get('pq_last', 0)
-                        # ── Reconstruct tripartite W-state ──────────────────────
-                        try:
-                            triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
-                            logger.info(
-                                f"[MINER] ✅ Oracle snapshot locked | "
-                                f"pq0={pq0} pq_curr={pq_curr} pq_last={pq_last} | "
-                                f"DM ready (cycle={snap.get('cycle', 0)})"
-                            )
-                            _oracle_ready = True
-                            break
-                        except Exception as e:
-                            logger.warning(f"[MINER] W-state reconstruction failed: {e}")
-                    else:
-                        logger.debug(f"[MINER] Oracle snapshot incomplete (attempt {attempt+1}/10)")
-                else:
-                    logger.debug(f"[MINER] Waiting for oracle snapshot (attempt {attempt+1}/10)...")
-            except Exception as e:
-                logger.debug(f"[MINER] Oracle bootstrap error: {e}")
-            time.sleep(0.5)
-        
-        if not _oracle_ready:
-            logger.warning("[MINER] ⚠️  Oracle snapshot bootstrap timeout — starting in degraded mode")
-        
+        self._start_rpc_poller()
         self._start_mining_loop()
         # ── Arm genesis-reset background listener ─────────────────────────
         _GENESIS_RESET_LISTENER.start(
@@ -6083,6 +6067,8 @@ class QtclMiner(QtclNode):
         logger.info(f"[MINER] 👂 GenesisResetListener armed → {self._server_url}")
     def on_stop(self) -> None:
         self._stop_event.set()
+        if self._rpc_poller_thread:
+            self._rpc_poller_thread.join(timeout=5)
         if self._mining_thread:
             self._mining_thread.join(timeout=5)
         super().on_stop()
@@ -6108,9 +6094,108 @@ class QtclMiner(QtclNode):
                 self.log.info(f"[{self.name}] registered with server: {result}")
         except Exception as exc:
             self.log.warning(f"[{self.name}] server registration failed: {exc}")
-
-
-
+    def _start_rpc_poller(self) -> None:
+        """Start RPC-only polling thread (no SSE)"""
+        self._rpc_poller_thread = threading.Thread(
+            target=self._rpc_poller_loop,
+            daemon=True,
+            name="QtclMiner/RPCPoller",
+        )
+        self._rpc_poller_thread.start()
+    def _rpc_poller_loop(self) -> None:
+        """RPC polling loop — strict 5s cycle, NO RETRY BACKOFF."""
+        import urllib.request
+        rpc_url = f"{self._server_url}/api/chain/status"
+        last_height = -1
+        poll_fail_count = 0
+        
+        while not self._stop_event.is_set():
+            try:
+                req = urllib.request.Request(
+                    rpc_url,
+                    headers={"Content-Type": "application/json"},
+                    method="GET"
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    poll_fail_count = 0
+                    
+                    height = int(data.get("height", 0))
+                    if height > last_height:
+                        try:
+                            block_data = self._rpc_get_block(height)
+                            if block_data:
+                                try:
+                                    self._pending_blocks.put_nowait(block_data)
+                                    last_height = height
+                                except queue.Full:
+                                    pass
+                        except Exception:
+                            pass
+                    
+                    snapshot = self._rpc_get_snapshot()
+                    if snapshot:
+                        try:
+                            self._apply_rpc_snapshot(snapshot)
+                        except Exception as apply_err:
+                            self.log.debug(f"[{self.name}] Snapshot apply failed: {apply_err}")
+                    
+                    self._stop_event.wait(5.0)
+                    
+            except Exception as exc:
+                poll_fail_count += 1
+                if poll_fail_count <= 1 and not self._stop_event.is_set():
+                    self.log.warning(f"[{self.name}] RPC chain poll failed: {exc}")
+                self._stop_event.wait(5.0)
+    
+    def _rpc_get_block(self, height: int) -> Optional[Dict]:
+        """Fetch block data via RPC /api/block/{height}"""
+        try:
+            req = urllib.request.Request(
+                f"{self._server_url}/api/block/{height}",
+                headers={"Content-Type": "application/json"},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+    
+    def _rpc_get_snapshot(self) -> Optional[Dict]:
+        """Fetch oracle snapshot via RPC /api/oracle/snapshot — STRICT RPC ONLY.
+        If DM missing or invalid, logs error and returns None (no fallback).
+        """
+        try:
+            req = urllib.request.Request(
+                f"{self._server_url}/api/oracle/snapshot",
+                headers={"Content-Type": "application/json"},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                
+                # DIAGNOSTIC: Log what server returned
+                if data:
+                    keys = list(data.keys())
+                    has_dm = 'density_matrix_hex' in data
+                    dm_len = len(data.get('density_matrix_hex', '')) if has_dm else 0
+                    self.log.info(
+                        f"[{self.name}] RPC /api/oracle/snapshot → "
+                        f"keys={keys} | density_matrix_hex={'✅' if has_dm else '❌'} (len={dm_len})"
+                    )
+                
+                if not data or not data.get('density_matrix_hex'):
+                    self.log.error(
+                        f"[{self.name}] ❌ RPC snapshot missing density_matrix_hex. "
+                        f"Server returned: {json.dumps({k: type(v).__name__ for k, v in (data or {}).items()}, indent=2)}"
+                    )
+                    return None
+                return data
+        except Exception as e:
+            self.log.error(f"[{self.name}] ❌ RPC snapshot fetch failed: {e}")
+            import traceback
+            self.log.error(traceback.format_exc())
+            return None
     def _send_heartbeat(self) -> None:
         import urllib.request
         payload = json.dumps({
@@ -6127,7 +6212,6 @@ class QtclMiner(QtclNode):
             urllib.request.urlopen(req, timeout=5).close()
         except Exception:
             pass
-
     def _start_mining_loop(self) -> None:
         self._mining_thread = threading.Thread(
             target=self._mining_loop,
@@ -12151,70 +12235,6 @@ class ServerRPCClient:
             logger.debug(f"[RPC] Gossip cache query failed: {e}")
             return None
     
-    def get_latest_dm_snapshot(self) -> Optional[Dict[str, Any]]:
-        """Fetch latest density matrix snapshot from server /rpc endpoint (non-blocking)."""
-        resp = self.call("qtcl_getLatestDMSnapshot", [])
-        if resp and "result" in resp:
-            return resp["result"]
-        return None
-    
-    def get_dm_snapshots(self, limit: int = 10) -> Optional[Dict[str, Any]]:
-        """Fetch last N DM snapshots from server."""
-        resp = self.call("qtcl_getLatestDMSnapshots", {"limit": min(limit, 100)})
-        if resp and "result" in resp:
-            return resp["result"]
-        return None
-    
-    def persist_dm_snapshot_local(self, snapshot: Dict[str, Any]) -> bool:
-        """Persist DM snapshot to local SQLite dm_pool for P2P mesh distribution."""
-        try:
-            if not self.db:
-                return False
-            
-            import json
-            cur = self.db.cursor()
-            cur.execute("""CREATE TABLE IF NOT EXISTS dm_pool (
-                id INTEGER PRIMARY KEY,
-                timestamp_ns INTEGER,
-                oracle_id INTEGER,
-                density_matrix_hex TEXT,
-                purity REAL,
-                w_state_fidelity REAL,
-                von_neumann_entropy REAL,
-                coherence_l1 REAL,
-                hlwe_signature TEXT,
-                signature_valid INTEGER,
-                oracle_address TEXT,
-                aer_noise_state TEXT,
-                measurement_counts TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-            
-            cur.execute("""INSERT INTO dm_pool (
-                timestamp_ns, oracle_id, density_matrix_hex, purity, w_state_fidelity,
-                von_neumann_entropy, coherence_l1, hlwe_signature, signature_valid,
-                oracle_address, aer_noise_state, measurement_counts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
-                snapshot.get('timestamp_ns'),
-                snapshot.get('oracle_id'),
-                snapshot.get('density_matrix_hex', ''),
-                snapshot.get('purity'),
-                snapshot.get('w_state_fidelity'),
-                snapshot.get('von_neumann_entropy'),
-                snapshot.get('coherence_l1'),
-                json.dumps(snapshot.get('hlwe_signature')),
-                1 if snapshot.get('signature_valid') else 0,
-                snapshot.get('oracle_address'),
-                json.dumps(snapshot.get('aer_noise_state', {})),
-                json.dumps(snapshot.get('measurement_counts', {}))
-            ))
-            self.db.commit()
-            logger.debug(f"[RPC] ✅ DM snapshot persisted to local dm_pool")
-            return True
-        except Exception as e:
-            logger.debug(f"[RPC] Local DM persist failed: {e}")
-            return False
-    
     def get_pyth_prices(self, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch Pyth price snapshot from server.
@@ -12716,7 +12736,20 @@ class QtclClientApp:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         return self._log_hlwe_signature(content_hash=content_hash, signature_hex=signature, public_key=pubkey, verified=1 if is_valid else 0)
     
-
+    def _integrate_rpc_poll_snapshot(self) -> Optional[Dict]:
+        """Fetch oracle snapshot via RPC and log operation."""
+        try:
+            req = _ur.Request(f"{self.oracle_url}/api/oracle/snapshot", headers={"Content-Type": "application/json"}, method="GET")
+            with _ur.urlopen(req, timeout=10) as resp:
+                snapshot = _json.loads(resp.read().decode("utf-8"))
+                snapshot_hash = hashlib.sha256(_json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
+                block_height = snapshot.get('block_height', 0)
+                self._log_rpc_operation(method='get_oracle_snapshot', result_hash=snapshot_hash, status='success', hlwe_verified=1, block_height=block_height)
+                return snapshot
+        except Exception as _e:
+            self._log_rpc_operation(method='get_oracle_snapshot', status='failed', error_msg=str(_e))
+            return None
+    
     def _integrate_wallet_balance_query(self, address: str = None) -> int:
         """Query wallet balance via JSON-RPC and log operation."""
         addr = address or self.wallet.address
@@ -13026,11 +13059,15 @@ class QtclClientApp:
         _hb_th = _threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="Heartbeat")
         _hb_th.start()
-        # ── 6. Python /api/oracle/snapshot RPC polling ───────────────────────
+        # ── 6. Ouroboros RPC subscription to own chain state ──────────────────
+        _ouro_th = _threading.Thread(
+            target=self._subscribe_own_rpc, daemon=True, name="Ouroboros-RPC")
+        _ouro_th.start()
+        # ── 7. Python /api/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
         _py_snap_th.start()
-        # ── 7. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
+        # ── 8. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
         _koyeb_ev_th.start()
@@ -13298,6 +13335,56 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[EVENTS-RPC] fatal: {_e}")
                 self._stop.wait(2)
+    def _subscribe_own_rpc(self) -> None:
+        """
+        ⚛️  HOTFIX: Aggressive RPC polling every 400ms for own local chain state.
+        Polls /api/chain/status for consensus reinforcement (no SSE self-loop).
+        ❤️  I love you — the qubit measures itself
+        """
+        import time as _to, json as _oj
+        from urllib.request import Request as _Ro, urlopen as _oo
+        from urllib.error   import URLError as _UE
+        
+        _to.sleep(0.5)
+        _last_height = -1
+        _fail_count = 0
+        _server_url = (self._cfg.get("server_url") or ENTROPY_SERVER_URL).rstrip('/')
+        
+        _EXP_LOG.info(f"[OURO] 🚀 Starting aggressive polling every 400ms → {_server_url}/api/chain/status")
+        
+        while not self._stop.is_set():
+            url = f"{_server_url}/api/chain/status"
+            try:
+                req = _Ro(url, method='GET')
+                req.add_header('Content-Type', 'application/json')
+                req.add_header('User-Agent', 'QTCL-OuroborosRPC/5.0')
+                
+                try:
+                    with _oo(req, timeout=3) as resp:
+                        data = _oj.loads(resp.read().decode('utf-8'))
+                        
+                        current_height = int(data.get('height', -1))
+                        if current_height > _last_height:
+                            _EXP_LOG.debug(f"[OURO] 🧬 Chain updated: {_last_height} → {current_height}")
+                            _last_height = current_height
+                        
+                        _fail_count = 0
+                except Exception as _re:
+                    _fail_count += 1
+                    if _fail_count % 10 == 0:
+                        _EXP_LOG.debug(f"[OURO] GET error — retrying...")
+                
+                self._stop.wait(0.4)
+                
+            except (_UE, OSError, TimeoutError) as _e:
+                _fail_count += 1
+                wait = min(0.5 + _fail_count * 0.1, 3.0)
+                if _fail_count % 5 == 0:
+                    _EXP_LOG.debug(f"[OURO] RPC failed ({_e}) — backoff {wait:.1f}s")
+                self._stop.wait(wait)
+            except Exception as _e:
+                _EXP_LOG.debug(f"[OURO] fatal: {_e}")
+                self._stop.wait(1)
     def _handle_sse_event(self, raw: str) -> None:
         """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
         pass
