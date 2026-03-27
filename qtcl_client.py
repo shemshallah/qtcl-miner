@@ -10884,10 +10884,13 @@ class KoyebAPIClient:
           height, block_height, tip_hash, block_hash, hash, ts
         """
         r = self._rpc("qtcl_getBlockHeight", [])
+        _EXP_LOG.debug(f"[get_chain_tip] raw response: {r}")
         if not isinstance(r, dict):
+            _EXP_LOG.debug(f"[get_chain_tip] returning None - not a dict")
             return None
         h = int(r.get("height", 0))
         th = str(r.get("tip_hash", "0" * 64))
+        _EXP_LOG.debug(f"[get_chain_tip] height={h}, tip_hash={th[:32]}…")
         return {
             "height":       h,
             "block_height": h,
@@ -10899,8 +10902,14 @@ class KoyebAPIClient:
     def get_block_height(self) -> Optional[int]:
         """Get current block height via JSON-RPC."""
         tip = self._rpc("qtcl_getBlockHeight", [])
+        _EXP_LOG.debug(f"[get_block_height] raw response: {tip}")
         if isinstance(tip, int):
             return tip
+        if isinstance(tip, dict):
+            h = tip.get("height") or tip.get("block_height")
+            _EXP_LOG.debug(f"[get_block_height] extracted height: {h}")
+            return h
+        _EXP_LOG.debug(f"[get_block_height] returning None - unexpected type")
         return None
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
         """Get oracle quantum metrics via JSON-RPC."""
@@ -10959,9 +10968,13 @@ class KoyebAPIClient:
         return GKSLBathParams.from_snap(snap) if snap else CANONICAL_BATH
     def get_balance(self, address: str) -> Optional[float]:
         """Pure JSON-RPC 2.0 balance query — calls qtcl_getBalance on server."""
+        _EXP_LOG.debug(f"[get_balance] requesting balance for {address[:24]}…")
         result = self._rpc("qtcl_getBalance", [address])
+        _EXP_LOG.debug(f"[get_balance] raw response: {result}")
         if isinstance(result, dict) and "balance" in result:
+            _EXP_LOG.debug(f"[get_balance] returning: {result['balance']}")
             return float(result["balance"])
+        _EXP_LOG.debug(f"[get_balance] returning None - no balance in result")
         return None
     def get_address_history(self, address: str, limit: int = 50) -> list:
         # 🔄 RPC-ONLY: Use qtcl_getEvents with address filter instead of REST
