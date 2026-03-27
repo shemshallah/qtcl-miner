@@ -13830,8 +13830,12 @@ class QtclClientApp:
                 'w_state_fidelity': _fid,
                 'dm_hex':          _dm_hex,
             }
+            if _dm_hex:
+                _dm_status = f"✅ Oracle DM acquired  fidelity={_fid:.4f}"
+            else:
+                _dm_status = f"⚠️  Oracle DM unavailable (using entropy fallback)  fidelity={_fid:.4f}"
             _report = (
-                f"  ✅ Oracle DM acquired  fidelity={_fid:.4f}\n"
+                f"  {_dm_status}\n"
                 f"  ⛏️  Mining at height {_bh}  "
                 f"pq_curr={_pqc}  pq_last={_pql}"
             )
@@ -13894,52 +13898,9 @@ class QtclClientApp:
             - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
-            import urllib.request as _ur, urllib.error as _ure
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
-            
-            # ══════════════════════════════════════════════════════════════════════
-            # DIRECT RPC CLIENT (pure urllib, no requests library, no fallbacks)
-            # ══════════════════════════════════════════════════════════════════════
-            class _DirectRPC:
-                def __init__(self, base_url):
-                    self.base_url = base_url.rstrip('/')
-                    self.timeout = 10
-                
-                def _call(self, method: str, params: list = None) -> dict:
-                    url = f"{self.base_url}/rpc"
-                    payload = {'jsonrpc': '2.0', 'method': method, 'params': params or [], 'id': 1}
-                    body = _j.dumps(payload).encode('utf-8')
-                    req = _ur.Request(url, data=body, headers={'Content-Type': 'application/json'}, method='POST')
-                    with _ur.urlopen(req, timeout=self.timeout) as resp:
-                        return _j.loads(resp.read().decode('utf-8'))
-                
-                def get_block_height(self) -> tuple:
-                    result = self._call('qtcl_getBlockHeight', [])
-                    if 'result' in result:
-                        r = result['result']
-                        h = int(r.get('height', 0))
-                        th = str(r.get('tip_hash', '0' * 64))
-                        return (h, th)
-                    raise RuntimeError(f"RPC error: {result.get('error', result)}")
-                
-                def get_block(self, height: int) -> dict:
-                    result = self._call('qtcl_getBlock', [height])
-                    if 'result' in result:
-                        return result['result']
-                    raise RuntimeError(f"RPC error: {result.get('error', result)}")
-                
-                def get_mempool(self) -> list:
-                    try:
-                        result = self._call('qtcl_getMempool', [])
-                        if 'result' in result:
-                            return result['result'] if isinstance(result['result'], list) else []
-                    except Exception:
-                        pass
-                    return []
-            
-            _direct_rpc = _DirectRPC(ENTROPY_SERVER_URL)
             
             # ══════════════════════════════════════════════════════════════════════
             # SUBMISSION PIPELINE — Single RPC Path, Exponential Backoff
@@ -14055,66 +14016,71 @@ class QtclClientApp:
             while True:  # Main mining loop (restart on chain advance)
                 try:
                     # ──────────────────────────────────────────────────────────────
-                    # STAGE 1: Get chain tip via DIRECT RPC (2-call atomic fetch)
+                    # STAGE 1: Get chain tip via direct JSON-RPC (2 calls: height + block)
                     # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.debug("[MINER] STAGE 1: Fetching chain tip via direct RPC…")
+                    _EXP_LOG.debug("[MINER] STAGE 1: Fetching chain tip via JSON-RPC…")
                     
                     oracle_height = None
                     oracle_hash = None
                     difficulty_bits = None
-                    pq_curr_id = None
-                    pq_last_id = None
                     
-                    # Call 1: Get height + tip_hash (4 retries)
-                    for _retry in range(4):
+                    # RPC Call 1: Get block height
+                    for _retry_h in range(4):
                         try:
-                            oracle_height, oracle_hash = _direct_rpc.get_block_height()
+                            _url_h = f"{ENTROPY_SERVER_URL}/rpc"
+                            _payload_h = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlockHeight', 'params': [], 'id': 1}).encode('utf-8')
+                            _req_h = _ur.Request(_url_h, data=_payload_h, headers={'Content-Type': 'application/json'}, method='POST')
+                            with _ur.urlopen(_req_h, timeout=10) as _resp_h:
+                                _result_h = _j.loads(_resp_h.read().decode('utf-8'))
+                                _rh = _result_h.get('result', {})
+                                oracle_height = int(_rh.get('height', 0))
+                                oracle_hash = str(_rh.get('tip_hash', '0' * 64))
                             _EXP_LOG.debug(f"[MINER] STAGE 1: Got height={oracle_height}, tip={oracle_hash[:16]}…")
                             break
-                        except Exception as e:
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: get_block_height attempt {_retry+1}/4: {e}")
-                            if _retry < 3:
-                                await _asyncio.sleep(0.5 * (2 ** _retry))
+                        except Exception as _e_h:
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: getBlockHeight attempt {_retry_h+1}/4: {_e_h}")
+                            if _retry_h < 3:
+                                await _asyncio.sleep(0.5 * (2 ** _retry_h))
                             else:
-                                raise RuntimeError(f"get_block_height failed after 4 attempts: {e}")
+                                raise RuntimeError(f"getBlockHeight failed: {_e_h}")
                     
                     if oracle_height is None:
-                        _EXP_LOG.warning("[MINER] STAGE 1: oracle_height is None, retrying in 0.5s")
+                        _EXP_LOG.warning("[MINER] STAGE 1: height is None, retry in 0.5s")
                         _MINE_TELEM.mark_idle()
                         await _asyncio.sleep(0.5)
                         continue
                     
-                    # Call 2: Get full block to extract difficulty + quantum state (2 retries)
-                    tip_block = None
-                    for _retry in range(2):
+                    # RPC Call 2: Get full block (contains difficulty)
+                    for _retry_b in range(2):
                         try:
-                            tip_block = _direct_rpc.get_block(oracle_height)
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got block h={oracle_height}")
+                            _url_b = f"{ENTROPY_SERVER_URL}/rpc"
+                            _payload_b = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlock', 'params': [oracle_height], 'id': 1}).encode('utf-8')
+                            _req_b = _ur.Request(_url_b, data=_payload_b, headers={'Content-Type': 'application/json'}, method='POST')
+                            with _ur.urlopen(_req_b, timeout=10) as _resp_b:
+                                _result_b = _j.loads(_resp_b.read().decode('utf-8'))
+                                _block = _result_b.get('result', {})
+                            difficulty_bits = int(_block.get('difficulty_bits', _block.get('difficulty', 5)))
+                            difficulty_bits = int(max(5, min(difficulty_bits, 20)))
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got block, diff={difficulty_bits}")
                             break
-                        except Exception as e:
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: get_block({oracle_height}) attempt {_retry+1}/2: {e}")
-                            if _retry < 1:
+                        except Exception as _e_b:
+                            _EXP_LOG.debug(f"[MINER] STAGE 1: getBlock attempt {_retry_b+1}/2: {_e_b}")
+                            if _retry_b < 1:
                                 await _asyncio.sleep(1.0)
                             else:
-                                raise RuntimeError(f"get_block({oracle_height}) failed after 2 attempts: {e}")
+                                raise RuntimeError(f"getBlock failed: {_e_b}")
                     
-                    if tip_block is None:
-                        _EXP_LOG.warning("[MINER] STAGE 1: tip_block is None, retrying in 0.5s")
+                    if difficulty_bits is None:
+                        _EXP_LOG.warning("[MINER] STAGE 1: difficulty_bits is None, retry in 0.5s")
                         _MINE_TELEM.mark_idle()
                         await _asyncio.sleep(0.5)
                         continue
                     
-                    # Extract critical fields from block
-                    difficulty_bits = int(tip_block.get('difficulty_bits', tip_block.get('difficulty', 5)))
-                    difficulty_bits = int(max(5, min(difficulty_bits, 20)))
-                    pq_curr_id = int(tip_block.get('pq_curr', oracle_height))
-                    pq_last_id = int(tip_block.get('pq_last', max(0, oracle_height - 1)))
-                    
-                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} pq_curr={pq_curr_id} pq_last={pq_last_id}")
+                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} diff={difficulty_bits}")
                     
                     target_height = oracle_height + 1
                     parent_hash = oracle_hash
-                    timestamp = int(tip_block.get('timestamp', tip_block.get('timestamp_s', int(_t.time()))))
+                    timestamp = int(_t.time())
                     miner_addr = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
                     
                     # ──────────────────────────────────────────────────────────────
@@ -14133,9 +14099,14 @@ class QtclClientApp:
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
                     # ──────────────────────────────────────────────────────────────
                     
-                    # Fetch pending transactions from RPC
+                    # Fetch pending transactions via RPC
                     try:
-                        _pending_user_txs = _direct_rpc.get_mempool()
+                        _url_mp = f"{ENTROPY_SERVER_URL}/rpc"
+                        _payload_mp = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMempool', 'params': [], 'id': 1}).encode('utf-8')
+                        _req_mp = _ur.Request(_url_mp, data=_payload_mp, headers={'Content-Type': 'application/json'}, method='POST')
+                        with _ur.urlopen(_req_mp, timeout=5) as _resp_mp:
+                            _result_mp = _j.loads(_resp_mp.read().decode('utf-8'))
+                            _pending_user_txs = _result_mp.get('result', []) if isinstance(_result_mp.get('result'), list) else []
                     except Exception as e:
                         _pending_user_txs = []
                         _EXP_LOG.debug(f"[MINER] Mempool fetch failed: {e}")
