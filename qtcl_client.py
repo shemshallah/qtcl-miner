@@ -10919,11 +10919,9 @@ class KoyebAPIClient:
             return filtered[:limit]
         return []
     def get_mempool(self) -> list:
-        """Get mempool transactions via JSON-RPC."""
-        result = self._rpc("qtcl_getMempoolStats", [])
-        if isinstance(result, dict) and "transactions" in result:
-            return result["transactions"]
-        elif isinstance(result, list):
+        """Get pending transactions via JSON-RPC."""
+        result = self._rpc("qtcl_getMempool", [])
+        if isinstance(result, list):
             return result
         return []
     def submit_transaction(self, tx: dict) -> Optional[dict]:
@@ -14079,7 +14077,6 @@ class QtclClientApp:
                         _w_entropy_seed = _LIVE_RPC_ORACLE.get_pow_seed(target_height, parent_hash)
                     except Exception as e:
                         _EXP_LOG.debug(f"[MINER] Oracle seed failed: {e}")
-                        # Fallback: deterministic seed from timestamp + parent
                         _w_entropy_seed = _hl.sha3_256(
                             str(int(_t.time()/30)).encode() + parent_hash.encode()
                         ).digest()
@@ -14087,13 +14084,6 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
                     # ──────────────────────────────────────────────────────────────
-                    
-                    # Fetch pending transactions from mempool
-                    try:
-                        _pending_user_txs = kapi.get_mempool() or []
-                    except Exception as e:
-                        _pending_user_txs = []
-                        _EXP_LOG.debug(f"[MINER] Mempool fetch failed: {e}")
                     
                     # Get reward schedule
                     try:
