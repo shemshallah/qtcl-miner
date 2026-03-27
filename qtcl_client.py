@@ -13852,8 +13852,11 @@ class QtclClientApp:
                 _res_snap = _j_snap.loads(_resp_snap.read().decode('utf-8'))
                 _snap_data = _res_snap.get('result', {})
                 _dm_hex = _snap_data.get('density_matrix_hex', '')
-                _w_fid = float(_snap_data.get('w_state', {}).get('fidelity', 0.0))
-                _dm_ready = bool(_dm_hex and _w_fid > 0)
+                _raw_fid = (_snap_data.get('w_state') or {}).get('fidelity') or \
+                           _snap_data.get('w_state_fidelity') or \
+                           (_snap_data.get('lattice') or {}).get('fidelity') or 0.0
+                _w_fid = float(_raw_fid)
+                _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
         except Exception as _e_snap:
             print(f"  [SNAPSHOT-ERROR] {_e_snap}", flush=True)
             _dm_ready = False
