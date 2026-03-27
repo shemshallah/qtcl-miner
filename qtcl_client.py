@@ -10913,8 +10913,15 @@ class KoyebAPIClient:
         return None
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
         """Get oracle quantum metrics via JSON-RPC."""
-        r = self._rpc("qtcl_getQuantumMetrics", [])
-        return r if isinstance(r, dict) else None
+        for _attempt in range(3):
+            try:
+                r = self._rpc("qtcl_getQuantumMetrics", [], timeout=15)
+                if r:
+                    return r
+            except Exception as e:
+                _EXP_LOG.debug(f"[get_oracle_pq0_bloch] attempt {_attempt+1}/3 failed: {e}")
+                time.sleep(2)
+        return None
     def get_oracle_w_state(self) -> Optional[dict]:
         """Get W-state oracle data via JSON-RPC."""
         return self._rpc("qtcl_getQuantumMetrics", [])
@@ -13761,27 +13768,31 @@ class QtclClientApp:
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
-        def _wait_oracle_dm(timeout_s: float = 30.0) -> bool:
+        def _wait_oracle_dm(timeout_s: float = 60.0) -> bool:
             """Gate on oracle DM arrival via simple REST call."""
             print("  🔗 Fetching oracle snapshot…", flush=True)
-            try:
-                kapi = KoyebAPIClient()
-                print(f"  🔗 Calling RPC qtcl_getQuantumMetrics...", flush=True)
-                snap = kapi.get_oracle_pq0_bloch()
-                print(f"  🔗 Got snap: {snap}", flush=True)
-                if snap is None:
-                    print(f"  🔗 _last_error: {kapi._last_error}", flush=True)
-                print(f"  🔗 Got response: type={type(snap)}", flush=True)
-                if snap:
-                    dm_hex = snap.get('density_matrix_hex', '')
-                    lattice = snap.get('lattice', {})
-                    w_state = snap.get('w_state', {})
-                    print(f"  🔗 dm_hex len={len(dm_hex)}, lattice cycle={lattice.get('cycle', 0)}, w_state fid={w_state.get('fidelity', 0)}", flush=True)
-                    if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
-                        print("  ✅ Oracle DM acquired!", flush=True)
-                        return True
-            except Exception as e:
-                print(f"  🔗 Exception: {type(e).__name__}: {e}", flush=True)
+            for _retry in range(12):
+                try:
+                    kapi = KoyebAPIClient(timeout=15)
+                    print(f"  🔗 Calling RPC qtcl_getQuantumMetrics (attempt {_retry+1}/12)...", flush=True)
+                    snap = kapi.get_oracle_pq0_bloch()
+                    print(f"  🔗 Got snap: {snap}", flush=True)
+                    if snap is None:
+                        print(f"  🔗 _last_error: {kapi._last_error}", flush=True)
+                        time.sleep(5)
+                        continue
+                    print(f"  🔗 Got response: type={type(snap)}", flush=True)
+                    if snap:
+                        dm_hex = snap.get('density_matrix_hex', '')
+                        lattice = snap.get('lattice', {})
+                        w_state = snap.get('w_state', {})
+                        print(f"  🔗 dm_hex len={len(dm_hex)}, lattice cycle={lattice.get('cycle', 0)}, w_state fid={w_state.get('fidelity', 0)}", flush=True)
+                        if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
+                            print("  ✅ Oracle DM acquired!", flush=True)
+                            return True
+                except Exception as e:
+                    print(f"  🔗 Exception: {type(e).__name__}: {e}", flush=True)
+                    time.sleep(5)
             print("  ❌ degraded mode", flush=True)
             return False
         
@@ -14092,7 +14103,7 @@ class QtclClientApp:
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
             
-            kapi = KoyebAPIClient()
+            kapi = KoyebAPIClient(timeout=15)
             _MINE_TELEM.mark_idle()
             
             # ══════════════════════════════════════════════════════════════════════
@@ -14213,14 +14224,15 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     _EXP_LOG.debug("[MINER] Getting chain tip…")
                     tip = None
-                    for _retry in range(4):
+                    for _retry in range(8):
                         try:
+                            kapi = KoyebAPIClient(timeout=15)
                             tip = kapi.get_chain_tip()
                             if tip and (tip.get("block_height") is not None or tip.get("height") is not None):
                                 break
                         except Exception as e:
-                            _EXP_LOG.debug(f"[MINER] Chain tip retry {_retry+1}/4: {e}")
-                            await _asyncio.sleep(0.5 * (2 ** _retry))
+                            _EXP_LOG.debug(f"[MINER] Chain tip retry {_retry+1}/8: {e}")
+                            await _asyncio.sleep(1 * (2 ** _retry))
                     
                     if tip is None:
                         _EXP_LOG.warning("[MINER] Chain tip failed, retrying in 0.5s")
