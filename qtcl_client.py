@@ -13772,6 +13772,9 @@ class QtclClientApp:
                 kapi = KoyebAPIClient()
                 print(f"  🔗 Calling RPC qtcl_getQuantumMetrics...", flush=True)
                 snap = kapi.get_oracle_pq0_bloch()
+                print(f"  🔗 Got snap: {snap}", flush=True)
+                if snap is None:
+                    print(f"  🔗 _last_error: {kapi._last_error}", flush=True)
                 print(f"  🔗 Got response: type={type(snap)}", flush=True)
                 if snap:
                     dm_hex = snap.get('density_matrix_hex', '')
