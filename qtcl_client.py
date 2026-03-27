@@ -10883,22 +10883,42 @@ class KoyebAPIClient:
         Returns normalised dict with aliases the mining loop expects:
           height, block_height, tip_hash, block_hash, hash, ts
         """
-        r = self._rpc("qtcl_getBlockHeight", [])
-        _EXP_LOG.debug(f"[get_chain_tip] raw response: {r}")
-        if not isinstance(r, dict):
-            _EXP_LOG.debug(f"[get_chain_tip] returning None - not a dict")
-            return None
-        h = int(r.get("height", 0))
-        th = str(r.get("tip_hash", "0" * 64))
-        _EXP_LOG.debug(f"[get_chain_tip] height={h}, tip_hash={th[:32]}…")
-        return {
-            "height":       h,
-            "block_height": h,
-            "tip_hash":     th,
-            "block_hash":   th,
-            "hash":         th,
-            "ts":           r.get("ts"),
-        }
+        for _attempt in range(3):
+            try:
+                r = self._rpc("qtcl_getBlockHeight", [], timeout=15)
+                _EXP_LOG.debug(f"[get_chain_tip] attempt {_attempt+1} raw response: {r}")
+                if not isinstance(r, dict):
+                    _EXP_LOG.debug(f"[get_chain_tip] not a dict, continuing...")
+                    time.sleep(2)
+                    continue
+                h = int(r.get("height", 0))
+                th = str(r.get("tip_hash", "0" * 64))
+                _EXP_LOG.debug(f"[get_chain_tip] height={h}, tip_hash={th[:32]}…")
+                return {
+                    "height":       h,
+                    "block_height": h,
+                    "tip_hash":     th,
+                    "block_hash":   th,
+                    "hash":         th,
+                    "ts":           r.get("ts"),
+                }
+            except Exception as e:
+                _EXP_LOG.debug(f"[get_chain_tip] attempt {_attempt+1}/3 failed: {e}")
+                time.sleep(2)
+        
+        # Fallback: try REST endpoint
+        try:
+            _EXP_LOG.debug(f"[get_chain_tip] Trying REST /api/chain/tip fallback")
+            rest_tip = self._get("/api/chain/tip", timeout=10)
+            if rest_tip and isinstance(rest_tip, dict):
+                h = int(rest_tip.get("height") or rest_tip.get("block_height") or 0)
+                return {"height": h, "block_height": h, "tip_hash": rest_tip.get("hash", "0"*64)}
+        except Exception as e:
+            _EXP_LOG.debug(f"[get_chain_tip] REST fallback failed: {e}")
+        
+        _EXP_LOG.debug(f"[get_chain_tip] returning None - all attempts failed")
+        return None
+    
     def get_block_height(self) -> Optional[int]:
         """Get current block height via JSON-RPC."""
         tip = self._rpc("qtcl_getBlockHeight", [])
@@ -10912,15 +10932,29 @@ class KoyebAPIClient:
         _EXP_LOG.debug(f"[get_block_height] returning None - unexpected type")
         return None
     def get_oracle_pq0_bloch(self) -> Optional[dict]:
-        """Get oracle quantum metrics via JSON-RPC."""
+        """Get oracle quantum metrics via JSON-RPC - with fallback to REST."""
         for _attempt in range(3):
             try:
                 r = self._rpc("qtcl_getQuantumMetrics", [], timeout=15)
                 if r:
+                    # If we got response but it's an error, try REST fallback
+                    if r.get("error") or r.get("lattice_error"):
+                        _EXP_LOG.debug(f"[get_oracle_pq0_bloch] RPC error, trying REST fallback")
+                        break
                     return r
             except Exception as e:
                 _EXP_LOG.debug(f"[get_oracle_pq0_bloch] attempt {_attempt+1}/3 failed: {e}")
                 time.sleep(2)
+        
+        # REST fallback - try direct /api/oracle/snapshot endpoint
+        try:
+            _EXP_LOG.debug(f"[get_oracle_pq0_bloch] Trying REST /api/oracle/snapshot fallback")
+            rest_resp = self._get("/api/oracle/snapshot", timeout=10)
+            if rest_resp:
+                return rest_resp
+        except Exception as e:
+            _EXP_LOG.debug(f"[get_oracle_pq0_bloch] REST fallback failed: {e}")
+        
         return None
     def get_oracle_w_state(self) -> Optional[dict]:
         """Get W-state oracle data via JSON-RPC."""
