@@ -13793,36 +13793,10 @@ class QtclClientApp:
                 _EXP_LOG.info("[CLIENT] ✅ C koyeb registration thread (re)started with wallet address")
             except Exception as _kwe:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
-        # ── RPC poll thread — no SSE ──────────────────────
-        # ── Fetch live RPC snapshot on-demand ────────────────────────
+        # ── Wait for oracle snapshot FIRST, then sync chain ─────────────────────
+        # ── Fetch live RPC snapshot on-demand ───────────────────────────────
         _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
         snap = _snap or {}
-        # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
-        bh = int(snap.get('block_height') or snap.get('height') or
-                 self.koyeb_state.block_height or 0)
-        th = str(snap.get('tip_hash') or snap.get('block_hash') or snap.get('hash') or "0" * 64)
-        pq_curr_id = str(snap.get('pq_curr') or snap.get('pq_curr_id') or bh or '')
-        pq_last_id = str(snap.get('pq_last') or snap.get('pq_last_id') or
-                         max(0, bh - 1) if bh else '')
-        
-        # ── SYNC CHAIN FROM SERVER ─────────────────────────────────────────────
-        print(f"  🔗 Syncing chain from server (height={bh}, tip_hash={th[:16]}…)", flush=True)
-        if bh > 0:
-            try:
-                kapi = KoyebAPIClient(timeout=15)
-                synced = 0
-                for h in range(0, min(bh + 1, 50)):  # Sync up to 50 blocks
-                    try:
-                        block = kapi.get_block_by_height(h)
-                        if block and isinstance(block, dict):
-                            self._db.insert_block(block.get('height', h), block)
-                            synced += 1
-                    except Exception:
-                        pass
-                print(f"  🔗 Synced {synced} blocks from server", flush=True)
-            except Exception as e:
-                _EXP_LOG.debug(f"[CHAIN-SYNC] Failed: {e}")
-        
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
@@ -13846,6 +13820,28 @@ class QtclClientApp:
                         w_state = snap.get('w_state', {})
                         print(f"  🔗 dm_hex len={len(dm_hex)}, lattice cycle={lattice.get('cycle', 0)}, w_state fid={w_state.get('fidelity', 0)}", flush=True)
                         if dm_hex or lattice.get('cycle', 0) > 0 or w_state.get('fidelity', 0) > 0:
+                            # ── NOW sync chain after getting snapshot ─────────────────
+                            bh = int(snap.get('block_height') or snap.get('height') or 0)
+                            th = str(snap.get('tip_hash') or snap.get('block_hash') or snap.get('hash') or "0" * 64)
+                            pq_curr_id = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
+                            pq_last_id = str(max(0, bh - 1)) if bh > 0 else str(snap.get("pq_last", ""))
+                            print(f"  🔗 Syncing chain from server (height={bh}, tip_hash={th[:16]}…, pq={pq_curr_id}→{pq_last_id})", flush=True)
+                            if bh > 0:
+                                try:
+                                    synced = 0
+                                    for h in range(0, min(bh + 1, 50)):
+                                        try:
+                                            block = kapi.get_block_by_height(h)
+                                            if block and isinstance(block, dict):
+                                                self._db.insert_block(block.get('height', h), block)
+                                                synced += 1
+                                        except Exception:
+                                            pass
+                                    print(f"  🔗 Synced {synced} blocks from server", flush=True)
+                                except Exception as e:
+                                    _EXP_LOG.debug(f"[CHAIN-SYNC] Failed: {e}")
+                            # ── Update koyeb_state with chain info ───────────────
+                            self.koyeb_state.block_height = bh
                             print("  ✅ Oracle DM acquired!", flush=True)
                             return True
                 except Exception as e:
