@@ -2356,6 +2356,7 @@ _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
 
 # ── Peer management uses main qtcl_blockchain.db (p2p_peers table) ─────────────────
+import pathlib as _plib
 _PEER_DB_PATH = str(_plib.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
 
 def peerdb_load(path: str = _PEER_DB_PATH) -> int:
