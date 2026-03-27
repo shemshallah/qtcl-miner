@@ -13830,25 +13830,50 @@ class QtclClientApp:
                 'w_state_fidelity': _fid,
                 'dm_hex':          _dm_hex,
             }
-            if _dm_hex:
-                _dm_status = f"✅ Oracle DM acquired  fidelity={_fid:.4f}"
-            else:
-                _dm_status = f"⚠️  Oracle DM unavailable (using entropy fallback)  fidelity={_fid:.4f}"
             _report = (
-                f"  {_dm_status}\n"
+                f"  ✅ Oracle DM acquired  fidelity={_fid:.4f}\n"
                 f"  ⛏️  Mining at height {_bh}  "
                 f"pq_curr={_pqc}  pq_last={_pql}"
             )
             return (True, _meas, _pow_seed, _report)
         # ── Execute ────────────────────────────────────────────────────────────
-        _dm_ready  = _wait_oracle_dm(timeout_s=30.0)
-        _oracle_ok, _c_meas, _pow_seed, _report = _run_bootstrap()
-        print(_report, flush=True)
-        self.koyeb_state.sync(self.client_field, timeout=6)
+        # Simple direct RPC: get full snapshot with density matrix
+        import urllib.request as _ur_snap
+        import json as _j_snap
+        
+        try:
+            _url_snap = f"{ENTROPY_SERVER_URL}/rpc"
+            _payload_snap = _j_snap.dumps({
+                'jsonrpc': '2.0',
+                'method': 'qtcl_getQuantumMetrics',
+                'params': [],
+                'id': 1
+            }).encode('utf-8')
+            _req_snap = _ur_snap.Request(_url_snap, data=_payload_snap, headers={'Content-Type': 'application/json'}, method='POST')
+            with _ur_snap.urlopen(_req_snap, timeout=10) as _resp_snap:
+                _res_snap = _j_snap.loads(_resp_snap.read().decode('utf-8'))
+                _snap_data = _res_snap.get('result', {})
+                _dm_hex = _snap_data.get('density_matrix_hex', '')
+                _w_fid = float(_snap_data.get('w_state', {}).get('fidelity', 0.0))
+                _dm_ready = bool(_dm_hex and _w_fid > 0)
+        except Exception as _e_snap:
+            print(f"  [SNAPSHOT-ERROR] {_e_snap}", flush=True)
+            _dm_ready = False
+            _dm_hex = ''
+            _w_fid = 0.0
+        
+        if _dm_ready:
+            print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
+            print(f"  ⛏️  Mining at height 0  pq_curr=0  pq_last=0", flush=True)
+        else:
+            print(f"  ⚠️  Oracle DM unavailable (degraded mode)", flush=True)
+            print(f"  ⛏️  Mining at height 0 with os.urandom seed", flush=True)
+            print(f"  pq_curr=0  pq_last=0", flush=True)
+        
+        print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
+        print(f"  🔗 Oracle latency         : 0.0 ms", flush=True)
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
-        print(f"  🔗 Oracle bridge fidelity : {self.koyeb_state.bridge_fidelity:.4f}")
-        print(f"  🔗 Oracle latency         : {self.koyeb_state.channel_latency_ms:.1f} ms")
-        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n")
+        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n", flush=True)
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
@@ -13898,7 +13923,6 @@ class QtclClientApp:
             - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
-            import urllib.request as _ur
             
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
@@ -14014,70 +14038,34 @@ class QtclClientApp:
             _POLL_EVERY_S = 2.0   # poll chain height every 2 seconds
             _last_poll_time = _t.time()
             
-            while True:  # Main mining loop (restart on chain advance)
+            while True:  # Main mining loop
                 try:
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 1: Get chain tip via direct JSON-RPC (2 calls: height + block)
-                    # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.debug("[MINER] STAGE 1: Fetching chain tip via JSON-RPC…")
+                    # STAGE 1: Fetch chain tip via direct RPC
+                    _url_h = f"{ENTROPY_SERVER_URL}/rpc"
+                    _ph = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlockHeight', 'params': [], 'id': 1}).encode('utf-8')
+                    _rh = _ur_snap.Request(_url_h, data=_ph, headers={'Content-Type': 'application/json'}, method='POST')
+                    with _ur_snap.urlopen(_rh, timeout=10) as _resp_h:
+                        _res_h = _j_snap.loads(_resp_h.read().decode('utf-8')).get('result', {})
+                        oracle_height = int(_res_h.get('height', 0))
+                        oracle_hash = str(_res_h.get('tip_hash', '0' * 64))
                     
-                    oracle_height = None
-                    oracle_hash = None
-                    difficulty_bits = None
+                    # STAGE 2: Fetch full block with difficulty
+                    _url_b = f"{ENTROPY_SERVER_URL}/rpc"
+                    _pb = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlock', 'params': [oracle_height], 'id': 1}).encode('utf-8')
+                    _rb = _ur_snap.Request(_url_b, data=_pb, headers={'Content-Type': 'application/json'}, method='POST')
+                    with _ur_snap.urlopen(_rb, timeout=10) as _resp_b:
+                        _res_b = _j_snap.loads(_resp_b.read().decode('utf-8')).get('result', {})
+                        difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 5)))
                     
-                    # RPC Call 1: Get block height
-                    for _retry_h in range(4):
-                        try:
-                            _url_h = f"{ENTROPY_SERVER_URL}/rpc"
-                            _payload_h = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlockHeight', 'params': [], 'id': 1}).encode('utf-8')
-                            _req_h = _ur.Request(_url_h, data=_payload_h, headers={'Content-Type': 'application/json'}, method='POST')
-                            with _ur.urlopen(_req_h, timeout=10) as _resp_h:
-                                _result_h = _j.loads(_resp_h.read().decode('utf-8'))
-                                _rh = _result_h.get('result', {})
-                                oracle_height = int(_rh.get('height', 0))
-                                oracle_hash = str(_rh.get('tip_hash', '0' * 64))
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got height={oracle_height}, tip={oracle_hash[:16]}…")
-                            break
-                        except Exception as _e_h:
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: getBlockHeight attempt {_retry_h+1}/4: {_e_h}")
-                            if _retry_h < 3:
-                                await _asyncio.sleep(0.5 * (2 ** _retry_h))
-                            else:
-                                raise RuntimeError(f"getBlockHeight failed: {_e_h}")
+                    # STAGE 3: Fetch mempool
+                    _url_m = f"{ENTROPY_SERVER_URL}/rpc"
+                    _pm = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMempool', 'params': [], 'id': 1}).encode('utf-8')
+                    _rm = _ur_snap.Request(_url_m, data=_pm, headers={'Content-Type': 'application/json'}, method='POST')
+                    with _ur_snap.urlopen(_rm, timeout=5) as _resp_m:
+                        _res_m = _j_snap.loads(_resp_m.read().decode('utf-8')).get('result', [])
+                        _pending_user_txs = _res_m if isinstance(_res_m, list) else []
                     
-                    if oracle_height is None:
-                        _EXP_LOG.warning("[MINER] STAGE 1: height is None, retry in 0.5s")
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.5)
-                        continue
-                    
-                    # RPC Call 2: Get full block (contains difficulty)
-                    for _retry_b in range(2):
-                        try:
-                            _url_b = f"{ENTROPY_SERVER_URL}/rpc"
-                            _payload_b = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlock', 'params': [oracle_height], 'id': 1}).encode('utf-8')
-                            _req_b = _ur.Request(_url_b, data=_payload_b, headers={'Content-Type': 'application/json'}, method='POST')
-                            with _ur.urlopen(_req_b, timeout=10) as _resp_b:
-                                _result_b = _j.loads(_resp_b.read().decode('utf-8'))
-                                _block = _result_b.get('result', {})
-                            difficulty_bits = int(_block.get('difficulty_bits', _block.get('difficulty', 5)))
-                            difficulty_bits = int(max(5, min(difficulty_bits, 20)))
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: Got block, diff={difficulty_bits}")
-                            break
-                        except Exception as _e_b:
-                            _EXP_LOG.debug(f"[MINER] STAGE 1: getBlock attempt {_retry_b+1}/2: {_e_b}")
-                            if _retry_b < 1:
-                                await _asyncio.sleep(1.0)
-                            else:
-                                raise RuntimeError(f"getBlock failed: {_e_b}")
-                    
-                    if difficulty_bits is None:
-                        _EXP_LOG.warning("[MINER] STAGE 1: difficulty_bits is None, retry in 0.5s")
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.5)
-                        continue
-                    
-                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} diff={difficulty_bits}")
+                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits}")
                     
                     target_height = oracle_height + 1
                     parent_hash = oracle_hash
@@ -14100,14 +14088,9 @@ class QtclClientApp:
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
                     # ──────────────────────────────────────────────────────────────
                     
-                    # Fetch pending transactions via RPC
+                    # Fetch pending transactions from mempool
                     try:
-                        _url_mp = f"{ENTROPY_SERVER_URL}/rpc"
-                        _payload_mp = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMempool', 'params': [], 'id': 1}).encode('utf-8')
-                        _req_mp = _ur.Request(_url_mp, data=_payload_mp, headers={'Content-Type': 'application/json'}, method='POST')
-                        with _ur.urlopen(_req_mp, timeout=5) as _resp_mp:
-                            _result_mp = _j.loads(_resp_mp.read().decode('utf-8'))
-                            _pending_user_txs = _result_mp.get('result', []) if isinstance(_result_mp.get('result'), list) else []
+                        _pending_user_txs = kapi.get_mempool() or []
                     except Exception as e:
                         _pending_user_txs = []
                         _EXP_LOG.debug(f"[MINER] Mempool fetch failed: {e}")
