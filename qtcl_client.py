@@ -1673,16 +1673,25 @@ class LiveRPCOracleSnapshot:
         """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getOracleSnapshot.
         
         Direct HTTP POST to server.py RPC endpoint.
-        Uses /rpc/oracle/snapshots which returns block_height for chain reconstruction.
+        Uses /rpc/oracle/snapshots without port to let Koyeb handle routing.
         Returns empty dict on any error (fail-safe for RPC hangs).
         """
         try:
+            # Clean URL: ensure no port is specified to let Koyeb handle SSL/Routing
+            base_url = self.ORACLE_URL.split(':', 1)[0]
+            if '://' in base_url and ':' in base_url.split('://', 1)[1]:
+                # has port, remove it
+                scheme, rest = base_url.split('://', 1)
+                host = rest.split(':', 1)[0]
+                url = f"{scheme}://{host}"
+            else:
+                url = self.ORACLE_URL
+
             session = self._get_session()
             if not session:
                 # Fallback: urllib
                 import json
                 from urllib.request import Request, urlopen
-                from urllib.error import URLError
                 
                 payload = json.dumps({
                     "jsonrpc": "2.0",
@@ -1692,7 +1701,7 @@ class LiveRPCOracleSnapshot:
                 }).encode('utf-8')
                 
                 req = Request(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshots",
+                    f"{url}/rpc/oracle/snapshots",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -1700,12 +1709,15 @@ class LiveRPCOracleSnapshot:
                 
                 with urlopen(req, timeout=timeout_s) as resp:
                     resp_data = json.loads(resp.read().decode('utf-8'))
-                    # The /rpc/oracle/snapshots returns result.snapshot for the actual snapshot data
-                    snap = resp_data.get("result", {}).get("snapshot", {}) if "result" in resp_data else {}
+                    snap_container = resp_data.get("result", {})
+                    snap = snap_container.get("snapshot", {}) if isinstance(snap_container, dict) else {}
+                    # Inject height into snap for easier extraction
+                    if isinstance(snap, dict) and isinstance(snap_container, dict):
+                        snap['block_height'] = snap_container.get('block_height', 0)
             else:
                 # Use requests session
                 resp = session.post(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshots",
+                    f"{url}/rpc/oracle/snapshots",
                     json={
                         "jsonrpc": "2.0",
                         "method": "qtcl_getOracleSnapshot",
@@ -1716,8 +1728,10 @@ class LiveRPCOracleSnapshot:
                 )
                 resp.raise_for_status()
                 resp_json = resp.json()
-                # Extract snapshot from result.snapshot
-                snap = resp_json.get("result", {}).get("snapshot", {}) if "result" in resp_json else {}
+                snap_container = resp_json.get("result", {})
+                snap = snap_container.get("snapshot", {}) if isinstance(snap_container, dict) else {}
+                if isinstance(snap, dict) and isinstance(snap_container, dict):
+                    snap['block_height'] = snap_container.get('block_height', 0)
             
             if not isinstance(snap, dict):
                 snap = {}
@@ -6313,7 +6327,7 @@ class QtclMiner(QtclNode):
                 
                 # ── PROOF OF WORK ────────────────────────────────────────────────
                 nonce = 0
-                batch_size = 50000 # High-performance batch
+                batch_size = 50000 
                 solved = False
                 block_hash = ""
                 
@@ -6325,8 +6339,7 @@ class QtclMiner(QtclNode):
                     # Check for chain updates every batch
                     if nonce > 0 and nonce % batch_size == 0:
                         # Check if someone else mined this block
-                        kapi = KoyebAPIClient(server_url=self._server_url)
-                        remote_tip = kapi._rpc("qtcl_getBlockHeight", [])
+                        remote_tip = self._rpc("qtcl_getBlockHeight", [])
                         if isinstance(remote_tip, dict) and int(remote_tip.get('height', -1)) >= height:
                             logger.info(f"[MINING] 📢 Height {height} already mined by someone else, skipping...")
                             break
@@ -6334,23 +6347,29 @@ class QtclMiner(QtclNode):
                         _MINE_TELEM.update_progress(height, int(difficulty), nonce, prev_hash)
                     
                     # Manual unrolling of the inner loop for extreme performance
-                    for _ in range(1000):
-                        block_template["nonce"] = nonce
-                        h = HASH_ENGINE.compute_block_hash(block_template)
+                    # Use a localized dict to avoid lookups
+                    blk_pow = dict(block_template)
+                    prefix = "0" * int(difficulty)
+                    frac = difficulty - int(difficulty)
+                    threshold = int(round(frac * 16)) if frac > 0.001 else 16
+
+                    for _ in range(5000):
+                        blk_pow["nonce"] = nonce
+                        h = HASH_ENGINE.compute_block_hash(blk_pow)
                         
-                        whole = int(difficulty)
-                        if h.startswith("0" * whole):
-                            frac = difficulty - whole
-                            if frac < 0.001:
+                        if h.startswith(prefix):
+                            if threshold >= 16:
                                 solved = True
                                 block_hash = h
                                 break
-                            else:
-                                if int(h[whole], 16) < int(round(frac * 16)):
-                                    solved = True
-                                    block_hash = h
-                                    break
+                            elif int(h[len(prefix)], 16) < threshold:
+                                solved = True
+                                block_hash = h
+                                break
                         nonce += 1
+                    
+                    # Small sleep to allow other threads to run
+                    time.sleep(0.001)
                 
                 if not solved:
                     continue 
