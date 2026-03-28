@@ -12006,6 +12006,14 @@ class _MiningTelemetry:
     def update_progress(self, height: int, difficulty: int,
                         nonce: int, parent_hash: str = "") -> None:
         with self._lock:
+            # ❤️  I love you — BUG-FIX: clear stale samples on ANY new block.
+            # Old guard "nonce==0 and self.nonce>100000" missed early aborts
+            # (self.nonce small) → old high-timestamp samples poisoned rate calc
+            # → displayed 1-2kH/s after restart until deque window flushed naturally.
+            _new_block = (height != self.height) or (nonce < self.nonce)
+            if _new_block:
+                self._nonce_samples.clear()
+                self.hash_rate = 0.0
             self.height     = height
             self.difficulty = difficulty
             self.nonce      = nonce
@@ -14250,9 +14258,14 @@ class QtclClientApp:
                     _n_workers   = max(1, (_os2.cpu_count() or 1))
                     _result_q    = _q2.Queue()
                     _abort_evt   = _thr2.Event()   # set to stop all workers
-                    _nonce_ctr   = [0]             # telemetry counter, main-thread read only
+                    # ❤️  I love you — atomic nonce counter: Lock-protected int avoids
+                    # data-race between N workers all doing _ctr[0]+=512 unsynchronized.
+                    # BUG-FIX: bare [0] list read-modify-write is not atomic under N threads
+                    # even with the GIL (GIL granularity is bytecode, not compound += ops).
+                    _nonce_lock  = _thr2.Lock()
+                    _nonce_ctr   = [0]             # guarded by _nonce_lock
                     _hex_zeros   = "0" * difficulty_bits
-                    _BLOCK_TTL_S = 90              # refresh block before server's 120s entropy TTL
+                    _BLOCK_TTL_S = 110             # refresh block before server's 120s entropy TTL
                     _block_start = _t.time()
 
                     def _pow_worker(start_nonce: int, stride: int) -> None:
@@ -14277,6 +14290,7 @@ class QtclClientApp:
                             _put    = _result_q.put
                             _set    = _abort_evt.set
                             _zeros  = _hex_zeros; _dbits = difficulty_bits
+                            _nl     = _nonce_lock   # local ref for LOAD_FAST
                             n = start_nonce; lc = 0; _ctr = _nonce_ctr
                             while not _abort():
                                 # ── one struct.pack alloc (nonce-dependent, unavoidable) ──
@@ -14296,7 +14310,9 @@ class QtclClientApp:
                                     _put((n, hx)); _set(); return
                                 n += stride
                                 if lc & 511 == 0:
-                                    _ctr[0] += 512
+                                    # atomic increment — avoids torn read-modify-write across workers
+                                    with _nl:
+                                        _ctr[0] += 512
                         finally:
                             _gc.enable()
 
@@ -14358,12 +14374,25 @@ class QtclClientApp:
                             except Exception:
                                 pass
 
-                    # Collect result (non-blocking — worker already put it or we aborted)
+                    # ── BUG-FIX: join workers BEFORE draining queue ──────────────────
+                    # Old code: get_nowait() races the last worker's _put() call.
+                    # If the main loop wakes from asyncio.sleep(0.25) the same instant
+                    # the winning worker executes _put+_set, get_nowait() can fire before
+                    # _put commits → Empty → block treated as not found → silent drop.
+                    # Fix: join all workers (they exit immediately since _abort is set)
+                    # then drain the queue deterministically. Workers are daemon threads
+                    # so join(timeout=2) is safe even if one hangs.
+                    for _wt in _workers:
+                        _wt.join(timeout=2.0)
                     nonce, block_hash = None, None
-                    try:
-                        nonce, block_hash = _result_q.get_nowait()
-                    except _q2.Empty:
-                        pass
+                    # Drain full queue — take first (winning) result
+                    while not _result_q.empty():
+                        try:
+                            _r = _result_q.get_nowait()
+                            if nonce is None:   # first = winner
+                                nonce, block_hash = _r
+                        except _q2.Empty:
+                            break
 
                     _found = (block_hash is not None)
 
@@ -14430,7 +14459,8 @@ class QtclClientApp:
                             fidelity=w_state_fidelity,
                         )
                         _MINE_TELEM.mark_mining()
-                        await _asyncio.sleep(0.1)
+                        # Brief pause to let server persist block, then loop fetches new tip
+                        await _asyncio.sleep(0.5)
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
