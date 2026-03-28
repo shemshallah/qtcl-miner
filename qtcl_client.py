@@ -13651,16 +13651,12 @@ class QtclClientApp:
                             
                             # ❌ ERROR: Check if chain advanced or real validation error
                             elif isinstance(result, dict) and "error" in result:
-                                # error field may be dict {"code":N,"message":"..."} or string
                                 _err_raw = result.get("error", {})
                                 error_msg = (
                                     _err_raw.get("message", str(_err_raw))
                                     if isinstance(_err_raw, dict)
                                     else str(_err_raw)
                                 )
-                                
-                                # Chain advanced — server expected block_height+1, meaning
-                                # our block was already accepted by a prior attempt
                                 if "Invalid height" in error_msg and f"expected {block_height + 1}" in error_msg:
                                     _EXP_LOG.info(
                                         f"[SUBMIT] ✅ CHAIN ADVANCED h={block_height} "
@@ -13668,8 +13664,6 @@ class QtclClientApp:
                                     )
                                     self.accept_count += 1
                                     return (True, result)
-                                
-                                # Real validation error — don't retry
                                 _EXP_LOG.error(
                                     f"[SUBMIT] ❌ REJECTED h={block_height} | {error_msg}"
                                 )
@@ -13932,7 +13926,7 @@ class QtclClientApp:
                     _nonce_lock  = _thr2.Lock()    # ❤️  guards counter across N workers
                     _nonce_ctr   = [0]
                     _hex_zeros   = "0" * difficulty_bits
-                    _BLOCK_TTL_S = 270  # server entropy TTL=300s; 30s margin for submit+tip-wait
+                    _BLOCK_TTL_S = 270
                     _block_start = _t.time()
 
                     def _pow_worker(start_nonce: int, stride: int) -> None:
@@ -14116,14 +14110,12 @@ class QtclClientApp:
                             timestamp=timestamp, fidelity=w_state_fidelity, reward_qtcl=_srv_r,
                         )
                         _MINE_TELEM.mark_idle()
-                        # ❤️  Wait for server tip to advance to target_height before
-                        # re-entering loop.  Without this, qtcl_getBlockHeight may still
-                        # return the old height (DB commit lag on Koyeb) causing the miner
-                        # to set oracle_height = old → target_height = same → re-mine
-                        # the same block height indefinitely.
-                        _TIP_WAIT_MAX_S   = 30.0
-                        _TIP_WAIT_POLL_S  = 0.5  # fast-poll for height confirmation
-                        _tip_wait_start   = _t.time()
+                        # Wait for server tip to advance before re-entering loop.
+                        # Without this the miner races back, sees stale height,
+                        # and re-mines the same block height indefinitely.
+                        _TIP_WAIT_MAX_S  = 30.0
+                        _TIP_WAIT_POLL_S = 0.5
+                        _tip_wait_start  = _t.time()
                         while _t.time() - _tip_wait_start < _TIP_WAIT_MAX_S:
                             await _asyncio.sleep(_TIP_WAIT_POLL_S)
                             try:
@@ -14134,20 +14126,13 @@ class QtclClientApp:
                                 if _confirmed_h >= target_height:
                                     _EXP_LOG.warning(
                                         f"[MINER] ✅ Server tip confirmed h={_confirmed_h} "
-                                        f"(waited {_t.time()-_tip_wait_start:.1f}s) — advancing"
+                                        f"(waited {_t.time()-_tip_wait_start:.1f}s)"
                                     )
                                     break
-                                _EXP_LOG.debug(
-                                    f"[MINER] ⏳ Waiting for server tip: have={_confirmed_h} "
-                                    f"need>={target_height} ({_t.time()-_tip_wait_start:.1f}s elapsed)"
-                                )
                             except Exception as _te:
-                                _EXP_LOG.debug(f"[MINER] tip-wait poll error: {_te}")
+                                _EXP_LOG.debug(f"[MINER] tip-wait poll: {_te}")
                         else:
-                            _EXP_LOG.warning(
-                                f"[MINER] ⚠️  tip-wait timeout after {_TIP_WAIT_MAX_S:.0f}s "
-                                f"(server may be lagging) — advancing anyway"
-                            )
+                            _EXP_LOG.warning("[MINER] ⚠️  tip-wait timeout — advancing anyway")
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
