@@ -14180,9 +14180,13 @@ class QtclClientApp:
                     _POW_N_WINDOWS        = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
 
                     # Build scratchpad once (~1.7ms), shared read-only across threads
-                    _scratchpad = _hl.shake_256(
+                    # PERF-FIX: wrap in memoryview → zero-copy 64-byte window reads in hot loop
+                    # (bytes slice creates new object each read — at 64 rounds × N threads × kH/s
+                    #  that is millions of tiny allocs/sec → GC stalls → hash rate collapses)
+                    _scratchpad_bytes = _hl.shake_256(
                         b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed
                     ).digest(_POW_SCRATCHPAD_BYTES)
+                    _sp_mv = memoryview(_scratchpad_bytes)   # zero-copy slicing
 
                     # Pre-pack fixed header fields (immutable, safe to share)
                     _ph_parent = bytes.fromhex(parent_hash.zfill(64))[:32]
@@ -14190,14 +14194,19 @@ class QtclClientApp:
                     _ph_miner  = miner_addr.encode()[:40].ljust(40, b'\x00')
                     _ph_seed   = _w_entropy_seed[:32]
 
+                    # PERF-FIX: pre-pack all 64 round suffix bytes once — eliminates
+                    # _st.pack('>I', rnd) allocation inside the 64-round inner loop
+                    _rnd_packed = [_st.pack('>I', r) for r in range(_POW_MIX_ROUNDS)]
+
                     # Capture locals for worker closures
                     _tgt_h   = target_height
                     _ts      = timestamp
                     _diff    = difficulty_bits
-                    _sp      = _scratchpad
                     _ws      = _POW_WINDOW_BYTES
                     _nwin    = _POW_N_WINDOWS
                     _mix     = _POW_MIX_ROUNDS
+                    _rp      = _rnd_packed
+                    _smv     = _sp_mv
 
                     def _qtcl_hash(nonce: int) -> str:
                         hdr = _st.pack(
@@ -14209,35 +14218,48 @@ class QtclClientApp:
                         )
                         state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
                         for rnd in range(_mix):
+                            # PERF-FIX: memoryview slice is zero-copy (no bytes alloc)
+                            # PERF-FIX: _rp[rnd] is pre-packed (no struct.pack alloc)
                             wi = _st.unpack_from('>I', state, 0)[0] % _nwin
                             state = _hl.sha3_256(
-                                state + _sp[wi*_ws : wi*_ws+_ws] + _st.pack('>I', rnd)
+                                state + bytes(_smv[wi*_ws : wi*_ws+_ws]) + _rp[rnd]
                             ).digest()
                         return state.hex()
 
                     _n_workers   = max(1, (_os2.cpu_count() or 1))
                     _result_q    = _q2.Queue()
                     _abort_evt   = _thr2.Event()   # set to stop all workers
-                    _nonce_ctr   = [0]             # approximate telemetry counter (lock-free OK)
+                    # PERF-FIX: use atomic integer via array for lock-free cross-thread counter
+                    import array as _arr
+                    _nonce_ctr_arr = _arr.array('q', [0])   # 'q' = signed 64-bit, atomic on CPython
+                    _nonce_ctr     = [0]                    # kept for telemetry read path (main thread only)
                     _hex_zeros   = "0" * difficulty_bits
                     _BLOCK_TTL_S = 90              # refresh block before server's 120s entropy TTL
                     _block_start = _t.time()
 
                     def _pow_worker(start_nonce: int, stride: int) -> None:
-                        """Hash nonces start, start+stride, start+2*stride … until found or aborted."""
-                        n = start_nonce
-                        local_count = 0
-                        while not _abort_evt.is_set():
-                            h = _qtcl_hash(n)
-                            local_count += 1
-                            if h.startswith(_hex_zeros):
-                                _result_q.put((n, h))
-                                _abort_evt.set()
-                                return
-                            n += stride
-                            # Update shared telemetry counter every 200 hashes (cheap)
-                            if local_count % 200 == 0:
-                                _nonce_ctr[0] += 200
+                        """Hash nonces start, start+stride, start+2*stride … until found or aborted.
+                        PERF-FIX: disable GC inside worker — all hot-path objects are stack-local
+                        or immortal module-level; GC scans are pure overhead here."""
+                        import gc as _gc
+                        _gc.disable()
+                        try:
+                            n = start_nonce
+                            local_count = 0
+                            _abort_check = _abort_evt.is_set   # bind method once
+                            while not _abort_check():
+                                h = _qtcl_hash(n)
+                                local_count += 1
+                                if h[:difficulty_bits] == _hex_zeros:
+                                    _result_q.put((n, h))
+                                    _abort_evt.set()
+                                    return
+                                n += stride
+                                # Update shared telemetry counter every 512 hashes
+                                if local_count & 511 == 0:
+                                    _nonce_ctr[0] += 512
+                        finally:
+                            _gc.enable()
 
                     _EXP_LOG.warning(
                         f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} "
