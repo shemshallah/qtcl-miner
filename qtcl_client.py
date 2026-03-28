@@ -14220,6 +14220,8 @@ class QtclClientApp:
                     _abort_evt   = _thr2.Event()   # set to stop all workers
                     _nonce_ctr   = [0]             # approximate telemetry counter (lock-free OK)
                     _hex_zeros   = "0" * difficulty_bits
+                    _BLOCK_TTL_S = 90              # refresh block before server's 120s entropy TTL
+                    _block_start = _t.time()
 
                     def _pow_worker(start_nonce: int, stride: int) -> None:
                         """Hash nonces start, start+stride, start+2*stride … until found or aborted."""
@@ -14257,6 +14259,7 @@ class QtclClientApp:
 
                     # Poll chain-tip and update telemetry while workers run
                     _chain_advanced = False
+                    _ttl_expired    = False
                     _last_telem_nonce = 0
                     while not _abort_evt.is_set():
                         await _asyncio.sleep(0.25)   # yield to event loop every 250ms
@@ -14265,6 +14268,16 @@ class QtclClientApp:
                             _MINE_TELEM.update_progress(target_height, difficulty_bits,
                                                         _cur_nonce, parent_hash)
                             _last_telem_nonce = _cur_nonce
+
+                        # Block TTL check — abort and rebuild before server entropy expires
+                        if _t.time() - _block_start > _BLOCK_TTL_S:
+                            _EXP_LOG.warning(
+                                f"[MINER] ⏰ Block TTL ({_BLOCK_TTL_S}s) reached at "
+                                f"nonce={_cur_nonce:,} — rebuilding with fresh seed/timestamp"
+                            )
+                            _ttl_expired = True
+                            _abort_evt.set()
+                            break
 
                         _now = _t.time()
                         if _now - _last_poll_time > _POLL_EVERY_S:
@@ -14293,8 +14306,11 @@ class QtclClientApp:
 
                     _found = (block_hash is not None)
 
-                    if not _found or _chain_advanced:
-                        _EXP_LOG.info("[MINER] Chain advanced during mining, restarting…")
+                    if not _found or _chain_advanced or _ttl_expired:
+                        if _ttl_expired:
+                            _EXP_LOG.info("[MINER] TTL expired, rebuilding block with fresh oracle seed…")
+                        else:
+                            _EXP_LOG.info("[MINER] Chain advanced during mining, restarting…")
                         _MINE_TELEM.mark_idle()
                         await _asyncio.sleep(0.1)
                         continue
@@ -14349,11 +14365,37 @@ class QtclClientApp:
                             fidelity=w_state_fidelity,
                         )
                         _MINE_TELEM.mark_idle()
+                        await _asyncio.sleep(0.5)
                     else:
-                        _MINE_TELEM.mark_idle()
-                    
-                    # Wait before restarting mining loop
-                    await _asyncio.sleep(0.5)
+                        # Parse rejection reason for smart retry
+                        _err_msg = ""
+                        if isinstance(_result, dict):
+                            _err_obj = _result.get("error") or _result
+                            _err_msg = str(_err_obj.get("message", "") if isinstance(_err_obj, dict) else _err_obj)
+                        
+                        if "entropy_expired" in _err_msg:
+                            # Seed is stale — rebuild block with fresh seed, same height
+                            _EXP_LOG.warning(
+                                f"[MINER] 🔄 entropy_expired h={target_height} — "
+                                f"rebuilding with fresh seed (no chain tip re-fetch)"
+                            )
+                            # Jump back to seed fetch (STAGE 2) by restarting loop
+                            # but keeping oracle_height/parent_hash — `continue` re-enters
+                            # the outer while True which re-fetches tip; that's one RPC but
+                            # guarantees height consistency.
+                            _MINE_TELEM.mark_mining()
+                            await _asyncio.sleep(0.1)
+                            # Don't go IDLE — loop continues immediately
+                        elif "Invalid height" in _err_msg or "chain advanced" in _err_msg.lower():
+                            # Chain moved, need fresh tip
+                            _EXP_LOG.info(f"[MINER] height mismatch on submit — restarting from tip")
+                            _MINE_TELEM.mark_idle()
+                            await _asyncio.sleep(0.5)
+                        else:
+                            # Unknown rejection (DB error, etc.) — brief pause then retry
+                            _EXP_LOG.warning(f"[MINER] ⚠️  submit rejected: {_err_msg[:120]} — retrying")
+                            _MINE_TELEM.mark_mining()
+                            await _asyncio.sleep(1.0)
                 
                 except Exception as e:
                     _EXP_LOG.error(
