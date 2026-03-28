@@ -4090,7 +4090,7 @@ class LocalBlockchainDB:
                         parent,
                         int(blk.get('timestamp_s') or blk.get('timestamp', 0)),
                         int(blk.get('nonce', 0)),
-                        int(blk.get('difficulty_bits') or blk.get('difficulty', 5)),
+                        int(blk.get('difficulty_bits') or blk.get('difficulty', 4)),
                         str(blk.get('miner_address', '')),
                         int(blk.get('pq_curr', h)),
                         int(blk.get('pq_last', max(0, h - 1))),
@@ -4717,7 +4717,7 @@ class SnapshotManager(ComponentBase):
             computed = self._hash.compute_block_hash(block_copy)
             if computed != stored_hash:
                 errors.append(f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…")
-        difficulty = float(block.get("difficulty", 5.25))
+        difficulty = float(block.get("difficulty", 4.0))
         if not self._hash.verify_pow(block, difficulty):
             errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
         height = block.get("height", 0)
@@ -5896,14 +5896,12 @@ class QtclServer(QtclNode):
         super().__init__(config_path=config_path, node_type="server", name="QtclServer")
         self._http_server: Optional[socketserver.TCPServer] = None
         self._http_thread: Optional[threading.Thread] = None
-        self._block_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
     def on_start(self) -> None:
         super().on_start()
         self.bootstrap.bootstrap_node("server")
         self._stop_event.clear()
         self._start_http_server()
-        self._start_block_production()
     def on_stop(self) -> None:
         self._stop_event.set()
         if self._http_server:
@@ -5992,341 +5990,6 @@ class QtclServer(QtclNode):
                 resp = req_handler.handle_OPTIONS(path)
                 self._send_response(resp)
         return QtclHTTPHandler
-    def _start_block_production(self) -> None:
-        self._block_thread = threading.Thread(
-            target=self._block_production_loop,
-            daemon=True,
-            name="QtclServer/BlockProduction",
-        )
-        self._block_thread.start()
-    def _block_production_loop(self) -> None:
-        block_interval = float(self._cfg.get("block_interval_seconds", 10.0))
-        difficulty = float(self._cfg.get("difficulty", 5.25))
-        snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        
-        while not self._stop_event.wait(block_interval):
-            try:
-                latest = self.db.get_latest_block()
-                prev_hash = latest["hash"] if latest else "0" * 64  # ✅ Use "hash" not "block_hash"
-                height = (latest["height"] + 1) if latest else 0
-                pending_txs = self.db.get_pending_transactions(limit=50)
-                tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
-                merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
-                evo_metrics: Dict = {}
-                if self.quantum_evo and self.quantum_evo.is_running():
-                    pre_hash = HASH_ENGINE.compute_hash(
-                        f"{height}:{prev_hash}:{time.time()}"
-                    )
-                    evo_metrics = self.quantum_evo.evolve(
-                        block_hash=pre_hash, height=height
-                    )
-                    lattice = getattr(self, "lattice", None)
-                    if lattice and lattice.is_running():
-                        self.quantum_evo.integrate_lattice(lattice, pre_hash, height)
-                    lineage = getattr(self, "lineage_tracker", None)
-                    if lineage and lineage.is_running():
-                        sv = self.quantum_evo.get_state()
-                        if sv is not None:
-                            lineage.track_lineage(height, sv, prev_hash)
-                block = {
-                    "height": height,
-                    "prev_hash": prev_hash,
-                    "merkle_root": merkle_root,
-                    "timestamp": time.time(),
-                    "difficulty": difficulty,
-                    "miner_id": "server",
-                    "tx_count": len(pending_txs),
-                    "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
-                    "nonce": 0,
-                }
-                nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
-                block["nonce"] = nonce
-                block["hash"] = block_hash
-                if self.quantum_evo and HAS_NUMPY:
-                    sv = self.quantum_evo.get_state()
-                    if sv is not None:
-                        self.db.insert_qubit_state(
-                            block_height=height,
-                            qubit_id=hash(block_hash)%65536,
-                            state_data={
-                                "block_hash": block_hash,
-                                "state_vector": sv.tobytes(),
-                                "metrics": evo_metrics,
-                                "evolution_seed": block_hash[:16],
-                                "timestamp": time.time(),
-                            }
-                        )
-                self.db.insert_block(block["height"], block)
-                for tx in pending_txs:
-                    self.db.confirm_transaction(
-                        tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx),
-                        block_hash,
-                    )
-                token_ledger = getattr(self, "token_ledger", None)
-                if token_ledger and token_ledger.is_running():
-                    _blk_h = block.get('height', 0)
-                    try:
-                        from globals import TessellationRewardSchedule as _TRS_ar
-                        _ar_rewards = _TRS_ar.get_rewards_for_height(_blk_h)
-                        _ar_total   = _ar_rewards['miner'] + _ar_rewards['treasury']
-                    except Exception:
-                        _ar_total = 800
-                    token_ledger.apply_block_rewards(block, "server", _ar_total)
-                if self.broadcaster:
-                    self.broadcaster.broadcast_block(block)
-                
-                if height > 0 and height % snap_interval == 0:
-                    try:
-                        snap = self.snapshot_mgr.create_snapshot(height)
-                        if self.broadcaster:
-                            self.broadcaster.broadcast_snapshot(snap)
-                        self.log.info(f"[{self.name}] snapshot broadcast at height {height}")
-                    except Exception as exc:
-                        self.log.warning(f"[{self.name}] snapshot failed: {exc}")
-                self.log.info(
-                    f"[{self.name}] block {height} mined "
-                    f"hash={block_hash[:12]}… nonce={nonce} txs={len(pending_txs)}"
-                )
-            except sqlite3.ProgrammingError as exc:
-                if "closed database" in str(exc).lower():
-                    self.log.warning(f"[{self.name}] database closed, stopping block production")
-                    break
-                else:
-                    self.log.error(f"[{self.name}] block production database error: {exc}")
-            except Exception as exc:
-                self.log.error(f"[{self.name}] block production error: {exc}\n{traceback.format_exc()}")
-class QtclMiner(QtclNode):
-    """
-    Miner entrypoint. Subscribes to SSE snapshots, mines blocks.
-    """
-    def __init__(self, config_path: Optional[str] = None):
-        super().__init__(config_path=config_path, node_type="miner", name="QtclMiner")
-        self._miner_id: str = ""
-        self._server_url: str = ""
-        self._mining_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._pending_blocks: queue.Queue = queue.Queue(maxsize=64)
-    def on_start(self) -> None:
-        super().on_start()
-        self._miner_id = self._cfg.get("miner_id") or HASH_ENGINE.compute_hash(
-            f"miner:{time.time()}"
-        )
-        self._server_url = self._cfg.get("server_url") or ENTROPY_SERVER_URL
-        self.bootstrap.bootstrap_node("miner")
-        self._register_with_server()
-        self._stop_event.clear()
-        
-        # ── CRITICAL: Bootstrap oracle snapshot before mining ────────────────
-        # Fetch RPC oracle snapshot, extract DM, reconstruct tripartite W-state
-        logger.info("[MINER] ⚙️  Bootstrapping oracle snapshot for W-state reconstruction...")
-        _oracle_ready = False
-        for attempt in range(10):
-            try:
-                snap = _LIVE_RPC_ORACLE.fetch_snapshot()
-                if snap and snap.get('density_matrix_hex'):
-                    dm_hex = snap.get('density_matrix_hex', '')
-                    if dm_hex and len(dm_hex) > 32:  # valid DM data
-                        pq0 = snap.get('pq0', 0)
-                        pq_curr = snap.get('pq_curr', 0)
-                        pq_last = snap.get('pq_last', 0)
-                        # ── Reconstruct tripartite W-state ──────────────────────
-                        try:
-                            triangle = HyperbolicTriangle.compute(pq0, pq_curr, pq_last)
-                            logger.info(
-                                f"[MINER] ✅ Oracle snapshot locked | "
-                                f"pq0={pq0} pq_curr={pq_curr} pq_last={pq_last} | "
-                                f"DM ready (cycle={snap.get('cycle', 0)})"
-                            )
-                            _oracle_ready = True
-                            break
-                        except Exception as e:
-                            logger.warning(f"[MINER] W-state reconstruction failed: {e}")
-                    else:
-                        logger.debug(f"[MINER] Oracle snapshot incomplete (attempt {attempt+1}/10)")
-                else:
-                    logger.debug(f"[MINER] Waiting for oracle snapshot (attempt {attempt+1}/10)...")
-            except Exception as e:
-                logger.debug(f"[MINER] Oracle bootstrap error: {e}")
-            time.sleep(0.5)
-        
-        if not _oracle_ready:
-            logger.warning("[MINER] ⚠️  Oracle snapshot bootstrap timeout — starting in degraded mode")
-        
-        self._start_mining_loop()
-        # ── Arm genesis-reset background listener ─────────────────────────
-        _GENESIS_RESET_LISTENER.start(
-            db            = self.db,
-            server_url    = self._server_url,
-            miner_address = getattr(self, '_miner_id', NULL_COINBASE_ADDRESS),
-            peers         = (list(self.db.get_known_peers())
-                             if hasattr(self.db, 'get_known_peers') else []),
-            broadcaster   = getattr(self, 'broadcaster', None),
-        )
-        logger.info(f"[MINER] 👂 GenesisResetListener armed → {self._server_url}")
-    def on_stop(self) -> None:
-        self._stop_event.set()
-        if self._mining_thread:
-            self._mining_thread.join(timeout=5)
-        super().on_stop()
-    def _register_with_server(self) -> None:
-        import urllib.request
-        host = self._cfg.get("miner_host") or _MY_IP or "127.0.0.1"
-        port = int(self._cfg.get("miner_port", 9000))
-        payload = json.dumps({
-            "miner_id": self._miner_id,
-            "address": host,
-            "port": port,
-            "pubkey": "",
-        }).encode()
-        req = urllib.request.Request(
-            f"{self._server_url}/register",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
-                self.log.info(f"[{self.name}] registered with server: {result}")
-        except Exception as exc:
-            self.log.warning(f"[{self.name}] server registration failed: {exc}")
-
-
-
-    def _send_heartbeat(self) -> None:
-        import urllib.request
-        payload = json.dumps({
-            "node_id": self._miner_id,
-            "type": "miner",
-        }).encode()
-        req = urllib.request.Request(
-            f"{self._server_url}/heartbeat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            urllib.request.urlopen(req, timeout=5).close()
-        except Exception:
-            pass
-
-    def _start_mining_loop(self) -> None:
-        self._mining_thread = threading.Thread(
-            target=self._mining_loop,
-            daemon=True,
-            name="QtclMiner/MiningLoop",
-        )
-        self._mining_thread.start()
-    def _mining_loop(self) -> None:
-        difficulty = float(self._cfg.get("difficulty", 5.25))
-        snap_interval = int(self._cfg.get("snapshot_interval", 100))
-        import urllib.request
-        while not self._stop_event.is_set():
-            try:
-                # ── _RESET_PERFORMED: background reset wiped DB ──────────────────
-                if _RESET_PERFORMED.is_set():
-                    _RESET_PERFORMED.clear()
-                    logger.warning("[MINING] ⚡ genesis-reset signal — restarting from h=0")
-                    self._stop_event.wait(1.0)
-                    continue
-                # ── Server chain-tip probe: detect server-side genesis wipe ──────
-                try:
-                    # 🔄 RPC-ONLY: Use qtcl_getBlockHeight RPC instead of REST /api/chain/tip
-                    tip = self._rpc("qtcl_getBlockHeight", [])
-                    if isinstance(tip, dict):
-                        _srv_h = int(tip.get('height') or 0)
-                    else:
-                        _srv_h = 0
-                    if _check_and_handle_chain_reset(
-                        server_height=_srv_h, db=self.db,
-                        server_url=self._server_url,
-                        miner_address=getattr(self,'_miner_id', NULL_COINBASE_ADDRESS),
-                        broadcaster=getattr(self,'broadcaster', None),
-                        peers=(list(self.db.get_known_peers())
-                               if hasattr(self.db,'get_known_peers') else []),
-                    ):
-                        logger.info("[MINING] ↩ Chain reset — restarting from genesis")
-                        self._stop_event.wait(2.0); continue
-                except Exception as _rce:
-                    logger.debug(f"[MINING] chain-tip probe (non-fatal): {_rce}")
-                timeout_mgr = getattr(self, "timeout_mgr", None)
-                server_timeout = timeout_mgr.get_timeout("server") if timeout_mgr else 5.0
-                try:
-                    latest_block = self._pending_blocks.get(timeout=server_timeout)
-                except queue.Empty:
-                    latest_block = self.db.get_latest_block()
-                if not latest_block:
-                    self._stop_event.wait(2.0)
-                    continue
-                prev_hash = latest_block.get("hash") or latest_block.get("block_hash", "0" * 64)
-                height = latest_block.get("height", 0) + 1
-                pending_txs = self.db.get_pending_transactions(limit=50)
-                tx_hashes = [tx.get("tx_hash") or HASH_ENGINE.compute_hash(tx) for tx in pending_txs]
-                merkle_root = HASH_ENGINE.merkle_root(tx_hashes)
-                evo_metrics: Dict = {}
-                if self.quantum_evo and self.quantum_evo.is_running():
-                    pre_hash = HASH_ENGINE.compute_hash(f"{height}:{prev_hash}")
-                    try:
-                        evo_metrics = self.quantum_evo.evolve(
-                            block_hash=pre_hash, height=height
-                        )
-                    except Exception as exc:
-                        self.log.warning(f"[{self.name}] quantum evo failed: {exc}")
-                block = {
-                    "height": height,
-                    "prev_hash": prev_hash,
-                    "merkle_root": merkle_root,
-                    "timestamp": time.time(),
-                    "difficulty": difficulty,
-                    "miner_id": self._miner_id,
-                    "tx_count": len(pending_txs),
-                    "nonce": 0,
-                    "data": {"quantum_metrics": {k: v for k, v in evo_metrics.items() if isinstance(v, (int, float, str))}},
-                }
-                nonce, block_hash = HASH_ENGINE.proof_of_work(block, difficulty)
-                block["nonce"] = nonce
-                block["hash"] = block_hash
-                self.db.insert_block(block)
-                self.db.increment_miner_blocks(self._miner_id)
-                if self.quantum_evo and HAS_NUMPY:
-                    sv = self.quantum_evo.get_state()
-                    if sv is not None:
-                        self.db.insert_qubit_state(
-                            block_height=height,
-                            qubit_id=hash(block_hash)%65536,
-                            state_data={
-                                "block_hash": block_hash,
-                                "state_vector": sv.tobytes(),
-                                "metrics": evo_metrics,
-                                "evolution_seed": block_hash[:16],
-                                "timestamp": time.time(),
-                            }
-                        )
-                payload = json.dumps({"block": block}).encode()
-                req = urllib.request.Request(
-                    f"{self._server_url}/block",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        pass
-                except Exception as exc:
-                    self.log.warning(f"[{self.name}] block submit failed: {exc}")
-                if height > 0 and height % snap_interval == 0:
-                    try:
-                        snap = self.snapshot_mgr.create_snapshot(height)
-                        self.broadcaster.push_snapshot_to_server(self._server_url, snap)
-                    except Exception as exc:
-                        self.log.warning(f"[{self.name}] snapshot push failed: {exc}")
-                self.log.info(
-                    f"[{self.name}] mined block {height} "
-                    f"hash={block_hash[:12]}… nonce={nonce}"
-                )
-            except Exception as exc:
-                self.log.error(f"[{self.name}] mining error: {exc}\n{traceback.format_exc()}")
-                self._stop_event.wait(2.0)
 class QtclOracle(QtclNode):
     """Oracle node: observes chain, emits oracle events, syncs with server."""
     def __init__(self, config_path: Optional[str] = None):
@@ -14059,7 +13722,7 @@ class QtclClientApp:
 
                     # STAGE 2: Fetch difficulty from latest block
                     _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
-                    difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 5)))
+                    difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 4)))
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
