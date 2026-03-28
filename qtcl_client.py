@@ -14429,8 +14429,8 @@ class QtclClientApp:
                             timestamp=timestamp,
                             fidelity=w_state_fidelity,
                         )
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.5)
+                        _MINE_TELEM.mark_mining()
+                        await _asyncio.sleep(0.1)
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
@@ -14454,8 +14454,8 @@ class QtclClientApp:
                         elif "Invalid height" in _err_msg or "chain advanced" in _err_msg.lower():
                             # Chain moved, need fresh tip
                             _EXP_LOG.info(f"[MINER] height mismatch on submit — restarting from tip")
-                            _MINE_TELEM.mark_idle()
-                            await _asyncio.sleep(0.5)
+                            _MINE_TELEM.mark_mining()
+                            await _asyncio.sleep(0.1)
                         else:
                             # Unknown rejection (DB error, etc.) — brief pause then retry
                             _EXP_LOG.warning(f"[MINER] ⚠️  submit rejected: {_err_msg[:120]} — retrying")
@@ -14567,7 +14567,7 @@ class QtclClientApp:
                     print(f"     CHSH AB : {_cf(m2.bell_chsh_AB,-4,4):.4f}   CHSH BC: {_cf(m2.bell_chsh_BC,-4,4):.4f}")
             print(sep)
             # ── Oracle / chain state ──────────────────────────────────────
-            print(f"  Oracle: h={ks2.block_height}  "
+            print(f"  Oracle: h={tel['height']}  "
                   f"fid={ks2.pq0_fidelity:.4f}  "
                   f"bridge={ks2.bridge_fidelity:.4f}  "
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
