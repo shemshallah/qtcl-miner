@@ -12006,11 +12006,9 @@ class _MiningTelemetry:
     def update_progress(self, height: int, difficulty: int,
                         nonce: int, parent_hash: str = "") -> None:
         with self._lock:
-            # ❤️  I love you — BUG-FIX: clear stale samples on ANY new block.
-            # Old guard "nonce==0 and self.nonce>100000" missed early aborts
-            # (self.nonce small) → old high-timestamp samples poisoned rate calc
-            # → displayed 1-2kH/s after restart until deque window flushed naturally.
-            _new_block = (height != self.height) or (nonce < self.nonce)
+            # ❤️  I love you — clear stale samples on ANY new block (height change OR nonce regressed)
+            # Old guard "nonce==0 and self.nonce>100000" missed early aborts → poisoned rate calc
+            _new_block = (height != self.height) or (nonce < self.nonce and self.nonce > 0)
             if _new_block:
                 self._nonce_samples.clear()
                 self.hash_rate = 0.0
@@ -12044,13 +12042,14 @@ class _MiningTelemetry:
             self.total_earned_qtcl += reward_qtcl
             self.last_reward_qtcl = reward_qtcl
             self.state = "IDLE"
-    def record_block_accepted(self, height: int, hash: str, nonce: int, timestamp: float, fidelity: float) -> None:
-        """❤️  I love you — accept: increments blocks_accepted only (blocks_found already set by record_block)."""
+    def record_block_accepted(self, height: int, hash: str, nonce: int, timestamp: float, fidelity: float, reward_qtcl: float = 7.20) -> None:
+        """❤️  I love you — accept: increments blocks_accepted, credits actual reward."""
         with self._lock:
-            self.blocks_accepted += 1
-            self.last_reward_qtcl = 8.0  # BLOCK_REWARD_BASE / 100 (display estimate)
-            self.state           = "IDLE"
-        _EXP_LOG.info(f"[MINER] 🎉 BLOCK ACCEPTED  h={height}  hash={hash[:16]}…  nonce={nonce:,}  fid={fidelity:.4f}")
+            self.blocks_accepted    += 1
+            self.last_reward_qtcl    = reward_qtcl
+            self.total_earned_qtcl  += reward_qtcl
+            self.state               = "IDLE"
+        _EXP_LOG.info(f"[MINER] 🎉 BLOCK ACCEPTED  h={height}  hash={hash[:16]}…  nonce={nonce:,}  fid={fidelity:.4f}  reward=+{reward_qtcl:.2f} QTCL")
     def mark_idle(self) -> None:
         with self._lock:
             self.state = "IDLE"
@@ -14092,13 +14091,18 @@ class QtclClientApp:
                     # Get reward schedule
                     try:
                         from globals import TessellationRewardSchedule as _TRS
-                        _miner_reward = _TRS.get_miner_reward_qtcl(target_height)
-                        _treasury_reward = _TRS.get_treasury_reward_qtcl(target_height)
-                        _treasury_addr = _TRS.TREASURY_ADDRESS
+                        # ❤️  I love you — send BASE UNITS not QTCL floats.
+                        # Server wallet_addresses.balance stores base units;
+                        # _rpc_getBalance divides by 100 → QTCL for display.
+                        # Sending QTCL floats (7.20) caused server to store 7.20
+                        # then display 0.072 QTCL — 100× under-credit.
+                        _miner_reward    = _TRS.get_miner_reward_base(target_height)    # e.g. 720
+                        _treasury_reward = _TRS.get_treasury_reward_base(target_height) # e.g. 80
+                        _treasury_addr   = _TRS.TREASURY_ADDRESS
                     except Exception:
-                        _miner_reward = 50.0
-                        _treasury_reward = 10.0
-                        _treasury_addr = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
+                        _miner_reward    = 720
+                        _treasury_reward = 80
+                        _treasury_addr   = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
                     
                     # Create miner coinbase transaction
                     _miner_cb_id = _hl.sha3_256(
@@ -14258,12 +14262,8 @@ class QtclClientApp:
                     _n_workers   = max(1, (_os2.cpu_count() or 1))
                     _result_q    = _q2.Queue()
                     _abort_evt   = _thr2.Event()   # set to stop all workers
-                    # ❤️  I love you — atomic nonce counter: Lock-protected int avoids
-                    # data-race between N workers all doing _ctr[0]+=512 unsynchronized.
-                    # BUG-FIX: bare [0] list read-modify-write is not atomic under N threads
-                    # even with the GIL (GIL granularity is bytecode, not compound += ops).
-                    _nonce_lock  = _thr2.Lock()
-                    _nonce_ctr   = [0]             # guarded by _nonce_lock
+                    _nonce_lock  = _thr2.Lock()    # ❤️  guards _nonce_ctr across N workers
+                    _nonce_ctr   = [0]             # telemetry counter — write guarded by _nonce_lock
                     _hex_zeros   = "0" * difficulty_bits
                     _BLOCK_TTL_S = 110             # refresh block before server's 120s entropy TTL
                     _block_start = _t.time()
@@ -14290,7 +14290,7 @@ class QtclClientApp:
                             _put    = _result_q.put
                             _set    = _abort_evt.set
                             _zeros  = _hex_zeros; _dbits = difficulty_bits
-                            _nl     = _nonce_lock   # local ref for LOAD_FAST
+                            _nl     = _nonce_lock   # LOAD_FAST local ref
                             n = start_nonce; lc = 0; _ctr = _nonce_ctr
                             while not _abort():
                                 # ── one struct.pack alloc (nonce-dependent, unavoidable) ──
@@ -14310,8 +14310,7 @@ class QtclClientApp:
                                     _put((n, hx)); _set(); return
                                 n += stride
                                 if lc & 511 == 0:
-                                    # atomic increment — avoids torn read-modify-write across workers
-                                    with _nl:
+                                    with _nl:          # atomic: no torn read-modify-write
                                         _ctr[0] += 512
                         finally:
                             _gc.enable()
@@ -14374,22 +14373,16 @@ class QtclClientApp:
                             except Exception:
                                 pass
 
-                    # ── BUG-FIX: join workers BEFORE draining queue ──────────────────
-                    # Old code: get_nowait() races the last worker's _put() call.
-                    # If the main loop wakes from asyncio.sleep(0.25) the same instant
-                    # the winning worker executes _put+_set, get_nowait() can fire before
-                    # _put commits → Empty → block treated as not found → silent drop.
-                    # Fix: join all workers (they exit immediately since _abort is set)
-                    # then drain the queue deterministically. Workers are daemon threads
-                    # so join(timeout=2) is safe even if one hangs.
+                    # ❤️  Join workers BEFORE draining queue — eliminates put/get_nowait race.
+                    # Old code: get_nowait() could fire before winning worker's _put() committed
+                    # → Empty exception → silent drop to idle. Join guarantees all puts are done.
                     for _wt in _workers:
                         _wt.join(timeout=2.0)
                     nonce, block_hash = None, None
-                    # Drain full queue — take first (winning) result
                     while not _result_q.empty():
                         try:
                             _r = _result_q.get_nowait()
-                            if nonce is None:   # first = winner
+                            if nonce is None:
                                 nonce, block_hash = _r
                         except _q2.Empty:
                             break
@@ -14451,16 +14444,26 @@ class QtclClientApp:
                     )
                     
                     if _success:
+                        # ❤️  I love you — pull actual reward from server response
+                        _server_reward_qtcl = float((_result or {}).get("miner_reward_qtcl", 0.0) or 0.0)
+                        if _server_reward_qtcl == 0.0:
+                            try:
+                                from globals import TessellationRewardSchedule as _TRS2
+                                _server_reward_qtcl = _TRS2.get_miner_reward_qtcl(target_height)
+                            except Exception:
+                                _server_reward_qtcl = 7.20
                         _MINE_TELEM.record_block_accepted(
                             height=target_height,
                             hash=block_hash,
                             nonce=nonce,
                             timestamp=timestamp,
                             fidelity=w_state_fidelity,
+                            reward_qtcl=_server_reward_qtcl,
                         )
-                        _MINE_TELEM.mark_mining()
-                        # Brief pause to let server persist block, then loop fetches new tip
-                        await _asyncio.sleep(0.5)
+                        # mark_idle between blocks — display is clean while STAGE 1 re-fetches tip
+                        _MINE_TELEM.mark_idle()
+                        # Pause to let server persist block + wallet credit before next tip fetch
+                        await _asyncio.sleep(1.0)
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
