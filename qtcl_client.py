@@ -14218,26 +14218,25 @@ class QtclClientApp:
                             break
                         
                         nonce += 1
-                        _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
-                        
-                        # Async yield every 10k hashes (prevent blocking)
+
+                        # Batch: telemetry + yield + poll only every 10k hashes
                         if nonce % _YIELD_EVERY == 0:
+                            _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                             await _asyncio.sleep(0)
-                        
-                        # Poll chain height every 2 seconds
-                        _now = _t.time()
-                        if _now - _last_poll_time > _POLL_EVERY_S:
-                            _last_poll_time = _now
-                            try:
-                                _tip_check = kapi.get_chain_tip()
-                                _check_h = int(_tip_check.get("block_height") or _tip_check.get("height") or 0)
-                                if _check_h > oracle_height:
-                                    _EXP_LOG.warning(
-                                        f"[MINER] ⚡ Chain advanced h={_check_h} → abort mining, restart"
-                                    )
-                                    break  # Exit mining loop, restart main loop
-                            except Exception:
-                                pass
+                            # Poll chain height every 2 seconds
+                            _now = _t.time()
+                            if _now - _last_poll_time > _POLL_EVERY_S:
+                                _last_poll_time = _now
+                                try:
+                                    _tip_check = kapi.get_chain_tip()
+                                    _check_h = int(_tip_check.get("block_height") or _tip_check.get("height") or 0)
+                                    if _check_h > oracle_height:
+                                        _EXP_LOG.warning(
+                                            f"[MINER] ⚡ Chain advanced h={_check_h} → abort mining, restart"
+                                        )
+                                        break
+                                except Exception:
+                                    pass
                     
                     if not _found:
                         # Chain advanced during mining, restart from new tip
