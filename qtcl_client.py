@@ -1744,15 +1744,21 @@ class LiveRPCOracleSnapshot:
             # Update oracle state
             if snap:
                 with self._oracle_state_lock:
-                    w_state = snap.get('w_state', {})
+                    w_state = snap.get('w_state') or {}
+                    _lattice = snap.get('lattice') or {}
+                    _fid_raw = (w_state.get('fidelity') or
+                                snap.get('w_state_fidelity') or
+                                _lattice.get('fidelity') or 0.0)
                     self._oracle_state = {
-                        'w_state_fidelity': w_state.get('fidelity', 0.0),
-                        'coherence_l1': w_state.get('coherence', 0.0),
-                        'von_neumann_entropy': w_state.get('entropy', 0.0),
-                        'purity': w_state.get('purity', 0.0),
+                        'w_state_fidelity': float(_fid_raw),
+                        'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
+                        'von_neumann_entropy': float(w_state.get('entropy') or 0.0),
+                        'purity': float(w_state.get('purity') or _lattice.get('fidelity') or 0.0),
                         'cycle': snap.get('cycle', 0),
                         'consensus': snap.get('consensus', False),
-                        'mermin_test': snap.get('mermin_test', {})
+                        'mermin_test': snap.get('mermin_test', {}),
+                        'block_height': int(snap.get('block_height') or snap.get('height') or 0),
+                        'density_matrix_hex': snap.get('density_matrix_hex', ''),
                     }
             
             return snap
@@ -13835,28 +13841,14 @@ class QtclClientApp:
             )
             return (True, _meas, _pow_seed, _report)
         # ── Execute ────────────────────────────────────────────────────────────
-        # Simple direct RPC: get full snapshot with density matrix
-        import urllib.request as _ur_snap
-        import json as _j_snap
-        
         try:
-            _url_snap = f"{ENTROPY_SERVER_URL}/rpc"
-            _payload_snap = _j_snap.dumps({
-                'jsonrpc': '2.0',
-                'method': 'qtcl_getQuantumMetrics',
-                'params': [],
-                'id': 1
-            }).encode('utf-8')
-            _req_snap = _ur_snap.Request(_url_snap, data=_payload_snap, headers={'Content-Type': 'application/json'}, method='POST')
-            with _ur_snap.urlopen(_req_snap, timeout=10) as _resp_snap:
-                _res_snap = _j_snap.loads(_resp_snap.read().decode('utf-8'))
-                _snap_data = _res_snap.get('result', {})
-                _dm_hex = _snap_data.get('density_matrix_hex', '')
-                _raw_fid = (_snap_data.get('w_state') or {}).get('fidelity') or \
-                           _snap_data.get('w_state_fidelity') or \
-                           (_snap_data.get('lattice') or {}).get('fidelity') or 0.0
-                _w_fid = float(_raw_fid)
-                _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
+            _snap_data = self.api._rpc("qtcl_getQuantumMetrics", [], timeout=10, retries=2) or {}
+            _dm_hex = _snap_data.get('density_matrix_hex', '')
+            _raw_fid = ((_snap_data.get('w_state') or {}).get('fidelity') or
+                        _snap_data.get('w_state_fidelity') or
+                        (_snap_data.get('lattice') or {}).get('fidelity') or 0.0)
+            _w_fid = float(_raw_fid)
+            _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
         except Exception as _e_snap:
             print(f"  [SNAPSHOT-ERROR] {_e_snap}", flush=True)
             _dm_ready = False
@@ -13924,13 +13916,11 @@ class QtclClientApp:
             - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
-            
+
             kapi = KoyebAPIClient()
             _MINE_TELEM.mark_idle()
-            
-            # ══════════════════════════════════════════════════════════════════════
-            # SUBMISSION PIPELINE — Single RPC Path, Exponential Backoff
-            # ══════════════════════════════════════════════════════════════════════
+            _POLL_EVERY_S = 2.0
+            _last_poll_time = _t.time()
             class _SubmissionPipeline:
                 """⚛️ Enterprise RPC submission with atomic quantum state locking."""
                 RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]  # 61s window
@@ -14035,7 +14025,6 @@ class QtclClientApp:
             # ══════════════════════════════════════════════════════════════════════
             # UNIFIED MINING LOOP — Pure Python, Single Path, No Fallbacks
             # ══════════════════════════════════════════════════════════════════════
-            _YIELD_EVERY = 10000  # async yield every 10k hashes
             _POLL_EVERY_S = 2.0   # poll chain height every 2 seconds
             _last_poll_time = _t.time()
             
@@ -14175,47 +14164,73 @@ class QtclClientApp:
                     merkle_root = _compute_merkle(_block_txs)
                     
                     # ──────────────────────────────────────────────────────────────
-                    # STAGE 4: Mine (Pure Python SHA256 — Single Path, No Fallbacks)
+                    # STAGE 4: QTCL-PoW (matches server qtcl_pow_hash exactly)
+                    # SHAKE-256 512KB scratchpad → SHA3-256 struct header →
+                    # 64 sequential scratchpad-mix rounds per nonce
+                    # Scratchpad built ONCE per block from oracle seed
                     # ──────────────────────────────────────────────────────────────
-                    _EXP_LOG.info(
-                        f"[MINER] Mining h={target_height} diff={difficulty_bits} "
-                        f"parent={parent_hash[:16]}… "
-                        f"target={'0'*difficulty_bits}…"
+                    import struct as _st
+                    _POW_SCRATCHPAD_BYTES = 512 * 1024
+                    _POW_WINDOW_BYTES     = 64
+                    _POW_MIX_ROUNDS       = 64
+                    _POW_N_WINDOWS        = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
+
+                    # Build scratchpad once (~1.7ms), reused across all nonces
+                    _scratchpad = _hl.shake_256(
+                        b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed
+                    ).digest(_POW_SCRATCHPAD_BYTES)
+
+                    # Pre-pack fixed header fields
+                    _ph_parent = bytes.fromhex(parent_hash.zfill(64))[:32]
+                    _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
+                    _ph_miner  = miner_addr.encode()[:40].ljust(40, b'\x00')
+                    _ph_seed   = _w_entropy_seed[:32]
+
+                    def _qtcl_hash(nonce: int) -> str:
+                        hdr = _st.pack(
+                            '>Q I 32s 32s I I 40s 32s',
+                            target_height, timestamp,
+                            _ph_parent, _ph_merkle,
+                            difficulty_bits, nonce,
+                            _ph_miner, _ph_seed,
+                        )
+                        state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
+                        sp = _scratchpad
+                        ws = _POW_WINDOW_BYTES
+                        for rnd in range(_POW_MIX_ROUNDS):
+                            wi = _st.unpack_from('>I', state, 0)[0] % _POW_N_WINDOWS
+                            state = _hl.sha3_256(
+                                state + sp[wi*ws : wi*ws+ws] + _st.pack('>I', rnd)
+                            ).digest()
+                        return state.hex()
+
+                    _EXP_LOG.warning(
+                        f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} "
+                        f"seed={_w_entropy_seed.hex()[:16]}… scratchpad=512KB"
                     )
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                     _MINE_TELEM.mark_mining()
-                    
+
                     hex_zeros = "0" * difficulty_bits
                     block_hash = None
                     nonce = 0
                     _found = False
-                    
+
                     while not _found:
-                        # Pure Python: block JSON → SHA256 → check leading zeros
-                        _block_data = {
-                            "height": target_height,
-                            "parent_hash": parent_hash,
-                            "merkle_root": merkle_root,
-                            "timestamp": timestamp,
-                            "nonce": nonce,
-                            "difficulty_bits": difficulty_bits,
-                            "miner_address": miner_addr,
-                        }
-                        _canonical = _j.dumps(_block_data, sort_keys=True, separators=(',', ':')).encode()
-                        _hash_result = _hl.sha256(_canonical).hexdigest()
-                        
+                        _hash_result = _qtcl_hash(nonce)
+
                         if _hash_result.startswith(hex_zeros):
                             block_hash = _hash_result
                             _found = True
                             break
-                        
+
                         nonce += 1
 
-                        # Batch: telemetry + yield + poll only every 10k hashes
-                        if nonce % _YIELD_EVERY == 0:
+                        # Telemetry + yield + poll every 500 hashes
+                        # (each hash = 64 SHA3 rounds, much heavier than SHA256)
+                        if nonce % 500 == 0:
                             _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
                             await _asyncio.sleep(0)
-                            # Poll chain height every 2 seconds
                             _now = _t.time()
                             if _now - _last_poll_time > _POLL_EVERY_S:
                                 _last_poll_time = _now
@@ -14224,7 +14239,7 @@ class QtclClientApp:
                                     _check_h = int((_tip_check or {}).get("height") or 0)
                                     if _check_h > oracle_height:
                                         _EXP_LOG.warning(
-                                            f"[MINER] ⚡ Chain advanced h={_check_h} → abort mining, restart"
+                                            f"[MINER] ⚡ Chain advanced h={_check_h} → abort, restart"
                                         )
                                         break
                                 except Exception:
