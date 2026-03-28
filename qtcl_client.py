@@ -14041,31 +14041,23 @@ class QtclClientApp:
             
             while True:  # Main mining loop
                 try:
-                    # STAGE 1: Fetch chain tip via direct RPC
-                    _url_h = f"{ENTROPY_SERVER_URL}/rpc"
-                    _ph = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlockHeight', 'params': [], 'id': 1}).encode('utf-8')
-                    _rh = _ur_snap.Request(_url_h, data=_ph, headers={'Content-Type': 'application/json'}, method='POST')
-                    with _ur_snap.urlopen(_rh, timeout=10) as _resp_h:
-                        _res_h = _j_snap.loads(_resp_h.read().decode('utf-8')).get('result', {})
-                        oracle_height = int(_res_h.get('height', 0))
-                        oracle_hash = str(_res_h.get('tip_hash', '0' * 64))
-                    
-                    # STAGE 2: Fetch full block with difficulty
-                    _url_b = f"{ENTROPY_SERVER_URL}/rpc"
-                    _pb = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getBlock', 'params': [oracle_height], 'id': 1}).encode('utf-8')
-                    _rb = _ur_snap.Request(_url_b, data=_pb, headers={'Content-Type': 'application/json'}, method='POST')
-                    with _ur_snap.urlopen(_rb, timeout=10) as _resp_b:
-                        _res_b = _j_snap.loads(_resp_b.read().decode('utf-8')).get('result', {})
-                        difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 5)))
-                    
+                    # STAGE 1: Fetch chain tip
+                    _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
+                    if not _res_h:
+                        _EXP_LOG.warning("[MINER] chain tip fetch failed, retrying…")
+                        await _asyncio.sleep(2.0)
+                        continue
+                    oracle_height = int(_res_h.get('height', 0))
+                    oracle_hash = str(_res_h.get('tip_hash', '0' * 64))
+
+                    # STAGE 2: Fetch difficulty from latest block
+                    _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
+                    difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 5)))
+
                     # STAGE 3: Fetch mempool
-                    _url_m = f"{ENTROPY_SERVER_URL}/rpc"
-                    _pm = _j_snap.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMempool', 'params': [], 'id': 1}).encode('utf-8')
-                    _rm = _ur_snap.Request(_url_m, data=_pm, headers={'Content-Type': 'application/json'}, method='POST')
-                    with _ur_snap.urlopen(_rm, timeout=5) as _resp_m:
-                        _res_m = _j_snap.loads(_resp_m.read().decode('utf-8')).get('result', [])
-                        _pending_user_txs = _res_m if isinstance(_res_m, list) else []
-                    
+                    _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
+                    _pending_user_txs = _res_m if isinstance(_res_m, list) else []
+
                     _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits}")
                     
                     target_height = oracle_height + 1
@@ -14228,8 +14220,8 @@ class QtclClientApp:
                             if _now - _last_poll_time > _POLL_EVERY_S:
                                 _last_poll_time = _now
                                 try:
-                                    _tip_check = kapi.get_chain_tip()
-                                    _check_h = int(_tip_check.get("block_height") or _tip_check.get("height") or 0)
+                                    _tip_check = kapi._rpc("qtcl_getBlockHeight", [], timeout=3, retries=1)
+                                    _check_h = int((_tip_check or {}).get("height") or 0)
                                     if _check_h > oracle_height:
                                         _EXP_LOG.warning(
                                             f"[MINER] ⚡ Chain advanced h={_check_h} → abort mining, restart"
