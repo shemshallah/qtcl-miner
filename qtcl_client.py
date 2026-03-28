@@ -14168,85 +14168,132 @@ class QtclClientApp:
                     # SHAKE-256 512KB scratchpad → SHA3-256 struct header →
                     # 64 sequential scratchpad-mix rounds per nonce
                     # Scratchpad built ONCE per block from oracle seed
+                    # Multi-threaded: hashlib releases the GIL, so N threads × full
+                    # core throughput.  Chain-tip poll runs in its own thread so it
+                    # never stalls the hash workers.
                     # ──────────────────────────────────────────────────────────────
-                    import struct as _st
+                    import struct as _st, os as _os2, threading as _thr2, queue as _q2
+
                     _POW_SCRATCHPAD_BYTES = 512 * 1024
                     _POW_WINDOW_BYTES     = 64
                     _POW_MIX_ROUNDS       = 64
                     _POW_N_WINDOWS        = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
 
-                    # Build scratchpad once (~1.7ms), reused across all nonces
+                    # Build scratchpad once (~1.7ms), shared read-only across threads
                     _scratchpad = _hl.shake_256(
                         b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed
                     ).digest(_POW_SCRATCHPAD_BYTES)
 
-                    # Pre-pack fixed header fields
+                    # Pre-pack fixed header fields (immutable, safe to share)
                     _ph_parent = bytes.fromhex(parent_hash.zfill(64))[:32]
                     _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
                     _ph_miner  = miner_addr.encode()[:40].ljust(40, b'\x00')
                     _ph_seed   = _w_entropy_seed[:32]
 
+                    # Capture locals for worker closures
+                    _tgt_h   = target_height
+                    _ts      = timestamp
+                    _diff    = difficulty_bits
+                    _sp      = _scratchpad
+                    _ws      = _POW_WINDOW_BYTES
+                    _nwin    = _POW_N_WINDOWS
+                    _mix     = _POW_MIX_ROUNDS
+
                     def _qtcl_hash(nonce: int) -> str:
                         hdr = _st.pack(
                             '>Q I 32s 32s I I 40s 32s',
-                            target_height, timestamp,
+                            _tgt_h, _ts,
                             _ph_parent, _ph_merkle,
-                            difficulty_bits, nonce,
+                            _diff, nonce,
                             _ph_miner, _ph_seed,
                         )
                         state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
-                        sp = _scratchpad
-                        ws = _POW_WINDOW_BYTES
-                        for rnd in range(_POW_MIX_ROUNDS):
-                            wi = _st.unpack_from('>I', state, 0)[0] % _POW_N_WINDOWS
+                        for rnd in range(_mix):
+                            wi = _st.unpack_from('>I', state, 0)[0] % _nwin
                             state = _hl.sha3_256(
-                                state + sp[wi*ws : wi*ws+ws] + _st.pack('>I', rnd)
+                                state + _sp[wi*_ws : wi*_ws+_ws] + _st.pack('>I', rnd)
                             ).digest()
                         return state.hex()
 
+                    _n_workers   = max(1, (_os2.cpu_count() or 1))
+                    _result_q    = _q2.Queue()
+                    _abort_evt   = _thr2.Event()   # set to stop all workers
+                    _nonce_ctr   = [0]             # approximate telemetry counter (lock-free OK)
+                    _hex_zeros   = "0" * difficulty_bits
+
+                    def _pow_worker(start_nonce: int, stride: int) -> None:
+                        """Hash nonces start, start+stride, start+2*stride … until found or aborted."""
+                        n = start_nonce
+                        local_count = 0
+                        while not _abort_evt.is_set():
+                            h = _qtcl_hash(n)
+                            local_count += 1
+                            if h.startswith(_hex_zeros):
+                                _result_q.put((n, h))
+                                _abort_evt.set()
+                                return
+                            n += stride
+                            # Update shared telemetry counter every 200 hashes (cheap)
+                            if local_count % 200 == 0:
+                                _nonce_ctr[0] += 200
+
                     _EXP_LOG.warning(
                         f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} "
-                        f"seed={_w_entropy_seed.hex()[:16]}… scratchpad=512KB"
+                        f"seed={_w_entropy_seed.hex()[:16]}… scratchpad=512KB "
+                        f"workers={_n_workers}"
                     )
                     _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, parent_hash)
                     _MINE_TELEM.mark_mining()
 
-                    hex_zeros = "0" * difficulty_bits
-                    block_hash = None
-                    nonce = 0
-                    _found = False
+                    # Launch worker threads (hashlib C calls release the GIL)
+                    _workers = []
+                    for _wi in range(_n_workers):
+                        _wt = _thr2.Thread(
+                            target=_pow_worker, args=(_wi, _n_workers),
+                            daemon=True, name=f"PoW-{_wi}"
+                        )
+                        _wt.start()
+                        _workers.append(_wt)
 
-                    while not _found:
-                        _hash_result = _qtcl_hash(nonce)
+                    # Poll chain-tip and update telemetry while workers run
+                    _chain_advanced = False
+                    _last_telem_nonce = 0
+                    while not _abort_evt.is_set():
+                        await _asyncio.sleep(0.25)   # yield to event loop every 250ms
+                        _cur_nonce = _nonce_ctr[0]
+                        if _cur_nonce != _last_telem_nonce:
+                            _MINE_TELEM.update_progress(target_height, difficulty_bits,
+                                                        _cur_nonce, parent_hash)
+                            _last_telem_nonce = _cur_nonce
 
-                        if _hash_result.startswith(hex_zeros):
-                            block_hash = _hash_result
-                            _found = True
-                            break
+                        _now = _t.time()
+                        if _now - _last_poll_time > _POLL_EVERY_S:
+                            _last_poll_time = _now
+                            try:
+                                # Run blocking RPC in thread so event loop stays free
+                                _tip_check = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlockHeight", [], 3, 1
+                                )
+                                _check_h = int((_tip_check or {}).get("height") or 0)
+                                if _check_h > oracle_height:
+                                    _EXP_LOG.warning(
+                                        f"[MINER] ⚡ Chain advanced h={_check_h} → abort, restart"
+                                    )
+                                    _chain_advanced = True
+                                    _abort_evt.set()
+                            except Exception:
+                                pass
 
-                        nonce += 1
+                    # Collect result (non-blocking — worker already put it or we aborted)
+                    nonce, block_hash = None, None
+                    try:
+                        nonce, block_hash = _result_q.get_nowait()
+                    except _q2.Empty:
+                        pass
 
-                        # Telemetry + yield + poll every 500 hashes
-                        # (each hash = 64 SHA3 rounds, much heavier than SHA256)
-                        if nonce % 500 == 0:
-                            _MINE_TELEM.update_progress(target_height, difficulty_bits, nonce, parent_hash)
-                            await _asyncio.sleep(0)
-                            _now = _t.time()
-                            if _now - _last_poll_time > _POLL_EVERY_S:
-                                _last_poll_time = _now
-                                try:
-                                    _tip_check = kapi._rpc("qtcl_getBlockHeight", [], timeout=3, retries=1)
-                                    _check_h = int((_tip_check or {}).get("height") or 0)
-                                    if _check_h > oracle_height:
-                                        _EXP_LOG.warning(
-                                            f"[MINER] ⚡ Chain advanced h={_check_h} → abort, restart"
-                                        )
-                                        break
-                                except Exception:
-                                    pass
-                    
-                    if not _found:
-                        # Chain advanced during mining, restart from new tip
+                    _found = (block_hash is not None)
+
+                    if not _found or _chain_advanced:
                         _EXP_LOG.info("[MINER] Chain advanced during mining, restarting…")
                         _MINE_TELEM.mark_idle()
                         await _asyncio.sleep(0.1)
