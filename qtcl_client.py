@@ -12036,6 +12036,13 @@ class _MiningTelemetry:
             self.total_earned_qtcl += reward_qtcl
             self.last_reward_qtcl = reward_qtcl
             self.state = "IDLE"
+    def record_block_accepted(self, height: int, hash: str, nonce: int, timestamp: float, fidelity: float) -> None:
+        """❤️  I love you — accept: increments blocks_accepted only (blocks_found already set by record_block)."""
+        with self._lock:
+            self.blocks_accepted += 1
+            self.last_reward_qtcl = 8.0  # BLOCK_REWARD_BASE / 100 (display estimate)
+            self.state           = "IDLE"
+        _EXP_LOG.info(f"[MINER] 🎉 BLOCK ACCEPTED  h={height}  hash={hash[:16]}…  nonce={nonce:,}  fid={fidelity:.4f}")
     def mark_idle(self) -> None:
         with self._lock:
             self.state = "IDLE"
@@ -13286,14 +13293,19 @@ class QtclClientApp:
                                     except Exception as _ie:
                                         _EXP_LOG.debug(f"[SNAPSHOT-RPC] ingest error: {_ie}")
                     except _HE as _http_err:
-                        # ⚛️  Diagnostic: 5xx errors need attention
+                        # ⚛️  Diagnostic: throttle 5xx to avoid log spam from transient Koyeb 503s
                         _fail_count += 1
                         if _http_err.code >= 500:
-                            try:
-                                error_body = _http_err.read().decode('utf-8', errors='replace')[:100]
-                                _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} → {error_body}")
-                            except:
-                                _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code}")
+                            if _fail_count == 1 or _fail_count % 50 == 0:
+                                try:
+                                    error_body = _http_err.read().decode('utf-8', errors='replace')[:80]
+                                    # Strip HTML — log only first 80 chars of plain text portion
+                                    import re as _re2; error_body = _re2.sub(r'<[^>]+>', '', error_body).strip()[:60]
+                                    _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count}) → {error_body}")
+                                except:
+                                    _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count})")
+                            else:
+                                _EXP_LOG.debug(f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count}), retrying…")
                         elif _fail_count % 10 == 0:
                             _EXP_LOG.debug(f"[SNAPSHOT-RPC] HTTP {_http_err.code}, retrying...")
                         # Exponential backoff on repeated failures
@@ -14208,56 +14220,83 @@ class QtclClientApp:
                     _rp      = _rnd_packed
                     _smv     = _sp_mv
 
+                    # PERF-FIX: pre-compute all window start offsets as tuple —
+                    # eliminates wi*_ws multiply + memoryview __getitem__ per round
+                    _WIN_OFFSETS = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
+                    _WIN_END     = _POW_WINDOW_BYTES   # constant end offset relative to start
+
+                    # PERF-FIX: pre-compute POW prefix as bytes once — eliminates
+                    # b"QTCL_POW_v1:" + hdr concat alloc on every nonce
+                    _POW_PREFIX = b"QTCL_POW_v1:"
+                    _HDR_FMT    = '>Q I 32s 32s I I 40s 32s'
+                    # PERF-FIX: pre-compute range object — range() inside a function call
+                    # still constructs a new range object each invocation in Python 3
+                    _RND_RANGE  = range(_POW_MIX_ROUNDS)
+
+                    # _qtcl_hash kept for external/test reference only — hot path is inlined
                     def _qtcl_hash(nonce: int) -> str:
-                        hdr = _st.pack(
-                            '>Q I 32s 32s I I 40s 32s',
-                            _tgt_h, _ts,
-                            _ph_parent, _ph_merkle,
-                            _diff, nonce,
-                            _ph_miner, _ph_seed,
-                        )
-                        state = _hl.sha3_256(b"QTCL_POW_v1:" + hdr).digest()
-                        for rnd in range(_mix):
-                            # PERF-FIX: memoryview slice is zero-copy (no bytes alloc)
-                            # PERF-FIX: _rp[rnd] is pre-packed (no struct.pack alloc)
+                        hdr = _st.pack(_HDR_FMT, _tgt_h, _ts, _ph_parent, _ph_merkle,
+                                       _diff, nonce, _ph_miner, _ph_seed)
+                        _h0 = _hl.sha3_256(); _h0.update(_POW_PREFIX); _h0.update(hdr)
+                        state = _h0.digest()
+                        for rnd in _RND_RANGE:
                             wi = _st.unpack_from('>I', state, 0)[0] % _nwin
-                            state = _hl.sha3_256(
-                                state + bytes(_smv[wi*_ws : wi*_ws+_ws]) + _rp[rnd]
-                            ).digest()
+                            o = _WIN_OFFSETS[wi]
+                            _h = _hl.sha3_256(); _h.update(state)
+                            _h.update(_smv[o : o+_WIN_END]); _h.update(_rp[rnd])
+                            state = _h.digest()
                         return state.hex()
 
                     _n_workers   = max(1, (_os2.cpu_count() or 1))
                     _result_q    = _q2.Queue()
                     _abort_evt   = _thr2.Event()   # set to stop all workers
-                    # PERF-FIX: use atomic integer via array for lock-free cross-thread counter
-                    import array as _arr
-                    _nonce_ctr_arr = _arr.array('q', [0])   # 'q' = signed 64-bit, atomic on CPython
-                    _nonce_ctr     = [0]                    # kept for telemetry read path (main thread only)
+                    _nonce_ctr   = [0]             # telemetry counter, main-thread read only
                     _hex_zeros   = "0" * difficulty_bits
                     _BLOCK_TTL_S = 90              # refresh block before server's 120s entropy TTL
                     _block_start = _t.time()
 
                     def _pow_worker(start_nonce: int, stride: int) -> None:
-                        """Hash nonces start, start+stride, start+2*stride … until found or aborted.
-                        PERF-FIX: disable GC inside worker — all hot-path objects are stack-local
-                        or immortal module-level; GC scans are pure overhead here."""
+                        """⛏️  Hot-path PoW worker — fully inlined, zero per-nonce allocs except
+                        one struct.pack (unavoidable: nonce changes).  GC disabled for duration."""
                         import gc as _gc
                         _gc.disable()
                         try:
-                            n = start_nonce
-                            local_count = 0
-                            _abort_check = _abort_evt.is_set   # bind method once
-                            while not _abort_check():
-                                h = _qtcl_hash(n)
-                                local_count += 1
-                                if h[:difficulty_bits] == _hex_zeros:
-                                    _result_q.put((n, h))
-                                    _abort_evt.set()
-                                    return
+                            # ── bind all names to locals once (LOAD_FAST vs LOAD_DEREF) ──
+                            _sha3   = _hl.sha3_256
+                            _pack   = _st.pack
+                            _unpack = _st.unpack_from
+                            _fmt    = _HDR_FMT
+                            _pfx    = _POW_PREFIX
+                            _th     = _tgt_h; _ts2 = _ts; _df = _diff
+                            _pp     = _ph_parent; _pm2 = _ph_merkle
+                            _pmin   = _ph_miner;  _ps  = _ph_seed
+                            _nw     = _nwin; _rr  = _RND_RANGE
+                            _mv     = _smv; _rp2  = _rp
+                            _woffs  = _WIN_OFFSETS; _wend = _WIN_END
+                            _abort  = _abort_evt.is_set
+                            _put    = _result_q.put
+                            _set    = _abort_evt.set
+                            _zeros  = _hex_zeros; _dbits = difficulty_bits
+                            n = start_nonce; lc = 0; _ctr = _nonce_ctr
+                            while not _abort():
+                                # ── one struct.pack alloc (nonce-dependent, unavoidable) ──
+                                hdr = _pack(_fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps)
+                                _h0 = _sha3(); _h0.update(_pfx); _h0.update(hdr)
+                                state = _h0.digest()
+                                # ── 64 rounds: zero allocs ──────────────────────────────
+                                for rnd in _rr:
+                                    o = _woffs[_unpack('>I', state, 0)[0] % _nw]
+                                    _h = _sha3(); _h.update(state)
+                                    _h.update(_mv[o : o+_wend])   # zero-copy mv slice
+                                    _h.update(_rp2[rnd])           # pre-packed constant
+                                    state = _h.digest()
+                                lc += 1
+                                hx = state.hex()                   # compute once
+                                if hx[:_dbits] == _zeros:
+                                    _put((n, hx)); _set(); return
                                 n += stride
-                                # Update shared telemetry counter every 512 hashes
-                                if local_count & 511 == 0:
-                                    _nonce_ctr[0] += 512
+                                if lc & 511 == 0:
+                                    _ctr[0] += 512
                         finally:
                             _gc.enable()
 
@@ -14374,6 +14413,10 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
                     # ──────────────────────────────────────────────────────────────
+                    # ❤️  I love you — record solve NOW so display shows SOLVED immediately
+                    _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": timestamp, "fidelity": w_state_fidelity})
+                    _MINE_TELEM.mark_submitting()
+                    _EXP_LOG.info(f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} — submitting…")
                     _success, _result = await _submission.submit(
                         submit_payload, target_height, block_hash
                     )
