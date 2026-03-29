@@ -12579,21 +12579,21 @@ class QtclClientApp:
         _tp.sleep(0.1)  # minimal yield — wallet/DB already settled by caller
         try:
             peer_id = getattr(self, '_peer_id', None)
-            if not peer_id: return
+            if not peer_id:
+                _EXP_LOG.debug("[CLIENT] P2P: no peer_id, skipping P2P init")
+                return
             _P2P_NODE = _init_p2p_node(peer_id, QtclP2PNode.DEFAULT_PORT)
             ok = _P2P_NODE.start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
             if ok:
-                _EXP_LOG.info("[CLIENT] 🌐 P2P consensus node started on port 9091")
+                _EXP_LOG.info("[CLIENT] P2P consensus node started on port 9091")
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
                     _GENESIS_RESET_LISTENER._broadcaster = _P2P_NODE
             else:
-                _EXP_LOG.warning(
-                    "[CLIENT] P2P C layer unavailable — running in solo mode. "
-                    "Delete __pycache__ and ensure clang+openssl are installed: "
-                    "pkg install clang openssl libffi"
+                _EXP_LOG.debug(
+                    "[CLIENT] P2P C layer unavailable — running in solo mode"
                 )
         except Exception as _e:
-            _EXP_LOG.warning(f"[CLIENT] _start_p2p: {_e}")
+            _EXP_LOG.debug(f"[CLIENT] P2P init skipped: {_e}")
     def _heartbeat_loop(self) -> None:
         """
         Every 30 seconds:
@@ -13488,10 +13488,12 @@ class QtclClientApp:
             
             _NULL_HASH = '0' * 64
             _ORACLE_LAT_MAX_MS = 20000.0   # hard gate: refuse to mine if oracle RTT > 20s
+            _has_valid_tip = False  # Track if we've fetched a valid chain tip
+            
             while True:  # Main mining loop
                 try:
-                    # Ensure we're in MINING state at start of each loop iteration
-                    _MINE_TELEM.mark_mining()
+                    # Only mark as MINING after we have a valid tip
+                    # Don't set state here - wait until we have actual work to do
                     
                     # ── GATE 0: Oracle liveness check ─────────────────────────────
                     _t_oracle_start = _t.time()
@@ -13499,11 +13501,11 @@ class QtclClientApp:
                     _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
                     if not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS:
                         _EXP_LOG.warning(
-                            f"[MINER] ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — "
-                            f"blocking mine, retry in 5s"
+                            f"[MINER] Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — blocking mine, retry in 5s"
                         )
-                        print(f"  ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — waiting…", flush=True)
-                        _MINE_TELEM.mark_mining()  # Keep state as MINING during wait
+                        print(f"  Oracle waiting... (lat={_oracle_lat_ms:.0f}ms)", flush=True)
+                        if _has_valid_tip:
+                            _MINE_TELEM.mark_mining()
                         await _asyncio.sleep(5.0)
                         continue
 
@@ -13511,11 +13513,15 @@ class QtclClientApp:
                     _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=20, retries=2)
                     if not _res_h:
                         _EXP_LOG.warning("[MINER] chain tip fetch failed, retrying…")
-                        _MINE_TELEM.mark_mining()  # Keep state as MINING during retry
                         await _asyncio.sleep(2.0)
                         continue
                     oracle_height = int(_res_h.get('height', 0))
                     oracle_hash = str(_res_h.get('tip_hash') or _NULL_HASH)
+
+                    # Got valid tip - mark mining state
+                    if not _has_valid_tip:
+                        _has_valid_tip = True
+                        _MINE_TELEM.mark_mining()
 
                     # ── GATE 1: Refuse null parent — would fork the chain ──────────
                     if oracle_hash == _NULL_HASH:
@@ -14085,12 +14091,16 @@ class QtclClientApp:
             now  = time.time()
             sep  = "─" * 72
             # ── state badge ───────────────────────────────────────────────
-            state_badge = {
-                "IDLE":        "💤 IDLE",
-                "MINING":      "⛏️  MINING",
-                "SOLVED":      "✅ BLOCK SOLVED",
-                "SUBMITTING":  "📡 SUBMITTING",
-            }.get(tel["state"], tel["state"])
+            # Show "INITIALIZING..." if no valid tip yet
+            if tel["height"] == 0 and tel["state"] == "MINING":
+                state_badge = "⚙️  INITIALIZING"
+            else:
+                state_badge = {
+                    "IDLE":        "💤 IDLE",
+                    "MINING":      "⛏️  MINING",
+                    "SOLVED":      "✅ BLOCK SOLVED",
+                    "SUBMITTING":  "📡 SUBMITTING",
+                }.get(tel["state"], tel["state"])
             hr_str = (f"{tel['hash_rate']:.0f} H/s"
                       if tel["hash_rate"] > 0 else "warming up…")
             session = _fmt_duration(now - tel["session_start"])
@@ -14099,11 +14109,15 @@ class QtclClientApp:
             print(sep)
             # ── PoW live progress ─────────────────────────────────────────
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
-                target_zeros = tel["difficulty"]
-                nonce_str    = f"{tel['nonce']:,}"
-                print(f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
-                      f"nonce={nonce_str}  │  {hr_str}")
-                print(f"  Parent: {tel['parent_hash'][:32]}…")
+                if tel["height"] == 0:
+                    # Still initializing - don't show misleading info
+                    print(f"  Fetching chain tip...  │  {hr_str}")
+                else:
+                    target_zeros = tel["difficulty"]
+                    nonce_str    = f"{tel['nonce']:,}"
+                    print(f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
+                          f"nonce={nonce_str}  │  {hr_str}")
+                    print(f"  Parent: {tel['parent_hash'][:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
             # ── Last solved block ─────────────────────────────────────────
