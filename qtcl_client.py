@@ -10545,12 +10545,19 @@ class KoyebAPIClient:
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         raw_curr = snap.get("pq_curr") or snap.get("pq_current")
         raw_last = snap.get("pq_last")
+        # pq_curr/pq_last are 0-7 pseudoqubit sector indices (height mod 8)
+        # Never store raw block height — that breaks the Poincaré disk overlay
         if bh > 0:
-            pq_curr = str(bh)
-            pq_last = str(max(0, bh - 1))
+            pq_curr = str(bh % 8)
+            pq_last = str(max(0, bh - 1) % 8)
+        elif raw_curr is not None:
+            _rc = int(raw_curr) if str(raw_curr).isdigit() else 0
+            _rl = int(raw_last) if raw_last is not None and str(raw_last).isdigit() else 0
+            pq_curr = str(_rc % 8)
+            pq_last = str(_rl % 8)
         else:
-            pq_curr = str(raw_curr) if raw_curr is not None else ""
-            pq_last = str(raw_last) if raw_last is not None else ""
+            pq_curr = "0"
+            pq_last = "0"
         return {
             "pq_curr":          pq_curr,
             "pq_last":          pq_last,
@@ -14056,13 +14063,57 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 5: Build submission payload (atomic quantum state lock)
                     # ──────────────────────────────────────────────────────────────
-                    pq_curr = target_height
-                    pq_last = target_height - 1
-                    w_state_fidelity = 0.75
-                    
-                    # Try to get actual fidelity from client field
+                    # pq0   = oracle ground anchor — dominant eigenstate of the DM
+                    #         (index 0-7 of max diagonal element)
+                    # pq_last = forward boundary of parent block (parent's pq_curr)
+                    # pq_curr = next face on {8,3} lattice = (pq_last + 1) % 8
+                    # These define the geodesic triangle of the blockfield object.
                     try:
-                        if self.client_field and self.client_field.metrics:
+                        _parent_pq_curr = int(_res_b.get('pq_curr') or 0)
+                        _parent_pq_last = int(_res_b.get('pq_last') or 0)
+                        # Blockfield boundary evolution:
+                        # rear boundary = parent's forward boundary
+                        pq_last = _parent_pq_curr % 8
+                        # forward boundary = next face on {8,3} lattice
+                        pq_curr = (_parent_pq_curr + 1) % 8
+                        # oracle ground anchor from DM dominant diagonal
+                        _ora_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=2.0) or {}
+                        _dmh = _ora_snap.get('density_matrix_hex', '')
+                        pq0 = 0
+                        if _dmh and len(_dmh) >= 128:
+                            # Parse first 8 diagonal elements (stride 32 chars each for complex128)
+                            # diagonal[i] at byte offset i*(8+8) = i*16 bytes = i*32 hex chars
+                            _stride = len(_dmh) // 64  # 32 for complex128, 16 for complex64
+                            _diag = []
+                            for _di in range(8):
+                                _off = _di * 9 * _stride  # diagonal index i*i + i offset in flat 8x8
+                                if _stride == 32:  # complex128
+                                    _off2 = _di * 9 * 16 * 2  # row*8+col, flat, bytes→hex
+                                    # simpler: diagonal element i is at flat index i*8+i = i*9
+                                    _hex8 = _dmh[_di*9*32 : _di*9*32+16]  # re bytes
+                                else:
+                                    _hex8 = _dmh[_di*9*16 : _di*9*16+8]
+                                try:
+                                    import struct as _st2
+                                    _b8 = bytes.fromhex(_hex8.ljust(16, '0')[:16])
+                                    _re = _st2.unpack('<d', _b8)[0] if _stride==32 else _st2.unpack('<f', bytes.fromhex(_hex8.ljust(8,'0')[:8]))[0]
+                                    _diag.append((_re, _di))
+                                except Exception:
+                                    _diag.append((0.0, _di))
+                            pq0 = max(_diag, key=lambda x: x[0])[1] if _diag else 0
+                    except Exception as _pq_e:
+                        _EXP_LOG.debug(f"[MINER] pq boundary derivation: {_pq_e}")
+                        pq_last = int(_res_b.get('pq_curr') or 0) % 8
+                        pq_curr = (pq_last + 1) % 8
+                        pq0 = 0
+
+                    w_state_fidelity = 0.75
+                    # Try to get actual fidelity from client field or oracle snap
+                    try:
+                        _ora_fid = float((_LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=1.0) or {}).get('w_state_fidelity') or 0.0)
+                        if 0.0 < _ora_fid <= 1.0:
+                            w_state_fidelity = _ora_fid
+                        elif self.client_field and self.client_field.metrics:
                             _fid = self.client_field.metrics.fidelity_to_w3
                             if _fid is not None and 0.0 <= _fid <= 1.0:
                                 w_state_fidelity = float(_fid)
@@ -14081,6 +14132,7 @@ class QtclClientApp:
                             "difficulty_bits": difficulty_bits,
                             "w_entropy_hash": _w_entropy_seed.hex(),
                             "w_state_fidelity": round(w_state_fidelity, 4),
+                            "pq0": pq0,
                             "pq_curr": pq_curr,
                             "pq_last": pq_last,
                         },
