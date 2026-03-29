@@ -1749,6 +1749,7 @@ class LiveRPCOracleSnapshot:
                     _fid_raw = (w_state.get('fidelity') or
                                 snap.get('w_state_fidelity') or
                                 _lattice.get('fidelity') or 0.0)
+                    _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
                     self._oracle_state = {
                         'w_state_fidelity': float(_fid_raw),
                         'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
@@ -1757,8 +1758,11 @@ class LiveRPCOracleSnapshot:
                         'cycle': snap.get('cycle', 0),
                         'consensus': snap.get('consensus', False),
                         'mermin_test': snap.get('mermin_test', {}),
-                        'block_height': int(snap.get('block_height') or snap.get('height') or 0),
+                        'block_height': _bh_snap,
                         'density_matrix_hex': snap.get('density_matrix_hex', ''),
+                        'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
+                        'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
+                        'latency_ms': float(snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0),
                     }
             
             return snap
@@ -12739,7 +12743,7 @@ class QtclClientApp:
                         f"[FIELD] h={bh} pq={pq_curr_id}→{pq_last_id} "
                         f"fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f} "
                         f"chsh_AB={m.bell_chsh_AB:.3f} neg_AB={m.negativity_AB:.4f} "
-                        f"rpc_snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)}")
+                        f"rpc_snaps={_LIVE_RPC_ORACLE.get_oracle_state().get('cycle', 0)}")
             except Exception as e:
                 _EXP_LOG.debug(f"[FIELD] loop: {e}")
     # ── RPC monitor for Koyeb oracle /rpc/oracle/snapshot (no SSE) ──────────────
@@ -13552,31 +13556,24 @@ class QtclClientApp:
                 f"pq_curr={_pqc}  pq_last={_pql}"
             )
             return (True, _meas, _pow_seed, _report)
-        # ── Execute ────────────────────────────────────────────────────────────
-        try:
-            _snap_data = self.api._rpc("qtcl_getQuantumMetrics", [], timeout=10, retries=2) or {}
-            _dm_hex = _snap_data.get('density_matrix_hex', '')
-            _raw_fid = ((_snap_data.get('w_state') or {}).get('fidelity') or
-                        _snap_data.get('w_state_fidelity') or
-                        (_snap_data.get('lattice') or {}).get('fidelity') or 0.0)
-            _w_fid = float(_raw_fid)
-            _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
-        except Exception as _e_snap:
-            print(f"  [SNAPSHOT-ERROR] {_e_snap}", flush=True)
-            _dm_ready = False
-            _dm_hex = ''
-            _w_fid = 0.0
-        
+        # ── Status display — use live snap already fetched above ───────────────
+        _dm_hex   = snap.get('density_matrix_hex', '')
+        _w_fid    = float(
+            (snap.get('w_state') or {}).get('fidelity') or
+            snap.get('w_state_fidelity') or
+            (snap.get('lattice') or {}).get('fidelity') or 0.0
+        )
+        _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
+        _lat_ms   = float(snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
-            print(f"  ⛏️  Mining at height 0  pq_curr=0  pq_last=0", flush=True)
+            print(f"  ⛏️  Mining at height {bh}  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
         else:
             print(f"  ⚠️  Oracle DM unavailable (degraded mode)", flush=True)
-            print(f"  ⛏️  Mining at height 0 with os.urandom seed", flush=True)
-            print(f"  pq_curr=0  pq_last=0", flush=True)
-        
+            print(f"  ⛏️  Mining at height {bh} with os.urandom seed", flush=True)
+            print(f"  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
         print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
-        print(f"  🔗 Oracle latency         : 0.0 ms", flush=True)
+        print(f"  🔗 Oracle latency         : {_lat_ms:.1f} ms", flush=True)
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
         print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n", flush=True)
         # ── Miner handle ───────────────────────────────────────────────────────
@@ -13589,8 +13586,9 @@ class QtclClientApp:
             deadline = time.time() + timeout_s
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
             while time.time() < deadline:
-                if _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0) > 0:
-                    print(f" ✅ (RPC)  snaps={_LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)}", flush=True)
+                _dm_snap = _LIVE_RPC_ORACLE.fetch_snapshot()
+                if _dm_snap.get('cycle', 0) > 0:
+                    print(f" ✅ (RPC)  snaps={_dm_snap.get('cycle', 0)}", flush=True)
                     return True
                 print('.', end='', flush=True)
                 time.sleep(0.3)
