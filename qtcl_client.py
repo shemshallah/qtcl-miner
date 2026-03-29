@@ -1684,102 +1684,84 @@ class LiveRPCOracleSnapshot:
         Direct HTTP POST to server.py RPC endpoint.
         Returns empty dict on any error (fail-safe for RPC hangs).
         """
+        import logging
+        _log = logging.getLogger("qtcl.oracle")
         _t0 = time.time()
-        try:
-            session = self._get_session()
-            if not session:
-                # Fallback: urllib
-                import json
-                from urllib.request import Request, urlopen
-                from urllib.error import URLError
+        _log.debug(f"Fetching snapshot from {self.ORACLE_URL}")
+        for _retry in range(3):
+            try:
+                session = self._get_session()
+                if not session:
+                    import json
+                    from urllib.request import Request, urlopen
+                    payload = json.dumps({"jsonrpc":"2.0","method":"qtcl_getQuantumMetrics","params":[],"id":1}).encode('utf-8')
+                    req = Request(f"{self.ORACLE_URL}/rpc", data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                    with urlopen(req, timeout=timeout_s) as resp:
+                        resp_data = json.loads(resp.read().decode('utf-8'))
+                        snap = resp_data.get("result", {}) if "result" in resp_data else {}
+                else:
+                    resp = session.post(f"{self.ORACLE_URL}/rpc", json={"jsonrpc":"2.0","method":"qtcl_getQuantumMetrics","params":[],"id":1}, timeout=timeout_s)
+                    resp.raise_for_status()
+                    snap = resp.json().get("result", {}) if "result" in resp.json() else {}
                 
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_getQuantumMetrics",
-                    "params": [],
-                    "id": 1
-                }).encode('utf-8')
+                if not isinstance(snap, dict): snap = {}
+                if snap.get('density_matrix_hex'):
+                    break
+            except Exception as e:
+                if _retry == 2:
+                    _log.error(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
+                    return {}
+                time.sleep(1.0)
                 
-                req = Request(
-                    f"{self.ORACLE_URL}/rpc",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
+        # Parse density matrix if present
+        if snap and snap.get('density_matrix_hex'):
+            try:
+                dm_hex = snap['density_matrix_hex']
+                bdata = bytes.fromhex(dm_hex)
+                dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
                 
-                with urlopen(req, timeout=timeout_s) as resp:
-                    resp_data = json.loads(resp.read().decode('utf-8'))
-                    snap = resp_data.get("result", {}) if "result" in resp_data else {}
-            else:
-                # Use requests session
-                resp = session.post(
-                    f"{self.ORACLE_URL}/rpc",
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "qtcl_getQuantumMetrics",
-                        "params": [],
-                        "id": 1
-                    },
-                    timeout=timeout_s
-                )
-                resp.raise_for_status()
-                snap = resp.json().get("result", {}) if "result" in resp.json() else {}
-            
-            if not isinstance(snap, dict):
-                snap = {}
-            
-            # Parse density matrix if present
-            if snap and snap.get('density_matrix_hex'):
-                try:
-                    dm_hex = snap['density_matrix_hex']
-                    bdata = bytes.fromhex(dm_hex)
-                    dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                    
-                    if len(bdata) == 1024:
-                        for i in range(64):
-                            re, im = struct.unpack_from('>dd', bdata, i*16)
-                            dm_re_new[i], dm_im_new[i] = re, im
-                    elif len(bdata) == 512:
-                        for i in range(64):
-                            re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                    
-                    with self._dm_lock:
-                        self._dm_re = dm_re_new
-                        self._dm_im = dm_im_new
-                        self._last_fetch_ts = time.time()
-                except Exception as parse_e:
-                    logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
-            
-            # Update oracle state
-            if snap:
-                with self._oracle_state_lock:
-                    w_state = snap.get('w_state') or {}
-                    _lattice = snap.get('lattice') or {}
-                    _fid_raw = (w_state.get('fidelity') or
-                                snap.get('w_state_fidelity') or
-                                _lattice.get('fidelity') or 0.0)
-                    _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
-                    self._oracle_state = {
-                        'w_state_fidelity': float(_fid_raw),
-                        'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
-                        'von_neumann_entropy': float(w_state.get('entropy') or 0.0),
-                        'purity': float(w_state.get('purity') or _lattice.get('fidelity') or 0.0),
-                        'cycle': snap.get('cycle', 0),
-                        'consensus': snap.get('consensus', False),
-                        'mermin_test': snap.get('mermin_test', {}),
-                        'block_height': _bh_snap,
-                        'density_matrix_hex': snap.get('density_matrix_hex', ''),
-                        'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
-                        'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
-                        'latency_ms': round((time.time() - _t0) * 1000.0, 1),
-                    }
-            
-            snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
-            return snap
-        except Exception as e:
-            logger.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
-            return {}
+                if len(bdata) == 1024:
+                    for i in range(64):
+                        re, im = struct.unpack_from('>dd', bdata, i*16)
+                        dm_re_new[i], dm_im_new[i] = re, im
+                elif len(bdata) == 512:
+                    for i in range(64):
+                        re, im = struct.unpack_from('>ff', bdata, i*8)
+                        dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                
+                with self._dm_lock:
+                    self._dm_re = dm_re_new
+                    self._dm_im = dm_im_new
+                    self._last_fetch_ts = time.time()
+            except Exception as parse_e:
+                logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
+        
+        # Update oracle state
+        if snap:
+            with self._oracle_state_lock:
+                w_state = snap.get('w_state') or {}
+                _lattice = snap.get('lattice') or {}
+                _fid_raw = (w_state.get('fidelity') or
+                            snap.get('w_state_fidelity') or
+                            _lattice.get('fidelity') or 0.0)
+                _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
+                self._oracle_state = {
+                    'w_state_fidelity': float(_fid_raw),
+                    'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
+                    'von_neumann_entropy': float(w_state.get('entropy') or 0.0),
+                    'purity': float(w_state.get('purity') or _lattice.get('fidelity') or 0.0),
+                    'cycle': snap.get('cycle', 0),
+                    'consensus': snap.get('consensus', False),
+                    'mermin_test': snap.get('mermin_test', {}),
+                    'block_height': _bh_snap,
+                    'density_matrix_hex': snap.get('density_matrix_hex', ''),
+                    'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
+                    'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
+                    'latency_ms': round((time.time() - _t0) * 1000.0, 1),
+                }
+        
+        snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
+        return snap
     
     def get_oracle_dm(self) -> tuple:
         """Return (dm_re, dm_im, age_sec) thread-safe."""
@@ -12546,10 +12528,13 @@ class QtclClientApp:
     def _load_wallet(self) -> bool:
         if self.wallet.is_loaded():
             return True
-        try:
-            pw = getpass.getpass("  Wallet password: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return False
+        # Try environment variable first for non-interactive use
+        pw = os.environ.get('WALLET_PASSWORD')
+        if not pw:
+            try:
+                pw = getpass.getpass("  Wallet password: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return False
         return bool(pw) and self.wallet.load(pw)
     def _start_threads(self) -> None:
         """
@@ -13138,8 +13123,7 @@ class QtclClientApp:
     # ── Mine mode ─────────────────────────────────────────────────────────────
     def run_mine_mode(self) -> None:
         print("\n  🔄 Loading wallet…")
-        _wallet_password = os.environ.get('WALLET_PASSWORD', '')
-        if not self._load_wallet(_wallet_password if _wallet_password else None):
+        if not self._load_wallet():
             print("  ❌ Wallet load failed — use Wallet → Create New first"); return
         print(f"  ✅ Wallet: {self.wallet.address}")
         self._init_db()
@@ -13179,7 +13163,7 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── RPC poll thread — no SSE ──────────────────────
         # ── Fetch live RPC snapshot on-demand ────────────────────────
-        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
+        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=15.0)
         snap = _snap or {}
         # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
         bh = int(snap.get('block_height') or snap.get('height') or
@@ -13325,7 +13309,7 @@ class QtclClientApp:
             snap.get('w_state_fidelity') or
             (snap.get('lattice') or {}).get('fidelity') or 0.0
         )
-        _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
+        _dm_ready = bool(_dm_hex and len(_dm_hex) >= 32)
         _lat_ms   = float(snap.get('_latency_ms') or snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
