@@ -1675,6 +1675,7 @@ class LiveRPCOracleSnapshot:
         Direct HTTP POST to server.py RPC endpoint.
         Returns empty dict on any error (fail-safe for RPC hangs).
         """
+        _t0 = time.time()
         try:
             session = self._get_session()
             if not session:
@@ -1762,9 +1763,10 @@ class LiveRPCOracleSnapshot:
                         'density_matrix_hex': snap.get('density_matrix_hex', ''),
                         'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
                         'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
-                        'latency_ms': float(snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0),
+                        'latency_ms': round((time.time() - _t0) * 1000.0, 1),
                     }
             
+            snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
             return snap
         except Exception as e:
             logger.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
@@ -10336,7 +10338,7 @@ def _reconstruct_dm_from_bloch(snap: dict):
 # SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
 # γ-SWARM  KoyebAPIClient  (endpoints verified vs GossipHTTPHandler)
 class KoyebAPIClient:
-    """Thread-safe REST client for qtcl-blockchain.koyeb.app (https/443)."""
+    """Thread-safe JSON-RPC 2.0 client for qtcl-blockchain.koyeb.app (https/443). RPC-only, no REST."""
     TIMEOUT: int = 10
     def __init__(self, base_url: str = None, timeout: int = 10):
         self.base_url = (base_url or _ORACLE_BASE_URL).rstrip("/")
@@ -10349,63 +10351,8 @@ class KoyebAPIClient:
         if self._session is None and _HAS_REQUESTS:
             with self._lock:
                 if self._session is None:
-                    from requests.adapters import HTTPAdapter
-                    from urllib3.util.retry import Retry
-                    s = _requests.Session()
-                    r = Retry(total=3, backoff_factor=0.5,
-                              status_forcelist=[502, 503, 504])
-                    s.mount("https://", HTTPAdapter(max_retries=r))
-                    s.mount("http://",  HTTPAdapter(max_retries=r))
-                    self._session = s
+                    self._session = _requests.Session()
         return self._session
-    def _get(self, path: str, params: dict = None,
-             timeout: int = None, retries: int = 2) -> Optional[dict]:
-        t   = timeout or self.timeout
-        url = f"{self.base_url}{path}"
-        last_error = None
-        
-        for attempt in range(retries):
-            if _HAS_REQUESTS:
-                try:
-                    r = self._get_session().get(url, params=params, timeout=t)
-                    if r.status_code == 200:
-                        return r.json()
-                    _EXP_LOG.debug(f"[API] GET {path} → {r.status_code}")
-                    last_error = f"HTTP {r.status_code}"
-                    break  # Don't retry on HTTP errors
-                except (_requests.ConnectionError, _requests.Timeout, _requests.RequestException) as e:
-                    last_error = str(e)
-                    if attempt < retries - 1:
-                        backoff = 2 ** attempt
-                        _EXP_LOG.debug(f"[API] GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        time.sleep(backoff)
-                    else:
-                        _EXP_LOG.debug(f"[API] GET {path}: {e} (final attempt)")
-                except Exception as e:
-                    _EXP_LOG.debug(f"[API] GET {path}: {e}")
-                    last_error = str(e)
-                    break
-            else:
-                try:
-                    import urllib.parse
-                    full = url + ("?" + urllib.parse.urlencode(params) if params else "")
-                    with urllib.request.urlopen(full, timeout=t) as resp:
-                        return _json.loads(resp.read())
-                except (_urllib_error.URLError, _socket.timeout) as e:
-                    last_error = str(e)
-                    if attempt < retries - 1:
-                        backoff = 2 ** attempt
-                        _EXP_LOG.debug(f"[API] urllib GET {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        time.sleep(backoff)
-                    else:
-                        _EXP_LOG.debug(f"[API] urllib GET {path}: {e} (final attempt)")
-                except Exception as e:
-                    _EXP_LOG.debug(f"[API] urllib GET {path}: {e}")
-                    last_error = str(e)
-                    break
-        
-        self._last_error = last_error
-        return None
     def _rpc(self, method: str, params: list = None, timeout: int = None, retries: int = 2) -> Optional[dict]:
         """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
         t = timeout or self.timeout
@@ -10454,72 +10401,6 @@ class KoyebAPIClient:
         
         self._last_error = last_error
         return None
-    def _post(self, path: str, payload: dict,
-              timeout: int = None, retries: int = 3) -> Optional[dict]:
-        t   = timeout or self.timeout
-        url = f"{self.base_url}{path}"
-        last_error = None
-        last_error_response = None
-        
-        for attempt in range(retries):
-            if _HAS_REQUESTS:
-                try:
-                    r = self._get_session().post(url, json=payload, timeout=t)
-                    if r.status_code in (200, 201, 202):
-                        return r.json()
-                    try:
-                        last_error_response = r.json()
-                    except:
-                        last_error_response = {"error": f"HTTP {r.status_code}", "text": r.text[:100]}
-                    _EXP_LOG.debug(f"[API] POST {path} → {r.status_code}: {r.text[:80]}")
-                    last_error = f"HTTP {r.status_code}: {r.text[:100]}"
-                    break  # Don't retry on HTTP errors, only network errors
-                except (_requests.ConnectionError, _requests.Timeout, _requests.RequestException) as e:
-                    last_error = str(e)
-                    if attempt < retries - 1:
-                        backoff = 2 ** attempt  # 1s, 2s, 4s
-                        _EXP_LOG.debug(f"[API] POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        time.sleep(backoff)
-                    else:
-                        _EXP_LOG.debug(f"[API] POST {path}: {e} (final attempt)")
-                except Exception as e:
-                    _EXP_LOG.debug(f"[API] POST {path}: {e}")
-                    last_error = str(e)
-                    break
-            else:
-                try:
-                    import urllib.request
-                    data = _json.dumps(payload).encode()
-                    req  = urllib.request.Request(
-                        url, data=data,
-                        headers={"Content-Type": "application/json"}, method="POST")
-                    with urllib.request.urlopen(req, timeout=t) as resp:
-                        return _json.loads(resp.read())
-                except urllib.error.HTTPError as e:
-                    try:
-                        last_error_response = _json.loads(e.read())
-                    except:
-                        last_error_response = {"error": f"HTTP {e.code}", "text": str(e)[:100]}
-                    _EXP_LOG.debug(f"[API] urllib POST {path} → {e.code}: {str(e)[:80]}")
-                    last_error = f"HTTP {e.code}: {str(e)[:100]}"
-                    break  # Don't retry on HTTP errors
-                except (_urllib_error.URLError, _socket.timeout) as e:
-                    last_error = str(e)
-                    if attempt < retries - 1:
-                        backoff = 2 ** attempt
-                        _EXP_LOG.debug(f"[API] urllib POST {path} attempt {attempt+1}/{retries} failed: {e}. Retrying in {backoff}s...")
-                        time.sleep(backoff)
-                    else:
-                        _EXP_LOG.debug(f"[API] urllib POST {path}: {e} (final attempt)")
-                except Exception as e:
-                    _EXP_LOG.debug(f"[API] urllib POST {path}: {e}")
-                    last_error = str(e)
-                    break
-        
-        self._last_error = last_error
-        if last_error_response is not None:
-            return last_error_response
-        return None
     def get_chain_tip(self) -> Optional[dict]:
         """Get chain tip via JSON-RPC (qtcl_getBlockHeight).
         
@@ -10545,10 +10426,12 @@ class KoyebAPIClient:
         if isinstance(tip, int):
             return tip
         return None
-    def get_oracle_pq0_bloch(self) -> Optional[dict]:
-        """Get oracle quantum metrics via JSON-RPC."""
+    def get_quantum_metrics(self) -> Optional[dict]:
+        """Get oracle quantum metrics via JSON-RPC (qtcl_getQuantumMetrics)."""
         r = self._rpc("qtcl_getQuantumMetrics", [])
         return r if isinstance(r, dict) else None
+    # Alias for backward compat within this file
+    get_oracle_pq0_bloch = get_quantum_metrics
     def get_oracle_w_state(self) -> Optional[dict]:
         """Get W-state oracle data via JSON-RPC."""
         return self._rpc("qtcl_getQuantumMetrics", [])
@@ -10811,136 +10694,6 @@ class KoyebAPIClient:
         # 🔄 RPC-ONLY: DM pushed via RPC quantum metrics update
         return {"status": "dm_queued_for_rpc_broadcast"}
     
-    def get_difficulty(self) -> Optional[dict]:
-        """Get current difficulty."""
-        return self._get("/api/difficulty")
-    
-    def set_difficulty(self, difficulty: float) -> Optional[dict]:
-        """Set difficulty."""
-        return self._post("/api/difficulty/set", {"difficulty": difficulty})
-    
-    def adjust_difficulty(self, adjustment: float) -> Optional[dict]:
-        """Adjust difficulty by factor."""
-        return self._post("/api/difficulty/adjust", {"adjustment": adjustment})
-    
-    def build_mining_transactions(self, miner_addr: str, block_height: int) -> Optional[dict]:
-        """Build candidate transactions for mining."""
-        return self._post("/api/mining/build-transactions", {
-            "miner_address": miner_addr,
-            "block_height": block_height
-        })
-    
-    def get_metrics(self) -> Optional[dict]:
-        """Get all metrics."""
-        return self._get("/rpc/metrics")
-    
-    def get_metrics_all(self) -> Optional[dict]:
-        """Get comprehensive metrics."""
-        return self._get("/rpc/metrics/all")
-    
-    def get_lattice_metrics(self) -> Optional[dict]:
-        """Get lattice controller metrics."""
-        return self._get("/api/lattice/metrics")
-    
-    def get_entropy_stats(self) -> Optional[dict]:
-        """Get entropy/QRNG statistics."""
-        return self._get("/api/entropy/stats")
-    
-    def get_stats(self) -> Optional[dict]:
-        """Get server statistics."""
-        return self._get("/api/stats")
-    
-    def get_p2p_stats(self) -> Optional[dict]:
-        """Get P2P network statistics."""
-        return self._get("/api/p2p/stats")
-    
-    def get_p2p_peers(self) -> Optional[list]:
-        """Get P2P peer list."""
-        return (self._get("/api/p2p/peers") or {}).get("peers", [])
-    
-    def p2p_peer_exchange(self, peer_info: dict) -> Optional[dict]:
-        """Peer exchange protocol."""
-        return self._post("/api/p2p/peer_exchange", peer_info)
-    
-    def p2p_discovery(self) -> Optional[dict]:
-        """Discover peers on network."""
-        return self._get("/api/p2p/discovery")
-    
-    def dht_add_peer(self, peer: dict) -> Optional[dict]:
-        """Add peer to DHT."""
-        return self._post("/api/dht/add-peer", peer)
-    
-    def dht_lookup(self, target_id: str) -> Optional[dict]:
-        """DHT lookup for target."""
-        return self._get(f"/api/dht/lookup/{target_id}")
-    
-    def dht_node_info(self) -> Optional[dict]:
-        """Get local DHT node info."""
-        return self._get("/api/dht/node")
-    
-    def dht_stats(self) -> Optional[dict]:
-        """Get DHT statistics."""
-        return self._get("/api/dht/stats")
-    
-    def dht_store(self, key: str, value: str) -> Optional[dict]:
-        """Store value in DHT."""
-        return self._post("/api/dht/state/store", {"key": key, "value": value})
-    
-    def dht_retrieve(self, key: str) -> Optional[dict]:
-        """Retrieve value from DHT."""
-        return self._get(f"/api/dht/state/retrieve/{key}")
-    
-    def send_heartbeat(self, data: dict) -> Optional[dict]:
-        """Send heartbeat to network."""
-        return self._post("/api/heartbeat", data)
-    
-    def register_validator(self, validator_data: dict) -> Optional[dict]:
-        """Register as validator."""
-        return self._post("/api/validators/register", validator_data)
-    
-    def list_validators(self) -> Optional[list]:
-        """Get list of validators."""
-        return (self._get("/api/validators") or {}).get("validators", [])
-    
-    def submit_attestation(self, attestation: dict) -> Optional[dict]:
-        """Submit validator attestation."""
-        return self._post("/api/attestations", attestation)
-    
-    def get_finality(self) -> Optional[dict]:
-        """Get finality checkpoint."""
-        return self._get("/api/finality")
-    
-    def submit_quantum_witness(self, witness: dict) -> Optional[dict]:
-        """Submit quantum witness for validation."""
-        return self._post("/api/quantum_witness", witness)
-    
-    def get_pending_mempool(self) -> Optional[list]:
-        """Get pending transactions."""
-        return (self._get("/api/mempool/pending") or {}).get("transactions", [])
-    
-    def get_mempool_tx(self, tx_hash: str) -> Optional[dict]:
-        """Get specific mempool transaction."""
-        return self._get(f"/api/mempool/tx/{tx_hash}")
-    
-    def get_utxo_stats(self) -> Optional[dict]:
-        """Get UTXO statistics."""
-        return self._get("/api/utxo/stats")
-    
-    def get_health(self) -> Optional[dict]:
-        """Get server health status."""
-        return self._get("/api/health")
-    
-    def list_miners(self, limit: int = 100) -> Optional[list]:
-        """Get list of active miners."""
-        return (self._get("/api/miners", params={"limit": limit}) or {}).get("miners", [])
-    
-    def get_miners_debug(self) -> Optional[dict]:
-        """Get miner debug information."""
-        return self._get("/api/miners/debug")
-    
-    def send_miners_heartbeat(self, miner_data: dict) -> Optional[dict]:
-        """Send heartbeat as miner."""
-        return self._post("/api/miners/heartbeat", miner_data)
     def get_diagnostics(self) -> str:
         """Return a human-readable diagnostic report."""
         lines = []
@@ -11249,46 +11002,45 @@ class KoyebOracleState:
         if self._api is None:
             self._api = KoyebAPIClient(self.oracle_url)
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
-        """RPC-based metric refresh — reads _LIVE_RPC_ORACLE state, no SSE."""
+        """RPC-based metric refresh — always does a live fetch to measure real latency."""
         try:
-            rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
-            if rpc_state:
+            t0 = time.time()
+            live = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
+            if live:
                 def _nv(v):
                     try:
                         f = float(v)
                         return f if (f == f and abs(f) < 1e15) else None
                     except Exception:
                         return None
-                fid = (_nv(rpc_state.get("w_state_fidelity")) or
-                       _nv(rpc_state.get("fidelity")) or 0.0)
-                self.pq0_fidelity     = float(fid)
-                self.w_state_fidelity = float(fid)
-                self.connected        = True
-                self.last_sync_ts     = time.time()
+                fid = (_nv(live.get("w_state_fidelity")) or
+                       _nv((live.get("w_state") or {}).get("fidelity")) or
+                       _nv(live.get("fidelity")) or 0.0)
+                self.pq0_fidelity       = float(fid)
+                self.w_state_fidelity   = float(fid)
+                self.channel_latency_ms = (time.time() - t0) * 1000.0
+                self.connected          = True
+                self.last_sync_ts       = time.time()
                 if client_field:
                     return self.sync(client_field, timeout=3)
                 return True
+            self.connected = False
             return self.sync(client_field, timeout=3) if client_field else False
         except Exception as e:
             _logging.debug(f"[METRICS REFRESH] Error: {e}")
+            self.connected = False
             return False
     
     def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
-        """RPC-primary sync. REST fallback if RPC unavailable."""
+        """RPC-only sync via _LIVE_RPC_ORACLE.fetch_snapshot()."""
         t0 = time.time()
         snap = {}
         try:
-            rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
-            if rpc_state:
-                snap = rpc_state
+            snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=min(timeout, 6)) or {}
+            if snap:
+                self.channel_latency_ms = (time.time() - t0) * 1000.0
         except Exception:
             pass
-        if not snap:
-            try:
-                snap = self._api.get_oracle_pq0_bloch() or {}
-                self.channel_latency_ms = (time.time() - t0) * 1000.0
-            except Exception:
-                pass
         if not snap:
             self.connected = False
             return False
@@ -11305,9 +11057,9 @@ class KoyebOracleState:
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
         if bh == 0:
             try:
-                _fb = self._api.get_block_height()
-                if _fb and int(_fb) > 0:
-                    bh = int(_fb)
+                _fb = self._api._rpc("qtcl_getBlockHeight", [], timeout=5)
+                if isinstance(_fb, dict):
+                    bh = int(_fb.get("height", 0))
             except Exception:
                 pass
         self.pq0_fidelity     = float(fid)
@@ -12330,13 +12082,13 @@ class QtclClientApp:
         # ── Gossip to Koyeb + P2P (daemon thread — non-blocking) ─────────────
         def _do_broadcast(payload=reg_payload):
             try:
-                self.api._post("/api/gossip/ingest", {
+                self.api._rpc("qtcl_gossipIngest", [{
                     "origin":     self._peer_id,
                     "event_type": "oracle_registration",
                     "channel":    "oracle",
                     "ts":         time.time(),
                     "oracle":     payload,
-                })
+                }])
             except Exception as _be:
                 _EXP_LOG.debug(f"[ORACLE-REG] Koyeb gossip: {_be}")
         _threading.Thread(target=_do_broadcast, daemon=True,
@@ -12616,7 +12368,7 @@ class QtclClientApp:
                         },
                         'txs': [],   # no pending txs in this gossip
                     }
-                    self.api._post('/api/gossip/ingest', gossip_payload)
+                    self.api._rpc('qtcl_gossipIngest', [gossip_payload])
                 except Exception as _ge:
                     _EXP_LOG.debug(f"[GOSSIP] Koyeb ingest failed: {_ge}")
             _threading.Thread(target=_post_gossip, daemon=True,
@@ -12633,7 +12385,7 @@ class QtclClientApp:
         """
         _EXP_LOG.debug("[FIELD] 🌀 tensor field metrics loop started")
         _last_koyeb  = 0.0
-        _last_rest   = 0.0
+        _last_rpc_ts = 0.0
         _hb_counter  = 0
         while not self._stop.is_set():
             try:
@@ -13564,7 +13316,7 @@ class QtclClientApp:
             (snap.get('lattice') or {}).get('fidelity') or 0.0
         )
         _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
-        _lat_ms   = float(snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
+        _lat_ms   = float(snap.get('_latency_ms') or snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
             print(f"  ⛏️  Mining at height {bh}  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
@@ -13739,8 +13491,23 @@ class QtclClientApp:
             _POLL_EVERY_S = 2.0   # poll chain height every 2 seconds
             _last_poll_time = _t.time()
             
+            _NULL_HASH = '0' * 64
+            _ORACLE_LAT_MAX_MS = 5000.0   # hard gate: refuse to mine if oracle RTT > 5s
             while True:  # Main mining loop
                 try:
+                    # ── GATE 0: Oracle liveness check ─────────────────────────────
+                    _t_oracle_start = _t.time()
+                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=6.0)
+                    _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
+                    if not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS:
+                        _EXP_LOG.warning(
+                            f"[MINER] ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — "
+                            f"blocking mine, retry in 5s"
+                        )
+                        print(f"  ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — waiting…", flush=True)
+                        await _asyncio.sleep(5.0)
+                        continue
+
                     # STAGE 1: Fetch chain tip
                     _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
                     if not _res_h:
@@ -13748,7 +13515,28 @@ class QtclClientApp:
                         await _asyncio.sleep(2.0)
                         continue
                     oracle_height = int(_res_h.get('height', 0))
-                    oracle_hash = str(_res_h.get('tip_hash', '0' * 64))
+                    oracle_hash = str(_res_h.get('tip_hash') or _NULL_HASH)
+
+                    # ── GATE 1: Refuse null parent — would fork the chain ──────────
+                    if oracle_hash == _NULL_HASH:
+                        _EXP_LOG.error(
+                            f"[MINER] ❌ tip_hash is null at h={oracle_height} — "
+                            f"refusing to mine off null parent (would create genesis fork). "
+                            f"Waiting for valid tip…"
+                        )
+                        print(f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip", flush=True)
+                        await _asyncio.sleep(5.0)
+                        continue
+
+                    # ── GATE 2: tip_hash must match oracle snapshot height ──────────
+                    _snap_height = int(_oracle_snap.get('block_height') or _oracle_snap.get('height') or 0)
+                    if _snap_height > 0 and abs(_snap_height - oracle_height) > 2:
+                        _EXP_LOG.warning(
+                            f"[MINER] ⚠️  Chain tip height mismatch: RPC h={oracle_height} "
+                            f"oracle_snap h={_snap_height} — re-fetching"
+                        )
+                        await _asyncio.sleep(2.0)
+                        continue
 
                     # STAGE 2: Fetch difficulty from latest block
                     _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
@@ -13758,22 +13546,24 @@ class QtclClientApp:
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
                     _pending_user_txs = _res_m if isinstance(_res_m, list) else []
 
-                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits}")
-                    
+                    _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms")
+
                     target_height = oracle_height + 1
                     parent_hash = oracle_hash
                     timestamp = int(_t.time())
                     miner_addr = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
-                    
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 2: Fetch quantum seed (QRNG-injected)
-                    # ──────────────────────────────────────────────────────────────
-                    try:
-                        _w_entropy_seed = _LIVE_RPC_ORACLE.get_pow_seed(target_height, parent_hash)
-                    except Exception as e:
-                        _EXP_LOG.debug(f"[MINER] Oracle seed failed: {e}")
+
+                    # ── STAGE 2: Quantum PoW seed from live oracle snap ────────────
+                    _dm_hex = _oracle_snap.get('density_matrix_hex', '')
+                    if _dm_hex and len(_dm_hex) > 32:
                         _w_entropy_seed = _hl.sha3_256(
-                            str(int(_t.time()/30)).encode() + parent_hash.encode()
+                            bytes.fromhex(_dm_hex[:64]) +
+                            target_height.to_bytes(8, 'big') +
+                            bytes.fromhex(parent_hash[:32])
+                        ).digest()
+                    else:
+                        _w_entropy_seed = _hl.sha3_256(
+                            str(int(_t.time() / 30)).encode() + parent_hash.encode()
                         ).digest()
                     
                     # ──────────────────────────────────────────────────────────────
@@ -15077,12 +14867,8 @@ class QtclClientApp:
             "params":  params,
             "id":      int(time.time() * 1000) & 0xFFFFFF,
         }
-        r = self.api._post("/rpc", payload, timeout=6)
-        if r and "result" in r:
-            return r["result"]
-        if r and "error" in r:
-            _EXP_LOG.debug(f"[RPC] {method} error: {r['error']}")
-        return None
+        r = self.api._rpc(method, params, timeout=6)
+        return r
     # ── Hermes feed-ID cache — populated once, reused forever ────────────────
     _HERMES_ID_CACHE: dict = {}   # { "BTC": "0xe62df6c8b4a85fe1…", … }
     _HERMES_BASE = "https://hermes.pyth.network"
