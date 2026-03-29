@@ -19,9 +19,16 @@ if _sys.platform.startswith('linux') and _os.getenv('PREFIX', '').endswith('term
     warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*arm_neon.*')
     print("[STARTUP] 🛡️  ARM64 hardening: CFFI/NEON compilation disabled, pure Python mode active", file=_sys.stderr)
 # Preemptively catch and log CFFI compilation errors
-_original_import = __builtins__.__import__
+try:
+    import builtins as _builtins
+    _original_import = _builtins.__import__
+except AttributeError:
+    _original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else None
+
 def _import_with_cffi_fallback(name, *args, **kwargs):
     """Wrap __import__ to gracefully degrade when CFFI compilation fails."""
+    if _original_import is None:
+        return __import__(name, *args, **kwargs)
     try:
         return _original_import(name, *args, **kwargs)
     except Exception as e:
@@ -30,7 +37,9 @@ def _import_with_cffi_fallback(name, *args, **kwargs):
             _suppress_logging.getLogger('qtcl.client').warning(f"[STARTUP] Skipped CFFI {name} due to ARM NEON: {str(e)[:60]}")
             raise ImportError(f"CFFI module {name} not available (ARM NEON incompatible); using pure Python fallback") from None
         raise
-__builtins__.__import__ = _import_with_cffi_fallback
+
+if hasattr(__builtins__, '__import__'):
+    __builtins__.__import__ = _import_with_cffi_fallback
 import os
 import sys
 import getpass
@@ -13129,7 +13138,8 @@ class QtclClientApp:
     # ── Mine mode ─────────────────────────────────────────────────────────────
     def run_mine_mode(self) -> None:
         print("\n  🔄 Loading wallet…")
-        if not self._load_wallet():
+        _wallet_password = os.environ.get('WALLET_PASSWORD', '')
+        if not self._load_wallet(_wallet_password if _wallet_password else None):
             print("  ❌ Wallet load failed — use Wallet → Create New first"); return
         print(f"  ✅ Wallet: {self.wallet.address}")
         self._init_db()
