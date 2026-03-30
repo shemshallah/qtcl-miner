@@ -13170,6 +13170,7 @@ class QtclClientApp:
         # ── RPC poll thread — no SSE ──────────────────────
         # ── Fetch live RPC snapshot on-demand ────────────────────────
         # ── Bootstrap oracle fetch: retry up to 30s — handles Koyeb cold-start ──
+        import time as _t
         _snap = {}
         _boot_deadline = _t.time() + 30.0
         _boot_attempt  = 0
@@ -13182,7 +13183,6 @@ class QtclClientApp:
                 print("  🔗 Connecting to oracle…", end="", flush=True)
             else:
                 print(".", end="", flush=True)
-            import time as _t
             _t.sleep(min(2.0, _boot_deadline - _t.time()))
         if _boot_attempt > 0:
             print("", flush=True)  # newline after dots
