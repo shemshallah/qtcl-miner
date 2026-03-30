@@ -13996,7 +13996,7 @@ class QtclClientApp:
                             height=target_height, hash=block_hash, nonce=nonce,
                             timestamp=timestamp, fidelity=w_state_fidelity, reward_qtcl=_srv_r,
                         )
-                        _MINE_TELEM.mark_idle()
+                        _MINE_TELEM.mark_mining()
                         # Wait for server tip to advance before re-entering loop.
                         # Without this the miner races back, sees stale height,
                         # and re-mines the same block height indefinitely.
@@ -14015,11 +14015,13 @@ class QtclClientApp:
                                         f"[MINER] ✅ Server tip confirmed h={_confirmed_h} "
                                         f"(waited {_t.time()-_tip_wait_start:.1f}s)"
                                     )
+                                    _MINE_TELEM.mark_idle()
                                     break
                             except Exception as _te:
                                 _EXP_LOG.debug(f"[MINER] tip-wait poll: {_te}")
                         else:
                             _EXP_LOG.warning("[MINER] ⚠️  tip-wait timeout — advancing anyway")
+                            _MINE_TELEM.mark_idle()
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
