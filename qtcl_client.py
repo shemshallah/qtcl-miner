@@ -19,16 +19,9 @@ if _sys.platform.startswith('linux') and _os.getenv('PREFIX', '').endswith('term
     warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*arm_neon.*')
     print("[STARTUP] 🛡️  ARM64 hardening: CFFI/NEON compilation disabled, pure Python mode active", file=_sys.stderr)
 # Preemptively catch and log CFFI compilation errors
-try:
-    import builtins as _builtins
-    _original_import = _builtins.__import__
-except AttributeError:
-    _original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else None
-
+_original_import = __builtins__.__import__
 def _import_with_cffi_fallback(name, *args, **kwargs):
     """Wrap __import__ to gracefully degrade when CFFI compilation fails."""
-    if _original_import is None:
-        return __import__(name, *args, **kwargs)
     try:
         return _original_import(name, *args, **kwargs)
     except Exception as e:
@@ -37,9 +30,7 @@ def _import_with_cffi_fallback(name, *args, **kwargs):
             _suppress_logging.getLogger('qtcl.client').warning(f"[STARTUP] Skipped CFFI {name} due to ARM NEON: {str(e)[:60]}")
             raise ImportError(f"CFFI module {name} not available (ARM NEON incompatible); using pure Python fallback") from None
         raise
-
-if hasattr(__builtins__, '__import__'):
-    __builtins__.__import__ = _import_with_cffi_fallback
+__builtins__.__import__ = _import_with_cffi_fallback
 import os
 import sys
 import getpass
@@ -68,13 +59,12 @@ import re
 import copy
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
-        level=logging.WARNING,
+        level=logging.INFO,
         format='[%(asctime)s] %(levelname)s: %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 logger = logging.getLogger(__name__)
 _EXP_LOG = logging.getLogger("qtcl.client.expansion")
-_EXP_LOG.setLevel(logging.WARNING)
 #    QRNG_API_KEY_1 → random.org          (env: RANDOM_ORG_KEY  in qrng_ensemble.py)
 #    QRNG_API_KEY_2 → ANU quantum vacuum  (env: ANU_API_KEY     in qrng_ensemble.py)
 #    QRNG_API_KEY_3 → QBICK/ID Quantique  (env: QRNG_API_KEY    in qrng_ensemble.py)
@@ -1679,90 +1669,171 @@ class LiveRPCOracleSnapshot:
                 self._session = False  # Mark as failed
         return self._session if self._session else None
     
-    def fetch_snapshot(self, timeout_s=15.0) -> dict:
-        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getQuantumMetrics.
-        
-        Direct HTTP POST to server.py RPC endpoint.
-        Returns empty dict on any error (fail-safe for RPC hangs).
+    def fetch_snapshot(self, timeout_s=5.0) -> dict:
+        """Fetch live oracle snapshot.
+
+        Strategy (ordered by reliability):
+          1. GET /rpc/oracle/snapshot  — populated by oracle cluster's RPC broadcast
+             independently of ORACLE_W_STATE_MANAGER warm-up.  Always has dm_hex.
+          2. POST /rpc qtcl_getQuantumMetrics — fallback when snapshot cache is cold.
+          3. POST /rpc/oracle/snapshots ring — extract latest entry as last resort.
+
+        Reconstructs 8×8 W-state DM from density_matrix_hex and caches dm_re/dm_im
+        for the C mining layer.  Returns empty dict on total failure (degraded mode).
         """
-        import logging
-        _log = logging.getLogger("qtcl.oracle")
+        import json as _json
+        from urllib.request import Request as _Req, urlopen as _uo
         _t0 = time.time()
-        _log.debug(f"Fetching snapshot from {self.ORACLE_URL}")
-        for _retry in range(3):
+        _base = self.ORACLE_URL.rstrip('/')
+
+        def _do_get(path: str, t: float) -> dict:
+            """urllib GET → parse jsonrpc result."""
             try:
-                session = self._get_session()
-                if not session:
-                    import json
-                    from urllib.request import Request, urlopen
-                    payload = json.dumps({"jsonrpc":"2.0","method":"qtcl_getQuantumMetrics","params":[],"id":1}).encode('utf-8')
-                    req = Request(f"{self.ORACLE_URL}/rpc", data=payload, headers={"Content-Type": "application/json"}, method="POST")
-                    with urlopen(req, timeout=timeout_s) as resp:
-                        resp_data = json.loads(resp.read().decode('utf-8'))
-                        snap = resp_data.get("result", {}) if "result" in resp_data else {}
-                else:
-                    resp = session.post(f"{self.ORACLE_URL}/rpc", json={"jsonrpc":"2.0","method":"qtcl_getQuantumMetrics","params":[],"id":1}, timeout=timeout_s)
-                    resp.raise_for_status()
-                    snap = resp.json().get("result", {}) if "result" in resp.json() else {}
-                
-                if not isinstance(snap, dict): snap = {}
-                if snap.get('density_matrix_hex'):
-                    break
-            except Exception as e:
-                if _retry == 2:
-                    _log.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
-                    return {}
-                time.sleep(1.0)
-                
-        # Parse density matrix if present
-        if snap and snap.get('density_matrix_hex'):
+                req = _Req(f"{_base}{path}", headers={"Accept": "application/json"}, method="GET")
+                with _uo(req, timeout=t) as r:
+                    data = _json.loads(r.read().decode('utf-8'))
+                return data.get('result') or data  # /rpc/oracle/snapshot wraps in result
+            except Exception as _e:
+                logger.debug(f"[RPC-ORACLE] GET {path} failed: {_e}"); return {}
+
+        def _do_post(method: str, params: list, t: float) -> dict:
+            """urllib POST JSON-RPC → parse result."""
             try:
-                dm_hex = snap['density_matrix_hex']
-                bdata = bytes.fromhex(dm_hex)
-                dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                
-                if len(bdata) == 1024:
-                    for i in range(64):
-                        re, im = struct.unpack_from('>dd', bdata, i*16)
-                        dm_re_new[i], dm_im_new[i] = re, im
-                elif len(bdata) == 512:
-                    for i in range(64):
-                        re, im = struct.unpack_from('>ff', bdata, i*8)
-                        dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                
+                body = _json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode()
+                req  = _Req(f"{_base}/rpc", data=body,
+                            headers={"Content-Type":"application/json"}, method="POST")
+                with _uo(req, timeout=t) as r:
+                    data = _json.loads(r.read().decode('utf-8'))
+                return data.get('result') or {}
+            except Exception as _e:
+                logger.debug(f"[RPC-ORACLE] POST {method} failed: {_e}"); return {}
+
+        try:
+            snap: dict = {}
+
+            # ── PASS 1: GET /rpc/oracle/snapshot ─────────────────────────────
+            _t_rem = max(1.0, timeout_s - (time.time() - _t0))
+            snap = _do_get('/rpc/oracle/snapshot', _t_rem)
+            if not isinstance(snap, dict):
+                snap = {}
+
+            # ── PASS 2: qtcl_getQuantumMetrics fallback ───────────────────────
+            if not snap.get('density_matrix_hex'):
+                _t_rem = max(1.0, timeout_s - (time.time() - _t0))
+                _qm = _do_post('qtcl_getQuantumMetrics', [], _t_rem)
+                if isinstance(_qm, dict) and _qm.get('density_matrix_hex'):
+                    snap = {**snap, **_qm}
+
+            # ── PASS 3: ring buffer last resort ──────────────────────────────
+            if not snap.get('density_matrix_hex'):
+                _t_rem = max(0.5, timeout_s - (time.time() - _t0))
+                _ring = _do_get('/rpc/oracle/snapshots?limit=1', _t_rem)
+                if isinstance(_ring, dict):
+                    _snaps = _ring.get('snapshots') or []
+                    if _snaps and isinstance(_snaps[-1], dict):
+                        snap = {**snap, **_snaps[-1]}
+
+            if not isinstance(snap, dict):
+                snap = {}
+
+            # ── Normalise field aliases ───────────────────────────────────────
+            _ws  = snap.get('w_state') or {}
+            _lat = snap.get('lattice') or {}
+            def _nv(*keys):
+                for k in keys:
+                    v = snap.get(k) or _ws.get(k) or _lat.get(k)
+                    try:
+                        f = float(v)
+                        return f if (f == f and abs(f) < 1e15) else None
+                    except Exception:
+                        pass
+                return None
+            _fid = _nv('w_state_fidelity','fidelity','w3_fidelity','pq0_fidelity') or 0.0
+            _coh = _nv('coherence_l1','coherence') or 0.0
+            _ent = _nv('von_neumann_entropy','entropy') or 0.0
+            _pur = _nv('purity') or 0.0
+            _bh  = int(snap.get('block_height') or snap.get('height') or 0)
+            _cyc = int(snap.get('cycle') or snap.get('lattice_refresh_counter') or 0)
+            _dmh = snap.get('density_matrix_hex','') or snap.get('dm_hex','') or ''
+
+            # ── Decode density_matrix_hex → dm_re/dm_im for C mining layer ───
+            if _dmh and len(_dmh) >= 32:
+                try:
+                    bdata = bytes.fromhex(_dmh[:2048])
+                    n_bytes = len(bdata)
+                    dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
+                    if n_bytes >= 1024:      # complex128 big-endian
+                        for i in range(64):
+                            re, im = struct.unpack_from('>dd', bdata, i * 16)
+                            dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                    elif n_bytes >= 512:     # complex64 big-endian
+                        for i in range(64):
+                            re, im = struct.unpack_from('>ff', bdata, i * 8)
+                            dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                    elif n_bytes >= 128:     # float16 little-endian
+                        for i in range(min(64, n_bytes // 2)):
+                            dm_re_new[i] = float(struct.unpack_from('<e', bdata, i * 2)[0])
+                    _tr = sum(dm_re_new[i*8+i] for i in range(8))
+                    if _tr > 1e-9:
+                        if abs(_tr - 1.0) > 0.05:
+                            dm_re_new = [v / _tr for v in dm_re_new]
+                        with self._dm_lock:
+                            self._dm_re = dm_re_new
+                            self._dm_im = dm_im_new
+                            self._last_fetch_ts = time.time()
+                        logger.debug(f"[RPC-ORACLE] DM decoded ok tr={_tr:.4f} fid={_fid:.4f}")
+                except Exception as _pe:
+                    logger.debug(f"[RPC-ORACLE] DM parse error: {_pe}")
+
+            # ── Reconstruct W-state from fidelity if DM still absent ─────────
+            if self._last_fetch_ts == 0.0 and _fid > 0.0:
+                _w_re = [0.0]*64
+                _w_frac = min(1.0, max(0.0, _fid))
+                for i in range(8):
+                    _w_re[i*8+i] = (1.0 - _w_frac) / 8.0
+                for _idx in [1, 2, 4]:   # |001⟩ |010⟩ |100⟩ W3 subspace
+                    _w_re[_idx*8+_idx] += _w_frac / 3.0
                 with self._dm_lock:
-                    self._dm_re = dm_re_new
-                    self._dm_im = dm_im_new
+                    self._dm_re = _w_re
+                    self._dm_im = [0.0]*64
                     self._last_fetch_ts = time.time()
-            except Exception as parse_e:
-                logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
-        
-        # Update oracle state
-        if snap:
-            with self._oracle_state_lock:
-                w_state = snap.get('w_state') or {}
-                _lattice = snap.get('lattice') or {}
-                _fid_raw = (w_state.get('fidelity') or
-                            snap.get('w_state_fidelity') or
-                            _lattice.get('fidelity') or 0.0)
-                _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
-                self._oracle_state = {
-                    'w_state_fidelity': float(_fid_raw),
-                    'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
-                    'von_neumann_entropy': float(w_state.get('entropy') or 0.0),
-                    'purity': float(w_state.get('purity') or _lattice.get('fidelity') or 0.0),
-                    'cycle': snap.get('cycle', 0),
-                    'consensus': snap.get('consensus', False),
-                    'mermin_test': snap.get('mermin_test', {}),
-                    'block_height': _bh_snap,
-                    'density_matrix_hex': snap.get('density_matrix_hex', ''),
-                    'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
-                    'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
-                    'latency_ms': round((time.time() - _t0) * 1000.0, 1),
-                }
-        
-        snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
-        return snap
+                logger.debug(f"[RPC-ORACLE] W-state DM reconstructed fidelity={_fid:.4f}")
+                _dmh = _dmh or 'reconstructed'
+
+            # ── Cache oracle state dict ───────────────────────────────────────
+            if snap or _fid > 0.0:
+                with self._oracle_state_lock:
+                    self._oracle_state = {
+                        'w_state_fidelity':    _fid,
+                        'coherence_l1':        _coh,
+                        'von_neumann_entropy': _ent,
+                        'purity':              _pur,
+                        'cycle':               _cyc,
+                        'consensus':           snap.get('consensus', False),
+                        'mermin_test':         snap.get('mermin_test') or snap.get('bell_test') or {},
+                        'block_height':        _bh,
+                        'density_matrix_hex':  _dmh,
+                        'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh or 0),
+                        'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh-1)),
+                        'latency_ms': round((time.time() - _t0) * 1000.0, 1),
+                    }
+
+            # ── Inject normalised fields into snap for callers ────────────────
+            snap.setdefault('density_matrix_hex', _dmh)
+            snap.setdefault('w_state_fidelity',   _fid)
+            snap.setdefault('coherence_l1',        _coh)
+            snap.setdefault('von_neumann_entropy', _ent)
+            snap.setdefault('purity',              _pur)
+            snap.setdefault('block_height',        _bh)
+            snap.setdefault('height',              _bh)
+            snap.setdefault('cycle',               _cyc)
+            snap.setdefault('pq_curr', int(snap.get('pq_curr') or _bh or 0))
+            snap.setdefault('pq_last', int(snap.get('pq_last') or max(0, _bh-1)))
+            snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
+            return snap
+        except Exception as e:
+            logger.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
+            return {}
     
     def get_oracle_dm(self) -> tuple:
         """Return (dm_re, dm_im, age_sec) thread-safe."""
@@ -10448,17 +10519,18 @@ class KoyebAPIClient:
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         raw_curr = snap.get("pq_curr") or snap.get("pq_current")
         raw_last = snap.get("pq_last")
-        # pq_curr/pq_last are actual block heights, not modulo 8
+        # pq_curr/pq_last are 0-7 pseudoqubit sector indices (height mod 8)
+        # Never store raw block height — that breaks the Poincaré disk overlay
         if bh > 0:
-            pq_curr = str(bh + 1)
-            pq_last = str(bh)
+            pq_curr = str(bh % 8)
+            pq_last = str(max(0, bh - 1) % 8)
         elif raw_curr is not None:
             _rc = int(raw_curr) if str(raw_curr).isdigit() else 0
             _rl = int(raw_last) if raw_last is not None and str(raw_last).isdigit() else 0
-            pq_curr = str(_rc + 1)
-            pq_last = str(_rc)
+            pq_curr = str(_rc % 8)
+            pq_last = str(_rl % 8)
         else:
-            pq_curr = "1"
+            pq_curr = "0"
             pq_last = "0"
         return {
             "pq_curr":          pq_curr,
@@ -10996,7 +11068,7 @@ class KoyebOracleState:
         """RPC-based metric refresh — always does a live fetch to measure real latency."""
         try:
             t0 = time.time()
-            live = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=15.0)
+            live = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
             if live:
                 def _nv(v):
                     try:
@@ -11013,21 +11085,21 @@ class KoyebOracleState:
                 self.connected          = True
                 self.last_sync_ts       = time.time()
                 if client_field:
-                    return self.sync(client_field, timeout=15)
+                    return self.sync(client_field, timeout=3)
                 return True
             self.connected = False
-            return self.sync(client_field, timeout=15) if client_field else False
+            return self.sync(client_field, timeout=3) if client_field else False
         except Exception as e:
             _logging.debug(f"[METRICS REFRESH] Error: {e}")
             self.connected = False
             return False
     
-    def sync(self, client_field: "ClientFieldState", timeout: int = 15) -> bool:
+    def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
         """RPC-only sync via _LIVE_RPC_ORACLE.fetch_snapshot()."""
         t0 = time.time()
         snap = {}
         try:
-            snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=timeout) or {}
+            snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=min(timeout, 6)) or {}
             if snap:
                 self.channel_latency_ms = (time.time() - t0) * 1000.0
         except Exception:
@@ -12393,9 +12465,8 @@ class QtclClientApp:
                 bath = GKSLBathParams.from_snap(snap)
                 bh   = int(snap.get("block_height") or snap.get("height") or
                            snap.get("lattice_refresh_counter") or 0)
-                # pq_curr/pq_last should be actual block heights, not modulo 8
-                pq_curr_id = str(bh + 1) if bh > 0 else '1'
-                pq_last_id = str(bh) if bh > 0 else '0'
+                pq_curr_id = str(bh)     if bh > 0 else str(int(snap.get("pq_curr") or 0) or 0)
+                pq_last_id = str(bh - 1) if bh > 0 else str(int(snap.get("pq_last") or 0) or 0)
                 dm_curr = None
                 try:
                     re_list, im_list, _ = _LIVE_RPC_ORACLE.get_oracle_dm()
@@ -12529,13 +12600,10 @@ class QtclClientApp:
     def _load_wallet(self) -> bool:
         if self.wallet.is_loaded():
             return True
-        # Try environment variable first for non-interactive use
-        pw = os.environ.get('WALLET_PASSWORD')
-        if not pw:
-            try:
-                pw = getpass.getpass("  Wallet password: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return False
+        try:
+            pw = getpass.getpass("  Wallet password: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
         return bool(pw) and self.wallet.load(pw)
     def _start_threads(self) -> None:
         """
@@ -12579,21 +12647,21 @@ class QtclClientApp:
         _tp.sleep(0.1)  # minimal yield — wallet/DB already settled by caller
         try:
             peer_id = getattr(self, '_peer_id', None)
-            if not peer_id:
-                _EXP_LOG.debug("[CLIENT] P2P: no peer_id, skipping P2P init")
-                return
+            if not peer_id: return
             _P2P_NODE = _init_p2p_node(peer_id, QtclP2PNode.DEFAULT_PORT)
             ok = _P2P_NODE.start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
             if ok:
-                _EXP_LOG.info("[CLIENT] P2P consensus node started on port 9091")
+                _EXP_LOG.info("[CLIENT] 🌐 P2P consensus node started on port 9091")
                 if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
                     _GENESIS_RESET_LISTENER._broadcaster = _P2P_NODE
             else:
-                _EXP_LOG.debug(
-                    "[CLIENT] P2P C layer unavailable — running in solo mode"
+                _EXP_LOG.warning(
+                    "[CLIENT] P2P C layer unavailable — running in solo mode. "
+                    "Delete __pycache__ and ensure clang+openssl are installed: "
+                    "pkg install clang openssl libffi"
                 )
         except Exception as _e:
-            _EXP_LOG.debug(f"[CLIENT] P2P init skipped: {_e}")
+            _EXP_LOG.warning(f"[CLIENT] _start_p2p: {_e}")
     def _heartbeat_loop(self) -> None:
         """
         Every 30 seconds:
@@ -12752,9 +12820,9 @@ class QtclClientApp:
                                     error_body = _http_err.read().decode('utf-8', errors='replace')[:80]
                                     # Strip HTML — log only first 80 chars of plain text portion
                                     import re as _re2; error_body = _re2.sub(r'<[^>]+>', '', error_body).strip()[:60]
-                                    _EXP_LOG.warning(f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count}) → {error_body}")
+                                    _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count}) → {error_body}")
                                 except:
-                                    _EXP_LOG.warning(f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count})")
+                                    _EXP_LOG.error(f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count})")
                             else:
                                 _EXP_LOG.debug(f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count}), retrying…")
                         elif _fail_count % 10 == 0:
@@ -13164,14 +13232,14 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── RPC poll thread — no SSE ──────────────────────
         # ── Fetch live RPC snapshot on-demand ────────────────────────
-        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=15.0)
+        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
         snap = _snap or {}
         # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
         bh = int(snap.get('block_height') or snap.get('height') or
                  self.koyeb_state.block_height or 0)
-        # pq_curr/pq_last should be actual block heights, not modulo 8
-        pq_curr_id = str(bh + 1) if bh > 0 else '1'
-        pq_last_id = str(bh) if bh > 0 else '0'
+        pq_curr_id = str(snap.get('pq_curr') or snap.get('pq_curr_id') or bh or '')
+        pq_last_id = str(snap.get('pq_last') or snap.get('pq_last_id') or
+                         max(0, bh - 1) if bh else '')
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
         #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
@@ -13280,7 +13348,7 @@ class QtclClientApp:
                 _pow_seed = os.urandom(32)
                 return (False, {}, _pow_seed, _report)
             # Oracle DM available — build real blockfield
-            _live_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=15.0) or {}
+            _live_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0) or {}
             _dm_hex = _live_snap.get('density_matrix_hex', '')
             _fid    = float(_live_snap.get('w_state_fidelity') or
                             _live_snap.get('fidelity') or 0.0)
@@ -13310,7 +13378,7 @@ class QtclClientApp:
             snap.get('w_state_fidelity') or
             (snap.get('lattice') or {}).get('fidelity') or 0.0
         )
-        _dm_ready = bool(_dm_hex and len(_dm_hex) >= 32)
+        _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
         _lat_ms   = float(snap.get('_latency_ms') or snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
@@ -13334,8 +13402,8 @@ class QtclClientApp:
             print("  🔗 Awaiting oracle DM frame…", end='', flush=True)
             while time.time() < deadline:
                 _dm_snap = _LIVE_RPC_ORACLE.fetch_snapshot()
-                if _dm_snap.get('density_matrix_hex'):
-                    print(f" ✅ (RPC)", flush=True)
+                if _dm_snap.get('cycle', 0) > 0:
+                    print(f" ✅ (RPC)  snaps={_dm_snap.get('cycle', 0)}", flush=True)
                     return True
                 print('.', end='', flush=True)
                 time.sleep(0.3)
@@ -13440,8 +13508,8 @@ class QtclClientApp:
                                     )
                                     self.accept_count += 1
                                     return (True, result)
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] REJECTED h={block_height} | {error_msg}"
+                                _EXP_LOG.error(
+                                    f"[SUBMIT] ❌ REJECTED h={block_height} | {error_msg}"
                                 )
                                 self.reject_count += 1
                                 return (False, result)
@@ -13472,8 +13540,8 @@ class QtclClientApp:
                             await _asyncio.sleep(backoff)
                     
                     # All retries exhausted
-                    _EXP_LOG.warning(
-                        f"[SUBMIT] Failed after 6 attempts: {last_error}"
+                    _EXP_LOG.error(
+                        f"[SUBMIT] ❌ FAILED after 6 attempts (61s window): {last_error}"
                     )
                     self.reject_count += 1
                     return (False, None)
@@ -13487,30 +13555,24 @@ class QtclClientApp:
             _last_poll_time = _t.time()
             
             _NULL_HASH = '0' * 64
-            _ORACLE_LAT_MAX_MS = 20000.0   # hard gate: refuse to mine if oracle RTT > 20s
-            _has_valid_tip = False  # Track if we've fetched a valid chain tip
-            
+            _ORACLE_LAT_MAX_MS = 5000.0   # hard gate: refuse to mine if oracle RTT > 5s
             while True:  # Main mining loop
                 try:
-                    # Only mark as MINING after we have a valid tip
-                    # Don't set state here - wait until we have actual work to do
-                    
                     # ── GATE 0: Oracle liveness check ─────────────────────────────
                     _t_oracle_start = _t.time()
-                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=20.0)
+                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=6.0)
                     _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
                     if not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS:
                         _EXP_LOG.warning(
-                            f"[MINER] Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — blocking mine, retry in 5s"
+                            f"[MINER] ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — "
+                            f"blocking mine, retry in 5s"
                         )
-                        print(f"  Oracle waiting... (lat={_oracle_lat_ms:.0f}ms)", flush=True)
-                        if _has_valid_tip:
-                            _MINE_TELEM.mark_mining()
+                        print(f"  ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — waiting…", flush=True)
                         await _asyncio.sleep(5.0)
                         continue
 
                     # STAGE 1: Fetch chain tip
-                    _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=20, retries=2)
+                    _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
                     if not _res_h:
                         _EXP_LOG.warning("[MINER] chain tip fetch failed, retrying…")
                         await _asyncio.sleep(2.0)
@@ -13518,16 +13580,12 @@ class QtclClientApp:
                     oracle_height = int(_res_h.get('height', 0))
                     oracle_hash = str(_res_h.get('tip_hash') or _NULL_HASH)
 
-                    # Got valid tip - mark mining state
-                    if not _has_valid_tip:
-                        _has_valid_tip = True
-                        _MINE_TELEM.mark_mining()
-
                     # ── GATE 1: Refuse null parent — would fork the chain ──────────
                     if oracle_hash == _NULL_HASH:
-                        _EXP_LOG.warning(
-                            f"[MINER] tip_hash is null at h={oracle_height} — "
-                            f"refusing to mine off null parent. Waiting for valid tip…"
+                        _EXP_LOG.error(
+                            f"[MINER] ❌ tip_hash is null at h={oracle_height} — "
+                            f"refusing to mine off null parent (would create genesis fork). "
+                            f"Waiting for valid tip…"
                         )
                         print(f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip", flush=True)
                         await _asyncio.sleep(5.0)
@@ -13544,11 +13602,11 @@ class QtclClientApp:
                         continue
 
                     # STAGE 2: Fetch difficulty from latest block
-                    _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=20, retries=2) or {}
+                    _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
                     difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 4)))
 
                     # STAGE 3: Fetch mempool
-                    _res_m = kapi._rpc("qtcl_getMempool", [], timeout=20, retries=1)
+                    _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
                     _pending_user_txs = _res_m if isinstance(_res_m, list) else []
 
                     _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms")
@@ -13882,19 +13940,19 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # pq0   = oracle ground anchor — dominant eigenstate of the DM
                     #         (index 0-7 of max diagonal element)
-                    # pq_last = chain tip height (actual block height)
-                    # pq_curr = next block height = pq_last + 1
+                    # pq_last = forward boundary of parent block (parent's pq_curr)
+                    # pq_curr = next face on {8,3} lattice = (pq_last + 1) % 8
                     # These define the geodesic triangle of the blockfield object.
                     try:
                         _parent_pq_curr = int(_res_b.get('pq_curr') or 0)
                         _parent_pq_last = int(_res_b.get('pq_last') or 0)
                         # Blockfield boundary evolution:
-                        # pq_last = actual chain tip height
-                        pq_last = oracle_height
-                        # pq_curr = next block height
-                        pq_curr = target_height
+                        # rear boundary = parent's forward boundary
+                        pq_last = _parent_pq_curr % 8
+                        # forward boundary = next face on {8,3} lattice
+                        pq_curr = (_parent_pq_curr + 1) % 8
                         # oracle ground anchor from DM dominant diagonal
-                        _ora_snap = _oracle_snap
+                        _ora_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=2.0) or {}
                         _dmh = _ora_snap.get('density_matrix_hex', '')
                         pq0 = 0
                         if _dmh and len(_dmh) >= 128:
@@ -13920,15 +13978,14 @@ class QtclClientApp:
                             pq0 = max(_diag, key=lambda x: x[0])[1] if _diag else 0
                     except Exception as _pq_e:
                         _EXP_LOG.debug(f"[MINER] pq boundary derivation: {_pq_e}")
-                        # Fallback: use actual block heights
-                        pq_last = oracle_height
-                        pq_curr = target_height
+                        pq_last = int(_res_b.get('pq_curr') or 0) % 8
+                        pq_curr = (pq_last + 1) % 8
                         pq0 = 0
 
                     w_state_fidelity = 0.75
                     # Try to get actual fidelity from client field or oracle snap
                     try:
-                        _ora_fid = float(_oracle_snap.get('w_state_fidelity') or 0.0)
+                        _ora_fid = float((_LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=1.0) or {}).get('w_state_fidelity') or 0.0)
                         if 0.0 < _ora_fid <= 1.0:
                             w_state_fidelity = _ora_fid
                         elif self.client_field and self.client_field.metrics:
@@ -14035,8 +14092,9 @@ class QtclClientApp:
                             await _asyncio.sleep(1.0)
                 
                 except Exception as e:
-                    _EXP_LOG.warning(
-                        f"[MINER] {type(e).__name__}: {e}"
+                    _EXP_LOG.error(
+                        f"[MINER] FATAL: {type(e).__name__}: {e}",
+                        exc_info=True
                     )
                     _MINE_TELEM.mark_idle()
                     await _asyncio.sleep(1.0)
@@ -14091,16 +14149,12 @@ class QtclClientApp:
             now  = time.time()
             sep  = "─" * 72
             # ── state badge ───────────────────────────────────────────────
-            # Show "INITIALIZING..." if no valid tip yet
-            if tel["height"] == 0 and tel["state"] == "MINING":
-                state_badge = "⚙️  INITIALIZING"
-            else:
-                state_badge = {
-                    "IDLE":        "💤 IDLE",
-                    "MINING":      "⛏️  MINING",
-                    "SOLVED":      "✅ BLOCK SOLVED",
-                    "SUBMITTING":  "📡 SUBMITTING",
-                }.get(tel["state"], tel["state"])
+            state_badge = {
+                "IDLE":        "💤 IDLE",
+                "MINING":      "⛏️  MINING",
+                "SOLVED":      "✅ BLOCK SOLVED",
+                "SUBMITTING":  "📡 SUBMITTING",
+            }.get(tel["state"], tel["state"])
             hr_str = (f"{tel['hash_rate']:.0f} H/s"
                       if tel["hash_rate"] > 0 else "warming up…")
             session = _fmt_duration(now - tel["session_start"])
@@ -14109,15 +14163,11 @@ class QtclClientApp:
             print(sep)
             # ── PoW live progress ─────────────────────────────────────────
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
-                if tel["height"] == 0:
-                    # Still initializing - don't show misleading info
-                    print(f"  Fetching chain tip...  │  {hr_str}")
-                else:
-                    target_zeros = tel["difficulty"]
-                    nonce_str    = f"{tel['nonce']:,}"
-                    print(f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
-                          f"nonce={nonce_str}  │  {hr_str}")
-                    print(f"  Parent: {tel['parent_hash'][:32]}…")
+                target_zeros = tel["difficulty"]
+                nonce_str    = f"{tel['nonce']:,}"
+                print(f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
+                      f"nonce={nonce_str}  │  {hr_str}")
+                print(f"  Parent: {tel['parent_hash'][:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
             # ── Last solved block ─────────────────────────────────────────
@@ -14257,9 +14307,8 @@ class QtclClientApp:
                     bh = int(_fb)
             except Exception:
                 pass
-        # pq_curr/pq_last are actual block heights, not modulo 8
-        pq_curr = str(bh + 1) if bh > 0 else "1"
-        pq_last = str(bh) if bh > 0 else "0"
+        pq_curr = str(bh % 8)          if bh > 0 else "0"
+        pq_last = str((bh - 1) % 8)    if bh > 0 else "0"
         dm_curr = _decode_dm_8x8(snap)
         if dm_curr is None:
             dm_curr = _reconstruct_dm_from_bloch(snap)
@@ -14503,9 +14552,10 @@ class QtclClientApp:
             if mermin > 4.0:
                 mermin = 0.0; _mq = False; _mverd = "(field error — check M_value key)"
             _bf  = w_state.get("block_field") or {}
-            _bh_disp = int(w_state.get("block_height") or pq0.get("block_height") or tip.get("block_height") or 0)
-            pq_c = str(_bh_disp + 1) if _bh_disp > 0 else "1"
-            pq_l = str(_bh_disp) if _bh_disp > 0 else "0"
+            pq_c = str(_bf.get("pq_curr") or w_state.get("pq_curr") or
+                       w_state.get("pq_current") or pq0.get("pq_curr") or "?")
+            pq_l = str(_bf.get("pq_last") or w_state.get("pq_last") or
+                       pq0.get("pq_last") or "?")
             dm_hex = (w_state.get("density_matrix_hex") or
                       pq0.get("density_matrix_hex") or "—")
             oracle_addr = (w_state.get("oracle_id") or pq0.get("oracle_id") or
