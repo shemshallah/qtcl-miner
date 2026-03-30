@@ -1,0 +1,1840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>QTCL &middot; Quantum Temporal Coherence Ledger</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="QTCL is a live post-quantum proof-of-work blockchain with W-state entangled block certification, HLWE post-quantum signatures, and Mermin inequality-verified 5-node oracle consensus. Block explorer, live transactions, and quantum metrics.">
+  <meta name="keywords" content="quantum blockchain, post-quantum cryptography, W-state entanglement, Mermin inequality, HLWE, lattice cryptography, proof of work, block explorer, QRNG">
+  <meta name="author" content="Shemshallah">
+  <meta property="og:title" content="QTCL · Quantum Temporal Coherence Ledger">
+  <meta property="og:description" content="Live post-quantum PoW blockchain. W-state certified blocks. HLWE signatures. Mermin M₃≈2.8 oracle consensus.">
+  <meta property="og:url" content="https://qtcl-blockchain.koyeb.app/">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:site" content="@galacticfed638">
+  <meta name="twitter:creator" content="@galacticfed638">
+  <meta name="twitter:title" content="QTCL · Quantum Blockchain Explorer">
+  <meta name="twitter:description" content="Live post-quantum PoW blockchain. W-state certified blocks. Mermin inequality oracle.">
+  <link rel="canonical" href="https://qtcl-blockchain.koyeb.app/">
+  <link rel="sitemap" type="application/xml" href="/sitemap.xml">
+  <meta name="google-site-verification" content="TCf7Ywazq-Y0iMZJj51d6L-AgbPgp-4h2ayXQmVIDMo">
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@300;400;600&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#030610;--bg2:#060c1c;--bg3:#0a1228;--card:#080e20;
+  --b:rgba(0,220,255,.10);--b2:rgba(0,220,255,.18);
+  --cy:#00dcff;--cy2:rgba(0,220,255,.12);
+  --go:#d4a020;--go2:rgba(212,160,32,.12);
+  --vi:#8040ff;--vi2:rgba(128,64,255,.12);
+  --gr:#00ff9d;--gr2:rgba(0,255,157,.10);
+  --re:#ff3355;--dim:#3a4a68;--tx:#bbc8e0;--br:#e8f0ff;
+  --mono:'JetBrains Mono',monospace;--disp:'Orbitron',sans-serif;--body:'DM Sans',sans-serif;
+}
+html{font-size:14px;background:var(--bg)}
+body{font-family:var(--body);color:var(--tx);background:var(--bg);min-height:100vh;display:flex;flex-direction:column}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:9000;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.05) 3px,rgba(0,0,0,.05) 4px)}
+#hdr{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:52px;background:rgba(3,6,16,.97);border-bottom:1px solid var(--b2);position:sticky;top:0;z-index:100;flex-shrink:0}
+#hdr::after{content:'';position:absolute;bottom:-1px;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--cy) 40%,var(--vi) 70%,transparent);opacity:.5}
+.hb{display:flex;align-items:center;gap:12px}
+#lc{display:block;flex-shrink:0}
+.ht{font-family:var(--disp);font-size:15px;font-weight:900;letter-spacing:4px;color:var(--cy);text-shadow:0 0 18px rgba(0,220,255,.5)}
+.hs{font-size:9px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
+.hr{display:flex;align-items:center;gap:20px}
+.hst{text-align:right}
+.hstl{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase}
+.hstv{font-family:var(--mono);font-size:13px;color:var(--go);margin-top:2px}
+#cp{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:4px 10px;border-radius:20px;background:var(--gr2);border:1px solid rgba(0,255,157,.25);color:var(--gr);transition:all .3s}
+#cp.off{background:rgba(255,51,85,.1);border-color:rgba(255,51,85,.25);color:var(--re)}
+.cd{width:6px;height:6px;border-radius:50%;background:var(--gr);animation:pl 2s infinite;flex-shrink:0}
+#cp.off .cd{background:var(--re);animation:none}
+@keyframes pl{0%,100%{opacity:1;box-shadow:0 0 6px var(--gr)}50%{opacity:.4;box-shadow:none}}
+#hck{font-family:var(--mono);font-size:10px;color:var(--dim)}
+#page{flex:1;padding:16px 20px 32px;display:flex;flex-direction:column;gap:16px;max-width:1600px;width:100%;margin:0 auto}
+.st{font-family:var(--disp);font-size:8px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:var(--dim);margin-bottom:10px}
+.mg{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}
+.mc{background:var(--card);border:1px solid var(--b);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .2s}
+.mc:hover{border-color:var(--b2)}
+.mc::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cy),var(--vi));opacity:.6}
+.mc.go::after{background:linear-gradient(90deg,var(--go),#ffcf60)}
+.mc.vi::after{background:linear-gradient(90deg,var(--vi),var(--cy))}
+.mc.gr::after{background:var(--gr)}
+.ml{font-size:9px;color:var(--dim);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px}
+.mv{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--cy);line-height:1;min-height:26px;transition:color .3s}
+.mv.go{color:var(--go)}.mv.vi{color:var(--vi)}.mv.gr{color:var(--gr)}.mv.dm{color:var(--dim)}
+.ms{font-size:9px;color:var(--dim);margin-top:5px;font-family:var(--mono)}
+.mb{height:2px;background:var(--bg3);border-radius:2px;margin-top:8px;overflow:hidden}
+.mbf{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--cy),var(--vi));transition:width .8s ease}
+.tc{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.tc{grid-template-columns:1fr}}
+.pn{background:var(--card);border:1px solid var(--b);border-radius:8px;overflow:hidden}
+.ph{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--b);background:rgba(0,0,0,.2)}
+.pht{font-family:var(--disp);font-size:8px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+.pb{font-family:var(--mono);font-size:8px;letter-spacing:1px;padding:2px 8px;border-radius:3px;background:var(--cy2);color:var(--cy);border:1px solid rgba(0,220,255,.2)}
+.pb.go{background:var(--go2);color:var(--go);border-color:rgba(212,160,32,.2)}
+.pb.vi{background:var(--vi2);color:var(--vi);border-color:rgba(128,64,255,.2)}
+.pb.gr{background:var(--gr2);color:var(--gr);border-color:rgba(0,255,157,.2)}
+#dc,#qc{display:block;width:100%}
+#cs{overflow-x:auto;padding:12px 16px;display:flex;align-items:center;gap:0;min-height:96px;scrollbar-width:thin;scrollbar-color:var(--b) transparent}
+#cs::-webkit-scrollbar{height:3px}
+#cs::-webkit-scrollbar-thumb{background:var(--b)}
+.bn{flex-shrink:0;display:flex;flex-direction:column;align-items:center}
+.bco{width:24px;height:2px;flex-shrink:0;background:var(--b2);position:relative;align-self:center}
+.bco::after{content:'';position:absolute;right:-4px;top:-3px;border:4px solid transparent;border-left-color:var(--b2)}
+.bh{width:56px;height:56px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;position:relative;transition:transform .2s}
+.bh:hover{transform:scale(1.12)}
+.bh canvas{position:absolute;inset:0}
+.bnum{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--go);z-index:1}
+.btx{font-family:var(--mono);font-size:8px;color:var(--dim);z-index:1}
+.bl{font-family:var(--mono);font-size:8px;color:var(--dim);margin-top:4px;max-width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+.bn.fr .bh{animation:bfr .6s cubic-bezier(.34,1.56,.64,1)}
+@keyframes bfr{0%{transform:scale(0);opacity:0}100%{transform:scale(1);opacity:1}}
+.tt{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+.tt th{font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);padding:8px 14px;border-bottom:1px solid var(--b);text-align:left;background:rgba(0,0,0,.15);font-family:var(--disp);font-weight:700}
+.tt td{padding:8px 14px;border-bottom:1px solid rgba(0,220,255,.04);color:var(--tx)}
+.tt tr:hover td{background:var(--cy2)}
+.tt tr.fr td{animation:tfr .5s ease-out}
+@keyframes tfr{0%{background:rgba(0,220,255,.15)}100%{background:transparent}}
+.tba{display:inline-block;font-size:8px;padding:2px 7px;border-radius:3px;letter-spacing:.5px;font-family:var(--disp)}
+.tba.pending{background:var(--go2);color:var(--go)}
+.tba.confirmed{background:var(--gr2);color:var(--gr)}
+.tba.coinbase{background:var(--vi2);color:var(--vi)}
+.tba.treasury{background:var(--go2);color:var(--go);border:1px solid rgba(212,160,32,.3)}
+.tba.transfer{background:var(--cy2);color:var(--cy)}
+.txfbtn{background:rgba(0,220,255,.06);border:1px solid rgba(0,220,255,.15);color:var(--dim);font-size:9px;
+  padding:3px 8px;border-radius:3px;cursor:pointer;font-family:var(--disp);letter-spacing:.5px;transition:all .2s}
+.txfbtn:hover,.txfbtn.active{background:rgba(0,220,255,.18);color:var(--cy);border-color:var(--cy)}
+.txfbtn.active.cb{background:rgba(255,0,200,.15);color:var(--vi);border-color:var(--vi)}
+.txfbtn.active.tr{background:rgba(0,220,255,.15);color:var(--cy);border-color:var(--cy)}
+.txpbtn{background:rgba(0,220,255,.06);border:1px solid rgba(0,220,255,.12);color:var(--dim);font-size:10px;
+  padding:3px 12px;border-radius:3px;cursor:pointer;font-family:var(--mono);transition:all .2s}
+.txpbtn:hover:not(:disabled){color:var(--cy);border-color:var(--cy)}
+.txpbtn:disabled{opacity:.3;cursor:default}
+.miner-row{display:flex;flex-direction:column;padding:8px 14px;border-bottom:1px solid rgba(0,220,255,.05);transition:background .15s}
+.miner-row:hover{background:rgba(0,220,255,.04)}
+.miner-row.live .miner-dot{background:var(--gr);box-shadow:0 0 5px var(--gr);animation:pl 1.8s infinite}
+.miner-row.seen .miner-dot{background:var(--go)}
+.miner-row.historic .miner-dot{background:var(--dim)}
+@keyframes p2ppulse{0%,100%{opacity:1;box-shadow:0 0 8px var(--gr),0 0 16px rgba(0,255,157,.3)}50%{opacity:.5;box-shadow:none}}
+.miner-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:3px}
+.miner-addr{font-family:var(--mono);font-size:10px;color:var(--cy);cursor:pointer;user-select:all}
+.miner-addr:hover{color:#fff}
+.miner-stats{display:flex;gap:12px;font-size:9px;margin-top:3px;color:var(--dim)}
+.miner-stat-val{color:var(--tx)}
+.miner-badge{font-size:8px;padding:1px 5px;border-radius:2px;font-family:var(--disp);letter-spacing:.4px}
+.miner-badge.live{background:rgba(0,255,157,.12);color:var(--gr)}
+.miner-badge.seen{background:rgba(255,165,0,.12);color:var(--go)}
+.miner-badge.historic{background:rgba(255,255,255,.06);color:var(--dim)}
+.tx-cb td:first-child{border-left:2px solid var(--vi)}
+.tx-tr td:first-child{border-left:2px solid rgba(0,220,255,.3)}
+.tx-new{animation:tfr .8s ease}
+.or{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--b);transition:background .2s}
+.or:hover{background:var(--vi2)}
+.or:last-child{border-bottom:none}
+.od{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.od.on{background:var(--gr);box-shadow:0 0 6px var(--gr)}
+.od.off{background:var(--re)}
+.on2{font-family:var(--mono);font-size:10px;color:var(--br);flex:1}
+.ort{font-size:8px;color:var(--dim)}
+.of{font-family:var(--mono);font-size:11px;color:var(--vi);font-weight:600}
+.nr{display:flex;justify-content:space-between;padding:7px 16px;border-bottom:1px solid rgba(0,220,255,.05)}
+.nr:last-child{border-bottom:none}
+.nk{font-size:9px;color:var(--dim)}.nv{font-family:var(--mono);font-size:10px;color:var(--vi)}
+.md{padding:16px;display:flex;align-items:center;gap:20px}
+.mb2{font-family:var(--disp);font-size:48px;font-weight:900;line-height:1;flex-shrink:0;transition:color .5s}
+.mb2.q{color:var(--cy);text-shadow:0 0 30px rgba(0,220,255,.4)}
+.mb2.c{color:var(--re);text-shadow:0 0 20px rgba(255,51,85,.3)}
+.mi{flex:1;min-width:0}
+.mv2{font-size:11px;color:var(--br);font-weight:500;margin-bottom:6px}
+.ms2{font-family:var(--mono);font-size:9px;color:var(--dim);margin-bottom:4px}
+.mba{height:4px;background:var(--bg3);border-radius:2px;overflow:hidden;margin-top:8px}
+.mbaf{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--vi),var(--cy));transition:width .8s ease}
+.mbl{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--dim);margin-top:4px}
+.mac{padding:0 16px 12px;display:flex;flex-wrap:wrap;gap:4px}
+.ac{font-family:var(--mono);font-size:8px;padding:2px 6px;border-radius:3px;background:var(--bg3);color:var(--dim);border:1px solid var(--b)}
+.bs{display:flex;border-top:1px solid var(--b)}
+.bv{flex:1;padding:10px 14px;border-right:1px solid var(--b);text-align:center}
+.bv:last-child{border-right:none}
+.bvl{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.bvn{font-family:var(--mono);font-size:13px;color:var(--vi)}
+#bb{position:sticky;bottom:0;display:flex;align-items:center;height:30px;background:rgba(3,6,16,.99);border-top:1px solid rgba(0,220,255,.22);font-family:var(--mono);font-size:10px;overflow:hidden;flex-shrink:0;gap:0}
+.bi{display:flex;align-items:center;gap:6px;padding:0 14px;white-space:nowrap;border-right:1px solid rgba(0,220,255,.12);height:100%}
+.bl2{color:rgba(90,120,160,.9);font-size:8.5px;letter-spacing:.8px;text-transform:uppercase}.bv2{color:var(--cy);font-size:10.5px}.bvg{color:var(--gr);font-size:10.5px}.bvy{color:var(--go);font-size:10.5px}
+#bt{flex:1;overflow:hidden}
+#bts{display:inline-block;animation:tk 42s linear infinite;white-space:nowrap;color:rgba(150,180,220,.7);font-size:9.5px;letter-spacing:.3px;padding-left:100%}
+@keyframes tk{0%{transform:translateX(0)}100%{transform:translateX(-100%)}}
+#bu{padding:0 14px;white-space:nowrap;color:rgba(140,170,210,.85);border-left:1px solid rgba(0,220,255,.12);font-size:9.5px}
+.sy{overflow-y:auto;max-height:280px;scrollbar-width:thin;scrollbar-color:var(--b) transparent}
+.sy::-webkit-scrollbar{width:3px}
+.sy::-webkit-scrollbar-thumb{background:var(--b)}
+.fl{animation:fl .4s ease-out}
+@keyframes fl{0%{color:var(--cy);text-shadow:0 0 12px var(--cy)}100%{}}
+.es{padding:24px;text-align:center;font-size:11px;color:var(--dim)}
+/* ── Block detail modal ───────────────────────────────────────────────────── */
+#blk-modal-bg{display:none;position:fixed;inset:0;z-index:9100;background:rgba(0,0,0,.72);backdrop-filter:blur(3px);align-items:center;justify-content:center}
+#blk-modal-bg.open{display:flex}
+#blk-modal{background:var(--card);border:1px solid var(--b2);border-radius:10px;width:min(540px,94vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 0 60px rgba(0,220,255,.1)}
+#blk-modal::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--cy),var(--vi));border-radius:10px 10px 0 0;pointer-events:none}
+.bm-hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--b);flex-shrink:0}
+.bm-title{font-family:var(--disp);font-size:11px;letter-spacing:2px;color:var(--cy)}
+.bm-meta{font-family:var(--mono);font-size:9px;color:var(--dim);margin-top:3px}
+.bm-close{width:24px;height:24px;border-radius:50%;border:1px solid var(--b2);background:transparent;color:var(--dim);cursor:pointer;font-size:14px;line-height:22px;text-align:center;transition:all .15s}
+.bm-close:hover{border-color:var(--cy);color:var(--cy)}
+.bm-body{overflow-y:auto;flex:1;padding:8px 0;scrollbar-width:thin;scrollbar-color:var(--b) transparent}
+.bm-body::-webkit-scrollbar{width:3px}.bm-body::-webkit-scrollbar-thumb{background:var(--b)}
+.bm-tx{display:flex;align-items:flex-start;gap:10px;padding:10px 16px;border-bottom:1px solid rgba(0,220,255,.05);cursor:pointer;transition:background .15s;position:relative}
+.bm-tx:last-child{border-bottom:none}
+.bm-tx:hover{background:rgba(0,220,255,.05)}
+.bm-tx:active{background:rgba(0,220,255,.1)}
+.bm-tx-icon{flex-shrink:0;width:28px;height:28px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:12px;margin-top:1px}
+.bm-tx-icon.coinbase{background:rgba(128,64,255,.15);border:1px solid rgba(128,64,255,.25)}
+.bm-tx-icon.transfer{background:rgba(0,220,255,.08);border:1px solid rgba(0,220,255,.15)}
+.bm-tx-info{flex:1;min-width:0}
+.bm-tx-hash{font-family:var(--mono);font-size:10px;color:var(--cy);word-break:break-all;line-height:1.4}
+.bm-tx-sub{font-family:var(--mono);font-size:9px;color:var(--dim);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+.bm-tx-amt{font-family:var(--mono);font-size:11px;font-weight:600;flex-shrink:0;margin-top:1px}
+.bm-tx-amt.coinbase{color:var(--vi)}.bm-tx-amt.transfer{color:var(--go)}
+.bm-copy-hint{position:absolute;right:14px;bottom:8px;font-size:8px;color:var(--dim);opacity:0;transition:opacity .2s;font-family:var(--disp);letter-spacing:.5px}
+.bm-tx:hover .bm-copy-hint{opacity:1}
+.bm-copied{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,255,157,.15);border:1px solid var(--gr);color:var(--gr);font-family:var(--mono);font-size:11px;padding:8px 20px;border-radius:6px;pointer-events:none;z-index:9200;opacity:0;transition:opacity .2s}
+.bm-copied.show{opacity:1}
+.bm-loading{padding:32px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--dim)}
+</style>
+</head>
+<body>
+<header id="hdr">
+  <div class="hb">
+    <canvas id="lc" width="36" height="36"></canvas>
+    <div>
+      <div class="ht">QTCL</div>
+      <div class="hs">Quantum Temporal Coherence Ledger &middot; Explorer</div>
+      <div style="font-size:0.85rem; margin-top:4px; color:#00dcff;">Mining client is available at <a href="https://www.github.com/shemshallah/qtcl-miner" target="_blank" style="color:#00dcff; text-decoration:underline;">github.com/shemshallah/qtcl-miner</a></div>
+    </div>
+  </div>
+  <div class="hr">
+    <div class="hst"><div class="hstl">Height</div><div class="hstv" id="hh">&mdash;</div></div>
+    <div class="hst"><div class="hstl">W-Fidelity</div><div class="hstv" id="hf">&mdash;</div></div>
+    <div class="hst"><div class="hstl">Mempool</div><div class="hstv" id="hm">&mdash;</div></div>
+    <div id="cp"><span class="cd"></span><span id="ct">CONNECTING</span></div>
+    <div id="hck"></div>
+  </div>
+</header>
+<div id="page">
+  <div>
+    <div class="st">Chain Metrics</div>
+    <div class="mg">
+      <div class="mc go"><div class="ml">Block Height</div><div class="mv go dm" id="mh">&mdash;</div><div class="ms" id="mhs">hash: &mdash;</div></div>
+      <div class="mc"><div class="ml">W-State Fidelity</div><div class="mv dm" id="mf">&mdash;</div><div class="mb"><div class="mbf" id="mfb" style="width:0"></div></div><div class="ms" id="mfs">quantum confidence</div></div>
+      <div class="mc vi"><div class="ml">Coherence</div><div class="mv vi dm" id="mc2">&mdash;</div><div class="mb"><div class="mbf" id="mcb" style="width:0;background:linear-gradient(90deg,var(--vi),var(--cy))"></div></div></div>
+      <div class="mc gr"><div class="ml">Avg Block Time</div><div class="mv gr dm" id="mbt">&mdash;</div><div class="ms">seconds</div></div>
+      <div class="mc"><div class="ml">Total Transactions</div><div class="mv dm" id="mtx">&mdash;</div><div class="ms">on-chain</div></div>
+      <div class="mc"><div class="ml">Difficulty</div><div class="mv dm" id="mdf">&mdash;</div><div class="ms">leading hex zeros</div></div>
+      <div class="mc go"><div class="ml">Block Reward</div><div class="mv go dm" id="mrew">8.00 Q</div><div class="ms" id="mrew-depth">tessellation depth &mdash;</div></div>
+      <div class="mc"><div class="ml">Treasury / Block</div><div class="mv dm" id="mtrew">&mdash;</div><div class="ms" id="mtrew-pct">&mdash;% of block</div></div>
+      <div class="mc"><div class="ml">Purity</div><div class="mv vi dm" id="mpu">&mdash;</div><div class="ms" id="mng">negativity: &mdash;</div></div>
+      <div class="mc"><div class="ml">QFI</div><div class="mv dm" id="mqf">&mdash;</div><div class="ms" id="mdc">discord: &mdash;</div></div>
+    </div>
+  </div>
+  <div class="tc">
+    <div class="pn">
+      <div class="ph"><span class="pht">H³ Hyperbolic Lattice · {8,3}</span><span class="pb vi" id="dkb">pq &mdash;</span></div>
+      <div id="dc3d" style="width:100%;height:340px;position:relative;overflow:hidden;background:#000508;border-radius:0;">
+        <!-- pq Bloch overlay — rendered by _PQ canvas system -->
+        <canvas id="pq-overlay" style="position:absolute;right:0;top:0;pointer-events:none;z-index:10;opacity:0.97"></canvas>
+        <!-- node type legend -->
+        <div style="position:absolute;left:8px;top:8px;pointer-events:none;z-index:10;display:flex;flex-direction:column;gap:4px">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:7.5px;color:rgba(0,220,255,0.45);letter-spacing:1.5px;margin-bottom:2px">LEGEND</div>
+          <div style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;background:#d4a020;border-radius:1px;display:inline-block;flex-shrink:0"></span><span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(212,160,32,0.8)">Oracle node (×5)</span></div>
+          <div style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;background:#00dcff;border-radius:50%;display:inline-block;flex-shrink:0"></span><span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(0,200,235,0.7)">Lattice pseudoqubit</span></div>
+          <div style="display:flex;align-items:center;gap:5px"><span style="width:18px;height:2px;background:#00dcff;display:inline-block;flex-shrink:0"></span><span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(0,200,235,0.7)">W-state entanglement arc</span></div>
+          <div style="display:flex;align-items:center;gap:5px"><span style="width:7px;height:7px;background:#ffd040;border-radius:50%;display:inline-block;flex-shrink:0"></span><span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(255,208,64,0.9)">Current block ⬡</span></div>
+          <div style="display:flex;align-items:center;gap:5px"><span style="width:18px;height:1px;background:rgba(128,64,255,0.6);display:inline-block;flex-shrink:0;border-top:1px dashed rgba(128,64,255,0.6)"></span><span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(128,64,255,0.75)">Oracle entanglement</span></div>
+        </div>
+        <!-- field-fidelity HUD strip -->
+        <div id="pq-hud" style="position:absolute;left:0;bottom:0;right:0;height:28px;pointer-events:none;z-index:11;display:flex;align-items:center;padding:0 10px;gap:14px;background:linear-gradient(0deg,rgba(0,5,8,.92) 0%,transparent 100%)">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(0,220,255,.55);letter-spacing:1.5px">BLOCK FIELD</span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(0,220,255,.4)">pq_last=<span id="pqh-last" style="color:#8040ff">—</span></span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(0,220,255,.4)">pq_curr=<span id="pqh-curr" style="color:#d4a020">—</span></span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(0,220,255,.4)">Δ=<span id="pqh-delta" style="color:#00ff9d">—</span></span>
+          <span style="flex:1"></span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(128,64,255,.6);letter-spacing:1px" id="pqh-cycle">ψ —</span>
+        </div>
+      </div>
+      <div class="bs">
+        <div class="bv"><div class="bvl">|W₃| Fidelity</div><div class="bvn" id="bfi">&mdash;</div></div>
+        <div class="bv"><div class="bvl">pq_curr</div><div class="bvn" id="ben" style="color:var(--go)">&mdash;</div></div>
+        <div class="bv"><div class="bvl">pq_last</div><div class="bvn" id="bcn">&mdash;</div></div>
+        <div class="bv"><div class="bvl">Field Fidelity</div><div class="bvn" id="bte">&mdash;</div></div>
+      </div>
+    </div>
+    <div class="pn">
+      <div class="ph"><span class="pht">Mermin Inequality Test</span><span class="pb" id="mb3">M &mdash;</span><span class="pb vi" id="mcy" style="font-size:.72em;opacity:.6">cycle —</span></div>
+      <div class="md">
+        <div class="mb2 c" id="mM">&mdash;</div>
+        <div class="mi">
+          <div class="mv2" id="mvd">Awaiting oracle measurement&hellip;</div>
+          <div class="ms2">Classical bound: 2.0 &middot; W-max: 3.046 &middot; GHZ-max: 4.0</div>
+          <div class="mba"><div class="mbaf" id="mbar" style="width:0"></div></div>
+          <div class="mbl"><span>0</span><span>2.0</span><span>3.046</span><span>4.0</span></div>
+        </div>
+      </div>
+      <div class="mac" id="mac"></div>
+      <div class="ph"><span class="pht">GKSL Noise Bath</span><span class="pb">LIVE</span></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr">
+        <div>
+          <div class="nr"><span class="nk">gamma1 (amp)</span><span class="nv" id="ng1">&mdash;</span></div>
+          <div class="nr"><span class="nk">gammaphi (deph)</span><span class="nv" id="ngp">&mdash;</span></div>
+          <div class="nr"><span class="nk">omega</span><span class="nv" id="nom">&mdash;</span></div>
+          <div class="nr"><span class="nk">QRNG health</span><span class="nv" id="nqr">&mdash;</span></div>
+        </div>
+        <div>
+          <div class="nr"><span class="nk">discord</span><span class="nv" id="ndi">&mdash;</span></div>
+          <div class="nr"><span class="nk">ou_mem</span><span class="nv" id="nou">&mdash;</span></div>
+          <div class="nr"><span class="nk">phase_drift</span><span class="nv" id="npd">&mdash;</span></div>
+          <div class="nr"><span class="nk">sector_occ</span><span class="nv" id="nso">&mdash;</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="pn">
+    <div class="ph"><span class="pht">Block Stream &mdash; Live</span><span class="pb go" id="bcc">0 blocks</span></div>
+    <div id="cs"></div>
+  </div>
+  <div class="tc">
+    <div class="pn">
+      <div class="ph">
+        <span class="pht">Transaction Explorer</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <span class="pb vi" id="txb">0 txs</span>
+          <button class="txfbtn active" id="txf-all" onclick="txFilter('all')">ALL</button>
+          <button class="txfbtn" id="txf-coinbase" onclick="txFilter('coinbase')">COINBASE</button>
+          <button class="txfbtn" id="txf-transfer" onclick="txFilter('transfer')">TRANSFER</button>
+          <button class="txfbtn" id="txf-treasury" onclick="txFilter('treasury')">🏛 TREASURY</button>
+        </span>
+      </div>
+      <div style="padding:6px 16px 2px;display:flex;align-items:center;gap:8px">
+        <input id="txsearch" placeholder="Search address or hash…" oninput="txSearch(this.value)"
+          style="flex:1;background:rgba(0,220,255,.05);border:1px solid rgba(0,220,255,.15);color:var(--tx);
+                 font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:4px;outline:none"/>
+        <span id="tx-live" style="font-size:9px;color:var(--gr);letter-spacing:.5px">● LIVE</span>
+      </div>
+      <div id="txwrap" style="height:340px;overflow-y:auto;overflow-x:hidden">
+        <table class="tt" style="width:100%;table-layout:fixed">
+          <thead><tr>
+            <th style="width:80px">Type</th>
+            <th style="width:130px">Hash</th>
+            <th style="width:90px">From</th>
+            <th style="width:90px">To</th>
+            <th style="width:80px">Amount</th>
+            <th style="width:60px">Block</th>
+            <th style="width:65px">Status</th>
+          </tr></thead>
+          <tbody id="ttb"><tr><td colspan="7" class="es">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 16px;border-top:1px solid var(--b)">
+        <button class="txpbtn" onclick="txPage(-1)" id="txprev">◀ Prev</button>
+        <span id="txpageinfo" style="font-size:10px;color:var(--dim)">Page 1</span>
+        <button class="txpbtn" onclick="txPage(1)" id="txnext">Next ▶</button>
+      </div>
+    </div>
+    <div class="pn">
+      <div class="ph"><span class="pht">Oracle Network (5 nodes)</span><span class="pb vi">3-of-5 Byzantine</span></div>
+      <div id="ol"><div class="es">Loading&hellip;</div></div>
+      <div class="ph"><span class="pht">Validation</span><span class="pb gr" id="vb">&mdash;</span></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr">
+        <div style="padding:12px 14px;border-right:1px solid var(--b)"><div class="ml" style="margin-bottom:4px">Quantum</div><div class="mv dm" id="vq" style="font-size:10px;word-break:break-all">&mdash;</div></div>
+        <div style="padding:12px 14px;border-right:1px solid var(--b)"><div class="ml" style="margin-bottom:4px">PQ-Lattice</div><div class="mv dm" id="vp" style="font-size:10px">&mdash;</div></div>
+        <div style="padding:12px 14px"><div class="ml" style="margin-bottom:4px">Oracle Con.</div><div class="mv dm" id="vo" style="font-size:10px">&mdash;</div></div>
+      </div>
+      <div class="ph">
+        <span class="pht">⛏ Miner Network</span>
+        <span style="display:flex;gap:6px;align-items:center">
+          <span class="pb gr" id="pcb">0 miners</span>
+          <button id="p2p-hist-btn" class="txfbtn" onclick="p2pToggleHist()" title="Show historic miners" style="font-size:8px;padding:2px 7px">LIVE</button>
+          <span id="p2p-live-dot" style="width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block"></span>
+        </span>
+      </div>
+      <div id="pl" style="max-height:280px;overflow-y:auto;overflow-x:hidden"></div>
+      <div style="padding:4px 16px 6px;border-top:1px solid var(--b);display:flex;justify-content:space-between;font-size:9px;color:var(--dim)">
+        <span id="p2p-live-count">● <span id="p2plc">0</span> live</span>
+        <span id="p2p-seen-count">◎ <span id="p2psc">0</span> seen today</span>
+        <span id="p2p-total-count">◌ <span id="p2ptc">0</span> historic</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── System Description ─────────────────────────────────────── -->
+  <div class="pn" style="border:1px solid rgba(0,220,255,.12);border-radius:8px;overflow:hidden">
+    <div class="ph" style="background:rgba(128,64,255,.07)"><span class="pht" style="color:var(--vi)">⬡ System Architecture</span><span class="pb vi">QTCL-1 Production</span></div>
+    <div style="padding:18px 20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px">
+      <div>
+        <div class="ml" style="color:var(--cy);margin-bottom:8px;font-size:9px;letter-spacing:2px">CONSENSUS LAYER</div>
+        <p style="font-size:11.5px;line-height:1.75;color:var(--tx)">QTCL deploys a <span style="color:var(--cy)">five-node Byzantine-fault-tolerant oracle network</span> whose consensus is certified by the <span style="color:var(--vi)">Mermin M₃ inequality</span> — a tripartite extension of Bell's theorem with classical bound 2.0 and W-state maximum ≈ 3.046. Block finality requires M₃ &gt; 2.0, providing information-theoretic proof of genuine quantum entanglement at the consensus layer rather than classical simulation.</p>
+      </div>
+      <div>
+        <div class="ml" style="color:var(--go);margin-bottom:8px;font-size:9px;letter-spacing:2px">SPATIAL STRUCTURE</div>
+        <p style="font-size:11.5px;line-height:1.75;color:var(--tx)">Blocks tile a <span style="color:var(--go)">{8,3} hyperbolic tessellation</span> (Poincaré ball model, H³) — 8 octagons meeting at every vertex, curvature κ = −1. Exponential volume growth V(R) ~ e^R supports a node density that scales with network participation without topology collapse. Each spatial tile is a block; the chain is a geodesic path through hyperbolic space, not a linear sequence.</p>
+      </div>
+      <div>
+        <div class="ml" style="color:var(--gr);margin-bottom:8px;font-size:9px;letter-spacing:2px">CRYPTOGRAPHIC BACKBONE</div>
+        <p style="font-size:11.5px;line-height:1.75;color:var(--tx)">All signatures use <span style="color:var(--gr)">HLWE — Hyperbolic Learning With Errors</span> post-quantum cryptography, hardened over PSL(2,ℝ) lattices. Block entropy is seeded by a <span style="color:var(--cy)">QRNG ensemble</span> — four independent quantum sources XOR-hedged for information-theoretic security: <span style="color:var(--cy)">ANU QRNG</span> (quantum vacuum fluctuations, Australian National University), <span style="color:var(--cy)">QBICK</span> (ID Quantique Quantis hardware, Quantum Blockchains Inc.), <span style="color:var(--cy)">Outshift</span> (PaloAlto), and <span style="color:var(--cy)">Random.org</span> (atmospheric noise) — then mixed via RFC 5869 HKDF. Mining is memory-hard (4 MB SHA3-256 matrix) defeating ASICs while the tessellation depth parameter scales block reward with network-proven work.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── HLWE Micro-Whitepaper ────────────────────────────────────── -->
+  <div class="pn" style="border:1px solid rgba(212,160,32,.15);border-radius:8px;overflow:hidden">
+    <div class="ph" style="background:rgba(212,160,32,.06)"><span class="pht" style="color:var(--go)">◈ HLWE · Hyperbolic Learning With Errors</span><span class="pb go">Micro-Whitepaper</span></div>
+    <div style="padding:18px 20px;display:grid;grid-template-columns:1fr 1fr;gap:24px">
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--go);letter-spacing:2px;margin-bottom:6px;text-transform:uppercase">§1 · Hardness Foundation</div>
+          <p style="font-size:11px;line-height:1.8;color:var(--tx)">HLWE is a post-quantum lattice scheme whose security reduces to the hardness of the <em style="color:var(--cy)">Learning With Errors (LWE)</em> problem instantiated over the isometry group PSL(2,ℝ) acting on the hyperbolic plane H². Standard LWE asks: given (A, b = As + e) over Z_q^n, recover secret vector <strong style="color:var(--go)">s</strong>, where <strong>e</strong> is Gaussian noise. HLWE replaces the Euclidean lattice Z^n with a <span style="color:var(--vi)">hyperbolic lattice Λ_H</span> whose shortest-vector problem (SVP) is strictly harder due to the exponential volume growth of H² balls: |B(r)| ~ sinh(r) ≫ e^{n/2} for large r, collapsing the approximation ratio that lattice sieving algorithms exploit.</p>
+        </div>
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--go);letter-spacing:2px;margin-bottom:6px;text-transform:uppercase">§2 · Key Generation</div>
+          <p style="font-size:11px;line-height:1.8;color:var(--tx)">A keypair is a pair (pk, sk) = (A·s + e mod q, s) where <strong style="color:var(--go)">A ∈ Λ_H^{n×m}</strong> is a public H²-lattice basis sampled from the <span style="color:var(--cy)">QRNG ensemble</span>, <strong>s</strong> is the secret drawn from a hyperbolic Gaussian centered at the Poincaré origin, and <strong>e</strong> is sub-Gaussian noise with variance bounded by the injectivity radius of the tessellation tile. In QTCL, oracle keypairs are delegated from wallet keys via <code style="color:var(--vi);font-family:var(--mono);font-size:10px">oracle_priv = SHA3-256(wallet_priv ‖ "QTCL_ORACLE_DELEGATE_v1")</code>, chaining on-chain accountability without exposing the root key.</p>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--go);letter-spacing:2px;margin-bottom:6px;text-transform:uppercase">§3 · Sign &amp; Verify</div>
+          <p style="font-size:11px;line-height:1.8;color:var(--tx)">Signing a message <em>m</em>: sample a masking vector <strong>y</strong> ~ D_Λ (discrete Gaussian over Λ_H), compute commitment <strong>c</strong> = H(A·y mod q, m) ∈ {0,1}^κ, then release <strong>z</strong> = y + c·s if z passes a <span style="color:var(--gr)">rejection-sampling gate</span> that guarantees z is statistically independent of s (Lyubashevsky's technique, adapted to H² geometry). Verification checks A·z − c·pk mod q is short in the hyperbolic metric. No random oracle strength is lost; security tightness is O(1/q) under HLWE assumption.</p>
+        </div>
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--go);letter-spacing:2px;margin-bottom:6px;text-transform:uppercase">§4 · Quantum Resistance &amp; NIST Alignment</div>
+          <p style="font-size:11px;line-height:1.8;color:var(--tx)">Shor's algorithm provides no advantage against LWE variants — no hidden subgroup structure exists to exploit. Grover's search applies only to the pre-image search over H², which the hyperbolic SVP hardness elevates to <span style="color:var(--re)">superpolynomial</span> even for a fault-tolerant quantum computer. HLWE targets NIST security category III (≥ 2^192 classical / 2^128 quantum). The PSL(2,ℝ) symmetry further provides <em style="color:var(--cy)">algebraic noise amplification</em>: small errors grow exponentially under the group action, making lattice-reduction attacks require exponentially many oracle queries as the hyperbolic radius increases.</p>
+        </div>
+      </div>
+    </div>
+    <div style="padding:10px 20px 14px;border-top:1px solid rgba(212,160,32,.1);font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:.5px">HLWE is original research by Justin Howard-Stanley. Implementation: <span style="color:var(--cy)">hlwe_engine.py</span> · Pure stdlib, no external crypto deps · BIP32/BIP38/BIP39 wallet infrastructure · In-database HLWE verification via Supabase triggers</div>
+  </div>
+
+</div>
+<div id="bb">
+  <div class="bi"><span class="bl2">NET</span><span class="bv2">QTCL-1</span></div>
+  <div class="bi"><span class="bl2">DIFF</span><span class="bvy" id="bbd">&mdash;</span></div>
+  <div class="bi"><span class="bl2">PEERS</span><span class="bvg" id="bbp">&mdash;</span></div>
+  <div class="bi"><span class="bl2">N_PEERS</span><span class="bv2" id="bbn">&mdash;</span></div>
+  <div class="bi"><span class="bl2">QRNG</span><span class="bv2" id="bbq">&mdash;</span></div>
+  <div id="bt"><span id="bts">QTCL &middot; Post-quantum blockchain &middot; HLWE cryptography &middot; W-state entangled mining &middot; 5-oracle Byzantine consensus &middot; Mermin inequality certified &middot; Poincare disk topology &middot; Memory-hard QTCL-PoW &middot; QRNG-seeded oracles</span></div>
+  <div id="bu">Updated &mdash;</div>
+</div>
+<div id="blk-modal-bg" onclick="if(event.target===this)closeBlockModal()">
+  <div id="blk-modal">
+    <div class="bm-hdr">
+      <div>
+        <div class="bm-title" id="bm-title">BLOCK #—</div>
+        <div class="bm-meta" id="bm-meta">Loading…</div>
+      </div>
+      <button class="bm-close" onclick="closeBlockModal()">✕</button>
+    </div>
+    <div class="bm-body" id="bm-body"><div class="bm-loading">Fetching transactions…</div></div>
+  </div>
+</div>
+<div class="bm-copied" id="bm-copied">✓ Copied</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+var BASE = window.location.origin;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANONICAL STATE — single source of truth for every DOM element
+// Field names match exact RPC result keys from server.py
+// ═══════════════════════════════════════════════════════════════════════════════
+var S = {
+  // qtcl_getBlockHeight
+  height: 0, tip_hash: '',
+  // qtcl_getQuantumMetrics → w_state
+  fidelity: 0.9, coherence: 0.7, purity: 0.8, entropy: 0,
+  // qtcl_getQuantumMetrics → lattice
+  lattice_fidelity: 0.9, lattice_coherence: 0.7, w_state_strength: 0,
+  cycle: 0,
+  // qtcl_getLatestDMSnapshot
+  negativity: 0, concurrence: 0, entanglement: 0.65,
+  qfi: 6.5, discord: 0, tele_fidelity: 0.6,
+  phase_drift: 0.02, gamma1: 0.04, gammaphi: 0.12,
+  omega: 0.5, ou_mem: 0.03, sector_occ: 0.9, qrng_health: 1,
+  // qtcl_getMempoolStats
+  mempool_size: 0,
+  // qtcl_getPeers
+  n_peers: 0,
+  // block chain metrics (computed from getBlockRange)
+  total_transactions: 0, avg_block_time_s: 0, difficulty_bits: 4,
+  // pq plane
+  pq_curr: 0, pq_last: 0, pq0: 0,
+  // oracle network (per-node from DM snapshots)
+  oracle_data: {}, // oracle_N → {w_state_fidelity, coherence, purity, pq0_*}
+  // mermin (from DM snapshots)
+  mermin: null,
+  // reward (computed from height via canonical schedule)
+  miner_reward_qtcl: 7.20, treasury_reward_qtcl: 0.80,
+  tessellation_depth: 5, treasury_pct: 10.0,
+  // oracle_consensus
+  oracle_consensus_reached: false,
+  quantum_validation_status: '--', pq_validation_status: '--',
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REWARD SCHEDULE — mirrors TessellationRewardSchedule from globals.py exactly
+// ═══════════════════════════════════════════════════════════════════════════════
+var REWARD_SCHEDULE = {
+  depths: [
+    { boundary: 106496,   depth: 5, miner: 720, treasury: 80  },
+    { boundary: 958464,   depth: 6, miner: 760, treasury: 40  },
+    { boundary: 7774208,  depth: 7, miner: 780, treasury: 20  },
+    { boundary: 62300160, depth: 8, miner: 790, treasury: 10  },
+  ],
+  forHeight: function(h) {
+    for (var i = 0; i < this.depths.length; i++) {
+      if (h < this.depths[i].boundary) return this.depths[i];
+    }
+    return this.depths[this.depths.length - 1];
+  }
+};
+
+function applyRewards(h) {
+  var r = REWARD_SCHEDULE.forHeight(h);
+  S.miner_reward_qtcl    = r.miner    / 100;
+  S.treasury_reward_qtcl = r.treasury / 100;
+  S.tessellation_depth   = r.depth;
+  S.treasury_pct         = (r.treasury / (r.miner + r.treasury) * 100);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JSON-RPC 2.0 TRANSPORT LAYER
+// ═══════════════════════════════════════════════════════════════════════════════
+var _rpcId = 1;
+
+async function rpc(method, params) {
+  try {
+    var r = await fetch(BASE + '/rpc', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0', id: _rpcId++, method: method, params: params || []}),
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!r.ok) return null;
+    var j = await r.json();
+    if (j.error) { console.warn('[RPC]', method, j.error.code, j.error.message); return null; }
+    return j.result;
+  } catch(e) { return null; }
+}
+
+// True JSON-RPC 2.0 batch — single HTTP round-trip
+async function rpcBatch(calls) {
+  try {
+    var base = _rpcId;
+    var batch = calls.map(function(c, i) {
+      return {jsonrpc:'2.0', id: base + i, method: c[0], params: c[1] || []};
+    });
+    _rpcId += calls.length;
+    var r = await fetch(BASE + '/rpc', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(batch),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!r.ok) return calls.map(function() { return null; });
+    var arr = await r.json();
+    // Server may return single object on error or batch array
+    if (!Array.isArray(arr)) {
+      return calls.map(function(_, i) { return i === 0 && arr && !arr.error ? arr.result : null; });
+    }
+    return calls.map(function(_, i) {
+      var res = arr.find(function(a) { return a && a.id === (base + i); });
+      return (res && !res.error) ? res.result : null;
+    });
+  } catch(e) { return calls.map(function() { return null; }); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLOCK + LOGO CANVAS
+// ═══════════════════════════════════════════════════════════════════════════════
+function tick() {
+  var d = new Date();
+  var el = document.getElementById('hck');
+  if (el) el.textContent = d.toISOString().replace('T',' ').slice(0,19) + ' UTC';
+}
+setInterval(tick, 1000); tick();
+
+(function() {
+  var c = document.getElementById('lc'), ctx = c ? c.getContext('2d') : null, t = 0;
+  if (!ctx) return;
+  (function fr() {
+    ctx.clearRect(0,0,36,36);
+    var cx=18,cy=18,r=13;
+    ctx.strokeStyle='rgba(0,220,255,.2)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.stroke();
+    for (var i=0;i<3;i++) {
+      var a=i*Math.PI*2/3+t, x=cx+r*Math.cos(a), y=cy+r*Math.sin(a);
+      ctx.strokeStyle='rgba(0,220,255,'+(0.35+0.25*Math.sin(t*2+i))+')'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(x,y); ctx.stroke();
+      ctx.fillStyle='rgba(0,220,255,'+(0.7+0.3*Math.sin(t*3+i))+')';
+      ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill();
+    }
+    ctx.fillStyle='rgba(212,160,32,.95)'; ctx.beginPath(); ctx.arc(cx,cy,3,0,Math.PI*2); ctx.fill();
+    t += 0.02; requestAnimationFrame(fr);
+  })();
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// H³ HYPERBOLIC LATTICE — {8,3} Poincaré Ball (Three.js)
+// Wired directly to S.* — pq_curr / pq_last / pq0 fully rendered
+// ═══════════════════════════════════════════════════════════════════════════════
+var _H = (function() {
+var renderer=null,scene=null,camera=null;
+var nodeMesh=null,oracleMeshes=[],wArcObjs=[],entangleObjs=[];
+var edgeLines=[],boundSphere=null;
+var blockCoreMesh=null,blockCoreWire=null; // current block — glowing octahedron at origin
+var rafId=null,lastT=0,fps=30;
+var revivalT=-999,blockFlashT=-999;
+var nodePositions=[],nodeDepths=[],nodeCount=0;
+var oracleIdx=[],wTriple=[];
+var dummy=null;
+var C={
+  nodeCyan:new THREE.Color(0x00dcff),nodeMid:new THREE.Color(0x6028c8),
+  nodeOut:new THREE.Color(0x003a60),oracle:new THREE.Color(0xd4a020),
+  oracleOff:new THREE.Color(0x3a1800),wArc:new THREE.Color(0x00dcff),
+  wStrong:new THREE.Color(0xd4a020),entangle:new THREE.Color(0x6028c8),
+  entangleQ:new THREE.Color(0x00dcff),boundary:new THREE.Color(0x00dcff),
+  revival:new THREE.Color(0xd4a020),
+  pqCurr:new THREE.Color(0xd4a020),   // gold — current block pq state
+  pqLast:new THREE.Color(0x8040ff),   // violet — last block pq state
+  pqDelta:new THREE.Color(0x00ff9d),  // green — field transition arc
+};
+function geodArc(p1,p2,n){
+  var cross=new THREE.Vector3().crossVectors(p1,p2);
+  if(cross.lengthSq()<1e-9){var pts=[];for(var i=0;i<=n;i++)pts.push(p1.clone().lerp(p2,i/n));return pts;}
+  var d11=p1.dot(p1),d12=p1.dot(p2),d22=p2.dot(p2),det=d11*d22-d12*d12;
+  if(Math.abs(det)<1e-9){var pts=[];for(var i=0;i<=n;i++)pts.push(p1.clone().lerp(p2,i/n));return pts;}
+  var r1=(d11+1)/2,r2=(d22+1)/2,a=(r1*d22-r2*d12)/det,b=(r2*d11-r1*d12)/det;
+  var c=p1.clone().multiplyScalar(a).add(p2.clone().multiplyScalar(b));
+  var rad=Math.sqrt(Math.max(0,c.lengthSq()-1));
+  if(rad<1e-7){var pts=[];for(var i=0;i<=n;i++)pts.push(p1.clone().lerp(p2,i/n));return pts;}
+  var e1=p1.clone().sub(c).normalize(),v2=p2.clone().sub(c);
+  var e2=v2.clone().sub(e1.clone().multiplyScalar(e1.dot(v2))).normalize();
+  var ang2=Math.atan2(e2.dot(v2),e1.dot(v2)),pts=[];
+  for(var i=0;i<=n;i++){var a2=(i/n)*ang2;pts.push(c.clone().add(e1.clone().multiplyScalar(rad*Math.cos(a2))).add(e2.clone().multiplyScalar(rad*Math.sin(a2))));}
+  return pts;
+}
+function makeTube(pts,radius,segs,matProps){
+  var curve=new THREE.CatmullRomCurve3(pts);
+  var geo=new THREE.TubeGeometry(curve,Math.max(4,pts.length-1),radius,segs,false);
+  return new THREE.Mesh(geo,new THREE.MeshBasicMaterial(matProps));
+}
+
+function genNodes(){
+  nodePositions=[];nodeDepths=[];oracleIdx=[];wTriple=[];
+  var rings=[[0.00,1],[0.779,8],[1.50,24],[2.20,56],[2.90,96]];
+  for(var ri=0;ri<rings.length;ri++){
+    var R=rings[ri][0],cnt=rings[ri][1],rho=Math.tanh(R/2);
+    if(cnt===1){nodePositions.push(new THREE.Vector3(0,0,0));nodeDepths.push(0);continue;}
+    for(var i=0;i<cnt;i++){
+      var phi=Math.acos(1-2*(i+0.5)/cnt),theta=Math.PI*(1+Math.sqrt(5))*i,tilt=ri*0.15;
+      nodePositions.push(new THREE.Vector3(rho*Math.sin(phi)*Math.cos(theta),rho*Math.sin(phi)*Math.sin(theta+tilt),rho*Math.cos(phi)*0.85));
+      nodeDepths.push(ri);
+    }
+  }
+  nodeCount=nodePositions.length;
+  for(var k=0;k<5;k++) oracleIdx.push(1+Math.floor(k*8/5));
+  wTriple=[1,1+3,1+6];
+}
+function buildEdges(rings){
+  var edges=[],startByRing=[0,1],s=1;
+  for(var ri=1;ri<rings.length;ri++){s+=rings[ri][1];startByRing.push(s);}
+  for(var ri=0;ri<rings.length-1;ri++){
+    var iS=startByRing[ri],iE=startByRing[ri+1],jS=startByRing[ri+1],jE=startByRing[ri+2];
+    for(var i=iS;i<iE;i++){
+      var pi=nodePositions[i],ds=[];
+      for(var j=jS;j<jE;j++) ds.push([j,pi.distanceTo(nodePositions[j])]);
+      ds.sort(function(a,b){return a[1]-b[1];});
+      for(var k=0;k<Math.min(3,ds.length);k++) edges.push([i,ds[k][0]]);
+    }
+  }
+  return edges;
+}
+function buildScene(){
+  var rings=[[0,1],[0.779,8],[1.50,24],[2.20,56],[2.90,96]];
+  var edges=buildEdges(rings);
+  dummy=new THREE.Object3D();
+  scene.add(new THREE.AmbientLight(0x000c1a,3.0));
+  var pl0=new THREE.PointLight(0x00dcff,3.0,4);scene.add(pl0);
+  var pl1=new THREE.PointLight(0x6028c8,2.0,3);pl1.position.set(0.8,0.6,0.2);scene.add(pl1);
+  var pl2=new THREE.PointLight(0xd4a020,1.5,2);pl2.position.set(-0.5,0,0.7);scene.add(pl2);
+  // ── Nodes ─────────────────────────────────────────────────────────────────
+  var nGeo=new THREE.SphereGeometry(0.016,6,5);
+  var nMat=new THREE.MeshPhongMaterial({color:0x00dcff,emissive:0x000820,transparent:true,opacity:0.9,shininess:60});
+  nodeMesh=new THREE.InstancedMesh(nGeo,nMat,nodeCount);
+  nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  nodeMesh.instanceColor=new THREE.InstancedBufferAttribute(new Float32Array(nodeCount*3),3);
+  for(var i=0;i<nodeCount;i++){
+    dummy.position.copy(nodePositions[i]);
+    var sc=Math.max(0.25,1.0-nodeDepths[i]*0.16);
+    dummy.scale.setScalar(sc);dummy.updateMatrix();
+    nodeMesh.setMatrixAt(i,dummy.matrix);nodeMesh.setColorAt(i,C.nodeCyan);
+  }
+  nodeMesh.instanceMatrix.needsUpdate=true;nodeMesh.instanceColor.needsUpdate=true;
+  scene.add(nodeMesh);
+  // ── Oracle icosahedra ──────────────────────────────────────────────────────
+  var oGeo=new THREE.IcosahedronGeometry(0.044,1);
+  for(var k=0;k<5;k++){
+    var oMat=new THREE.MeshPhongMaterial({color:0xd4a020,emissive:0x3a1000,transparent:true,opacity:0.92,shininess:120});
+    var m=new THREE.Mesh(oGeo,oMat);m.position.copy(nodePositions[oracleIdx[k]]);
+    scene.add(m);oracleMeshes.push(m);
+  }
+  // ── W-state arcs ──────────────────────────────────────────────────────────
+  for(var i=0;i<3;i++){
+    var pts=geodArc(nodePositions[wTriple[i]],nodePositions[wTriple[(i+1)%3]],40);
+    var tube=makeTube(pts,0.008,5,{color:0x00dcff,transparent:true,opacity:0.75});
+    scene.add(tube);wArcObjs.push(tube);
+  }
+  // ── Oracle entanglement tubes ─────────────────────────────────────────────
+  for(var i=0;i<5;i++){
+    for(var j=i+1;j<5;j++){
+      var pts=geodArc(nodePositions[oracleIdx[i]],nodePositions[oracleIdx[j]],32);
+      var tube=makeTube(pts,0.0035,4,{color:0x6028c8,transparent:true,opacity:0.0});
+      scene.add(tube);entangleObjs.push({mesh:tube,i:i,j:j});
+    }
+  }
+  // ── Lattice edges ─────────────────────────────────────────────────────────
+  var edgeSub=edges.filter(function(e){return nodeDepths[e[0]]<=2&&nodeDepths[e[1]]<=2;});
+  for(var ei=0;ei<Math.min(100,edgeSub.length);ei++){
+    var pts=geodArc(nodePositions[edgeSub[ei][0]],nodePositions[edgeSub[ei][1]],14);
+    var geo=new THREE.BufferGeometry().setFromPoints(pts);
+    var ln=new THREE.Line(geo,new THREE.LineBasicMaterial({color:0x002030,transparent:true,opacity:0.35}));
+    scene.add(ln);edgeLines.push(ln);
+  }
+  // ── Boundary sphere ───────────────────────────────────────────────────────
+  var bGeo=new THREE.SphereGeometry(0.99,48,24);
+  boundSphere=new THREE.Mesh(bGeo,new THREE.MeshBasicMaterial({color:0x00dcff,transparent:true,opacity:0.04,side:THREE.BackSide}));
+  scene.add(boundSphere);
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.99,20,10),new THREE.MeshBasicMaterial({color:0x001228,wireframe:true,transparent:true,opacity:0.18})));
+  // ── Latitude rings (hyperbolic tessellation grid) ─────────────────────────
+  var hRings=12,hSegs=48;
+  for(var ri2=0;ri2<hRings;ri2++){
+    var z0=-0.4+ri2/hRings*0.8,rho2=Math.sqrt(Math.max(0,1-z0*z0))*0.95,ringPts=[];
+    for(var si2=0;si2<=hSegs;si2++){var th=si2/hSegs*Math.PI*2;ringPts.push(new THREE.Vector3(rho2*Math.cos(th),rho2*Math.sin(th),z0));}
+    scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ringPts),new THREE.LineBasicMaterial({color:0x001a28,transparent:true,opacity:0.22})));
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // CURRENT BLOCK OBJECT — glowing octahedron at the lattice origin
+  // This IS the block. pq_curr/pq_last are shown in the 2D overlay.
+  // ══════════════════════════════════════════════════════════════════════════
+  var bcGeo=new THREE.OctahedronGeometry(0.09,1);
+  blockCoreMesh=new THREE.Mesh(bcGeo,new THREE.MeshPhongMaterial({
+    color:0xd4a020,emissive:0xd4a020,emissiveIntensity:0.6,
+    transparent:true,opacity:0.85,shininess:200,wireframe:false
+  }));
+  scene.add(blockCoreMesh);
+  var bcWGeo=new THREE.OctahedronGeometry(0.093,1);
+  blockCoreWire=new THREE.Mesh(bcWGeo,new THREE.MeshBasicMaterial({
+    color:0xffd040,wireframe:true,transparent:true,opacity:0.5
+  }));
+  scene.add(blockCoreWire);
+}
+
+
+function update(t){
+  if(!scene||!nodeMesh) return;
+  var fid=Math.max(0.3,Math.min(1.0,S.lattice_fidelity||S.fidelity||0.9));
+  var coh=Math.max(0.0,Math.min(1.0,S.lattice_coherence||S.coherence||0.7));
+  var neg=Math.max(0.0,Math.min(0.5,S.negativity||0));
+  var disc=Math.max(0.0,Math.min(2.0,S.discord||0));
+  var ent=Math.max(0.0,Math.min(1.0,S.entanglement||0.65));
+  var g1=Math.max(0.001,S.gamma1||0.04);
+  var om=Math.max(0.1,S.omega||0.5);
+  var cyc=S.cycle||0;
+  var odata=S.oracle_data||{};
+  var M=S.mermin?parseFloat(S.mermin.M_value||S.mermin.M||0):0;
+  var isQ=M>2.0,isStrong=M>2.8;
+
+  if(cyc>0&&cyc%8===0&&(t-revivalT)>2) revivalT=t;
+  var revAge=t-revivalT,revPulse=(revAge<2.0)?Math.exp(-revAge*2.5):0;
+  var blkAge=t-blockFlashT,blkPulse=(blkAge<1.0)?Math.exp(-blkAge*4):0;
+
+  var yaw=om*0.06*t,tilt=0.32+0.06*Math.sin(t*0.05);
+  camera.position.set(2.8*Math.sin(yaw)*Math.cos(tilt),2.8*Math.sin(tilt),2.8*Math.cos(yaw)*Math.cos(tilt));
+  camera.lookAt(0,0,0);
+
+  // ── Node colours + scales ─────────────────────────────────────────────────
+  var tmpCol=new THREE.Color();
+  for(var i=0;i<nodeCount;i++){
+    var dep=nodeDepths[i],isOracle=oracleIdx.indexOf(i)>=0,isW=wTriple.indexOf(i)>=0;
+    var noise=g1*15*(Math.sin(t*6.3+i*2.1)*0.5+0.5);
+    var bright=fid-dep*(1-fid)*0.18+noise*0.08-dep*noise*0.06;
+    bright=Math.max(0.05,Math.min(1.3,bright))+revPulse*(1-dep*0.08)+blkPulse*0.4;
+    if(isOracle) tmpCol.copy(C.oracle).multiplyScalar(bright);
+    else if(isW) tmpCol.copy(C.wArc).multiplyScalar(bright*1.3);
+    else if(dep<=1) tmpCol.copy(C.nodeCyan).multiplyScalar(bright);
+    else if(dep<=2) tmpCol.lerpColors(C.nodeCyan,C.nodeMid,0.55).multiplyScalar(bright*0.9);
+    else tmpCol.lerpColors(C.nodeMid,C.nodeOut,Math.min(1,(dep-2)/2)).multiplyScalar(bright*0.7);
+    nodeMesh.setColorAt(i,tmpCol);
+    dummy.position.copy(nodePositions[i]);
+    var sc=Math.max(0.2,1.0-dep*0.16)*(isOracle?1.7:1.0);
+    var breathe=1+0.09*Math.sin(t*3.1+i*0.97)*g1*8;
+    dummy.scale.setScalar(sc*breathe*(1+revPulse*0.35+blkPulse*0.25));
+    dummy.updateMatrix();nodeMesh.setMatrixAt(i,dummy.matrix);
+  }
+  nodeMesh.instanceMatrix.needsUpdate=true;nodeMesh.instanceColor.needsUpdate=true;
+
+  // ── Oracle icosahedra ─────────────────────────────────────────────────────
+  for(var k=0;k<5;k++){
+    var m=oracleMeshes[k],ok='oracle_'+(k+1),od=odata[ok]||{};
+    var oFid=od.w_state_fidelity!=null?od.w_state_fidelity:(od.fidelity||fid);
+    var oCons=od.in_consensus;
+    m.scale.setScalar(0.85+oFid*0.25+revPulse*0.35+blkPulse*0.2);
+    m.material.emissiveIntensity=oCons===false?0.1:(0.3+0.25*Math.sin(t*2.5+k*1.26)+revPulse*0.8);
+    m.material.color.set(oCons===false?0x3a1800:isStrong?0xffe040:0xd4a020);
+    m.material.emissive.set(oCons===false?0x1a0800:isStrong?0x604000:0x3a1000);
+  }
+
+  // ── W-arcs ────────────────────────────────────────────────────────────────
+  var wCol=isStrong?C.wStrong:isQ?C.wArc:new THREE.Color(0x3010a0);
+  var wOp=Math.min(0.9,0.35+fid*0.5+revPulse*0.4+blkPulse*0.2);
+  var wPulse=1+0.18*Math.sin(t*4.2)*(isQ?1:0.15);
+  for(var i=0;i<wArcObjs.length;i++){wArcObjs[i].material.color.copy(wCol);wArcObjs[i].material.opacity=wOp*wPulse;}
+
+  // ── Entanglement tubes ────────────────────────────────────────────────────
+  for(var ei=0;ei<entangleObjs.length;ei++){
+    var eo=entangleObjs[ei],pairFactor=0.5+0.5*Math.sin(t*1.8+eo.i*2.3+eo.j*1.1);
+    var op=Math.min(0.72,ent*neg*4*pairFactor+revPulse*0.25);
+    eo.mesh.material.opacity=op;
+    eo.mesh.material.color.lerpColors(C.entangle,C.entangleQ,Math.min(1,disc/2));
+  }
+
+  // ── Lattice edges ─────────────────────────────────────────────────────────
+  for(var li=0;li<edgeLines.length;li++){edgeLines[li].material.opacity=0.08+coh*0.28;edgeLines[li].material.color.setHex(isQ?0x002840:0x001020);}
+
+  // ── Boundary sphere ───────────────────────────────────────────────────────
+  if(boundSphere){boundSphere.material.opacity=0.015+fid*0.065+revPulse*0.10;boundSphere.material.color.set(isStrong?C.wStrong:C.boundary);}
+
+  // ── CURRENT BLOCK — glowing octahedron at origin ──────────────────────────
+  // Spins slowly; flashes bright gold on each new block; size breathes with fidelity
+  if(blockCoreMesh&&blockCoreWire){
+    blockCoreMesh.rotation.y=t*0.4;
+    blockCoreMesh.rotation.x=t*0.17;
+    blockCoreWire.rotation.y=t*0.4;
+    blockCoreWire.rotation.x=t*0.17;
+    var bsc=1.0+0.12*Math.sin(t*1.8)*fid+blkPulse*0.9+revPulse*0.4;
+    blockCoreMesh.scale.setScalar(bsc);
+    blockCoreWire.scale.setScalar(bsc*1.04);
+    blockCoreMesh.material.emissiveIntensity=0.4+0.3*Math.sin(t*2.2)+blkPulse*1.2+revPulse*0.6;
+    blockCoreMesh.material.color.setHex(isStrong?0xffe060:blkPulse>0.1?0xffffff:0xd4a020);
+    blockCoreMesh.material.emissive.setHex(isStrong?0xd4a020:blkPulse>0.1?0xffd040:0xc09010);
+    blockCoreWire.material.opacity=0.3+0.2*Math.sin(t*3.1)+blkPulse*0.5;
+  }
+
+  // ── 2D overlay — Bloch-disk + pq state + legend ───────────────────────────
+  _drawPqOverlay(t, fid, isQ, isStrong, blkPulse);
+
+  // ── HUD strip ─────────────────────────────────────────────────────────────
+  var pqC=S.pq_curr||0, pqL=S.pq_last||0;
+  var hl=document.getElementById('pqh-last');   if(hl) hl.textContent=pqL;
+  var hc=document.getElementById('pqh-curr');   if(hc) hc.textContent=pqC;
+  var hd=document.getElementById('pqh-delta');  if(hd) hd.textContent=(pqC-pqL>=0?'+':'')+(pqC-pqL);
+  var hcy=document.getElementById('pqh-cycle'); if(hcy) hcy.textContent='ψ cyc='+cyc+(cyc>0&&cyc%8===0?' ↑REVIVAL':cyc>0&&cyc%8===4?' ↓ANTI':'');
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2D PQ OVERLAY — Poincaré disk showing pq_curr and pq_last as labeled points
+// Drawn into the #pq-overlay canvas, top-right corner of dc3d
+// ═══════════════════════════════════════════════════════════════════════════════
+var _pqOvCanvas=null,_pqOvCtx=null;
+var _pqCurrAnim=0,_pqLastAnim=0; // smoothed for animation
+
+function _drawPqOverlay(t, fid, isQ, isStrong, blkPulse){
+  if(!_pqOvCanvas){
+    _pqOvCanvas=document.getElementById('pq-overlay');
+    if(!_pqOvCanvas) return;
+    // Size it: 148×148 in top-right
+    _pqOvCanvas.width=148; _pqOvCanvas.height=148;
+    _pqOvCanvas.style.width='148px'; _pqOvCanvas.style.height='148px';
+    _pqOvCanvas.style.top='8px'; _pqOvCanvas.style.right='8px';
+    _pqOvCtx=_pqOvCanvas.getContext('2d');
+  }
+  var ctx=_pqOvCtx, W=148, cx=74, cy=74, R=52;
+  ctx.clearRect(0,0,W,W);
+
+  var pqC=S.pq_curr||0, pqL=S.pq_last||0;
+  // Smooth toward real values
+  _pqCurrAnim += (pqC - _pqCurrAnim)*0.08;
+  _pqLastAnim += (pqL - _pqLastAnim)*0.08;
+
+  // pq states map to 8 positions on the unit circle (0–7 → 0°–315° in 45° steps)
+  // This is the Poincaré disk projection of the pseudoqubit Bloch equator
+  function pqAngle(v){ return v * Math.PI/4 - Math.PI/2; } // 0→top, clockwise
+  var angC=pqAngle(_pqCurrAnim), angL=pqAngle(_pqLastAnim);
+  var xC=cx+Math.cos(angC)*R, yC=cy+Math.sin(angC)*R;
+  var xL=cx+Math.cos(angL)*R, yL=cy+Math.sin(angL)*R;
+
+  // ── Background disk ───────────────────────────────────────────────────────
+  var bgGrad=ctx.createRadialGradient(cx,cy,0,cx,cy,R);
+  bgGrad.addColorStop(0,'rgba(0,18,32,0.92)');
+  bgGrad.addColorStop(1,'rgba(0,5,12,0.96)');
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2);
+  ctx.fillStyle=bgGrad; ctx.fill();
+
+  // ── Boundary ring ─────────────────────────────────────────────────────────
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2);
+  ctx.strokeStyle='rgba(0,220,255,0.22)'; ctx.lineWidth=1; ctx.stroke();
+
+  // ── 8 pq state positions as tick marks ───────────────────────────────────
+  for(var i=0;i<8;i++){
+    var a=pqAngle(i);
+    var ox=cx+Math.cos(a)*R, oy=cy+Math.sin(a)*R;
+    var ix=cx+Math.cos(a)*(R-7), iy=cy+Math.sin(a)*(R-7);
+    ctx.beginPath(); ctx.moveTo(ox,oy); ctx.lineTo(ix,iy);
+    ctx.strokeStyle='rgba(0,220,255,0.30)'; ctx.lineWidth=1; ctx.stroke();
+    // Label
+    ctx.font='bold 8px JetBrains Mono,monospace';
+    ctx.fillStyle='rgba(0,180,220,0.45)';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    var lx=cx+Math.cos(a)*(R+11), ly=cy+Math.sin(a)*(R+11);
+    ctx.fillText(i, lx, ly);
+  }
+
+  // ── Cross hairs ───────────────────────────────────────────────────────────
+  ctx.strokeStyle='rgba(0,220,255,0.08)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
+
+  // ── Arc from pq_last → pq_curr ────────────────────────────────────────────
+  if(pqC!==pqL){
+    var dA=angC-angL;
+    while(dA>Math.PI) dA-=Math.PI*2;
+    while(dA<-Math.PI) dA+=Math.PI*2;
+    ctx.beginPath();
+    ctx.arc(cx,cy,R*0.82,angL,angL+dA,dA<0);
+    ctx.strokeStyle='rgba(0,255,157,0.55)'; ctx.lineWidth=1.5;
+    ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+    // Arrow tip
+    var tipA=angL+dA, perp=tipA+(dA>0?-0.25:0.25);
+    var tx2=cx+Math.cos(tipA)*R*0.82, ty2=cy+Math.sin(tipA)*R*0.82;
+    var tx1=cx+Math.cos(perp)*R*0.82*0.92, ty1=cy+Math.sin(perp)*R*0.82*0.92;
+    ctx.beginPath(); ctx.moveTo(tx2,ty2); ctx.lineTo(tx1,ty1);
+    ctx.strokeStyle='rgba(0,255,157,0.7)'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+
+  // ── Line from center to pq_last (ghost violet) ───────────────────────────
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(xL,yL);
+  ctx.strokeStyle='rgba(128,64,255,0.35)'; ctx.lineWidth=1.5;
+  ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]);
+
+  // ── Line from center to pq_curr (gold, solid) ────────────────────────────
+  var glow=0.65+0.2*Math.sin(t*2.8)+blkPulse*0.35;
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(xC,yC);
+  ctx.strokeStyle='rgba(212,160,32,'+Math.min(1,glow)+')'; ctx.lineWidth=2; ctx.stroke();
+
+  // ── pq_last dot + label ───────────────────────────────────────────────────
+  ctx.beginPath(); ctx.arc(xL,yL,4,0,Math.PI*2);
+  ctx.fillStyle='rgba(128,64,255,0.7)'; ctx.fill();
+  ctx.font='bold 8px JetBrains Mono,monospace';
+  ctx.fillStyle='rgba(170,120,255,0.9)';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('LAST·'+pqL, xL+(xL>cx?14:-14), yL+(yL>cy?-10:10));
+
+  // ── pq_curr dot + label (brighter, larger) ───────────────────────────────
+  var cPulse=1+blkPulse*0.8;
+  // Glow ring
+  var glowGrad=ctx.createRadialGradient(xC,yC,0,xC,yC,10*cPulse);
+  glowGrad.addColorStop(0,'rgba(255,200,40,0.5)');
+  glowGrad.addColorStop(1,'rgba(255,200,40,0)');
+  ctx.beginPath(); ctx.arc(xC,yC,10*cPulse,0,Math.PI*2);
+  ctx.fillStyle=glowGrad; ctx.fill();
+  // Dot
+  ctx.beginPath(); ctx.arc(xC,yC,5*cPulse,0,Math.PI*2);
+  ctx.fillStyle=isStrong?'rgba(255,240,100,1)':'rgba(212,160,32,1)'; ctx.fill();
+  // Label
+  ctx.font='bold 9px JetBrains Mono,monospace';
+  ctx.fillStyle='rgba(255,210,60,1)';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('CURR·'+pqC, xC+(xC>cx?16:-16), yC+(yC>cy?-12:12));
+
+  // ── Center dot (lattice origin = current block) ───────────────────────────
+  ctx.beginPath(); ctx.arc(cx,cy,3,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,200,40,0.8)'; ctx.fill();
+
+  // ── Title ─────────────────────────────────────────────────────────────────
+  ctx.font='7px JetBrains Mono,monospace';
+  ctx.fillStyle='rgba(0,180,220,0.5)';
+  ctx.textAlign='center'; ctx.textBaseline='top';
+  ctx.fillText('PQ STATE DISK · fid='+fid.toFixed(2), cx, 2);
+
+  // ── Fidelity arc inside disk ──────────────────────────────────────────────
+  ctx.beginPath();
+  ctx.arc(cx,cy,R*0.22,0,Math.PI*2*fid);
+  ctx.strokeStyle=isQ?'rgba(0,255,157,0.5)':'rgba(0,180,220,0.35)';
+  ctx.lineWidth=2; ctx.stroke();
+}
+
+function onBlock(){
+  blockFlashT=performance.now()*0.001;
+  _pqCurrAnim = S.pq_curr || 0;
+  _pqLastAnim = S.pq_last || 0;
+}
+function animate(){
+  rafId=requestAnimationFrame(animate);
+  var now=performance.now();
+  if(now-lastT<1000/fps) return;
+  lastT=now;update(now*0.001);renderer.render(scene,camera);
+}
+function init(){
+  var container=document.getElementById('dc3d');
+  if(!container||typeof THREE==='undefined') return;
+  var w=container.clientWidth||container.parentElement.clientWidth||400,h=340;
+  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+  renderer.setSize(w,h);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  renderer.setClearColor(0x000000,0);container.appendChild(renderer.domElement);
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(50,w/h,0.01,50);
+  camera.position.set(0,0.6,2.8);camera.lookAt(0,0,0);
+  genNodes();buildScene();animate();
+  window.addEventListener('resize',function(){
+    var cont=document.getElementById('dc3d');if(!cont||!renderer||!camera) return;
+    var nw=cont.clientWidth;camera.aspect=nw/340;camera.updateProjectionMatrix();renderer.setSize(nw,340);
+  });
+}
+return {init:init,onBlock:onBlock};
+})();
+
+(function _h3dBoot(){
+  if(typeof THREE==='undefined'){setTimeout(_h3dBoot,80);return;}
+  var cont=document.getElementById('dc3d');
+  if(!cont){setTimeout(_h3dBoot,80);return;}
+  _H.init();
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEX BLOCK RENDERER + CHAIN STREAM
+// ═══════════════════════════════════════════════════════════════════════════════
+var blocks = [], _blocksById = {};
+
+function drawHex(canvas, fid, fresh) {
+  var ctx=canvas.getContext('2d'),w=canvas.width,h=canvas.height,cx=w/2,cy=h/2,r=w/2-3;
+  ctx.clearRect(0,0,w,h); ctx.beginPath();
+  for(var i=0;i<6;i++){var a=i*Math.PI/3-Math.PI/6;i===0?ctx.moveTo(cx+r*Math.cos(a),cy+r*Math.sin(a)):ctx.lineTo(cx+r*Math.cos(a),cy+r*Math.sin(a));}
+  ctx.closePath();
+  var col=fresh?'212,160,32':'0,220,255';
+  var grd=ctx.createRadialGradient(cx,cy,0,cx,cy,r);
+  grd.addColorStop(0,'rgba('+col+',.14)');grd.addColorStop(1,'rgba('+col+',.03)');
+  ctx.fillStyle=grd;ctx.fill();
+  ctx.strokeStyle='rgba('+col+','+(fresh?.9:.45)+')';ctx.lineWidth=1.5;ctx.stroke();
+  if(fid>0){ctx.beginPath();ctx.arc(cx,cy,r*.35,0,Math.PI*2*fid);ctx.strokeStyle='rgba(128,64,255,.6)';ctx.lineWidth=2;ctx.stroke();}
+}
+
+function renderChain() {
+  var el=document.getElementById('cs');
+  if(!el) return;
+  if(!blocks.length){
+    el.innerHTML='<div style="color:var(--dim);font-family:var(--mono);font-size:10px;padding:8px 0;opacity:.6">Awaiting blocks…</div>';
+    var bcc=document.getElementById('bcc');if(bcc) bcc.textContent='0 blocks';
+    return;
+  }
+  el.innerHTML='';
+  var freshThresh=blocks.length-3;
+  blocks.forEach(function(b,i){
+    if(i>0){var c=document.createElement('div');c.className='bco';el.appendChild(c);}
+    var isFr=i>=freshThresh||b._fr;
+    var node=document.createElement('div');node.className='bn'+(isFr?' fr':'');
+    var hex=document.createElement('div');hex.className='bh';
+    hex.style.cursor='pointer';hex.title='Block #'+b.height;
+    hex.onclick=(function(blk){return function(e){e.stopPropagation();openBlockModal(blk);};})(b);
+    var cv=document.createElement('canvas');cv.width=56;cv.height=56;
+    drawHex(cv,b.w_state_fidelity||b.fidelity||.9,isFr);hex.appendChild(cv);
+    var num=document.createElement('div');num.className='bnum';num.textContent='#'+b.height;
+    var tx2=document.createElement('div');tx2.className='btx';tx2.textContent=(b.tx_count||0)+' txs';
+    hex.appendChild(num);hex.appendChild(tx2);
+    var lbl=document.createElement('div');lbl.className='bl';lbl.textContent=(b.block_hash||b.hash||'').slice(0,10)+'...';
+    node.appendChild(hex);node.appendChild(lbl);el.appendChild(node);
+  });
+  el.scrollLeft=el.scrollWidth;
+  var bcc=document.getElementById('bcc');if(bcc) bcc.textContent=blocks.length+' blocks';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BLOCK MODAL
+// ═══════════════════════════════════════════════════════════════════════════════
+var _TREASURY_ADDR = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87';
+var _bmCopiedTimer = null;
+
+function _bmCopy(text) {
+  try{navigator.clipboard.writeText(text);}catch(e){
+    var t=document.createElement('textarea');t.value=text;
+    document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);
+  }
+  var el=document.getElementById('bm-copied');
+  el.classList.add('show');clearTimeout(_bmCopiedTimer);
+  _bmCopiedTimer=setTimeout(function(){el.classList.remove('show');},1200);
+}
+
+function openBlockModal(blk) {
+  var bg=document.getElementById('blk-modal-bg');
+  var body=document.getElementById('bm-body');
+  var title=document.getElementById('bm-title');
+  var meta=document.getElementById('bm-meta');
+  title.textContent='BLOCK #'+blk.height;
+  meta.textContent='hash: '+(blk.block_hash||blk.hash||'').slice(0,22)+'…  ·  '+(blk.tx_count||0)+' txs  ·  fidelity: '+((blk.w_state_fidelity||blk.fidelity||0)*100).toFixed(2)+'%';
+  body.innerHTML='<div class="bm-loading">Fetching via RPC…</div>';
+  bg.classList.add('open');document.body.style.overflow='hidden';
+  // Use qtcl_getBlock to fetch full tx list
+  rpc('qtcl_getBlock', [blk.height]).then(function(d) {
+    if(!d||!Array.isArray(d.transactions)||!d.transactions.length){
+      body.innerHTML='<div class="bm-loading" style="color:var(--re)">No transactions found for block #'+blk.height+'</div>';
+      return;
+    }
+    var txList=d.transactions.slice().sort(function(a,b){
+      var at=a.tx_type||a.type||'';var bt=b.tx_type||b.type||'';
+      return at==='coinbase'?-1:bt==='coinbase'?1:0;
+    });
+    body.innerHTML=txList.map(function(tx){
+      var tp=tx.tx_type||tx.type||'transfer',cb=tp==='coinbase';
+      var hash=tx.tx_id||tx.tx_hash||tx.hash||'';
+      var from=tx.from_addr||tx.from_address||tx.sender||'';
+      var to=tx.to_addr||tx.to_address||tx.receiver||'';
+      var amt=parseFloat(tx.amount||0)/100; // base units → QTCL
+      var txStatus=tx.status||'confirmed';
+      var isTreasury=cb&&(to===_TREASURY_ADDR||from===_TREASURY_ADDR);
+      var isPending=isTreasury&&txStatus==='pending';
+      // pending treasury: clock icon, dimmed, striped bg — confirmed on next block
+      var icon=isPending?'⏳':isTreasury?'🏛':cb?'⛏':'⇄';
+      var fromShort=from.length>20?from.slice(0,10)+'…'+from.slice(-8):from||'—';
+      var toShort=to.length>20?to.slice(0,10)+'…'+to.slice(-8):to||'—';
+      var pendingTag=isPending
+        ?'<span style="background:rgba(212,160,32,.08);color:rgba(212,160,32,.55);padding:1px 6px;border-radius:3px;font-family:var(--disp);font-size:8px;border:1px solid rgba(212,160,32,.18);letter-spacing:.4px">⏳ NEXT BLOCK</span>'
+        :'';
+      var badge=isTreasury
+        ?'<span style="background:var(--go2);color:'+(isPending?'rgba(212,160,32,.45)':'var(--go)')+';padding:1px 6px;border-radius:3px;font-family:var(--disp);font-size:8px;border:1px solid rgba(212,160,32,.3)">🏛 TREASURY</span>'
+        :cb?'<span style="background:var(--vi2);color:var(--vi);padding:1px 6px;border-radius:3px;font-family:var(--disp);font-size:8px">⛏ COINBASE</span>':'';
+      var rowStyle=isPending?'opacity:.62;background:repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(212,160,32,.03) 4px,rgba(212,160,32,.03) 8px);':'';
+      var amtColor=isPending?'color:rgba(212,160,32,.45)':isTreasury?'color:var(--go)':'';
+      return '<div class="bm-tx" onclick="_bmCopy(\''+hash+'\')" title="'+(isPending?'Treasury pending — confirms when next block is mined':'Click to copy TX ID')+'" style="'+rowStyle+'">'
+        +'<div class="bm-tx-icon '+(isTreasury?'treasury':tp)+'" style="'+(isPending?'opacity:.5':'')+'">'+icon+'</div>'
+        +'<div class="bm-tx-info">'
+        +'<div class="bm-tx-hash" style="'+(isPending?'color:rgba(0,220,255,.4)':'')+'">'+hash+'</div>'
+        +'<div class="bm-tx-sub"><span style="color:var(--dim)">from:</span> <span style="color:var(--tx)">'+fromShort+'</span>'
+        +'<span style="color:var(--dim)">→</span><span style="color:'+(isTreasury?'var(--go)':'var(--gr)')+'">'+toShort+'</span>'+badge+' '+pendingTag+'</div>'
+        +'</div>'
+        +'<div class="bm-tx-amt '+(isTreasury?'transfer':tp)+'" style="'+amtColor+'">'+amt.toFixed(2)+' Q</div>'
+        +'<div class="bm-copy-hint">CLICK TO COPY</div>'
+        +'</div>';
+    }).join('');
+  }).catch(function(){
+    body.innerHTML='<div class="bm-loading" style="color:var(--re)">RPC error loading block</div>';
+  });
+}
+
+function closeBlockModal(){
+  document.getElementById('blk-modal-bg').classList.remove('open');
+  document.body.style.overflow='';
+}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeBlockModal();});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRANSACTION EXPLORER
+// ═══════════════════════════════════════════════════════════════════════════════
+var txs=[], txPage_n=0, txPerPage=50, txTotal=0, txPages=1;
+var txFilterMode='all', txSearchQ='', txLoading=false, _txSearchTimer=null;
+
+function txFilter(mode){
+  txFilterMode=mode;txPage_n=0;
+  if(mode==='treasury'){txSearchQ=_TREASURY_ADDR;var si=document.getElementById('txsearch');if(si)si.value=_TREASURY_ADDR;}
+  else if(txSearchQ===_TREASURY_ADDR){txSearchQ='';var si=document.getElementById('txsearch');if(si)si.value='';}
+  ['all','coinbase','transfer','treasury'].forEach(function(m){
+    var b=document.getElementById('txf-'+m);if(!b) return;
+    var act=mode===m;
+    b.className='txfbtn'+(act?' active'+(m==='coinbase'?' cb':m==='transfer'?' tr':m==='treasury'?' go':''):'');
+  });
+  loadTxPage();
+}
+function txSearch(q){txSearchQ=q.trim();txPage_n=0;clearTimeout(_txSearchTimer);_txSearchTimer=setTimeout(loadTxPage,350);}
+function txPage(d){txPage_n=Math.max(0,Math.min(txPages-1,txPage_n+d));loadTxPage();}
+function _shortHash(h,n){h=h||'';return h.length>n?h.slice(0,n>>1)+'…'+h.slice(-(n>>1)):h;}
+
+function renderTxRow(tx,isNew){
+  var tp=tx.tx_type||tx.type||'transfer',cb=tp==='coinbase';
+  var hash=tx.tx_hash||tx.tx_id||tx.hash||'';
+  var from=tx.from_address||tx.from_addr||tx.sender||'';
+  var to=tx.to_address||tx.to_addr||tx.receiver||'';
+  var isTreasury=cb&&(to===_TREASURY_ADDR||from===_TREASURY_ADDR);
+  var amt=parseFloat(tx.amount||0);
+  // Server stores base units (int); display as QTCL (/100)
+  if(amt>1000) amt=amt/100;
+  var blk=tx.height||tx.block_height||'—';
+  var st=tx.status||'confirmed';
+  var isPending=isTreasury&&st==='pending';
+  var typeLabel=isPending?'⏳ PENDING':isTreasury?'🏛 TREASURY':cb?'⛏ COINBASE':'⇄ TRANSFER';
+  var typeClass=isPending?'pending':isTreasury?'treasury':cb?'coinbase':'transfer';
+  var rowOpacity=isPending?'opacity:.6;':'';
+  var amtStyle=isPending?'color:rgba(212,160,32,.45)':isTreasury?'color:var(--go)':'';
+  return '<tr class="'+(isNew?'tx-new ':'')+( cb?'tx-cb':'tx-tr')+'" title="'+(isPending?'Treasury pending — confirms when next block is mined':hash)+'" style="'+rowOpacity+'">'
+    +'<td><span class="tba '+typeClass+'">'+typeLabel+'</span></td>'
+    +'<td style="font-family:var(--mono);font-size:10px;cursor:pointer;color:'+(isPending?'rgba(0,220,255,.35)':'var(--cy)')+'" title="'+hash+'" onclick="_bmCopy(this.title);this.style.color=\'var(--go)\';var _c=this;setTimeout(function(){_c.style.color=\''+(isPending?'rgba(0,220,255,.35)':'var(--cy)')+'\';},900)">'+_shortHash(hash,18)+' <span style="font-size:7px;opacity:.5">⧉</span></td>'
+    +'<td style="font-family:var(--mono);font-size:9px;color:var(--dim)" title="'+from+'">'+_shortHash(from,14)+'</td>'
+    +'<td style="font-family:var(--mono);font-size:9px;color:'+(isTreasury?'var(--go)':'var(--gr)')+'" title="'+to+'">'+_shortHash(to,14)+'</td>'
+    +'<td style="font-size:11px;'+amtStyle+'">'+amt.toFixed(2)+' Q</td>'
+    +'<td style="color:var(--dim);font-size:10px">'+blk+'</td>'
+    +'<td><span class="tba '+st+'">'+st.toUpperCase()+'</span></td>'
+    +'</tr>';
+}
+
+// TX loading — pure RPC, qtcl_getTransactions, no REST, no fallback
+async function loadTxPage(){
+  if(txLoading) return;
+  txLoading=true;
+  var _wd=setTimeout(function(){txLoading=false;},8000);
+  var tb=document.getElementById('ttb');
+  if(tb) tb.innerHTML='<tr><td colspan="7" class="es" style="opacity:.5">Loading…</td></tr>';
+  try{
+    var req={page:txPage_n,per_page:txPerPage};
+    if(txFilterMode&&txFilterMode!=='all') req.type=txFilterMode;
+    if(txSearchQ) req.address=txSearchQ;
+    var d=await rpc('qtcl_getTransactions',[req]);
+    if(d&&Array.isArray(d.transactions)){
+      txs=d.transactions;txTotal=d.total||0;txPages=d.pages||1;txPage_n=d.page||0;
+      renderTxs();
+    }else{
+      if(tb) tb.innerHTML='<tr><td colspan="7" class="es">No transactions found</td></tr>';
+    }
+  }catch(e){
+    if(tb) tb.innerHTML='<tr><td colspan="7" class="es">Error: '+e.message+'</td></tr>';
+  }finally{
+    clearTimeout(_wd);txLoading=false;
+  }
+}
+
+function renderTxs(){
+  var tb=document.getElementById('ttb');
+  var txb=document.getElementById('txb');if(txb) txb.textContent=txTotal+' txs';
+  var pi=document.getElementById('txpageinfo');if(pi) pi.textContent='Page '+(txPage_n+1)+' / '+txPages+' ('+txTotal+' total)';
+  var prev=document.getElementById('txprev'),next=document.getElementById('txnext');
+  if(prev) prev.disabled=txPage_n===0;
+  if(next) next.disabled=txPage_n>=txPages-1;
+  if(!txs.length){if(tb) tb.innerHTML='<tr><td colspan="7" class="es">No transactions found</td></tr>';return;}
+  if(tb) tb.innerHTML=txs.map(function(tx){return renderTxRow(tx,tx._fresh);}).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORACLE PANEL RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+function renderOracles(){
+  var defs=[
+    {id:'oracle_1',role:'PRIMARY_LATTICE'},{id:'oracle_2',role:'SECONDARY_LATTICE'},
+    {id:'oracle_3',role:'VALIDATION'},{id:'oracle_4',role:'ARBITER'},{id:'oracle_5',role:'METRICS'}
+  ];
+  var data=S.oracle_data||{};
+  var el=document.getElementById('ol');if(!el) return;
+  el.innerHTML=defs.map(function(o){
+    var m=data[o.id]||{};
+    var fid=m.w_state_fidelity!=null?m.w_state_fidelity:(m.fidelity!=null?m.fidelity:null);
+    var on=fid!=null&&fid>0.5,cons=m.in_consensus;
+    var fidStr=fid!=null?(fid*100).toFixed(2)+'%':'—';
+    var cohStr=m.coherence!=null?(m.coherence*100).toFixed(2)+'%':'—';
+    var pq0o=m.pq0_oracle_fidelity!=null?m.pq0_oracle_fidelity.toFixed(4):'—';
+    var pq0iv=m.pq0_IV_fidelity!=null?m.pq0_IV_fidelity.toFixed(4):'—';
+    var pq0v=m.pq0_V_fidelity!=null?m.pq0_V_fidelity.toFixed(4):'—';
+    return '<div class="or" style="flex-direction:column;gap:4px;padding:10px 14px;border-bottom:1px solid var(--b)">'
+      +'<div style="display:flex;align-items:center;gap:8px">'
+      +'<div class="od '+(on?'on':'off')+'"></div>'
+      +'<div style="flex:1"><div class="on2">'+o.id.toUpperCase()+(cons?'<span style="margin-left:6px;font-size:8px;color:var(--gr)">✓BYZ</span>':'')+'</div>'
+      +'<div class="ort">'+o.role+' · '+(on?'ONLINE':'AWAITING')+'</div></div>'
+      +'<div class="of">'+fidStr+'</div>'
+      +'</div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;font-size:9px;font-family:var(--mono)">'
+      +'<div style="color:var(--dim)">coh: <span style="color:var(--vi)">'+cohStr+'</span></div>'
+      +'<div style="color:var(--dim)">pq0: <span style="color:var(--cy)">'+pq0o+'</span></div>'
+      +'<div style="color:var(--dim)">IV: <span style="color:var(--cy)">'+pq0iv+'</span></div>'
+      +'<div style="color:var(--dim)">V: <span style="color:var(--cy)">'+pq0v+'</span></div>'
+      +'</div></div>';
+  }).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MERMIN PANEL RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+function renderMermin(m){
+  if(!m) return;
+  var M=parseFloat(m.M_value||m.M||m.mermin_value||0),isQ=M>2.0;
+  var el=document.getElementById('mM');if(el){el.textContent=M.toFixed(3);el.className='mb2 '+(isQ?'q':'c');}
+  var mvd=document.getElementById('mvd');if(mvd) mvd.textContent=m.verdict||m.interpretation||'--';
+  var mb3=document.getElementById('mb3');if(mb3) mb3.textContent='M='+M.toFixed(3);
+  var mbar=document.getElementById('mbar');if(mbar) mbar.style.width=Math.min(100,M/4*100)+'%';
+  var mcy=document.getElementById('mcy');
+  if(mcy){var sig=(S.cycle%8===0)?'· REVIVAL':(S.cycle%8===4)?'· ANTI-REV':'';mcy.textContent='cycle '+S.cycle+' '+sig;}
+  var angles=m.angle_degrees||m.angles||[],labels=m.angle_labels||['θA1','φA1','θA2','φA2','θA3','φA3','θB1','φB1','θB2','φB2','θB3','φB3'];
+  var mac=document.getElementById('mac');if(mac) mac.innerHTML=angles.map(function(a,i){return '<span class="ac">'+(labels[i]||i)+'='+a+'°</span>';}).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MINER NETWORK RENDERER
+// ═══════════════════════════════════════════════════════════════════════════════
+var _miners=[], _p2pShowHist=false;
+
+function p2pToggleHist(){
+  _p2pShowHist=!_p2pShowHist;
+  var btn=document.getElementById('p2p-hist-btn');
+  if(btn){btn.textContent=_p2pShowHist?'ALL':'LIVE';btn.className='txfbtn'+(_p2pShowHist?' active':'');}
+  renderMiners(_miners);
+}
+
+function _age(secs){
+  if(!secs&&secs!==0) return '—';
+  if(secs<60) return secs+'s ago';
+  if(secs<3600) return Math.floor(secs/60)+'m ago';
+  if(secs<86400) return Math.floor(secs/3600)+'h ago';
+  return Math.floor(secs/86400)+'d ago';
+}
+
+function renderMiners(miners){
+  var el=document.getElementById('pl');if(!el) return;
+  if(!miners||!miners.length){
+    el.innerHTML='<div class="es" style="padding:20px;line-height:1.8"><div style="color:var(--dim);margin-bottom:6px">No miners in registry yet</div>'
+      +'<div style="font-size:9px;color:var(--dim);font-family:var(--mono)">qtcl_getPeers → 0 entries</div></div>';
+    ['pcb','p2plc','p2psc','p2ptc'].forEach(function(id){var e=document.getElementById(id);if(e)e.textContent='0';});
+    var dot=document.getElementById('p2p-live-dot');if(dot){dot.style.background='var(--dim)';dot.style.animation='none';}
+    return;
+  }
+  _miners=miners;
+  miners.forEach(function(m){if(!m.status)m.status='historic';});
+  var live=miners.filter(function(m){return m.status==='live';});
+  var seen=miners.filter(function(m){return m.status==='seen';});
+  var hist=miners.filter(function(m){return m.status==='historic';});
+  var pcb=document.getElementById('pcb');if(pcb)pcb.textContent=miners.length+' miners';
+  var p2plc=document.getElementById('p2plc');if(p2plc)p2plc.textContent=live.length;
+  var p2psc=document.getElementById('p2psc');if(p2psc)p2psc.textContent=seen.length;
+  var p2ptc=document.getElementById('p2ptc');if(p2ptc)p2ptc.textContent=hist.length;
+  var dot=document.getElementById('p2p-live-dot');
+  if(dot){dot.style.background=live.length?'var(--gr)':'var(--dim)';dot.style.animation=live.length?'p2ppulse 1.6s infinite':'none';dot.style.boxShadow=live.length?'0 0 6px var(--gr)':'none';}
+  var visible=_p2pShowHist?miners:miners.filter(function(m){return m.status!=='historic';});
+  if(!visible.length&&miners.length) visible=miners.slice(0,5);
+  el.innerHTML=visible.map(function(m){
+    var addr=m.miner_address||m.address||'';
+    var short=addr.length>20?addr.slice(0,10)+'…'+addr.slice(-10):addr||'(no address)';
+    var bks=m.block_count||0,earned=parseFloat(m.total_earned_qtcl||0).toFixed(2);
+    var h=m.last_height||0,age=_age(m.last_seen_age_s),st=m.status||'historic';
+    var pid=(m.peer_id||'').slice(0,12),gurl=m.gossip_url||'';
+    return '<div class="miner-row '+st+'">'
+      +'<div style="display:flex;align-items:flex-start;gap:8px">'
+      +'<div class="miner-dot" style="margin-top:4px"></div>'
+      +'<div style="flex:1;min-width:0">'
+      +'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+      +'<span class="miner-addr" title="'+addr+'" onclick="try{navigator.clipboard.writeText(\''+addr+'\');}catch(e){}">'+short+'</span>'
+      +'<span class="miner-badge '+st+'">'+st.toUpperCase()+'</span>'
+      +(gurl?'<span style="font-size:8px;color:var(--dim)">📡 P2P</span>':'')
+      +'</div>'
+      +'<div class="miner-stats">'
+      +(bks?'<span>⛏ <span class="miner-stat-val">'+bks+'</span> blocks</span>':'')
+      +(parseFloat(earned)>0?'<span>💰 <span class="miner-stat-val">'+earned+'</span> QTCL</span>':'')
+      +(h?'<span>h=<span class="miner-stat-val">'+h+'</span></span>':'')
+      +(age!=='—'?'<span class="miner-stat-val">'+age+'</span>':'')
+      +(pid?'<span style="color:var(--dim)">id:'+pid+'…</span>':'')
+      +'</div></div></div></div>';
+  }).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOM UPDATE — fires after every poll cycle
+// ═══════════════════════════════════════════════════════════════════════════════
+function st(id, v) {
+  var e=document.getElementById(id);if(!e) return;
+  var s=String(v);if(e.textContent!==s){e.textContent=s;e.classList.remove('fl');void e.offsetWidth;e.classList.add('fl');}
+}
+function pct(v,mx){return Math.min(100,Math.max(0,v/mx*100))+'%';}
+function fmt4(v){return v==null?'--':parseFloat(v).toFixed(4);}
+
+function updateDOM() {
+  // ── Header bar ──
+  st('hh','#'+S.height);
+  st('hf',(S.fidelity*100).toFixed(2)+'%');
+  st('hm',S.mempool_size+' tx');
+  // ── Chain metric cards ──
+  st('mh',S.height);
+  st('mhs','hash: '+(S.tip_hash||'').slice(0,14)+'...');
+  st('mf',(S.fidelity*100).toFixed(2)+'%');
+  var mfb=document.getElementById('mfb');if(mfb) mfb.style.width=pct(S.fidelity,1);
+  st('mfs',S.fidelity>=.9?'excellent':S.fidelity>=.75?'good':S.fidelity>=.7?'marginal':'degraded');
+  st('mc2',(S.coherence*100).toFixed(2)+'%');
+  var mcb=document.getElementById('mcb');if(mcb) mcb.style.width=pct(S.coherence,1);
+  st('mbt',S.avg_block_time_s>0?S.avg_block_time_s.toFixed(1)+'s':'--');
+  st('mtx',S.total_transactions);
+  st('mdf',S.difficulty_bits);
+  st('mpu',(S.purity*100).toFixed(2)+'%');
+  st('mng','negativity: '+fmt4(S.negativity));
+  st('mqf',fmt4(S.qfi));
+  st('mdc','discord: '+fmt4(S.discord));
+  // ── Block reward — split display ──
+  st('mrew',S.miner_reward_qtcl.toFixed(2)+' Q');
+  st('mrew-depth','depth '+S.tessellation_depth+' tessellation');
+  st('mtrew',S.treasury_reward_qtcl.toFixed(2)+' Q');
+  st('mtrew-pct',S.treasury_pct.toFixed(1)+'% of block');
+  // ── Lattice bloch strip ──
+  st('bfi',fmt4(S.fidelity));
+  st('ben',S.pq_curr);
+  st('bcn',S.pq_last);
+  st('bte',fmt4(S.tele_fidelity));
+  st('dkb','pq0='+S.pq0+' pq_last='+S.pq_last+' → pq_curr='+S.pq_curr+(S.pq_curr!==S.pq_last?' Δ='+(S.pq_curr-S.pq_last):''));
+  // ── GKSL noise bath ──
+  st('ng1',fmt4(S.gamma1));
+  st('ngp',fmt4(S.gammaphi));
+  st('nom',fmt4(S.omega));
+  st('nqr',fmt4(S.qrng_health));
+  st('ndi',fmt4(S.discord));
+  st('nou',fmt4(S.ou_mem));
+  st('npd',fmt4(S.phase_drift));
+  st('nso',fmt4(S.sector_occ));
+  // ── Validation panel ──
+  st('vq',String(S.quantum_validation_status).replace(/_/g,' ').toUpperCase().slice(0,14));
+  st('vp',String(S.pq_validation_status).toUpperCase().slice(0,10));
+  st('vo',S.oracle_consensus_reached?'YES':'NO');
+  var vb=document.getElementById('vb');if(vb) vb.textContent=S.oracle_consensus_reached?'CONSENSUS':'PENDING';
+  // ── Bottom bar ──
+  st('bbd',S.difficulty_bits);
+  st('bbn',S.n_peers||'—');
+  st('bbq',S.qrng_health.toFixed(3));
+  // ── Oracle + Mermin ──
+  renderOracles();
+  if(S.mermin) renderMermin(S.mermin);
+}
+
+function setOnline(ok) {
+  var p=document.getElementById('cp'),t=document.getElementById('ct');
+  if(!p||!t) return;
+  if(ok){p.classList.remove('off');}else{p.classList.add('off');}
+  t.textContent=ok?'LIVE':'OFFLINE';
+}
+
+var _lu = 0;
+function stamp() {
+  _lu=Date.now();
+  var bu=document.getElementById('bu');
+  if(bu) bu.textContent='Updated '+new Date().toTimeString().slice(0,8);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLL ENGINE — six independent RPC loops, each scoped to one concern
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── LOOP 1: Quantum Metrics — 2.5s — feeds lattice, oracle, mermin, noise bath
+// Sources: qtcl_getQuantumMetrics + qtcl_getLatestDMSnapshots
+(function loopQuantum() {
+  var _t = null;
+  async function poll() {
+    clearTimeout(_t);
+    var results = await rpcBatch([
+      ['qtcl_getQuantumMetrics', []],
+      ['qtcl_getLatestDMSnapshots', [{limit: 5}]],
+    ]);
+    var qm = results[0], dms = results[1];
+
+    if (qm) {
+      // w_state layer
+      var ws = qm.w_state || {};
+      if (ws.fidelity  != null) S.fidelity  = ws.fidelity;
+      if (ws.coherence != null) S.coherence = ws.coherence;
+      if (ws.purity    != null) S.purity    = ws.purity;
+      if (ws.entropy   != null) S.entropy   = ws.entropy;
+      // lattice layer
+      var la = qm.lattice || {};
+      if (la.fidelity  != null) S.lattice_fidelity  = la.fidelity;
+      if (la.coherence != null) S.lattice_coherence = la.coherence;
+      if (la.w_state_strength != null) S.w_state_strength = la.w_state_strength;
+      if (la.cycle != null && la.cycle > 0) S.cycle = la.cycle;
+      // lattice_refresh_counter from oracle snapshot is also the cycle count
+      var _lrc = (qm.w_state && qm.w_state.lattice_refresh_counter) || qm.lattice_refresh_counter || 0;
+      if (_lrc > S.cycle) S.cycle = _lrc;
+      // pq plane
+      if (qm.pq0    != null && S.pq0    === 0) S.pq0    = qm.pq0;
+      if (qm.pq_curr != null && S.pq_curr === 0) S.pq_curr = qm.pq_curr;
+      if (qm.pq_last != null && S.pq_last === 0) S.pq_last = qm.pq_last;
+      // block height from metrics (supplemental — loop2 is authoritative)
+      if (qm.height != null && qm.height > S.height) {
+        S.height = qm.height;
+        S.tip_hash = qm.tip_hash || S.tip_hash;
+        applyRewards(S.height);
+      }
+      // oracle consensus
+      if (qm.oracle_available != null) S.oracle_consensus_reached = qm.oracle_available;
+      // ── Mermin from getQuantumMetrics (primary path — always-on oracle object) ──
+      // getQuantumMetrics now injects mermin_test directly from DensityMatrixSnapshot.bell_test
+      if (qm.mermin_test) { S.mermin = qm.mermin_test; renderMermin(S.mermin); }
+      else if (qm.bell_test) { S.mermin = qm.bell_test; renderMermin(S.mermin); }
+      // ── Flat DM fields from getQuantumMetrics → oracle_1 state ──────────────
+      var _oid1 = 'oracle_1';
+      if (!S.oracle_data[_oid1]) S.oracle_data[_oid1] = {};
+      if (qm.w_state_fidelity   != null) { S.oracle_data[_oid1].w_state_fidelity = qm.w_state_fidelity; S.fidelity = qm.w_state_fidelity; }
+      if (qm.coherence_l1       != null) { S.oracle_data[_oid1].coherence        = qm.coherence_l1;     S.coherence = qm.coherence_l1; }
+      if (qm.purity             != null) { S.oracle_data[_oid1].purity           = qm.purity;            S.purity = qm.purity; }
+      if (qm.von_neumann_entropy!= null) { S.oracle_data[_oid1].entropy          = qm.von_neumann_entropy; S.entropy = qm.von_neumann_entropy; }
+      S.oracle_data[_oid1].in_consensus = (qm.w_state_fidelity || 0) > 0.5;
+    }
+
+    // DM Snapshots (ring buffer — flat single-oracle entries) → noise bath + Mermin only
+    // NOTE: ring buffer entries each have oracle_id=1 (flat consensus snapshot).
+    // oracle_consensus_reached is NOT computed here — loop 6 owns it via per_node array.
+    if (dms && Array.isArray(dms.snapshots) && dms.snapshots.length) {
+      var snap0 = dms.snapshots[0];
+      if (snap0) {
+        if (snap0.purity              != null) S.purity    = snap0.purity;
+        if (snap0.w_state_fidelity    != null) S.fidelity  = snap0.w_state_fidelity;
+        if (snap0.coherence_l1        != null) S.coherence = snap0.coherence_l1;
+        if (snap0.von_neumann_entropy != null) S.entropy   = snap0.von_neumann_entropy;
+        var p = snap0.purity || S.purity || 0.8;
+        S.negativity    = Math.max(0, (p - 0.5) * 0.8);
+        S.concurrence   = Math.max(0, (p - 0.333) * 1.2);
+        S.entanglement  = Math.max(0, (snap0.w_state_fidelity || S.fidelity) * 0.9);
+        S.qfi           = Math.max(0, (snap0.w_state_fidelity || S.fidelity) * 8.0);
+        S.discord       = Math.max(0, (1 - p) * 2.0);
+        S.tele_fidelity = Math.max(0, (snap0.w_state_fidelity || S.fidelity) * 0.95);
+      }
+      dms.snapshots.forEach(function(snap) {
+        if (snap.mermin_test || snap.mermin) S.mermin = snap.mermin_test || snap.mermin;
+      });
+    }
+
+    updateDOM();
+    setOnline(true);
+    stamp();
+    _t = setTimeout(poll, 2500);
+  }
+  poll();
+})();
+
+// ── LOOP 2: Block Stream — 3s — qtcl_getBlockHeight + qtcl_getBlockRange
+// Authoritative for height, difficulty, avg block time, pq fields
+// Uses getBlockRange to backfill chain stream efficiently
+(function loopBlocks() {
+  var _t = null, _lastFetchedHeight = 0, _loading = false;
+
+  async function poll() {
+    clearTimeout(_t);
+    if (_loading) { _t = setTimeout(poll, 3000); return; }
+    _loading = true;
+    try {
+      var hr = await rpc('qtcl_getBlockHeight');
+      if (!hr) { setOnline(false); return; }
+
+      var tip = parseInt(hr.height || 0);
+      S.height = tip;
+      S.tip_hash = hr.tip_hash || S.tip_hash;
+      applyRewards(tip);
+
+      // Update header immediately
+      st('hh', '#' + tip);
+      st('mh', tip);
+      st('mhs', 'hash: ' + (S.tip_hash || '').slice(0,14) + '...');
+
+      if (tip > 0) {
+        // Fetch the range from last known to tip (max 50 blocks per call)
+        var fromH = Math.max(0, _lastFetchedHeight > 0 ? _lastFetchedHeight : tip - 49);
+        var toH   = tip;
+        var rng = await rpc('qtcl_getBlockRange', [fromH, toH]);
+        if (rng && Array.isArray(rng.blocks)) {
+          rng.blocks.forEach(function(b) {
+            if (!_blocksById[b.height]) {
+              _blocksById[b.height] = b;
+              blocks.push(b);
+            } else {
+              // update in-place (difficulty etc may have changed)
+              Object.assign(_blocksById[b.height], b);
+            }
+          });
+          blocks.sort(function(a,b){return a.height-b.height;});
+          // Keep last 200 blocks in stream
+          if (blocks.length > 200) {
+            var removed = blocks.splice(0, blocks.length - 200);
+            removed.forEach(function(b){delete _blocksById[b.height];});
+          }
+          _lastFetchedHeight = toH;
+
+          // Derive chain metrics from block range
+          var sorted = rng.blocks.slice().sort(function(a,b){return a.height-b.height;});
+          var tipBlock = sorted[sorted.length-1];
+          if (sorted.length >= 2) {
+            var first = sorted[0];
+            if (tipBlock.timestamp_s && first.timestamp_s && tipBlock.height > first.height) {
+              S.avg_block_time_s = (tipBlock.timestamp_s - first.timestamp_s) / (tipBlock.height - first.height);
+            }
+          }
+          // Always update from tip block regardless of range size
+          if (tipBlock) {
+            if (tipBlock.difficulty_bits) S.difficulty_bits = tipBlock.difficulty_bits;
+            // pq0 is the oracle ground anchor — take directly from tip
+            if (tipBlock.pq0 != null) S.pq0 = tipBlock.pq0;
+            // Project the NEXT block's boundaries from tip's pq_curr
+            // so the visualization shows the live evolving blockfield, not stale stored state
+            var _tipPqC = tipBlock.pq_curr != null ? tipBlock.pq_curr : 0;
+            S.pq_last = _tipPqC % 8;                 // rear boundary = tip's forward boundary
+            S.pq_curr = (_tipPqC + 1) % 8;           // forward boundary = next face on {8,3}
+            if (tipBlock.w_state_fidelity) S.fidelity = Math.max(S.fidelity, tipBlock.w_state_fidelity);
+          }
+          S.total_transactions = blocks.reduce(function(acc,b){return acc+(b.tx_count||0);},0);
+          renderChain();
+          // Flash 3D on new tip
+          if (tip > 0 && tip !== window._lastKnownHeight) {
+            window._lastKnownHeight = tip;
+            if (typeof _H !== 'undefined') _H.onBlock();
+            // Reload txs when new block arrives
+            if (!txLoading) setTimeout(loadTxPage, 300);
+          }
+        }
+      }
+      // Update bottom bar difficulty
+      st('bbd', S.difficulty_bits);
+      st('mdf', S.difficulty_bits);
+      st('mbt', S.avg_block_time_s > 0 ? S.avg_block_time_s.toFixed(1)+'s' : '--');
+      st('mtx', S.total_transactions);
+      setOnline(true);
+    } finally {
+      _loading = false;
+      _t = setTimeout(poll, 3000);
+    }
+  }
+
+  // Initial backfill: fetch last 100 blocks in one shot
+  async function backfill() {
+    var hr = await rpc('qtcl_getBlockHeight');
+    if (!hr) { setTimeout(poll, 1000); return; }
+    var tip = parseInt(hr.height || 0);
+    S.height = tip; applyRewards(tip);
+    var bcc = document.getElementById('bcc');
+    if (bcc) bcc.textContent = 'loading blocks…';
+    var fromH = Math.max(0, tip - 99);
+    // Fetch in two parallel batches of 50
+    var r1 = rpc('qtcl_getBlockRange', [fromH, fromH + 49]);
+    var r2 = rpc('qtcl_getBlockRange', [fromH + 50, tip]);
+    var both = await Promise.allSettled([r1, r2]);
+    both.forEach(function(res) {
+      if (res.status !== 'fulfilled' || !res.value) return;
+      var rng = res.value;
+      if (!Array.isArray(rng.blocks)) return;
+      rng.blocks.forEach(function(b) {
+        if (!_blocksById[b.height]) { _blocksById[b.height]=b; blocks.push(b); }
+        else Object.assign(_blocksById[b.height], b);
+      });
+    });
+    blocks.sort(function(a,b){return a.height-b.height;});
+    if (blocks.length) {
+      var last = blocks[blocks.length-1];
+      if (last.difficulty_bits) S.difficulty_bits = last.difficulty_bits;
+      if (last.pq0 != null) S.pq0 = last.pq0;
+      var _lastPqC = last.pq_curr != null ? last.pq_curr : 0;
+      S.pq_last = _lastPqC % 8;
+      S.pq_curr = (_lastPqC + 1) % 8;
+      S.total_transactions = blocks.reduce(function(acc,b){return acc+(b.tx_count||0);},0);
+    }
+    _lastFetchedHeight = tip;
+    renderChain();
+    updateDOM();
+    poll(); // hand off to steady-state polling
+  }
+
+  backfill();
+})();
+
+// ── LOOP 3: Mempool — 5s — qtcl_getMempoolStats
+(function loopMempool() {
+  var _t = null;
+  async function poll() {
+    clearTimeout(_t);
+    var d = await rpc('qtcl_getMempoolStats');
+    if (d) {
+      S.mempool_size = d.depth != null ? d.depth : (d.pending != null ? d.pending : S.mempool_size);
+      st('hm', S.mempool_size + ' tx');
+    }
+    _t = setTimeout(poll, 5000);
+  }
+  setTimeout(poll, 1200);
+})();
+
+// ── LOOP 4: Peers + Miners — 8s — qtcl_getPeers (RPC-only, no REST)
+(function loopPeers() {
+  var _t = null;
+  async function poll() {
+    clearTimeout(_t);
+    var d = await rpc('qtcl_getPeers');
+    if (d) {
+      var rawPeers = Array.isArray(d.peers) ? d.peers : [];
+      S.n_peers = d.count || rawPeers.length;
+      var bbp = document.getElementById('bbp'); if(bbp) bbp.textContent = S.n_peers || '—';
+      var bbn = document.getElementById('bbn'); if(bbn) bbn.textContent = S.n_peers || '—';
+      // Normalize peer records → miner display format
+      var staleThresh = 300;
+      var miners = rawPeers.map(function(p) {
+        var ls = p.last_seen ? new Date(p.last_seen).getTime()/1000 : 0;
+        var age = ls > 0 ? Math.round(Date.now()/1000 - ls) : 999999;
+        return {
+          miner_address:      p.miner_address || p.address || p.node_id || '',
+          peer_id:            p.peer_id || p.node_id || '',
+          gossip_url:         p.gossip_url || '',
+          block_count:        p.block_count || 0,
+          last_height:        p.block_height || p.last_height || 0,
+          total_earned_qtcl:  p.total_earned_qtcl || 0,
+          last_seen_age_s:    age,
+          status:             age < staleThresh ? 'live' : (age < 86400 ? 'seen' : 'historic'),
+          ip_address:         p.ip_address || '',
+        };
+      }).filter(function(m) { return m.miner_address; });
+      if (miners.length) renderMiners(miners);
+      else {
+        // Fallback: show empty state with peer count
+        if (S.n_peers > 0) {
+          var el = document.getElementById('pl');
+          if (el) el.innerHTML = '<div class="es" style="padding:16px;font-family:var(--mono);font-size:10px;color:var(--dim)">'
+            + S.n_peers + ' peer(s) connected — no registry entries yet</div>';
+        }
+      }
+    }
+    _t = setTimeout(poll, 8000);
+  }
+  setTimeout(poll, 500);
+})();
+
+// ── LOOP 5: Events — 4s — qtcl_getEvents for new_block notifications
+// This drives real-time block ingest without SSE
+(function loopEvents() {
+  var _t = null, _lastEventTs = Date.now()/1000 - 60;
+  async function poll() {
+    clearTimeout(_t);
+    var d = await rpc('qtcl_getEvents', [{since: _lastEventTs, types: 'new_block', limit: 10}]);
+    if (d && Array.isArray(d.events) && d.events.length) {
+      d.events.forEach(function(ev) {
+        if (ev.ts > _lastEventTs) _lastEventTs = ev.ts;
+        if (ev.type === 'new_block') {
+          var h = parseInt(ev.height || ev.block_height || 0);
+          if (h > 0 && h > S.height) {
+            S.height = h;
+            applyRewards(h);
+            if (!_blocksById[h]) {
+              var nb = {height: h, block_hash: ev.block_hash||'', hash: ev.block_hash||'',
+                tx_count: ev.tx_count || 0, w_state_fidelity: ev.w_state_fidelity || S.fidelity,
+                difficulty_bits: ev.difficulty_bits || S.difficulty_bits, _fr: true};
+              // pq fields from event if present, normalized to 0-7
+              if (ev.pq_curr != null) { nb.pq_curr = ev.pq_curr > 7 ? ev.pq_curr % 8 : ev.pq_curr; S.pq_curr = nb.pq_curr; }
+              if (ev.pq_last != null) { nb.pq_last = ev.pq_last > 7 ? ev.pq_last % 8 : ev.pq_last; S.pq_last = nb.pq_last; }
+              _blocksById[h] = nb; blocks.push(nb);
+              blocks.sort(function(a,b){return a.height-b.height;});
+              renderChain();
+            }
+            if (typeof _H !== 'undefined') _H.onBlock();
+            window._lastKnownHeight = h; // keep loop2 flash in sync
+            if (!txLoading) setTimeout(loadTxPage, 400);
+          }
+        }
+      });
+      updateDOM();
+    }
+    _t = setTimeout(poll, 4000);
+  }
+  setTimeout(poll, 2000);
+})();
+
+// ── LOOP 6: Mermin + Oracle DM — 6s — qtcl_getLatestDMSnapshot for Mermin panel
+// The single latest DM carries the most recent Mermin test result AND all 5 per_node entries
+(function loopMermin() {
+  var _t = null;
+  async function poll() {
+    clearTimeout(_t);
+    var d = await rpc('qtcl_getLatestDMSnapshot');
+    if (d) {
+      // ── Consensus-level fields → global state ────────────────────────────
+      if (d.w_state_fidelity    != null) { S.fidelity  = d.w_state_fidelity; }
+      if (d.purity              != null) { S.purity    = d.purity; }
+      if (d.coherence_l1        != null) { S.coherence = d.coherence_l1; }
+      if (d.von_neumann_entropy != null) { S.entropy   = d.von_neumann_entropy; }
+      // lattice_refresh_counter is the oracle chirp cycle
+      if (d.lattice_refresh_counter != null && d.lattice_refresh_counter > S.cycle) {
+        S.cycle = d.lattice_refresh_counter;
+      }
+      // ── per_node: all 5 independent oracle measurements ──────────────────
+      // Lives at d.aer_noise_state.block_field.per_node[0..4]
+      // Each entry: {oracle_id, role, fidelity, coherence, entropy,
+      //              pq0_oracle_fidelity, pq0_IV_fidelity, pq0_V_fidelity,
+      //              in_consensus, mermin_violation}
+      var aer = d.aer_noise_state || {};
+      var bf  = aer.block_field   || {};
+      var perNode = bf.per_node   || [];
+      if (perNode.length > 0) {
+        perNode.forEach(function(n) {
+          var idx = n.oracle_id != null ? n.oracle_id : 1; // oracle_id is 1-based
+          var key = 'oracle_' + idx;
+          if (!S.oracle_data[key]) S.oracle_data[key] = {};
+          var od = S.oracle_data[key];
+          if (n.fidelity  != null) od.w_state_fidelity   = n.fidelity;
+          if (n.coherence != null) od.coherence           = n.coherence;
+          if (n.entropy   != null) od.entropy             = n.entropy;
+          if (n.pq0_oracle_fidelity != null) od.pq0_oracle_fidelity = n.pq0_oracle_fidelity;
+          if (n.pq0_IV_fidelity     != null) od.pq0_IV_fidelity     = n.pq0_IV_fidelity;
+          if (n.pq0_V_fidelity      != null) od.pq0_V_fidelity      = n.pq0_V_fidelity;
+          od.in_consensus = !!n.in_consensus;
+        });
+        // Recompute consensus from actual per_node in_consensus flags
+        var consensusCount = perNode.filter(function(n){ return n.in_consensus; }).length;
+        S.oracle_consensus_reached  = consensusCount >= 3;
+        S.quantum_validation_status = S.oracle_consensus_reached ? 'VALIDATED' : 'PENDING';
+        S.pq_validation_status      = S.oracle_consensus_reached ? 'HLWE_OK'   : 'PENDING';
+      } else {
+        // No per_node yet — fall back to single consensus fidelity
+        var _oid1 = 'oracle_1';
+        if (!S.oracle_data[_oid1]) S.oracle_data[_oid1] = {};
+        if (d.w_state_fidelity != null) {
+          S.oracle_data[_oid1].w_state_fidelity = d.w_state_fidelity;
+          S.oracle_data[_oid1].in_consensus = d.w_state_fidelity > 0.5;
+        }
+        // oracle_available from /rpc/health drives conn status when per_node absent
+        S.oracle_consensus_reached  = (d.w_state_fidelity || 0) > 0.5;
+        S.quantum_validation_status = S.oracle_consensus_reached ? 'VALIDATED' : 'PENDING';
+        S.pq_validation_status      = S.oracle_consensus_reached ? 'HLWE_OK'   : 'PENDING';
+      }
+      // pq block field boundaries
+      if (bf.pq_curr != null) S.pq_curr = bf.pq_curr;
+      if (bf.pq_last != null) S.pq_last = bf.pq_last;
+      if (aer.pq0_oracle_fidelity != null) {
+        // also store consensus pq0 components on oracle_1 if not already per-node
+        if (!S.oracle_data['oracle_1']) S.oracle_data['oracle_1'] = {};
+        if (S.oracle_data['oracle_1'].pq0_oracle_fidelity == null) {
+          S.oracle_data['oracle_1'].pq0_oracle_fidelity = aer.pq0_oracle_fidelity;
+          S.oracle_data['oracle_1'].pq0_IV_fidelity     = aer.pq0_IV_fidelity;
+          S.oracle_data['oracle_1'].pq0_V_fidelity      = aer.pq0_V_fidelity;
+        }
+      }
+      // ── Derived quantum bath from DM ──────────────────────────────────────
+      var _p = d.purity || S.purity || 0.8;
+      var _f = d.w_state_fidelity || S.fidelity || 0;
+      S.negativity    = Math.max(0, (_p - 0.5) * 0.8);
+      S.concurrence   = Math.max(0, (_p - 0.333) * 1.2);
+      S.entanglement  = Math.max(0, _f * 0.9);
+      S.qfi           = Math.max(0, _f * 8.0);
+      S.discord       = Math.max(0, (1 - _p) * 2.0);
+      S.tele_fidelity = Math.max(0, _f * 0.95);
+      // ── Mermin — real data only, no synthesis ─────────────────────────────
+      if (d.mermin_test) { S.mermin = d.mermin_test; renderMermin(S.mermin); }
+      else if (d.mermin) { S.mermin = d.mermin;      renderMermin(S.mermin); }
+      updateDOM();
+    }
+    _t = setTimeout(poll, 6000);
+  }
+  setTimeout(poll, 1800);
+})();
+
+// ── TX background refresh — 30s
+setInterval(function() { if (!txLoading) loadTxPage(); }, 30000);
+
+// ── Stale-connection watchdog
+setInterval(function() {
+  if (Date.now() - _lu > 15000 && _lu > 0) setOnline(false);
+}, 6000);
+
+// ── Boot TX
+setTimeout(function() { loadTxPage(); }, 1000);
+</script>
+
+</body>
+</html>
