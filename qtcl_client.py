@@ -1692,7 +1692,7 @@ class LiveRPCOracleSnapshot:
                 }).encode('utf-8')
                 
                 req = Request(
-                    f"{self.ORACLE_URL}/rpc",
+                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -1704,7 +1704,7 @@ class LiveRPCOracleSnapshot:
             else:
                 # Use requests session
                 resp = session.post(
-                    f"{self.ORACLE_URL}/rpc",
+                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
                     json={
                         "jsonrpc": "2.0",
                         "method": "qtcl_getQuantumMetrics",
