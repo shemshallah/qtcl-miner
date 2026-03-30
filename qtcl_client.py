@@ -13169,7 +13169,23 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── RPC poll thread — no SSE ──────────────────────
         # ── Fetch live RPC snapshot on-demand ────────────────────────
-        _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
+        # ── Bootstrap oracle fetch: retry up to 30s — handles Koyeb cold-start ──
+        _snap = {}
+        _boot_deadline = _t.time() + 30.0
+        _boot_attempt  = 0
+        while _t.time() < _boot_deadline:
+            _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=8.0)
+            if _snap and _snap.get("density_matrix_hex"):
+                break   # ✅ got DM
+            _boot_attempt += 1
+            if _boot_attempt == 1:
+                print("  🔗 Connecting to oracle…", end="", flush=True)
+            else:
+                print(".", end="", flush=True)
+            import time as _t
+            _t.sleep(min(2.0, _boot_deadline - _t.time()))
+        if _boot_attempt > 0:
+            print("", flush=True)  # newline after dots
         snap = _snap or {}
         # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
         bh = int(snap.get('block_height') or snap.get('height') or
@@ -13276,7 +13292,11 @@ class QtclClientApp:
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
+            # Re-check live oracle cache — DM may have arrived since bootstrap
             if not _dm_ready:
+                _cached_re, _cached_im, _cached_age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                if _cached_age < 60.0 and any(v != 0.0 for v in _cached_re):
+                    _dm_ready = True  # use cached DM from earlier successful fetch
                 _report = (
                     f"  ⚠️  Oracle DM unavailable (degraded mode)\n"
                     f"  ⛏️  Mining at height {_bh} with os.urandom seed\n"
@@ -13492,14 +13512,17 @@ class QtclClientApp:
             _last_poll_time = _t.time()
             
             _NULL_HASH = '0' * 64
-            _ORACLE_LAT_MAX_MS = 5000.0   # hard gate: refuse to mine if oracle RTT > 5s
+            _ORACLE_LAT_MAX_MS = 15000.0   # hard gate: 15s — handles Koyeb cold-start latency
             while True:  # Main mining loop
                 try:
                     # ── GATE 0: Oracle liveness check ─────────────────────────────
                     _t_oracle_start = _t.time()
-                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=6.0)
+                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=10.0)
                     _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
-                    if not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS:
+                    # Gate: block mining only if BOTH slow AND no cached DM
+                    _snap_has_dm = bool(_oracle_snap and (_oracle_snap.get("density_matrix_hex") or
+                                        _LIVE_RPC_ORACLE.get_oracle_dm()[2] < 120.0))
+                    if (not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS) and not _snap_has_dm:
                         _EXP_LOG.warning(
                             f"[MINER] ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — "
                             f"blocking mine, retry in 5s"
@@ -14155,15 +14178,12 @@ class QtclClientApp:
             try:
                 _addr2 = getattr(getattr(self, 'wallet', None), 'address', None)
                 if _addr2:
-                    # Short timeout + 1 retry — display-only, must not block mining loop
-                    # Two concurrent clients: jitter so they don't retry simultaneously
-                    import random as _rnd2
-                    time.sleep(_rnd2.uniform(0.0, 0.4))
                     _bal_r = self.api._rpc("qtcl_getBalance", [_addr2], timeout=5, retries=1)
                     _bal   = float(_bal_r["balance"]) if isinstance(_bal_r, dict) and "balance" in _bal_r else None
                     if _bal is not None:
                         print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
-                    # silently skip on transient timeout — avoids "RPC unavailable" spam
+                    # silently skip on transient timeout
+                    print(f"  Balance : {_bal_s}  ({_addr2[:24]}…)")
             except Exception:
                 pass
             if m2:
@@ -14299,9 +14319,9 @@ class QtclClientApp:
             if   ch == "1": self._send_tx_wizard()
             elif ch == "2": self._query_tx()
             elif ch == "3":
-                _bal_r2 = self.api._rpc("qtcl_getBalance", [self.wallet.address], timeout=6, retries=2)
-                bal = float(_bal_r2["balance"]) if isinstance(_bal_r2, dict) and "balance" in _bal_r2 else None
-                print(f"\n  💰 {(f"{bal:.8f} QTCL") if bal is not None else "balance fetch failed"}")
+                bal = self.api.get_balance(self.wallet.address)
+                print(f"\n  💰 {f'{bal:.8f} QTCL' if bal is not None else 'RPC unavailable'}"
+                      f"  ({self.wallet.address})")
             elif ch == "4":
                 break
         _tx_root_log.handlers = _tx_old_handlers
@@ -14768,10 +14788,10 @@ class QtclClientApp:
                     continue
                 
                 try:
-                    _bal_r3 = self.api._rpc("qtcl_getBalance", [self.wallet.address], timeout=5, retries=1)
-                    bal = float(_bal_r3["balance"]) if isinstance(_bal_r3, dict) and "balance" in _bal_r3 else None
+                    bal = self.api.get_balance(self.wallet.address)
                     if bal is None:
-                        bal_str = "…"   # transient — suppress RPC unavailable noise
+                        bal_str = "RPC unavailable"
+                    else:
                         bal_str = f"{float(bal):.8f} QTCL"
                 except Exception as e:
                     bal_str = f"RPC error: {e}"
