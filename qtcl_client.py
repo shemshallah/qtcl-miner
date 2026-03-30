@@ -14182,8 +14182,6 @@ class QtclClientApp:
                     _bal   = float(_bal_r["balance"]) if isinstance(_bal_r, dict) and "balance" in _bal_r else None
                     if _bal is not None:
                         print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
-                    # silently skip on transient timeout
-                    print(f"  Balance : {_bal_s}  ({_addr2[:24]}…)")
             except Exception:
                 pass
             if m2:
