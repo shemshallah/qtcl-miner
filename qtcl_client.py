@@ -11215,7 +11215,8 @@ class QtclClientApp:
         
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
-        _my_gossip_url = f"http://auto:9091"
+        _my_ip = _MY_IP or _get_hardware_ip()
+        _my_gossip_url = f"http://{_my_ip}:9091"
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_gossip_url, self.wallet.address, 0)
         if _reg_resp and False:
