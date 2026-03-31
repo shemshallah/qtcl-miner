@@ -14773,28 +14773,19 @@ class QtclClientApp:
                 _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
                 for peer in peers_resp['peers']:
                     p_addr = peer.get('external_addr') or peer.get('host', '')
-                    p_port = peer.get('port', 9092)
-                    p_id = peer.get('node_id', '')
-                    if p_addr and p_id and p_addr != ext_addr:
+                    p_id   = peer.get('node_id', '')
+                    # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
+                    if p_addr and p_id and p_id != node_id:
                         try:
-                            import urllib.request
-                            # Try to handshake with peer
-                            url = f"http://{p_addr}/rpc"
-                            data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_handshake","params":{"payload":{"version":"4.0.0","node_id":"' + p_id.encode() + b'","chain_height":' + str(height).encode() + b',"external_addr":"' + p_addr.encode() + b'","capabilities":["block","tx","sync"]}},"id":1}'
-                            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-                            with urllib.request.urlopen(req, timeout=5) as resp:
-                                _result = json.loads(resp.read())
-                                if _result.get('result'):
-                                    _EXP_LOG.info(f"[P2P] ✅ Connected to peer: {p_addr}")
-                                    # Add to peer manager
-                                    from qtcl_client import P2PPeer
-                                    p_host = p_addr.split(':')[0]
-                                    p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9092
-                                    new_peer = P2PPeer(p_host, p_port, p_id)
-                                    new_peer.state = 3  # ACTIVE
-                                    self.p2p_node.peer_mgr.add_peer(new_peer)
+                            p_host = p_addr.split(':')[0]
+                            p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9091
+                            # no circular import — P2PPeer is defined in this module
+                            new_peer = P2PPeer(p_host, p_port, p_id)
+                            new_peer.state = PeerState.ACTIVE
+                            self.p2p_node.peer_mgr.add_peer(new_peer)
+                            _EXP_LOG.info(f"[P2P] ✅ Added peer from registry: {p_addr} ({p_id[:16]}...)")
                         except Exception as _pe:
-                            _EXP_LOG.debug(f"[P2P] Failed to connect to {p_addr}: {_pe}")
+                            _EXP_LOG.debug(f"[P2P] Failed to add peer {p_addr}: {_pe}")
         except Exception as _e:
             _EXP_LOG.debug(f"[P2P] Koyeb registration failed: {_e}")
     def _heartbeat_loop(self) -> None:
