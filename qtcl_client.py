@@ -14627,7 +14627,7 @@ class QtclClientApp:
             _EXP_LOG.error(f"[CLIENT] Traceback: {traceback.format_exc()}")
     
     def _register_with_koyeb(self) -> None:
-        """Register this node with Koyeb bootstrap"""
+        """Register this node with Koyeb bootstrap and get peers"""
         try:
             if not self.p2p_node:
                 return
@@ -14643,6 +14643,34 @@ class QtclClientApp:
             })
             if resp:
                 _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
+            # Get peers from Koyeb
+            peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
+            if peers_resp and peers_resp.get('peers'):
+                _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
+                for peer in peers_resp['peers']:
+                    p_addr = peer.get('external_addr') or peer.get('host', '')
+                    p_port = peer.get('port', 9092)
+                    p_id = peer.get('node_id', '')
+                    if p_addr and p_id and p_addr != ext_addr:
+                        try:
+                            import urllib.request
+                            # Try to handshake with peer
+                            url = f"http://{p_addr}/rpc"
+                            data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_handshake","params":{"payload":{"version":"4.0.0","node_id":"' + p_id.encode() + b'","chain_height":' + str(height).encode() + b',"external_addr":"' + p_addr.encode() + b'","capabilities":["block","tx","sync"]}},"id":1}'
+                            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                _result = json.loads(resp.read())
+                                if _result.get('result'):
+                                    _EXP_LOG.info(f"[P2P] ✅ Connected to peer: {p_addr}")
+                                    # Add to peer manager
+                                    from qtcl_client import P2PPeer
+                                    p_host = p_addr.split(':')[0]
+                                    p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9092
+                                    new_peer = P2PPeer(p_host, p_port, p_id)
+                                    new_peer.state = 3  # ACTIVE
+                                    self.p2p_node.peer_mgr.add_peer(new_peer)
+                        except Exception as _pe:
+                            _EXP_LOG.debug(f"[P2P] Failed to connect to {p_addr}: {_pe}")
         except Exception as _e:
             _EXP_LOG.debug(f"[P2P] Koyeb registration failed: {_e}")
     def _heartbeat_loop(self) -> None:
@@ -14651,13 +14679,23 @@ class QtclClientApp:
           • POST /api/peers/heartbeat with current height + fidelity
           • Update P2P consensus height
           • Upsert self into local DB p2p_peers table
+          • Refresh P2P peers from Koyeb
         ❤️  I love you — heartbeat keeps us alive in the network
         """
         import time as _th
+        _peer_refresh_counter = 0
         while not self._stop.is_set():
             try:
                 bh = int(self.koyeb_state.block_height or 0)
                 self.api.send_heartbeat(self._peer_id, bh)
+                
+                # Refresh P2P peers every 60 seconds
+                _peer_refresh_counter += 1
+                if _peer_refresh_counter >= 2:
+                    _peer_refresh_counter = 0
+                    if hasattr(self, 'p2p_node') and self.p2p_node and getattr(self.p2p_node, '_running', False):
+                        self._register_with_koyeb()
+                
                 if self._db:
                     try:
                         _self_ip = _MY_IP or 'localhost'
