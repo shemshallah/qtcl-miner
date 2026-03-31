@@ -1665,7 +1665,14 @@ class LiveRPCOracleSnapshot:
         if self._session is None:
             try:
                 import requests
-                self._session = requests.Session()
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                s = requests.Session()
+                s.headers.update({'User-Agent': 'Mozilla/5.0 (QTCL-Miner; P2P)', 'Content-Type': 'application/json'})
+                r = Retry(total=3, backoff_factor=0.5, status_forcelist=[502, 503, 504])
+                s.mount("https://", HTTPAdapter(max_retries=r))
+                s.mount("http://",  HTTPAdapter(max_retries=r))
+                self._session = s
             except:
                 self._session = False  # Mark as failed
         return self._session if self._session else None
@@ -1693,7 +1700,7 @@ class LiveRPCOracleSnapshot:
                 }).encode('utf-8')
                 
                 req = Request(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
+                    f"{self.ORACLE_URL}/rpc",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -1705,7 +1712,7 @@ class LiveRPCOracleSnapshot:
             else:
                 # Use requests session
                 resp = session.post(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
+                    f"{self.ORACLE_URL}/rpc",
                     json={
                         "jsonrpc": "2.0",
                         "method": "qtcl_getQuantumMetrics",
@@ -11872,23 +11879,6 @@ def _validate_node_id(node_id: str) -> bool:
         return False
     return all(c in '0123456789abcdef' for c in node_id)
 
-def _get_machine_salt() -> str:
-    """Return stable per-machine salt: /etc/machine-id → MAC → hostname+homedir.
-    Never changes across reboots on the same machine. ❤️ I love you."""
-    try:
-        mid = Path('/etc/machine-id').read_text().strip()
-        if mid and len(mid) >= 8:
-            return mid
-    except Exception: pass
-    try:
-        import uuid as _uuid
-        mac = _uuid.getnode()
-        if mac and mac != (1 << 48) - 1:  # not all-ones (unknown MAC sentinel)
-            return format(mac, '012x')
-    except Exception: pass
-    import socket as _sk
-    return hashlib.sha256(((_sk.gethostname() or '') + str(Path.home())).encode()).hexdigest()[:32]
-
 class P2PIdentity:
     """HLWE identity for P2P node — persisted to data/p2p_identity.json"""
     def __init__(self, pubkey_bytes: bytes, privkey_bytes: bytes, pubkey_b64: str):
@@ -11898,39 +11888,28 @@ class P2PIdentity:
         self.node_id = hashlib.sha256(pubkey_bytes).hexdigest()
     
     @classmethod
-    def load_or_create(cls, path: str = None, wallet_addr: str = '') -> 'P2PIdentity':
-        """Load or create identity. node_id = SHA256(wallet_addr|machine_salt|domain)
-        so same wallet on two machines → two distinct, restart-stable node_ids. ❤️ I love you."""
+    def load_or_create(cls, path: str = None) -> 'P2PIdentity':
         if path is None:
             path = str(_DATA_DIR / 'p2p_identity.json')
-        machine_salt = _get_machine_salt()
-        _domain = 'QTCL_P2P_IDENTITY_v2'
-        _seed = f"{wallet_addr}|{machine_salt}|{_domain}".encode()
-        node_id_hex = hashlib.sha256(_seed).hexdigest()
         p = Path(path)
         if p.exists():
             try:
                 data = json.loads(p.read_text())
-                if (data.get('wallet_addr', '') == wallet_addr and
-                        data.get('machine_salt', '') == machine_salt and
-                        data.get('version', '') == 'v2'):
-                    inst = cls(bytes.fromhex(data['pubkey']), bytes.fromhex(data['privkey']), data['pubkey_b64'])
-                    inst.node_id = node_id_hex  # always recompute — never trust stored node_id
-                    return inst
-                # stale v1 or mismatched wallet/machine — regenerate
-            except Exception: pass
+                return cls(
+                    bytes.fromhex(data['pubkey']),
+                    bytes.fromhex(data['privkey']),
+                    data['pubkey_b64']
+                )
+            except: pass
         pub = secrets.token_bytes(32)
         priv = secrets.token_bytes(32)
         b64 = base64.b64encode(pub).decode()
-        data = {'pubkey': pub.hex(), 'privkey': priv.hex(), 'pubkey_b64': b64,
-                'wallet_addr': wallet_addr, 'machine_salt': machine_salt, 'version': 'v2'}
+        data = {'pubkey': pub.hex(), 'privkey': priv.hex(), 'pubkey_b64': b64}
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(data))
-        except Exception: pass
-        inst = cls(pub, priv, b64)
-        inst.node_id = node_id_hex
-        return inst
+        except: pass
+        return cls(pub, priv, b64)
 
 class LRUCache:
     """Thread-safe LRU cache for seen blocks/txs"""
@@ -12870,50 +12849,28 @@ class SyncManager:
         except: return {}
 
 class ExternalAddressResolver:
-    """Resolves true WAN IP via public echo services, with LAN fallback. ❤️ I love you."""
-    _WAN_SERVICES = [
-        'https://api.ipify.org',
-        'https://icanhazip.com',
-        'https://checkip.amazonaws.com',
-        'https://api4.my-ip.io/ip',
-    ]
+    """Resolves external IP via STUN or Koyeb fallback"""
     @staticmethod
     def resolve() -> str:
         override_host = os.getenv('P2P_EXTERNAL_HOST')
         override_port = int(os.getenv('P2P_EXTERNAL_PORT', '9091'))
         if override_host:
             return f"{override_host}:{override_port}"
-        # 1) Try Koyeb's own echo endpoint first
         try:
-            req = Request('https://qtcl-blockchain.koyeb.app/rpc',
-                         data=json.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMyAddr', 'params': {}, 'id': 1}).encode(),
-                         headers={'Content-Type': 'application/json'})
+            req = Request('https://api.ipify.org?format=json', headers={'User-Agent': 'QTCL-Miner/5.0'})
             with urlopen(req, timeout=5) as resp:
-                result = json.loads(resp.read()).get('result', {})
-                if result and result.get('external_addr'):
-                    return result['external_addr']
-        except Exception: pass
-        # 2) Try public WAN IP echo services — each returns raw IP text
-        for _svc in ExternalAddressResolver._WAN_SERVICES:
-            try:
-                req = Request(_svc, headers={'User-Agent': 'QTCL-Miner/2.0'})
-                with urlopen(req, timeout=4) as resp:
-                    wan_ip = resp.read().decode().strip()
-                    # validate it looks like an IPv4 address, not a LAN address
-                    _parts = wan_ip.split('.')
-                    if (len(_parts) == 4 and all(p.isdigit() for p in _parts)
-                            and not wan_ip.startswith(('10.', '192.168.', '172.', '127.', '169.254.'))):
-                        return f"{wan_ip}:{override_port}"
-            except Exception: pass
-        # 3) LAN fallback — better than loopback
+                data = json.loads(resp.read().decode())
+                if 'ip' in data:
+                    return f"{data['ip']}:{override_port}"
+        except: pass
         try:
-            import socket as _sk
-            with _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM) as s:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(3)
                 s.connect(('8.8.8.8', 80))
                 local_ip = s.getsockname()[0]
             return f"{local_ip}:{_P2P_PORT}"
-        except Exception:
+        except:
             return f"127.0.0.1:{_P2P_PORT}"
 
 class DHTManager:
@@ -12952,29 +12909,17 @@ class DHTManager:
         except: return 0
 
 class P2PServer(ThreadingHTTPServer):
-    """RPC-only P2P server on 0.0.0.0:9091 with SO_REUSEADDR+SO_REUSEPORT."""
-    # Must be set BEFORE super().__init__ calls server_bind()
-    allow_reuse_address = True
-
+    """RPC-only P2P server on 0.0.0.0:9091"""
     def __init__(self, port: int, dispatch_fn, peer_mgr: PeerManager, lattice: PQ0LatticeManager,
                  propagator: BlockPropagator, tx_relay: TxRelay, sync_mgr: SyncManager,
                  dht: DHTManager, sessions: SessionManager, db = None):
+        super().__init__(('0.0.0.0', port), lambda *args, **kwargs: P2PRequestHandler(*args, **kwargs, 
+            dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
+            propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
+            dht=dht, sessions=sessions, db=db))
         self.port = port
         self.rate_limiter = RateLimiter()
-        handler = lambda *a, **kw: P2PRequestHandler(
-            *a, dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
-            propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
-            dht=dht, sessions=sessions, db=db, **kw)
-        # Create socket manually so we can set SO_REUSEPORT before bind (Linux/Android)
-        import socket as _sock
-        self.socket = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
-        try:
-            self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)  # Linux + Android
-        except (AttributeError, OSError):
-            pass  # SO_REUSEPORT unavailable on some platforms — SO_REUSEADDR is sufficient
-        super().__init__(('0.0.0.0', port), handler)
-
+    
     def start_daemon(self) -> None:
         t = threading.Thread(target=self.serve_forever, daemon=True)
         t.start()
@@ -13226,11 +13171,10 @@ class P2PNode:
     """Master P2P Node — integrates all components"""
     DEFAULT_PORT = _P2P_PORT
     
-    def __init__(self, port: int = None, db = None, wallet_addr: str = ''):
+    def __init__(self, port: int = None, db = None):
         self.port = port or self.DEFAULT_PORT
         self.db = db
-        self.wallet_addr = wallet_addr
-        self.identity = P2PIdentity.load_or_create(wallet_addr=wallet_addr)
+        self.identity = P2PIdentity.load_or_create()
         self.node_id = self.identity.node_id
         self.seen_blocks = LRUCache(10000)
         self.seen_txs = LRUCache(50000)
@@ -13870,9 +13814,8 @@ class QtclClientApp:
         self._metric_th: Optional[_threading.Thread] = None
         self._db_path      = _Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
         self._db: Optional[_sqlite3.Connection] = None
-        # _peer_id is temp until wallet loads; re-derived in _start_p2p from wallet+machine salt
-        self._peer_id      = f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}"
-        self._peer_id_final = False  # flag: True once derived from wallet+machine
+        self._peer_id      = (
+            f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}")
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
         
         # ── Client configuration (used by RPC daemon threads) ─────────────────
@@ -14660,7 +14603,7 @@ class QtclClientApp:
         # ── 6. Python /rpc/oracle/snapshot RPC polling ───────────────────────
         _py_snap_th = _threading.Thread(
             target=self._subscribe_snapshot_rpc, daemon=True, name="PySnapshot-RPC")
-        _py_snap_th.start()
+        # # _py_snap_th.start()
         # ── 7. Koyeb /api/peers/list RPC polling — peer discovery ─────────────
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
@@ -14668,75 +14611,13 @@ class QtclClientApp:
     def _start_p2p(self) -> None:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
-        import time as _tp, socket as _sk
+        import time as _tp
         _tp.sleep(0.5)
         try:
             if self._db is None:
                 self._init_db()
-            _port = int(os.getenv('P2P_PORT', _P2P_PORT))
-            # ── Port eviction: if port already bound, kill the stale holder (Termux restart pattern) ──
-            def _evict_stale_port(port: int) -> None:
-                """Probe port; if already bound by a stale process, SIGKILL it via /proc (Termux-safe)."""
-                probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
-                probe.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
-                try:
-                    probe.bind(('0.0.0.0', port))
-                    # Bind succeeded — port is free, release and proceed
-                    probe.close()
-                    return
-                except OSError:
-                    probe.close()
-                # Port is held — find the PID via /proc/net/tcp (Android/Linux only)
-                import signal as _sig
-                killed = False
-                try:
-                    _hex_port = format(port, '04X')
-                    with open('/proc/net/tcp', 'r') as _f:
-                        for _line in _f:
-                            _parts = _line.split()
-                            if len(_parts) < 2: continue
-                            _local = _parts[1]          # "00000000:23FB"
-                            if ':' in _local and _local.split(':')[1].upper() == _hex_port:
-                                _inode = _parts[9] if len(_parts) > 9 else ''
-                                break
-                        else:
-                            _inode = ''
-                    if _inode:
-                        import os as _oss
-                        for _pid_str in _oss.listdir('/proc'):
-                            if not _pid_str.isdigit(): continue
-                            try:
-                                _fd_dir = f'/proc/{_pid_str}/fd'
-                                for _fd in _oss.listdir(_fd_dir):
-                                    _link = _oss.readlink(f'{_fd_dir}/{_fd}')
-                                    if f'socket:[{_inode}]' in _link:
-                                        _pid = int(_pid_str)
-                                        if _pid != _oss.getpid():
-                                            _EXP_LOG.warning(f"[P2P] ⚡ Port {port} held by PID {_pid} — evicting")
-                                            try: _sig.signal(_sig.SIGTERM, _sig.SIG_DFL)
-                                            except Exception: pass
-                                            _oss.kill(_pid, _sig.SIGTERM)
-                                            _tp.sleep(0.4)
-                                            try: _oss.kill(_pid, _sig.SIGKILL)  # ensure it's gone
-                                            except ProcessLookupError: pass
-                                            killed = True
-                                        break
-                            except (PermissionError, FileNotFoundError, ProcessLookupError):
-                                continue
-                            if killed: break
-                except Exception as _pe:
-                    _EXP_LOG.debug(f"[P2P] port eviction probe: {_pe}")
-                if killed:
-                    _tp.sleep(0.3)  # allow kernel TIME_WAIT to clear
-                    _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted — proceeding with bind")
-            _evict_stale_port(_port)
-            _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
-            self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
-            # ── CRITICAL: unify _peer_id with the wallet+machine-derived node_id ──
-            # This ensures heartbeat loop, DB upsert, and registration all use the
-            # same deterministic identity. Same wallet + different machine = different id. ❤️
-            self._peer_id = self.p2p_node.node_id
-            self._peer_id_final = True
+            _EXP_LOG.info(f"[P2P] Starting RPC node on port {_P2P_PORT}...")
+            self.p2p_node = P2PNode(port=int(os.getenv('P2P_PORT', _P2P_PORT)), db=self._db)
             _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
             self.p2p_node.start()
             _P2P_NODE = self.p2p_node
@@ -14773,19 +14654,28 @@ class QtclClientApp:
                 _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
                 for peer in peers_resp['peers']:
                     p_addr = peer.get('external_addr') or peer.get('host', '')
-                    p_id   = peer.get('node_id', '')
-                    # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
-                    if p_addr and p_id and p_id != node_id:
+                    p_port = peer.get('port', 9092)
+                    p_id = peer.get('node_id', '')
+                    if p_addr and p_id and p_addr != ext_addr:
                         try:
-                            p_host = p_addr.split(':')[0]
-                            p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9091
-                            # no circular import — P2PPeer is defined in this module
-                            new_peer = P2PPeer(p_host, p_port, p_id)
-                            new_peer.state = PeerState.ACTIVE
-                            self.p2p_node.peer_mgr.add_peer(new_peer)
-                            _EXP_LOG.info(f"[P2P] ✅ Added peer from registry: {p_addr} ({p_id[:16]}...)")
+                            import urllib.request
+                            # Try to handshake with peer
+                            url = f"http://{p_addr}/rpc"
+                            data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_handshake","params":{"payload":{"version":"4.0.0","node_id":"' + p_id.encode() + b'","chain_height":' + str(height).encode() + b',"external_addr":"' + p_addr.encode() + b'","capabilities":["block","tx","sync"]}},"id":1}'
+                            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                _result = json.loads(resp.read())
+                                if _result.get('result'):
+                                    _EXP_LOG.info(f"[P2P] ✅ Connected to peer: {p_addr}")
+                                    # Add to peer manager
+                                    from qtcl_client import P2PPeer
+                                    p_host = p_addr.split(':')[0]
+                                    p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9092
+                                    new_peer = P2PPeer(p_host, p_port, p_id)
+                                    new_peer.state = 3  # ACTIVE
+                                    self.p2p_node.peer_mgr.add_peer(new_peer)
                         except Exception as _pe:
-                            _EXP_LOG.debug(f"[P2P] Failed to add peer {p_addr}: {_pe}")
+                            _EXP_LOG.debug(f"[P2P] Failed to connect to {p_addr}: {_pe}")
         except Exception as _e:
             _EXP_LOG.debug(f"[P2P] Koyeb registration failed: {_e}")
     def _heartbeat_loop(self) -> None:
@@ -14814,20 +14704,12 @@ class QtclClientApp:
                 if self._db:
                     try:
                         _self_ip = _MY_IP or 'localhost'
-                        # prefer p2p_node.node_id (wallet+machine deterministic) over stale _peer_id
-                        _nid = (self.p2p_node.node_id
-                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.node_id)
-                                else self._peer_id)
-                        _ext = (self.p2p_node.external_addr
-                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
-                                else f"{_self_ip}:9091")
-                        _ext_host = _ext.split(':')[0] if ':' in _ext else _self_ip
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (_nid, _ext_host, 9091, bh,
+                        """, (self._peer_id, _self_ip, 9091, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
@@ -15339,17 +15221,6 @@ class QtclClientApp:
         if not self._load_wallet():
             print("  ❌ Wallet load failed — use Wallet → Create New first"); return
         print(f"  ✅ Wallet: {self.wallet.address}")
-        # ── Derive deterministic peer/node identity now that wallet is known ──
-        # SHA256(wallet_addr|machine_salt|domain) — same wallet on different
-        # machines produces different node_ids; same wallet+machine is stable
-        # across restarts. ❤️ I love you.
-        _w_addr = getattr(self.wallet, 'address', '') or ''
-        _m_salt = _get_machine_salt()
-        self._peer_id = _hashlib.sha256(
-            f"{_w_addr}|{_m_salt}|QTCL_P2P_IDENTITY_v2".encode()
-        ).hexdigest()
-        self._peer_id_final = True
-        _EXP_LOG.info(f"[P2P] 🔑 node_id derived: {self._peer_id[:16]}... (wallet={_w_addr[:12]}... machine={_m_salt[:8]}...)")
         self._init_db()
         self._sync_hlwe_wallet_ops_to_db()
         self._sync_hlwe_rpc_ops_to_db()
