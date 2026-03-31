@@ -11818,7 +11818,7 @@ class ServerRPCClient:
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 _P2P_VERSION = "4.0.0"
-_P2P_PORT = int(os.getenv('P2P_PORT', '9092'))
+_P2P_PORT = int(os.getenv('P2P_PORT', '9091'))   # canonical P2P port — must match C layer + bootstrap seeds
 _P2P_MAX_PEERS = int(os.getenv('P2P_MAX_PEERS', '32'))
 _P2P_MAX_OUTBOUND = int(os.getenv('P2P_MAX_OUTBOUND', '8'))
 _P2P_SESSION_TTL = int(os.getenv('P2P_SESSION_TTL', '600'))
@@ -12990,8 +12990,10 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             if not isinstance(payload, dict):
                 return None, {'code': -32602, 'message': 'invalid params: payload required'}
             version = payload.get('version', '')
-            if version != _P2P_VERSION:
-                return None, {'code': -1, 'message': 'version mismatch'}
+            # Accept same major version (e.g. "4.x.x") — strict equality blocks minor upgrades
+            def _ver_major(v): return str(v).split('.')[0] if v else '0'
+            if _ver_major(version) != _ver_major(_P2P_VERSION):
+                return None, {'code': -1, 'message': f'version mismatch: got {version} need {_P2P_VERSION[:1]}.*'}
             node_id = payload.get('node_id', '')
             if not node_id or len(node_id) != 64:
                 return None, {'code': -1, 'message': 'invalid node_id: must be 64 hex chars'}
@@ -14627,50 +14629,70 @@ class QtclClientApp:
             _EXP_LOG.error(f"[CLIENT] Traceback: {traceback.format_exc()}")
     
     def _register_with_koyeb(self) -> None:
-        """Register this node with Koyeb bootstrap and get peers"""
+        """Register this node with Koyeb bootstrap and initiate direct handshakes with returned peers."""
+        import urllib.request as _ur
         try:
             if not self.p2p_node:
                 return
-            ext_addr = self.p2p_node.external_addr
-            node_id = self.p2p_node.node_id
-            pubkey = self.p2p_node.identity.pubkey_b64
-            height = int(self.koyeb_state.block_height or 0)
+            my_ext_addr = self.p2p_node.external_addr   # OUR address — never substitute peer addr here
+            my_node_id  = self.p2p_node.node_id          # OUR node_id (sha256 of our pubkey)
+            my_pubkey   = self.p2p_node.identity.pubkey_b64
+            height      = int(self.koyeb_state.block_height or 0)
             resp = self.api.call("qtcl_registerPeer", {
-                "external_addr": ext_addr,
-                "pubkey": pubkey,
-                "chain_height": height,
-                "node_id": node_id
+                "external_addr": my_ext_addr,
+                "pubkey":        my_pubkey,
+                "chain_height":  height,
+                "node_id":       my_node_id,
             })
             if resp:
-                _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
-            # Get peers from Koyeb
+                _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {my_ext_addr}")
             peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
-            if peers_resp and peers_resp.get('peers'):
-                _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
-                for peer in peers_resp['peers']:
-                    p_addr = peer.get('external_addr') or peer.get('host', '')
-                    p_port = peer.get('port', 9092)
-                    p_id = peer.get('node_id', '')
-                    if p_addr and p_id and p_addr != ext_addr:
-                        try:
-                            import urllib.request
-                            # Try to handshake with peer
-                            url = f"http://{p_addr}/rpc"
-                            data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_handshake","params":{"payload":{"version":"4.0.0","node_id":"' + p_id.encode() + b'","chain_height":' + str(height).encode() + b',"external_addr":"' + p_addr.encode() + b'","capabilities":["block","tx","sync"]}},"id":1}'
-                            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-                            with urllib.request.urlopen(req, timeout=5) as resp:
-                                _result = json.loads(resp.read())
-                                if _result.get('result'):
-                                    _EXP_LOG.info(f"[P2P] ✅ Connected to peer: {p_addr}")
-                                    # Add to peer manager
-                                    from qtcl_client import P2PPeer
-                                    p_host = p_addr.split(':')[0]
-                                    p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9092
-                                    new_peer = P2PPeer(p_host, p_port, p_id)
-                                    new_peer.state = 3  # ACTIVE
-                                    self.p2p_node.peer_mgr.add_peer(new_peer)
-                        except Exception as _pe:
-                            _EXP_LOG.debug(f"[P2P] Failed to connect to {p_addr}: {_pe}")
+            if not (peers_resp and peers_resp.get('peers')):
+                return
+            _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
+            # Build OUR handshake payload once — node_id and external_addr are OURS, not the target peer's
+            _my_hs_payload = {
+                "version":       _P2P_VERSION,
+                "node_id":       my_node_id,          # ← fixed: was incorrectly sending p_id (peer's id)
+                "chain_height":  height,
+                "external_addr": my_ext_addr,         # ← fixed: was incorrectly sending p_addr (peer's addr)
+                "capabilities":  ["block", "tx", "sync"],
+            }
+            _hs_body = json.dumps({
+                "jsonrpc": "2.0", "method": "qtcl_p2p_handshake",
+                "params": {"payload": _my_hs_payload}, "id": 1,
+            }).encode()
+            for peer in peers_resp['peers']:
+                p_addr = peer.get('external_addr') or peer.get('host', '')
+                p_id   = peer.get('node_id', '')
+                if not p_addr or not p_id or p_addr == my_ext_addr:
+                    continue
+                # Resolve host:port — external_addr may be "ip:port" or bare ip
+                if ':' in p_addr:
+                    p_host, _pp = p_addr.rsplit(':', 1)
+                    p_port = int(_pp) if _pp.isdigit() else _P2P_PORT
+                else:
+                    p_host, p_port = p_addr, _P2P_PORT   # fixed: was 9092
+                def _do_handshake(_host=p_host, _port=p_port, _pid=p_id):
+                    try:
+                        url = f"http://{_host}:{_port}/rpc"
+                        req = _ur.Request(url, data=_hs_body,
+                                          headers={'Content-Type': 'application/json'})
+                        with _ur.urlopen(req, timeout=5) as r:
+                            _res = json.loads(r.read())
+                        if _res.get('result') and _res['result'].get('session_token'):
+                            _EXP_LOG.info(f"[P2P] ✅ Handshake OK → {_host}:{_port}")
+                            new_peer = P2PPeer(_host, _port, _pid)
+                            new_peer.state        = PeerState.ACTIVE
+                            new_peer.session_token  = _res['result']['session_token']
+                            new_peer.session_expiry = _res['result'].get('session_expiry', 0)
+                            self.p2p_node.peer_mgr.add_peer(new_peer)
+                        else:
+                            _EXP_LOG.debug(f"[P2P] Handshake no result from {_host}:{_port}: {_res}")
+                    except Exception as _he:
+                        _EXP_LOG.debug(f"[P2P] Handshake failed → {_host}:{_port}: {_he}")
+                _threading.Thread(target=_do_handshake, daemon=True,
+                                  name=f"P2P-HS-{p_host}").start()
         except Exception as _e:
             _EXP_LOG.debug(f"[P2P] Koyeb registration failed: {_e}")
     def _heartbeat_loop(self) -> None:
