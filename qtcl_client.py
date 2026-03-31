@@ -13870,8 +13870,9 @@ class QtclClientApp:
         self._metric_th: Optional[_threading.Thread] = None
         self._db_path      = _Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
         self._db: Optional[_sqlite3.Connection] = None
-        self._peer_id      = (
-            f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}")
+        # _peer_id is temp until wallet loads; re-derived in _start_p2p from wallet+machine salt
+        self._peer_id      = f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}"
+        self._peer_id_final = False  # flag: True once derived from wallet+machine
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
         
         # ── Client configuration (used by RPC daemon threads) ─────────────────
@@ -14731,6 +14732,11 @@ class QtclClientApp:
             _evict_stale_port(_port)
             _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
             self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
+            # ── CRITICAL: unify _peer_id with the wallet+machine-derived node_id ──
+            # This ensures heartbeat loop, DB upsert, and registration all use the
+            # same deterministic identity. Same wallet + different machine = different id. ❤️
+            self._peer_id = self.p2p_node.node_id
+            self._peer_id_final = True
             _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
             self.p2p_node.start()
             _P2P_NODE = self.p2p_node
@@ -14817,12 +14823,20 @@ class QtclClientApp:
                 if self._db:
                     try:
                         _self_ip = _MY_IP or 'localhost'
+                        # prefer p2p_node.node_id (wallet+machine deterministic) over stale _peer_id
+                        _nid = (self.p2p_node.node_id
+                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.node_id)
+                                else self._peer_id)
+                        _ext = (self.p2p_node.external_addr
+                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
+                                else f"{_self_ip}:9091")
+                        _ext_host = _ext.split(':')[0] if ':' in _ext else _self_ip
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (self._peer_id, _self_ip, 9091, bh,
+                        """, (_nid, _ext_host, 9091, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
@@ -15334,6 +15348,17 @@ class QtclClientApp:
         if not self._load_wallet():
             print("  ❌ Wallet load failed — use Wallet → Create New first"); return
         print(f"  ✅ Wallet: {self.wallet.address}")
+        # ── Derive deterministic peer/node identity now that wallet is known ──
+        # SHA256(wallet_addr|machine_salt|domain) — same wallet on different
+        # machines produces different node_ids; same wallet+machine is stable
+        # across restarts. ❤️ I love you.
+        _w_addr = getattr(self.wallet, 'address', '') or ''
+        _m_salt = _get_machine_salt()
+        self._peer_id = _hashlib.sha256(
+            f"{_w_addr}|{_m_salt}|QTCL_P2P_IDENTITY_v2".encode()
+        ).hexdigest()
+        self._peer_id_final = True
+        _EXP_LOG.info(f"[P2P] 🔑 node_id derived: {self._peer_id[:16]}... (wallet={_w_addr[:12]}... machine={_m_salt[:8]}...)")
         self._init_db()
         self._sync_hlwe_wallet_ops_to_db()
         self._sync_hlwe_rpc_ops_to_db()
