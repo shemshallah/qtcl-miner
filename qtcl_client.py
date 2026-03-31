@@ -7685,8 +7685,8 @@ class KoyebAPIClient:
         }])
     def send_heartbeat(self, peer_id: str, block_height: int = 0) -> Optional[dict]:
         """Send peer heartbeat via JSON-RPC (not REST)."""
-        return self._rpc("qtcl_sendHeartbeat", [{
-            "peer_id": peer_id, "block_height": block_height, "ts": time.time(),
+        return self._rpc("qtcl_heartbeat", [{
+            "node_id": peer_id, "block_height": block_height, "ts": time.time(),
         }])
     def gossip_ingest(self, payload: dict) -> Optional[dict]:
         """Ingest gossip via JSON-RPC (not REST)."""
@@ -10942,10 +10942,10 @@ class QtclClientApp:
     def _heartbeat_loop(self) -> None:
         """
         Every 30 seconds:
-          • POST /api/peers/heartbeat with current height + fidelity
-          • Update P2P consensus height
+          • POST qtcl_heartbeat to server with current height
+          • Process peer list from server response
+          • Connect to any new peers discovered
           • Upsert self into local DB p2p_peers table
-          • Refresh P2P peers from Koyeb
         ❤️  I love you — heartbeat keeps us alive in the network
         """
         import time as _th
@@ -10953,7 +10953,20 @@ class QtclClientApp:
         while not self._stop.is_set():
             try:
                 bh = int(self.koyeb_state.block_height or 0)
-                self.api.send_heartbeat(self._peer_id, bh)
+                result = self.api.send_heartbeat(self._peer_id, bh)
+                
+                # Process peer list from heartbeat response
+                if result and isinstance(result, dict):
+                    peers = result.get('peers', [])
+                    if peers and hasattr(self, 'p2p_node') and self.p2p_node:
+                        for peer in peers:
+                            host = peer.get('ip_address') or peer.get('host', '')
+                            port = int(peer.get('port', 9091))
+                            node_id = peer.get('peer_id', '')
+                            if host and host not in ('127.0.0.1', 'localhost', ''):
+                                self.p2p_node.add_peer(host, port, node_id)
+                        if peers:
+                            _EXP_LOG.info(f"[HB] Received {len(peers)} peers from server")
                 
                 # Refresh P2P peers every 60 seconds
                 _peer_refresh_counter += 1
@@ -10974,7 +10987,8 @@ class QtclClientApp:
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
-                    except Exception: pass
+                    except Exception:
+                        pass
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
