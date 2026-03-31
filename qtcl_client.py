@@ -11818,7 +11818,7 @@ class ServerRPCClient:
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 _P2P_VERSION = "4.0.0"
-_P2P_PORT = int(os.getenv('P2P_PORT', '9091'))
+_P2P_PORT = int(os.getenv('P2P_PORT', '9092'))
 _P2P_MAX_PEERS = int(os.getenv('P2P_MAX_PEERS', '32'))
 _P2P_MAX_OUTBOUND = int(os.getenv('P2P_MAX_OUTBOUND', '8'))
 _P2P_SESSION_TTL = int(os.getenv('P2P_SESSION_TTL', '600'))
@@ -11987,7 +11987,7 @@ class P2PPeer:
         validated_host = _validate_peer_host(host) if host else None
         validated_port = _validate_port(port) if port else None
         self.host = validated_host if validated_host else '0.0.0.0'
-        self.port = validated_port if validated_port else 9091
+        self.port = validated_port if validated_port else _P2P_PORT
         self.node_id = node_id if _validate_node_id(node_id) else ''
         self.external_addr = f"{self.host}:{self.port}"
         self.state = PeerState.UNKNOWN
@@ -13033,7 +13033,7 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             else:
                 host_port = external_addr.split(':')
                 host = _validate_peer_host(host_port[0]) if host_port else _validate_peer_host(client_ip)
-                port = _validate_port(host_port[1]) if len(host_port) > 1 else 9091
+                port = _validate_port(host_port[1]) if len(host_port) > 1 else _P2P_PORT
                 if not host or not port:
                     return None, {'code': -32602, 'message': 'invalid host/port'}
                 new_peer = P2PPeer(host, port, node_id)
@@ -13058,7 +13058,7 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             for p in peers_data:
                 try:
                     host = _validate_peer_host(p.get('host', ''))
-                    port = _validate_port(p.get('port', 9091))
+                    port = _validate_port(p.get('port', _P2P_PORT))
                     node_id = p.get('node_id', '')
                     if not host or not port or not _validate_node_id(node_id):
                         continue
@@ -13819,6 +13819,9 @@ class QtclClientApp:
             "oracle_context": oracle_context or {},
             "peer_id": self._peer_id,
         }
+        
+        # ── P2P Node (initialized in _start_p2p thread) ─────────────────────
+        self.p2p_node: Optional[Any] = None
     # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
@@ -14604,19 +14607,24 @@ class QtclClientApp:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
         import time as _tp
-        _tp.sleep(0.1)
+        _tp.sleep(0.5)
         try:
             if self._db is None:
                 self._init_db()
-            self.p2p_node = P2PNode(port=int(os.getenv('P2P_PORT', 9091)), db=self._db)
+            _EXP_LOG.info(f"[P2P] Starting RPC node on port {_P2P_PORT}...")
+            self.p2p_node = P2PNode(port=int(os.getenv('P2P_PORT', _P2P_PORT)), db=self._db)
+            _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
             self.p2p_node.start()
             _P2P_NODE = self.p2p_node
             _EXP_LOG.info(f"[CLIENT] 🌐 P2P RPC node started on {self.p2p_node.external_addr}")
             if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
                 _GENESIS_RESET_LISTENER._broadcaster = self.p2p_node
             self._register_with_koyeb()
+            _EXP_LOG.info(f"[P2P] ✅ P2P fully initialized - running={getattr(self.p2p_node, '_running', False)}")
         except Exception as _e:
-            _EXP_LOG.warning(f"[CLIENT] _start_p2p failed: {_e}")
+            import traceback
+            _EXP_LOG.error(f"[CLIENT] _start_p2p FAILED: {_e}")
+            _EXP_LOG.error(f"[CLIENT] Traceback: {traceback.format_exc()}")
     
     def _register_with_koyeb(self) -> None:
         """Register this node with Koyeb bootstrap"""
@@ -15385,7 +15393,16 @@ class QtclClientApp:
         print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
         print(f"  🔗 Oracle latency         : {_lat_ms:.1f} ms", flush=True)
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
-        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked\n", flush=True)
+        print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked", flush=True)
+        # ── P2P status in mining loop ──────────────────────────────────────────
+        _p2p_node = getattr(self, 'p2p_node', None)
+        if _p2p_node and getattr(_p2p_node, '_running', False):
+            _p2p_ext = getattr(_p2p_node, 'external_addr', 'unknown')
+            _p2p_peers = len(_p2p_node.peer_mgr.get_active_peers()) if _p2p_node.peer_mgr else 0
+            print(f"  🌐 P2P RPC               : ✅ {_p2p_ext}  peers={_p2p_peers}", flush=True)
+        else:
+            print(f"  🌐 P2P RPC               : ⚠️  starting...", flush=True)
+        print(flush=True)
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
             """
@@ -16034,6 +16051,25 @@ class QtclClientApp:
                             height=target_height, hash=block_hash, nonce=nonce,
                             timestamp=timestamp, fidelity=w_state_fidelity, reward_qtcl=_srv_r,
                         )
+                        # P2P Block Broadcast
+                        _p2p_n = getattr(self, 'p2p_node', None)
+                        if _p2p_n and getattr(_p2p_n, '_running', False):
+                            try:
+                                _peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
+                                if _peers:
+                                    _EXP_LOG.info(f"[P2P] 📡 Broadcasting block h={target_height} to {len(_peers)} peers...")
+                                    # Broadcast inv to all peers
+                                    for _p in _peers:
+                                        try:
+                                            import urllib.request
+                                            _url = f"http://{_p.host}:{_p.port}/rpc"
+                                            _data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"' + block_hash.encode() + b'","height":' + str(target_height).encode() + b',"miner_addr":"' + (self._oracle_id.get('address','')).encode() + b'","ttl_hops":8},"id":1}'
+                                            urllib.request.urlopen(_url, data=_data, timeout=5)
+                                        except Exception as _pe:
+                                            pass
+                                    _EXP_LOG.info(f"[P2P] ✅ Block broadcast complete")
+                            except Exception as _p2pe:
+                                _EXP_LOG.debug(f"[P2P] Broadcast error: {_p2pe}")
                         _MINE_TELEM.mark_mining()
                         # Wait for server tip to advance before re-entering loop.
                         # Without this the miner races back, sees stale height,
@@ -16201,6 +16237,13 @@ class QtclClientApp:
                   f"bridge={ks2.bridge_fidelity:.4f}  "
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
                   f"{'✅' if ks2.connected else '❌'}")
+            # ── P2P Status ─────────────────────────────────────────────────
+            _p2p_n = getattr(self, 'p2p_node', None)
+            if _p2p_n and getattr(_p2p_n, '_running', False):
+                _p2p_peers = len(_p2p_n.peer_mgr.get_active_peers()) if _p2p_n.peer_mgr else 0
+                print(f"  🌐 P2P     : ✅ {_p2p_n.external_addr}  peers={_p2p_peers}")
+            else:
+                print(f"  🌐 P2P     : ⚠️  starting...")
             print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
             if tel['total_earned_qtcl'] > 0:
                 print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)")
@@ -16678,89 +16721,68 @@ class QtclClientApp:
                 a(f"  {pid}  {purl}  last={plat}")
             # ── P2P Ouroboros network status ───────────────────────
             a(HR)
-            a("  P2P OUROBOROS NETWORK  —  port 9091")
-            if False and _P2P_NODE is None:
-                try:
-                    _lazy_id = getattr(self, '_peer_id', None) or f"oracle_panel_{id(self)}"
-                    globals()['_P2P_NODE'] = _init_p2p_node(_lazy_id, QtclP2PNode.DEFAULT_PORT)
-                    globals()['_P2P_NODE'].start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
-                except Exception as _li_e:
-                    pass
-            _p2p_running = (False and _P2P_NODE is not None
-                            and (getattr(_P2P_NODE, '_started', False)
-                                 or (False and hasattr(_accel_lib, 'qtcl_p2p_peer_count'))))
+            a(f"  P2P OUROBOROS NETWORK  —  port {_P2P_PORT} RPC")
+            _p2p_node = getattr(self, 'p2p_node', None)
+            _p2p_running = _p2p_node is not None and getattr(_p2p_node, '_running', False)
             if _p2p_running:
                 try:
-                    a(f"  Status         : ✅ RUNNING  protocol=RPC-only  peers={n_peers}  consensus=clean")
-                    a(f"  Known peers    : {n_peers}   Connected: {n_conn}   (no SSE broadcast)")
-                    cons = _P2P_NODE.get_consensus_dm()
-                    if cons:
-                        _re, _im, _cf, _ch = cons
-                        _cf_bar = "█" * int(_cf * 20) + "░" * (20 - int(_cf * 20))
-                        a(f"  Consensus DM   : h={_ch}  F={_cf_bar}  {_cf:.4f}  ✅ explicit RPC polling")
-                        a(f"  Local oracle   : F={float(getattr(_LIVE_RPC_ORACLE.get_latest_measurement(),'fidelity_to_w3',0) if _LIVE_RPC_ORACLE.get_latest_measurement() else 0):.4f}  (pre-consensus)")
-                    else:
-                        a("  Consensus DM   : ⏳ awaiting peer contributions")
-                        a("  Temporal decay : exp(-age/30s) × fid²  weighting active when peers join")
-                    _plist = _P2P_NODE.get_peers()
-                    if _plist:
-                        a(f"  Active peers   : ({len(_plist)} connected)")
-                        a(f"  {'HOST':<22} {'PORT':<6} {'H':>6} {'F':>7} {'LAT':>8} {'BAN':>5}")
-                        a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*7} {'─'*8} {'─'*5}")
-                        for _pp in sorted(_plist[:12],
-                                          key=lambda x: x.get('last_fidelity',0), reverse=True):
-                            _ph   = _pp.get('host','?')[:22]
-                            _ppo  = _pp.get('port', 9091)
-                            _pf   = float(_pp.get('last_fidelity', 0))
-                            _pht  = int(_pp.get('chain_height', 0))
-                            _plat = float(_pp.get('latency_ms', 0))
-                            _pban = int(_pp.get('ban_score', 0))
-                            _fid_icon = '✅' if _pf >= 0.70 else '⚠️ ' if _pf >= 0.50 else '❌'
-                            a(f"  {_ph:<22} {_ppo:<6} {_pht:>6} {_fid_icon}{_pf:.4f} {_plat:>7.1f}ms {_pban:>5}")
+                    _ext_addr = getattr(_p2p_node, 'external_addr', 'unknown')
+                    _node_id = getattr(_p2p_node, 'node_id', 'unknown')[:16] + '...'
+                    _peer_mgr = getattr(_p2p_node, 'peer_mgr', None)
+                    _active_peers = _peer_mgr.get_active_peers() if _peer_mgr else []
+                    _n_peers = len(_active_peers)
+                    _lattice = getattr(_p2p_node, 'lattice', None)
+                    a(f"  Status         : ✅ RUNNING")
+                    a(f"  Protocol       : RPC-only (JSON-RPC 2.0) — NO REST API")
+                    a(f"  Listen addr    : {_ext_addr}")
+                    a(f"  Node ID        : {_node_id}")
+                    a(f"  Active peers   : {_n_peers}")
+                    if _lattice:
+                        a(f"  PQ0 Lattice    : ✅ tripartite consensus active")
+                    if _active_peers:
+                        a(f"  {'HOST':<22} {'PORT':<6} {'H':>6} {'BAN':>5} {'STATE':<10}")
+                        a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*5} {'─'*10}")
+                        for _pp in _active_peers[:12]:
+                            _ph = getattr(_pp, 'host', '?')[:22]
+                            _ppo = getattr(_pp, 'port', 9091)
+                            _pht = getattr(_pp, 'chain_height', 0)
+                            _pban = getattr(_pp, 'ban_score', 0)
+                            _pstate = str(getattr(_pp, 'state', 'UNKNOWN'))[9:]
+                            a(f"  {_ph:<22} {_ppo:<6} {_pht:>6} {_pban:>5} {_pstate:<10}")
                     else:
                         a("  Active peers   : none — bootstrap connecting…")
-                        a("  Tip: check port 9091 firewall / NAT rules")
-                    if _plist:
-                        _all_lats = [p.get('latency_ms',0) for p in _plist if p.get('latency_ms',0) > 0]
-                        _all_fids = [p.get('last_fidelity',0) for p in _plist]
-                        _all_h    = [p.get('chain_height',0) for p in _plist]
-                        if _all_lats:
-                            a(f"  Avg latency    : {sum(_all_lats)/len(_all_lats):.1f}ms  "
-                              f"min={min(_all_lats):.1f}ms  max={max(_all_lats):.1f}ms")
-                        if _all_fids:
-                            a(f"  Avg fidelity   : {sum(_all_fids)/len(_all_fids):.4f}  "
-                              f"best={max(_all_fids):.4f}")
-                        if _all_h:
-                            a(f"  Chain heights  : min={min(_all_h)}  max={max(_all_h)}  "
-                              f"{'✅ synced' if max(_all_h)-min(_all_h)<=1 else '⚠️  diverged'}")
+                        a(f"  Tip: check port {_P2P_PORT} firewall / NAT rules")
+                    _all_h = [p.chain_height for p in _active_peers] if _active_peers else []
+                    if _all_h:
+                        a(f"  Chain heights  : min={min(_all_h)}  max={max(_all_h)}")
                 except Exception as _pe:
-                    a(f"  P2P query      : {_pe}")
+                    a(f"  Status         : ⚠️  Error: {_pe}")
             else:
-                import time as _p2p_t
-                if not False:
-                    _why = "C layer unavailable — delete __pycache__ and run: pkg install clang openssl libffi"
-                elif _P2P_NODE is None:
-                    _why = "not initialized — enter Mine mode to activate"
-                elif not getattr(_P2P_NODE, '_started', False):
-                    _why = "starting…"
-                else:
-                    _why = "failed to bind port 9091"
+                _why = "starting..." if _p2p_node else "not initialized — enter Mine mode to activate"
                 a(f"  Status         : ⚠️  {_why}")
-                a(f"  C accel        : {'✅ available' if False else '❌ unavailable'}")
-                a("  Ouroboros      : self-loop inactive — no peer DM averaging")
-                if False:
-                    a("  To activate    : enter Mine mode (option 1) then return here")
-            # ── Local C layer status ────────────────────────────────
+                a(f"  Protocol       : RPC-only (JSON-RPC 2.0)")
+                a(f"  Port           : {_P2P_PORT}")
+                a("  To activate    : enter Mine mode (option 1) to start P2P node")
+            # ── PQ0 Lattice Status ───────────────────────────────────────
             a(HR)
-            a("  LOCAL C LAYER")
-            a(f"  accel compiled : {'✅' if False else '❌'}")
-            if False:
+            a("  PQ0 TRIPARTITE LATTICE")
+            if _p2p_running and _lattice:
                 try:
-                    a(f"  bootstrap DM   : {'✅ fresh' if bs_ok else '⚠️  stale / not yet received'}")
-                    a(f"  selftest       : {'✅ PASS' if sc == 1 else f'❌ FAIL ({sc})'}")
-                except Exception as _ce:
-                    a(f"  C query error  : {_ce}")
-            # ── Diagnostics ────────────────────────────────────────
+                    _latest = self._db.execute("SELECT block_height, pq0_virtual, pq0_inverse_virtual, pq0_pseudoqubit FROM pq0_lattice ORDER BY block_height DESC LIMIT 1").fetchone()
+                    if _latest:
+                        a(f"  Latest height  : {_latest[0]}")
+                        a(f"  Virtual pq0    : {_latest[1]}")
+                        a(f"  Inv-Virtual   : {_latest[2]}")
+                        a(f"  Pseudoqubit   : {_latest[3]}")
+                        _cons_ok, _cons_data = _lattice.get_tripartite_consensus(_latest[0])
+                        a(f"  Consensus     : {'✅ VALID' if _cons_ok else '⚠️  INVALID'}")
+                    else:
+                        a("  State         : no lattice data yet")
+                except Exception as _lq:
+                    a(f"  Lattice query : {_lq}")
+            else:
+                a("  Status         : waiting for P2P node")
+            # ── Diagnostics ──────────────────────────────────────────────
             if diag:
                 a(HR)
                 a("  DIAGNOSTICS  (server /api/diagnostics)")
@@ -17446,7 +17468,8 @@ class QtclClientApp:
         print("║                                                              ║")
         print("║  W-State : |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)               ║")
         print("║  Ready to mine, transact, or manage wallet                   ║")
-        print("║  Port    : 9091  (GossipListener — all API routes)          ║")
+        print("║  Port    : 9091  (GossipListener)                           ║")
+        print("║  P2P     : 9092 RPC (JSON-RPC 2.0 — NO REST API)           ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
