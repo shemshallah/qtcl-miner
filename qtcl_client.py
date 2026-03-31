@@ -3242,9 +3242,23 @@ class LocalBlockchainDB:
                 pq_last INTEGER,
                 qubit_snapshot TEXT,
                 w_state_fidelity REAL,
+                merkle_root TEXT,
+                tx_count INTEGER DEFAULT 0,
+                synced_from_server INTEGER DEFAULT 0,
                 data TEXT
             )
         """)
+        
+        # Migration: add missing columns to existing blocks table
+        for col, coltype in [
+            ('merkle_root', 'TEXT'),
+            ('tx_count', 'INTEGER DEFAULT 0'),
+            ('synced_from_server', 'INTEGER DEFAULT 0'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE blocks ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass  # Column already exists or other error
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
@@ -3256,9 +3270,29 @@ class LocalBlockchainDB:
                 amount REAL,
                 fee REAL DEFAULT 0.0,
                 timestamp INTEGER,
-                status TEXT DEFAULT 'pending'
+                status TEXT DEFAULT 'pending',
+                block_hash TEXT,
+                transaction_index INTEGER DEFAULT 0,
+                tx_type TEXT DEFAULT 'transfer',
+                quantum_state_hash TEXT,
+                w_proof TEXT,
+                metadata TEXT
             )
         """)
+        
+        # Migration: add missing columns to existing transactions table
+        for col, coltype in [
+            ('block_hash', 'TEXT'),
+            ('transaction_index', 'INTEGER DEFAULT 0'),
+            ('tx_type', 'TEXT DEFAULT "transfer"'),
+            ('quantum_state_hash', 'TEXT'),
+            ('w_proof', 'TEXT'),
+            ('metadata', 'TEXT'),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass  # Column already exists or other error
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS wallets (
