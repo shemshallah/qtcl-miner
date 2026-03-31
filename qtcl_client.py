@@ -12959,7 +12959,6 @@ class DHTManager:
 
 class P2PServer(ThreadingHTTPServer):
     """RPC-only P2P server on 0.0.0.0:9091 with SO_REUSEADDR+SO_REUSEPORT."""
-    # Must be set BEFORE super().__init__ calls server_bind()
     allow_reuse_address = True
 
     def __init__(self, port: int, dispatch_fn, peer_mgr: PeerManager, lattice: PQ0LatticeManager,
@@ -12971,15 +12970,16 @@ class P2PServer(ThreadingHTTPServer):
             *a, dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
             propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
             dht=dht, sessions=sessions, db=db, **kw)
-        # Create socket manually so we can set SO_REUSEPORT before bind (Linux/Android)
-        import socket as _sock
-        self.socket = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
-        try:
-            self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)  # Linux + Android
-        except (AttributeError, OSError):
-            pass  # SO_REUSEPORT unavailable on some platforms — SO_REUSEADDR is sufficient
         super().__init__(('0.0.0.0', port), handler)
+
+    def server_bind(self):
+        """Override to set SO_REUSEPORT before bind — must happen after socket creation."""
+        import socket as _sock
+        try:
+            self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
 
     def start_daemon(self) -> None:
         t = threading.Thread(target=self.serve_forever, daemon=True)
@@ -14686,59 +14686,64 @@ class QtclClientApp:
             _port = int(os.getenv('P2P_PORT', _P2P_PORT))
             # ── Port eviction: if port already bound, kill the stale holder (Termux restart pattern) ──
             def _evict_stale_port(port: int) -> None:
-                """Probe port; if already bound by a stale process, SIGKILL it via /proc (Termux-safe)."""
-                probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
-                probe.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+                """Kill whatever holds the port — /proc/net/tcp inode walk + fuser fallback."""
+                import signal as _sig, os as _oss, subprocess as _sp
+                # quick probe
+                _probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+                _probe.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
                 try:
-                    probe.bind(('0.0.0.0', port))
-                    # Bind succeeded — port is free, release and proceed
-                    probe.close()
-                    return
+                    _probe.bind(('0.0.0.0', port)); _probe.close(); return
                 except OSError:
-                    probe.close()
-                # Port is held — find the PID via /proc/net/tcp (Android/Linux only)
-                import signal as _sig
+                    _probe.close()
+                _EXP_LOG.warning(f"[P2P] ⚡ Port {port} busy — evicting stale holder")
                 killed = False
+                # --- method 1: fuser (fastest on Termux) ---
                 try:
-                    _hex_port = format(port, '04X')
-                    with open('/proc/net/tcp', 'r') as _f:
-                        for _line in _f:
-                            _parts = _line.split()
-                            if len(_parts) < 2: continue
-                            _local = _parts[1]          # "00000000:23FB"
-                            if ':' in _local and _local.split(':')[1].upper() == _hex_port:
-                                _inode = _parts[9] if len(_parts) > 9 else ''
-                                break
-                        else:
-                            _inode = ''
-                    if _inode:
-                        import os as _oss
-                        for _pid_str in _oss.listdir('/proc'):
-                            if not _pid_str.isdigit(): continue
+                    out = _sp.check_output(['fuser', f'{port}/tcp'],
+                                           stderr=_sp.DEVNULL, timeout=2).decode().strip()
+                    for _pid_s in out.split():
+                        try:
+                            _pid = int(_pid_s)
+                            if _pid != _oss.getpid():
+                                _oss.kill(_pid, _sig.SIGKILL)
+                                killed = True
+                                _EXP_LOG.info(f"[P2P] fuser killed PID {_pid}")
+                        except Exception: pass
+                except Exception: pass
+                # --- method 2: /proc/net/tcp inode walk ---
+                if not killed:
+                    try:
+                        _hex_port = format(port, '04X')
+                        _inode = ''
+                        for _tcp_f in ('/proc/net/tcp', '/proc/net/tcp6'):
                             try:
-                                _fd_dir = f'/proc/{_pid_str}/fd'
-                                for _fd in _oss.listdir(_fd_dir):
-                                    _link = _oss.readlink(f'{_fd_dir}/{_fd}')
-                                    if f'socket:[{_inode}]' in _link:
-                                        _pid = int(_pid_str)
-                                        if _pid != _oss.getpid():
-                                            _EXP_LOG.warning(f"[P2P] ⚡ Port {port} held by PID {_pid} — evicting")
-                                            try: _sig.signal(_sig.SIGTERM, _sig.SIG_DFL)
-                                            except Exception: pass
-                                            _oss.kill(_pid, _sig.SIGTERM)
-                                            _tp.sleep(0.4)
-                                            try: _oss.kill(_pid, _sig.SIGKILL)  # ensure it's gone
-                                            except ProcessLookupError: pass
-                                            killed = True
-                                        break
-                            except (PermissionError, FileNotFoundError, ProcessLookupError):
-                                continue
-                            if killed: break
-                except Exception as _pe:
-                    _EXP_LOG.debug(f"[P2P] port eviction probe: {_pe}")
+                                with open(_tcp_f) as _f:
+                                    for _line in _f:
+                                        _parts = _line.split()
+                                        if len(_parts) < 10: continue
+                                        if ':' in _parts[1] and _parts[1].split(':')[1].upper() == _hex_port:
+                                            _inode = _parts[9]; break
+                                if _inode: break
+                            except Exception: pass
+                        if _inode:
+                            for _pid_str in _oss.listdir('/proc'):
+                                if not _pid_str.isdigit(): continue
+                                try:
+                                    for _fd in _oss.listdir(f'/proc/{_pid_str}/fd'):
+                                        if f'socket:[{_inode}]' in _oss.readlink(f'/proc/{_pid_str}/fd/{_fd}'):
+                                            _pid = int(_pid_str)
+                                            if _pid != _oss.getpid():
+                                                _oss.kill(_pid, _sig.SIGKILL)
+                                                killed = True
+                                                _EXP_LOG.info(f"[P2P] proc walk killed PID {_pid}")
+                                            break
+                                except Exception: pass
+                                if killed: break
+                    except Exception as _pe:
+                        _EXP_LOG.debug(f"[P2P] proc eviction: {_pe}")
                 if killed:
-                    _tp.sleep(0.3)  # allow kernel TIME_WAIT to clear
-                    _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted — proceeding with bind")
+                    _tp.sleep(0.8)  # TIME_WAIT clearance
+                    _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted")
             _evict_stale_port(_port)
             _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
             self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
