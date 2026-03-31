@@ -11818,7 +11818,7 @@ class ServerRPCClient:
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 _P2P_VERSION = "4.0.0"
-_P2P_PORT = int(os.getenv('P2P_PORT', '9092'))
+_P2P_PORT = int(os.getenv('P2P_PORT', '9091'))
 _P2P_MAX_PEERS = int(os.getenv('P2P_MAX_PEERS', '32'))
 _P2P_MAX_OUTBOUND = int(os.getenv('P2P_MAX_OUTBOUND', '8'))
 _P2P_SESSION_TTL = int(os.getenv('P2P_SESSION_TTL', '600'))
@@ -12870,7 +12870,12 @@ class SyncManager:
         except: return {}
 
 class ExternalAddressResolver:
-    """Resolves true WAN IP via public echo services, with LAN fallback. ❤️ I love you."""
+    """Resolves true WAN IP via STUN (qtcl_getMyAddr) then public echo services. ❤️ I love you."""
+    _RFC1918 = ('10.', '192.168.', '127.', '169.254.',
+                '172.16.', '172.17.', '172.18.', '172.19.',
+                '172.20.', '172.21.', '172.22.', '172.23.',
+                '172.24.', '172.25.', '172.26.', '172.27.',
+                '172.28.', '172.29.', '172.30.', '172.31.')
     _WAN_SERVICES = [
         'https://api.ipify.org',
         'https://icanhazip.com',
@@ -12878,34 +12883,35 @@ class ExternalAddressResolver:
         'https://api4.my-ip.io/ip',
     ]
     @staticmethod
+    def _is_public(ip: str) -> bool:
+        return bool(ip) and not any(ip.startswith(p) for p in ExternalAddressResolver._RFC1918)
+    @staticmethod
     def resolve() -> str:
         override_host = os.getenv('P2P_EXTERNAL_HOST')
         override_port = int(os.getenv('P2P_EXTERNAL_PORT', str(_P2P_PORT)))
         if override_host:
             return f"{override_host}:{override_port}"
-        # 1) Try Koyeb's own echo endpoint first
+        # 1) STUN via Koyeb — server reads X-Forwarded-For so client gets its real WAN IP
         try:
             req = Request('https://qtcl-blockchain.koyeb.app/rpc',
                          data=json.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMyAddr', 'params': {}, 'id': 1}).encode(),
                          headers={'Content-Type': 'application/json'})
             with urlopen(req, timeout=5) as resp:
                 result = json.loads(resp.read()).get('result', {})
-                if result and result.get('external_addr'):
-                    return result['external_addr']
+                stun_ip = result.get('ip', '')
+                if ExternalAddressResolver._is_public(stun_ip):
+                    return f"{stun_ip}:{override_port}"
         except Exception: pass
-        # 2) Try public WAN IP echo services — each returns raw IP text
+        # 2) Public WAN echo services
         for _svc in ExternalAddressResolver._WAN_SERVICES:
             try:
                 req = Request(_svc, headers={'User-Agent': 'QTCL-Miner/2.0'})
                 with urlopen(req, timeout=4) as resp:
                     wan_ip = resp.read().decode().strip()
-                    # validate it looks like an IPv4 address, not a LAN address
-                    _parts = wan_ip.split('.')
-                    if (len(_parts) == 4 and all(p.isdigit() for p in _parts)
-                            and not wan_ip.startswith(('10.', '192.168.', '172.', '127.', '169.254.'))):
+                    if ExternalAddressResolver._is_public(wan_ip) and len(wan_ip.split('.')) == 4:
                         return f"{wan_ip}:{override_port}"
             except Exception: pass
-        # 3) LAN fallback — better than loopback
+        # 3) LAN fallback — at least the port is right
         try:
             import socket as _sk
             with _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM) as s:
@@ -14770,6 +14776,21 @@ class QtclClientApp:
                 "node_id": node_id
             })
             if resp:
+                # server echoes caller_ip (X-Forwarded-For) — use it to self-correct external_addr
+                _caller_ip = resp.get('caller_ip') or resp.get('ip', '')
+                if _caller_ip and ExternalAddressResolver._is_public(_caller_ip):
+                    _corrected = f"{_caller_ip}:{_P2P_PORT}"
+                    if _corrected != self.p2p_node.external_addr:
+                        _EXP_LOG.info(f"[P2P] 🔧 external_addr self-corrected: {self.p2p_node.external_addr} → {_corrected}")
+                        self.p2p_node.external_addr = _corrected
+                        ext_addr = _corrected
+                        # re-register with corrected addr
+                        self.api.call("qtcl_registerPeer", {
+                            "external_addr": ext_addr,
+                            "pubkey": pubkey,
+                            "chain_height": height,
+                            "node_id": node_id
+                        })
                 _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
             # Get peers from Koyeb
             peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
@@ -14783,7 +14804,6 @@ class QtclClientApp:
                         try:
                             p_host = p_addr.split(':')[0]
                             p_port = int(p_addr.split(':')[1]) if ':' in p_addr else _P2P_PORT
-                            # no circular import — P2PPeer is defined in this module
                             new_peer = P2PPeer(p_host, p_port, p_id)
                             new_peer.state = PeerState.ACTIVE
                             self.p2p_node.peer_mgr.add_peer(new_peer)
