@@ -11872,6 +11872,23 @@ def _validate_node_id(node_id: str) -> bool:
         return False
     return all(c in '0123456789abcdef' for c in node_id)
 
+def _get_machine_salt() -> str:
+    """Return stable per-machine salt: /etc/machine-id → MAC → hostname+homedir.
+    Never changes across reboots on the same machine. ❤️ I love you."""
+    try:
+        mid = Path('/etc/machine-id').read_text().strip()
+        if mid and len(mid) >= 8:
+            return mid
+    except Exception: pass
+    try:
+        import uuid as _uuid
+        mac = _uuid.getnode()
+        if mac and mac != (1 << 48) - 1:  # not all-ones (unknown MAC sentinel)
+            return format(mac, '012x')
+    except Exception: pass
+    import socket as _sk
+    return hashlib.sha256(((_sk.gethostname() or '') + str(Path.home())).encode()).hexdigest()[:32]
+
 class P2PIdentity:
     """HLWE identity for P2P node — persisted to data/p2p_identity.json"""
     def __init__(self, pubkey_bytes: bytes, privkey_bytes: bytes, pubkey_b64: str):
@@ -11881,28 +11898,39 @@ class P2PIdentity:
         self.node_id = hashlib.sha256(pubkey_bytes).hexdigest()
     
     @classmethod
-    def load_or_create(cls, path: str = None) -> 'P2PIdentity':
+    def load_or_create(cls, path: str = None, wallet_addr: str = '') -> 'P2PIdentity':
+        """Load or create identity. node_id = SHA256(wallet_addr|machine_salt|domain)
+        so same wallet on two machines → two distinct, restart-stable node_ids. ❤️ I love you."""
         if path is None:
             path = str(_DATA_DIR / 'p2p_identity.json')
+        machine_salt = _get_machine_salt()
+        _domain = 'QTCL_P2P_IDENTITY_v2'
+        _seed = f"{wallet_addr}|{machine_salt}|{_domain}".encode()
+        node_id_hex = hashlib.sha256(_seed).hexdigest()
         p = Path(path)
         if p.exists():
             try:
                 data = json.loads(p.read_text())
-                return cls(
-                    bytes.fromhex(data['pubkey']),
-                    bytes.fromhex(data['privkey']),
-                    data['pubkey_b64']
-                )
-            except: pass
+                if (data.get('wallet_addr', '') == wallet_addr and
+                        data.get('machine_salt', '') == machine_salt and
+                        data.get('version', '') == 'v2'):
+                    inst = cls(bytes.fromhex(data['pubkey']), bytes.fromhex(data['privkey']), data['pubkey_b64'])
+                    inst.node_id = node_id_hex  # always recompute — never trust stored node_id
+                    return inst
+                # stale v1 or mismatched wallet/machine — regenerate
+            except Exception: pass
         pub = secrets.token_bytes(32)
         priv = secrets.token_bytes(32)
         b64 = base64.b64encode(pub).decode()
-        data = {'pubkey': pub.hex(), 'privkey': priv.hex(), 'pubkey_b64': b64}
+        data = {'pubkey': pub.hex(), 'privkey': priv.hex(), 'pubkey_b64': b64,
+                'wallet_addr': wallet_addr, 'machine_salt': machine_salt, 'version': 'v2'}
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(data))
-        except: pass
-        return cls(pub, priv, b64)
+        except Exception: pass
+        inst = cls(pub, priv, b64)
+        inst.node_id = node_id_hex
+        return inst
 
 class LRUCache:
     """Thread-safe LRU cache for seen blocks/txs"""
@@ -12842,30 +12870,50 @@ class SyncManager:
         except: return {}
 
 class ExternalAddressResolver:
-    """Resolves external IP via STUN or Koyeb fallback"""
+    """Resolves true WAN IP via public echo services, with LAN fallback. ❤️ I love you."""
+    _WAN_SERVICES = [
+        'https://api.ipify.org',
+        'https://icanhazip.com',
+        'https://checkip.amazonaws.com',
+        'https://api4.my-ip.io/ip',
+    ]
     @staticmethod
     def resolve() -> str:
         override_host = os.getenv('P2P_EXTERNAL_HOST')
         override_port = int(os.getenv('P2P_EXTERNAL_PORT', '9091'))
         if override_host:
             return f"{override_host}:{override_port}"
+        # 1) Try Koyeb's own echo endpoint first
         try:
-            req = Request('https://qtcl-blockchain.koyeb.app/rpc', 
+            req = Request('https://qtcl-blockchain.koyeb.app/rpc',
                          data=json.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMyAddr', 'params': {}, 'id': 1}).encode(),
                          headers={'Content-Type': 'application/json'})
             with urlopen(req, timeout=5) as resp:
                 result = json.loads(resp.read()).get('result', {})
                 if result and result.get('external_addr'):
                     return result['external_addr']
-        except: pass
+        except Exception: pass
+        # 2) Try public WAN IP echo services — each returns raw IP text
+        for _svc in ExternalAddressResolver._WAN_SERVICES:
+            try:
+                req = Request(_svc, headers={'User-Agent': 'QTCL-Miner/2.0'})
+                with urlopen(req, timeout=4) as resp:
+                    wan_ip = resp.read().decode().strip()
+                    # validate it looks like an IPv4 address, not a LAN address
+                    _parts = wan_ip.split('.')
+                    if (len(_parts) == 4 and all(p.isdigit() for p in _parts)
+                            and not wan_ip.startswith(('10.', '192.168.', '172.', '127.', '169.254.'))):
+                        return f"{wan_ip}:{override_port}"
+            except Exception: pass
+        # 3) LAN fallback — better than loopback
         try:
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            import socket as _sk
+            with _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM) as s:
                 s.settimeout(3)
                 s.connect(('8.8.8.8', 80))
                 local_ip = s.getsockname()[0]
             return f"{local_ip}:{_P2P_PORT}"
-        except:
+        except Exception:
             return f"127.0.0.1:{_P2P_PORT}"
 
 class DHTManager:
@@ -13178,10 +13226,11 @@ class P2PNode:
     """Master P2P Node — integrates all components"""
     DEFAULT_PORT = _P2P_PORT
     
-    def __init__(self, port: int = None, db = None):
+    def __init__(self, port: int = None, db = None, wallet_addr: str = ''):
         self.port = port or self.DEFAULT_PORT
         self.db = db
-        self.identity = P2PIdentity.load_or_create()
+        self.wallet_addr = wallet_addr
+        self.identity = P2PIdentity.load_or_create(wallet_addr=wallet_addr)
         self.node_id = self.identity.node_id
         self.seen_blocks = LRUCache(10000)
         self.seen_txs = LRUCache(50000)
@@ -14681,7 +14730,7 @@ class QtclClientApp:
                     _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted — proceeding with bind")
             _evict_stale_port(_port)
             _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
-            self.p2p_node = P2PNode(port=_port, db=self._db)
+            self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
             _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
             self.p2p_node.start()
             _P2P_NODE = self.p2p_node
