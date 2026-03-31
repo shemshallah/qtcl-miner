@@ -1671,54 +1671,35 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous HTTP JSON-RPC 2.0 call: qtcl_getQuantumMetrics.
-        
-        Direct HTTP POST to server.py RPC endpoint.
-        Returns empty dict on any error (fail-safe for RPC hangs).
-        """
+        """Synchronous JSON-RPC 2.0 call to /rpc → qtcl_getQuantumMetrics.
+        Falls back to /rpc/oracle/snapshot GET if RPC returns empty.
+        Returns empty dict on any error — fail-safe for RPC hangs. ❤️"""
         _t0 = time.time()
+        _rpc_url  = f"{self.ORACLE_URL}/rpc"
+        _snap_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
+        _payload  = {"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1}
+        snap: dict = {}
         try:
             session = self._get_session()
-            if not session:
-                # Fallback: urllib
-                import json
-                from urllib.request import Request, urlopen
-                from urllib.error import URLError
-                
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_getQuantumMetrics",
-                    "params": [],
-                    "id": 1
-                }).encode('utf-8')
-                
-                req = Request(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                
-                with urlopen(req, timeout=timeout_s) as resp:
-                    resp_data = json.loads(resp.read().decode('utf-8'))
-                    snap = resp_data.get("result", {}) if "result" in resp_data else {}
-            else:
-                # Use requests session
-                resp = session.post(
-                    f"{self.ORACLE_URL}/rpc/oracle/snapshot",
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "qtcl_getQuantumMetrics",
-                        "params": [],
-                        "id": 1
-                    },
-                    timeout=timeout_s
-                )
-                resp.raise_for_status()
-                snap = resp.json().get("result", {}) if "result" in resp.json() else {}
-            
-            if not isinstance(snap, dict):
-                snap = {}
+            for _url, _is_rpc in ((_rpc_url, True), (_snap_url, False)):
+                try:
+                    if session:
+                        _r = session.post(_url, json=_payload, timeout=timeout_s)
+                        if _r.status_code not in (200, 202):
+                            continue
+                        _body = _r.json()
+                    else:
+                        from urllib.request import Request as _Req, urlopen as _uo
+                        _req = _Req(_url, data=json.dumps(_payload).encode(),
+                                    headers={"Content-Type": "application/json"}, method="POST")
+                        with _uo(_req, timeout=timeout_s) as _resp:
+                            _body = json.loads(_resp.read())
+                    snap = _body.get("result") or {}
+                    if not isinstance(snap, dict): snap = {}
+                    if snap: break  # got data — no need for fallback
+                except Exception as _fe:
+                    logger.debug(f"[RPC-ORACLE] {_url} failed: {_fe}")
+                    continue
             
             # Parse density matrix if present
             if snap and snap.get('density_matrix_hex'):
