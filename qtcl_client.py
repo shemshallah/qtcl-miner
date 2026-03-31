@@ -11818,7 +11818,7 @@ class ServerRPCClient:
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 _P2P_VERSION = "4.0.0"
-_P2P_PORT = int(os.getenv('P2P_PORT', '9091'))   # canonical P2P port — must match C layer + bootstrap seeds
+_P2P_PORT = int(os.getenv('P2P_PORT', '9092'))
 _P2P_MAX_PEERS = int(os.getenv('P2P_MAX_PEERS', '32'))
 _P2P_MAX_OUTBOUND = int(os.getenv('P2P_MAX_OUTBOUND', '8'))
 _P2P_SESSION_TTL = int(os.getenv('P2P_SESSION_TTL', '600'))
@@ -12904,17 +12904,29 @@ class DHTManager:
         except: return 0
 
 class P2PServer(ThreadingHTTPServer):
-    """RPC-only P2P server on 0.0.0.0:9091"""
+    """RPC-only P2P server on 0.0.0.0:9091 with SO_REUSEADDR+SO_REUSEPORT."""
+    # Must be set BEFORE super().__init__ calls server_bind()
+    allow_reuse_address = True
+
     def __init__(self, port: int, dispatch_fn, peer_mgr: PeerManager, lattice: PQ0LatticeManager,
                  propagator: BlockPropagator, tx_relay: TxRelay, sync_mgr: SyncManager,
                  dht: DHTManager, sessions: SessionManager, db = None):
-        super().__init__(('0.0.0.0', port), lambda *args, **kwargs: P2PRequestHandler(*args, **kwargs, 
-            dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
-            propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
-            dht=dht, sessions=sessions, db=db))
         self.port = port
         self.rate_limiter = RateLimiter()
-    
+        handler = lambda *a, **kw: P2PRequestHandler(
+            *a, dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
+            propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
+            dht=dht, sessions=sessions, db=db, **kw)
+        # Create socket manually so we can set SO_REUSEPORT before bind (Linux/Android)
+        import socket as _sock
+        self.socket = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        try:
+            self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)  # Linux + Android
+        except (AttributeError, OSError):
+            pass  # SO_REUSEPORT unavailable on some platforms — SO_REUSEADDR is sufficient
+        super().__init__(('0.0.0.0', port), handler)
+
     def start_daemon(self) -> None:
         t = threading.Thread(target=self.serve_forever, daemon=True)
         t.start()
@@ -12990,10 +13002,8 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             if not isinstance(payload, dict):
                 return None, {'code': -32602, 'message': 'invalid params: payload required'}
             version = payload.get('version', '')
-            # Accept same major version (e.g. "4.x.x") — strict equality blocks minor upgrades
-            def _ver_major(v): return str(v).split('.')[0] if v else '0'
-            if _ver_major(version) != _ver_major(_P2P_VERSION):
-                return None, {'code': -1, 'message': f'version mismatch: got {version} need {_P2P_VERSION[:1]}.*'}
+            if version != _P2P_VERSION:
+                return None, {'code': -1, 'message': 'version mismatch'}
             node_id = payload.get('node_id', '')
             if not node_id or len(node_id) != 64:
                 return None, {'code': -1, 'message': 'invalid node_id: must be 64 hex chars'}
@@ -14608,13 +14618,70 @@ class QtclClientApp:
     def _start_p2p(self) -> None:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
-        import time as _tp
+        import time as _tp, socket as _sk
         _tp.sleep(0.5)
         try:
             if self._db is None:
                 self._init_db()
-            _EXP_LOG.info(f"[P2P] Starting RPC node on port {_P2P_PORT}...")
-            self.p2p_node = P2PNode(port=int(os.getenv('P2P_PORT', _P2P_PORT)), db=self._db)
+            _port = int(os.getenv('P2P_PORT', _P2P_PORT))
+            # ── Port eviction: if port already bound, kill the stale holder (Termux restart pattern) ──
+            def _evict_stale_port(port: int) -> None:
+                """Probe port; if already bound by a stale process, SIGKILL it via /proc (Termux-safe)."""
+                probe = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+                probe.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+                try:
+                    probe.bind(('0.0.0.0', port))
+                    # Bind succeeded — port is free, release and proceed
+                    probe.close()
+                    return
+                except OSError:
+                    probe.close()
+                # Port is held — find the PID via /proc/net/tcp (Android/Linux only)
+                import signal as _sig
+                killed = False
+                try:
+                    _hex_port = format(port, '04X')
+                    with open('/proc/net/tcp', 'r') as _f:
+                        for _line in _f:
+                            _parts = _line.split()
+                            if len(_parts) < 2: continue
+                            _local = _parts[1]          # "00000000:23FB"
+                            if ':' in _local and _local.split(':')[1].upper() == _hex_port:
+                                _inode = _parts[9] if len(_parts) > 9 else ''
+                                break
+                        else:
+                            _inode = ''
+                    if _inode:
+                        import os as _oss
+                        for _pid_str in _oss.listdir('/proc'):
+                            if not _pid_str.isdigit(): continue
+                            try:
+                                _fd_dir = f'/proc/{_pid_str}/fd'
+                                for _fd in _oss.listdir(_fd_dir):
+                                    _link = _oss.readlink(f'{_fd_dir}/{_fd}')
+                                    if f'socket:[{_inode}]' in _link:
+                                        _pid = int(_pid_str)
+                                        if _pid != _oss.getpid():
+                                            _EXP_LOG.warning(f"[P2P] ⚡ Port {port} held by PID {_pid} — evicting")
+                                            try: _sig.signal(_sig.SIGTERM, _sig.SIG_DFL)
+                                            except Exception: pass
+                                            _oss.kill(_pid, _sig.SIGTERM)
+                                            _tp.sleep(0.4)
+                                            try: _oss.kill(_pid, _sig.SIGKILL)  # ensure it's gone
+                                            except ProcessLookupError: pass
+                                            killed = True
+                                        break
+                            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                                continue
+                            if killed: break
+                except Exception as _pe:
+                    _EXP_LOG.debug(f"[P2P] port eviction probe: {_pe}")
+                if killed:
+                    _tp.sleep(0.3)  # allow kernel TIME_WAIT to clear
+                    _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted — proceeding with bind")
+            _evict_stale_port(_port)
+            _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
+            self.p2p_node = P2PNode(port=_port, db=self._db)
             _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
             self.p2p_node.start()
             _P2P_NODE = self.p2p_node
@@ -14629,70 +14696,50 @@ class QtclClientApp:
             _EXP_LOG.error(f"[CLIENT] Traceback: {traceback.format_exc()}")
     
     def _register_with_koyeb(self) -> None:
-        """Register this node with Koyeb bootstrap and initiate direct handshakes with returned peers."""
-        import urllib.request as _ur
+        """Register this node with Koyeb bootstrap and get peers"""
         try:
             if not self.p2p_node:
                 return
-            my_ext_addr = self.p2p_node.external_addr   # OUR address — never substitute peer addr here
-            my_node_id  = self.p2p_node.node_id          # OUR node_id (sha256 of our pubkey)
-            my_pubkey   = self.p2p_node.identity.pubkey_b64
-            height      = int(self.koyeb_state.block_height or 0)
+            ext_addr = self.p2p_node.external_addr
+            node_id = self.p2p_node.node_id
+            pubkey = self.p2p_node.identity.pubkey_b64
+            height = int(self.koyeb_state.block_height or 0)
             resp = self.api.call("qtcl_registerPeer", {
-                "external_addr": my_ext_addr,
-                "pubkey":        my_pubkey,
-                "chain_height":  height,
-                "node_id":       my_node_id,
+                "external_addr": ext_addr,
+                "pubkey": pubkey,
+                "chain_height": height,
+                "node_id": node_id
             })
             if resp:
-                _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {my_ext_addr}")
+                _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
+            # Get peers from Koyeb
             peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
-            if not (peers_resp and peers_resp.get('peers')):
-                return
-            _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
-            # Build OUR handshake payload once — node_id and external_addr are OURS, not the target peer's
-            _my_hs_payload = {
-                "version":       _P2P_VERSION,
-                "node_id":       my_node_id,          # ← fixed: was incorrectly sending p_id (peer's id)
-                "chain_height":  height,
-                "external_addr": my_ext_addr,         # ← fixed: was incorrectly sending p_addr (peer's addr)
-                "capabilities":  ["block", "tx", "sync"],
-            }
-            _hs_body = json.dumps({
-                "jsonrpc": "2.0", "method": "qtcl_p2p_handshake",
-                "params": {"payload": _my_hs_payload}, "id": 1,
-            }).encode()
-            for peer in peers_resp['peers']:
-                p_addr = peer.get('external_addr') or peer.get('host', '')
-                p_id   = peer.get('node_id', '')
-                if not p_addr or not p_id or p_addr == my_ext_addr:
-                    continue
-                # Resolve host:port — external_addr may be "ip:port" or bare ip
-                if ':' in p_addr:
-                    p_host, _pp = p_addr.rsplit(':', 1)
-                    p_port = int(_pp) if _pp.isdigit() else _P2P_PORT
-                else:
-                    p_host, p_port = p_addr, _P2P_PORT   # fixed: was 9092
-                def _do_handshake(_host=p_host, _port=p_port, _pid=p_id):
-                    try:
-                        url = f"http://{_host}:{_port}/rpc"
-                        req = _ur.Request(url, data=_hs_body,
-                                          headers={'Content-Type': 'application/json'})
-                        with _ur.urlopen(req, timeout=5) as r:
-                            _res = json.loads(r.read())
-                        if _res.get('result') and _res['result'].get('session_token'):
-                            _EXP_LOG.info(f"[P2P] ✅ Handshake OK → {_host}:{_port}")
-                            new_peer = P2PPeer(_host, _port, _pid)
-                            new_peer.state        = PeerState.ACTIVE
-                            new_peer.session_token  = _res['result']['session_token']
-                            new_peer.session_expiry = _res['result'].get('session_expiry', 0)
-                            self.p2p_node.peer_mgr.add_peer(new_peer)
-                        else:
-                            _EXP_LOG.debug(f"[P2P] Handshake no result from {_host}:{_port}: {_res}")
-                    except Exception as _he:
-                        _EXP_LOG.debug(f"[P2P] Handshake failed → {_host}:{_port}: {_he}")
-                _threading.Thread(target=_do_handshake, daemon=True,
-                                  name=f"P2P-HS-{p_host}").start()
+            if peers_resp and peers_resp.get('peers'):
+                _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
+                for peer in peers_resp['peers']:
+                    p_addr = peer.get('external_addr') or peer.get('host', '')
+                    p_port = peer.get('port', 9092)
+                    p_id = peer.get('node_id', '')
+                    if p_addr and p_id and p_addr != ext_addr:
+                        try:
+                            import urllib.request
+                            # Try to handshake with peer
+                            url = f"http://{p_addr}/rpc"
+                            data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_handshake","params":{"payload":{"version":"4.0.0","node_id":"' + p_id.encode() + b'","chain_height":' + str(height).encode() + b',"external_addr":"' + p_addr.encode() + b'","capabilities":["block","tx","sync"]}},"id":1}'
+                            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                _result = json.loads(resp.read())
+                                if _result.get('result'):
+                                    _EXP_LOG.info(f"[P2P] ✅ Connected to peer: {p_addr}")
+                                    # Add to peer manager
+                                    from qtcl_client import P2PPeer
+                                    p_host = p_addr.split(':')[0]
+                                    p_port = int(p_addr.split(':')[1]) if ':' in p_addr else 9092
+                                    new_peer = P2PPeer(p_host, p_port, p_id)
+                                    new_peer.state = 3  # ACTIVE
+                                    self.p2p_node.peer_mgr.add_peer(new_peer)
+                        except Exception as _pe:
+                            _EXP_LOG.debug(f"[P2P] Failed to connect to {p_addr}: {_pe}")
         except Exception as _e:
             _EXP_LOG.debug(f"[P2P] Koyeb registration failed: {_e}")
     def _heartbeat_loop(self) -> None:
