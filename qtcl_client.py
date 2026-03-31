@@ -376,15 +376,15 @@ def init_p2p_bootstrap() -> None:
         for (host, port), seed_info in P2P_HARDCODED_SEEDS.items():
             try:
                 cur.execute("INSERT OR REPLACE INTO known_peers(host,port) VALUES(?,?)",
-                           (host, port))
+                           (host.split(':')[0], int(port)))
             except Exception as e:
                 logger.debug(f"[P2P] Seed insert {host}:{port}: {e}")
         
         conn.commit()
         conn.close()
-        logger.info(f"[P2P] ✅ Bootstrapped {len(P2P_HARDCODED_SEEDS)} seed peers")
+        logger.info(f"[P2P] ✅ Bootstrapped {len(P2P_HARDCODED_SEEDS)} seed peers to DB (handshakes will begin on P2PNode.start())")
     except Exception as e:
-        logger.debug(f"[P2P] Bootstrap failed (non-fatal): {e}")
+        logger.debug(f"[P2P] Bootstrap DB init failed (non-fatal): {e}")
 BIP39_WORDLIST = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic",
@@ -13252,7 +13252,45 @@ class P2PNode:
         self.peer_mgr.load_from_db(self.db)
         self._running = True
         self.sync_mgr.start_daemon()
+        self._start_peer_bootstrap_daemon()
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
+    
+    def _start_peer_bootstrap_daemon(self) -> None:
+        """Launch async peer bootstrap—connects to seeds, performs handshakes, activates peers."""
+        import threading as _t, json as _j, time as _tm; from urllib.request import urlopen, Request
+        def _bootstrap_loop():
+            _backoff = {host_port: 1.0 for host_port in P2P_HARDCODED_SEEDS.keys()}
+            while self._running:
+                try:
+                    active_now = len(self.peer_mgr.get_active_peers())
+                    if active_now < 4:
+                        for seed_addr, seed_meta in P2P_HARDCODED_SEEDS.items():
+                            if not self._running: break
+                            host, port = seed_addr.split(':'); port = int(port)
+                            existing = any(p.host == host and p.port == port for p in self.peer_mgr.peers.values())
+                            if existing: continue
+                            _bo = _backoff.get(seed_addr, 1.0)
+                            if _tm.time() % 600 < _bo: continue
+                            try:
+                                hs_payload = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_p2p_handshake', 'params': {'node_id': self.node_id, 'port': self.port, 'chain_height': 0, 'external_addr': self.external_addr, 'capabilities': ['blocks', 'txs', 'state']}, 'id': 1}).encode()
+                                req = Request(f'http://{seed_addr}/rpc', data=hs_payload, headers={'Content-Type': 'application/json'})
+                                with urlopen(req, timeout=5) as resp:
+                                    result = _j.loads(resp.read().decode())
+                                    if result.get('result'):
+                                        seed_id = seed_meta.get('id', self.node_id)
+                                        new_peer = P2PPeer(host, port, seed_id)
+                                        new_peer.state = PeerState.ACTIVE
+                                        new_peer.external_addr = seed_addr
+                                        self.peer_mgr.add_peer(new_peer)
+                                        logger.info(f"[P2P] ✅ Bootstrapped seed {seed_addr}: peer ACTIVE")
+                                        _backoff[seed_addr] = 1.0
+                                    else: _backoff[seed_addr] = min(300.0, _bo * 2)
+                            except Exception as e:
+                                _backoff[seed_addr] = min(300.0, _bo * 2)
+                                logger.debug(f"[P2P] Bootstrap {seed_addr}: {type(e).__name__}")
+                    _tm.sleep(10)
+                except Exception as e: logger.debug(f"[P2P] Bootstrap daemon error: {e}"); _tm.sleep(30)
+        _t.Thread(target=_bootstrap_loop, daemon=True).start()
     
     def stop(self) -> None:
         self._running = False
@@ -16235,6 +16273,7 @@ class QtclClientApp:
                         )
                         # P2P Block Broadcast
                         _p2p_n = getattr(self, 'p2p_node', None)
+                        _broadcast_ok = False
                         if _p2p_n and getattr(_p2p_n, '_running', False):
                             try:
                                 _peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
@@ -16250,8 +16289,19 @@ class QtclClientApp:
                                         except Exception as _pe:
                                             pass
                                     _EXP_LOG.info(f"[P2P] ✅ Block broadcast complete")
+                                    _broadcast_ok = True
+                                else:
+                                    _EXP_LOG.warning(f"[P2P] ⚠️  Block h={target_height} ready but NO ACTIVE PEERS — bootstrap connecting…")
                             except Exception as _p2pe:
                                 _EXP_LOG.debug(f"[P2P] Broadcast error: {_p2pe}")
+                        else:
+                            _EXP_LOG.warning(f"[P2P] ⚠️  Block h={target_height} ready but P2P node not running — fallback to server-side gossip")
+                        
+                        # Fallback: announce block to server (server broadcasts to connected miners)
+                        if not _broadcast_ok:
+                            try:
+                                kapi.rpc("qtcl_gossipBlockAnnounce", [{"height": target_height, "hash": block_hash, "miner": miner_addr, "timestamp": timestamp}], 3, 1)
+                            except Exception: pass
                         _MINE_TELEM.mark_mining()
                         # Wait for server tip to advance before re-entering loop.
                         # Without this the miner races back, sees stale height,
