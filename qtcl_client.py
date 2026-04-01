@@ -128,19 +128,12 @@ os.environ.setdefault('ENTROPY_SERVER', ENTROPY_SERVER_URL)
 os.environ.setdefault('ORACLE_URL',     ENTROPY_SERVER_URL)
 P2P_BOOTSTRAP_PEERS = [
     ('qtcl-blockchain.koyeb.app', 9091),
-    ('qtcl-primary.koyeb.app', 9091),
 ]
 P2P_HARDCODED_SEEDS = {
     'qtcl-blockchain.koyeb.app:9091': {
         'id': '16d894aeee9dae65d1b5c6f7a8b9c0d1e2f3g4h5',
         'role': 'primary',
         'region': 'us-west-2',
-        'verified': True,
-    },
-    'qtcl-primary.koyeb.app:9091': {
-        'id': '8283d1c55f6155c7a9b8c7d6e5f4g3h2i1j0k9l8',
-        'role': 'secondary',
-        'region': 'us-east-1',
         'verified': True,
     },
 }
@@ -11931,31 +11924,81 @@ class QtclClientApp:
                              local_fid: float = 0.9,
                              upstream_fid: float = 0.0) -> 'numpy.ndarray':
         """
-        Hermitian mean of local 3-node consensus DM and upstream Koyeb 5-oracle DM.
-        Weighting: upstream contribution scales with its fidelity.
-        w_up = upstream_fid * 0.4   (max 40% upstream influence)
-        w_lo = 1.0 - w_up
-        Returns renormalised 8×8 DM.
+        Joint W4 fusion: Koyeb is party-3 in a shared 4-party W-state.
+        When the numpy-only path is active (no Aer), we have a 16x16 joint
+        DM in self._joint_dm_16.  Koyeb's 8x8 DM is projected to a 2x2
+        marginal and injected as party-3, then the updated local 3-qubit
+        subsystem is extracted via partial trace.  This preserves genuine
+        multipartite entanglement structure rather than classical mixing.
+
+        When Aer is active (joint_dm_16 absent), falls back to fidelity-
+        weighted mean, capped at 40% upstream influence.
         """
         try:
             import numpy as _np_f
+
+            # ── Joint W4 path (numpy-only mode) ───────────────────────────
+            _joint_dm = getattr(self, '_joint_dm_16', None)
+            _ptrace   = getattr(self, '_ptrace_fn',  None)
+            _wdm_ref  = getattr(self, '_wdm_local_ref', None)
+
+            if _joint_dm is not None and _ptrace is not None and upstream_dm is not None and upstream_fid >= 0.05:
+                # Project Koyeb 8x8 → 2x2: partial trace over qubits 1,2
+                try:
+                    _k8 = _np_f.array(upstream_dm, dtype=_np_f.complex128)
+                    if _k8.shape == (8, 8):
+                        # ptrace keep qubit-0 of 3-qubit koyeb DM
+                        _k2 = _ptrace(_k8, keep=[0], N=3)
+                        # Build party-3 injection term: I8/8 x koyeb_2x2
+                        _k2 = (_k2 + _k2.conj().T) / 2.0
+                        _tr_k2 = float(_np_f.real(_np_f.trace(_k2)))
+                        if _tr_k2 > 1e-12:
+                            _k2 /= _tr_k2
+                        _inj = _np_f.kron(
+                            _np_f.eye(8, dtype=_np_f.complex128) / 8.0,
+                            _k2
+                        )
+                        _inj /= float(_np_f.real(_np_f.trace(_inj)))
+                        # Inject into joint DM
+                        _w_k = min(upstream_fid * 0.40, 0.40)
+                        _jdm_new = (1.0 - _w_k) * _joint_dm + _w_k * _inj
+                        _jdm_new = (_jdm_new + _jdm_new.conj().T) / 2.0
+                        _jdm_new /= float(_np_f.real(_np_f.trace(_jdm_new)))
+                        # Update stored joint DM
+                        self._joint_dm_16 = _jdm_new
+                        # Extract local 3-qubit subsystem
+                        _rho_local = _ptrace(_jdm_new, keep=[0,1,2])
+                        _tr_l = float(_np_f.real(_np_f.trace(_rho_local)))
+                        if _tr_l > 1e-12:
+                            _rho_local /= _tr_l
+                        _EXP_LOG.debug(
+                            f"[TRIPARTITE] joint W4 fuse: w_koyeb={_w_k:.3f} "
+                            f"upstream_fid={upstream_fid:.4f}"
+                        )
+                        return _rho_local
+                except Exception as _jfe:
+                    _EXP_LOG.debug(f"[TRIPARTITE] joint fuse error: {_jfe} — falling back")
+
+            # ── Fallback: fidelity-weighted mean (Aer path or no joint DM) ──
             if upstream_dm is None or upstream_fid < 0.05:
-                _EXP_LOG.debug(f"[TRIPARTITE] fuse: no valid upstream (fid={upstream_fid:.4f}) — using local only")
+                _EXP_LOG.debug(f"[TRIPARTITE] fuse: no upstream (fid={upstream_fid:.4f})")
                 return local_dm
             _tr_l = float(_np_f.real(_np_f.trace(local_dm)))
             _tr_u = float(_np_f.real(_np_f.trace(upstream_dm)))
             if _tr_l < 1e-12 or _tr_u < 1e-12:
-                _EXP_LOG.debug(f"[TRIPARTITE] fuse: zero trace — local={_tr_l:.6f} upstream={_tr_u:.6f}")
                 return local_dm
             _l = local_dm    / _tr_l
             _u = upstream_dm / _tr_u
-            w_up = min(float(upstream_fid) * 0.5, 0.50)  # Cap at 50% upstream influence (was 25%, increased for higher upstream fidelity)
+            w_up = min(float(upstream_fid) * 0.4, 0.40)
             w_lo = 1.0 - w_up
             fused = w_lo * _l + w_up * _u
             _tr_f = float(_np_f.real(_np_f.trace(fused)))
             if _tr_f > 1e-12:
                 fused /= _tr_f
-            _EXP_LOG.debug(f"[TRIPARTITE] fuse: w_lo={w_lo:.4f} w_up={w_up:.4f} local_fid={local_fid:.4f} upstream_fid={upstream_fid:.4f}")
+            _EXP_LOG.debug(
+                f"[TRIPARTITE] Aer fuse: w_lo={w_lo:.3f} w_up={w_up:.3f} "
+                f"local_fid={local_fid:.4f} upstream_fid={upstream_fid:.4f}"
+            )
             return fused
         except Exception as _fe:
             _EXP_LOG.warning(f"[TRIPARTITE] fuse error: {_fe}")
@@ -12054,14 +12097,103 @@ class QtclClientApp:
                     _local_fid = float(_np_l.real(_np_l.trace(_wdm @ local_dm)))
                     _local_fid = max(0.0, min(1.0, _local_fid))
                 elif _HAS_NP_L:
-                    # numpy-only fallback — use GKSL-evolved identity
-                    local_dm = _np_l.eye(8, dtype=_np_l.complex128) / 8.0
-                    _local_fid = 0.0
+                    # ── numpy-only fallback: JOINT 4-party W-state ─────────
+                    # All 4 parties (pq0, pq0_IV, pq0_V, koyeb) share ONE
+                    # joint |W4> state in 16-dim Hilbert space.  Each local
+                    # node applies a small QRNG-seeded SU(2) on its OWN party
+                    # qubit — an independent sensor without breaking entanglement
+                    # with the other parties.  Koyeb is incorporated as party-3
+                    # marginal injection after upstream fetch in Step 3.
+
+                    # |W4> = (|1000>+|0100>+|0010>+|0001>)/2
+                    _w4_sv = _np_l.zeros(16, dtype=_np_l.complex128)
+                    for _k in range(4):
+                        _w4_sv[1 << _k] = 1.0
+                    _w4_sv /= _np_l.linalg.norm(_w4_sv)
+
+                    # |W3> for local-subsystem fidelity checks
                     _w = _np_l.zeros(8, dtype=_np_l.complex128)
                     for _k in range(3):
                         _w[1 << _k] = 1.0
                     _w /= _np_l.sqrt(3)
                     _wdm = _np_l.outer(_w, _w.conj())
+
+                    def _su2_seed(sb, strength=0.10):
+                        import hashlib as _hl2
+                        _si = int.from_bytes(_hl2.sha3_256(sb).digest()[:4], 'big')
+                        _r2 = _np_l.random.default_rng(_si)
+                        _th = _r2.random() * strength * _math.pi
+                        _n2 = _r2.standard_normal(3)
+                        _n2 /= _np_l.linalg.norm(_n2)
+                        _c2, _s2 = _math.cos(_th/2), _math.sin(_th/2)
+                        return _np_l.array(
+                            [[_c2+1j*_s2*_n2[2], _s2*(_n2[1]+1j*_n2[0])],
+                             [-_s2*(_n2[1]-1j*_n2[0]), _c2-1j*_s2*_n2[2]]],
+                            dtype=_np_l.complex128)
+
+                    def _apply_su2(sv, U, qubit, N=4):
+                        sv = sv.reshape([2]*N)
+                        sv = _np_l.tensordot(U, sv, axes=([1],[qubit]))
+                        sv = _np_l.moveaxis(sv, 0, qubit)
+                        return sv.reshape(2**N)
+
+                    def _ptrace(rho, keep, N=4):
+                        _to = sorted([p for p in range(N) if p not in keep], reverse=True)
+                        for _pt in _to:
+                            _cn = int(round(_np_l.log2(rho.shape[0])))
+                            _db = 2**_pt
+                            _da = 2**(_cn-_pt-1)
+                            rho = rho.reshape(_db,2,_da,_db,2,_da)
+                            rho = rho[:,0,:,:,0,:] + rho[:,1,:,:,1,:]
+                            rho = rho.reshape(_db*_da, _db*_da)
+                        return rho
+
+                    try:
+                        _epool  = get_entropy_pool()
+                        _ebytes = _epool.get(96)
+                    except Exception:
+                        _ebytes = os.urandom(96)
+
+                    _node_seeds     = [_ebytes[i*32:(i+1)*32] for i in range(3)]
+                    _node_strengths = [0.10, 0.09, 0.11]
+
+                    # Each node rotates ITS party qubit on the shared |W4> sv
+                    _jdms = []
+                    for _ni in range(3):
+                        _U_n = _su2_seed(_node_seeds[_ni], _node_strengths[_ni])
+                        _svp = _apply_su2(_w4_sv.copy(), _U_n, qubit=_ni)
+                        _svp /= _np_l.linalg.norm(_svp)
+                        _jdms.append(_np_l.outer(_svp, _svp.conj()))
+
+                    # 3-of-3 consensus joint DM (16x16)
+                    _joint_dm = sum(_jdms) / 3.0
+                    _joint_dm = (_joint_dm + _joint_dm.conj().T) / 2.0
+                    _joint_dm /= float(_np_l.real(_np_l.trace(_joint_dm)))
+
+                    # Lightweight Lindblad phase-damping on joint 16x16 space
+                    _gj, _dtj = 0.03, 0.06
+                    for _kq in range(4):
+                        _P1j = _np_l.zeros((16,16), dtype=_np_l.complex128)
+                        for _ix in range(16):
+                            if (_ix >> _kq) & 1:
+                                _P1j[_ix,_ix] = 1.0
+                        _Lj = _np_l.sqrt(_gj) * _P1j
+                        _drj = (_Lj @ _joint_dm @ _Lj.conj().T
+                                - 0.5*(_Lj.conj().T @ _Lj @ _joint_dm
+                                       + _joint_dm @ _Lj.conj().T @ _Lj))
+                        _joint_dm = _joint_dm + _dtj * _drj
+                    _joint_dm = (_joint_dm + _joint_dm.conj().T) / 2.0
+                    _joint_dm /= float(_np_l.real(_np_l.trace(_joint_dm)))
+
+                    # Store for Step 3 Koyeb injection (party-3 marginal update)
+                    self._joint_dm_16   = _joint_dm
+                    self._ptrace_fn     = _ptrace
+                    self._wdm_local_ref = _wdm
+
+                    # Extract local 3-qubit subsystem (parties 0,1,2)
+                    local_dm   = _ptrace(_joint_dm, keep=[0,1,2])
+                    _local_fid = float(_np_l.real(_np_l.trace(_wdm @ local_dm)))
+                    _local_fid = max(0.0, min(1.0, _local_fid))
                 else:
                     self._stop.wait(_measure_interval)
                     continue
