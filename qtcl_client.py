@@ -13254,8 +13254,12 @@ class P2PServer(ThreadingHTTPServer):
         super().__init__(('0.0.0.0', port), handler)
 
     def server_bind(self):
-        """Override to set SO_REUSEPORT before bind — must happen after socket creation."""
+        """Override to set SO_REUSEADDR + SO_REUSEPORT before bind — must happen after socket creation."""
         import socket as _sock
+        try:
+            self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        except (AttributeError, OSError):
+            pass
         try:
             self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
@@ -15551,8 +15555,11 @@ class QtclClientApp:
                     except Exception as _pe:
                         _EXP_LOG.debug(f"[P2P] proc eviction: {_pe}")
                 if killed:
-                    _tp.sleep(0.8)  # TIME_WAIT clearance
+                    _tp.sleep(2.0)  # TIME_WAIT clearance — bumped from 0.8s
                     _EXP_LOG.info(f"[P2P] ✅ Port {port} evicted")
+                else:
+                    # Even without a killed PID, give TIME_WAIT sockets time to clear
+                    _tp.sleep(1.0)
             _evict_stale_port(_port)
             _EXP_LOG.info(f"[P2P] Starting RPC node on port {_port}...")
             self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
@@ -15562,7 +15569,20 @@ class QtclClientApp:
             self._peer_id = self.p2p_node.node_id
             self._peer_id_final = True
             _EXP_LOG.info(f"[P2P] P2PNode created, starting server...")
-            self.p2p_node.start()
+            # ── Retry bind once on EADDRINUSE (TIME_WAIT race after eviction) ──
+            try:
+                self.p2p_node.start()
+            except OSError as _bind_err:
+                if _bind_err.errno == 98:  # EADDRINUSE
+                    _EXP_LOG.warning(f"[P2P] EADDRINUSE on first bind attempt — waiting 3s for TIME_WAIT to clear...")
+                    _tp.sleep(3.0)
+                    # Recreate node object (resets socket state)
+                    self.p2p_node = P2PNode(port=_port, db=self._db, wallet_addr=getattr(self.wallet, 'address', '') or '')
+                    self._peer_id = self.p2p_node.node_id
+                    self.p2p_node.start()
+                    _EXP_LOG.info(f"[P2P] ✅ Retry bind succeeded")
+                else:
+                    raise
             _P2P_NODE = self.p2p_node
             _EXP_LOG.info(f"[CLIENT] 🌐 P2P RPC node started on {self.p2p_node.external_addr}")
             if hasattr(_GENESIS_RESET_LISTENER, '_broadcaster'):
@@ -18733,6 +18753,7 @@ class NodeRPCMeshServer:
     # Schema — pq0_entanglement_log table (idempotent)
     # ─────────────────────────────────────────────────────────────────────────
     def _ensure_mesh_schema(self) -> None:
+        import sqlite3  # NodeRPCMeshServer scope — all other imports are aliased
         try:
             conn = sqlite3.connect(str(self._db_path), timeout=10,
                                    check_same_thread=False)
@@ -18846,6 +18867,7 @@ class NodeRPCMeshServer:
 
     def _record_entanglement(self, snap: dict) -> None:
         """Derive and persist one epoch of the pq0 tripartite entanglement log."""
+        import sqlite3  # NodeRPCMeshServer scope
         try:
             block_height  = int(snap.get("block_height") or snap.get("height") or 0)
             server_pq0    = int(snap.get("pq_curr") or snap.get("pq0") or block_height)
@@ -18946,6 +18968,7 @@ class NodeRPCMeshServer:
 
     def _db_conn(self) -> sqlite3.Connection:
         """Open a fresh per-request read connection (thread-safe)."""
+        import sqlite3  # NodeRPCMeshServer scope
         conn = sqlite3.connect(str(self._db_path), timeout=10,
                                check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -19247,6 +19270,7 @@ class NodeRPCMeshServer:
         # Also write locally if server accepted
         if isinstance(result, dict) and result.get("accepted"):
             try:
+                import sqlite3  # NodeRPCMeshServer scope
                 conn = sqlite3.connect(str(self._db_path), timeout=10,
                                        check_same_thread=False)
                 h    = int(block.get("height") or block.get("block_height") or 0)
@@ -19333,6 +19357,7 @@ class NodeRPCMeshServer:
         # Async audit log — non-blocking
         def _log_async(m=method, p=params, ok_=ok, lat=latency, pa=peer_addr):
             try:
+                import sqlite3  # NodeRPCMeshServer scope
                 c = sqlite3.connect(str(self._db_path), timeout=5,
                                     check_same_thread=False)
                 c.execute(
@@ -19454,6 +19479,7 @@ class NodeRPCMeshServer:
     def _ingest_gossip(self, event: dict) -> None:
         """Persist inbound gossip event to gossip_inventory."""
         try:
+            import sqlite3  # NodeRPCMeshServer scope
             conn = sqlite3.connect(str(self._db_path), timeout=5,
                                    check_same_thread=False)
             conn.execute(
