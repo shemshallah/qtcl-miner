@@ -1850,7 +1850,9 @@ class LiveRPCOracleSnapshot:
                     _lattice = snap.get('lattice') or {}
                     _fid_raw = (w_state.get('fidelity') or
                                 snap.get('w_state_fidelity') or
-                                _lattice.get('fidelity') or 0.0)
+                                _lattice.get('fidelity') or
+                                snap.get('fidelity') or
+                                snap.get('client_fused_fidelity') or 0.0)
                     _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
                     self._oracle_state = {
                         'w_state_fidelity': float(_fid_raw),
@@ -10711,7 +10713,10 @@ class KoyebAPIClient:
                 return None
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
         fid  = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
-                _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.0)
+                _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or
+                _nv((snap.get("w_state") or {}).get("fidelity")) or
+                _nv((snap.get("lattice") or {}).get("fidelity")) or
+                _nv(snap.get("client_fused_fidelity")) or 0.0)
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         raw_curr = snap.get("pq_curr") or snap.get("pq_current")
@@ -11311,7 +11316,10 @@ class KoyebOracleState:
             except Exception:
                 return None
         fid  = (_nv(snap.get("fidelity")) or _nv(snap.get("w3_fidelity")) or
-                _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or 0.0)
+                _nv(snap.get("w_state_fidelity")) or _nv(snap.get("pq0_fidelity")) or
+                _nv((snap.get("w_state") or {}).get("fidelity")) or
+                _nv((snap.get("lattice") or {}).get("fidelity")) or
+                _nv(snap.get("client_fused_fidelity")) or 0.0)
         coh  = (_nv(snap.get("coherence")) or _nv(snap.get("coherence_l1")) or 0.0)
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         bh   = int(snap.get("block_height") or snap.get("height") or 0)
@@ -13239,31 +13247,46 @@ class DHTManager:
         except: return 0
 
 class P2PServer(ThreadingHTTPServer):
-    """RPC-only P2P server on 0.0.0.0:9091 with SO_REUSEADDR+SO_REUSEPORT."""
+    """RPC-only P2P server on 0.0.0.0:9091 with SO_REUSEADDR+SO_REUSEPORT.
+
+    CRITICAL (Android/Termux): SO_REUSEADDR must be set on the socket BEFORE
+    bind() is called. Python's TCPServer.__init__ creates the socket then
+    immediately calls server_bind() -> socket.bind() in one shot.
+    We pass bind_and_activate=False, set opts on self.socket first, then
+    call server_bind() + server_activate() ourselves in the correct order.
+    """
     allow_reuse_address = True
 
     def __init__(self, port: int, dispatch_fn, peer_mgr: PeerManager, lattice: PQ0LatticeManager,
                  propagator: BlockPropagator, tx_relay: TxRelay, sync_mgr: SyncManager,
                  dht: DHTManager, sessions: SessionManager, db = None):
+        import socket as _sock
         self.port = port
         self.rate_limiter = RateLimiter()
         handler = lambda *a, **kw: P2PRequestHandler(
             *a, dispatch_fn=dispatch_fn, peer_mgr=peer_mgr, lattice=lattice,
             propagator=propagator, tx_relay=tx_relay, sync_mgr=sync_mgr,
             dht=dht, sessions=sessions, db=db, **kw)
-        super().__init__(('0.0.0.0', port), handler)
-
-    def server_bind(self):
-        """Override to set SO_REUSEADDR + SO_REUSEPORT before bind — must happen after socket creation."""
-        import socket as _sock
+        # bind_and_activate=False: TCPServer creates self.socket but does NOT call
+        # server_bind() yet — lets us set socket options before bind().
+        super().__init__(('0.0.0.0', port), handler, bind_and_activate=False)
         try:
             self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
-        except (AttributeError, OSError):
+        except OSError:
             pass
         try:
             self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
+        except OSError:
             pass
+        try:
+            self.server_bind()
+            self.server_activate()
+        except Exception:
+            self.server_close()
+            raise
+
+    def server_bind(self):
+        """Bind — socket opts already set pre-bind in __init__."""
         super().server_bind()
 
     def start_daemon(self) -> None:
