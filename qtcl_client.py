@@ -2,35 +2,7 @@ from __future__ import annotations
 import logging as _suppress_logging
 for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
-# ═══════════════════════════════════════════════════════════════════════════════════════
-# ARM NEON / CFFI COMPILATION HARDENING (Termux ARM64 compatibility)
-# ═══════════════════════════════════════════════════════════════════════════════════════
-import os as _os
-import sys as _sys
-# Force CFFI to NOT compile C extensions on ARM64 (Termux lacks proper arm_neon.h headers)
-# Fallback to pure Python implementations instead
-if _sys.platform.startswith('linux') and _os.getenv('PREFIX', '').endswith('termux'):
-    _os.environ.setdefault('ZIGGURAT_USE_PURE_PYTHON', '1')
-    _os.environ.setdefault('CFFI_NO_COMPILE', '1')
-    _os.environ.setdefault('CRYPTOGRAPHY_DONT_BUILD_EXT', '1')
-    # Disable inline assembly for NEON intrinsics
-    _os.environ['CFLAGS'] = _os.environ.get('CFLAGS', '').replace('-march=armv8-a+simd', '-march=armv8-a')
-    import warnings
-    warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*arm_neon.*')
-    print("[STARTUP] 🛡️  ARM64 hardening: CFFI/NEON compilation disabled, pure Python mode active", file=_sys.stderr)
-# Preemptively catch and log CFFI compilation errors
-_original_import = __builtins__.__import__
-def _import_with_cffi_fallback(name, *args, **kwargs):
-    """Wrap __import__ to gracefully degrade when CFFI compilation fails."""
-    try:
-        return _original_import(name, *args, **kwargs)
-    except Exception as e:
-        if 'uint64x2_t' in str(e) or 'arm_neon' in str(e) or 'vdupq_n_u64' in str(e):
-            # NEON compilation error - skip problematic module
-            _suppress_logging.getLogger('qtcl.client').warning(f"[STARTUP] Skipped CFFI {name} due to ARM NEON: {str(e)[:60]}")
-            raise ImportError(f"CFFI module {name} not available (ARM NEON incompatible); using pure Python fallback") from None
-        raise
-__builtins__.__import__ = _import_with_cffi_fallback
+
 import os
 import sys
 import getpass
@@ -193,22 +165,7 @@ _DATA_DIR:  Path = _REPO_ROOT / 'data'
 _DB_PATH:   Path = _DATA_DIR / 'qtcl_blockchain.db'
 # Ensure data directory exists at import time
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
-_C_LIB=None
-try:
-    import ctypes
-    import platform
-    _arch=platform.machine()
-    _os=sys.platform
-    if 'android' not in _os.lower() and 'arm' not in _arch.lower():
-        try:
-            _C_LIB=ctypes.CDLL('./qtcl_accel.so')
-            logger.info("[ACCEL] ✅ C acceleration library loaded")
-        except (OSError,ctypes.CDLL.LoadError,Exception):
-            logger.debug("[ACCEL] C library not available, pure Python mode")
-    else:
-        logger.warning("[ACCEL] ARM/Android detected — C compilation unavailable")
-except Exception as e:
-    logger.debug(f"[ACCEL] Init failed: {e} — pure Python mode")
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # RPC ENDPOINT REGISTRY (Standard Format)
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -332,17 +289,7 @@ class HyperbolicEntropyPool:
     # ── C-accelerated combiners ────────────────────────────────────────────────
     def _xor3(self, s1: Optional[bytes], s2: Optional[bytes],
                s3: Optional[bytes]) -> bytes:
-        if False:
-            try:
-                def _cb(s):
-                    if s is None: return _accel_ffi.NULL
-                    buf = _accel_ffi.new('uint8_t[32]')
-                    for i, x in enumerate((s + b'\x00' * 32)[:32]): buf[i] = x
-                    return buf
-                out = _accel_ffi.new('uint8_t[32]')
-                return bytes(out)
-            except Exception as e:
-                logger.debug(f"[HypEnt] C xor3: {e}")
+
         import hashlib as _hl
         xored = bytearray(32)
         for src in (s1, s2, s3):
@@ -355,14 +302,7 @@ class HyperbolicEntropyPool:
         return h.digest()
     def _hyp_mix(self, raw: bytes, depth: int = 64) -> bytes:
         seed = (raw + os.urandom(8))[:32]   # 8-byte local liveness hedge
-        if False:
-            try:
-                sb = _accel_ffi.new('uint8_t[32]')
-                ob = _accel_ffi.new('uint8_t[32]')
-                for i, b in enumerate(seed): sb[i] = b
-                return bytes(ob)
-            except Exception as e:
-                logger.debug(f"[HypEnt] C hyp_mix: {e}")
+
         import hashlib as _hl
         h = _hl.shake_256()
         h.update(b"QTCL_HYP_ENT_v1:")
@@ -705,11 +645,6 @@ class LatticeMath:
         if len(u) != len(v):
             raise ValueError("Vector dimensions must match")
         n = len(u)
-        if False:
-            _u = _accel_ffi.new('uint32_t[]', u)
-            _v = _accel_ffi.new('uint32_t[]', v)
-            _o = _accel_vec_buf(n)
-            return list(_o)
         return [(u[i] + v[i]) % q for i in range(n)]
     @staticmethod
     def vector_sub(u: List[int], v: List[int], q: int) -> List[int]:
@@ -717,11 +652,6 @@ class LatticeMath:
         if len(u) != len(v):
             raise ValueError("Vector dimensions must match")
         n = len(u)
-        if False:
-            _u = _accel_ffi.new('uint32_t[]', u)
-            _v = _accel_ffi.new('uint32_t[]', v)
-            _o = _accel_vec_buf(n)
-            return list(_o)
         return [(u[i] - v[i]) % q for i in range(n)]
     @staticmethod
     def matrix_vector_mult(A: List[List[int]], v: List[int], q: int) -> List[int]:
@@ -735,12 +665,6 @@ class LatticeMath:
         m = len(v)
         if m != len(A[0]):
             raise ValueError(f"Dimension mismatch: A is {n}×{len(A[0])}, v is {m}")
-        if False and n <= 2048:
-            _A = _accel_ffi.new(f'uint32_t[{n*m}]',
-                                [A[i][j] for i in range(n) for j in range(m)])
-            _v = _accel_ffi.new(f'uint32_t[{m}]', v)
-            _o = _accel_vec_buf(n)
-            return list(_o)
         result = []
         for i in range(n):
             dot = sum(A[i][j] * v[j] for j in range(m))
@@ -752,11 +676,6 @@ class LatticeMath:
         Hash bytes → lattice vector in Z_q^n.
         C path: counter-mode SHA-256 via reused EVP_MD_CTX (no Python object allocation).
         """
-        if False:
-            seed = data[:32].ljust(32, b'\x00')
-            _seed = _accel_ffi.new('uint8_t[32]', seed)
-            _out  = _accel_vec_buf(n)
-            return list(_out)
         vector, offset = [], 0
         while len(vector) < n:
             h = hashlib.sha256(data + bytes([offset])).digest()
@@ -809,11 +728,6 @@ class HLWEEngine:
         """
         n = self.params.DIMENSION
         q = self.params.MODULUS
-        if False:
-            seed = entropy[:32].ljust(32, b'\x00')
-            _e   = _accel_ffi.new('uint8_t[32]', seed)
-            _A   = _accel_vec_buf(n * n)
-            return [[int(_A[i * n + j]) for j in range(n)] for i in range(n)]
         A = []
         for i in range(n):
             row = []
@@ -830,11 +744,6 @@ class HLWEEngine:
         C path: reuses single EVP_MD_CTX across all n rounds — no Python int boxing.
         """
         q = self.params.MODULUS
-        if False:
-            seed = entropy[:32].ljust(32, b'\x00')
-            _e = _accel_ffi.new('uint8_t[32]', seed)
-            _s = _accel_vec_buf(dimension)
-            return list(_s)
         s = []
         for i in range(dimension):
             xof_input = entropy + bytes([i & 0xFF]) + b"HLWE_SECRET_VECTOR" + bytes([i >> 8])
@@ -856,11 +765,6 @@ class HLWEEngine:
         Derive QTCL wallet address: SHA256(packed public key)[:16] as hex.
         C path: streaming EVP_DigestUpdate over packed uint32 — no intermediate bytes object.
         """
-        if False:
-            n = len(public_key)
-            _pk  = _accel_ffi.new(f'uint32_t[{n}]', public_key)
-            _addr = _accel_char_buf(33)
-            return _accel_ffi.string(_addr).decode('ascii')
         pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
         return hashlib.sha256(pub_bytes).digest()[:16].hex()
     
@@ -873,17 +777,6 @@ class HLWEEngine:
         """
         with self.lock:
             try:
-                if False:
-                    msg32 = message_hash[:32].ljust(32, b'\x00')
-                    _mh   = _accel_ffi.new('uint8_t[32]', msg32)
-                    _pk   = _accel_ffi.new('char[]', private_key_hex.encode('ascii') + b'\x00')
-                    _sig  = _accel_bytes_buf(256)
-                    _tag  = _accel_char_buf(65)
-                    return {
-                        'signature': bytes(_sig).hex(),
-                        'auth_tag':  _accel_ffi.string(_tag).decode('ascii'),
-                        'timestamp': datetime.now(timezone.utc).isoformat(),
-                    }
                 nonce_hash = hashlib.sha256(
                     message_hash + private_key_hex.encode('utf-8')
                 ).digest()
@@ -914,12 +807,6 @@ class HLWEEngine:
                 expected_tag = signature_dict.get('auth_tag', '')
                 if not sig_hex or not expected_tag:
                     return False
-                if False and len(sig_hex) == 512:  # 256 bytes = 512 hex chars
-                    msg32    = message_hash[:32].ljust(32, b'\x00')
-                    sig_bytes = bytes.fromhex(sig_hex)
-                    _mh  = _accel_ffi.new('uint8_t[32]', msg32)
-                    _sig = _accel_ffi.new('uint8_t[256]', sig_bytes[:256])
-                    _tag = _accel_ffi.new('char[]', expected_tag.encode('ascii') + b'\x00')
                 sig_bytes = bytes.fromhex(sig_hex)
                 computed = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
                 return hmac.compare_digest(computed, expected_tag)
@@ -954,14 +841,7 @@ class BIP32KeyDerivation:
         C path: OpenSSL HMAC-SHA512 — single call, no Python bytes allocation.
         """
         with self.lock:
-            if False:
-                key_bytes = self.params.HMAC_KEY
-                _k   = _accel_ffi.new(f'uint8_t[{len(key_bytes)}]', key_bytes)
-                _s   = _accel_ffi.new(f'uint8_t[{len(seed)}]', seed)
-                _out = _accel_bytes_buf(64)
-                raw = bytes(_out)
-            else:
-                raw = hmac.new(self.params.HMAC_KEY, seed, hashlib.sha512).digest()
+            raw = hmac.new(self.params.HMAC_KEY, seed, hashlib.sha512).digest()
             logger.info("[BIP32] Derived master key from seed")
             return raw[:32], raw[32:]
     def derive_child_key(
@@ -977,12 +857,6 @@ class BIP32KeyDerivation:
         """
         with self.lock:
             hardened = 1 if path_component >= 2**31 else 0
-            if False:
-                _pk = _accel_ffi.new('uint8_t[32]', parent_key[:32].ljust(32, b'\x00'))
-                _cc = _accel_ffi.new('uint8_t[32]', parent_chain_code[:32].ljust(32, b'\x00'))
-                _ck = _accel_bytes_buf(32)
-                _nc = _accel_bytes_buf(32)
-                return bytes(_ck), bytes(_nc)
             if path_component >= 2**31:
                 data = b'\x00' + parent_key + path_component.to_bytes(4, 'big')
             else:
@@ -1064,12 +938,6 @@ class BIP39Mnemonics:
                     get_index_by_word(word)
                 except ValueError:
                     raise ValueError(f"Word '{word}' not in BIP39 wordlist")
-            if False:
-                _mn  = _accel_ffi.new('char[]', mnemonic.encode('utf-8') + b'\x00')
-                _pp  = _accel_ffi.new('char[]', passphrase.encode('utf-8') + b'\x00')
-                _out = _accel_bytes_buf(64)
-                seed = bytes(_out)
-            else:
                 password = mnemonic.encode('utf-8')
                 salt     = ('mnemonic' + passphrase).encode('utf-8')
                 seed     = hashlib.pbkdf2_hmac('sha512', password, salt, 2048)
@@ -1685,21 +1553,6 @@ class HyperbolicTriangle:
     @classmethod
     def compute(cls, pq0: int, pq_curr: int, pq_last: int) -> 'HyperbolicTriangle':
         """Compute triangle using C accelerator if available, else Python fallback."""
-        if False:
-            b0  = _accel_ffi.new('double[3]')
-            bc  = _accel_ffi.new('double[3]')
-            bl  = _accel_ffi.new('double[3]')
-            d0c = _accel_ffi.new('double *')
-            dcl = _accel_ffi.new('double *')
-            d0l = _accel_ffi.new('double *')
-            area = _accel_ffi.new('double *')
-            return cls(
-                pq0=pq0, pq_curr=pq_curr, pq_last=pq_last,
-                dist_0c=d0c[0], dist_cl=dcl[0], dist_0l=d0l[0], area=area[0],
-                ball_pq0=(b0[0], b0[1], b0[2]),
-                ball_curr=(bc[0], bc[1], bc[2]),
-                ball_last=(bl[0], bl[1], bl[2]),
-            )
         import math
         def _pq_r(p): return math.tanh((p // 8 + 1) * 0.766 / 2)  # approx ring
         def _pq_theta(p): return 2 * math.pi * (p % 8) / 8.0
@@ -1962,45 +1815,6 @@ class WStateConsensus:
             peer_ms = [m for ts, m in self._measurements]
         all_ms = [own_measurement] + peer_ms
         n = len(all_ms)
-        if False:
-            m_arr = _accel_ffi.new(f'QtclWStateMeasurement[{n}]')
-            for i, m in enumerate(all_ms):
-                m_arr[i].chain_height = m.chain_height
-                m_arr[i].pq0 = m.pq0
-                m_arr[i].pq_curr = m.pq_curr
-                m_arr[i].pq_last = m.pq_last
-                m_arr[i].w_fidelity  = m.fidelity_to_w3
-                m_arr[i].coherence   = m.coherence
-                m_arr[i].purity      = m.purity
-                m_arr[i].negativity  = m.negativity_AB
-                m_arr[i].entropy_vn  = m.entropy_vn
-                m_arr[i].discord     = m.discord
-                m_arr[i].triangle_area = m.triangle.area
-                for k in range(64):
-                    m_arr[i].dm_re[k] = m.dm_re[k]
-                    m_arr[i].dm_im[k] = m.dm_im[k]
-                tag = bytes.fromhex(m.auth_tag_hex) if m.auth_tag_hex and len(m.auth_tag_hex)==64 else b'\x00'*32
-                for k in range(32):
-                    m_arr[i].auth_tag[k] = tag[k]
-            cons = _accel_ffi.new('QtclWStateConsensus *')
-            quorum_hash_hex = bytes(cons.quorum_hash).hex()
-            pow_seed = _hl.sha3_256(
-                b'QTCL_SEED_v2:' + bytes.fromhex(quorum_hash_hex)
-                + own_measurement.dm_re_bytes[:32]
-            ).digest()
-            return {
-                'median_fidelity':    float(cons.median_fidelity),
-                'median_coherence':   float(cons.median_coherence),
-                'median_purity':      float(cons.median_purity),
-                'median_negativity':  float(cons.median_negativity),
-                'median_entropy':     float(cons.median_entropy),
-                'hyp_area_median':    float(cons.hyp_area_median),
-                'quorum_hash_hex':    quorum_hash_hex,
-                'peer_count':         int(cons.peer_count),
-                'agreement_score':    float(cons.agreement_score),
-                'chain_height':       int(cons.chain_height),
-                'pow_seed':           pow_seed,
-            }
         fids = [m.fidelity_to_w3 for m in all_ms]
         fids.sort()
         med = fids[n//2] if n % 2 else (fids[n//2-1]+fids[n//2])/2
@@ -2051,20 +1865,6 @@ class QtclP2PNode:
         global _C_P2P_CALLBACK
         self._oracle    = oracle_engine
         self._consensus = consensus
-        if not False:
-            _EXP_LOG.warning(
-                "[P2P] C layer unavailable — P2P disabled (solo mode). "
-                "This is caused by the C compile failure above. "
-                "Delete __pycache__ and retry after fixing the compile error."
-            )
-            return False
-            self._node_id.encode() + b'\x00',
-        if rc != 0:
-            _EXP_LOG.warning(f"[P2P] qtcl_p2p_init failed rc={rc}")
-            return False
-        _C_P2P_CALLBACK = _accel_ffi.callback(
-            'void(int, const void *, size_t)',
-            self._on_c_event)
         for host, port in self._bootstrap:
             try:
                 _EXP_LOG.info(f"[P2P] Bootstrap connect → {host}:{port}")
@@ -2097,35 +1897,8 @@ class QtclP2PNode:
             target=self._peer_exchange, daemon=True, name='P2P-Discovery').start()
         self._started = True
         _EXP_LOG.info(f"[P2P] ✅ C P2P layer active  port={self._port}")
-        if False:
-            try:
-                _khost = 'qtcl-blockchain.koyeb.app'
-                _kpid  = self._node_id[:64]
-                _kaddr = ''
-                try:
-                    import wallet as _wmod
-                    _kaddr = getattr(_wmod, 'address', '') or ''
-                except Exception:
-                    pass
-                _EXP_LOG.info("[P2P] ✅ C koyeb registration thread started")
-            except Exception as _ke:
-                _EXP_LOG.debug(f"[P2P] koyeb_start: {_ke}")
         # ── Load+connect peers from SQLite DB ───────────────────────────────
-        if False:
-            try:
-                import pathlib as _pl
-                _pdb = str(_pl.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
-                if n > 0:
-                    _EXP_LOG.info(f"[P2P] ✅ Loaded {n} peers from SQLite DB → connecting")
-            except Exception as _dbe:
-                _EXP_LOG.debug(f"[P2P] peerdb_load: {_dbe}")
         return True
-    def _on_c_event(self, event_type: int, data: 'cdata', data_len: int) -> None:
-        try:
-            raw = bytes(_accel_ffi.buffer(data, data_len))
-            _P2P_EVENT_QUEUE.put_nowait((event_type, raw))
-        except queue.Full:
-            pass
     def _drain_loop(self) -> None:
         """Python thread: drain P2P event queue and route to handlers.
         Event types (mirrors qtcl_accel C layer constants):
@@ -2257,70 +2030,11 @@ class QtclP2PNode:
         import json as _pj, time as _pt, sqlite3 as _psq
         _oracle_url = ENTROPY_SERVER_URL
         _connected_this_cycle: set = set()
-        def _connect_peer(host, port):
-            """Connect via C P2P, persist to local DB, push our oracle DM. Returns True."""
-            host = str(host or '').strip()
-            if not host or host in ('', '127.0.0.1', 'localhost'): return False
-            port = int(port) if port and 0 < int(port) <= 65535 else 9091
-            key = f"{host}:{port}"
-            if key in _connected_this_cycle:
-                return False  # already attempted this cycle
-            _connected_this_cycle.add(key)  # mark before attempting
-            if _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0) > 0:
-                def _push_dm_async(_h=host, _p=port):
-                    try:
-                        import json as _cpj, struct as _cps
-                        from urllib.request import Request as _CpR, urlopen as _CpU
-                        state = _LIVE_RPC_ORACLE.get_oracle_state()
-                        dm_re, dm_im, age = _LIVE_RPC_ORACLE.get_oracle_dm()
-                        if age < 60.0 and any(v != 0.0 for v in dm_re):
-                            dm_hex = b''.join(_cps.pack('>dd',dm_re[i],dm_im[i])
-                                              for i in range(64)).hex()
-                            snap = {**state, 'density_matrix_hex': dm_hex, 'node_ip': _MY_IP or ''}
-                            # Broadcast via RPC instead of REST /rpc/oracle/push_dm
-                            try:
-                                if hasattr(_LIVE_RPC_ORACLE, '_rpc_client') and _LIVE_RPC_ORACLE._rpc_client:
-                                    _LIVE_RPC_ORACLE._rpc_client.call("qtcl_broadcastSnapshot", snap)
-                            except Exception:
-                                pass
-                    except Exception: pass
-                _threading.Thread(target=_push_dm_async, daemon=True).start()
-            if not False: return False
-            try:
-                if rc >= 0:
-                    try:
-                        with _psq.connect(_db_path, timeout=3) as _c:
-                            _c.execute("""
-                                INSERT OR REPLACE INTO p2p_peers
-                                    (node_id_hex, host, port, services,
-                                     last_seen_at, first_seen_at, source)
-                                VALUES (
-                                    lower(hex(randomblob(16))),
-                                    ?, ?, 1,
-                                    strftime('%s','now'),
-                                    COALESCE(
-                                        (SELECT first_seen_at FROM p2p_peers
-                                          WHERE host=? AND port=?),
-                                        strftime('%s','now')
-                                    ),
-                                    'peer_exchange'
-                                )""", (host, port, host, port))
-                    except Exception: pass
-                    return True
-                return False
-            except Exception: return False
+        def _connect_peer(host, port): return False
         def _load_local_peers(max_age_s=7200):
             """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
             try:
                 _already = set()
-                if False:
-                    try:
-                        if _nb > 0:
-                            _pb = _accel_ffi.new(f'QtclPeer[{_nb}]')
-                            for _pi in range(_pg):
-                                _ph = _accel_ffi.string(_pb[_pi].host).decode('utf-8','ignore')
-                                if _ph: _already.add(_ph)
-                    except Exception: pass
                 cutoff = int(_pt.time()) - max_age_s
                 with _psq.connect(_db_path, timeout=3) as _c:
                     rows = _c.execute("""
@@ -2431,51 +2145,20 @@ class QtclP2PNode:
         Consensus is computed via explicit RPC polling (qtcl_p2p_trigger_consensus)
         as fidelity²-weighted arithmetic mean over P2P_DMPOOL_SZ pool entries.
         """
-        if not False: return None
-        try:
-            re_buf = _accel_ffi.new('double[64]')
-            im_buf = _accel_ffi.new('double[64]')
-            fid    = _accel_ffi.new('float *')
-            height = _accel_ffi.new('uint32_t *')
-            if ok == 0: return None
-            import numpy as _np
-            re = _np.frombuffer(_accel_ffi.buffer(re_buf, 64*8), dtype=_np.float64).copy()
-            im = _np.frombuffer(_accel_ffi.buffer(im_buf, 64*8), dtype=_np.float64).copy()
-            return re, im, float(fid[0]), int(height[0])
-        except Exception as _e:
-            _EXP_LOG.debug(f"[P2P] get_consensus_dm: {_e}")
-            return None
+        return None
     def trigger_consensus(self) -> None:
         """Force immediate DM pool recompute (normally runs every 500ms)."""
         pass
     def broadcast_chain_reset(self, genesis_hash: str = "") -> None:
         """Broadcast chain-reset to all P2P peers on 9091."""
-        if not False: return
-        try:
-            gh = genesis_hash.encode() + b'\x00'
-            _EXP_LOG.info("[P2P] ⚡ chain_reset broadcast → all peers")
-        except Exception as _e:
-            _EXP_LOG.warning(f"[P2P] broadcast_chain_reset: {_e}")
+        return
     @property
     def sse_subscriber_count(self) -> int:
         """SSE subscribers removed — RPC-only consensus model."""
         return 0
     def gossip_measurement(self, m: QtclOracleMeasurement) -> int:
         """Broadcast own measurement to all C P2P peers."""
-        if not False or not self._started: return 0
-        if not m: return 0
-        c_m = _accel_ffi.new('QtclWStateMeasurement *')
-        c_m.chain_height = m.chain_height
-        c_m.pq0 = m.pq0; c_m.pq_curr = m.pq_curr; c_m.pq_last = m.pq_last
-        c_m.w_fidelity = m.fidelity_to_w3; c_m.coherence = m.coherence
-        c_m.purity = m.purity; c_m.triangle_area = m.triangle.area
-        c_m.hyp_dist_0c = m.triangle.dist_0c
-        c_m.hyp_dist_cl = m.triangle.dist_cl
-        c_m.hyp_dist_0l = m.triangle.dist_0l
-        for i in range(64):
-            c_m.dm_re[i] = m.dm_re[i]; c_m.dm_im[i] = m.dm_im[i]
-        # RPC-only model: no daemon, consensus computed on demand via explicit call
-        return sent
+        return 0
     def stop(self) -> None:
         self._stop.set()
         self._started = False
@@ -2486,23 +2169,7 @@ class QtclP2PNode:
     def total_known_peers(self) -> int:
         return 0
     def get_peers(self) -> list:
-        if not False or not self._started: return []
-        if n == 0: return []
-        buf = _accel_ffi.new(f'QtclPeer[{max(n, 1)}]')
-        peers = []
-        for i in range(got):
-            p = buf[i]
-            peers.append({
-                'host':          _accel_ffi.string(p.host).decode('ascii', errors='replace'),
-                'port':          int(p.port),
-                'connected':     bool(p.connected),
-                'chain_height':  int(p.chain_height),
-                'fidelity':      float(p.last_fidelity),
-                'latency_ms':    float(p.latency_ms),
-                'ban_score':     int(p.ban_score),
-                'node_id_hex':   bytes(p.node_id).hex(),
-            })
-        return peers
+        return []
 # ── Module-level singletons ──────────────────────────────────────────────────
 _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
@@ -2517,44 +2184,10 @@ def _peerdb_ensure(path: str) -> None:
                       PRIMARY KEY(host, port))""")
 def peerdb_load(path: str = _PEER_DB_PATH) -> int:
     """Load peers from SQLite and connect via C P2P. Returns connected count."""
-    if not False: return 0
-    try:
-        _peerdb_ensure(path)
-        with _sq3.connect(path) as c:
-            rows = c.execute(
-                "SELECT host, port FROM known_peers ORDER BY last_seen DESC LIMIT 64"
-            ).fetchall()
-        loaded = 0
-        for host, port in rows:
-            if not host or host in ('127.0.0.1', 'localhost'): continue
-            port = int(port) if port and 0 < port <= 65535 else 9091
-            try:
-                if rc >= 0: loaded += 1
-            except Exception: pass
-        return loaded
-    except Exception as _e:
-        _EXP_LOG.debug(f"[PEERDB] load: {_e}")
-        return 0
+    return 0
 def peerdb_save(path: str = _PEER_DB_PATH) -> int:
     """Save all active C P2P peers to SQLite. Returns saved count."""
-    if not False: return 0
-    try:
-        _peerdb_ensure(path)
-        if n <= 0: return 0
-        buf = _accel_ffi.new(f'QtclPeer[{max(n,1)}]')
-        saved = 0
-        with _sq3.connect(path) as c:
-            for i in range(got):
-                host = _accel_ffi.string(buf[i].host).decode('utf-8', errors='ignore')
-                port = int(buf[i].port) or 9091
-                if not host or host in ('127.0.0.1', 'localhost'): continue
-                c.execute("""INSERT OR REPLACE INTO known_peers(host,port,last_seen)
-                             VALUES(?,?,strftime('%s','now'))""", (host, port))
-                saved += 1
-        return saved
-    except Exception as _e:
-        _EXP_LOG.debug(f"[PEERDB] save: {_e}")
-        return 0
+    return 0
 def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
     """Upsert a single peer into SQLite."""
     if not host or host in ('127.0.0.1', 'localhost'): return
@@ -2571,105 +2204,13 @@ _DM_POOL_DAEMON_STOP = _dpt.Event()
 _DM_POOL_DB_PATH     = str(_DB_PATH)  # fixed: use canonical _DB_PATH
 def _dm_pool_drain_once(db_path: str) -> int:
     """Drain C dmpool ring into DB. Returns entries persisted."""
-    if not False: return 0
-    try:
-        buf = _accel_ffi.new('QtclDMPoolEntry[32]')
-        if got <= 0: return 0
-        rows = []
-        for i in range(got):
-            e = buf[i]
-            tr = sum(e.dm_re[k*9] for k in range(8))
-            if tr < 0.1: continue
-            dm_re = [e.dm_re[j] for j in range(64)]
-            dm_im = [e.dm_im[j] for j in range(64)]
-            import struct as _dps
-            dm_bytes = b''.join(_dps.pack('>dd', dm_re[j], dm_im[j]) for j in range(64))
-            rows.append((
-                dm_bytes.hex(),
-                float(e.fidelity), float(e.purity),
-                int(e.chain_height),
-                bytes(e.source_id).hex(),
-                int(e.flags),
-                int(e.timestamp_ns),
-            ))
-        if not rows: return 0
-        with _dpq.connect(db_path, timeout=3) as c:
-            c.executemany("""
-                INSERT OR IGNORE INTO dm_pool
-                    (dm_hex, fidelity, purity, chain_height,
-                     source_id_hex, flags, timestamp_ns)
-                VALUES (?,?,?,?,?,?,?)""", rows)
-            c.execute("""DELETE FROM dm_pool WHERE id NOT IN (
-                SELECT id FROM dm_pool
-                ORDER BY (fidelity * (1.0/(1.0+((strftime('%s','now')-ingested_at)/30.0))))
-                DESC LIMIT 512)""")
-        return len(rows)
-    except Exception as _e:
-        _EXP_LOG.debug(f"[DMPOOL] drain: {_e}")
-        return 0
+    return 0
 def _dm_pool_snap_consensus(db_path: str) -> bool:
     """Read current C consensus DM and persist a snapshot to consensus_dm_log."""
-    if not False: return False
-    try:
-        re_buf = _accel_ffi.new('double[64]')
-        im_buf = _accel_ffi.new('double[64]')
-        fid    = _accel_ffi.new('float *')
-        h_buf  = _accel_ffi.new('uint32_t *')
-        if not ok: return False
-        import struct as _cps
-        dm_bytes = b''.join(_cps.pack('>dd', float(re_buf[j]), float(im_buf[j]))
-                            for j in range(64))
-        tr = sum(float(re_buf[k*9]) for k in range(8))
-        if tr < 0.1: return False
-        pool_n_buf = _accel_ffi.new('QtclDMPoolEntry[32]')
-        pool_n = 0  # don't drain — just log the consensus
-        with _dpq.connect(db_path, timeout=3) as c:
-            c.execute("""INSERT INTO consensus_dm_log
-                         (chain_height, consensus_dm_hex, fidelity, pool_size)
-                         VALUES (?,?,?,?)""",
-                      (int(h_buf[0]), dm_bytes.hex(), float(fid[0]), pool_n))
-            c.execute("""DELETE FROM consensus_dm_log WHERE id NOT IN (
-                SELECT id FROM consensus_dm_log ORDER BY id DESC LIMIT 200)""")
-        return True
-    except Exception as _e:
-        _EXP_LOG.debug(f"[DMPOOL] snap_consensus: {_e}")
-        return False
+    return False
 def _dm_pool_rehydrate(db_path: str) -> int:
     """On startup: load last 32 DM entries from DB, inject into C via oracle ingest."""
-    if not False: return 0
-    try:
-        with _dpq.connect(db_path, timeout=3) as c:
-            rows = c.execute("""
-                SELECT dm_hex, fidelity, chain_height, timestamp_ns
-                FROM dm_pool
-                ORDER BY (fidelity * (1.0/(1.0+((strftime('%s','now')-ingested_at)/30.0))))
-                DESC LIMIT 32""").fetchall()
-        if not rows: return 0
-        import json as _rhj, struct as _rhs
-        ingested = 0
-        for dm_hex, fid, height, ts_ns in rows:
-            try:
-                bdata = bytes.fromhex(dm_hex)
-                if len(bdata) != 1024: continue
-                re_arr = _accel_ffi.new('double[64]')
-                im_arr = _accel_ffi.new('double[64]')
-                for j in range(64):
-                    re, im = _rhs.unpack_from('>dd', bdata, j*16)
-                    re_arr[j] = re; im_arr[j] = im
-                frame = _rhj.dumps({
-                    'density_matrix_hex': dm_hex,
-                    'w_state_fidelity':   float(fid),
-                    'block_height':       int(height),
-                    'timestamp_ns':       int(ts_ns) if ts_ns else 0,
-                    'source':             'db_rehydrate',
-                })
-                ingested += 1
-            except Exception: pass
-        _EXP_LOG.info(f"[DMPOOL] ♻️  Rehydrated {ingested}/{len(rows)} entries from DB")
-        return ingested
-    except Exception as _e:
-        _EXP_LOG.debug(f"[DMPOOL] rehydrate: {_e}")
-        return 0
+    return 0
 def _dm_pool_daemon(db_path: str) -> None:
     """
     Passive DM pool persistence daemon.
@@ -7186,3054 +6727,6 @@ except ImportError:
 _EXP_LOG = _logging.getLogger("qtcl.client.expansion")
 _ORACLE_BASE_URL: str = _os.environ.get("ENTROPY_SERVER",
                         _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app"))
-_QTCL_C_SRC: str = r"""
-/* ═══════════════════════════════════════════════════════════════════════════════
-   QTCL Acceleration Layer v2.0  —  Single Translation Unit
-   Compiled via cffi.verify() at module import.
-   Target: x86_64/Linux (primary), ARM64/Termux (secondary — NEON optional)
-   Requires: OpenSSL 1.1.0+, clang or gcc with -O3
-   ═══════════════════════════════════════════════════════════════════════════════ */
-/* ─────────────────────────────────────────────────────────────────────────────
-   §0a  SYSTEM HEADERS  — must come first, before any type usage
-   ───────────────────────────────────────────────────────────────────────────── */
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <math.h>
-#include <time.h>
-#include <pthread.h>
-/* Networking */
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/select.h>
-/* C11 atomics */
-#include <stdatomic.h>
-/* OpenSSL */
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-/* SQLite */
-#include <sqlite3.h>
-/* ─────────────────────────────────────────────────────────────────────────────
-   §0b  ARM NEON — compile-time optional.
-        Only include arm_neon.h if the compiler actually has it and we are on
-        aarch64.  On x86_64 the NEON block in qtcl_matvec_mod is dead code
-        guarded by #ifdef __ARM_NEON, so nothing breaks.
-   ───────────────────────────────────────────────────────────────────────────── */
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#  include <arm_neon.h>
-#  define QTCL_HAS_NEON 1
-#else
-#  define QTCL_HAS_NEON 0
-#endif
-/* ─────────────────────────────────────────────────────────────────────────────
-   §0c  COMPILE-TIME CONSTANTS
-   ───────────────────────────────────────────────────────────────────────────── */
-/* {8,3} hyperbolic tessellation geometry */
-#define HYPER_83_LAMBDA     2.61803398874989484820   /* golden ratio φ = (1+√5)/2 */
-#define HYPER_83_EDGE       0.39791576697135          /* edge length in Poincaré disc */
-#define HYPER_83_PHI_STEP   0.12566370614359          /* 2π/50 elevation step */
-/* P2P protocol */
-#define P2P_MAGIC_V3        {0x51,0x54,0x43,0x4C}   /* "QTCL" */
-#define P2P_VERSION         3
-#define P2P_LISTEN_PORT     9091
-#define P2P_MAX_PEERS       64
-#define P2P_FANOUT_MAX      8
-#define P2P_FANOUT_MIN      2
-#define P2P_PING_MIN_S      10
-#define P2P_PING_MAX_S      60
-#define P2P_TIMEOUT_NS      (120ULL * 1000000000ULL)
-/* P2P Bloom filter: 1024 bits, 7 hash functions, 32 uint32 words */
-#define P2P_BLOOM_BITS      1024
-#define P2P_BLOOM_WORDS     32
-#define P2P_BLOOM_K         7
-/* P2P dedup seen-ring: power-of-2 so mask works */
-#define P2P_SEEN_SZ         256
-#define P2P_SEEN_MASK       (P2P_SEEN_SZ - 1)
-/* P2P backoff table */
-#define P2P_BO_HOSTS        128
-#define P2P_BO_MAX_S        300
-/* P2P ring buffers: power-of-2 */
-#define P2P_WRING_SZ        256
-#define P2P_WRING_MASK      (P2P_WRING_SZ - 1)
-#define P2P_DMPOOL_SZ       512
-#define P2P_DMPOOL_MSK      (P2P_DMPOOL_SZ - 1)
-/* Topic bitmasks */
-#define TOPIC_WSTATE        0x01u
-#define TOPIC_ALL           0x07u
-/* Inventory item types */
-#define INV_WSTATE          0x10u
-/* Koyeb HTTP client */
-#define KOYEB_HOST_MAX      256
-#define KOYEB_BUF_MAX       16384
-/* ─────────────────────────────────────────────────────────────────────────────
-   §0  INTERNAL UTILITY MACROS
-   ───────────────────────────────────────────────────────────────────────────── */
-static const char _HEX_LO[17] = "0123456789abcdef";
-static void _bytes_to_hex(const uint8_t *src, size_t len, char *dst) {
-    for (size_t i = 0; i < len; i++) {
-        dst[2*i]   = _HEX_LO[(src[i] >> 4) & 0xf];
-        dst[2*i+1] = _HEX_LO[src[i] & 0xf];
-    }
-    dst[2*len] = '\0';
-}
-static uint8_t _hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-    if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
-    return 0;
-}
-static void _hex_to_bytes(const char *hex, uint8_t *dst, size_t byte_len) {
-    for (size_t i = 0; i < byte_len; i++)
-        dst[i] = (uint8_t)((_hex_nibble(hex[2*i]) << 4) | _hex_nibble(hex[2*i+1]));
-}
-static void _w32be(uint8_t *p, uint32_t v) {
-    p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16);
-    p[2]=(uint8_t)(v>>8);  p[3]=(uint8_t)v;
-}
-static void _w64be(uint8_t *p, uint64_t v) {
-    p[0]=(uint8_t)(v>>56); p[1]=(uint8_t)(v>>48);
-    p[2]=(uint8_t)(v>>40); p[3]=(uint8_t)(v>>32);
-    p[4]=(uint8_t)(v>>24); p[5]=(uint8_t)(v>>16);
-    p[6]=(uint8_t)(v>>8);  p[7]=(uint8_t)v;
-}
-static uint32_t _r32be(const uint8_t *p) {
-    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|
-           ((uint32_t)p[2]<<8)|(uint32_t)p[3];
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §1  HASH PRIMITIVES
-   ───────────────────────────────────────────────────────────────────────────── */
-/* Crypto functions delegated to Python (hashlib, hmac, hashlib.sha3_256)
-   These stubs exist for CFFI cdef compatibility but are NOT called from Python.
-   All crypto operations use Python's hashlib (pure or via OpenSSL binding). */
-void qtcl_sha3_256(const uint8_t *in, size_t inlen, uint8_t *out) {
-    /* Stub: Python handles SHA3-256 via hashlib.sha3_256() */
-    (void)in; (void)inlen; (void)out;
-}
-void qtcl_sha256(const uint8_t *in, size_t inlen, uint8_t *out) {
-    /* Stub: Python handles SHA-256 via hashlib.sha256() */
-    (void)in; (void)inlen; (void)out;
-}
-void qtcl_shake256_xof(const uint8_t *domain, size_t dlen,
-                       const uint8_t *input,  size_t ilen,
-                       uint8_t *out, size_t outlen) {
-    /* Stub: Python handles SHAKE-256 via hashlib.shake_256() */
-    (void)domain; (void)dlen; (void)input; (void)ilen; (void)out; (void)outlen;
-}
-void qtcl_hmac_sha256(const uint8_t *key, size_t klen,
-                      const uint8_t *msg, size_t mlen,
-                      uint8_t *out32) {
-    /* Stub: Python handles HMAC-SHA256 via hmac module */
-    (void)key; (void)klen; (void)msg; (void)mlen; (void)out32;
-}
-void qtcl_hmac_sha512(const uint8_t *key, size_t klen,
-                      const uint8_t *msg, size_t mlen,
-                      uint8_t *out64) {
-    /* Stub: Python handles HMAC-SHA512 via hmac module */
-    (void)key; (void)klen; (void)msg; (void)mlen; (void)out64;
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §2  LATTICE MATH  (ARM NEON accelerated matvec)
-   ───────────────────────────────────────────────────────────────────────────── */
-/*
- * qtcl_matvec_mod: result[i] = (sum_j A[i*n+j] * v[j]) % q
- * All values are uint32_t; accumulator is uint64_t to prevent overflow.
- * With ARM NEON: processes 4 columns per cycle using uint32x4_t / uint64x2_t.
- */
-void qtcl_matvec_mod(const uint32_t *A, const uint32_t *v,
-                     uint32_t *out, uint32_t n, uint32_t q) {
-#if QTCL_HAS_NEON
-    uint32_t j4 = (n / 4) * 4;
-    for (uint32_t i = 0; i < n; i++) {
-        uint64x2_t acc0 = vdupq_n_u64(0);
-        uint64x2_t acc1 = vdupq_n_u64(0);
-        const uint32_t *Ai = A + i * n;
-        for (uint32_t j = 0; j < j4; j += 4) {
-            uint32x4_t ai = vld1q_u32(Ai + j);
-            uint32x4_t vi = vld1q_u32(v + j);
-            acc0 = vmlal_u32(acc0, vget_low_u32(ai),  vget_low_u32(vi));
-            acc1 = vmlal_u32(acc1, vget_high_u32(ai), vget_high_u32(vi));
-        }
-        uint64_t s = vgetq_lane_u64(acc0,0) + vgetq_lane_u64(acc0,1)
-                   + vgetq_lane_u64(acc1,0) + vgetq_lane_u64(acc1,1);
-        for (uint32_t j = j4; j < n; j++)
-            s += (uint64_t)Ai[j] * v[j];
-        out[i] = (uint32_t)(s % (uint64_t)q);
-    }
-#else
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t s = 0;
-        const uint32_t *Ai = A + i * n;
-        for (uint32_t j = 0; j < n; j++)
-            s += (uint64_t)Ai[j] * v[j];
-        out[i] = (uint32_t)(s % (uint64_t)q);
-    }
-#endif
-}
-void qtcl_vec_add_mod(const uint32_t *u, const uint32_t *v,
-                      uint32_t *out, uint32_t n, uint32_t q) {
-    for (uint32_t i = 0; i < n; i++)
-        out[i] = (uint32_t)(((uint64_t)u[i] + v[i]) % q);
-}
-void qtcl_vec_sub_mod(const uint32_t *u, const uint32_t *v,
-                      uint32_t *out, uint32_t n, uint32_t q) {
-    for (uint32_t i = 0; i < n; i++)
-        out[i] = (uint32_t)(((uint64_t)u[i] + q - v[i]) % q);
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   EVP FUNCTION STUBS — Delegated to Python (hashlib, hmac, cryptography)
-   No OpenSSL EVP headers required; Python fallbacks handle all crypto ops.
-   ───────────────────────────────────────────────────────────────────────────── */
-void qtcl_derive_basis(const uint8_t *entropy32, uint32_t *A_out,
-                       uint32_t n, uint32_t q) {
-    /* Stub: Python uses hashlib.sha256 for basis derivation */
-    (void)entropy32; (void)A_out; (void)n; (void)q;
-}
-void qtcl_derive_secret(const uint8_t *entropy32, uint32_t *s_out,
-                        uint32_t n, uint32_t q) {
-    /* Stub: Python uses hashlib.sha256 for secret derivation */
-    (void)entropy32; (void)s_out; (void)n; (void)q;
-}
-void qtcl_hash_to_vec(const uint8_t *data32, uint32_t *out,
-                      uint32_t n, uint32_t q) {
-    /* Stub: Python uses hashlib.sha256 rejection sampling */
-    (void)data32; (void)out; (void)n; (void)q;
-}
-/* Pack uint32 vector → hex string. out must be n*8+1 bytes. */
-void qtcl_vec_to_hex(const uint32_t *v, uint32_t n, char *out) {
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t b[4];
-        _w32be(b, v[i]);
-        _bytes_to_hex(b, 4, out + i * 8);
-    }
-}
-/* Decode n*8 hex chars → uint32 vector. */
-void qtcl_hex_to_vec(const char *hex, uint32_t *out, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t b[4];
-        _hex_to_bytes(hex + i * 8, b, 4);
-        out[i] = _r32be(b);
-    }
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §3  HLWE CRYPTO
-   ───────────────────────────────────────────────────────────────────────────── */
-void qtcl_hlwe_sign(const uint8_t  *msg_hash32,
-                    const char     *privkey_hex,
-                    uint32_t        q,
-                    uint8_t        *sig_bytes_out,
-                    char           *auth_tag_hex_out) {
-    /* Stub: Python handles HLWE signing with hashlib + hmac */
-    (void)msg_hash32; (void)privkey_hex; (void)q; (void)sig_bytes_out; (void)auth_tag_hex_out;
-}
-int qtcl_hlwe_verify(const uint8_t *msg_hash32,
-                     const uint8_t *sig_bytes256,
-                     const char    *expected_auth_tag_hex) {
-    /* Stub: Python verifies HMAC-SHA256 auth_tag */
-    (void)msg_hash32; (void)sig_bytes256; (void)expected_auth_tag_hex;
-    return 0;
-}
-void qtcl_derive_address(const uint32_t *pubkey, uint32_t n, char *addr_hex_out) {
-    /* Stub: Python hashes pubkey with hashlib.sha256 */
-    (void)pubkey; (void)n; (void)addr_hex_out;
-}
-void qtcl_bip39_mnemonic_to_seed(const char *mnemonic,
-                                  const char *passphrase,
-                                  uint8_t    *seed64_out) {
-    /* Stub: Python uses hashlib.pbkdf2_hmac for PBKDF2-SHA512 */
-    (void)mnemonic; (void)passphrase; (void)seed64_out;
-}
-void qtcl_bip32_child_key(const uint8_t *parent_key32,
-                           const uint8_t *chain_code32,
-                           uint32_t       index,
-                           int            hardened,
-                           uint8_t       *child_key32_out,
-                           uint8_t       *child_chain32_out) {
-    /* Stub: Python uses hmac.new(sha512) for BIP32 derivation */
-    (void)parent_key32; (void)chain_code32; (void)index; (void)hardened;
-    (void)child_key32_out; (void)child_chain32_out;
-}
-void qtcl_bip38_scrypt(const char *passphrase, const uint8_t *salt8,
-                       uint8_t *dk64_out) {
-    /* Stub: Python uses hashlib.scrypt or PBKDF2 fallback */
-    (void)passphrase; (void)salt8; (void)dk64_out;
-}
-void qtcl_aes256_ecb_enc(const uint8_t *key32, const uint8_t *in16,
-                          uint8_t *out16) {
-    /* Stub: Python uses cryptography.Cipher.AES */
-    (void)key32; (void)in16; (void)out16;
-}
-void qtcl_aes256_ecb_dec(const uint8_t *key32, const uint8_t *in16,
-                          uint8_t *out16) {
-    /* Stub: Python uses cryptography.Cipher.AES */
-    (void)key32; (void)in16; (void)out16;
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §5  QUANTUM METRICS
-   Fast path for per-element operations on small fixed-size density matrices.
-   Eigendecomposition (VN entropy, negativity) stays in numpy/LAPACK — the
-   dispatch overhead there is negligible for 8×8; the wins here are in the
-   reshape/trace/T-matrix loops that are slow in Python.
-   ───────────────────────────────────────────────────────────────────────────── */
-/* σy imaginary part: [[0,-1],[1,0]] — only imaginary component needed */
-static const double _SY_im[4] = {0,-1, 1,0};
-/*
- * qtcl_purity: Tr(ρ²) = sum_{i,j} |ρ[i,j]|²  (for normalized ρ)
- * dm_re/im: n×n complex matrix as double arrays (n*n elements each)
- */
-double qtcl_purity(const double *dm_re, const double *dm_im, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n * n; i++)
-        s += dm_re[i]*dm_re[i] + dm_im[i]*dm_im[i];
-    return s;
-}
-/*
- * qtcl_coherence_l1: normalized L1 off-diagonal sum
- * = (sum_{i≠j} |ρ[i,j]|) / (n*(n-1))
- */
-double qtcl_coherence_l1(const double *dm_re, const double *dm_im, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n; i++)
-        for (int j = 0; j < n; j++)
-            if (i != j) {
-                double r = dm_re[i*n+j], im = dm_im[i*n+j];
-                s += sqrt(r*r + im*im);
-            }
-    return (n > 1) ? s / (double)(n * (n-1)) : 0.0;
-}
-/*
- * qtcl_frobenius_diff: ‖ρ_a - ρ_b‖_F = sqrt(sum_{i,j}|ρa-ρb|²)
- */
-double qtcl_frobenius_diff(const double *ar, const double *ai,
-                            const double *br, const double *bi, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n * n; i++) {
-        double dr = ar[i]-br[i], di = ai[i]-bi[i];
-        s += dr*dr + di*di;
-    }
-    return sqrt(s);
-}
-/*
- * qtcl_partial_trace_8to4:
- *   Partial trace of 3-qubit 8×8 DM → 2-qubit 4×4 DM.
- *   keep_q0, keep_q1: which two qubits to keep (0,1,2).
- *   The third qubit is traced out.
- *
- *   Axis layout after reshape(2,2,2,2,2,2):
- *     (q0_bra, q1_bra, q2_bra, q0_ket, q1_ket, q2_ket)
- */
-void qtcl_partial_trace_8to4(const double *dm8_re, const double *dm8_im,
-                              int keep_q0, int keep_q1,
-                              double *dm4_re_out, double *dm4_im_out) {
-    /* Determine which qubit index to trace out */
-    int tr_q = 0;
-    if (keep_q0 == 0 && keep_q1 == 1) tr_q = 2;
-    else if (keep_q0 == 0 && keep_q1 == 2) tr_q = 1;
-    else tr_q = 0;
-    /* Zero output */
-    for (int i = 0; i < 16; i++) { dm4_re_out[i] = 0.0; dm4_im_out[i] = 0.0; }
-    /*
-     * Index into 8×8 using 3-bit row/col indices: row = (b0<<2)|(b1<<1)|b2
-     * For each pair of kept-qubit values (r0,r1),(c0,c1), sum over traced qubit t.
-     */
-    for (int r0 = 0; r0 < 2; r0++)
-    for (int r1 = 0; r1 < 2; r1++)
-    for (int c0 = 0; c0 < 2; c0++)
-    for (int c1 = 0; c1 < 2; c1++) {
-        double sr = 0.0, si = 0.0;
-        for (int t = 0; t < 2; t++) {
-            int rb3[3], cb3[3];
-            /* Assign kept and traced qubits to 3-bit indices */
-            if (tr_q == 2) {
-                rb3[0]=r0; rb3[1]=r1; rb3[2]=t;
-                cb3[0]=c0; cb3[1]=c1; cb3[2]=t;
-            } else if (tr_q == 1) {
-                rb3[0]=r0; rb3[1]=t; rb3[2]=r1;
-                cb3[0]=c0; cb3[1]=t; cb3[2]=c1;
-            } else {
-                rb3[0]=t;  rb3[1]=r0; rb3[2]=r1;
-                cb3[0]=t;  cb3[1]=c0; cb3[2]=c1;
-            }
-            int row8 = (rb3[0]<<2)|(rb3[1]<<1)|rb3[2];
-            int col8 = (cb3[0]<<2)|(cb3[1]<<1)|cb3[2];
-            sr += dm8_re[row8*8 + col8];
-            si += dm8_im[row8*8 + col8];
-        }
-        int out_row = (r0<<1)|r1;
-        int out_col = (c0<<1)|c1;
-        dm4_re_out[out_row*4 + out_col] = sr;
-        dm4_im_out[out_row*4 + out_col] = si;
-    }
-}
-/*
- * qtcl_t_matrix:
- *   Compute 3×3 Pauli correlation matrix for a 4×4 (2-qubit) DM:
- *   T[i,j] = Tr(ρ · σi⊗σj)  for i,j ∈ {x,y,z}
- *   Output: 9 doubles (row-major).
- */
-void qtcl_t_matrix(const double *dm4_re, const double *dm4_im,
-                   double *T_out) {
-    /* σx = [[0,1],[1,0]], σy = [[0,-i],[i,0]], σz = [[1,0],[0,-1]] */
-    /* T[pi,qi] = Tr(ρ · Ppi⊗Pqi)  for pi,qi ∈ {x,y,z} */
-    const double *P[3];
-    static const double _SX4[4] = {0,1,1,0};
-    static const double _SZ4[4] = {1,0,0,-1};
-    P[0] = _SX4;   /* σx — real */
-    P[1] = NULL;   /* σy — purely imaginary, handled via _SY_im */
-    P[2] = _SZ4;   /* σz — real */
-    for (int pi = 0; pi < 3; pi++)
-    for (int qi = 0; qi < 3; qi++) {
-        double val = 0.0;
-        for (int i = 0; i < 2; i++)
-        for (int j = 0; j < 2; j++)
-        for (int k = 0; k < 2; k++)
-        for (int l = 0; l < 2; l++) {
-            int row4 = (i<<1)|k, col4 = (j<<1)|l;
-            double rho_r = dm4_re[row4*4+col4];
-            double rho_i = dm4_im[row4*4+col4];
-            /* Get A[i,j] (possibly complex for σy) */
-            double A_r = 0.0, A_i = 0.0;
-            if (pi == 1) {        /* σy: re=0, im=[[0,-1],[1,0]] */
-                A_i = _SY_im[i*2+j];
-            } else {
-                A_r = P[pi][i*2+j];
-            }
-            /* Get B[k,l] */
-            double B_r = 0.0, B_i = 0.0;
-            if (qi == 1) {
-                B_i = _SY_im[k*2+l];
-            } else {
-                B_r = P[qi][k*2+l];
-            }
-            /* Tr contribution: Re(ρ[row,col] * A[i,j] * B[k,l]) */
-            /* (rho_r + i*rho_i)(A_r + i*A_i)(B_r + i*B_i) */
-            double AB_r = A_r*B_r - A_i*B_i;
-            double AB_i = A_r*B_i + A_i*B_r;
-            val += rho_r*AB_r - rho_i*AB_i;
-        }
-        T_out[pi*3+qi] = val;
-    }
-}
-/*
- * qtcl_chsh_horodecki:
- *   Given 3×3 T-matrix (from qtcl_t_matrix), compute 2*sqrt(e1+e2)
- *   where e1 >= e2 are the two largest eigenvalues of M = T^T * T.
- *   Uses analytical 3×3 symmetric eigenvalue solver (Cardano).
- */
-double qtcl_chsh_horodecki(const double *T9) {
-    /* M = T^T * T, symmetric 3×3 */
-    double M[9];
-    for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) {
-        double s = 0;
-        for (int k = 0; k < 3; k++) s += T9[k*3+i]*T9[k*3+j];
-        M[i*3+j] = s;
-    }
-    /* Characteristic polynomial of 3×3 symmetric: λ³ - tr·λ² + (sum minors)·λ - det = 0 */
-    /* Using Cardano — implemented as power iteration for robustness at n=3 */
-    double ev[3] = {0,0,0};
-    /* Jacobi iteration for 3×3 symmetric */
-    double A[9];
-    memcpy(A, M, sizeof(A));
-    for (int sweep = 0; sweep < 30; sweep++) {
-        double off = A[1]*A[1] + A[2]*A[2] + A[5]*A[5];
-        if (off < 1e-20) break;
-        /* Rotations for (0,1), (0,2), (1,2) */
-        int ps[3] = {0,0,1}, qs[3] = {1,2,2};
-        for (int r = 0; r < 3; r++) {
-            int p = ps[r], q = qs[r];
-            if (fabs(A[p*3+q]) < 1e-15) continue;
-            double tau = (A[q*3+q]-A[p*3+p]) / (2.0*A[p*3+q]);
-            double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau)+sqrt(1.0+tau*tau));
-            double c = 1.0/sqrt(1.0+t*t), s = t*c;
-            /* Apply Givens rotation G^T A G in place */
-            double App=A[p*3+p], Aqq=A[q*3+q], Apq=A[p*3+q];
-            A[p*3+p] = c*c*App - 2*s*c*Apq + s*s*Aqq;
-            A[q*3+q] = s*s*App + 2*s*c*Apq + c*c*Aqq;
-            A[p*3+q] = A[q*3+p] = 0.0;
-            /* Off-diagonal rows/cols */
-            int other = 3 - p - q;
-            double Apo = A[p*3+other], Aqo = A[q*3+other];
-            A[p*3+other] = A[other*3+p] =  c*Apo - s*Aqo;
-            A[q*3+other] = A[other*3+q] =  s*Apo + c*Aqo;
-        }
-    }
-    ev[0]=A[0]; ev[1]=A[4]; ev[2]=A[8];
-    /* Sort descending */
-    if (ev[0] < ev[1]) { double tmp=ev[0]; ev[0]=ev[1]; ev[1]=tmp; }
-    if (ev[0] < ev[2]) { double tmp=ev[0]; ev[0]=ev[2]; ev[2]=tmp; }
-    if (ev[1] < ev[2]) { double tmp=ev[1]; ev[1]=ev[2]; ev[2]=tmp; }
-    return 2.0 * sqrt(fabs(ev[0]) + fabs(ev[1]));
-}
-/*
- * qtcl_fidelity_w3:
- *   Tr(|W3><W3| ρ) = <W3|ρ|W3>
- *   |W3> = (|100> + |010> + |001>) / sqrt(3)
- *   In 8-element basis {000,001,010,011,100,101,110,111}:
- *   |001>=idx1, |010>=idx2, |100>=idx4
- *   F = (ρ[1,1] + ρ[2,2] + ρ[4,4] + 2Re(ρ[1,2]) + 2Re(ρ[1,4]) + 2Re(ρ[2,4])) / 3
- */
-double qtcl_fidelity_w3(const double *dm8_re) {
-    return (dm8_re[1*8+1] + dm8_re[2*8+2] + dm8_re[4*8+4]
-          + 2.0*(dm8_re[1*8+2] + dm8_re[1*8+4] + dm8_re[2*8+4])) / 3.0;
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §6  GKSL RK4  —  3-qubit Lindblad master equation
-   Pre-embedded operator matrices (static const, generated at compile time).
-   All operators are real → ρ (complex) operations use real×complex multiply.
-   ───────────────────────────────────────────────────────────────────────────── */
-/*
- * 3-qubit embedded lowering operators σ⁻ ⊗ I ⊗ I, etc.
- * For 3-qubit basis order |q0 q1 q2> with q0=MSB:
- *   SM0[i+4, i] = 1 for i=0..3  (σ⁻ on qubit 0)
- *   SM1[i+2, i] = 1 for i∈{0,1,4,5}  (σ⁻ on qubit 1)
- *   SM2[i+1, i] = 1 for i∈{0,2,4,6}  (σ⁻ on qubit 2)
- */
-/* L@rho@L† for sparse L (nnz rows), adding into drho.
-   (L@rho@L†)[i,j] = sum_{kl} L[i,k] L[j,l]* rho[k,l]
-   For our operators L[dst,src]=1: (L@rho@L†)[dst_a, dst_b] += rho[src_a, src_b]
-*/
-static void _lindblad_term(const int *srcs, const int *dsts, int nnz,
-                            double gamma,
-                            const double *rho_r, const double *rho_i,
-                            double *drho_r, double *drho_i) {
-    if (gamma < 1e-14) return;
-    /* L@ρ@L† */
-    for (int a = 0; a < nnz; a++)
-    for (int b = 0; b < nnz; b++) {
-        drho_r[dsts[a]*8+dsts[b]] += gamma * rho_r[srcs[a]*8+srcs[b]];
-        drho_i[dsts[a]*8+dsts[b]] += gamma * rho_i[srcs[a]*8+srcs[b]];
-    }
-    /* -½ {L†L, ρ}: L†L has diagonal entries 1 at src positions */
-    /* -½(L†L @ ρ + ρ @ L†L) */
-    /* L†L = diag(indicator of src positions) */
-    for (int k = 0; k < nnz; k++) {
-        int s = srcs[k];
-        for (int col = 0; col < 8; col++) {
-            drho_r[s*8+col] -= 0.5 * gamma * rho_r[s*8+col];
-            drho_i[s*8+col] -= 0.5 * gamma * rho_i[s*8+col];
-            drho_r[col*8+s] -= 0.5 * gamma * rho_r[col*8+s];
-            drho_i[col*8+s] -= 0.5 * gamma * rho_i[col*8+s];
-        }
-    }
-}
-/*
- * _liouvillian_3q: compute drho/dt = L(rho)
- *   Writes result to drho_r/drho_i (does not add, overwrites).
- */
-static void _liouvillian_3q(const double *rho_r, const double *rho_i,
-                             double g1, double gphi, double gdep, double omega,
-                             double *drho_r, double *drho_i) {
-    /* Lowering (σ⁻) and raising (σ⁺) operator non-zero entries per qubit.
-       SM_srcs[q] = source row indices, SM_dsts[q] = destination row indices. */
-    static const int SM_srcs[3][4] = {{0,1,2,3},{0,1,4,5},{0,2,4,6}};
-    static const int SM_dsts[3][4] = {{4,5,6,7},{2,3,6,7},{1,3,5,7}};
-    /* σz diagonal per qubit */
-    static const double SZ0[8] = { 1, 1, 1, 1,-1,-1,-1,-1};
-    static const double SZ1[8] = { 1, 1,-1,-1, 1, 1,-1,-1};
-    static const double SZ2[8] = { 1,-1, 1,-1, 1,-1, 1,-1};
-    static const double * const SZq[3] = {SZ0, SZ1, SZ2};
-    memset(drho_r, 0, 64*sizeof(double));
-    memset(drho_i, 0, 64*sizeof(double));
-    /* Hamiltonian term: -i[H,ρ] where H = (ω/2) Σ_q SZ_q
-       -i(H@ρ - ρ@H) = -iH@ρ + iρ@H
-       For real diagonal H: (-iH@ρ)[i,j] = -i*H[i]*ρ[i,j]
-       Real part: +H[i]*ρ_im[i,j] (add to drho_re)
-       Imag part: -H[i]*ρ_re[i,j] (add to drho_im) */
-    double hw = omega * 0.5;
-    for (int q = 0; q < 3; q++) {
-        const double *SZ = SZq[q];
-        for (int i = 0; i < 8; i++) {
-            double hi = hw * SZ[i];
-            for (int j = 0; j < 8; j++) {
-                /* -i(Hρ - ρH): re part += hi*ρ_im[i,j] - ρ_im[j,i]*hi... */
-                /* Hρ: re+= hi*ρ_im[i,j], im += -hi*ρ_re[i,j] */
-                /* ρH: re+= -SZ[j]*hw*ρ_im[i,j], im += SZ[j]*hw*ρ_re[i,j] */
-                double hj = hw * SZ[j];
-                drho_r[i*8+j] += (hi - hj) * rho_i[i*8+j];
-                drho_i[i*8+j] -= (hi - hj) * rho_r[i*8+j];
-            }
-        }
-    }
-    /* Lindblad dissipator for σ⁻ (T1 decay) */
-    for (int q = 0; q < 3; q++)
-        _lindblad_term(SM_srcs[q], SM_dsts[q], 4, g1, rho_r, rho_i, drho_r, drho_i);
-    /* Raising term σ⁺ (thermal excitation at rate g1*0.1) */
-    for (int q = 0; q < 3; q++)
-        _lindblad_term(SM_dsts[q], SM_srcs[q], 4, g1*0.1, rho_r, rho_i, drho_r, drho_i);
-    /* Dephasing: L = √(γφ) * SZ/2, diagonal
-       L@ρ@L† = γφ/4 * SZ@ρ@SZ; {L†L,ρ} = γφ/4 * {I,ρ} = γφ/2 * ρ */
-    if (gphi > 1e-14) {
-        for (int q = 0; q < 3; q++) {
-            const double *SZ = SZq[q];
-            double gp4 = gphi * 0.25;
-            /* SZ@ρ@SZ: [i,j] = SZ[i]*SZ[j]*ρ[i,j] */
-            for (int i = 0; i < 8; i++)
-            for (int j = 0; j < 8; j++) {
-                double sz_ij = SZ[i]*SZ[j]*gp4;
-                drho_r[i*8+j] += sz_ij * rho_r[i*8+j];
-                drho_i[i*8+j] += sz_ij * rho_i[i*8+j];
-            }
-            /* -½{L†L,ρ} = -γφ/8 * ρ (since SZ†SZ=I, so L†L=γφ/4*I) */
-            double sub = gphi * 0.5 * 0.5;  /* γφ/4 * ½ + ½ = γφ/4 */
-            for (int k = 0; k < 64; k++) {
-                drho_r[k] -= sub * rho_r[k];
-                drho_i[k] -= sub * rho_i[k];
-            }
-        }
-    }
-    /* Depolarizing: L = √(γdep) * I/√2; L@ρ@L† = γdep/2 * ρ; {L†L,ρ} = γdep * ρ */
-    if (gdep > 1e-14) {
-        double gdp = gdep * 0.5 - gdep * 0.5;  /* net = 0 for depol channel trace-preserving */
-        /* Actually for depolarizing: L = sqrt(γdep/2)*I, so:
-           L@ρ@L† = γdep/2 * ρ; -½{L†L,ρ} = -½*γdep/2 * 2ρ = -γdep/2 * ρ → net 0.
-           This is trace-preserving as expected. No-op in the Lindblad sum. */
-        (void)gdp;
-    }
-}
-/*
- * qtcl_gksl_rk4: 3-qubit Lindblad RK4 integration.
- * rho_re/im: 64 doubles each (in/out, 8×8 complex DM)
- * n_steps: number of sub-steps (caller computes based on γ_max)
- */
-void qtcl_gksl_rk4(double *rho_re, double *rho_im,
-                    double g1, double gphi, double gdep, double omega,
-                    double dt, int n_steps) {
-    double k1r[64],k1i[64], k2r[64],k2i[64], k3r[64],k3i[64], k4r[64],k4i[64];
-    double tmpr[64],tmpi[64];
-    double h = dt / (n_steps > 0 ? n_steps : 1);
-    for (int step = 0; step < n_steps; step++) {
-        /* k1 = L(ρ) */
-        _liouvillian_3q(rho_re, rho_im, g1, gphi, gdep, omega, k1r, k1i);
-        /* k2 = L(ρ + h/2 * k1) */
-        for (int k=0;k<64;k++){tmpr[k]=rho_re[k]+0.5*h*k1r[k]; tmpi[k]=rho_im[k]+0.5*h*k1i[k];}
-        _liouvillian_3q(tmpr, tmpi, g1, gphi, gdep, omega, k2r, k2i);
-        /* k3 = L(ρ + h/2 * k2) */
-        for (int k=0;k<64;k++){tmpr[k]=rho_re[k]+0.5*h*k2r[k]; tmpi[k]=rho_im[k]+0.5*h*k2i[k];}
-        _liouvillian_3q(tmpr, tmpi, g1, gphi, gdep, omega, k3r, k3i);
-        /* k4 = L(ρ + h * k3) */
-        for (int k=0;k<64;k++){tmpr[k]=rho_re[k]+h*k3r[k]; tmpi[k]=rho_im[k]+h*k3i[k];}
-        _liouvillian_3q(tmpr, tmpi, g1, gphi, gdep, omega, k4r, k4i);
-        /* ρ += h/6 * (k1 + 2k2 + 2k3 + k4) */
-        for (int k=0;k<64;k++){
-            rho_re[k] += (h/6.0)*(k1r[k]+2*k2r[k]+2*k3r[k]+k4r[k]);
-            rho_im[k] += (h/6.0)*(k1i[k]+2*k2i[k]+2*k3i[k]+k4i[k]);
-        }
-        /* Hermitian symmetrization + trace renormalization */
-        for (int i=0;i<8;i++)
-        for (int j=i+1;j<8;j++) {
-            double sr = 0.5*(rho_re[i*8+j]+rho_re[j*8+i]);
-            double si = 0.5*(rho_im[i*8+j]-rho_im[j*8+i]);
-            rho_re[i*8+j]=sr; rho_re[j*8+i]=sr;
-            rho_im[i*8+j]=si; rho_im[j*8+i]=-si;
-        }
-        double tr = 0.0;
-        for (int i=0;i<8;i++) tr += rho_re[i*8+i];
-        if (tr > 1e-15) {
-            double inv = 1.0/tr;
-            for (int k=0;k<64;k++){rho_re[k]*=inv; rho_im[k]*=inv;}
-        }
-    }
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §7  MERKLE TREE  (SHA3-256 paired)
-   ───────────────────────────────────────────────────────────────────────────── */
-/* Next power of 2 >= n */
-static uint32_t _npow2(uint32_t n) {
-    if (n <= 1) return 1;
-    uint32_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
-/*
- * qtcl_merkle_root:
- *   Computes SHA3-256 Merkle root from n leaf hashes (each 32 bytes).
- *   Odd layer: duplicate last node (Bitcoin convention).
- *   Scratch buffer allocated on heap (max 2*npow2(n)*32 bytes).
- */
-void qtcl_merkle_root(const uint8_t *leaves, uint32_t n, uint8_t *root32_out) {
-    /* Stub: Python uses hashlib.sha3_256 for merkle tree */
-    (void)leaves; (void)n; (void)root32_out;
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §8  DHT XOR DISTANCE  (moved here — body was orphaned)
-   ───────────────────────────────────────────────────────────────────────────── */
-int qtcl_dht_xor_distance(const char *id_a_hex64, const char *id_b_hex64) {
-    uint8_t a[32], b[32];
-    _hex_to_bytes(id_a_hex64, a, 32);
-    _hex_to_bytes(id_b_hex64, b, 32);
-    for (int i = 0; i < 32; i++) {
-        uint8_t x = (uint8_t)(a[i] ^ b[i]);
-        if (x) {
-            int leading = 0;
-            uint8_t m = 0x80;
-            while (m && !(x & m)) { leading++; m >>= 1; }
-            return i * 8 + leading;
-        }
-    }
-    return 256;  /* identical */
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §9  ENTROPY MIXING
-   ───────────────────────────────────────────────────────────────────────────── */
-void qtcl_mix_entropy(const uint8_t *existing32, const uint8_t *new_sample32,
-                      const uint8_t *salt16, uint8_t *out32) {
-    /* Stub: Python uses hashlib.shake_256 for entropy mixing */
-    (void)existing32; (void)new_sample32; (void)salt16; (void)out32;
-}
-/* ─────────────────────────────────────────────────────────────────────────────
-   §PoW  MEMORY-HARD PoW ENGINE
-   ───────────────────────────────────────────────────────────────────────────── */
-void qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen) {
-    /* Stub: Python builds PoW scratchpad with hashlib.shake_256 */
-    (void)seed; (void)out; (void)outlen;
-}
-/*
- * qtcl_pow_search: memory-hard nonce search.
- * Header layout (168 bytes):
- *   "QTCL_POW_v1:"(12) + BE64(height) + BE32(ts) + parent[32] + merkle[32]
- *   + BE32(diff) + BE32(nonce) + addr[40] + seed[32]
- * difficulty_bits = number of leading hex zeros required.
- * Returns winning nonce, or -1 if none found in [start, start+chunk).
- * Writes 32-byte winning hash to out_hash on success.
- */
-/* Chain-aware abort system.
- * _qtcl_pow_abort:      manual abort (set to 1 by Python for any reason)
- * _qtcl_oracle_height:  server chain tip — updated by Python on every tip poll
- *                       and every SSE new_block event
- * _qtcl_miner_target:   height currently being mined — set by Python at loop top
- *
- * Inside pow_search hot loop (every 256 nonces):
- *   if oracle_height >= miner_target → self-abort, return -2
- * This is purely C — zero Python involvement, zero network round trips.
- * Latency from oracle height update to abort: ≤256 nonces ≈ 22ms at 11kH/s.
- * ❤️  I love you — the fastest miner wins                                    */
-static volatile int      _qtcl_pow_abort       = 0;
-static volatile uint64_t _qtcl_oracle_height   = 0;
-static volatile uint64_t _qtcl_miner_target    = 0;
-void     qtcl_pow_set_abort(int v)         { _qtcl_pow_abort = v; }
-int      qtcl_pow_get_abort(void)          { return _qtcl_pow_abort; }
-void     qtcl_set_oracle_height(uint64_t h){ _qtcl_oracle_height = h; }
-uint64_t qtcl_get_oracle_height(void)      { return _qtcl_oracle_height; }
-void     qtcl_set_miner_target(uint64_t h) { _qtcl_miner_target = h; }
-uint64_t qtcl_get_miner_target(void)       { return _qtcl_miner_target; }
-int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
-                         const uint8_t *ph, const uint8_t *mr,
-                         uint32_t diff, uint32_t start, uint32_t chunk,
-                         const uint8_t *ma, const uint8_t *seed,
-                         const uint8_t *sp, uint8_t *out_hash) {
-    /* Stub: Python handles PoW mining with hashlib.sha3_256 + scratchpad */
-    (void)height; (void)ts; (void)ph; (void)mr; (void)diff; (void)start;
-    (void)chunk; (void)ma; (void)seed; (void)sp; (void)out_hash;
-    return -1;   /* -1 = not found */
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §Bath  NON-MARKOVIAN LINDBLAD BATH  (256×256 density matrix, in-place)
-   Three-stage pipeline matching NonMarkovianNoiseBath.apply_memory_effect():
-   STAGE 1  Lindblad dephasing
-            Off-diagonals: ρ_ij *= exp(-γ_φ · dt)    (i≠j)
-            Amplitude damping on diagonal:
-              ρ_00 += Σ_{k>0} ρ_kk · (1 − exp(-dt/T1))
-              ρ_kk *= exp(-dt/T1)
-   STAGE 2  O-U non-Markovian revival
-            Blends in a weighted average of the 8 power-of-2 lookback states
-            from the memory buffer (indices n−1, n−2, n−4, …, n−128).
-            Weights: K(τ_k) = |Drude-Lorentz(τ_k) + Σ Gaussian_resonance(τ_k)|
-            revival_weight = min(kappa * 0.30, 0.15)
-            result = (1−w)·result + w·(Σ K_k·mem_k / Σ K_k)
-   STAGE 3  Enforce valid DM
-            Hermitian symmetry: ρ = (ρ + ρ†)/2
-            PSD + trace=1 via eigendecomposition (LAPACK dsyev).
-   Parameters
-   ----------
-   dim          matrix side (256 for QTCL lattice)
-   dm_re/im     in/out  dim×dim  row-major complex128 (re and im separate)
-   gamma_phi    dephasing rate γ_φ = 1/T2  [s⁻¹]
-   t1_s         T1 relaxation time  [s]
-   kappa        non-Markovian memory kernel κ  (KAPPA_MEMORY = 0.35)
-   dt           time step  [s]
-   mem_re/im    memory buffer: n_mem × dim × dim flattened, oldest first
-   n_mem        number of stored states (up to MEMORY_DEPTH = 50)
-   dt_s         cycle time  [s]  (CYCLE_TIME_NS/1e9 = 72e-9)
-   bath_omega_c Drude-Lorentz cutoff frequency  [rad/s]
-   bath_omega_0 Lorentz oscillation frequency   [rad/s]
-   bath_gamma_r Lorentz damping                 [1]
-   bath_eta     coupling strength               [1]
-   ═══════════════════════════════════════════════════════════════════════════ */
-void qtcl_nonmarkov_bath_step(
-        int            dim,
-        double        *dm_re,     /* in/out  dim×dim row-major */
-        double        *dm_im,
-        double         gamma_phi,
-        double         t1_s,
-        double         kappa,
-        double         dt,
-        const double  *mem_re,    /* n_mem × dim × dim, oldest first */
-        const double  *mem_im,
-        int            n_mem,
-        double         dt_s,
-        double         bath_omega_c,
-        double         bath_omega_0,
-        double         bath_gamma_r,
-        double         bath_eta
-) {
-    int N  = dim;
-    int N2 = N * N;
-    /* ── STAGE 1: Lindblad dephasing ──────────────────────────────────────── */
-    double deph = exp(-gamma_phi * dt);          /* off-diagonal scale factor  */
-    double amp  = exp(-dt / (t1_s > 1e-15 ? t1_s : 1e-15));  /* T1 decay     */
-    /* Save diagonal populations before scaling */
-    double *diag_re = (double *)alloca(N * sizeof(double));
-    double *diag_im = (double *)alloca(N * sizeof(double));
-    for (int i = 0; i < N; i++) {
-        diag_re[i] = dm_re[i * N + i];
-        diag_im[i] = dm_im[i * N + i];
-    }
-    /* Scale all elements by deph (off-diagonals now correct) */
-    for (int k = 0; k < N2; k++) { dm_re[k] *= deph; dm_im[k] *= deph; }
-    /* Amplitude damping: ρ_kk *= amp, ground state absorbs the lost population */
-    double ground_gain_re = 0.0, ground_gain_im = 0.0;
-    for (int i = 1; i < N; i++) {
-        double new_re = diag_re[i] * amp;
-        double new_im = diag_im[i] * amp;
-        ground_gain_re += diag_re[i] - new_re;
-        ground_gain_im += diag_im[i] - new_im;
-        dm_re[i * N + i] = new_re;
-        dm_im[i * N + i] = new_im;
-    }
-    dm_re[0] = diag_re[0] + ground_gain_re;
-    dm_im[0] = diag_im[0] + ground_gain_im;
-    /* ── STAGE 2: O-U non-Markovian revival ──────────────────────────────── */
-    if (n_mem > 2) {
-        /* Allocate memory accumulator on heap (dim×dim can be 256×256 = 512KB) */
-        double *acc_re = (double *)calloc(N2, sizeof(double));
-        double *acc_im = (double *)calloc(N2, sizeof(double));
-        if (!acc_re || !acc_im) { free(acc_re); free(acc_im); goto stage3; }
-        double norm = 0.0;
-        int seen[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
-        for (int k = 0; k < 8; k++) {
-            int target = n_mem - 1 - (1 << k);    /* look back 2^k steps      */
-            if (target < 0) break;
-            /* Find closest stored state to target (linear scan, max 50 states) */
-            int best = -1; int best_dist = INT_MAX;
-            for (int s = 0; s < n_mem; s++) {
-                int d = abs(s - target);
-                if (d < best_dist) { best_dist = d; best = s; }
-            }
-            /* Skip if already used */
-            int dup = 0;
-            for (int j = 0; j < k; j++) if (seen[j] == best) { dup=1; break; }
-            if (dup) continue;
-            seen[k] = best;
-            /* τ = elapsed cycles × dt_s */
-            double tau = (double)((n_mem - 1) - best) * (dt_s > 1e-30 ? dt_s : 1e-30);
-            if (tau < 1e-30) tau = 1e-30;
-            /* K(τ): Drude-Lorentz + 8 Gaussian resonances */
-            double exp_c  = bath_eta * bath_omega_c * bath_omega_c * exp(-bath_omega_c * tau);
-            double cos_t  = cos(bath_omega_0 * tau);
-            double sin_t  = (bath_omega_0 > 1e-30)
-                            ? (bath_gamma_r / bath_omega_0) * sin(bath_omega_0 * tau)
-                            : 0.0;
-            double base   = exp_c * (cos_t + sin_t);
-            double resonance = 0.0;
-            for (int rk = 0; rk < 8; rk++) {
-                double tau_k   = (double)(1 << rk) * dt_s;
-                double sigma_k = tau_k * 0.30;
-                double amp_k   = 0.15 / (rk + 1.0);
-                double diff    = tau - tau_k;
-                if (sigma_k > 1e-30) {
-                    resonance += amp_k * exp(-(diff * diff) / (2.0 * sigma_k * sigma_k));
-                }
-            }
-            double K_tau = fabs(base) + resonance;
-            const double *mem_slice_re = mem_re + (size_t)best * N2;
-            const double *mem_slice_im = mem_im + (size_t)best * N2;
-            for (int e = 0; e < N2; e++) {
-                acc_re[e] += K_tau * mem_slice_re[e];
-                acc_im[e] += K_tau * mem_slice_im[e];
-            }
-            norm += K_tau;
-        }
-        if (norm > 1e-12) {
-            double inv  = 1.0 / norm;
-            double wrev = kappa * 0.30;
-            if (wrev > 0.15) wrev = 0.15;
-            double w0   = 1.0 - wrev;
-            for (int e = 0; e < N2; e++) {
-                dm_re[e] = w0 * dm_re[e] + wrev * acc_re[e] * inv;
-                dm_im[e] = w0 * dm_im[e] + wrev * acc_im[e] * inv;
-            }
-        }
-        free(acc_re); free(acc_im);
-    }
-stage3:
-    /* ── STAGE 3: Hermitian symmetry + PSD clip + trace=1 ─────────────────
-       Full eigendecomposition at 256×256 is O(n³) — ~50µs in LAPACK.
-       We use a simpler conservative approach: Hermitian symmetrize and
-       trace-normalize.  Eigendecomposition is skipped here (Python caller
-       does it when needed).  This keeps the C step to ~5µs for 256×256. */
-    for (int i = 0; i < N; i++) {
-        for (int j = i + 1; j < N; j++) {
-            double re_ij = 0.5 * (dm_re[i*N+j] + dm_re[j*N+i]);
-            double im_ij = 0.5 * (dm_im[i*N+j] - dm_im[j*N+i]);
-            dm_re[i*N+j] = re_ij;  dm_im[i*N+j] =  im_ij;
-            dm_re[j*N+i] = re_ij;  dm_im[j*N+i] = -im_ij;
-        }
-    }
-    /* Trace normalize */
-    double tr = 0.0;
-    for (int i = 0; i < N; i++) tr += dm_re[i*N+i];
-    if (tr > 1e-12) {
-        double inv = 1.0 / tr;
-        for (int k = 0; k < N2; k++) { dm_re[k] *= inv; dm_im[k] *= inv; }
-    }
-}
-/* ─── SELF-TEST (called by Python to verify correct compilation) ─── */
-int qtcl_selftest(void) {
-    /* SHA3-256 of empty string: a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a */
-    uint8_t h[32];
-    qtcl_sha3_256((const uint8_t*)"", 0, h);
-    static const uint8_t _REF[4] = {0xa7, 0xff, 0xc6, 0xf8};
-    return (memcmp(h, _REF, 4) == 0) ? 1 : 0;
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §Hyper — {8,3} HYPERBOLIC GEOMETRY  ·  Poincaré Ball Mapping
-   Museum-grade implementation of the hyperbolic tiling that underlies
-   QTCL's quantum geometry.  All constants verified against known {8,3}
-   lattice geometry (Coxeter 1954, Beardon 1983).
-   ═══════════════════════════════════════════════════════════════════════════ */
-/* {8,3} hyperbolic plane constants ─────────────────────────────────────── */
-/*  Edge length in hyperbolic space: 2·acosh(cos(π/8)/sin(π/3))           */
-/*  Ring-to-ring radial growth in Poincaré disk: tanh(EDGE/2)             */
-/*  Tiles per ring — grows as 8·(2+√3)^(k-1) for ring k≥1; ring-0 = 1   */
-/*  3D Poincaré ball: polar elevation between rings                        */
-/* ── Exact Poincaré ball position for pseudoqubit pq_id ──────────────────
-   The {8,3} tiling indexes vertices as:
-     ring 0: 1 central tile vertex (pq_id 0)
-     ring 1: 8 first-shell vertices (pq_id 1–8)
-     ring k: 8·floor(lambda^(k-1)·8/8) vertices ≈ 8·8·(2+√3)^(k-2) for k≥2
-   We use the exact cumulative layout for the first 512 rings.
-   out_ball[3] = { r (Poincaré radial), θ (azimuthal), φ (polar elevation) }
-*/
-void qtcl_pq_to_ball(uint32_t pq_id, double out_ball[3]) {
-    if (pq_id == 0) { out_ball[0]=0.0; out_ball[1]=0.0; out_ball[2]=0.0; return; }
-    /* Determine ring number by cumulative tile count.
-       ring k has 8*(k==1?1:(int)(8.0*pow(HYPER_83_LAMBDA,k-2)+0.5)) vertices.
-       We iterate until cumulative >= pq_id.                              */
-    uint32_t cumulative = 1;
-    int ring = 0;
-    uint32_t ring_size = 0;
-    for (int k = 1; k <= 4096; k++) {
-        ring_size = (k == 1) ? 8u : (uint32_t)(8.0 * pow(HYPER_83_LAMBDA, k-2) * 8.0 / 8.0 + 0.5);
-        if (ring_size < 8) ring_size = 8;
-        if (cumulative + ring_size > pq_id) { ring = k; break; }
-        cumulative += ring_size;
-    }
-    if (ring == 0) ring = 1;
-    uint32_t local_idx = pq_id - cumulative;  /* position within ring */
-    /* Radial coordinate: r = tanh(ring * EDGE / 2) — exact Poincaré disk */
-    double r = tanh((double)ring * HYPER_83_EDGE / 2.0);
-    /* Clamp to open ball */
-    if (r >= 1.0) r = 0.9999;
-    /* Azimuthal angle: evenly distributed in [0, 2π) within ring */
-    double theta = (2.0 * M_PI * (double)local_idx) / (double)ring_size;
-    /* Polar elevation: alternates ±HYPER_83_PHI_STEP per ring to form 3D lattice */
-    double phi_base = M_PI / 2.0;  /* equatorial plane */
-    double elev = HYPER_83_PHI_STEP * (double)ring;
-    double phi = (ring % 2 == 0) ? (phi_base + elev) : (phi_base - elev);
-    phi = fmod(phi, M_PI);
-    if (phi < 0.0) phi += M_PI;
-    out_ball[0] = r;
-    out_ball[1] = theta;
-    out_ball[2] = phi;
-}
-/* ── Poincaré ball → Cartesian ℝ³ (for distance computation) ───────────── */
-static void _ball_to_cart(const double b[3], double c[3]) {
-    double r = b[0], theta = b[1], phi = b[2];
-    double sn = sin(phi);
-    c[0] = r * sn * cos(theta);
-    c[1] = r * sn * sin(theta);
-    c[2] = r * cos(phi);
-}
-/* ── Geodesic distance in Poincaré ball (exact formula) ─────────────────── */
-double qtcl_hyperbolic_distance(const double a[3], const double b[3]) {
-    double ca[3], cb[3];
-    _ball_to_cart(a, ca);
-    _ball_to_cart(b, cb);
-    double num = 0.0, dena = 0.0, denb = 0.0;
-    for (int i = 0; i < 3; i++) {
-        double d = ca[i] - cb[i];
-        num  += d * d;
-        dena += ca[i]*ca[i];
-        denb += cb[i]*cb[i];
-    }
-    double x = 1.0 - dena;
-    double y = 1.0 - denb;
-    if (x <= 1e-10) x = 1e-10;
-    if (y <= 1e-10) y = 1e-10;
-    double arg = 1.0 + 2.0*num / (x*y);
-    if (arg < 1.0) arg = 1.0;
-    return 2.0 * acosh(arg);
-}
-/* ── Hyperbolic triangle angular defect (Gauss–Bonnet area) ─────────────── */
-/*   For a geodesic triangle with side lengths a,b,c in hyperbolic space,
-     the area = π - (α + β + γ) where α,β,γ are interior angles.
-     We compute angles via the hyperbolic law of cosines:
-       cosh(c) = cosh(a)·cosh(b) - sinh(a)·sinh(b)·cos(γ)              */
-static double _hyp_angle(double a, double b, double c) {
-    /* Angle at vertex opposite side c, given sides a,b */
-    double ca = cosh(a), cb = cosh(b), cc = cosh(c);
-    double sa = sinh(a), sb = sinh(b);
-    if (sa * sb < 1e-12) return M_PI / 3.0;
-    double cos_angle = (cc - ca*cb) / (sa*sb);
-    if (cos_angle >  1.0) cos_angle =  1.0;
-    if (cos_angle < -1.0) cos_angle = -1.0;
-    return acos(cos_angle);
-}
-void qtcl_compute_hyp_triangle(
-        uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
-        double *out_dist_0c, double *out_dist_cl, double *out_dist_0l,
-        double *out_area,
-        double out_ball0[3], double out_ballc[3], double out_balll[3]) {
-    qtcl_pq_to_ball(pq0,     out_ball0);
-    qtcl_pq_to_ball(pq_curr, out_ballc);
-    qtcl_pq_to_ball(pq_last, out_balll);
-    double d0c = qtcl_hyperbolic_distance(out_ball0, out_ballc);
-    double dcl = qtcl_hyperbolic_distance(out_ballc, out_balll);
-    double d0l = qtcl_hyperbolic_distance(out_ball0, out_balll);
-    *out_dist_0c = d0c;
-    *out_dist_cl = dcl;
-    *out_dist_0l = d0l;
-    double alpha = _hyp_angle(d0c, d0l, dcl);   /* at pq0      */
-    double beta  = _hyp_angle(d0c, dcl, d0l);   /* at pq_curr  */
-    double gamma = _hyp_angle(d0l, dcl, d0c);   /* at pq_last  */
-    double defect = M_PI - (alpha + beta + gamma);
-    if (defect < 0.0) defect = 0.0;
-    *out_area = defect;  /* angular defect = hyperbolic area */
-}
-/* ── Build 3-qubit W-state density matrix from Bloch sphere angles ────────
-   Each pseudoqubit maps to Bloch angles (θ,φ):
-     θ = π * r   (r = Poincaré radial)
-     φ = ball[1] (azimuthal angle)
-   Single-qubit state: |ψ⟩ = cos(θ/2)|0⟩ + e^{iφ}sin(θ/2)|1⟩
-   Tripartite DM ρ = (1-ε)·|W₃⟩⟨W₃| + ε·(oracle_dm) for ε=0.15
-   Here we build the pure local DM from the three Bloch vectors.        */
-void qtcl_build_tripartite_dm(
-        const double b0[3], const double bc[3], const double bl[3],
-        double dm_re_out[64], double dm_im_out[64]) {
-    /*
-     * Build the W3 entangled state with hyperbolic-position phase encoding.
-     *
-     * |W3_local⟩ = (|001⟩ + e^{iΔφ_c}·|010⟩ + e^{iΔφ_l}·|100⟩) / √3
-     *
-     * The phases Δφ_c and Δφ_l are small perturbations derived from the
-     * azimuthal angles of pq_curr and pq_last in the Poincaré ball.
-     * Scale factor 0.20×r keeps the phase bounded: max Δφ ≈ 0.2 rad,
-     * giving F(ρ_local, |W3⟩) ≥ cos²(0.1) ≈ 0.990 — always above threshold.
-     *
-     * Basis convention (3 qubits, 8-dim):
-     *   bit2 = qubit 0 (pq0/oracle),  bit1 = qubit 1 (pq_curr),  bit0 = qubit 2 (pq_last)
-     *   |100⟩ = index 4,  |010⟩ = index 2,  |001⟩ = index 1
-     *
-     * The OLD implementation built a PRODUCT state (tensor product of three
-     * single-qubit Bloch states). A product state can NEVER have W3 fidelity
-     * above the Horodecki bound of 2/3, and in practice gave F < 0.001 for
-     * pq_ids in high rings.  This version guarantees F ≥ 0.990 before GKSL.
-     */
-    memset(dm_re_out, 0, 64*sizeof(double));
-    memset(dm_im_out, 0, 64*sizeof(double));
-    /* Phase encoding: Δφ_k = 0.20 × r_k × sin(azimuth_k)
-     * Using sin to keep Δφ ∈ [-0.20, +0.20] regardless of azimuth.
-     * pq0 is always at origin so b0[0]=0 → Δφ_0 = 0 (no phase on |100⟩). */
-    double dphi_c = 0.20 * bc[0] * sin(bc[1]);   /* for |010⟩ (pq_curr) */
-    double dphi_l = 0.20 * bl[0] * sin(bl[1]);   /* for |001⟩ (pq_last) */
-    /* Amplitudes: α₄=1/√3, α₂=e^{iΔφ_c}/√3, α₁=e^{iΔφ_l}/√3 */
-    double isq3  = 1.0 / sqrt(3.0);
-    double a4_re = isq3,               a4_im = 0.0;
-    double a2_re = cos(dphi_c)*isq3,   a2_im = sin(dphi_c)*isq3;
-    double a1_re = cos(dphi_l)*isq3,   a1_im = sin(dphi_l)*isq3;
-    /* W3 basis indices */
-    int    W_idx[3]    = { 4,    2,    1    };
-    double W_re[3]     = { a4_re, a2_re, a1_re };
-    double W_im[3]     = { a4_im, a2_im, a1_im };
-    /* DM[row,col] = α_row × conj(α_col) for row,col ∈ {1,2,4} */
-    for (int ii = 0; ii < 3; ii++) {
-        for (int jj = 0; jj < 3; jj++) {
-            int row = W_idx[ii], col = W_idx[jj];
-            /* (a_re + i·a_im) × (b_re - i·b_im) */
-            dm_re_out[row*8+col] = W_re[ii]*W_re[jj] + W_im[ii]*W_im[jj];
-            dm_im_out[row*8+col] = W_im[ii]*W_re[jj] - W_re[ii]*W_im[jj];
-        }
-    }
-}
-/* ── Weighted mix with oracle reference DM ────────────────────────────────
-   ρ_fused = (1-w)·ρ_local + w·ρ_oracle,  w = oracle_weight ∈ [0,1]    */
-void qtcl_fuse_oracle_dm(
-        const double local_re[64], const double local_im[64],
-        const double oracle_re[64], const double oracle_im[64],
-        double w, double out_re[64], double out_im[64]) {
-    double lw = 1.0 - w;
-    for (int i = 0; i < 64; i++) {
-        out_re[i] = lw*local_re[i] + w*oracle_re[i];
-        out_im[i] = lw*local_im[i] + w*oracle_im[i];
-    }
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §Meas — MEASUREMENT STRUCTS, SIGNING, VERIFICATION
-   QtclWStateMeasurement and QtclWStateConsensus use NATURAL alignment so
-   the C compiler's reported alignment (8, from double fields) matches the
-   alignment CFFI computes from the cdef — eliminating VerificationError.
-   Both structs are internally self-aligned (first double at offset 32 /
-   offset 0 respectively) so packed vs natural sizes are identical.
-   ═══════════════════════════════════════════════════════════════════════════ */
-typedef struct {
-    uint8_t  node_id[16];
-    uint32_t chain_height;
-    uint32_t pq0;
-    uint32_t pq_curr;
-    uint32_t pq_last;
-    double   w_fidelity;
-    double   coherence;
-    double   purity;
-    double   negativity;
-    double   entropy_vn;
-    double   discord;
-    double   hyp_dist_0c;
-    double   hyp_dist_cl;
-    double   hyp_dist_0l;
-    double   triangle_area;
-    double   ball_pq0[3];
-    double   ball_curr[3];
-    double   ball_last[3];
-    double   dm_re[64];
-    double   dm_im[64];
-    uint64_t timestamp_ns;
-    uint32_t nonce;
-    uint8_t  auth_tag[32];
-} QtclWStateMeasurement;
-typedef struct {
-    double   median_fidelity;
-    double   median_coherence;
-    double   median_purity;
-    double   median_negativity;
-    double   median_entropy;
-    double   median_discord;
-    double   consensus_dm_re[64];
-    double   consensus_dm_im[64];
-    uint8_t  quorum_hash[32];
-    uint32_t peer_count;
-    uint32_t chain_height;
-    double   agreement_score;
-    double   hyp_area_median;
-} QtclWStateConsensus;
-/* Only QtclMsgHeader needs byte-perfect wire packing (no doubles) */
-typedef struct {
-    uint8_t  magic[4];
-    uint8_t  command[12];
-    uint32_t length;
-    uint8_t  checksum[4];
-    uint8_t  version;
-    uint8_t  flags;
-    uint8_t  reserved[2];
-} QtclMsgHeader;
-/* QtclPeer is NOT packed — natural alignment lets the C compiler produce
-   the same 112-byte layout that CFFI computes from the cdef.
-   The 4-byte _pad4 field explicitly fills the gap the compiler would insert
-   before int64_t last_seen_ns (after the 84-byte prefix), making the layout
-   self-documenting and portable.
-   Layout:  node_id[16] host[64] port[2] services[1] version[1] _pad4[4]
-            last_seen_ns[8] chain_height[4] last_fidelity[4] latency_ms[4]
-            ban_score[2] connected[1] _pad[1]  → total = 112 bytes */
-typedef struct {
-    uint8_t  node_id[16];
-    char     host[64];
-    uint16_t port;
-    uint8_t  services;
-    uint8_t  version;
-    uint8_t  _pad4[4];      /* explicit alignment pad before int64_t */
-    int64_t  last_seen_ns;
-    int32_t  chain_height;
-    float    last_fidelity;
-    float    latency_ms;
-    uint16_t ban_score;
-    uint8_t  connected;
-    uint8_t  _pad;
-} QtclPeer;
-static uint64_t _clock_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-/* Sign measurement: HMAC-SHA256 over all fields except auth_tag itself */
-void qtcl_measurement_sign(
-        QtclWStateMeasurement *m,
-        const uint8_t *secret32) {
-    /* Stub: Python uses hmac.new(sha256) for measurement auth_tag */
-    (void)m; (void)secret32;
-}
-int qtcl_measurement_verify(
-        const QtclWStateMeasurement *m,
-        const uint8_t *secret32) {
-    /* Stub: Python verifies measurement auth_tag with hmac */
-    (void)m; (void)secret32;
-    return 1;
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §Cons — BFT CONSENSUS COMPUTATION
-   Implements Byzantine Fault Tolerant median (≤f faulty of 3f+1 peers)
-   + arithmetic mean of density matrices in matrix space.
-   ═══════════════════════════════════════════════════════════════════════════ */
-static int _cmp_double(const void *a, const void *b) {
-    double da = *(const double*)a, db = *(const double*)b;
-    return (da > db) - (da < db);
-}
-static double _median(double *arr, int n) {
-    if (n <= 0) return 0.0;
-    /* Partial sort via qsort on copy */
-    double *tmp = (double*)malloc(n * sizeof(double));
-    if (!tmp) return 0.0;
-    memcpy(tmp, arr, n*sizeof(double));
-    qsort(tmp, n, sizeof(double), _cmp_double);
-    double med = (n%2==1) ? tmp[n/2] : (tmp[n/2-1]+tmp[n/2])/2.0;
-    free(tmp);
-    return med;
-}
-void qtcl_consensus_compute(
-        const QtclWStateMeasurement *measurements,
-        int n,
-        const QtclWStateMeasurement *oracle_dm,   /* may be NULL */
-        double oracle_weight,
-        QtclWStateConsensus *out) {
-    if (n <= 0) { memset(out, 0, sizeof(*out)); return; }
-    double *fid  = (double*)malloc(n*sizeof(double));
-    double *coh  = (double*)malloc(n*sizeof(double));
-    double *pur  = (double*)malloc(n*sizeof(double));
-    double *neg  = (double*)malloc(n*sizeof(double));
-    double *ent  = (double*)malloc(n*sizeof(double));
-    double *disc = (double*)malloc(n*sizeof(double));
-    double *area = (double*)malloc(n*sizeof(double));
-    if (!fid||!coh||!pur||!neg||!ent||!disc||!area) goto cleanup;
-    /* Accumulate DM mean in double precision (CRITICAL: average DMs not fidelities) */
-    double dm_sum_re[64] = {0}, dm_sum_im[64] = {0};
-    uint32_t max_height = 0;
-    for (int i = 0; i < n; i++) {
-        fid[i]  = measurements[i].w_fidelity;
-        coh[i]  = measurements[i].coherence;
-        pur[i]  = measurements[i].purity;
-        neg[i]  = measurements[i].negativity;
-        ent[i]  = measurements[i].entropy_vn;
-        disc[i] = measurements[i].discord;
-        area[i] = measurements[i].triangle_area;
-        for (int k = 0; k < 64; k++) {
-            dm_sum_re[k] += measurements[i].dm_re[k];
-            dm_sum_im[k] += measurements[i].dm_im[k];
-        }
-        if (measurements[i].chain_height > max_height)
-            max_height = measurements[i].chain_height;
-    }
-    out->median_fidelity  = _median(fid,  n);
-    out->median_coherence = _median(coh,  n);
-    out->median_purity    = _median(pur,  n);
-    out->median_negativity= _median(neg,  n);
-    out->median_entropy   = _median(ent,  n);
-    out->median_discord   = _median(disc, n);
-    out->hyp_area_median  = _median(area, n);
-    out->peer_count       = (uint32_t)n;
-    out->chain_height     = max_height;
-    /* Arithmetic mean DM — valid mixed state */
-    double inv_n = 1.0 / (double)n;
-    if (oracle_dm && oracle_weight > 0.0) {
-        double lw = (1.0 - oracle_weight) * inv_n;
-        for (int k = 0; k < 64; k++) {
-            out->consensus_dm_re[k] = lw*dm_sum_re[k] + oracle_weight*oracle_dm->dm_re[k];
-            out->consensus_dm_im[k] = lw*dm_sum_im[k] + oracle_weight*oracle_dm->dm_im[k];
-        }
-    } else {
-        for (int k = 0; k < 64; k++) {
-            out->consensus_dm_re[k] = dm_sum_re[k] * inv_n;
-            out->consensus_dm_im[k] = dm_sum_im[k] * inv_n;
-        }
-    }
-    /* Quorum hash: SHA3-256 Merkle root over all auth_tags.
-       Use heap (not VLA) so the goto cleanup above cannot bypass
-       initialization — C99 §6.8.6.1 forbids jumping over VLAs. */
-    uint8_t *leaves_buf = (uint8_t*)malloc((size_t)n * 32);
-    if (leaves_buf) {
-        for (int i = 0; i < n; i++)
-            memcpy(leaves_buf + i*32, measurements[i].auth_tag, 32);
-        qtcl_merkle_root(leaves_buf, (uint32_t)n, out->quorum_hash);
-        free(leaves_buf);
-    } else {
-        memset(out->quorum_hash, 0, 32);
-    }
-    /* Agreement score: 1 - std(fidelity)/mean(fidelity) clamped [0,1] */
-    double mean_f = 0.0;
-    for (int i = 0; i < n; i++) mean_f += fid[i];
-    mean_f *= inv_n;
-    double var_f = 0.0;
-    for (int i = 0; i < n; i++) {
-        double d = fid[i] - mean_f;
-        var_f += d*d;
-    }
-    var_f *= inv_n;
-    double std_f = (mean_f > 1e-9) ? sqrt(var_f) / mean_f : 0.0;
-    out->agreement_score = (std_f > 1.0) ? 0.0 : 1.0 - std_f;
-cleanup:
-    free(fid); free(coh); free(pur); free(neg); free(ent); free(disc); free(area);
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §SSE — C SSE HTTP/1.1 CLIENT (Raw socket, zero libcurl dependency)
-   Reads text/event-stream from oracle.  Handles chunked transfer encoding.
-   Termux-safe: only POSIX sockets + OpenSSL for TLS.
-   ═══════════════════════════════════════════════════════════════════════════ */
-/* ═══════════════════════════════════════════════════════════════════════════
-   §P2P — QTCL CUSTOM PROTOCOL v4 — OUROBOROS · EPIDEMIC GOSSIP · BLOOM
-   ═══════════════════════════════════════════════════════════════════════════
-   v4 improvements:
-     2. Fanout-limited epidemic gossip  — ceil(sqrt(n)) reputation-ranked peers
-     3. Peer reputation scoring         — fid²·(1000/lat_ms)·uptime_sigmoid
-     5. Topic-based subscriptions       — bitmask filter, no unwanted traffic
-     6. Temporal DM weighting           — exp(-age/τ)·fid² decay in consensus
-     9. Connection backoff table        — exponential per-host, 1s→64s cap
-    10. Immediate peer exchange         — addr swap on verack, mesh in O(diam)
-   Plus: Bloom dedup, INV/GETDATA pull, seen-message ring, RTT-adaptive ping,
-         all-topics SSE, SO_REUSEPORT multiplexing on 9091.
-   Health / liveness:  /health ONLY on Flask port 8000 (gunicorn).
-   P2P + SSE + gossip: everything on 9091 (P2P_PORT env var).
-   ═══════════════════════════════════════════════════════════════════════════ */
-/* ── Constants ─────────────────────────────────────────────────────────── */
-/* Bloom: 256-bit, 4 Jenkins-derived hash functions, 60s TTL */
-/* Seen-message ring: 512 × 8-byte fingerprints, O(1) check */
-/* Fanout: gossip to ceil(sqrt(n_peers)), [1, 8] */
-/* Backoff: 1s→2s→…→64s cap, 128-host table */
-/* Topics */
-/* Adaptive ping: clamp(3×RTT, 10s, 120s) */
-static const char *CMD_VERSION  = "version";
-static const char *CMD_VERACK   = "verack";
-static const char *CMD_GETADDR  = "getaddr";
-static const char *CMD_ADDR     = "addr";
-static const char *CMD_PING     = "ping";
-static const char *CMD_PONG     = "pong";
-static const char *CMD_WSTATE   = "wstate";
-static const char *CMD_DMPOOL   = "dmpool";
-static const char *CMD_INV      = "inv";
-static const char *CMD_GETDATA  = "getdata";
-static const char *CMD_NOTFOUND = "notfound";
-static const char *CMD_REJECT   = "reject";
-static const char *CMD_SSESUB   = "ssesub";
-static const char *CMD_CHAIN_RST= "chain_rst";
-static const char *CMD_SUBSCRIBE= "subscribe";
-/* ── Wire header v4 (32 bytes, natural alignment) ───────────────────────── */
-typedef struct {
-    uint8_t  magic[4];
-    uint8_t  version;
-    uint8_t  flags;
-    uint16_t reserved;
-    char     command[12];
-    uint32_t length;
-    uint8_t  checksum[4];
-    uint8_t  node_id[4];
-} QtclMsgHeaderV3;
-/* ── DM pool entry (no packed — double arrays need 8-byte alignment) ──── */
-typedef struct {
-    double   dm_re[64];
-    double   dm_im[64];
-    float    fidelity;
-    float    purity;
-    uint32_t chain_height;
-    uint64_t timestamp_ns;
-    uint8_t  source_id[16];
-    uint8_t  flags;
-} QtclDMPoolEntry;
-/* ── Bloom filter ───────────────────────────────────────────────────────── */
-typedef struct { uint32_t w[P2P_BLOOM_WORDS]; uint64_t reset_ns; } _Bloom;
-static uint32_t _bj(const uint8_t *k,int n,uint32_t s){
-    uint32_t h=s; for(int i=0;i<n;i++){h+=k[i];h+=(h<<10);h^=(h>>6);}
-    h+=(h<<3);h^=(h>>11);h+=(h<<15); return h;
-}
-static void _bloom_add(_Bloom *b,const uint8_t *id8){
-    for(int k=0;k<P2P_BLOOM_K;k++){uint32_t h=_bj(id8,8,(uint32_t)(k*0x9e3779b9u))%P2P_BLOOM_BITS;b->w[h/32]|=(1u<<(h%32));}
-}
-static int  _bloom_test(const _Bloom *b,const uint8_t *id8){
-    for(int k=0;k<P2P_BLOOM_K;k++){uint32_t h=_bj(id8,8,(uint32_t)(k*0x9e3779b9u))%P2P_BLOOM_BITS;if(!(b->w[h/32]&(1u<<(h%32))))return 0;}return 1;
-}
-static void _bloom_reset(_Bloom *b){memset(b->w,0,sizeof(b->w));b->reset_ns=_clock_ns();}
-/* ── Seen-message ring ──────────────────────────────────────────────────── */
-typedef struct { uint64_t s[P2P_SEEN_SZ]; uint32_t h; } _SeenRing;
-static void _seen_add(_SeenRing *r,uint64_t f){r->s[r->h&P2P_SEEN_MASK]=f;r->h++;}
-static int  _seen_chk(const _SeenRing *r,uint64_t f){for(int i=0;i<P2P_SEEN_SZ;i++)if(r->s[i]==f)return 1;return 0;}
-static uint64_t _wfp(const QtclWStateMeasurement *m){
-    uint8_t src[24],h[32]; memcpy(src,m->node_id,16); memcpy(src+16,&m->timestamp_ns,8);
-    qtcl_sha3_256(src,24,h); uint64_t f; memcpy(&f,h,8); return f;
-}
-/* ── Backoff table ──────────────────────────────────────────────────────── */
-typedef struct { char host[64]; uint32_t s; uint64_t next_ns; } _BOEntry;
-static _BOEntry _BO[P2P_BO_HOSTS];
-static pthread_mutex_t _bo_lock = PTHREAD_MUTEX_INITIALIZER;
-static int _bo_ok(const char *host){
-    uint64_t now=_clock_ns(); pthread_mutex_lock(&_bo_lock);
-    for(int i=0;i<P2P_BO_HOSTS;i++) if(!strncmp(_BO[i].host,host,63)){int ok=(now>=_BO[i].next_ns);pthread_mutex_unlock(&_bo_lock);return ok;}
-    pthread_mutex_unlock(&_bo_lock); return 1;
-}
-static void _bo_fail(const char *host){
-    uint64_t now=_clock_ns(); pthread_mutex_lock(&_bo_lock);
-    int oldest=0; uint64_t ot=UINT64_MAX;
-    for(int i=0;i<P2P_BO_HOSTS;i++){
-        if(!strncmp(_BO[i].host,host,63)){uint32_t b=_BO[i].s?(_BO[i].s*2>P2P_BO_MAX_S?P2P_BO_MAX_S:_BO[i].s*2):1;_BO[i].s=b;_BO[i].next_ns=now+(uint64_t)b*1000000000ULL;pthread_mutex_unlock(&_bo_lock);return;}
-        if(_BO[i].next_ns<ot){ot=_BO[i].next_ns;oldest=i;}
-    }
-    memcpy(_BO[oldest].host,host,63);_BO[oldest].host[63]='\0';_BO[oldest].s=1;_BO[oldest].next_ns=now+1000000000ULL;
-    pthread_mutex_unlock(&_bo_lock);
-}
-static void _bo_ok_clear(const char *host){
-    pthread_mutex_lock(&_bo_lock);
-    for(int i=0;i<P2P_BO_HOSTS;i++) if(!strncmp(_BO[i].host,host,63)){_BO[i].s=0;_BO[i].next_ns=0;break;}
-    pthread_mutex_unlock(&_bo_lock);
-}
-/* ── SSE subscriber — REMOVED (RPC-only consensus model) ────────────────── */
-/* ── Peer connection ────────────────────────────────────────────────────── */
-typedef struct {
-    volatile int fd, active, handshake_done;
-    char         host[64];
-    uint16_t     port;
-    pthread_t    thread;
-    int32_t      chain_height;
-    float        last_fidelity, latency_ms, reputation;
-    uint64_t     last_recv_ns, connect_time_ns, msgs_recv, msgs_sent;
-    uint16_t     ban_score;
-    uint8_t      node_id[16], protocol_version, topics;
-} _P2PConn;
-/* ── Global state ───────────────────────────────────────────────────────── */
-typedef struct {
-    void           (*callback)(int,const void*,size_t);
-    _P2PConn        peers[P2P_MAX_PEERS];
-    int             n_peers;
-    pthread_mutex_t peers_lock;
-    int             listen_fd, running;
-    pthread_t       accept_thread, ping_thread;
-    uint8_t         node_id[16];
-    uint16_t        listen_port;
-    int             max_peers;
-    volatile uint64_t  wring_head, wring_tail;
-    QtclWStateMeasurement wring[P2P_WRING_SZ];
-    volatile uint64_t  dmpool_head, dmpool_tail;
-    QtclDMPoolEntry    dmpool[P2P_DMPOOL_SZ];
-    double          consensus_dm_re[64], consensus_dm_im[64];
-    float           consensus_fidelity;
-    uint32_t        consensus_height;
-    pthread_mutex_t consensus_lock;
-    QtclWStateMeasurement self_meas;
-    volatile int    self_meas_ready;
-    pthread_mutex_t self_lock;
-    _Bloom          bloom;
-    pthread_mutex_t bloom_lock;
-    _SeenRing       seen;
-    pthread_mutex_t seen_lock;
-    /* INV cache: 64-slot ring, fp→full measurement for GETDATA */
-    QtclWStateMeasurement inv_cache[64];
-    uint64_t        inv_fps[64];
-    uint32_t        inv_head;
-    pthread_mutex_t inv_lock;
-    uint8_t         hmac_secret[32];
-} _P2PState;
-static _P2PState _P2P = {0};
-/* Forward decl — qtcl_p2p_connect used inside peer thread (addr handler) */
-int qtcl_p2p_connect(const char *host, uint16_t port);
-/* ── Reputation score ────────────────────────────────────────────────────
-   score = fid² × (1000/lat_ms) × sigmoid(age_s/300)
-   Higher = preferred fanout target.                                      */
-static float _rep(const _P2PConn *c){
-    if(!c->active||!c->handshake_done)return 0.0f;
-    float ff=c->last_fidelity*c->last_fidelity;
-    float lat=c->latency_ms>0?c->latency_ms:999.0f;
-    uint64_t age_s=(_clock_ns()-c->connect_time_ns)/1000000000ULL;
-    float up=(float)age_s/((float)age_s+300.0f);
-    return ff*(1000.0f/lat)*(0.5f+0.5f*up);
-}
-/* ── Fanout: top ceil(sqrt(n)) peers by reputation ─────────────────────── */
-static int _fanout(int *out,int max){
-    float r[P2P_MAX_PEERS]; int idx[P2P_MAX_PEERS],n=0;
-    for(int i=0;i<P2P_MAX_PEERS;i++){
-        if(!_P2P.peers[i].active||!_P2P.peers[i].handshake_done)continue;
-        r[n]=_rep(&_P2P.peers[i]);idx[n]=i;n++;
-    }
-    for(int i=1;i<n;i++){float kr=r[i];int ki=idx[i],j=i-1;while(j>=0&&r[j]<kr){r[j+1]=r[j];idx[j+1]=idx[j];j--;}r[j+1]=kr;idx[j+1]=ki;}
-    int sq=1; while(sq*sq<n)sq++;
-    int f=sq<P2P_FANOUT_MAX?sq:P2P_FANOUT_MAX;
-    if(f<P2P_FANOUT_MIN)f=P2P_FANOUT_MIN;
-    int out_n=f<n?f:n; out_n=out_n<max?out_n:max;
-    for(int i=0;i<out_n;i++)out[i]=idx[i];
-    return out_n;
-}
-/* ── Wire layer ─────────────────────────────────────────────────────────── */
-static void _hdr(QtclMsgHeaderV3 *h,const char *cmd,uint32_t plen,const uint8_t *pay,uint8_t fl){
-    memset(h,0,sizeof(*h)); uint8_t mg[4]=P2P_MAGIC_V3; memcpy(h->magic,mg,4);
-    h->version=P2P_VERSION; h->flags=fl; strncpy(h->command,cmd,11);
-    h->length=plen; memcpy(h->node_id,_P2P.node_id,4);
-    if(pay&&plen){uint8_t hs[32];qtcl_sha3_256(pay,plen,hs);memcpy(h->checksum,hs,4);}
-}
-static int _wra(int fd,const void *b,size_t n){
-    const char *p=(const char*)b;
-    while(n>0){ssize_t r=write(fd,p,n);if(r<=0)return -1;p+=r;n-=r;}return 0;
-}
-static int _send(int fd,const char *cmd,const void *pay,uint32_t plen,uint8_t fl){
-    QtclMsgHeaderV3 h; _hdr(&h,cmd,plen,(const uint8_t*)pay,fl);
-    if(_wra(fd,&h,sizeof(h))<0) return -1;
-    if(plen>0 && _wra(fd,pay,plen)<0) return -1;
-    return 0;
-}
-static int _recv(int fd,char cmd[13],uint8_t *buf,int bsz,int *ver){
-    QtclMsgHeaderV3 h; int n=recv(fd,&h,sizeof(h),MSG_WAITALL);
-    if(n!=(int)sizeof(h))return -1;
-    uint8_t mg[4]=P2P_MAGIC_V3; if(memcmp(h.magic,mg,4))return -1;
-    if(ver) *ver=(int)h.version;
-    memset(cmd,0,13); memcpy(cmd,h.command,12);
-    uint32_t pl=h.length; if(!pl)return 0; if((int)pl>bsz)return -1;
-    n=recv(fd,buf,pl,MSG_WAITALL); return n==(int)pl?(int)pl:-1;
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   TEMPORAL DM POOL CONSENSUS — exp(-age/τ)·fid² weighting (feature 6)
-   τ=30s: fresh measurements dominate, stale ones decay gracefully.
-   Enforces Hermiticity and trace=1 before storing.
-   ══════════════════════════════════════════════════════════════════════════ */
-static void _consensus(void){
-    QtclDMPoolEntry e[P2P_DMPOOL_SZ]; int n=0;
-    uint64_t tail=_P2P.dmpool_tail;
-    atomic_thread_fence(memory_order_acquire);
-    while(tail!=_P2P.dmpool_head&&n<P2P_DMPOOL_SZ){e[n]=_P2P.dmpool[tail&P2P_DMPOOL_MSK];tail=(tail+1)&P2P_DMPOOL_MSK;n++;}
-    _P2P.dmpool_tail=tail;
-    if(!n)return;
-    uint64_t now=_clock_ns(); double tau=30.0;
-    double ar[64]={0},ai[64]={0},ws=0.0;
-    for(int i=0;i<n;i++){
-        double tr=0.0; for(int k=0;k<8;k++)tr+=e[i].dm_re[k*9];
-        if(tr<0.5||tr>1.5)continue;
-        double f=(double)e[i].fidelity;
-        double age=(double)(now-e[i].timestamp_ns)/1e9; if(age<0)age=0;
-        double w=f*f*exp(-age/tau); if(w<1e-9)continue;
-        for(int j=0;j<64;j++){ar[j]+=w*e[i].dm_re[j];ai[j]+=w*e[i].dm_im[j];}
-        ws+=w;
-    }
-    if(ws<1e-15)return;
-    double iw=1.0/ws; for(int j=0;j<64;j++){ar[j]*=iw;ai[j]*=iw;}
-    /* Enforce Hermiticity: ρ=(ρ+ρ†)/2 */
-    for(int i=0;i<8;i++)for(int j=0;j<8;j++){
-        double sr=0.5*(ar[i*8+j]+ar[j*8+i]),si=0.5*(ai[i*8+j]-ai[j*8+i]);
-        ar[i*8+j]=sr;ai[i*8+j]=si;ar[j*8+i]=sr;ai[j*8+i]=-si;
-    }
-    double tr=0.0; for(int k=0;k<8;k++)tr+=ar[k*9];
-    if(tr<1e-12)return;
-    double it=1.0/tr; for(int j=0;j<64;j++){ar[j]*=it;ai[j]*=it;}
-    float cf=(float)qtcl_fidelity_w3(ar);
-    pthread_mutex_lock(&_P2P.consensus_lock);
-    memcpy(_P2P.consensus_dm_re,ar,64*sizeof(double));
-    memcpy(_P2P.consensus_dm_im,ai,64*sizeof(double));
-    _P2P.consensus_fidelity=cf;
-    pthread_mutex_unlock(&_P2P.consensus_lock);
-}
-static void _dmpool_push(const QtclWStateMeasurement *m,uint8_t fl){
-    QtclDMPoolEntry e; memset(&e,0,sizeof(e));
-    double b0[3],bc[3],bl[3];
-    for(int i=0;i<3;i++){b0[i]=m->ball_pq0[i];bc[i]=m->ball_curr[i];bl[i]=m->ball_last[i];}
-    qtcl_build_tripartite_dm(b0,bc,bl,e.dm_re,e.dm_im);
-    e.fidelity=(float)m->w_fidelity; e.purity=(float)m->purity;
-    e.chain_height=(uint32_t)m->chain_height; e.timestamp_ns=(uint64_t)m->timestamp_ns;
-    memcpy(e.source_id,m->node_id,16); e.flags=fl;
-    uint64_t h=_P2P.dmpool_head,nx=(h+1)&P2P_DMPOOL_MSK;
-    _P2P.dmpool[h]=e; atomic_thread_fence(memory_order_release); _P2P.dmpool_head=nx;
-    if(nx==_P2P.dmpool_tail)_P2P.dmpool_tail=(nx+1)&P2P_DMPOOL_MSK;
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   SSE BROADCAST — REMOVED [RPC-ONLY CONSENSUS MODEL]
-   All P2P distribution now via explicit RPC polling (/rpc/oracle/snapshot)
-   No in-band gossip means no self-referential feedback loops
-   ══════════════════════════════════════════════════════════════════════════ */
-/* (OBSOLETE — deleted to prevent consensus contamination via broadcast self-ingest) */
-static int _wstate_json(const QtclWStateMeasurement *m,char *out,int sz,int self){
-    char nh[33]={0};for(int i=0;i<16;i++)snprintf(nh+i*2,3,"%02x",m->node_id[i]);
-    return snprintf(out,sz,
-        "{\"event\":\"wstate\",\"node_id\":\"%s\",\"chain_height\":%u,"
-        "\"pq0\":%u,\"pq_curr\":%u,\"pq_last\":%u,"
-        "\"w_fidelity\":%.6f,\"purity\":%.6f,\"coherence\":%.6f,"
-        "\"entropy_vn\":%.6f,\"discord\":%.6f,\"negativity\":%.6f,"
-        "\"hyp_dist_0c\":%.6f,\"hyp_dist_cl\":%.6f,\"hyp_dist_0l\":%.6f,"
-        "\"triangle_area\":%.6f,\"timestamp_ns\":%llu,\"ouroboros\":%d}",
-        nh,(unsigned)m->chain_height,(unsigned)m->pq0,
-        (unsigned)m->pq_curr,(unsigned)m->pq_last,
-        m->w_fidelity,m->purity,m->coherence,
-        m->entropy_vn,m->discord,m->negativity,
-        m->hyp_dist_0c,m->hyp_dist_cl,m->hyp_dist_0l,
-        m->triangle_area,(unsigned long long)m->timestamp_ns,self);
-}
-static int _cons_json(char *out,int sz){
-    pthread_mutex_lock(&_P2P.consensus_lock);
-    float f=_P2P.consensus_fidelity;uint32_t h=_P2P.consensus_height;
-    double tr=0.0,pu=0.0;
-    for(int k=0;k<8;k++)tr+=_P2P.consensus_dm_re[k*9];
-    for(int i=0;i<64;i++)pu+=_P2P.consensus_dm_re[i]*_P2P.consensus_dm_re[i]+_P2P.consensus_dm_im[i]*_P2P.consensus_dm_im[i];
-    pthread_mutex_unlock(&_P2P.consensus_lock);
-    return snprintf(out,sz,"{\"event\":\"dm_consensus\",\"chain_height\":%u,"
-        "\"consensus_fidelity\":%.6f,\"trace\":%.6f,\"purity\":%.6f,"
-        "\"temporal_weighted\":true}",(unsigned)h,(double)f,tr,pu);
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   OUROBOROS SELF-LOOP — REMOVED [RPC-ONLY CONSENSUS MODEL]
-   Consensus now triggered explicitly via /rpc/oracle/snapshot (no self-ingestion)
-   ══════════════════════════════════════════════════════════════════════════ */
-/* (OBSOLETE — deleted to prevent state contamination from self-referential feedback) */
-/* ══════════════════════════════════════════════════════════════════════════
-   PEER PROTOCOL THREAD
-   Features 2(fanout) 3(reputation) 5(topics) 9(backoff) 10(immediate exchange)
-   ══════════════════════════════════════════════════════════════════════════ */
-static void *_p2p_peer_thread(void *arg){
-    _P2PConn *c=(_P2PConn*)arg; c->connect_time_ns=_clock_ns();
-    uint8_t rb[sizeof(QtclWStateMeasurement)+512]; char cmd[13];
-    /* Send VERSION */
-    uint8_t vp[21]={0}; memcpy(vp,_P2P.node_id,16);
-    vp[16]=P2P_VERSION; *((uint16_t*)(vp+17))=_P2P.listen_port;
-    vp[19]=TOPIC_ALL; vp[20]=0x07;
-    _send(c->fd,"version",vp,sizeof(vp),0);
-    while(_P2P.running&&c->active){
-        memset(cmd,0,13); int vi=0;
-        int pl=_recv(c->fd,cmd,rb,sizeof(rb),&vi);
-        if(pl<0)break;
-        c->last_recv_ns=_clock_ns(); c->msgs_recv++;
-        if(!strcmp(cmd,"version")){
-            if(pl>=16)memcpy(c->node_id,rb,16);
-            c->topics=(pl>=20)?rb[19]:TOPIC_ALL;
-            _send(c->fd,"verack",NULL,0,0);
-            c->handshake_done=1; c->reputation=0.5f;
-            if(_P2P.callback)_P2P.callback(1,c,sizeof(*c));
-            _bo_ok_clear(c->host);
-            /* Feature 10: immediate peer exchange both directions */
-            _send(c->fd,"getaddr",NULL,0,0);
-            pthread_mutex_lock(&_P2P.peers_lock);
-            uint8_t ab[P2P_MAX_PEERS*70];int off=0;
-            for(int i=0;i<P2P_MAX_PEERS;i++){
-                if(!_P2P.peers[i].active||&_P2P.peers[i]==c)continue;
-                memcpy(ab+off,_P2P.peers[i].host,64);off+=64;
-                *((uint16_t*)(ab+off))=_P2P.peers[i].port;off+=2;
-                if(off+66>(int)sizeof(ab))break;
-            }
-            pthread_mutex_unlock(&_P2P.peers_lock);
-            if(off)_send(c->fd,"addr",ab,off,0);
-        } else if(!strcmp(cmd,"verack")){
-            c->handshake_done=1;
-        } else if(!strcmp(cmd,"subscribe")&&pl>=1){
-            c->topics=rb[0];
-        } else if(!strcmp(cmd,"ping")){
-            uint64_t ts=_clock_ns(); _send(c->fd,"pong",&ts,8,0);
-        } else if(!strcmp(cmd,"pong")&&pl>=8){
-            uint64_t sent; memcpy(&sent,rb,8);
-            c->latency_ms=(float)((_clock_ns()-sent)/1e6);
-            c->reputation=_rep(c);
-        } else if(!strcmp(cmd,"inv")&&pl>=9){
-            /* Pull protocol: check Bloom + seen before requesting */
-            uint8_t it=rb[0]; uint64_t fp; memcpy(&fp,rb+1,8);
-            if(it==INV_WSTATE){
-                pthread_mutex_lock(&_P2P.bloom_lock);
-                int bh=_bloom_test(&_P2P.bloom,(uint8_t*)&fp);
-                pthread_mutex_unlock(&_P2P.bloom_lock);
-                pthread_mutex_lock(&_P2P.seen_lock);
-                int sh=_seen_chk(&_P2P.seen,fp);
-                pthread_mutex_unlock(&_P2P.seen_lock);
-                if(!bh&&!sh){
-                    uint8_t req[9];req[0]=INV_WSTATE;memcpy(req+1,&fp,8);
-                    _send(c->fd,"getdata",req,9,0);
-                }
-            }
-        } else if(!strcmp(cmd,"getdata")&&pl>=9){
-            uint8_t rt=rb[0]; uint64_t fp; memcpy(&fp,rb+1,8);
-            if(rt==INV_WSTATE){
-                pthread_mutex_lock(&_P2P.inv_lock);
-                int found=0;
-                for(int i=0;i<64;i++) if(_P2P.inv_fps[i]==fp){
-                    _send(c->fd,"wstate",&_P2P.inv_cache[i],sizeof(QtclWStateMeasurement),0);
-                    found=1;break;
-                }
-                pthread_mutex_unlock(&_P2P.inv_lock);
-                if(!found)_send(c->fd,"notfound",rb,9,0);
-            }
-        } else if(!strcmp(cmd,"wstate")&&pl==(int)sizeof(QtclWStateMeasurement)){
-            const QtclWStateMeasurement *m=(const QtclWStateMeasurement*)rb;
-            if(!qtcl_measurement_verify(m,_P2P.hmac_secret)){
-                c->ban_score=(uint16_t)((int)c->ban_score+5);
-                if(c->ban_score>=100) break;
-                continue;
-            }
-            c->last_fidelity=(float)m->w_fidelity;
-            c->chain_height=(int32_t)m->chain_height;
-            c->reputation=_rep(c);
-            /* Dedup via Bloom + seen ring */
-            uint64_t fp=_wfp(m);
-            pthread_mutex_lock(&_P2P.bloom_lock);
-            int bh=_bloom_test(&_P2P.bloom,(uint8_t*)&fp);
-            if(!bh)_bloom_add(&_P2P.bloom,(uint8_t*)&fp);
-            pthread_mutex_unlock(&_P2P.bloom_lock);
-            pthread_mutex_lock(&_P2P.seen_lock);
-            int sh=_seen_chk(&_P2P.seen,fp);
-            if(!sh)_seen_add(&_P2P.seen,fp);
-            pthread_mutex_unlock(&_P2P.seen_lock);
-            if(bh&&sh)continue; /* already propagated */
-            /* Cache for GETDATA */
-            pthread_mutex_lock(&_P2P.inv_lock);
-            uint32_t sl=_P2P.inv_head&63;
-            _P2P.inv_cache[sl]=*m;_P2P.inv_fps[sl]=fp;_P2P.inv_head++;
-            pthread_mutex_unlock(&_P2P.inv_lock);
-            /* Wstate ring */
-            uint64_t wh=_P2P.wring_head;
-            if(((wh+1)&P2P_WRING_MASK)!=_P2P.wring_tail){
-                _P2P.wring[wh]=*m;atomic_thread_fence(memory_order_release);
-                _P2P.wring_head=(wh+1)&P2P_WRING_MASK;
-            }
-            _dmpool_push(m,0);
-            /* Feature 2+3: fanout INV to ceil(sqrt(n)) best-rep peers */
-            {
-                int fi[P2P_FANOUT_MAX];
-                pthread_mutex_lock(&_P2P.peers_lock);
-                int nf=_fanout(fi,P2P_FANOUT_MAX);
-                uint8_t inv[9];inv[0]=INV_WSTATE;memcpy(inv+1,&fp,8);
-                for(int i=0;i<nf;i++){
-                    int pi=fi[i];
-                    if(&_P2P.peers[pi]==c)continue;
-                    if(!(_P2P.peers[pi].topics&TOPIC_WSTATE)&&
-                       !(_P2P.peers[pi].topics&TOPIC_ALL))continue;
-                    _send(_P2P.peers[pi].fd,"inv",inv,9,0);
-                    _P2P.peers[pi].msgs_sent++;
-                }
-                pthread_mutex_unlock(&_P2P.peers_lock);
-            }
-            /* wstate JSON generation removed — RPC-only model, no SSE broadcast */
-            if(_P2P.callback)_P2P.callback(3,m,sizeof(*m));
-        } else if(!strcmp(cmd,"dmpool")&&pl>=(int)sizeof(QtclDMPoolEntry)){
-            const QtclDMPoolEntry *de=(const QtclDMPoolEntry*)rb;
-            uint64_t dh=_P2P.dmpool_head,dnx=(dh+1)&P2P_DMPOOL_MSK;
-            if(dnx!=_P2P.dmpool_tail){
-                _P2P.dmpool[dh]=*de;atomic_thread_fence(memory_order_release);
-                _P2P.dmpool_head=dnx;
-            }
-            if(_P2P.callback)_P2P.callback(7,de,sizeof(*de));
-        } else if(!strcmp(cmd,"ssesub")){
-            /* SSE subscription requests ignored — RPC-only consensus model */
-            pthread_mutex_lock(&_P2P.peers_lock);
-            c->active=0;c->fd=-1;
-            _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;
-            pthread_mutex_unlock(&_P2P.peers_lock);
-            return NULL;
-        } else if(!strcmp(cmd,"chain_rst")){
-            if(_P2P.callback)_P2P.callback(8,rb,(size_t)pl);
-            /* chain_reset broadcast removed — RPC-only model, no SSE */
-        } else if(!strcmp(cmd,"getaddr")){
-            pthread_mutex_lock(&_P2P.peers_lock);
-            uint8_t ab[P2P_MAX_PEERS*70];int off=0;
-            for(int i=0;i<P2P_MAX_PEERS;i++){
-                if(!_P2P.peers[i].active||&_P2P.peers[i]==c)continue;
-                memcpy(ab+off,_P2P.peers[i].host,64);off+=64;
-                *((uint16_t*)(ab+off))=_P2P.peers[i].port;off+=2;
-                if(off+66>(int)sizeof(ab))break;
-            }
-            pthread_mutex_unlock(&_P2P.peers_lock);
-            if(off)_send(c->fd,"addr",ab,off,0);
-        } else if(!strcmp(cmd,"addr")){
-            /* Feature 9+10: backoff-gated connection to advertised peers */
-            int na=pl/66;
-            for(int i=0;i<na;i++){
-                char h[65]={0};memcpy(h,rb+i*66,64);
-                uint16_t p=*((uint16_t*)(rb+i*66+64));
-                if(!p||p==_P2P.listen_port)continue;
-                if(_bo_ok(h))qtcl_p2p_connect(h,p);
-            }
-        }
-    }
-    pthread_mutex_lock(&_P2P.peers_lock);
-    if(c->fd>=0){close(c->fd);c->fd=-1;}
-    if(_P2P.callback)_P2P.callback(2,c,sizeof(*c));
-    memset(c,0,sizeof(*c));c->fd=-1;
-    _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    return NULL;
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   ACCEPT THREAD — 9091 multiplexing: HTTP GET → SSE/REST  else → P2P
-   Health /health lives ONLY on Flask/gunicorn port 8000 (Koyeb probe).
-   All P2P, SSE, gossip, peers, consensus_dm on 9091.
-   ══════════════════════════════════════════════════════════════════════════ */
-static void *_accept_thread(void *arg){
-    (void)arg;
-    while(_P2P.running){
-        struct sockaddr_in addr; socklen_t al=sizeof(addr);
-        int cfd=accept(_P2P.listen_fd,(struct sockaddr*)&addr,&al);
-        if(cfd<0){if(_P2P.running)usleep(10000);continue;}
-        int fl=1;
-        setsockopt(cfd,IPPROTO_TCP,TCP_NODELAY,&fl,sizeof(fl));
-        setsockopt(cfd,SOL_SOCKET,SO_KEEPALIVE,&fl,sizeof(fl));
-        char rh[64]={0}; inet_ntop(AF_INET,&addr.sin_addr,rh,sizeof(rh));
-        uint8_t pk[4]={0}; ssize_t pn=recv(cfd,pk,4,MSG_PEEK|MSG_DONTWAIT);
-        int http=(pn==4&&(
-            !memcmp(pk,"GET ",4)||!memcmp(pk,"POST",4)||
-            !memcmp(pk,"HEAD",4)||!memcmp(pk,"OPTI",4)));
-        if(http){
-            char hb[2048]={0}; recv(cfd,hb,sizeof(hb)-1,0);
-            if(strstr(hb,"/events")){
-                /* SSE not supported — RPC-only consensus model */
-                const char *na="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 41\r\n\r\nSSE disabled (RPC-only consensus model)";
-                if(write(cfd,na,strlen(na))<0){};close(cfd);
-            } else if(strstr(hb,"/gossip")){
-                /* POST /gossip — JSON chain_reset or wstate ingestion */
-                const char *body=strstr(hb,"\r\n\r\n");
-                if(body&&_P2P.callback)_P2P.callback(8,body+4,strlen(body+4));
-                const char *ok="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                if(write(cfd,ok,strlen(ok))<0){};close(cfd);
-            } else if(strstr(hb,"/api/p2p/peers")){
-                /* Lightweight JSON peer list for discovery */
-                char pb[4096]={0}; int off=0;
-                off+=snprintf(pb+off,sizeof(pb)-off,"{\"peers\":[");
-                pthread_mutex_lock(&_P2P.peers_lock);
-                int first=1;
-                for(int i=0;i<P2P_MAX_PEERS;i++){
-                    if(!_P2P.peers[i].active)continue;
-                    char nh[33]={0};for(int j=0;j<16;j++)snprintf(nh+j*2,3,"%02x",_P2P.peers[i].node_id[j]);
-                    off+=snprintf(pb+off,sizeof(pb)-off,
-                        "%s{\"host\":\"%s\",\"port\":%u,\"fidelity\":%.4f,"
-                        "\"height\":%d,\"lat_ms\":%.1f,\"rep\":%.3f}",
-                        first?"":",",_P2P.peers[i].host,(unsigned)_P2P.peers[i].port,
-                        _P2P.peers[i].last_fidelity,_P2P.peers[i].chain_height,
-                        _P2P.peers[i].latency_ms,(double)_P2P.peers[i].reputation);
-                    first=0;
-                }
-                pthread_mutex_unlock(&_P2P.peers_lock);
-                off+=snprintf(pb+off,sizeof(pb)-off,"]}");
-                char resp[4200]; int rl=snprintf(resp,sizeof(resp),
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    "Content-Length: %d\r\n\r\n%s",off,pb);
-                if(write(cfd,resp,rl)<0){};close(cfd);
-            } else {
-                const char *r404="HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-                if(write(cfd,r404,strlen(r404))<0){};close(cfd);
-            }
-        } else {
-            pthread_mutex_lock(&_P2P.peers_lock);
-            if(_P2P.n_peers>=_P2P.max_peers){pthread_mutex_unlock(&_P2P.peers_lock);close(cfd);continue;}
-            _P2PConn *slot=NULL;
-            for(int i=0;i<P2P_MAX_PEERS;i++) if(!_P2P.peers[i].active){slot=&_P2P.peers[i];break;}
-            if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(cfd);continue;}
-            memset(slot,0,sizeof(*slot));
-            slot->fd=cfd;slot->active=1;slot->port=ntohs(addr.sin_port);
-            slot->last_recv_ns=_clock_ns();
-            memcpy(slot->host,rh,63);slot->host[63]='\0';
-            _P2P.n_peers++;
-            pthread_mutex_unlock(&_P2P.peers_lock);
-            pthread_attr_t a;pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-            pthread_create(&slot->thread,&a,_p2p_peer_thread,slot);
-            pthread_attr_destroy(&a);
-        }
-    }
-    return NULL;
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   ADAPTIVE PING THREAD — interval = clamp(3×RTT, 10s, 120s)
-   ══════════════════════════════════════════════════════════════════════════ */
-static void *_ping_thread(void *arg){
-    (void)arg;
-    while(_P2P.running){
-        sleep(P2P_PING_MIN_S);
-        pthread_mutex_lock(&_P2P.peers_lock);
-        uint64_t now=_clock_ns();
-        for(int i=0;i<P2P_MAX_PEERS;i++){
-            if(!_P2P.peers[i].active)continue;
-            if(now-_P2P.peers[i].last_recv_ns>P2P_TIMEOUT_NS){
-                close(_P2P.peers[i].fd);_P2P.peers[i].fd=-1;
-                _bo_fail(_P2P.peers[i].host);
-                if(_P2P.callback)_P2P.callback(2,&_P2P.peers[i],sizeof(_P2PConn));
-                memset(&_P2P.peers[i],0,sizeof(_P2PConn));_P2P.peers[i].fd=-1;
-                _P2P.n_peers=(_P2P.n_peers>0)?_P2P.n_peers-1:0;continue;
-            }
-            /* RTT-adaptive: only ping if interval elapsed */
-            float rtt=_P2P.peers[i].latency_ms;
-            float ivl=(rtt>0?rtt*3.0f/1000.0f:(float)P2P_PING_MIN_S);
-            if(ivl<P2P_PING_MIN_S)ivl=P2P_PING_MIN_S;
-            if(ivl>P2P_PING_MAX_S)ivl=P2P_PING_MAX_S;
-            uint64_t elapsed=(now-_P2P.peers[i].last_recv_ns)/1000000000ULL;
-            if((float)elapsed>=ivl){
-                uint64_t ts=now; _send(_P2P.peers[i].fd,"ping",&ts,8,0);
-            }
-        }
-        pthread_mutex_unlock(&_P2P.peers_lock);
-    }
-    return NULL;
-}
-/* ══════════════════════════════════════════════════════════════════════════
-   PUBLIC API
-   ══════════════════════════════════════════════════════════════════════════ */
-int qtcl_p2p_init(const char *node_id_hex,uint16_t listen_port,int max_peers){
-    memset(&_P2P,0,sizeof(_P2P));
-    pthread_mutex_init(&_P2P.peers_lock,NULL);
-    /* sse_lock removed — RPC-only consensus model */
-    pthread_mutex_init(&_P2P.consensus_lock,NULL);
-    pthread_mutex_init(&_P2P.self_lock,NULL);
-    pthread_mutex_init(&_P2P.bloom_lock,NULL);
-    pthread_mutex_init(&_P2P.seen_lock,NULL);
-    pthread_mutex_init(&_P2P.inv_lock,NULL);
-    _bloom_reset(&_P2P.bloom);
-    _P2P.listen_port=listen_port?listen_port:P2P_LISTEN_PORT;
-    _P2P.max_peers=(max_peers>P2P_MAX_PEERS)?P2P_MAX_PEERS:max_peers;
-    for(int i=0;i<P2P_MAX_PEERS;i++)_P2P.peers[i].fd=-1;
-    /* sse_subs initialization removed — RPC-only model */
-    size_t hl=strlen(node_id_hex);
-    if(hl>=32)_hex_to_bytes(node_id_hex,_P2P.node_id,16);
-    else{uint8_t t[32]={0};qtcl_sha3_256((const uint8_t*)node_id_hex,hl,t);memcpy(_P2P.node_id,t,16);}
-    uint8_t ss[34]; memcpy(ss,"QTCL_P2P_HMAC_v4:",17); memcpy(ss+17,_P2P.node_id,16); ss[33]=P2P_VERSION;
-    qtcl_sha3_256(ss,34,_P2P.hmac_secret);
-    if(_P2P.listen_port){
-        _P2P.listen_fd=socket(AF_INET,SOCK_STREAM,0);
-        if(_P2P.listen_fd<0)return -1;
-        int opt=1;
-        setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-        setsockopt(_P2P.listen_fd,SOL_SOCKET,SO_REUSEPORT,&opt,sizeof(opt));
-        struct sockaddr_in sin={0};
-        sin.sin_family=AF_INET;sin.sin_port=htons(_P2P.listen_port);sin.sin_addr.s_addr=INADDR_ANY;
-        if(bind(_P2P.listen_fd,(struct sockaddr*)&sin,sizeof(sin))<0){close(_P2P.listen_fd);return -1;}
-        listen(_P2P.listen_fd,128);
-    }
-    _P2P.running=1;
-    pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-    if(_P2P.listen_port)pthread_create(&_P2P.accept_thread,&a,_accept_thread,NULL);
-    pthread_create(&_P2P.ping_thread,&a,_ping_thread,NULL);
-    /* ouroboros_thread removed — RPC-only consensus model */
-    pthread_attr_destroy(&a);
-    return 0;
-}
-int qtcl_p2p_connect(const char *host,uint16_t port){
-    if(!host||!host[0])return -1;
-    /* Feature 9: backoff gate */
-    if(!_bo_ok(host))return -2;
-    struct addrinfo hints={0},*res=NULL;
-    hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;
-    char ps[8];snprintf(ps,sizeof(ps),"%u",port?port:P2P_LISTEN_PORT);
-    if(getaddrinfo(host,ps,&hints,&res)||!res)return -1;
-    int fd=socket(res->ai_family,SOCK_STREAM,0);
-    if(fd<0){freeaddrinfo(res);return -1;}
-    int fl=1;
-    setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&fl,sizeof(fl));
-    setsockopt(fd,SOL_SOCKET,SO_KEEPALIVE,&fl,sizeof(fl));
-    fcntl(fd,F_SETFL,O_NONBLOCK);
-    connect(fd,res->ai_addr,res->ai_addrlen);
-    freeaddrinfo(res);
-    struct timeval tv={5,0}; fd_set wf;FD_ZERO(&wf);FD_SET(fd,&wf);
-    if(select(fd+1,NULL,&wf,NULL,&tv)<=0){close(fd);_bo_fail(host);return -1;}
-    int err=0;socklen_t el=sizeof(err);
-    getsockopt(fd,SOL_SOCKET,SO_ERROR,&err,&el);
-    if(err){close(fd);_bo_fail(host);return -1;}
-    fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)&~O_NONBLOCK);
-    _bo_ok_clear(host);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    if(_P2P.n_peers>=_P2P.max_peers){pthread_mutex_unlock(&_P2P.peers_lock);close(fd);return -1;}
-    _P2PConn *slot=NULL;
-    for(int i=0;i<P2P_MAX_PEERS;i++) if(!_P2P.peers[i].active){slot=&_P2P.peers[i];break;}
-    if(!slot){pthread_mutex_unlock(&_P2P.peers_lock);close(fd);return -1;}
-    memset(slot,0,sizeof(*slot));slot->fd=fd;
-    slot->port=(uint16_t)(port?port:P2P_LISTEN_PORT);
-    slot->active=1;slot->last_recv_ns=_clock_ns();
-    memcpy(slot->host,host,63);slot->host[63]='\0';
-    _P2P.n_peers++;
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-    pthread_create(&slot->thread,&a,_p2p_peer_thread,slot);
-    pthread_attr_destroy(&a);
-    return (int)(slot-_P2P.peers);
-}
-void qtcl_p2p_disconnect(int h){
-    if(h<0||h>=P2P_MAX_PEERS)return;
-    pthread_mutex_lock(&_P2P.peers_lock);
-    _P2PConn *s=&_P2P.peers[h];
-    if(s->active){s->active=0;if(s->fd>=0){shutdown(s->fd,SHUT_RDWR);close(s->fd);s->fd=-1;}if(_P2P.n_peers>0)_P2P.n_peers--;}
-    pthread_mutex_unlock(&_P2P.peers_lock);
-}
-void qtcl_p2p_shutdown(void){
-    _P2P.running=0;
-    if(_P2P.listen_fd>=0){close(_P2P.listen_fd);_P2P.listen_fd=-1;}
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].fd>=0) shutdown(_P2P.peers[i].fd,SHUT_RDWR);
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    /* SSE subscriber shutdown removed — RPC-only model */
-}
-int qtcl_p2p_send_wstate(const QtclWStateMeasurement *m){
-    if(!m||!_P2P.running)return 0;
-    QtclWStateMeasurement sm=*m; sm.timestamp_ns=(uint64_t)_clock_ns();
-    qtcl_measurement_sign(&sm,_P2P.hmac_secret);
-    pthread_mutex_lock(&_P2P.self_lock); _P2P.self_meas=sm; _P2P.self_meas_ready=1; pthread_mutex_unlock(&_P2P.self_lock);
-    /* Add to Bloom + seen so we don't relay our own broadcast back */
-    uint64_t fp=_wfp(&sm);
-    pthread_mutex_lock(&_P2P.bloom_lock);_bloom_add(&_P2P.bloom,(uint8_t*)&fp);pthread_mutex_unlock(&_P2P.bloom_lock);
-    pthread_mutex_lock(&_P2P.seen_lock);_seen_add(&_P2P.seen,fp);pthread_mutex_unlock(&_P2P.seen_lock);
-    int sent=0;
-    /* Feature 2: fanout broadcast via INV */
-    int fi[P2P_FANOUT_MAX]; pthread_mutex_lock(&_P2P.peers_lock);
-    int nf=_fanout(fi,P2P_FANOUT_MAX);
-    uint8_t inv[9];inv[0]=INV_WSTATE;memcpy(inv+1,&fp,8);
-    for(int i=0;i<nf;i++){
-        if(!(_P2P.peers[fi[i]].topics&TOPIC_WSTATE)&&!(_P2P.peers[fi[i]].topics&TOPIC_ALL))continue;
-        if(_send(_P2P.peers[fi[i]].fd,"inv",inv,9,0)==0)sent++;
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    /* Cache locally for GETDATA responses */
-    pthread_mutex_lock(&_P2P.inv_lock);
-    uint32_t sl=_P2P.inv_head&63;_P2P.inv_cache[sl]=sm;_P2P.inv_fps[sl]=fp;_P2P.inv_head++;
-    pthread_mutex_unlock(&_P2P.inv_lock);
-    return sent;
-}
-int qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf,int max){
-    int n=0;
-    while(n<max){
-        uint64_t t=_P2P.wring_tail;atomic_thread_fence(memory_order_acquire);
-        if(t==_P2P.wring_head)break;
-        buf[n]=_P2P.wring[t];_P2P.wring_tail=(t+1)&P2P_WRING_MASK;n++;
-    }
-    return n;
-}
-int qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf,int max){
-    int n=0;
-    while(n<max){
-        uint64_t t=_P2P.dmpool_tail;atomic_thread_fence(memory_order_acquire);
-        if(t==_P2P.dmpool_head)break;
-        buf[n]=_P2P.dmpool[t&P2P_DMPOOL_MSK];_P2P.dmpool_tail=(t+1)&P2P_DMPOOL_MSK;n++;
-    }
-    return n;
-}
-int qtcl_p2p_get_consensus_dm(double *re,double *im,float *fid,uint32_t *h){
-    pthread_mutex_lock(&_P2P.consensus_lock);
-    if(_P2P.consensus_fidelity<=0.0f){pthread_mutex_unlock(&_P2P.consensus_lock);return 0;}
-    if(re)memcpy(re,_P2P.consensus_dm_re,64*sizeof(double));
-    if(im)memcpy(im,_P2P.consensus_dm_im,64*sizeof(double));
-    if(fid)*fid=_P2P.consensus_fidelity;
-    if(h)*h=_P2P.consensus_height;
-    pthread_mutex_unlock(&_P2P.consensus_lock);
-    return 1;
-}
-void qtcl_p2p_trigger_consensus(void){_consensus();}
-void qtcl_p2p_broadcast_chain_reset(uint32_t new_h,const char *genesis_hex){
-    char p[128]={0};
-    snprintf(p,sizeof(p),"{\"event\":\"chain_reset\",\"new_height\":%u,\"genesis\":\"%s\"}",
-             (unsigned)new_h,genesis_hex?genesis_hex:"");
-    uint32_t pl=(uint32_t)strlen(p);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for(int i=0;i<P2P_MAX_PEERS;i++)
-        if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)
-            _send(_P2P.peers[i].fd,"chain_rst",p,pl,0);
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    /* SSE broadcast removed — RPC-only model, uses P2P gossip only */
-}
-void qtcl_p2p_send_inv(uint8_t t,const uint8_t *h32){
-    uint8_t p[33];p[0]=t;memcpy(p+1,h32,32);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for(int i=0;i<P2P_MAX_PEERS;i++)
-        if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)
-            _send(_P2P.peers[i].fd,"inv",p,33,0);
-    pthread_mutex_unlock(&_P2P.peers_lock);
-}
-int qtcl_p2p_peers(QtclPeer *buf,int max){
-    int n=0; pthread_mutex_lock(&_P2P.peers_lock);
-    for(int i=0;i<P2P_MAX_PEERS&&n<max;i++){
-        if(!_P2P.peers[i].active)continue;
-        memset(&buf[n],0,sizeof(QtclPeer));
-        memcpy(buf[n].node_id,_P2P.peers[i].node_id,16);
-        memcpy(buf[n].host,_P2P.peers[i].host,63);buf[n].host[63]='\0';
-        buf[n].port=_P2P.peers[i].port; buf[n].connected=(uint8_t)_P2P.peers[i].active;
-        buf[n].chain_height=_P2P.peers[i].chain_height;
-        buf[n].last_fidelity=_P2P.peers[i].last_fidelity;
-        buf[n].latency_ms=_P2P.peers[i].latency_ms;
-        buf[n].ban_score=_P2P.peers[i].ban_score;
-        buf[n].last_seen_ns=(int64_t)_P2P.peers[i].last_recv_ns;
-        n++;
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    return n;
-}
-int  qtcl_p2p_peer_count(void){return _P2P.n_peers;}
-int  qtcl_p2p_connected_count(void){int n=0;for(int i=0;i<P2P_MAX_PEERS;i++) if(_P2P.peers[i].active&&_P2P.peers[i].handshake_done)n++;return n;}
-/* qtcl_p2p_sse_sub_count() removed — RPC-only model, no SSE subscribers */
-void qtcl_p2p_set_callback(void(*cb)(int,const void*,size_t)){_P2P.callback=cb;}
-int  qtcl_wstate_measurement_size(void){return(int)sizeof(QtclWStateMeasurement);}
-int  qtcl_wstate_consensus_size(void){return(int)sizeof(QtclWStateConsensus);}
-int  qtcl_dm_pool_entry_size(void){return(int)sizeof(QtclDMPoolEntry);}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §HypEnt  HYPERBOLIC ENTROPY MULTIPLIER + XOR POOL COMBINER
-   ═══════════════════════════════════════════════════════════════════════════
-   Mathematical foundation:
-     Poincaré disk model of H² — the {8,3} hyperbolic tiling has 8 generators,
-     each a Möbius transform T_k(z) = (z + c_k) / (conj(c_k)·z + 1)
-     where c_k = r·e^(2πik/8), r = tanh(d/2), d = acosh(cos(π/3)/sin(π/8)).
-     A random walk of depth N visits ~exp(N) distinct tiles of the tiling,
-     giving exponential entropy amplification: 32 seed bytes drive a 64-step
-     walk through 2^64 distinguishable hyperbolic positions.
-     The walk endpoint is deterministic given the seed (entropy mixing, not
-     entropy creation) — but the avalanche property of the Möbius group means
-     a 1-bit change in seed produces an uncorrelated endpoint, modelled as
-     a hash function with geometric rather than algebraic diffusion.
-   ═══════════════════════════════════════════════════════════════════════════ */
-/* Möbius transform on Poincaré disk (double precision):
- * T(z) = (z + c) / (conj(c)·z + 1)
- * where z = (zr, zi), c = (cr, ci)
- * Operates in-place on (*zr, *zi). */
-static void _mob(double *zr, double *zi, double cr, double ci) {
-    /* numerator: z + c */
-    double nr = *zr + cr;
-    double ni = *zi + ci;
-    /* denominator: conj(c)·z + 1 = (cr - i·ci)(zr + i·zi) + 1
-     *            = (cr·zr + ci·zi + 1) + i·(cr·zi - ci·zr) */
-    double dr = cr * (*zr) + ci * (*zi) + 1.0;
-    double di = cr * (*zi) - ci * (*zr);
-    /* division: (nr + i·ni) / (dr + i·di)
-     *         = (nr·dr + ni·di) / |d|²  +  i·(ni·dr - nr·di) / |d|² */
-    double inv = 1.0 / (dr*dr + di*di);
-    *zr = (nr*dr + ni*di) * inv;
-    *zi = (ni*dr - nr*di) * inv;
-}
-/* {8,3} lattice generators: 8 Möbius translations of length d = acosh(cos(π/3)/sin(π/8))
- * r = tanh(d/2) ≈ 0.37451 — measured from geometry of the hyperbolic octagon. */
-/* qtcl_hyp_entropy_mul:
- *   seed32  — 32 bytes of input entropy (any source)
- *   depth   — walk depth (recommend 64; higher = more mixing, slower compile)
- *   out32   — 32 bytes of hyperbolic-mixed output entropy
- *
- *   Walk: map seed bytes to initial disk point z0, then apply generators
- *   selected by a SHA3-256 chain of the seed at each step.  Hash final point.
- *   Pure C, no allocations, no external calls. */
-void qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32) {
-    /* Stub: Python uses hashlib.shake_256 for hyperbolic entropy mixing */
-    (void)seed32; (void)depth; (void)out32;
-}
-/* qtcl_xor3_pool:
- *   XOR-combine up to three 32-byte entropy sources then run one SHA3-256 mix.
- *   NULL sources are replaced with SHA3-256(present_sources || zero_counter).
- *   Security: output is indistinguishable from random if ANY single source
- *   is truly random (XOR information-theoretic security, Maurer 1992). */
-void qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
-                    const uint8_t *s3, uint8_t *out32) {
-    /* Stub: Python XORs sources and hashes with hashlib.sha3_256 */
-    (void)s1; (void)s2; (void)s3; (void)out32;
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §Bootstrap  ENTANGLEMENT BOOTSTRAP PIPELINE
-   ═══════════════════════════════════════════════════════════════════════════
-   Full pre-mining quantum entanglement pipeline in C.
-   Gates the nonce loop on SSE/HTTP oracle DM reception + blockfield build.
-     qtcl_bootstrap_parse_dm_frame()   — JSON SSE frame → dm_re[64], dm_im[64]
-     qtcl_bootstrap_ingest_dm()        — store oracle DM + timestamp (mutex)
-     qtcl_bootstrap_dm_age_ok()        — returns 1 if DM < max_age_s old
-     qtcl_bootstrap_build_blockfield() — pq0/pq_curr/pq_last → full signed meas
-     qtcl_bootstrap_fidelity_report()  — UTF-8 terminal display buffer
-   ═══════════════════════════════════════════════════════════════════════════ */
-static double   _bs_dm_re[64] = {0};
-static double   _bs_dm_im[64] = {0};
-static uint64_t _bs_ts_ns     = 0;
-static int      _bs_ready     = 0;
-static pthread_mutex_t _bs_lock = PTHREAD_MUTEX_INITIALIZER;
-/* §Bootstrap-1: Parse density_matrix_hex from SSE/HTTP JSON frame.
- * Supports 2048-char complex128 and 1024-char complex64 wire formats.
- * Returns 1 on success, 0 on failure.                                     */
-int qtcl_bootstrap_parse_dm_frame(
-        const char *json_frame, double out_re[64], double out_im[64]) {
-    if (!json_frame) return 0;
-    const char *key = strstr(json_frame, "density_matrix_hex");
-    if (!key) {
-        const char *ws = strstr(json_frame, "\"w_state\"");
-        if (ws) key = strstr(ws, "density_matrix_hex");
-    }
-    if (!key) return 0;
-    const char *colon = strchr(key, ':');
-    if (!colon) return 0;
-    const char *quote = strchr(colon, '"');
-    if (!quote) return 0;
-    const char *hex = quote + 1;
-    size_t hlen = 0;
-    while (hex[hlen] && hex[hlen] != '"') hlen++;
-    static const int8_t NB[256] = {
-        ['0']=0,['1']=1,['2']=2,['3']=3,['4']=4,['5']=5,['6']=6,['7']=7,
-        ['8']=8,['9']=9,['a']=10,['b']=11,['c']=12,['d']=13,['e']=14,['f']=15,
-        ['A']=10,['B']=11,['C']=12,['D']=13,['E']=14,['F']=15,
-    };
-    if (hlen == 2048) {     /* complex128 little-endian: 64 × (re8 + im8) */
-        for (int i = 0; i < 64; i++) {
-            uint64_t rb = 0, ib = 0;
-            const char *p = hex + i * 32;
-            /* numpy tobytes() → IEEE754 little-endian doubles.
-               Accumulate bytes LSB-first (b=0 = least-significant byte). */
-            for (int b = 0; b < 8; b++) {
-                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
-                if (hi < 0 || lo < 0) return 0;
-                rb |= (uint64_t)(uint8_t)((hi<<4)|lo) << (b*8);
-            }
-            p += 16;
-            for (int b = 0; b < 8; b++) {
-                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
-                if (hi < 0 || lo < 0) return 0;
-                ib |= (uint64_t)(uint8_t)((hi<<4)|lo) << (b*8);
-            }
-            double re, im; memcpy(&re, &rb, 8); memcpy(&im, &ib, 8);
-            out_re[i] = re; out_im[i] = im;
-        }
-        return 1;
-    } else if (hlen == 1024) {  /* complex64 little-endian: 64 × (re4 + im4) */
-        for (int i = 0; i < 64; i++) {
-            uint32_t rb = 0, ib = 0;
-            const char *p = hex + i * 16;
-            for (int b = 0; b < 4; b++) {
-                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
-                if (hi < 0 || lo < 0) return 0;
-                rb |= (uint32_t)(uint8_t)((hi<<4)|lo) << (b*8);
-            }
-            p += 8;
-            for (int b = 0; b < 4; b++) {
-                int8_t hi = NB[(uint8_t)p[b*2]], lo = NB[(uint8_t)p[b*2+1]];
-                if (hi < 0 || lo < 0) return 0;
-                ib |= (uint32_t)(uint8_t)((hi<<4)|lo) << (b*8);
-            }
-            float rf, imf; memcpy(&rf, &rb, 4); memcpy(&imf, &ib, 4);
-            out_re[i] = (double)rf; out_im[i] = (double)imf;
-        }
-        return 1;
-    }
-    return 0;
-}
-/* §Bootstrap-2: Store parsed oracle DM (thread-safe) */
-void qtcl_bootstrap_ingest_dm(const double dm_re[64], const double dm_im[64]) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    pthread_mutex_lock(&_bs_lock);
-    memcpy(_bs_dm_re, dm_re, 64*sizeof(double));
-    memcpy(_bs_dm_im, dm_im, 64*sizeof(double));
-    _bs_ts_ns = (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
-    _bs_ready = 1;
-    pthread_mutex_unlock(&_bs_lock);
-}
-/* §Bootstrap-3: Age gate — 1 if DM received within max_age_s, else 0 */
-int qtcl_bootstrap_dm_age_ok(double max_age_s) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t now = (uint64_t)ts.tv_sec*1000000000ULL + (uint64_t)ts.tv_nsec;
-    pthread_mutex_lock(&_bs_lock);
-    int rdy = _bs_ready; uint64_t ots = _bs_ts_ns;
-    pthread_mutex_unlock(&_bs_lock);
-    if (!rdy) return 0;
-    return ((double)(now - ots) / 1e9) < max_age_s ? 1 : 0;
-}
-/* §Bootstrap-4: Full blockfield measurement pipeline.
- *
- * Executes (all in C, no Python overhead):
- *   qtcl_compute_hyp_triangle  → Geodesic triangle on {8,3} lattice
- *   qtcl_build_tripartite_dm   → Bloch angles → 8x8 DM tensor product
- *   qtcl_gksl_rk4              → Lindblad decoherence evolution (4 steps)
- *   qtcl_fuse_oracle_dm        → Fuse with server oracle DM (weight 0.35·e^{-age/60})
- *   qtcl_fidelity_w3           → F(rho, |W3>)
- *   qtcl_coherence_l1          → L1 off-diagonal coherence
- *   qtcl_purity                → Tr(rho^2)
- *   Von Neumann entropy        → diagonal approximation S = -sum lam*log2(lam)
- *   Negativity lower bound     → N >= max(0, coh/2 - (1-pur)/4)
- *   Quantum discord approx     → D >= max(0, ent*(1-pur)/2)
- *   qtcl_measurement_sign      → HMAC-SHA256 auth_tag
- *   PoW seed                   → SHA3-256("QTCL_SEED_v2:"||auth_tag||dm_re_BE)
- *
- * Returns 1 if oracle entangled, 0 if degraded (local W3 state used).     */
-int qtcl_bootstrap_build_blockfield(
-        uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
-        uint32_t chain_height, const uint8_t node_id16[16],
-        double gamma1, double gammaphi, double gammadep, double omega,
-        double dt,
-        QtclWStateMeasurement *out_m, uint8_t out_seed32[32]) {
-    /* Snapshot oracle state under lock */
-    double o_re[64], o_im[64]; uint64_t o_ts = 0; int o_ok;
-    pthread_mutex_lock(&_bs_lock);
-    o_ok = _bs_ready;
-    if (o_ok) { memcpy(o_re, _bs_dm_re, 512); memcpy(o_im, _bs_dm_im, 512); o_ts = _bs_ts_ns; }
-    pthread_mutex_unlock(&_bs_lock);
-    /* 1 — Hyperbolic triangle */
-    double b0[3], bc[3], bl[3], d0c, dcl, d0l, area;
-    qtcl_compute_hyp_triangle(pq0, pq_curr, pq_last, &d0c, &dcl, &d0l, &area, b0, bc, bl);
-    /* 2 — Tripartite DM */
-    double dm_re[64], dm_im[64];
-    qtcl_build_tripartite_dm(b0, bc, bl, dm_re, dm_im);
-    /* 3 — GKSL RK4 (4 substeps) */
-    qtcl_gksl_rk4(dm_re, dm_im, gamma1, gammaphi, gammadep, omega, dt, 4);
-    /* 4 — Oracle fusion: w = 0.35·exp(-age_s/60) */
-    if (o_ok) {
-        struct timespec tn; clock_gettime(CLOCK_REALTIME, &tn);
-        uint64_t now = (uint64_t)tn.tv_sec*1000000000ULL + (uint64_t)tn.tv_nsec;
-        double age = (double)(now - o_ts) / 1e9;
-        double w   = 0.35 * exp(-age / 60.0);
-        if (w > 0.01) {
-            /* Verify oracle DM is physically normalised before fusing.
-             * Tr(oracle) must be ~1; if not (e.g. uninitialised zeros or
-             * corrupt bytes on ARM), skip fusion so metrics stay correct.  */
-            double o_tr = 0.0;
-            for (int i = 0; i < 8; i++) o_tr += o_re[i*9];
-            if (o_tr > 0.5 && o_tr < 2.0) {   /* physically sane range */
-                /* Renormalise oracle DM to exact Tr=1 before fusing */
-                double inv_o = 1.0 / o_tr;
-                double fr[64], fi[64];
-                for (int k = 0; k < 64; k++) {
-                    o_re[k] *= inv_o; o_im[k] *= inv_o;
-                }
-                qtcl_fuse_oracle_dm(dm_re, dm_im, o_re, o_im, w, fr, fi);
-                /* Renormalise fused result — weighted sum can drift from Tr=1 */
-                double f_tr = 0.0;
-                for (int i = 0; i < 8; i++) f_tr += fr[i*9];
-                if (f_tr > 1e-12) {
-                    double inv_f = 1.0 / f_tr;
-                    for (int k = 0; k < 64; k++) { fr[k] *= inv_f; fi[k] *= inv_f; }
-                }
-                memcpy(dm_re, fr, 512); memcpy(dm_im, fi, 512);
-            }
-            /* If oracle DM is not physical, use local DM only (already normalised) */
-        }
-    }
-    /* Defensive renorm of local DM before metrics — guards against any
-     * numerical drift through the GKSL RK4 substeps on ARM64             */
-    { double tr = 0.0;
-      for (int i = 0; i < 8; i++) tr += dm_re[i*9];
-      if (tr > 1e-12 && (tr < 0.99 || tr > 1.01)) {
-          double inv = 1.0 / tr;
-          for (int k = 0; k < 64; k++) { dm_re[k]*=inv; dm_im[k]*=inv; }
-      } }
-    /* 5 — Quantum metrics — all clamped to physical bounds */
-    double fid  = qtcl_fidelity_w3(dm_re);
-    
-    /* ✅ FIX-C-FIDELITY-GUARD: If fidelity unreasonably low, check W3 definition */
-    if (fid < 0.001) {
-        /* W3 fidelity < 0.001 suggests either:
-           1. DM is not a W-state (expected for W-state: 0.75-0.95)
-           2. Basis mapping wrong (|1⟩, |2⟩, |4⟩ should be |W3⟩ carriers)
-           
-           Add diagnostic: also compute fidelity using different basis subsets
-           to verify our assumption.
-        */
-        /* Try alternative: if DM is actually in |0⟩,|1⟩,|2⟩ subspace instead */
-        double fid_alt = (dm_re[0*8+0] + dm_re[1*8+1] + dm_re[2*8+2]
-                        + 2.0*(dm_re[0*8+1] + dm_re[0*8+2] + dm_re[1*8+2])) / 3.0;
-        if (fid_alt > fid && fid_alt > 0.5) {
-            fid = fid_alt;  /* Use alternative if it's sensible */
-        }
-    }
-    
-    double coh  = qtcl_coherence_l1(dm_re, dm_im, 8);
-    double pur  = qtcl_purity(dm_re, dm_im, 8);
-    /* Hard clamp: physical density matrices have all metrics in finite range */
-    if (fid < -1.0 || fid > 1.0 || fid != fid) fid = 0.0;  /* NaN/inf guard */
-    if (coh < 0.0  || coh > 1.0 || coh != coh) coh = 0.0;
-    if (pur < 0.0  || pur > 1.0 || pur != pur) pur = 1.0/8.0;
-    
-    /* ✅ FIX-C-ENTROPY: Compute entropy from EIGENVALUES, not diagonal elements */
-    double ent  = 0.0;
-    {
-        /* For 8×8 Hermitian matrix, compute eigenvalues numerically.
-           Since we can't easily link LAPACK, use simplified approach:
-           For small matrices, iterate through characteristic polynomial.
-           
-           For W-state (W3 subspace): eigenvalues ≈ [7/8, 1/64, 1/64, ...]
-           Expected entropy ≈ 0.8-1.2 bits
-        */
-        
-        /* Simplified: Use power iteration to find dominant eigenvalue, 
-           then subtract to find next, etc. For now, use trace-based estimate.
-           
-           CRITICAL: Prior code used diagonal elements as eigenvalues, which is
-           ONLY correct if matrix is diagonal. Generic ρ is NOT diagonal.
-        */
-        
-        /* Better approximation: purity gives us information.
-           For W-state: pur ≈ 7/8 + 7/64² ≈ 0.9811
-           Entropy can be estimated from purity for common states.
-           
-           For now: use a physics-informed heuristic:
-           - If pur ≈ 1: state is pure, S ≈ 0
-           - If pur ≈ 1/8: state is maximally mixed, S ≈ 3 bits
-           - For W-state (pur ≈ 0.981): S ≈ 0.8-1.2 bits
-        */
-        if (pur > 0.99) {
-            /* Nearly pure state */
-            ent = -pur * log2(pur) - (1.0-pur) * log2(fmax(1e-15, 1.0-pur));
-        } else {
-            /* Mixed state: use generalized entropy estimate */
-            /* For W-state eigenvalues: λ₁≈7/8, λᵢ≈1/64 for i>1 */
-            /* S = -(λ₁ log₂(λ₁) + 7λ_rest log₂(λ_rest)) */
-            double l1 = 0.875;  /* dominant eigenvalue for W-state */
-            double lrest = 1.0/64.0;
-            double s_w = -(l1 * log2(l1) + 7.0 * lrest * log2(lrest));
-            
-            /* Scale entropy estimate based on measured purity */
-            /* Purity for W: 0.9811, entropy: ~0.9 bits */
-            double pur_w = 0.9811;
-            ent = s_w * (pur_w / pur);  /* scale if different from W-state */
-            ent = fmax(0.0, fmin(3.0, ent));  /* clamp to valid range */
-        }
-    }
-    double neg  = fmax(0.0, fmin(0.5, coh*0.5 - (1.0-pur)*0.25));
-    double disc = fmax(0.0, fmin(3.0, ent*(1.0-pur)*0.5));
-    /* 6 — Populate struct */
-    memset(out_m, 0, sizeof(*out_m));
-    if (node_id16) memcpy(out_m->node_id, node_id16, 16);
-    out_m->chain_height=chain_height; out_m->pq0=pq0;
-    out_m->pq_curr=pq_curr; out_m->pq_last=pq_last;
-    out_m->w_fidelity=fid; out_m->coherence=coh; out_m->purity=pur;
-    out_m->negativity=neg; out_m->entropy_vn=ent; out_m->discord=disc;
-    out_m->hyp_dist_0c=d0c; out_m->hyp_dist_cl=dcl; out_m->hyp_dist_0l=d0l;
-    out_m->triangle_area=area;
-    for(int i=0;i<3;i++){out_m->ball_pq0[i]=b0[i]; out_m->ball_curr[i]=bc[i]; out_m->ball_last[i]=bl[i];}
-    memcpy(out_m->dm_re, dm_re, 512); memcpy(out_m->dm_im, dm_im, 512);
-    { struct timespec ts2; clock_gettime(CLOCK_REALTIME,&ts2);
-      out_m->timestamp_ns=(uint64_t)ts2.tv_sec*1000000000ULL+(uint64_t)ts2.tv_nsec; }
-    /* 7 — Sign: secret = SHA3-256("QTCL_LOCAL_MEAS_v2:"||BE32(pq0)||BE32(height)) */
-    { uint8_t src[27]; static const char D[]="QTCL_LOCAL_MEAS_v2:"; memcpy(src,D,19);
-      src[19]=(uint8_t)(pq0>>24); src[20]=(uint8_t)(pq0>>16);
-      src[21]=(uint8_t)(pq0>>8);  src[22]=(uint8_t)pq0;
-      src[23]=(uint8_t)(chain_height>>24); src[24]=(uint8_t)(chain_height>>16);
-      src[25]=(uint8_t)(chain_height>>8);  src[26]=(uint8_t)chain_height;
-      uint8_t sec[32]; qtcl_sha3_256(src,27,sec);
-      qtcl_measurement_sign(out_m,sec); }
-    /* 8 — PoW seed: SHA3-256("QTCL_SEED_v2:"||auth_tag[32]||dm_re_BE[32]) */
-    { uint8_t ss[77]; static const char SD[]="QTCL_SEED_v2:"; memcpy(ss,SD,13);
-      memcpy(ss+13, out_m->auth_tag, 32);
-      for(int i=0;i<4;i++){ uint64_t bits; double v=dm_re[i]; memcpy(&bits,&v,8);
-        for(int b=7;b>=0;b--) ss[45+i*8+(7-b)]=(uint8_t)(bits>>(b*8)); }
-      qtcl_sha3_256(ss,77,out_seed32); }
-    return o_ok;
-}
-/* §Bootstrap-5: UTF-8 terminal report (box-drawing via escape sequences) */
-int qtcl_bootstrap_fidelity_report(
-        const QtclWStateMeasurement *m,
-        int oracle_ok, double oracle_age_s,
-        char *buf, int buf_sz) {
-    return snprintf(buf,(size_t)buf_sz,
-        "  \xe2\x95\x94\xe2\x95\x90\xe2\x95\x90 BLOCKFIELD STATE [C] "
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\n"
-        "  \xe2\x95\x91  oracle DM  : age=%.1fs  entangled=%s\n"
-        "  \xe2\x95\x91  pq0        : oracle ground truth\n"
-        "  \xe2\x95\x91  pq_curr    : %u  (entry face)\n"
-        "  \xe2\x95\x91  pq_last    : %u  (exit face)\n"
-        "  \xe2\x95\x91  height     : %u\n"
-        "  \xe2\x95\x91  F\xe2\x86\x92|W3\xe2\x9f\xa9     : %.4f  [sep=0.667]\n"
-        "  \xe2\x95\x91  Entropy    : %.4f bits\n"
-        "  \xe2\x95\x91  Coherence  : %.4f\n"
-        "  \xe2\x95\x91  Discord    : %.4f\n"
-        "  \xe2\x95\x91  Purity     : %.4f\n"
-        "  \xe2\x95\x91  Negativity : %.4f\n"
-        "  \xe2\x95\x91  d(0,c/l/cl): %.3f / %.3f / %.3f\n"
-        "  \xe2\x95\x91  Hyp Area   : %.4f rad\n"
-        "  \xe2\x95\x91  auth_tag   : %02x%02x%02x%02x\xe2\x80\xa6\n"
-        "  \xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90"
-        "\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\n",
-        oracle_age_s,
-        oracle_ok?"\xe2\x9c\x85 YES":"\xe2\x9a\xa0\xef\xb8\x8f NO (local |W3>)",
-        m->pq_curr,m->pq_last,m->chain_height,
-        m->w_fidelity,m->entropy_vn,m->coherence,
-        m->discord,m->purity,m->negativity,
-        m->hyp_dist_0c,m->hyp_dist_0l,m->hyp_dist_cl,
-        m->triangle_area,
-        m->auth_tag[0],m->auth_tag[1],m->auth_tag[2],m->auth_tag[3]);
-}
-/* ── §Mermin  MERMIN-KLYSHKO NONLOCALITY WITNESS FOR 3-QUBIT BLOCKFIELD ────
- * M₃ = σₓ⊗σₓ⊗σₓ − σₓ⊗σᵧ⊗σᵧ − σᵧ⊗σₓ⊗σᵧ − σᵧ⊗σᵧ⊗σₓ
- * Classical separability bound: |⟨M₃⟩| ≤ 2
- * Quantum max for |W₃⟩: 4·F_W  (ideal: 4.0)
- * Unlike CHSH/Bell, Mermin tests genuine 3-partite entanglement.
- * Violation |⟨M₃⟩| > 2 certifies the blockfield is non-classically correlated.
- *
- * dm8_re/im: 8×8 density matrix (row-major, double precision)
- * Returns ⟨M₃⟩ (real for physical states). Caller checks |result| > 2.0.
- *
- * σₓ = [[0,1],[1,0]]   σᵧ = [[0,−i],[+i,0]]
- * All 4 tensor products act on qubit triple (A=pq0, B=pq_curr, C=pq_last). */
-double qtcl_mermin_w3(const double *dm8_re, const double *dm8_im) {
-    double tr_re = 0.0;
-    for (int r = 0; r < 8; r++) {
-        for (int c = 0; c < 8; c++) {
-            /* All three Paulis must flip their respective qubit index.
-             * If any index matches, that term's off-diagonal element is zero. */
-            int r0=(r>>2)&1, r1=(r>>1)&1, r2=r&1;
-            int c0=(c>>2)&1, c1=(c>>1)&1, c2=c&1;
-            if (r0==c0 || r1==c1 || r2==c2) continue;
-            /* σᵧ[ri][ci] (ri≠ci): +i if ri==1, −i if ri==0
-             * σₓ[ri][ci] (ri≠ci): always +1                              */
-            double m_re = 1.0, m_im = 0.0;   /* start with σₓ⊗σₓ⊗σₓ = +1 */
-            /* Subtract σₓ⊗σᵧ⊗σᵧ: factor = sy[r1][c1] × sy[r2][c2]
-             * sy[ri][ci]: re=0, im=(ri==1)?+1:-1                         */
-            { double i1 = (r1==1)?1.0:-1.0, i2 = (r2==1)?1.0:-1.0;
-              m_re -= 0.0*0.0 - i1*i2;     /* re(sy1*sy2) = -i1*i2 */
-              m_im -= 0.0*i2  + i1*0.0; }  /* im(sy1*sy2) = 0      */
-            /* Subtract σᵧ⊗σₓ⊗σᵧ */
-            { double i0 = (r0==1)?1.0:-1.0, i2 = (r2==1)?1.0:-1.0;
-              m_re -= 0.0*0.0 - i0*i2;
-              m_im -= 0.0*i2  + i0*0.0; }
-            /* Subtract σᵧ⊗σᵧ⊗σₓ */
-            { double i0 = (r0==1)?1.0:-1.0, i1 = (r1==1)?1.0:-1.0;
-              m_re -= 0.0*0.0 - i0*i1;
-              m_im -= 0.0*i1  + i0*0.0; }
-            /* Tr(ρ·M₃) += ρ[c][r] × M₃[r][c]  (column-row from trace sum) */
-            double rho_re = dm8_re[c*8+r], rho_im = dm8_im[c*8+r];
-            tr_re += rho_re*m_re - rho_im*m_im;
-        }
-    }
-    return tr_re;
-}
-/* ═══════════════════════════════════════════════════════════════════════════
-   §KoyebReg  KOYEB HTTPS PEER REGISTRATION + AUTO P2P WIRING
-   ═══════════════════════════════════════════════════════════════════════════ */
-typedef struct {
-    char   koyeb_host[KOYEB_HOST_MAX];
-    char   peer_id[65];
-    char   miner_addr[128];
-    char   my_ip[64];          /* outbound hardware IP — never "localhost" */
-    uint16_t p2p_port;
-    volatile int running;
-    pthread_t thread;
-} _KoyebCtx;
-static _KoyebCtx _KOYEB = {0};
-static pthread_t _koyeb_hb_tid;
-/* forward decl so helpers can reference qtcl_p2p_connect defined earlier */
-int qtcl_p2p_connect(const char *host, uint16_t port);
-int qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
-                               float *out_fidelity, uint32_t *out_height);
-/* TLS write-all — not static so cffi placement is safe */
-int _koyeb_ssl_write(SSL *ssl, const char *buf, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = SSL_write(ssl, buf+sent, len-sent);
-        if (n <= 0) return -1;
-        sent += n;
-    }
-    return sent;
-}
-/* POST json to host:443 over TLS. Returns body length or -1. */
-int _koyeb_post_tls(const char *host, const char *path,
-                    const char *json_body,
-                    char *resp_buf, int resp_max) {
-    struct addrinfo hints={0},*res=NULL;
-    hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
-    if (getaddrinfo(host,"443",&hints,&res)||!res) return -1;
-    int fd=socket(res->ai_family,SOCK_STREAM,0);
-    if (fd<0){freeaddrinfo(res);return -1;}
-    struct timeval tv={10,0};
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
-    if (connect(fd,res->ai_addr,res->ai_addrlen)){freeaddrinfo(res);close(fd);return -1;}
-    freeaddrinfo(res);
-    SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_verify(ctx,SSL_VERIFY_NONE,NULL);
-    SSL *ssl=SSL_new(ctx); SSL_set_fd(ssl,fd);
-    SSL_set_tlsext_host_name(ssl,host);
-    if (SSL_connect(ssl)<=0){SSL_free(ssl);SSL_CTX_free(ctx);close(fd);return -1;}
-    int blen=(int)strlen(json_body);
-    char req[1024];
-    int rlen=snprintf(req,sizeof(req),
-        "POST %s HTTP/1.1\r\nHost: %s\r\n"
-        "Content-Type: application/json\r\nContent-Length: %d\r\n"
-        "User-Agent: QTCL-C/4.0\r\nConnection: close\r\n\r\n",
-        path,host,blen);
-    if (_koyeb_ssl_write(ssl,req,rlen)<0||_koyeb_ssl_write(ssl,json_body,blen)<0){
-        SSL_free(ssl);SSL_CTX_free(ctx);close(fd);return -1;
-    }
-    int total=0; char tmp[4096];
-    while (total<resp_max-1){
-        int n=SSL_read(ssl,tmp,sizeof(tmp)); if(n<=0)break;
-        int copy=n; if(total+copy>=resp_max-1)copy=resp_max-1-total;
-        memcpy(resp_buf+total,tmp,copy); total+=copy;
-    }
-    resp_buf[total]='\0';
-    SSL_free(ssl);SSL_CTX_free(ctx);close(fd);
-    return total;
-}
-/* Extract a JSON string value for key into out. Returns length or 0. */
-int _json_str_val(const char *json, const char *key, char *out, int out_max) {
-    char needle[128]; snprintf(needle,sizeof(needle),"\"%s\":",key);
-    const char *p=strstr(json,needle);
-    if (!p) return 0;
-    p+=strlen(needle);
-    while(*p==' ')p++;
-    if (*p=='"'){
-        p++;
-        const char *e=strchr(p,'"'); if(!e) return 0;
-        int l=(int)(e-p); if(l>=out_max)l=out_max-1;
-        memcpy(out,p,l); out[l]='\0'; return l;
-    }
-    /* numeric value */
-    const char *e=p; while(*e&&*e!=','&&*e!='}'&&*e!=']')e++;
-    int l=(int)(e-p); if(l>=out_max)l=out_max-1;
-    memcpy(out,p,l); out[l]='\0'; return l;
-}
-/* Walk live_peers/peers array, qtcl_p2p_connect each entry. */
-int _parse_and_connect_peers(const char *json) {
-    const char *arr=strstr(json,"\"live_peers\"");
-    if (!arr) arr=strstr(json,"\"peers\"");
-    if (!arr) return 0;
-    arr=strchr(arr,'['); if(!arr) return 0;
-    int connected=0;
-    const char *p=arr+1;
-    while (*p&&*p!=']') {
-        const char *ob=strchr(p,'{'); if(!ob||*ob==']') break;
-        const char *cb=strchr(ob,'}'); if(!cb) break;
-        int olen=(int)(cb-ob+1);
-        char obj[512]; if(olen>=512)olen=511;
-        memcpy(obj,ob,olen); obj[olen]='\0';
-        char host[64]={0}; char port_s[16]={0}; int port=9091;
-        if (!_json_str_val(obj,"ip_address",host,sizeof(host)))
-            _json_str_val(obj,"host",host,sizeof(host));
-        if (_json_str_val(obj,"port",port_s,sizeof(port_s)))
-            port=(int)strtol(port_s,NULL,10);
-        if (port<=0||port>65535) port=9091;
-        if (host[0]&&strcmp(host,"127.0.0.1")!=0&&strcmp(host,"localhost")!=0) {
-            if (qtcl_p2p_connect(host,(uint16_t)port)>=0) connected++;
-        }
-        p=cb+1;
-    }
-    return connected;
-}
-void *_koyeb_reg_thread(void *arg) {
-    _KoyebCtx *k=(_KoyebCtx*)arg;
-    static int ssl_done=0;
-    if (!ssl_done){
-        OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS|
-                         OPENSSL_INIT_LOAD_CRYPTO_STRINGS,NULL);
-        ssl_done=1;
-    }
-    char resp[KOYEB_BUF_MAX], body[1024];
-    while (k->running) {
-        float fid=0.0f; uint32_t h=0;
-        qtcl_p2p_get_consensus_dm(NULL,NULL,&fid,&h);
-        snprintf(body,sizeof(body),
-            "{\"peer_id\":\"%s\",\"gossip_url\":\"http://%s:%u\","
-            "\"miner_address\":\"%s\",\"block_height\":%u,"
-            "\"port\":%u,\"network_version\":\"3\",\"supports_sse\":true}",
-            k->peer_id,
-            k->my_ip[0] ? k->my_ip : "0.0.0.0",
-            (unsigned)k->p2p_port,
-            k->miner_addr, h, (unsigned)k->p2p_port);
-        int n=_koyeb_post_tls(k->koyeb_host,"/api/peers/register",body,resp,sizeof(resp));
-        if (n>0){
-            char *bs=strstr(resp,"\r\n\r\n");
-            if (bs) _parse_and_connect_peers(bs+4);
-        }
-        snprintf(body,sizeof(body),
-            "{\"node_id\":\"%s\",\"port\":%u,\"version\":3}",
-            k->peer_id,(unsigned)k->p2p_port);
-        n=_koyeb_post_tls(k->koyeb_host,"/api/p2p/peer_exchange",body,resp,sizeof(resp));
-        if (n>0){
-            char *bs=strstr(resp,"\r\n\r\n");
-            if (bs) _parse_and_connect_peers(bs+4);
-        }
-        for (int i=0;i<120&&k->running;i++) sleep(1);
-    }
-    return NULL;
-}
-void *_koyeb_hb_thread(void *arg) {
-    _KoyebCtx *k=(_KoyebCtx*)arg;
-    char resp[512], body[512];
-    while (k->running) {
-        float fid=0.0f; uint32_t h=0;
-        qtcl_p2p_get_consensus_dm(NULL,NULL,&fid,&h);
-        snprintf(body,sizeof(body),
-            "{\"peer_id\":\"%s\",\"block_height\":%u,\"port\":%u}",
-            k->peer_id,(unsigned)h,(unsigned)k->p2p_port);
-        _koyeb_post_tls(k->koyeb_host,"/api/peers/heartbeat",body,resp,sizeof(resp));
-        for (int i=0;i<30&&k->running;i++) sleep(1);
-    }
-    return NULL;
-}
-int qtcl_koyeb_start(const char *host, const char *peer_id,
-                     const char *miner_addr, const char *my_ip, uint16_t p2p_port) {
-    if (_KOYEB.running) return 0;
-    strncpy(_KOYEB.koyeb_host, host,                     KOYEB_HOST_MAX-1);
-    strncpy(_KOYEB.peer_id,    peer_id,                  64);
-    strncpy(_KOYEB.miner_addr, miner_addr?miner_addr:"", 127);
-    strncpy(_KOYEB.my_ip,      my_ip?my_ip:"",           63);
-    _KOYEB.p2p_port = p2p_port ? p2p_port : 9091;
-    _KOYEB.running  = 1;
-    pthread_attr_t a; pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-    pthread_create(&_KOYEB.thread,  &a, _koyeb_reg_thread, &_KOYEB);
-    pthread_create(&_koyeb_hb_tid,  &a, _koyeb_hb_thread,  &_KOYEB);
-    pthread_attr_destroy(&a);
-    return 1;
-}
-void qtcl_koyeb_stop(void) { _KOYEB.running=0; }
-typedef struct { char host[KOYEB_HOST_MAX]; char path[256]; char body[KOYEB_BUF_MAX]; } _KPost;
-void *_kpost_thread(void *arg) {
-    _KPost *p=(_KPost*)arg; char resp[512];
-    _koyeb_post_tls(p->host,p->path,p->body,resp,sizeof(resp));
-    free(p); return NULL;
-}
-void qtcl_koyeb_post_async(const char *host, const char *path, const char *json_body) {
-    if (!host||!path||!json_body) return;
-    _KPost *p=(_KPost*)malloc(sizeof(_KPost)); if(!p) return;
-    strncpy(p->host, host, KOYEB_HOST_MAX-1);
-    strncpy(p->path, path, 255);
-    strncpy(p->body, json_body, KOYEB_BUF_MAX-1);
-    pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
-    pthread_create(&t,&a,_kpost_thread,p);
-    pthread_attr_destroy(&a);
-}
-void qtcl_p2p_announce_block(uint32_t height, const char *block_hash_hex,
-                              const char *miner_addr) {
-    if (!_P2P.running) return;
-    char json[512];
-    snprintf(json,sizeof(json),
-        "{\"type\":\"block\",\"height\":%u,\"hash\":\"%s\","
-        "\"miner\":\"%s\",\"ts\":%llu}",
-        height, block_hash_hex?block_hash_hex:"",
-        miner_addr?miner_addr:"", (unsigned long long)_clock_ns());
-    int jl=(int)strlen(json);
-    pthread_mutex_lock(&_P2P.peers_lock);
-    for (int i=0;i<P2P_MAX_PEERS;i++) {
-        if (_P2P.peers[i].active&&_P2P.peers[i].handshake_done&&_P2P.peers[i].fd>=0)
-            _send(_P2P.peers[i].fd,"blk",(uint8_t*)json,jl,0);
-    }
-    pthread_mutex_unlock(&_P2P.peers_lock);
-    if (_KOYEB.running&&_KOYEB.koyeb_host[0]) {
-        char body[640];
-        snprintf(body,sizeof(body),
-            "{\"block\":%s,\"origin\":\"%s\"}",
-            json, _KOYEB.peer_id[0]?_KOYEB.peer_id:"unknown");
-        qtcl_koyeb_post_async(_KOYEB.koyeb_host,"/api/gossip/ingest",body);
-    }
-}
-/* ─── §PeerDB  Stubs — peer persistence handled in Python (built-in sqlite3) ─ */
-int  qtcl_peerdb_load(const char *db_path)  { (void)db_path; return 0; }
-int  qtcl_peerdb_save(const char *db_path)  { (void)db_path; return 0; }
-int  qtcl_peerdb_upsert(const char *db_path, const char *host, uint16_t port)
-     { (void)db_path;(void)host;(void)port; return 0; }
-"""
-_QTCL_C_DEFS: str = """
-    /* §1 Hash */
-    /* P2P v2 structs — must precede function declarations */
-    typedef struct {
-        uint8_t  node_id[16];
-        uint32_t chain_height;
-        uint32_t pq0;
-        uint32_t pq_curr;
-        uint32_t pq_last;
-        double   w_fidelity;
-        double   coherence;
-        double   purity;
-        double   negativity;
-        double   entropy_vn;
-        double   discord;
-        double   hyp_dist_0c;
-        double   hyp_dist_cl;
-        double   hyp_dist_0l;
-        double   triangle_area;
-        double   ball_pq0[3];
-        double   ball_curr[3];
-        double   ball_last[3];
-        double   dm_re[64];
-        double   dm_im[64];
-        uint64_t timestamp_ns;
-        uint32_t nonce;
-        uint8_t  auth_tag[32];
-    } QtclWStateMeasurement;
-    typedef struct {
-        double   median_fidelity;
-        double   median_coherence;
-        double   median_purity;
-        double   median_negativity;
-        double   median_entropy;
-        double   median_discord;
-        double   consensus_dm_re[64];
-        double   consensus_dm_im[64];
-        uint8_t  quorum_hash[32];
-        uint32_t peer_count;
-        uint32_t chain_height;
-        double   agreement_score;
-        double   hyp_area_median;
-    } QtclWStateConsensus;
-    typedef struct {
-        uint8_t  node_id[16];
-        char     host[64];
-        uint16_t port;
-        uint8_t  services;
-        uint8_t  version;
-        uint8_t  _pad4[4];
-        int64_t  last_seen_ns;
-        int32_t  chain_height;
-        float    last_fidelity;
-        float    latency_ms;
-        uint16_t ban_score;
-        uint8_t  connected;
-        uint8_t  _pad;
-    } QtclPeer;
-    void    qtcl_sha3_256(const uint8_t *in, size_t inlen, uint8_t *out);
-    void    qtcl_sha256(const uint8_t *in, size_t inlen, uint8_t *out);
-    void    qtcl_shake256_xof(const uint8_t *domain, size_t dlen,
-                              const uint8_t *input, size_t ilen,
-                              uint8_t *out, size_t outlen);
-    void    qtcl_hmac_sha256(const uint8_t *key, size_t klen,
-                             const uint8_t *msg, size_t mlen, uint8_t *out32);
-    void    qtcl_hmac_sha512(const uint8_t *key, size_t klen,
-                             const uint8_t *msg, size_t mlen, uint8_t *out64);
-    /* §2 Lattice */
-    void    qtcl_matvec_mod(const uint32_t *A, const uint32_t *v,
-                            uint32_t *out, uint32_t n, uint32_t q);
-    void    qtcl_vec_add_mod(const uint32_t *u, const uint32_t *v,
-                             uint32_t *out, uint32_t n, uint32_t q);
-    void    qtcl_vec_sub_mod(const uint32_t *u, const uint32_t *v,
-                             uint32_t *out, uint32_t n, uint32_t q);
-    void    qtcl_derive_basis(const uint8_t *entropy32, uint32_t *A_out,
-                              uint32_t n, uint32_t q);
-    void    qtcl_derive_secret(const uint8_t *entropy32, uint32_t *s_out,
-                               uint32_t n, uint32_t q);
-    void    qtcl_hash_to_vec(const uint8_t *data32, uint32_t *out,
-                             uint32_t n, uint32_t q);
-    void    qtcl_vec_to_hex(const uint32_t *v, uint32_t n, char *out);
-    void    qtcl_hex_to_vec(const char *hex, uint32_t *out, uint32_t n);
-    /* §3 HLWE */
-    void    qtcl_hlwe_sign(const uint8_t *msg_hash32, const char *privkey_hex,
-                           uint32_t q, uint8_t *sig_bytes_out, char *auth_tag_hex_out);
-    int     qtcl_hlwe_verify(const uint8_t *msg_hash32, const uint8_t *sig_bytes256,
-                             const char *expected_auth_tag_hex);
-    void    qtcl_derive_address(const uint32_t *pubkey, uint32_t n, char *addr_hex_out);
-    /* §4 BIP */
-    void    qtcl_bip39_mnemonic_to_seed(const char *mnemonic, const char *passphrase,
-                                        uint8_t *seed64_out);
-    void    qtcl_bip32_child_key(const uint8_t *parent_key32, const uint8_t *chain_code32,
-                                 uint32_t index, int hardened,
-                                 uint8_t *child_key32_out, uint8_t *child_chain32_out);
-    void    qtcl_bip38_scrypt(const char *passphrase, const uint8_t *salt8, uint8_t *dk64_out);
-    void    qtcl_aes256_ecb_enc(const uint8_t *key32, const uint8_t *in16, uint8_t *out16);
-    void    qtcl_aes256_ecb_dec(const uint8_t *key32, const uint8_t *in16, uint8_t *out16);
-    /* §5 Quantum Metrics */
-    double  qtcl_purity(const double *dm_re, const double *dm_im, int n);
-    double  qtcl_coherence_l1(const double *dm_re, const double *dm_im, int n);
-    double  qtcl_frobenius_diff(const double *ar, const double *ai,
-                                const double *br, const double *bi, int n);
-    void    qtcl_partial_trace_8to4(const double *dm8_re, const double *dm8_im,
-                                    int keep_q0, int keep_q1,
-                                    double *dm4_re_out, double *dm4_im_out);
-    void    qtcl_t_matrix(const double *dm4_re, const double *dm4_im, double *T_out);
-    double  qtcl_chsh_horodecki(const double *T9);
-    double  qtcl_fidelity_w3(const double *dm8_re);
-    /* §6 GKSL */
-    void    qtcl_gksl_rk4(double *rho_re, double *rho_im,
-                           double g1, double gphi, double gdep, double omega,
-                           double dt, int n_steps);
-    /* §7 Merkle */
-    void    qtcl_merkle_root(const uint8_t *leaves, uint32_t n, uint8_t *root32_out);
-    /* §8 DHT */
-    int     qtcl_dht_xor_distance(const char *id_a_hex64, const char *id_b_hex64);
-    /* §9 Entropy */
-    void    qtcl_mix_entropy(const uint8_t *existing32, const uint8_t *new_sample32,
-                             const uint8_t *salt16, uint8_t *out32);
-    /* §PoW */
-    void    qtcl_build_scratchpad(const uint8_t *seed, uint8_t *out, size_t outlen);
-    int64_t qtcl_pow_search(uint64_t height, uint32_t ts,
-                            const uint8_t *ph, const uint8_t *mr,
-                            uint32_t diff, uint32_t start, uint32_t chunk,
-                            const uint8_t *ma, const uint8_t *seed,
-                            const uint8_t *sp, uint8_t *out_hash);
-    void     qtcl_pow_set_abort(int v);
-    int      qtcl_pow_get_abort(void);
-    void     qtcl_set_oracle_height(uint64_t h);
-    uint64_t qtcl_get_oracle_height(void);
-    void     qtcl_set_miner_target(uint64_t h);
-    uint64_t qtcl_get_miner_target(void);
-    /* §Bath — Non-Markovian Lindblad bath (256×256 DM, in-place) */
-    void    qtcl_nonmarkov_bath_step(
-                int dim,
-                double *dm_re, double *dm_im,
-                double gamma_phi, double t1_s, double kappa, double dt,
-                const double *mem_re, const double *mem_im,
-                int n_mem, double dt_s,
-                double bath_omega_c, double bath_omega_0,
-                double bath_gamma_r, double bath_eta);
-    /* Self-test */
-    int     qtcl_selftest(void);
-    /* §Hyper — Hyperbolic geometry */
-    void    qtcl_pq_to_ball(uint32_t pq_id, double out_ball[3]);
-    double  qtcl_hyperbolic_distance(const double a[3], const double b[3]);
-    void    qtcl_compute_hyp_triangle(
-                uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
-                double *out_dist_0c, double *out_dist_cl, double *out_dist_0l,
-                double *out_area,
-                double out_ball0[3], double out_ballc[3], double out_balll[3]);
-    void    qtcl_build_tripartite_dm(
-                const double b0[3], const double bc[3], const double bl[3],
-                double dm_re_out[64], double dm_im_out[64]);
-    void    qtcl_fuse_oracle_dm(
-                const double local_re[64], const double local_im[64],
-                const double oracle_re[64], const double oracle_im[64],
-                double w, double out_re[64], double out_im[64]);
-    /* §Meas — Measurement signing */
-    void    qtcl_measurement_sign(QtclWStateMeasurement *m,
-                                   const uint8_t *secret32);
-    int     qtcl_measurement_verify(const QtclWStateMeasurement *m,
-                                     const uint8_t *secret32);
-    /* §Cons — BFT Consensus */
-    void    qtcl_consensus_compute(
-                const QtclWStateMeasurement *measurements, int n,
-                const QtclWStateMeasurement *oracle_dm, double oracle_weight,
-                QtclWStateConsensus *out);
-    /* QtclDMPoolEntry — DM pool entry from P2P peers */
-    typedef struct {
-        double   dm_re[64];
-        double   dm_im[64];
-        float    fidelity;
-        float    purity;
-        uint32_t chain_height;
-        uint64_t timestamp_ns;
-        uint8_t  source_id[16];
-        uint8_t  flags;
-    } QtclDMPoolEntry;
-    /* §P2P — Ouroboros Custom Protocol v4: epidemic gossip, Bloom dedup,
-       fanout, reputation, temporal DM, backoff, topics, INV/GETDATA */
-    int     qtcl_p2p_init(const char *node_id_hex, uint16_t listen_port,
-                           int max_peers);
-    int     qtcl_p2p_connect(const char *host, uint16_t port);
-    void    qtcl_p2p_disconnect(int conn_handle);
-    void    qtcl_p2p_shutdown(void);
-    int     qtcl_p2p_peers(QtclPeer *buf, int max_peers);
-    int     qtcl_p2p_peer_count(void);
-    int     qtcl_p2p_connected_count(void);
-    /* qtcl_p2p_sse_sub_count() removed — RPC-only model */
-    int     qtcl_p2p_send_wstate(const QtclWStateMeasurement *m);
-    int     qtcl_p2p_poll_wstate(QtclWStateMeasurement *buf, int max_msgs);
-    int     qtcl_p2p_poll_dmpool(QtclDMPoolEntry *buf, int max_entries);
-    int     qtcl_p2p_get_consensus_dm(double *out_re, double *out_im,
-                                       float *out_fidelity, uint32_t *out_height);
-    void    qtcl_p2p_trigger_consensus(void);
-    void    qtcl_p2p_broadcast_chain_reset(uint32_t new_height,
-                                            const char *genesis_hash32_hex);
-    void    qtcl_p2p_send_inv(uint8_t inv_type, const uint8_t *hash32);
-    void    qtcl_p2p_set_callback(void (*cb)(int, const void *, size_t));
-    int     qtcl_wstate_measurement_size(void);
-    int     qtcl_wstate_consensus_size(void);
-    int     qtcl_dm_pool_entry_size(void);
-    /* §HypEnt — Hyperbolic entropy multiplier + XOR pool */
-    void    qtcl_hyp_entropy_mul(const uint8_t *seed32, uint32_t depth, uint8_t *out32);
-    void    qtcl_xor3_pool(const uint8_t *s1, const uint8_t *s2,
-                           const uint8_t *s3, uint8_t *out32);
-    /* §Bootstrap — Entanglement bootstrap pipeline */
-    int     qtcl_bootstrap_parse_dm_frame(const char *json_frame,
-                                          double *out_re, double *out_im);
-    void    qtcl_bootstrap_ingest_dm(const double *dm_re, const double *dm_im);
-    int     qtcl_bootstrap_dm_age_ok(double max_age_s);
-    int     qtcl_bootstrap_build_blockfield(
-                uint32_t pq0, uint32_t pq_curr, uint32_t pq_last,
-                uint32_t chain_height, const uint8_t *node_id16,
-                double gamma1, double gammaphi, double gammadep, double omega,
-                double dt,
-                QtclWStateMeasurement *out_m, uint8_t *out_seed32);
-    int     qtcl_bootstrap_fidelity_report(
-                const QtclWStateMeasurement *m,
-                int oracle_ok, double oracle_age_s,
-                char *buf, int buf_sz);
-    /* §Mermin — 3-qubit Mermin-Klyshko nonlocality witness */
-    double  qtcl_mermin_w3(const double *dm8_re, const double *dm8_im);
-    /* §KoyebReg — HTTPS peer registration + fire-and-forget posts */
-    int     qtcl_koyeb_start(const char *host, const char *peer_id,
-                              const char *miner_addr, const char *my_ip,
-                              uint16_t p2p_port);
-    void    qtcl_koyeb_stop(void);
-    void    qtcl_koyeb_post_async(const char *host, const char *path,
-                                   const char *json_body);
-    void    qtcl_p2p_announce_block(uint32_t height,
-                                     const char *block_hash_hex,
-                                     const char *miner_addr);
-    /* §PeerDB — SQLite peer persistence */
-    int     qtcl_peerdb_load(const char *db_path);
-    int     qtcl_peerdb_save(const char *db_path);
-    int     qtcl_peerdb_upsert(const char *db_path,
-                                const char *host, uint16_t port);
-"""
-def _compile_c_layer() -> None:
-    """
-    Compile the QTCL C acceleration layer once at module import.
-    Tries cffi.verify() with OpenSSL. Silently falls back to pure Python
-    on any error — every calling site checks False before using C paths.
-    Termux first-time setup:
-        pkg install clang openssl libffi
-    """
-    global _accel_ffi, _accel_lib
-    _log = _logging.getLogger("qtcl.accel")
-    try:
-        import cffi as _cffi_mod
-        import platform as _plat
-        _accel_ffi = _cffi_mod.FFI()
-        _accel_ffi.cdef(_QTCL_C_DEFS)
-        _TERMUX = '/data/data/com.termux/files/usr'
-        _inc = [_TERMUX + '/include'] if _os.path.isdir(_TERMUX) else []
-        _lib = [_TERMUX + '/lib']     if _os.path.isdir(_TERMUX) else []
-        
-        # Detect aarch64 (Android/Termux) and use generic CPU flag for max compatibility
-        _is_aarch64 = _plat.machine() in ('aarch64', 'arm64')
-        _march_flag = ['-mcpu=generic'] if _is_aarch64 else []   # no -march=native — cffi verify runs on build host
-
-        _accel_lib = _accel_ffi.verify(
-            _QTCL_C_SRC,
-            libraries=['ssl', 'crypto', 'sqlite3', 'pthread', 'm'],
-            extra_compile_args=[
-                '-O2',
-                '-std=c11',
-            ] + _march_flag + [
-                '-DOPENSSL_NO_DEPRECATED',
-                '-Wno-unused-function',
-                '-Wno-unused-variable',
-                '-Wno-unreachable-code',
-                '-Wno-implicit-function-declaration',
-                '-Wno-int-conversion',
-                '-Wno-return-type',
-                '-Wno-unused-but-set-variable',
-            ],
-            include_dirs=_inc,
-            library_dirs=_lib,
-        )
-        _log.info(
-            "⚡ QTCL C acceleration active  "
-            "(§PoW §Lattice §HLWE §BIP §Metrics §GKSL §Merkle §DHT §Entropy "
-            "§Hyper §Meas §Cons §RPC §P2P)"
-        )
-    except Exception as _e:
-        _err = str(_e)
-        if any(x in _err for x in ('error:', 'CompileError', 'VerificationError', 'cannot locate symbol')):
-            _log.warning(
-                f"[ACCEL] ❌ C compile/link FAILED — pure-Python mode active\n"
-                f"  Cause: {_err[:400]}\n"
-                f"  Fix:   rm -rf __pycache__ && pkg install clang openssl libffi sqlite && python qtcl_client.py"
-            )
-        else:
-            _log.warning(
-                f"[ACCEL] C layer unavailable ({type(_e).__name__}: {_e}). "
-                f"Pure-Python fallbacks engaged. "
-                f"For full acceleration on Termux: pkg install clang openssl libffi sqlite"
-            )
-_compile_c_layer()   # Fires once at import — cached by cffi thereafter (~1–3s on Termux)
-# ── Convenience helpers for tight-loop C buffer allocation ────────────────────
-def _accel_vec_buf(n: int):
-    """Allocate a uint32[n] cffi buffer. Only call if False."""
-    return _accel_ffi.new(f'uint32_t[{n}]')
-def _accel_bytes_buf(n: int):
-    """Allocate a uint8[n] cffi buffer."""
-    return _accel_ffi.new(f'uint8_t[{n}]')
-def _accel_double_buf(n: int):
-    """Allocate a double[n] cffi buffer."""
-    return _accel_ffi.new(f'double[{n}]')
-def _accel_char_buf(n: int):
-    """Allocate a char[n] cffi buffer."""
-    return _accel_ffi.new(f'char[{n}]')
 # ──────────────────────────────────────────────────────────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────
 def _patch_db_insert():
@@ -10994,12 +7487,6 @@ def _vn_entropy(dm) -> float:
     return float(-_np.sum(ev * _np.log2(ev))) if len(ev) else 0.0
 def _coherence_l1(dm) -> float:
     """Normalized L1 coherence. C path collapses 7 numpy calls to 1."""
-    if False and dm.shape[0] <= 8:
-        n   = dm.shape[0]
-        re  = _np.ascontiguousarray(_np.real(dm).flatten())
-        im  = _np.ascontiguousarray(_np.imag(dm).flatten())
-        _re = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re))
-        _im = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
     d   = dm.shape[0]
     off = float(_np.sum(_np.abs(dm)) - _np.sum(_np.abs(_np.diag(dm))))
     return off / max(1, d * (d - 1))
@@ -11019,13 +7506,6 @@ def _bell_chsh_full(dm4) -> float:
     C path: qtcl_t_matrix + qtcl_chsh_horodecki — Jacobi 3×3 eigen,
     no LAPACK dispatch overhead.
     """
-    if False and dm4.shape == (4, 4):
-        re  = _np.ascontiguousarray(_np.real(dm4).flatten())
-        im  = _np.ascontiguousarray(_np.imag(dm4).flatten())
-        T9  = _np.zeros(9, dtype=_np.float64)
-        _re  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(re))
-        _im  = _accel_ffi.cast('double *', _accel_ffi.from_buffer(im))
-        _T   = _accel_ffi.cast('double *', _accel_ffi.from_buffer(T9))
     sx, sy, sz = _SX, _SY, _SZ
     T = _np.zeros((3, 3), dtype=float)
     for i, pi in enumerate([sx, sy, sz]):
@@ -12086,6 +8566,7 @@ class ServerRPCClient:
 
 _P2P_VERSION = "4.0.0"
 _P2P_PORT = int(os.getenv('P2P_PORT', '9091'))
+_LOCAL_HTTP_PORT = int(os.getenv('LOCAL_HTTP_PORT', str(_P2P_PORT + 1)))  # Separate port for local HTTP/gossip server
 _P2P_MAX_PEERS = int(os.getenv('P2P_MAX_PEERS', '32'))
 _P2P_MAX_OUTBOUND = int(os.getenv('P2P_MAX_OUTBOUND', '8'))
 _P2P_SESSION_TTL = int(os.getenv('P2P_SESSION_TTL', '600'))
@@ -12322,7 +8803,12 @@ class PeerManager:
     
     def add_peer(self, peer: P2PPeer) -> None:
         with self.lock:
+            _is_new = peer.node_id not in self.peers
             self.peers[peer.node_id] = peer
+            if _is_new:
+                _EXP_LOG.info(f"[PEER] 📡 New peer added: {peer.host}:{peer.port} node_id={peer.node_id[:16] if peer.node_id else 'unknown'}...")
+            else:
+                _EXP_LOG.debug(f"[PEER] Peer updated: {peer.host}:{peer.port} node_id={peer.node_id[:16] if peer.node_id else 'unknown'}...")
     
     def get_peer(self, node_id: str) -> P2PPeer:
         return self.peers.get(node_id)
@@ -12962,7 +9448,7 @@ class BlockPropagator:
         self.pending_blocks = {}
     
     def broadcast_inv(self, block_hash: str, height: int, miner_addr: str, peers: List[P2PPeer]) -> None:
-        """Broadcast block inventory to all peers"""
+        """Broadcast block inventory to all peers with per-peer DEBUG logging"""
         payload = {
             'type': 'block',
             'hash': block_hash,
@@ -12970,17 +9456,32 @@ class BlockPropagator:
             'miner_addr': miner_addr,
             'ttl_hops': 8
         }
+        _success_count = 0
+        _fail_count = 0
         for peer in peers:
             try:
-                self._send_rpc(peer, 'qtcl_p2p_inv', payload)
-            except: pass
+                _EXP_LOG.debug(f"[GOSSIP] Sending qtcl_p2p_inv to {peer.host}:{peer.port} for block h={height} hash={block_hash[:16]}...")
+                result = self._send_rpc(peer, 'qtcl_p2p_inv', payload)
+                if result and not result.get('error'):
+                    _success_count += 1
+                    _EXP_LOG.debug(f"[GOSSIP] ✅ inv sent to {peer.host}:{peer.port}")
+                else:
+                    _fail_count += 1
+                    _EXP_LOG.debug(f"[GOSSIP] ⚠️ inv to {peer.host}:{peer.port} returned: {result}")
+            except Exception as e:
+                _fail_count += 1
+                _EXP_LOG.debug(f"[GOSSIP] ❌ inv to {peer.host}:{peer.port} failed: {e}")
+        _EXP_LOG.info(f"[GOSSIP] Block h={height} inv broadcast: {len(peers)} peers, {_success_count} ok, {_fail_count} failed")
     
     def handle_inv(self, payload: dict, peer: P2PPeer) -> dict:
-        """Handle incoming inv message"""
+        """Handle incoming inv message with DEBUG logging"""
         block_hash = payload.get('hash')
         height = payload.get('height')
+        miner_addr = payload.get('miner_addr', 'unknown')
         if not block_hash:
+            _EXP_LOG.debug(f"[GOSSIP] inv from {peer.host}:{peer.port} — no hash")
             return {'want': False}
+        _EXP_LOG.info(f"[GOSSIP] 📨 inv RECEIVED from {peer.host}:{peer.port} — h={height} hash={block_hash[:16]}... miner={miner_addr[:16]}...")
         return {'want': True}
     
     def handle_get_data(self, payload: dict, peer: P2PPeer, db) -> dict:
@@ -12999,23 +9500,29 @@ class BlockPropagator:
         return {'found': False}
     
     def handle_push_block(self, payload: dict, peer: P2PPeer, db) -> dict:
-        """Handle incoming block push"""
+        """Handle incoming block push with comprehensive DEBUG logging"""
         block_data = payload.get('block_data')
         if not block_data:
+            _EXP_LOG.debug(f"[GOSSIP] pushBlock from {peer.host}:{peer.port} — no block_data")
             return {'accepted': False, 'height': 0}
         try:
             height = block_data.get('height', 0)
             block_hash = block_data.get('block_hash', '')
             hyp_area = block_data.get('hyp_triangle_area', 0)
             oracle_ref = payload.get('oracle_snapshot_ref')
+            _EXP_LOG.debug(f"[GOSSIP] pushBlock received from {peer.host}:{peer.port} — h={height} hash={block_hash[:16]}...")
             if self.lattice:
                 stored = self.lattice.store_lattice_state(height, block_hash, hyp_area, oracle_ref, {}, {})
                 if stored:
                     consensus, _ = self.lattice.get_tripartite_consensus(height)
                     if not consensus:
+                        _EXP_LOG.warning(f"[GOSSIP] pushBlock h={height} REJECTED — PQ0 consensus failed")
                         return {'accepted': False, 'error': 'PQ0 consensus failed'}
+                    _EXP_LOG.debug(f"[GOSSIP] pushBlock h={height} PQ0 consensus passed")
+            _EXP_LOG.info(f"[GOSSIP] ✅ pushBlock ACCEPTED h={height} from {peer.host}:{peer.port}")
             return {'accepted': True, 'height': height}
         except Exception as e:
+            _EXP_LOG.warning(f"[GOSSIP] pushBlock from {peer.host}:{peer.port} error: {e}")
             return {'accepted': False, 'error': str(e)}
     
     def _send_rpc(self, peer: P2PPeer, method: str, params: dict) -> dict:
@@ -13459,10 +9966,15 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             if not propagator: return None, {'code': -32601, 'message': 'method not found'}
             block_hash = params.get('hash', '')
             height = params.get('height', 0)
+            miner_addr = params.get('miner_addr', 'unknown')
+            _EXP_LOG.debug(f"[P2P-RPC] qtcl_p2p_inv from {client_ip} — h={height} hash={block_hash[:16] if block_hash else 'none'}...")
             if seen_blocks and not seen_blocks.contains(block_hash):
                 seen_blocks.add(block_hash)
                 peer = P2PPeer(client_ip, _P2P_PORT)
-                return propagator.handle_inv(params, peer)
+                result = propagator.handle_inv(params, peer)
+                _EXP_LOG.info(f"[P2P-RPC] qtcl_p2p_inv handled — want={result.get('want', False)} for h={height}")
+                return result
+            _EXP_LOG.debug(f"[P2P-RPC] qtcl_p2p_inv duplicate or missing hash — rejecting")
             return {'want': False}, None
         
         if method == 'qtcl_p2p_getData':
@@ -13471,7 +9983,10 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
         
         if method == 'qtcl_p2p_pushBlock':
             if not propagator: return None, {'code': -32601, 'message': 'method not found'}
-            return propagator.handle_push_block(params, None, db), None
+            _EXP_LOG.debug(f"[P2P-RPC] qtcl_p2p_pushBlock from {client_ip}")
+            result = propagator.handle_push_block(params, None, db)
+            _EXP_LOG.info(f"[P2P-RPC] qtcl_p2p_pushBlock result: accepted={result.get('accepted', False)} height={result.get('height', 0)}")
+            return result, None
         
         if method == 'qtcl_p2p_pushTx':
             if not tx_relay: return None, {'code': -32601, 'message': 'method not found'}
@@ -14064,29 +10579,43 @@ class EnhancedBlockPropagator:
         now = time.time()
         inv_key = f"{block_hash}:{height}"
         if inv_key in self.recent_invs and now - self.recent_invs[inv_key] < 60:
+            _EXP_LOG.debug(f"[GOSSIP] Skipping duplicate inv for {block_hash[:16]}... (sent {now - self.recent_invs[inv_key]:.0f}s ago)")
             return
         self.recent_invs[inv_key] = now
-        payload = {'type': 'block', 'hash': block_hash, 'height': height, 
+        payload = {'type': 'block', 'hash': block_hash, 'height': height,
                    'miner_addr': miner_addr, 'ttl_hops': 8, 'timestamp': now}
+        _ok = 0
+        _fail = 0
         for peer in peers:
             try:
-                self._send_rpc(peer, 'qtcl_p2p_inv', payload)
-            except:
-                pass
+                _EXP_LOG.debug(f"[GOSSIP] Sending qtcl_p2p_inv to {peer.host}:{peer.port}...")
+                result = self._send_rpc(peer, 'qtcl_p2p_inv', payload)
+                if result and not result.get('error'):
+                    _ok += 1
+                    _EXP_LOG.debug(f"[GOSSIP] ✅ inv delivered to {peer.host}:{peer.port}")
+                else:
+                    _fail += 1
+            except Exception as e:
+                _fail += 1
+                _EXP_LOG.debug(f"[GOSSIP] ❌ inv to {peer.host}:{peer.port} failed: {e}")
+        _EXP_LOG.info(f"[GOSSIP] Block h={height} inv broadcast: {len(peers)} peers, {_ok} ok, {_fail} failed")
     
     def handle_inv(self, payload: dict, peer: Any) -> dict:
         block_hash = payload.get('hash')
         height = payload.get('height')
+        miner_addr = payload.get('miner_addr', 'unknown')
         if not block_hash:
             return {'want': False}
         if block_hash in self.dag.nodes:
+            _EXP_LOG.debug(f"[GOSSIP] inv from {peer.host}:{peer.port} — block {block_hash[:16]}... already known")
             return {'want': False}
+        _EXP_LOG.info(f"[GOSSIP] 📨 inv RECEIVED from {peer.host}:{peer.port} — h={height} hash={block_hash[:16]}... miner={miner_addr[:16]}...")
         parent_hashes = payload.get('parent_hashes', [])
         if parent_hashes:
             self.dag.add_block(block_hash, height, parent_hashes)
             tips = self.dag.get_tips()
             if len(tips) > 1:
-                logger.info(f"[BlockPropagator] Fork detected: {len(tips)} tips")
+                _EXP_LOG.warning(f"[GOSSIP] ⚠️ Fork detected: {len(tips)} tips at height {height}")
         return {'want': True}
     
     def handle_get_data(self, payload: dict, peer: Any, db) -> dict:
@@ -14112,15 +10641,18 @@ class EnhancedBlockPropagator:
     def handle_push_block(self, payload: dict, peer: Any, db) -> dict:
         block_data = payload.get('block_data')
         if not block_data:
+            _EXP_LOG.debug(f"[GOSSIP] pushBlock from {peer.host}:{peer.port} — no block_data")
             return {'accepted': False, 'height': 0}
         try:
             height = block_data.get('height', 0)
             block_hash = block_data.get('block_hash', '')
+            _EXP_LOG.debug(f"[GOSSIP] pushBlock received from {peer.host}:{peer.port} — h={height} hash={block_hash[:16]}...")
             tx_hashes = block_data.get('transactions', [])
             if tx_hashes:
                 merkle = MerkleTree(tx_hashes)
                 claimed_root = block_data.get('merkle_root', '')
                 if merkle.get_root() != claimed_root:
+                    _EXP_LOG.warning(f"[GOSSIP] pushBlock h={height} REJECTED — merkle root mismatch")
                     return {'accepted': False, 'error': 'merkle root mismatch'}
             hyp_area = block_data.get('hyp_triangle_area', 0)
             oracle_ref = payload.get('oracle_snapshot_ref')
@@ -14129,11 +10661,15 @@ class EnhancedBlockPropagator:
                 if stored:
                     consensus, _ = self.lattice.get_tripartite_consensus(height)
                     if not consensus:
+                        _EXP_LOG.warning(f"[GOSSIP] pushBlock h={height} REJECTED — PQ0 consensus failed")
                         return {'accepted': False, 'error': 'PQ0 consensus failed'}
+                    _EXP_LOG.debug(f"[GOSSIP] pushBlock h={height} PQ0 consensus passed")
             parent_hashes = block_data.get('parent_hashes', [])
             self.dag.add_block(block_hash, height, parent_hashes)
+            _EXP_LOG.info(f"[GOSSIP] ✅ pushBlock ACCEPTED h={height} from {peer.host}:{peer.port}")
             return {'accepted': True, 'height': height}
         except Exception as e:
+            _EXP_LOG.warning(f"[GOSSIP] pushBlock from {peer.host}:{peer.port} error: {e}")
             return {'accepted': False, 'error': str(e)}
     
     def _send_rpc(self, peer: Any, method: str, params: dict) -> dict:
@@ -14861,7 +11397,7 @@ class QtclClientApp:
                    purity, negativity_AB, negativity_BC, field_density,
                    entanglement_entropy, oracle_fidelity, oracle_coherence,
                    bridge_fidelity, channel_latency_ms, block_height, ts)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 m.pq_curr_id, m.pq_last_id, m.fidelity_to_w3, m.entropy_vn,
                 m.coherence_l1, m.quantum_discord, m.bell_chsh_AB, m.bell_chsh_BC,
@@ -14876,8 +11412,9 @@ class QtclClientApp:
                 f"(SELECT id FROM tensor_field_metrics ORDER BY ts DESC "
                 f"LIMIT {self.DB_METRIC_LIMIT})")
             self._db.commit()
+            _EXP_LOG.debug(f"[METRICS] ✅ Persisted tensor_field_metrics row — h={m.block_height} fid={m.fidelity_to_w3:.4f} S={m.entropy_vn:.3f}")
         except Exception as e:
-            _EXP_LOG.debug(f"[DB] persist_metrics: {e}")
+            _EXP_LOG.warning(f"[METRICS] persist_metrics failed: {e}")
     def _persist_gossip(self, event_type: str, channel: str, payload: dict) -> None:
         if self._db is None:
             return
@@ -14892,8 +11429,9 @@ class QtclClientApp:
                 f"(SELECT id FROM gossip_inventory ORDER BY ts DESC "
                 f"LIMIT {self.DB_GOSSIP_LIMIT})")
             self._db.commit()
+            _EXP_LOG.debug(f"[GOSSIP] ✅ Persisted gossip_inventory — type={event_type} channel={channel}")
         except Exception as e:
-            _EXP_LOG.debug(f"[DB] persist_gossip: {e}")
+            _EXP_LOG.warning(f"[GOSSIP] persist_gossip failed: {e}")
         if channel in ('metrics', 'quantum', 'oracle'):
             def _post_gossip(ev=event_type, ch=channel, pay=payload):
                 try:
@@ -15225,10 +11763,12 @@ class QtclClientApp:
         try:
             import numpy as _np_f
             if upstream_dm is None or upstream_fid < 0.05:
+                _EXP_LOG.debug(f"[TRIPARTITE] fuse: no valid upstream (fid={upstream_fid:.4f}) — using local only")
                 return local_dm
             _tr_l = float(_np_f.real(_np_f.trace(local_dm)))
             _tr_u = float(_np_f.real(_np_f.trace(upstream_dm)))
             if _tr_l < 1e-12 or _tr_u < 1e-12:
+                _EXP_LOG.debug(f"[TRIPARTITE] fuse: zero trace — local={_tr_l:.6f} upstream={_tr_u:.6f}")
                 return local_dm
             _l = local_dm    / _tr_l
             _u = upstream_dm / _tr_u
@@ -15238,9 +11778,10 @@ class QtclClientApp:
             _tr_f = float(_np_f.real(_np_f.trace(fused)))
             if _tr_f > 1e-12:
                 fused /= _tr_f
+            _EXP_LOG.debug(f"[TRIPARTITE] fuse: w_lo={w_lo:.4f} w_up={w_up:.4f} local_fid={local_fid:.4f} upstream_fid={upstream_fid:.4f}")
             return fused
         except Exception as _fe:
-            _EXP_LOG.debug(f"[TRIPARTITE] fuse: {_fe}")
+            _EXP_LOG.warning(f"[TRIPARTITE] fuse error: {_fe}")
             return local_dm
 
     def _broadcast_snapshot_sse(self, snap: dict) -> None:
@@ -15275,8 +11816,17 @@ class QtclClientApp:
         _EXP_LOG.info("[TRIPARTITE] 🚀 Oracle engine starting…")
 
         # Initialise nodes (may fail on Termux without qiskit_aer)
+        _EXP_LOG.info("[TRIPARTITE] Initialising 3-node oracle cluster (pq0, pq0_IV, pq0_V)...")
         _has_aer = self._init_client_oracle_nodes()
         _numpy_only = not _has_aer
+        if _has_aer:
+            _EXP_LOG.info("[TRIPARTITE] ✅ Qiskit Aer available — full quantum measurement mode")
+        else:
+            _EXP_LOG.warning("[TRIPARTITE] ⚠️  Qiskit Aer unavailable — numpy-only fallback mode")
+        if _has_aer:
+            _EXP_LOG.info("[TRIPARTITE] ✅ Qiskit Aer available — full quantum measurement mode")
+        else:
+            _EXP_LOG.warning("[TRIPARTITE] ⚠️  Qiskit Aer unavailable — numpy-only fallback mode")
 
         # Numpy-only fallback import
         try:
@@ -15301,11 +11851,13 @@ class QtclClientApp:
                 if _has_aer and _HAS_NP_L:
                     with self._local_oracle_lock:
                         _nodes = list(self._local_oracle_nodes)
+                    _EXP_LOG.debug(f"[TRIPARTITE] Measuring {len(_nodes)} AerSimulator nodes...")
                     for _node in _nodes:
                         _dm = self._client_oracle_measure_node(_node, seed_dm=seed)
                         _node['last_dm'] = _dm
                         _node['last_ts'] = now
                         dms.append(_dm)
+                        _EXP_LOG.debug(f"[TRIPARTITE] Node {_node['id']} measured — DM shape={_dm.shape}")
 
                 # ── Step 2: 3-of-3 Hermitian mean ─────────────────────────
                 if _HAS_NP_L and dms:
@@ -15491,9 +12043,9 @@ class QtclClientApp:
         _p2p_th = _threading.Thread(
             target=self._start_p2p, daemon=True, name="P2P-Init")
         _p2p_th.start()
-        # ── 4. Local 9091 health + gossip HTTP server ─────────────────────
+        # ── 4. Local HTTP health + gossip server (port P2P_PORT+1) ─────────
         _http_th = _threading.Thread(
-            target=self._local_http_server, daemon=True, name="LocalHTTP-9091")
+            target=self._local_http_server, daemon=True, name=f"LocalHTTP-{_LOCAL_HTTP_PORT}")
         _http_th.start()
         # ── 5. Heartbeat loop — registers peer + sends keepalives ─────────
         _hb_th = _threading.Thread(
@@ -15993,7 +12545,7 @@ class QtclClientApp:
         pass
     def _local_http_server(self) -> None:
         """
-        Full oracle+mesh node HTTP server on 0.0.0.0:9091.
+        Full oracle+mesh node HTTP server on 0.0.0.0:{_LOCAL_HTTP_PORT}.
         Acts as a LOCAL ORACLE NODE in the P2P mesh — peers can subscribe to
         our SSE stream, query our oracle state, and push measurements to us.
         Also serves as the Koyeb health probe target.
@@ -16005,14 +12557,14 @@ class QtclClientApp:
           GET  /rpc/oracle/pq0-bloch → pq0 bloch sphere angles + DM metrics
           GET  /rpc/oracle/pq0       → alias for pq0-bloch
           GET  /api/peers/list       → known peers from local DB
-          GET  /api/p2p/peers        → C P2P connected peers
+          GET  /api/p2p/peers        → P2P connected peers
           GET  /api/p2p/consensus_dm → current consensus DM
           GET  /api/p2p/status       → full P2P node status
           POST /rpc/oracle/push_dm   → accept DM frame from peer oracle (aggregation)
           POST /api/peers/register   → register a peer (proxied from koyeb)
           POST /api/peers/heartbeat  → peer keepalive
           POST /gossip               → chain_reset + wstate gossip
-        Port 9091: Python HTTP shares via SO_REUSEPORT with C P2P TCP binary listener.
+        Runs on LOCAL_HTTP_PORT (default P2P_PORT+1) to avoid conflict with P2P RPC server.
         ❤️  I love you — every endpoint is a synapse in the quantum mesh
         """
         import socketserver as _ss, http.server as _hs, json as _hj
@@ -16324,7 +12876,9 @@ class QtclClientApp:
                     self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
                     try:
                         self.socket.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
-                    except AttributeError: pass
+                        _EXP_LOG.debug(f"[HTTP] SO_REUSEPORT enabled successfully")
+                    except (AttributeError, OSError) as e:
+                        _EXP_LOG.debug(f"[HTTP] SO_REUSEPORT not available: {e}")
                     super().server_bind()
                 def handle_error(self, request, client_address):
                     import sys as _sys
@@ -16332,15 +12886,25 @@ class QtclClientApp:
                     if isinstance(exc, (BrokenPipeError, ConnectionResetError,
                                         ConnectionAbortedError)):
                         return  # client hung up mid-response — not an error
-                    _EXP_LOG.debug(f"[HTTP-9091] handler error from {client_address}: {exc}")
-            with _ReuseServer(('0.0.0.0', 9091), _Handler) as srv:
-                _EXP_LOG.info("[HTTP-9091] ✅ Local HTTP server on 0.0.0.0:9091 (/health /events /gossip)")
+                    _EXP_LOG.debug(f"[HTTP] handler error from {client_address}: {exc}")
+            _http_port = _LOCAL_HTTP_PORT
+            _EXP_LOG.info(f"[HTTP] Binding local HTTP server to 0.0.0.0:{_http_port}")
+            with _ReuseServer(('0.0.0.0', _http_port), _Handler) as srv:
+                _EXP_LOG.info(f"[HTTP] ✅ Local HTTP server on 0.0.0.0:{_http_port} (/health /events /gossip)")
                 while not self._stop.is_set():
                     srv.handle_request()
         except OSError as _ose:
-            _EXP_LOG.debug(f"[HTTP-9091] Port 9091 in use by C layer (expected): {_ose}")
+            _EXP_LOG.warning(f"[HTTP] Port {_LOCAL_HTTP_PORT} in use: {_ose}. Trying P2P_PORT+2...")
+            try:
+                _fallback_port = _P2P_PORT + 2
+                with _ReuseServer(('0.0.0.0', _fallback_port), _Handler) as srv:
+                    _EXP_LOG.info(f"[HTTP] ✅ Local HTTP server on fallback port 0.0.0.0:{_fallback_port}")
+                    while not self._stop.is_set():
+                        srv.handle_request()
+            except Exception as _fe:
+                _EXP_LOG.error(f"[HTTP] Fallback also failed: {_fe}. Local HTTP server unavailable.")
         except Exception as _he:
-            _EXP_LOG.warning(f"[HTTP-9091] HTTP server error: {_he}")
+            _EXP_LOG.warning(f"[HTTP] HTTP server error: {_he}")
     # ── Mine mode ─────────────────────────────────────────────────────────────
     def run_mine_mode(self) -> None:
         print("\n  🔄 Loading wallet…")
@@ -16363,7 +12927,7 @@ class QtclClientApp:
         self._sync_hlwe_rpc_ops_to_db()
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
-        _my_gossip_url = f"http://{_MY_IP or 'localhost'}:{_P2P_PORT}"  # Bug #5b: was literal "auto"
+        _my_gossip_url = f"http://{_MY_IP or 'localhost'}:{_LOCAL_HTTP_PORT}"  # Local HTTP server port for gossip/health
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_gossip_url, self.wallet.address, 0)
         if _reg_resp and False:
@@ -16383,16 +12947,6 @@ class QtclClientApp:
             start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
         except Exception as _dme:
             _EXP_LOG.debug(f"[DMPOOL] start: {_dme}")
-        if False:
-            try:
-                _khost = b'qtcl-blockchain.koyeb.app\x00'
-                _kpid  = (self._peer_id[:64]).encode() + b'\x00'
-                _kaddr = (getattr(getattr(self,'wallet',None),'address','') or '').encode() + b'\x00'
-                import time as _kst; _kst.sleep(0.05)
-                _kip = (_MY_IP or '').encode() + b'\x00'
-                _EXP_LOG.info("[CLIENT] ✅ C koyeb registration thread (re)started with wallet address")
-            except Exception as _kwe:
-                _EXP_LOG.debug(f"[CLIENT] koyeb restart: {_kwe}")
         # ── RPC poll thread — no SSE ──────────────────────
         # ── Fetch live RPC snapshot on-demand ────────────────────────
         # ── Bootstrap oracle fetch: retry up to 30s — handles Koyeb cold-start ──
@@ -17241,30 +13795,39 @@ class QtclClientApp:
                             try:
                                 _peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
                                 if _peers:
-                                    _EXP_LOG.info(f"[P2P] 📡 Broadcasting block h={target_height} to {len(_peers)} peers...")
+                                    _EXP_LOG.info(f"[GOSSIP] 📡 Broadcasting block h={target_height} hash={block_hash[:16]}... to {len(_peers)} peers")
+                                    _ok = 0
+                                    _fail = 0
                                     # Broadcast inv to all peers
                                     for _p in _peers:
                                         try:
                                             import urllib.request
                                             _url = f"http://{_p.host}:{_p.port}/rpc"
                                             _data = b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"' + block_hash.encode() + b'","height":' + str(target_height).encode() + b',"miner_addr":"' + (self._oracle_id.get('address','')).encode() + b'","ttl_hops":8},"id":1}'
+                                            _EXP_LOG.debug(f"[GOSSIP] Sending qtcl_p2p_inv to {_p.host}:{_p.port}...")
                                             urllib.request.urlopen(_url, data=_data, timeout=5)
-                                        except Exception as _pe:
-                                            pass
-                                    _EXP_LOG.info(f"[P2P] ✅ Block broadcast complete")
+                                            _ok += 1
+                                            _EXP_LOG.debug(f"[GOSSIP] ✅ inv delivered to {_p.host}:{_p.port}")
+                                        except Exception as _peer_err:
+                                            _fail += 1
+                                            _EXP_LOG.debug(f"[GOSSIP] ❌ inv to {_p.host}:{_p.port} failed: {_peer_err}")
+                                    _EXP_LOG.info(f"[GOSSIP] ✅ Block h={target_height} broadcast complete: {_ok} delivered, {_fail} failed out of {len(_peers)} peers")
                                     _broadcast_ok = True
                                 else:
-                                    _EXP_LOG.warning(f"[P2P] ⚠️  Block h={target_height} ready but NO ACTIVE PEERS — bootstrap connecting…")
+                                    _EXP_LOG.warning(f"[GOSSIP] ⚠️  Block h={target_height} ready but NO ACTIVE PEERS — will use server fallback")
                             except Exception as _p2pe:
-                                _EXP_LOG.debug(f"[P2P] Broadcast error: {_p2pe}")
+                                _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
                         else:
                             _EXP_LOG.warning(f"[P2P] ⚠️  Block h={target_height} ready but P2P node not running — fallback to server-side gossip")
                         
                         # Fallback: announce block to server (server broadcasts to connected miners)
                         if not _broadcast_ok:
                             try:
+                                _EXP_LOG.info(f"[GOSSIP] Fallback: announcing block h={target_height} to server via qtcl_gossipBlockAnnounce")
                                 kapi.rpc("qtcl_gossipBlockAnnounce", [{"height": target_height, "hash": block_hash, "miner": miner_addr, "timestamp": timestamp}], 3, 1)
-                            except Exception: pass
+                                _EXP_LOG.info(f"[GOSSIP] ✅ Server-side gossip announce sent for h={target_height}")
+                            except Exception as _g_err:
+                                _EXP_LOG.warning(f"[GOSSIP] Server gossip announce failed: {_g_err}")
                         _MINE_TELEM.mark_mining()
                         # Wait for server tip to advance before re-entering loop.
                         # Without this the miner races back, sees stale height,
@@ -17435,8 +13998,17 @@ class QtclClientApp:
             # ── P2P Status ─────────────────────────────────────────────────
             _p2p_n = getattr(self, 'p2p_node', None)
             if _p2p_n and getattr(_p2p_n, '_running', False):
-                _p2p_peers = len(_p2p_n.peer_mgr.get_active_peers()) if _p2p_n.peer_mgr else 0
+                _active_peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
+                _p2p_peers = len(_active_peers)
                 print(f"  🌐 P2P     : ✅ {_p2p_n.external_addr}  peers={_p2p_peers}")
+                if _active_peers:
+                    _lats = [p.latency_ms for p in _active_peers if p.latency_ms > 0]
+                    _fids = [p.last_fidelity for p in _active_peers if p.last_fidelity > 0]
+                    _avg_lat = sum(_lats) / len(_lats) if _lats else 0
+                    _avg_fid = sum(_fids) / len(_fids) if _fids else 0
+                    _peer_heights = [p.chain_height for p in _active_peers if p.chain_height > 0]
+                    _max_peer_h = max(_peer_heights) if _peer_heights else 0
+                    print(f"           : avg_lat={_avg_lat:.0f}ms  avg_fid={_avg_fid:.4f}  max_peer_h={_max_peer_h}")
             else:
                 print(f"  🌐 P2P     : ⚠️  starting...")
             print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
@@ -17470,6 +14042,22 @@ class QtclClientApp:
                       f"S={_cf2(m2.entropy_vn,0,3):.4f}  "
                       f"purity={_cf2(m2.purity,0,1):.4f}  "
                       f"‖Δρ‖={_cf2(m2.field_density,0,100):.4f}")
+            # ── Tripartite Oracle Status ─────────────────────────────────────
+            _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
+            if _ora_state and _ora_state.get('cycle', 0) > 0:
+                _cycle = _ora_state.get('cycle', 0)
+                _fid = _ora_state.get('w_state_fidelity', 0.0)
+                _purity = _ora_state.get('purity', 0.0)
+                _vne = _ora_state.get('von_neumann_entropy', 0.0)
+                _mode = _ora_state.get('aer_noise_state', 'unknown')
+                _pq0_f = _ora_state.get('pq0_oracle_fidelity', 0.0)
+                _pq0_iv_f = _ora_state.get('pq0_IV_fidelity', 0.0)
+                _pq0_v_f = _ora_state.get('pq0_V_fidelity', 0.0)
+                _up_f = _ora_state.get('upstream_fidelity', 0.0)
+                print(f"  ⚛️  Oracle: cycle={_cycle} mode={_mode} fused_fid={_fid:.4f} purity={_purity:.4f} S={_vne:.3f}")
+                print(f"          pq0={_pq0_f:.4f}  pq0_IV={_pq0_iv_f:.4f}  pq0_V={_pq0_v_f:.4f}  upstream={_up_f:.4f}")
+            else:
+                print(f"  ⚛️  Oracle: ⚠️  awaiting first cycle...")
             if False and _P2P_NODE is None:
                 try:
                     _da_id = getattr(self, '_peer_id', None) or f"miner_{id(self)}"
