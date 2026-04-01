@@ -1621,7 +1621,7 @@ class LatticeDatabase:
         """Initialize database schema."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            with self._p2p_sqlite3.connect(self.db_path) as conn:
+            with self.sqlite3.connect(self.db_path) as conn:
                 # Lattice measurements table
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS lattice_measurements (
@@ -1698,7 +1698,7 @@ class LatticeDatabase:
         """Save a lattice measurement."""
         with self._lock:
             try:
-                with self._p2p_sqlite3.connect(self.db_path) as conn:
+                with self.sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO lattice_measurements
                         (measurement_id, chain_height, pq0_id, pq_curr_id, pq_last_id,
@@ -1735,7 +1735,7 @@ class LatticeDatabase:
         """Save current lattice state."""
         with self._lock:
             try:
-                with self._p2p_sqlite3.connect(self.db_path) as conn:
+                with self.sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO lattice_state
                         (node_id, chain_height, pq0_id, pq_curr_id, pq_last_id)
@@ -1750,7 +1750,7 @@ class LatticeDatabase:
         """Save consensus snapshot."""
         with self._lock:
             try:
-                with self._p2p_sqlite3.connect(self.db_path) as conn:
+                with self.sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT INTO lattice_consensus_log
                         (chain_height, median_fidelity, mean_coherence, mean_purity,
@@ -1774,7 +1774,7 @@ class LatticeDatabase:
         """Get measurements, optionally filtered by node."""
         with self._lock:
             try:
-                with self._p2p_sqlite3.connect(self.db_path) as conn:
+                with self.sqlite3.connect(self.db_path) as conn:
                     if node_id:
                         rows = conn.execute("""
                             SELECT * FROM lattice_measurements
@@ -1797,7 +1797,7 @@ class LatticeDatabase:
         """Get aggregated peer metrics."""
         with self._lock:
             try:
-                with self._p2p_sqlite3.connect(self.db_path) as conn:
+                with self.sqlite3.connect(self.db_path) as conn:
                     rows = conn.execute("""
                         SELECT peer_id, chain_height, avg_fidelity, avg_coherence, 
                                avg_purity, measurement_count, last_seen
