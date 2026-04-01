@@ -11438,7 +11438,7 @@ class P2PNode:
         self._start_peer_discovery_daemon()
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
     
-    def _start_peer_discovery_daemon(self) -> None:
+    def _start_peer_discovery_daemon(self, app_instance) -> None:
         """World-first P2P active discovery: Queries Koyeb AND recursively gossips with peers."""
         import threading as _t, time as _tm, json as _j
         from urllib.request import urlopen, Request
@@ -11447,69 +11447,12 @@ class P2PNode:
             print("[P2P-DISC] 🚀 Active peer discovery engine online", flush=True)
             while self._running:
                 try:
-                    # 1. QUERY KOYEB FOR PEER REGISTRY
+                    # ... rest of loop ...
+                    # 4. RE-REGISTER WITH KOYEB AS RELAY
                     try:
-                        _rpc_url = f"{ENTROPY_SERVER_URL}/rpc"
-                        _body = _j.dumps({
-                            "jsonrpc": "2.0", "method": "qtcl_getPeers", "params": [], "id": 1
-                        }).encode()
-                        _req = Request(_rpc_url, data=_body, headers={'Content-Type': 'application/json'})
-                        with urlopen(_req, timeout=5) as _resp:
-                            _data = _j.loads(_resp.read())
-                            _peers = _data.get('result', {}).get('peers', [])
-                            if _peers:
-                                print(f"[P2P-DISC] Koyeb registry: found {len(_peers)} potential peers", flush=True)
-                            for _p in _peers:
-                                # Standardize field names for register_peer_info
-                                _p.setdefault('host', _p.get('ip_hint') or _p.get('peer_addr', '').split(':')[0] or _p.get('external_addr', '').split(':')[0])
-                                _p.setdefault('node_id', _p.get('peer_id') or _p.get('node_id'))
-                                
-                                # Use the standardized register_peer_info
-                                self.peer_mgr.register_peer_info(_p)
-                    except Exception as _ke:
-                        _EXP_LOG.debug(f"[P2P-DISC] Koyeb fetch failed: {_ke}")
-
-                    # 2. RECURSIVE P2P GOSSIP (GetAddr from existing peers)
-                    active_peers = self.peer_mgr.get_active_peers()
-                    if active_peers:
-                        print(f"[P2P-DISC] Gossiping with {len(active_peers)} active peers", flush=True)
-                    for _peer in active_peers:
-                        try:
-                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
-                            _body = _j.dumps({
-                                "jsonrpc": "2.0", "method": "qtcl_p2p_getAddr", "params": {}, "id": 1
-                            }).encode()
-                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
-                            with urlopen(_req, timeout=3) as _resp:
-                                _data = _j.loads(_resp.read())
-                                _new_peers = _data.get('result', {}).get('peers', [])
-                                for _np in _new_peers:
-                                    if _np.get('host') != self.external_addr:
-                                        self.peer_mgr.register_peer_info(_np)
-                        except Exception:
-                            continue
-
-                    # 3. BROADCAST OUR IDENTITY (Announce to all active peers)
-                    if active_peers:
-                        print(f"[P2P-DISC] Announcing to {len(active_peers)} peers", flush=True)
-                    for _peer in active_peers:
-                        try:
-                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
-                            _body = _j.dumps({
-                                "jsonrpc": "2.0", 
-                                "method": "qtcl_p2p_announce", 
-                                "params": {
-                                    "node_id": self.node_id,
-                                    "external_addr": self.external_addr,
-                                    "chain_height": 0
-                                }, 
-                                "id": 1
-                            }).encode()
-                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
-                            with urlopen(_req, timeout=2) as _resp:
-                                pass # Announce is fire-and-forget
-                        except Exception:
-                            continue
+                        app_instance._register_with_koyeb()
+                    except Exception:
+                        pass
 
                 except Exception as _le:
                     _EXP_LOG.debug(f"[P2P-DISC] Loop error: {_le}")
@@ -16083,7 +16026,7 @@ class QtclClientApp:
         _p2p = getattr(self, "p2p_node", None)
         if _p2p:
             if hasattr(_p2p, '_start_peer_discovery_daemon'):
-                _p2p._start_peer_discovery_daemon()
+                _p2p._start_peer_discovery_daemon(self)
             else:
                 print("  ⚠️  P2P: active discovery engine missing", flush=True)
 
