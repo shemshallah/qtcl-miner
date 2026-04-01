@@ -14113,8 +14113,12 @@ class P2PMeshNode:
         pid = params.get("node_id","")
         if pid == self.node_id: return {"ack":True,"reason":"self"}
         ph = params.get("host") or params.get("ip",client_ip); pp = int(params.get("port",self.port))
-        self.peer_mgr.add_peer(ph,pp,pid,ip_address=client_ip,chain_height=params.get("chain_height",0))
+        pht = int(params.get("chain_height",0))
+        self.peer_mgr.add_peer(ph,pp,pid,ip_address=client_ip,chain_height=pht)
         self.peer_mgr.update_state(ph,pp,P2PPeerState.ACTIVE)
+        # If peer announces new block, update our oracle immediately
+        if pht > self.oracle.chain_height:
+            self.oracle.update_chain_state(pht)
         return {"ack":True,"node_id":self.node_id,"chain_height":self.oracle.chain_height,"my_ip":self.my_ip}
     def _handle_getaddr(self, params, client_ip):
         return {"peers":[p.to_dict() for p in self.peer_mgr.get_active_peers()][:params.get("max",50)]}
@@ -14138,15 +14142,44 @@ class P2PMeshNode:
         while not self._stop.is_set():
             cycle += 1
             try:
+                # Always try bootstrap seeds when below capacity
                 if self.peer_mgr.active_count < P2P_MAX_OUTBOUND:
                     for host,port in self._bootstrap: self._try_handshake(host,port)
-                if cycle % 3 == 0: self._fetch_koyeb_peers()
-                if cycle % 5 == 0: self._load_persisted_peers()
-                self._exchange_peers(); self._register_with_peers()
-                for peer in [p for p in self.peer_mgr.get_all_peers() if p.state==P2PPeerState.DISCOVERED][:P2P_MAX_OUTBOUND]:
+                # Every 2 cycles: fetch peers from server
+                if cycle % 2 == 0: self._fetch_koyeb_peers()
+                # Every 3 cycles: load persisted peers
+                if cycle % 3 == 0: self._load_persisted_peers()
+                # Every cycle: exchange peers with connected + register with server
+                self._exchange_peers()
+                self._register_with_server()
+                # Handshake with all discovered but not-active peers
+                for peer in [p for p in self.peer_mgr.get_all_peers()
+                             if p.state in (P2PPeerState.DISCOVERED, P2PPeerState.IDLE)][:P2P_MAX_OUTBOUND]:
                     self._try_handshake(peer.host, peer.port)
             except Exception: pass
-            self._stop.wait(10 if self.peer_mgr.active_count==0 else 20)
+            self._stop.wait(8 if self.peer_mgr.active_count==0 else 15)
+
+    def _register_with_server(self):
+        """Register ourselves and our active peers with the koyeb server for cross-device discovery."""
+        try:
+            # Register ourselves
+            _p2p_rpc_post("qtcl-blockchain.koyeb.app", 9091, "registerPeer", {
+                "node_id": self.node_id,
+                "pubkey": "",
+                "external_addr": f"{self.my_ip}:{self.port}",
+                "chain_height": self.oracle.chain_height,
+            }, timeout=5)
+        except Exception: pass
+        # Also announce our active peers so server can relay them
+        for peer in self.peer_mgr.get_active_peers()[:20]:
+            try:
+                _p2p_rpc_post("qtcl-blockchain.koyeb.app", 9091, "registerPeer", {
+                    "node_id": peer.node_id or f"peer_{peer.host}_{peer.port}",
+                    "pubkey": "",
+                    "external_addr": f"{peer.ip_address or peer.host}:{peer.port}",
+                    "chain_height": peer.chain_height,
+                }, timeout=3)
+            except Exception: pass
     def _try_handshake(self, host, port):
         if not host or host in ("127.0.0.1","localhost",""): return None
         existing = self.peer_mgr.get_peer(host,port)
@@ -14214,14 +14247,42 @@ class P2PMeshNode:
                 except Exception: peer.ban_score += 1
             self.sessions.cleanup(); self._stop.wait(P2P_HEARTBEAT_INTERVAL)
     def _oracle_loop(self):
+        """Fast block height polling (every 1s) + register with server for push updates."""
+        last_height = 0
+        consec_errors = 0
         while not self._stop.is_set():
             try:
-                result = _p2p_rpc_post("qtcl-blockchain.koyeb.app",9091,"qtcl_getBlockHeight",timeout=8)
+                result = _p2p_rpc_post("qtcl-blockchain.koyeb.app",9091,"qtcl_getBlockHeight",timeout=5)
                 if result and isinstance(result,dict):
                     h = result.get("height") or result.get("result",0)
-                    if isinstance(h,int) and h > 0: self.oracle.update_chain_state(h)
-            except Exception: pass
-            self._stop.wait(5.0)
+                    if isinstance(h,int) and h > 0:
+                        self.oracle.update_chain_state(h)
+                        if h != last_height:
+                            last_height = h
+                            consec_errors = 0
+                            # New block detected — immediately gossip to peers
+                            threading.Thread(target=self._broadcast_new_height, args=(h,), daemon=True).start()
+                consec_errors = 0
+            except Exception:
+                consec_errors += 1
+            # Poll every 1s (fast), but back off on errors
+            wait = 1.0 if consec_errors == 0 else min(5.0, 1.0 * consec_errors)
+            self._stop.wait(wait)
+
+    def _broadcast_new_height(self, height: int):
+        """Broadcast new block height to all active peers immediately."""
+        for peer in self.peer_mgr.get_outbound_peers():
+            if peer.is_alive:
+                try:
+                    _p2p_rpc_post(peer.host, peer.port, "qtcl_p2p_announce", {
+                        "node_id": self.node_id,
+                        "host": self.my_ip,
+                        "port": self.port,
+                        "chain_height": height,
+                        "event": "new_block",
+                    }, timeout=3)
+                except Exception:
+                    pass
     def _tick_loop(self):
         while not self._stop.is_set():
             self.peer_mgr.tick()
