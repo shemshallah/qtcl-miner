@@ -1621,7 +1621,7 @@ class LatticeDatabase:
         """Initialize database schema."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            with self.sqlite3.connect(self.db_path) as conn:
+            with self._p2p_sqlite3.connect(self.db_path) as conn:
                 # Lattice measurements table
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS lattice_measurements (
@@ -1698,7 +1698,7 @@ class LatticeDatabase:
         """Save a lattice measurement."""
         with self._lock:
             try:
-                with self.sqlite3.connect(self.db_path) as conn:
+                with self._p2p_sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO lattice_measurements
                         (measurement_id, chain_height, pq0_id, pq_curr_id, pq_last_id,
@@ -1735,7 +1735,7 @@ class LatticeDatabase:
         """Save current lattice state."""
         with self._lock:
             try:
-                with self.sqlite3.connect(self.db_path) as conn:
+                with self._p2p_sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT OR REPLACE INTO lattice_state
                         (node_id, chain_height, pq0_id, pq_curr_id, pq_last_id)
@@ -1750,7 +1750,7 @@ class LatticeDatabase:
         """Save consensus snapshot."""
         with self._lock:
             try:
-                with self.sqlite3.connect(self.db_path) as conn:
+                with self._p2p_sqlite3.connect(self.db_path) as conn:
                     conn.execute("""
                         INSERT INTO lattice_consensus_log
                         (chain_height, median_fidelity, mean_coherence, mean_purity,
@@ -1774,7 +1774,7 @@ class LatticeDatabase:
         """Get measurements, optionally filtered by node."""
         with self._lock:
             try:
-                with self.sqlite3.connect(self.db_path) as conn:
+                with self._p2p_sqlite3.connect(self.db_path) as conn:
                     if node_id:
                         rows = conn.execute("""
                             SELECT * FROM lattice_measurements
@@ -1797,7 +1797,7 @@ class LatticeDatabase:
         """Get aggregated peer metrics."""
         with self._lock:
             try:
-                with self.sqlite3.connect(self.db_path) as conn:
+                with self._p2p_sqlite3.connect(self.db_path) as conn:
                     rows = conn.execute("""
                         SELECT peer_id, chain_height, avg_fidelity, avg_coherence, 
                                avg_purity, measurement_count, last_seen
@@ -13533,6 +13533,726 @@ def _silent_getpass(prompt: str) -> str:
         return getpass.getpass(prompt)
     finally:
         root_logger.setLevel(old_level)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P2P MESH NETWORK — Enterprise Grade, Pure Python, No C Dependencies
+# Each node becomes a PQ0 entanglement chain linked oracle.
+# Gossips with nearest ~8 peers via Kademlia DHT + epidemic broadcast.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import sqlite3 as _p2p_sqlite3
+from http.server import HTTPServer as _P2PHTTPServer
+
+_P2P_VERSION = "5.0.0"
+_P2P_USER_AGENT = f"QTCL-P2P/{_P2P_VERSION}"
+
+P2P_PORT = int(os.getenv("P2P_PORT", 9091))
+P2P_HOST = os.getenv("P2P_HOST", "0.0.0.0")
+P2P_MAX_OUTBOUND = int(os.getenv("P2P_MAX_OUTBOUND", 8))
+P2P_MAX_PEERS = int(os.getenv("P2P_MAX_PEERS", 32))
+P2P_HANDSHAKE_TIMEOUT = int(os.getenv("P2P_HANDSHAKE_TIMEOUT", 5))
+P2P_HEARTBEAT_INTERVAL = int(os.getenv("P2P_HEARTBEAT_INTERVAL", 30))
+P2P_GOSSIP_INTERVAL = int(os.getenv("P2P_GOSSIP_INTERVAL", 10))
+P2P_GOSSIP_TTL = int(os.getenv("P2P_GOSSIP_TTL", 6))
+P2P_SESSION_TTL = int(os.getenv("P2P_SESSION_TTL", 600))
+P2P_BAN_THRESHOLD = int(os.getenv("P2P_BAN_THRESHOLD", 100))
+P2P_RATE_LIMIT = int(os.getenv("P2P_RATE_LIMIT", 120))
+
+P2P_BOOTSTRAP_SEEDS = [
+    ("qtcl-blockchain.koyeb.app", 9091),
+    ("qtcl-primary.koyeb.app", 9091),
+]
+
+_P2P_PEER_DB_PATH = str(_REPO_ROOT / "qtcl_p2p_peers.db")
+
+# ── P2P Utility ──────────────────────────────────────────────────────────────
+
+def _p2p_now() -> float:
+    return time.time()
+
+def _p2p_rpc_post(host: str, port: int, method: str, params: dict = None, timeout: int = 5):
+    try:
+        payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}).encode()
+        req = Request(f"http://{host}:{port}/rpc", data=payload, method="POST",
+                      headers={"Content-Type": "application/json", "User-Agent": _P2P_USER_AGENT})
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode()).get("result")
+    except Exception:
+        return None
+
+def _p2p_http_get(host: str, port: int, path: str, timeout: int = 5):
+    try:
+        req = Request(f"http://{host}:{port}{path}", headers={"User-Agent": _P2P_USER_AGENT})
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+# ── P2P Peer Database ────────────────────────────────────────────────────────
+
+class P2PPeerDatabase:
+    def __init__(self, db_path: str = _P2P_PEER_DB_PATH):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            conn = _p2p_sqlite3.connect(db_path)
+            conn.execute("""CREATE TABLE IF NOT EXISTS known_peers (
+                host TEXT NOT NULL, port INTEGER NOT NULL, node_id TEXT DEFAULT '',
+                ip_address TEXT DEFAULT '', chain_height INTEGER DEFAULT 0,
+                score REAL DEFAULT 0.0, ban_score INTEGER DEFAULT 0,
+                last_seen INTEGER NOT NULL, first_seen INTEGER NOT NULL,
+                PRIMARY KEY(host, port))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_last ON known_peers(last_seen DESC)")
+            conn.commit()
+            conn.close()
+
+    def upsert(self, host, port, node_id='', ip_address='', chain_height=0, score=0.0):
+        if not host or host in ("127.0.0.1", "localhost", ""): return
+        with self._lock:
+            try:
+                conn = _p2p_sqlite3.connect(self.db_path)
+                now = int(_p2p_now())
+                conn.execute("""INSERT INTO known_peers(host,port,node_id,ip_address,chain_height,score,last_seen,first_seen)
+                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(host,port) DO UPDATE SET
+                    node_id=COALESCE(NULLIF(excluded.node_id,''),known_peers.node_id),
+                    ip_address=COALESCE(NULLIF(excluded.ip_address,''),known_peers.ip_address),
+                    chain_height=MAX(known_peers.chain_height,excluded.chain_height),
+                    score=excluded.score, last_seen=excluded.last_seen""",
+                    (host, port, node_id, ip_address, chain_height, score, now, now))
+                conn.commit(); conn.close()
+            except Exception: pass
+
+    def load_peers(self, limit=64, max_age_hours=48):
+        peers = []
+        with self._lock:
+            try:
+                conn = _p2p_sqlite3.connect(self.db_path)
+                cutoff = int(_p2p_now()) - max_age_hours * 3600
+                rows = conn.execute("SELECT host,port,node_id,ip_address,chain_height,score FROM known_peers WHERE last_seen>? AND ban_score<? ORDER BY score DESC LIMIT ?",
+                    (cutoff, P2P_BAN_THRESHOLD, limit)).fetchall()
+                conn.close()
+                for r in rows:
+                    if r[0] and r[0] not in ("127.0.0.1","localhost"):
+                        peers.append({"host":r[0],"port":r[1],"node_id":r[2],"ip_address":r[3],"chain_height":r[4],"score":r[5]})
+            except Exception: pass
+        return peers
+
+    def ban_peer(self, host, port, delta=20):
+        with self._lock:
+            try:
+                conn = _p2p_sqlite3.connect(self.db_path)
+                conn.execute("UPDATE known_peers SET ban_score=ban_score+? WHERE host=? AND port=?",(delta,host,port))
+                conn.commit(); conn.close()
+            except Exception: pass
+
+# ── Rate Limiter ──────────────────────────────────────────────────────────────
+
+class P2PRateLimiter:
+    def __init__(self, rpm=P2P_RATE_LIMIT):
+        self._rpm = rpm; self._buckets = defaultdict(lambda: deque(maxlen=rpm)); self._lock = threading.Lock()
+    def allow(self, key):
+        with self._lock:
+            bucket = self._buckets[key]; now = _p2p_now()
+            while bucket and now - bucket[0] > 60: bucket.popleft()
+            if len(bucket) >= self._rpm: return False
+            bucket.append(now); return True
+
+# ── Session Manager ───────────────────────────────────────────────────────────
+
+class P2PSessionManager:
+    def __init__(self): self._sessions = {}; self._lock = threading.Lock()
+    def create(self, node_id):
+        token = secrets.token_hex(32); expiry = int(_p2p_now()) + P2P_SESSION_TTL
+        with self._lock: self._sessions[token] = {"node_id":node_id,"expiry":expiry}
+        return token, expiry
+    def verify(self, token, node_id=""):
+        with self._lock:
+            s = self._sessions.get(token)
+            if not s: return False
+            if _p2p_now() > s["expiry"]: del self._sessions[token]; return False
+            if node_id and s["node_id"] != node_id: return False
+            return True
+    def cleanup(self):
+        with self._lock:
+            now = _p2p_now(); expired = [t for t,s in self._sessions.items() if now > s["expiry"]]
+            for t in expired: del self._sessions[t]
+
+# ── LRU Cache ─────────────────────────────────────────────────────────────────
+
+class P2PLRUCache:
+    def __init__(self, maxsize=10000):
+        self._max = maxsize; self._cache = deque(maxlen=maxsize); self._set = set(); self._lock = threading.Lock()
+    def add(self, item):
+        with self._lock:
+            if item in self._set: return False
+            self._cache.append(item); self._set.add(item)
+            if len(self._cache) > self._max: old = self._cache.popleft(); self._set.discard(old)
+            return True
+    def contains(self, item):
+        with self._lock: return item in self._set
+
+# ── Kademlia DHT ──────────────────────────────────────────────────────────────
+
+@dataclass
+class DHTNode:
+    node_id: str; host: str; port: int; last_seen: float = 0.0; failed_pings: int = 0
+    @property
+    def id_int(self): return int(self.node_id, 16) if self.node_id else 0
+    def to_dict(self): return {"node_id":self.node_id,"host":self.host,"port":self.port,"last_seen":self.last_seen}
+
+class KademliaRoutingTable:
+    K = 20
+    def __init__(self, local_node_id):
+        self.local_id = local_node_id; self.local_id_int = int(local_node_id,16) if local_node_id else 0
+        self.buckets = {}; self._lock = threading.Lock()
+    def _bucket_index(self, node_id):
+        dist = self.local_id_int ^ int(node_id, 16); return dist.bit_length()-1 if dist > 0 else 0
+    def add_node(self, node):
+        with self._lock:
+            idx = self._bucket_index(node.node_id)
+            if idx not in self.buckets: self.buckets[idx] = []
+            bucket = self.buckets[idx]
+            for i,ex in enumerate(bucket):
+                if ex.node_id == node.node_id: bucket[i].last_seen = _p2p_now(); bucket[i].failed_pings = 0; return True
+            if len(bucket) < self.K: node.last_seen = _p2p_now(); bucket.append(node); return True
+            return False
+    def remove_node(self, node_id):
+        with self._lock:
+            idx = self._bucket_index(node_id)
+            if idx in self.buckets: self.buckets[idx] = [n for n in self.buckets[idx] if n.node_id != node_id]
+    def get_closest(self, target_id, count=8):
+        with self._lock:
+            all_nodes = [n for b in self.buckets.values() for n in b]
+            all_nodes.sort(key=lambda n: n.id_int ^ int(target_id, 16))
+            return all_nodes[:count]
+    def count(self):
+        with self._lock: return sum(len(b) for b in self.buckets.values())
+
+# ── Peer State + Peer + PeerManager ──────────────────────────────────────────
+
+class P2PPeerState:
+    UNKNOWN=0; DISCOVERED=1; CONNECTING=2; HANDSHAKE=3; ACTIVE=4; IDLE=5; STALE=6; BANNED=7
+    NAMES = {0:"UNKNOWN",1:"DISCOVERED",2:"CONNECTING",3:"HANDSHAKE",4:"ACTIVE",5:"IDLE",6:"STALE",7:"BANNED"}
+    @staticmethod
+    def name(s): return P2PPeerState.NAMES.get(s,"UNKNOWN")
+
+@dataclass
+class P2PPeer:
+    host: str; port: int; node_id: str = ""; state: int = P2PPeerState.UNKNOWN
+    ip_address: str = ""; chain_height: int = 0; session_token: str = ""; session_expiry: int = 0
+    last_seen: float = 0.0; last_heartbeat: float = 0.0; ban_score: int = 0
+    score: float = 0.0; latency_ms: float = 0.0; capabilities: list = field(default_factory=list)
+    @property
+    def key(self): return f"{self.host}:{self.port}"
+    @property
+    def is_alive(self):
+        return self.state in (P2PPeerState.ACTIVE,P2PPeerState.IDLE) and self.ban_score < P2P_BAN_THRESHOLD and (_p2p_now()-self.last_seen) < P2P_SESSION_TTL
+    def to_dict(self):
+        return {"host":self.host,"port":self.port,"node_id":self.node_id,"ip_address":self.ip_address,
+                "state":P2PPeerState.name(self.state),"chain_height":self.chain_height,"last_seen":self.last_seen,
+                "latency_ms":self.latency_ms,"ban_score":self.ban_score,"score":self.score,"capabilities":self.capabilities}
+
+class P2PPeerManager:
+    def __init__(self, max_peers=P2P_MAX_PEERS, max_outbound=P2P_MAX_OUTBOUND, db=None):
+        self.max_peers = max_peers; self.max_outbound = max_outbound
+        self.db = db or P2PPeerDatabase(); self._peers = {}; self._lock = threading.Lock()
+        self._dht = KademliaRoutingTable("")
+    def set_local_node_id(self, node_id): self._dht = KademliaRoutingTable(node_id)
+    def add_peer(self, host, port, node_id="", ip_address="", chain_height=0):
+        key = f"{host}:{port}"
+        with self._lock:
+            if key in self._peers:
+                p = self._peers[key]
+                if node_id and not p.node_id: p.node_id = node_id
+                if ip_address and not p.ip_address: p.ip_address = ip_address
+                if chain_height > p.chain_height: p.chain_height = chain_height
+                p.last_seen = _p2p_now(); return p
+            if len(self._peers) >= self.max_peers: self._evict_weakest()
+            p = P2PPeer(host=host,port=port,node_id=node_id,state=P2PPeerState.DISCOVERED,
+                        ip_address=ip_address,chain_height=chain_height,last_seen=_p2p_now())
+            self._peers[key] = p
+            self._dht.add_node(DHTNode(node_id=node_id,host=host,port=port,last_seen=_p2p_now()))
+        self.db.upsert(host,port,node_id,ip_address,chain_height); return p
+    def get_peer(self, host, port):
+        with self._lock: return self._peers.get(f"{host}:{port}")
+    def get_peer_by_id(self, node_id):
+        with self._lock:
+            for p in self._peers.values():
+                if p.node_id == node_id: return p
+        return None
+    def get_active_peers(self):
+        with self._lock: return [p for p in self._peers.values() if p.is_alive]
+    def get_outbound_peers(self):
+        with self._lock:
+            active = [p for p in self._peers.values() if p.is_alive]
+            active.sort(key=lambda p: p.score, reverse=True)
+            return active[:self.max_outbound]
+    def get_all_peers(self):
+        with self._lock: return list(self._peers.values())
+    def update_state(self, host, port, state):
+        key = f"{host}:{port}"
+        with self._lock:
+            if key in self._peers: self._peers[key].state = state; self._peers[key].last_seen = _p2p_now()
+    def increment_ban(self, host, port, delta=20):
+        key = f"{host}:{port}"
+        with self._lock:
+            if key in self._peers:
+                self._peers[key].ban_score += delta
+                if self._peers[key].ban_score >= P2P_BAN_THRESHOLD: self._peers[key].state = P2PPeerState.BANNED
+        self.db.ban_peer(host, port, delta)
+    def update_score(self, host, port, latency_ms, success=True):
+        key = f"{host}:{port}"
+        with self._lock:
+            if key in self._peers:
+                p = self._peers[key]; p.latency_ms = latency_ms
+                p.score = max(0.0, 1.0 - min(1.0, latency_ms/1000.0)) if success else max(0.0, p.score - 0.1)
+    @property
+    def count(self):
+        with self._lock: return len(self._peers)
+    @property
+    def active_count(self): return len(self.get_active_peers())
+    def _evict_weakest(self):
+        if not self._peers: return
+        weakest = min(self._peers.keys(), key=lambda k: self._peers[k].score)
+        del self._peers[weakest]
+    def tick(self):
+        now = _p2p_now()
+        with self._lock:
+            for p in self._peers.values():
+                if p.state == P2PPeerState.BANNED: continue
+                age = now - p.last_seen
+                if age > P2P_SESSION_TTL*2: p.state = P2PPeerState.STALE
+                elif age > P2P_SESSION_TTL: p.state = P2PPeerState.IDLE
+                elif p.state == P2PPeerState.ACTIVE and age > 60: p.state = P2PPeerState.IDLE
+    def get_closest_peers(self, target_id, count=8):
+        closest = self._dht.get_closest(target_id, count*2); result = []
+        with self._lock:
+            for n in closest:
+                key = f"{n.host}:{n.port}"
+                if key in self._peers and self._peers[key].is_alive:
+                    result.append(self._peers[key])
+                    if len(result) >= count: break
+        return result
+
+# ── PQ0 Entanglement Oracle ──────────────────────────────────────────────────
+
+@dataclass
+class PQ0State:
+    pq_id: int = 0; ring: int = 0; depth: int = 1; r: float = 0.0; theta: float = 0.0
+    fidelity: float = 1.0; coherence: float = 1.0; purity: float = 1.0
+    entanglement_phase: float = 0.0; virtual_pq_id: int = 0; inverse_virtual_pq_id: int = 0
+    @classmethod
+    def compute(cls, pq_id, fidelity=1.0):
+        ring = pq_id % 8; depth = pq_id // 8 + 1
+        r = math.tanh(depth * 0.766 / 2.0); theta = 2.0 * math.pi * ring / 8.0
+        v_ring = (ring + 1) % 8; v_depth = depth
+        i_ring = (ring - 1) % 8; i_depth = max(1, depth - 1)
+        return cls(pq_id=pq_id, ring=ring, depth=depth, r=r, theta=theta, fidelity=fidelity,
+                   coherence=fidelity*0.9, purity=fidelity*0.85, entanglement_phase=theta,
+                   virtual_pq_id=(v_depth-1)*8+v_ring, inverse_virtual_pq_id=(i_depth-1)*8+i_ring)
+    def to_dict(self):
+        return {"pq_id":self.pq_id,"ring":self.ring,"depth":self.depth,"r":self.r,"theta":self.theta,
+                "fidelity":self.fidelity,"coherence":self.coherence,"purity":self.purity,
+                "entanglement_phase":self.entanglement_phase,"virtual_pq_id":self.virtual_pq_id,
+                "inverse_virtual_pq_id":self.inverse_virtual_pq_id}
+
+def _hyp_distance(r1, t1, r2, t2):
+    if abs(r1-r2)<1e-10 and abs(t1-t2)<1e-10: return 0.0
+    dx = r1*math.cos(t1)-r2*math.cos(t2); dy = r1*math.sin(t1)-r2*math.sin(t2)
+    denom = (1-r1*r1)*(1-r2*r2)
+    if denom < 1e-15: denom = 1e-15
+    return 2.0*math.acosh(max(1.0, 1.0+2.0*(dx*dx+dy*dy)/denom))
+
+@dataclass
+class P2PLatticeMeasurement:
+    chain_height: int = 0; pq0: PQ0State = field(default_factory=PQ0State)
+    pq_curr: PQ0State = field(default_factory=PQ0State); pq_last: PQ0State = field(default_factory=PQ0State)
+    fidelity_to_w3: float = 0.0; coherence_l1: float = 0.0; purity: float = 0.0
+    hyp_triangle_area: float = 0.0; hyp_dist_0c: float = 0.0; hyp_dist_cl: float = 0.0; hyp_dist_0l: float = 0.0
+    node_id: str = ""; node_ip: str = ""; timestamp: float = field(default_factory=_p2p_now)
+    measurement_id: str = field(default_factory=lambda: secrets.token_hex(16))
+    gossip_ttl: int = P2P_GOSSIP_TTL; gossip_hops: int = 0
+    def to_dict(self):
+        return {"chain_height":self.chain_height,"pq0":self.pq0.to_dict(),"pq_curr":self.pq_curr.to_dict(),
+                "pq_last":self.pq_last.to_dict(),"fidelity_to_w3":self.fidelity_to_w3,"coherence_l1":self.coherence_l1,
+                "purity":self.purity,"hyp_triangle_area":self.hyp_triangle_area,"hyp_dist_0c":self.hyp_dist_0c,
+                "hyp_dist_cl":self.hyp_dist_cl,"hyp_dist_0l":self.hyp_dist_0l,"node_id":self.node_id,"node_ip":self.node_ip,
+                "timestamp":self.timestamp,"measurement_id":self.measurement_id,"gossip_ttl":self.gossip_ttl,"gossip_hops":self.gossip_hops}
+    @classmethod
+    def from_dict(cls, d):
+        pq0=PQ0State(**{k:d.get("pq0",{}).get(k,0) for k in ["pq_id","ring","depth","r","theta","fidelity"]})
+        pq_curr=PQ0State(**{k:d.get("pq_curr",{}).get(k,0) for k in ["pq_id","ring","depth","r","theta","fidelity"]})
+        pq_last=PQ0State(**{k:d.get("pq_last",{}).get(k,0) for k in ["pq_id","ring","depth","r","theta","fidelity"]})
+        d0c=_hyp_distance(pq0.r,pq0.theta,pq_curr.r,pq_curr.theta)
+        dcl=_hyp_distance(pq_curr.r,pq_curr.theta,pq_last.r,pq_last.theta)
+        d0l=_hyp_distance(pq0.r,pq0.theta,pq_last.r,pq_last.theta)
+        return cls(chain_height=d.get("chain_height",0),pq0=pq0,pq_curr=pq_curr,pq_last=pq_last,
+                   fidelity_to_w3=d.get("fidelity_to_w3",0),coherence_l1=d.get("coherence_l1",0),
+                   purity=d.get("purity",0),hyp_triangle_area=max(0.0,math.pi-(d0c+dcl+d0l)),
+                   hyp_dist_0c=d0c,hyp_dist_cl=dcl,hyp_dist_0l=d0l,node_id=d.get("node_id",""),
+                   node_ip=d.get("node_ip",""),timestamp=d.get("timestamp",_p2p_now()),
+                   measurement_id=d.get("measurement_id",secrets.token_hex(16)),
+                   gossip_ttl=d.get("gossip_ttl",P2P_GOSSIP_TTL),gossip_hops=d.get("gossip_hops",0))
+
+class PQ0EntanglementOracle:
+    def __init__(self, node_id):
+        self.node_id = node_id; self._lock = threading.Lock()
+        self._chain_height = 0; self._pq0_id = 0; self._pq_curr_id = 1; self._pq_last_id = 0
+        self._oracle_fidelity = 0.0; self._measurements = deque(maxlen=1000)
+        self._peer_measurements = defaultdict(list)
+    def update_chain_state(self, height):
+        with self._lock:
+            if height <= self._chain_height: return
+            self._pq_last_id = self._pq_curr_id; self._pq_curr_id = height % 256; self._chain_height = height
+    def take_measurement(self, fidelity=0.0):
+        with self._lock:
+            pq0=PQ0State.compute(self._pq0_id,fidelity); pq_curr=PQ0State.compute(self._pq_curr_id,max(0.1,fidelity*0.95))
+            pq_last=PQ0State.compute(self._pq_last_id,max(0.1,fidelity*0.9))
+            d0c=_hyp_distance(pq0.r,pq0.theta,pq_curr.r,pq_curr.theta)
+            dcl=_hyp_distance(pq_curr.r,pq_curr.theta,pq_last.r,pq_last.theta)
+            d0l=_hyp_distance(pq0.r,pq0.theta,pq_last.r,pq_last.theta)
+            m=P2PLatticeMeasurement(chain_height=self._chain_height,pq0=pq0,pq_curr=pq_curr,pq_last=pq_last,
+                fidelity_to_w3=fidelity,coherence_l1=fidelity*0.9,purity=fidelity*0.85,
+                hyp_triangle_area=max(0.0,math.pi-(d0c+dcl+d0l)),hyp_dist_0c=d0c,hyp_dist_cl=dcl,hyp_dist_0l=d0l,node_id=self.node_id)
+            self._measurements.append(m); return m
+    def ingest_peer_measurement(self, m):
+        now = _p2p_now()
+        with self._lock:
+            nid = m.node_id or "unknown"
+            self._peer_measurements[nid] = [(t,mm) for t,mm in self._peer_measurements[nid] if now-t<300][-32:]
+            self._peer_measurements[nid].append((now,m))
+    def compute_consensus(self, own):
+        with self._lock:
+            all_ms = [own]
+            for nms in self._peer_measurements.values(): all_ms.extend([m for _,m in nms])
+        n = len(all_ms)
+        if n == 0: return {"median_fidelity":0.0,"peer_count":0,"agreement_score":0.0}
+        fids = sorted([m.fidelity_to_w3 for m in all_ms])
+        med = fids[n//2] if n%2 else (fids[n//2-1]+fids[n//2])/2.0
+        qhash = hashlib.sha3_256(b"".join(hashlib.sha256(m.measurement_id.encode()).digest() for m in all_ms)).hexdigest()
+        return {"median_fidelity":med,"mean_coherence":sum(m.coherence_l1 for m in all_ms)/n,
+                "mean_purity":sum(m.purity for m in all_ms)/n,"mean_triangle_area":sum(m.hyp_triangle_area for m in all_ms)/n,
+                "quorum_hash":qhash,"peer_count":n,"agreement_score":1.0-(max(fids)-min(fids)) if n>1 else 1.0,
+                "chain_height":max(m.chain_height for m in all_ms)}
+    def get_recent_measurements(self, count=5):
+        with self._lock: return list(self._measurements)[-count:]
+    @property
+    def chain_height(self):
+        with self._lock: return self._chain_height
+    @property
+    def state(self):
+        with self._lock: return {"chain_height":self._chain_height,"pq0":self._pq0_id,"pq_curr":self._pq_curr_id,
+                                 "pq_last":self._pq_last_id,"oracle_fidelity":self._oracle_fidelity}
+
+# ── Gossip Engine ─────────────────────────────────────────────────────────────
+
+class P2PGossipEngine:
+    def __init__(self, peer_mgr, oracle, node_id):
+        self.peer_mgr = peer_mgr; self.oracle = oracle; self.node_id = node_id
+        self._seen = P2PLRUCache(50000); self._stop = threading.Event(); self._thread = None
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._gossip_loop, daemon=True, name="P2P-Gossip"); self._thread.start()
+    def stop(self): self._stop.set()
+    def is_new(self, mid): return self._seen.add(mid)
+    def _gossip_loop(self):
+        while not self._stop.is_set():
+            try:
+                ms = self.oracle.get_recent_measurements(3)
+                if ms:
+                    for peer in self.peer_mgr.get_outbound_peers():
+                        if peer.is_alive:
+                            for m in ms: self._send_gossip(peer, m)
+            except Exception: pass
+            self._stop.wait(P2P_GOSSIP_INTERVAL)
+    def _send_gossip(self, peer, m):
+        try:
+            payload = json.dumps({"jsonrpc":"2.0","method":"qtcl_p2p_gossip","params":{"measurement":m.to_dict()},"id":1}).encode()
+            req = Request(f"http://{peer.host}:{peer.port}/rpc",data=payload,method="POST",
+                          headers={"Content-Type":"application/json","User-Agent":_P2P_USER_AGENT})
+            with urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode()).get("result",{}).get("ack",False)
+        except Exception: return False
+    def receive_gossip(self, data, sender_ip=""):
+        mid = data.get("measurement_id","")
+        if not self.is_new(mid): return {"ack":True,"reason":"duplicate"}
+        hops = data.get("gossip_hops",0); ttl = data.get("gossip_ttl",P2P_GOSSIP_TTL)
+        if hops >= ttl: return {"ack":True,"reason":"ttl_expired"}
+        m = P2PLatticeMeasurement.from_dict(data); self.oracle.ingest_peer_measurement(m)
+        m.gossip_hops = hops + 1
+        for peer in self.peer_mgr.get_outbound_peers():
+            if peer.is_alive: self._send_gossip(peer, m)
+        return {"ack":True,"hops":hops+1}
+
+# ── P2P RPC Server ───────────────────────────────────────────────────────────
+
+class P2PRPCServer:
+    def __init__(self, node): self.node = node; self._server = None; self._thread = None; self._limiter = P2PRateLimiter()
+    def start(self, host=P2P_HOST, port=P2P_PORT):
+        node = self.node; server = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def _send_json(self, data, status=200):
+                self.send_response(status); self.send_header("Content-Type","application/json")
+                self.send_header("X-Node-ID",node.node_id); self.send_header("X-Node-Port",str(node.port))
+                self.end_headers(); self.wfile.write(json.dumps(data).encode())
+            def _read_body(self):
+                length = int(self.headers.get("Content-Length",0))
+                body = self.rfile.read(length) if length else b"{}"
+                try: return json.loads(body)
+                except: return {}
+            def do_GET(self):
+                path = self.path.rstrip("/")
+                if path == "/rpc/p2p/status":
+                    self._send_json({"node_id":node.node_id,"ip":node.my_ip,"local_ip":node.local_ip,
+                                     "port":node.port,"peer_count":node.peer_mgr.active_count,
+                                     "total_peers":node.peer_mgr.count,"running":node.is_running,
+                                     "chain_height":node.oracle.chain_height,"version":_P2P_VERSION})
+                elif path == "/rpc/p2p/peers":
+                    self._send_json({"peers":[p.to_dict() for p in node.peer_mgr.get_active_peers()],"node_id":node.node_id})
+                elif path == "/rpc/p2p/health":
+                    self._send_json({"status":"ok","timestamp":_p2p_now()})
+                elif path == "/rpc/lattice/state":
+                    self._send_json(node.oracle.state)
+                elif path == "/rpc/lattice/metrics":
+                    ms = node.oracle.get_recent_measurements(20)
+                    self._send_json({"measurements":[m.to_dict() for m in ms],"consensus":node.oracle.compute_consensus(ms[0]) if ms else {}})
+                else: self._send_json({"error":"not found"},404)
+            def do_POST(self):
+                path = self.path.rstrip("/"); client_ip = self.client_address[0]
+                if not server._limiter.allow(client_ip): self._send_json({"error":"rate limited"},429); return
+                if path == "/rpc/p2p/register":
+                    data = self._read_body(); peer_host = data.get("host") or data.get("ip") or client_ip
+                    peer_port = int(data.get("port",9091)); peer_id = data.get("node_id","")
+                    if peer_id == node.node_id: self._send_json({"status":"ignored","reason":"self"}); return
+                    node.peer_mgr.add_peer(peer_host,peer_port,peer_id,ip_address=client_ip,chain_height=data.get("chain_height",0))
+                    token,expiry = node.sessions.create(peer_id)
+                    self._send_json({"status":"registered","my_ip":node.my_ip,"my_port":node.port,
+                                     "session_token":token,"session_expiry":expiry,"node_id":node.node_id,
+                                     "chain_height":node.oracle.chain_height}); return
+                elif path == "/rpc/p2p/exchange":
+                    self._send_json({"peers":[p.to_dict() for p in node.peer_mgr.get_active_peers()],"node_id":node.node_id}); return
+                elif path == "/rpc/p2p/heartbeat":
+                    data = self._read_body(); pid = data.get("node_id","")
+                    peer = node.peer_mgr.get_peer_by_id(pid)
+                    if peer: peer.last_seen=_p2p_now(); peer.last_heartbeat=_p2p_now(); peer.chain_height=data.get("chain_height",0); peer.state=P2PPeerState.ACTIVE
+                    self._send_json({"ack":True,"chain_height":node.oracle.chain_height}); return
+                elif path == "/rpc/p2p/getaddr":
+                    data = self._read_body()
+                    self._send_json({"peers":[p.to_dict() for p in node.peer_mgr.get_active_peers()][:data.get("max",50)]}); return
+                body = self._read_body(); method = body.get("method",""); params = body.get("params",{}); rpc_id = body.get("id",1)
+                result,error = node.dispatch_rpc(method,params,client_ip)
+                if error: self._send_json({"jsonrpc":"2.0","error":{"code":-32601,"message":error},"id":rpc_id})
+                else: self._send_json({"jsonrpc":"2.0","result":result,"id":rpc_id})
+        try:
+            self._server = _P2PHTTPServer((host,port),Handler)
+            self._thread = threading.Thread(target=self._server.serve_forever,daemon=True,name="P2P-RPC")
+            self._thread.start(); logger.info(f"[P2P-RPC] ✅ Listening on {host}:{port}")
+        except Exception as e: logger.error(f"[P2P-RPC] ❌ Failed: {e}"); raise
+    def stop(self):
+        if self._server:
+            try: self._server.shutdown()
+            except: pass
+
+# ── P2P Mesh Node ────────────────────────────────────────────────────────────
+
+class P2PMeshNode:
+    def __init__(self, node_id=None, port=P2P_PORT, bootstrap_peers=None):
+        self.node_id = node_id or hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        self.port = port; self.my_ip = _get_local_ip() or "127.0.0.1"; self.local_ip = self.my_ip; self.public_ip = ""
+        self.peer_db = P2PPeerDatabase(); self.peer_mgr = P2PPeerManager(db=self.peer_db)
+        self.peer_mgr.set_local_node_id(self.node_id)
+        self.sessions = P2PSessionManager(); self.oracle = PQ0EntanglementOracle(self.node_id)
+        self.gossip = P2PGossipEngine(self.peer_mgr,self.oracle,self.node_id); self.rpc = P2PRPCServer(self)
+        self.is_running = False; self._stop = threading.Event()
+        self._bootstrap = bootstrap_peers or list(P2P_BOOTSTRAP_SEEDS)
+        self._seen_blocks = P2PLRUCache(10000); self._seen_txs = P2PLRUCache(50000)
+        logger.info(f"[P2P-MESH] Node {self.node_id[:16]}... at {self.my_ip}:{self.port}")
+    def start(self):
+        if self.is_running: return True
+        self.is_running = True; self._stop.clear()
+        self.rpc.start(P2P_HOST, self.port)
+        threading.Thread(target=self._resolve_public_ip, daemon=True).start()
+        for target,loop,name in [(self._discovery_loop,"P2P-Discovery"),(self._heartbeat_loop,"P2P-Heartbeat"),
+                                  (self._oracle_loop,"P2P-Oracle"),(self._tick_loop,"P2P-Tick")]:
+            threading.Thread(target=target, daemon=True, name=name).start()
+        self.gossip.start()
+        logger.info(f"[P2P-MESH] ✅ Node {self.node_id[:16]}... RUNNING on port {self.port}"); return True
+    def stop(self):
+        self.is_running=False; self._stop.set(); self.gossip.stop(); self.rpc.stop()
+    def dispatch_rpc(self, method, params, client_ip=""):
+        handlers = {"qtcl_p2p_handshake":self._handle_handshake,"qtcl_p2p_ping":self._handle_ping,
+                    "qtcl_p2p_pong":self._handle_pong,"qtcl_p2p_announce":self._handle_announce,
+                    "qtcl_p2p_getAddr":self._handle_getaddr,"qtcl_p2p_gossip":self._handle_gossip,
+                    "qtcl_p2p_inv":self._handle_inv,"qtcl_p2p_getData":self._handle_getdata,
+                    "qtcl_p2p_pushBlock":self._handle_push_block,"qtcl_p2p_pushTx":self._handle_push_tx,
+                    "qtcl_dht_ping":self._handle_dht_ping,"qtcl_dht_findNode":self._handle_dht_findnode}
+        handler = handlers.get(method)
+        if not handler: return None, f"Method not found: {method}"
+        try: return handler(params, client_ip), None
+        except Exception as e: return None, f"Internal error: {e}"
+    def _handle_handshake(self, params, client_ip):
+        payload = params.get("payload",params); pid = payload.get("node_id","")
+        if pid == self.node_id: return {"error":"self_connection"}
+        token,expiry = self.sessions.create(pid); ph = payload.get("host",client_ip)
+        pp = int(payload.get("port",self.port))
+        self.peer_mgr.add_peer(ph,pp,pid,ip_address=client_ip,chain_height=payload.get("chain_height",0))
+        self.peer_mgr.update_state(ph,pp,P2PPeerState.ACTIVE)
+        return {"version":_P2P_VERSION,"node_id":self.node_id,"chain_height":self.oracle.chain_height,
+                "session_token":token,"session_expiry":expiry,"capabilities":["block_sync","tx_relay","gossip","pq0_oracle"],
+                "my_ip":self.my_ip,"my_port":self.port}
+    def _handle_ping(self, params, client_ip):
+        return {"nonce":params.get("nonce",secrets.token_hex(8)),"height":self.oracle.chain_height,
+                "node_id":self.node_id,"timestamp":_p2p_now()}
+    def _handle_pong(self, params, client_ip):
+        peer = self.peer_mgr.get_peer_by_id(params.get("node_id",""))
+        if peer: peer.last_seen=_p2p_now(); peer.state=P2PPeerState.ACTIVE
+        return {"ack":True,"nonce":params.get("nonce","")}
+    def _handle_announce(self, params, client_ip):
+        pid = params.get("node_id","")
+        if pid == self.node_id: return {"ack":True,"reason":"self"}
+        ph = params.get("host") or params.get("ip",client_ip); pp = int(params.get("port",self.port))
+        self.peer_mgr.add_peer(ph,pp,pid,ip_address=client_ip,chain_height=params.get("chain_height",0))
+        self.peer_mgr.update_state(ph,pp,P2PPeerState.ACTIVE)
+        return {"ack":True,"node_id":self.node_id,"chain_height":self.oracle.chain_height,"my_ip":self.my_ip}
+    def _handle_getaddr(self, params, client_ip):
+        return {"peers":[p.to_dict() for p in self.peer_mgr.get_active_peers()][:params.get("max",50)]}
+    def _handle_gossip(self, params, client_ip):
+        return self.gossip.receive_gossip(params.get("measurement",params), client_ip)
+    def _handle_inv(self, params, client_ip):
+        itype = params.get("type",""); ihashes = params.get("hashes",[])
+        if not ihashes: return {"ack":True,"reason":"empty_inv"}
+        missing = [h for h in ihashes if (itype=="block" and not self._seen_blocks.contains(h)) or (itype=="tx" and not self._seen_txs.contains(h))]
+        return {"ack":True,"missing":missing,"node_id":self.node_id,"chain_height":self.oracle.chain_height}
+    def _handle_getdata(self, params, client_ip): return {"error":"not_implemented"}
+    def _handle_push_block(self, params, client_ip): return {"error":"not_implemented"}
+    def _handle_push_tx(self, params, client_ip): return {"error":"not_implemented"}
+    def _handle_dht_ping(self, params, client_ip): return {"pong":True,"node_id":self.node_id}
+    def _handle_dht_findnode(self, params, client_ip):
+        return {"nodes":[p.to_dict() for p in self.peer_mgr.get_closest_peers(params.get("target_id",""),params.get("count",8))]}
+    def _resolve_public_ip(self):
+        self.public_ip = _get_public_ip()
+    def _discovery_loop(self):
+        cycle = 0
+        while not self._stop.is_set():
+            cycle += 1
+            try:
+                if self.peer_mgr.active_count < P2P_MAX_OUTBOUND:
+                    for host,port in self._bootstrap: self._try_handshake(host,port)
+                if cycle % 3 == 0: self._fetch_koyeb_peers()
+                if cycle % 5 == 0: self._load_persisted_peers()
+                self._exchange_peers(); self._register_with_peers()
+                for peer in [p for p in self.peer_mgr.get_all_peers() if p.state==P2PPeerState.DISCOVERED][:P2P_MAX_OUTBOUND]:
+                    self._try_handshake(peer.host, peer.port)
+            except Exception: pass
+            self._stop.wait(10 if self.peer_mgr.active_count==0 else 20)
+    def _try_handshake(self, host, port):
+        if not host or host in ("127.0.0.1","localhost",""): return None
+        existing = self.peer_mgr.get_peer(host,port)
+        if existing and existing.state == P2PPeerState.ACTIVE: return existing.to_dict()
+        start = _p2p_now()
+        result = _p2p_rpc_post(host,port,"qtcl_p2p_handshake",{"payload":{"version":_P2P_VERSION,"node_id":self.node_id,
+            "chain_height":self.oracle.chain_height,"host":self.my_ip,"port":self.port,
+            "capabilities":["block_sync","tx_relay","gossip","pq0_oracle"]}},timeout=P2P_HANDSHAKE_TIMEOUT)
+        latency = (_p2p_now()-start)*1000.0
+        if result and "error" not in result:
+            pnid = result.get("node_id",""); pht = result.get("chain_height",0); pip = result.get("my_ip",host)
+            peer = self.peer_mgr.add_peer(host,port,pnid,ip_address=pip,chain_height=pht)
+            self.peer_mgr.update_state(host,port,P2PPeerState.ACTIVE); self.peer_mgr.update_score(host,port,latency,True)
+            token = result.get("session_token","")
+            if token: peer.session_token = token; peer.session_expiry = result.get("session_expiry",0)
+            logger.info(f"[DISCOVERY] ✅ Handshake {host}:{port} (node={pnid[:16]}..., h={pht}, {latency:.0f}ms)")
+            return result
+        else: self.peer_mgr.update_score(host,port,latency,False); return None
+    def _fetch_koyeb_peers(self):
+        try:
+            result = _p2p_rpc_post("qtcl-blockchain.koyeb.app",9091,"qtcl_getPeers",{"limit":50},timeout=8)
+            if result and isinstance(result,list):
+                added = 0
+                for p in result:
+                    h = p.get("host") or p.get("ip_address") or p.get("ip"); pt = int(p.get("port",9091))
+                    if h and h not in ("127.0.0.1","localhost",""):
+                        self.peer_mgr.add_peer(h,pt,p.get("node_id",""),chain_height=p.get("chain_height",0)); added += 1
+                if added > 0: logger.info(f"[DISCOVERY] Fetched {added} peers from koyeb")
+        except Exception: pass
+    def _load_persisted_peers(self):
+        for p in self.peer_db.load_peers(limit=64):
+            self.peer_mgr.add_peer(p["host"],p["port"],p.get("node_id",""),ip_address=p.get("ip_address",""),chain_height=p.get("chain_height",0))
+    def _exchange_peers(self):
+        for peer in self.peer_mgr.get_outbound_peers():
+            if not peer.is_alive: continue
+            try:
+                result = _p2p_rpc_post(peer.host,peer.port,"qtcl_p2p_getAddr",{"max":50},timeout=5)
+                if result and "peers" in result:
+                    for p in result["peers"]:
+                        h = p.get("host") or p.get("ip_address"); pt = int(p.get("port",9091))
+                        if h and h not in ("127.0.0.1","localhost",""):
+                            self.peer_mgr.add_peer(h,pt,p.get("node_id",""),chain_height=p.get("chain_height",0))
+            except Exception: pass
+    def _register_with_peers(self):
+        for peer in self.peer_mgr.get_outbound_peers():
+            if not peer.is_alive: continue
+            try:
+                _p2p_rpc_post(peer.host,peer.port,"qtcl_p2p_announce",{"node_id":self.node_id,"host":self.my_ip,
+                    "port":self.port,"chain_height":self.oracle.chain_height},timeout=5)
+            except Exception: pass
+    def _heartbeat_loop(self):
+        while not self._stop.is_set():
+            for peer in self.peer_mgr.get_active_peers():
+                if not peer.is_alive: continue
+                try:
+                    start = _p2p_now()
+                    result = _p2p_rpc_post(peer.host,peer.port,"qtcl_p2p_ping",{"nonce":secrets.token_hex(8),"height":self.oracle.chain_height},timeout=5)
+                    latency = (_p2p_now()-start)*1000.0
+                    if result:
+                        peer.last_seen=_p2p_now(); peer.last_heartbeat=_p2p_now(); peer.state=P2PPeerState.ACTIVE
+                        peer.chain_height=result.get("height",peer.chain_height)
+                        self.peer_mgr.update_score(peer.host,peer.port,latency,True)
+                    else:
+                        self.peer_mgr.update_score(peer.host,peer.port,latency,False)
+                except Exception: peer.ban_score += 1
+            self.sessions.cleanup(); self._stop.wait(P2P_HEARTBEAT_INTERVAL)
+    def _oracle_loop(self):
+        while not self._stop.is_set():
+            try:
+                result = _p2p_rpc_post("qtcl-blockchain.koyeb.app",9091,"qtcl_getBlockHeight",timeout=8)
+                if result and isinstance(result,dict):
+                    h = result.get("height") or result.get("result",0)
+                    if isinstance(h,int) and h > 0: self.oracle.update_chain_state(h)
+            except Exception: pass
+            self._stop.wait(5.0)
+    def _tick_loop(self):
+        while not self._stop.is_set():
+            self.peer_mgr.tick()
+            for p in self.peer_mgr.get_active_peers():
+                self.peer_db.upsert(p.host,p.port,p.node_id,p.ip_address,p.chain_height,p.score)
+            self._stop.wait(30)
+    def get_status(self):
+        return {"node_id":self.node_id,"ip":self.my_ip,"port":self.port,"running":self.is_running,
+                "peer_count":self.peer_mgr.active_count,"total_peers":self.peer_mgr.count,
+                "chain_height":self.oracle.chain_height,"oracle_state":self.oracle.state,"version":_P2P_VERSION}
+
+# ── P2P Singletons ───────────────────────────────────────────────────────────
+
+_p2p_mesh_node: Optional[P2PMeshNode] = None
+
+def get_mesh_node(port=P2P_PORT) -> P2PMeshNode:
+    global _p2p_mesh_node
+    if _p2p_mesh_node is None: _p2p_mesh_node = P2PMeshNode(port=port); _p2p_mesh_node.start()
+    return _p2p_mesh_node
+
+def get_p2p_node(port=P2P_PORT) -> P2PMeshNode: return get_mesh_node(port)
+
+def start_p2p_mesh(port=P2P_PORT): return get_mesh_node(port)
+
+def get_p2p_status() -> dict:
+    try: return get_mesh_node().get_status()
+    except Exception as e: return {"error": str(e)}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END P2P MESH NETWORK
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:  # noqa: F811
     """
