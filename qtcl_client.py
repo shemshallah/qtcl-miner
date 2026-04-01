@@ -10125,16 +10125,26 @@ class PeerManager:
     def register_peer_info(self, info: dict) -> None:
         """Register a peer from raw info dict (discovery)"""
         try:
-            host = info.get('host')
-            port = info.get('port', _P2P_PORT)
-            node_id = info.get('node_id')
-            if not host or not node_id: return
+            # Try multiple common keys for the address
+            p_addr = info.get('external_addr') or info.get('host') or info.get('peer_addr')
+            node_id = info.get('node_id') or info.get('peer_id')
+            if not p_addr or not node_id: return
             
+            # Parse host/port
+            if ':' in p_addr:
+                host = p_addr.split(':')[0]
+                port = int(p_addr.split(':')[1])
+            else:
+                host = p_addr
+                port = info.get('port', _P2P_PORT)
+
             with self.lock:
                 if node_id not in self.peers:
                     peer = P2PPeer(host, port, node_id)
                     peer.chain_height = info.get('chain_height', 0)
                     peer.last_seen = info.get('last_seen', int(time.time()))
+                    # Discovery candidates start as UNKNOWN or CONNECTING
+                    peer.state = PeerState.UNKNOWN
                     self.peers[node_id] = peer
                     logger.debug(f"[P2P-MGR] Discovered new peer: {host}:{port}")
         except Exception as e:
@@ -11451,10 +11461,11 @@ class P2PNode:
                                 print(f"[P2P-DISC] Koyeb registry: found {len(_peers)} potential peers", flush=True)
                             for _p in _peers:
                                 # Standardize field names for register_peer_info
-                                _p.setdefault('host', _p.get('ip_hint') or _p.get('peer_addr', '').split(':')[0])
-                                _p.setdefault('node_id', _p.get('peer_id'))
-                                if _p.get('host') and _p.get('host') != self.external_addr:
-                                    self.peer_mgr.register_peer_info(_p)
+                                _p.setdefault('host', _p.get('ip_hint') or _p.get('peer_addr', '').split(':')[0] or _p.get('external_addr', '').split(':')[0])
+                                _p.setdefault('node_id', _p.get('peer_id') or _p.get('node_id'))
+                                
+                                # Use the standardized register_peer_info
+                                self.peer_mgr.register_peer_info(_p)
                     except Exception as _ke:
                         _EXP_LOG.debug(f"[P2P-DISC] Koyeb fetch failed: {_ke}")
 
@@ -13833,11 +13844,14 @@ class QtclClientApp:
             node_id = self.p2p_node.node_id
             pubkey = self.p2p_node.identity.pubkey_b64
             height = int(self.koyeb_state.block_height or 0)
+            is_node_mode = hasattr(self, '_lff') # simple heuristic for node mode
             resp = self.api.call("qtcl_registerPeer", {
                 "external_addr": ext_addr,
                 "pubkey": pubkey,
                 "chain_height": height,
-                "node_id": node_id
+                "node_id": node_id,
+                "is_node": True, # Always true if called from here
+                "is_relay": True
             })
             if resp:
                 # server echoes caller_ip (X-Forwarded-For) — use it to self-correct external_addr
