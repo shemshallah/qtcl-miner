@@ -7136,9 +7136,10 @@ class KoyebAPIClient:
                         if 'result' in result:
                             return result.get('result')
                         elif 'error' in result:
-                            _EXP_LOG.debug(f"[RPC] {method} → error: {result['error'].get('message')}")
-                            last_error = result['error'].get('message')
-                        return result
+                            _err = result['error']
+                            last_error = _err.get('message') if isinstance(_err, dict) else str(_err)
+                            _EXP_LOG.debug(f"[RPC] {method} → error: {last_error}")
+                            return None  # server JSON-RPC error — not a valid result
                     _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
                     last_error = f"HTTP {r.status_code}"
                 else:
@@ -7150,7 +7151,11 @@ class KoyebAPIClient:
                         result = _json.loads(resp.read().decode('utf-8'))
                         if 'result' in result:
                             return result.get('result')
-                        return result
+                        elif 'error' in result:
+                            _err = result['error']
+                            last_error = _err.get('message') if isinstance(_err, dict) else str(_err)
+                            _EXP_LOG.debug(f"[RPC] {method} → error: {last_error}")
+                            return None  # server JSON-RPC error — not a valid result
             except Exception as e:
                 last_error = str(e)
                 if attempt < retries - 1:
@@ -7161,6 +7166,30 @@ class KoyebAPIClient:
                     _EXP_LOG.debug(f"[RPC] {method}: {e} (final)")
         
         self._last_error = last_error
+        return None
+
+    def _rpc_envelope(self, method: str, params: list = None, timeout: int = None, retries: int = 2) -> Optional[dict]:
+        """Like _rpc but returns the full JSON-RPC envelope including error objects.
+        Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline)."""
+        t = timeout or self.timeout
+        url = f"{self.base_url}/rpc"
+        payload = {'jsonrpc': '2.0', 'method': method, 'params': params or [], 'id': 1}
+        for attempt in range(retries):
+            try:
+                if _HAS_REQUESTS:
+                    r = self._get_session().post(url, json=payload, timeout=t)
+                    if r.status_code == 200:
+                        return r.json()
+                else:
+                    import urllib.request as _ur
+                    body = _json.dumps(payload).encode()
+                    req = _ur.Request(url, data=body, method='POST')
+                    req.add_header('Content-Type', 'application/json')
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        return _json.loads(resp.read().decode('utf-8'))
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
         return None
     def get_chain_tip(self) -> Optional[dict]:
         """Get chain tip via JSON-RPC (qtcl_getBlockHeight).
@@ -13414,12 +13443,16 @@ class QtclClientApp:
                             )
                             
                             # RPC call with timeout (no internal retry — we handle retry loop)
-                            result = kapi._rpc(
+                            # Use _rpc_envelope to get full response including error details
+                            # needed for smart rejection handling (entropy_expired, Invalid height)
+                            _envelope = kapi._rpc_envelope(
                                 "qtcl_submitBlock",
                                 [payload],
                                 timeout=15,
                                 retries=1
                             )
+                            result = _envelope.get('result') if isinstance(_envelope, dict) and 'result' in _envelope else \
+                                     (_envelope if isinstance(_envelope, dict) and 'error' in _envelope else None)
                             
                             # ✅ SUCCESS: Block accepted
                             if isinstance(result, dict) and result.get("status") == "accepted":
@@ -13529,8 +13562,15 @@ class QtclClientApp:
 
                     # STAGE 1: Fetch chain tip
                     _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
-                    if not _res_h:
-                        _EXP_LOG.warning("[MINER] chain tip fetch failed, retrying…")
+                    # _rpc fall-through bug: server JSON-RPC error {"error":{...}} is
+                    # truthy but has no 'height'/'tip_hash' keys — treat as failure so
+                    # the NULL_HASH gate never fires on a bad response.
+                    if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
+                        _EXP_LOG.warning(
+                            "[MINER] chain tip fetch failed "
+                            f"({'RPC error: ' + str(_res_h.get('error','?')) if isinstance(_res_h, dict) else 'None'})"
+                            ", retrying…"
+                        )
                         await _asyncio.sleep(2.0)
                         continue
                     oracle_height = int(_res_h.get('height', 0))
@@ -13554,7 +13594,8 @@ class QtclClientApp:
                             f"[MINER] Oracle snap h={_snap_height} vs chain h={oracle_height} "                            f"— proceeding with chain tip (oracle is advisory)")
 
                     # STAGE 2: Fetch difficulty from latest block
-                    _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
+                    _res_b_raw = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2)
+                    _res_b = (_res_b_raw if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw else {})
                     difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 4)))
 
                     # STAGE 3: Fetch mempool
