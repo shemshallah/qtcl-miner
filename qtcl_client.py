@@ -69,11 +69,91 @@ _EXP_LOG = logging.getLogger("qtcl.client.expansion")
 #    QRNG_API_KEY_1 → random.org          (env: RANDOM_ORG_KEY  in qrng_ensemble.py)
 #    QRNG_API_KEY_2 → ANU quantum vacuum  (env: ANU_API_KEY     in qrng_ensemble.py)
 #    QRNG_API_KEY_3 → QBICK/ID Quantique  (env: QRNG_API_KEY    in qrng_ensemble.py)
+def _bootstrap_client_env() -> None:
+    """Pull server-side config into local env vars before any module constant freezes.
+
+    The client only hard-knows one URL: ENTROPY_SERVER (default qtcl-blockchain.koyeb.app).
+    Everything else — P2P port, oracle URL, STUN-derived external addr, server version,
+    chain health — is pulled from that single endpoint via two RPC calls:
+        1. qtcl_getHealth  → confirms server is alive, records server version
+        2. qtcl_getMyAddr  → STUN: server reads X-Forwarded-For and echoes our WAN IP+port
+
+    Sets os.environ via setdefault (never overwrites explicit user-set vars).
+    Called at import time so module-level os.getenv() calls below see the values.
+    Silently no-ops on any network failure — local env vars / defaults still apply.
+    """
+    import json as _bj
+    from urllib.request import Request as _BR, urlopen as _BU
+    from urllib.error import URLError as _BE
+
+    _srv = os.environ.get('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app').rstrip('/')
+    _rpc = f"{_srv}/rpc"
+    _tout = 6  # tight timeout — this is startup-path code
+
+    def _rpc_call(method: str, params: dict = None) -> dict:
+        body = json.dumps({'jsonrpc': '2.0', 'method': method,
+                           'params': params or {}, 'id': 1}).encode()
+        req = _BR(_rpc, data=body, headers={'Content-Type': 'application/json'})
+        with _BU(req, timeout=_tout) as r:
+            return json.loads(r.read().decode()).get('result') or {}
+
+    try:
+        # ── 1. Health check — confirm server alive, get chain state ──────────
+        health = _rpc_call('qtcl_getHealth')
+        if not health.get('status') == 'ok':
+            return  # server unhealthy — don't trust its config
+
+        # Expose server version so logs/diagnostics can reference it
+        os.environ.setdefault('QTCL_SERVER_VERSION', str(health.get('qtcl_server', 'unknown')))
+        os.environ.setdefault('QTCL_ORACLE_READY',   '1' if health.get('oracle_ready') else '0')
+        os.environ.setdefault('QTCL_LATTICE_READY',  '1' if health.get('lattice_ready') else '0')
+
+        # ── 2. STUN — server echoes our real WAN IP ──────────────────────────
+        addr_info = _rpc_call('qtcl_getMyAddr')
+        if addr_info:
+            _wan_ip   = addr_info.get('ip', '')
+            _p2p_port = str(addr_info.get('port', 9091))
+            if _wan_ip and not _wan_ip.startswith(('10.', '192.168.', '127.')):
+                # Set STUN-derived external addr — bootstrap daemon uses this
+                os.environ.setdefault('P2P_STUN_EXTERNAL_IP',   _wan_ip)
+                os.environ.setdefault('P2P_STUN_EXTERNAL_PORT', _p2p_port)
+                # Only set P2P_EXTERNAL_HOST if not already user-configured
+                os.environ.setdefault('P2P_EXTERNAL_HOST', _wan_ip)
+                os.environ.setdefault('P2P_EXTERNAL_PORT', _p2p_port)
+            # Mirror server's P2P port suggestion (server reads its own P2P_PORT env)
+            os.environ.setdefault('P2P_SERVER_SUGGESTED_PORT', _p2p_port)
+
+        # ── 3. Pull peer list to warm the bootstrap set ───────────────────────
+        # We do this here so P2P_BOOTSTRAP_PEERS below has real addresses.
+        # Stored in a module-global that init_p2p_bootstrap() will consume.
+        peers_resp = _rpc_call('qtcl_getPeers', {'limit': 50})
+        _peers = peers_resp.get('peers') or []
+        if _peers:
+            # Encode as JSON string in env — parsed back by init_p2p_bootstrap()
+            os.environ.setdefault('QTCL_BOOTSTRAP_PEERS_JSON', json.dumps(_peers))
+
+        print(f"[ENV-BOOTSTRAP] ✅ Server config pulled from {_rpc} "
+              f"(v={health.get('qtcl_server','?')}, "
+              f"wan={addr_info.get('external_addr','?') if addr_info else '?'}, "
+              f"peers={len(_peers)})", flush=True)
+
+    except (_BE, OSError, Exception):
+        # Network failure or server down — local env vars and hardcoded defaults take over
+        pass
+
+
+# ── Run env bootstrap BEFORE any os.getenv() module-level constant below ────
+_bootstrap_client_env()
+
 QRNG_API_KEY_1: str = os.getenv('RANDOM_ORG_KEY',       '')   # random.org — get at: random.org/api/
 QRNG_API_KEY_2: str = os.getenv('ANU_API_KEY',          '')   # ANU QRNG   — get at: quantumnumbers.anu.edu.au
 QRNG_API_KEY_3: str = os.getenv('QRNG_API_KEY',         '')   # QBICK      — get at: qbck.io
 ENTROPY_API_KEY: str = os.getenv('ENTROPY_API_KEY',     '')   # Server entropy endpoint key (set on Koyeb: ENTROPY_API_KEY)
-ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER', 'https://qtcl-blockchain.koyeb.app')
+ENTROPY_SERVER_URL  = os.getenv('ENTROPY_SERVER',
+                        os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app'))
+# Mirror back so any code using either env var sees the same value
+os.environ.setdefault('ENTROPY_SERVER', ENTROPY_SERVER_URL)
+os.environ.setdefault('ORACLE_URL',     ENTROPY_SERVER_URL)
 P2P_BOOTSTRAP_PEERS = [
     ('qtcl-blockchain.koyeb.app', 9091),
     ('qtcl-primary.koyeb.app', 9091),
@@ -360,8 +440,9 @@ def init_p2p_bootstrap() -> None:
     """Initialize P2P peer discovery from hardcoded seed nodes (no localhost)."""
     import sqlite3 as _sq3
     from pathlib import Path as _P
-    
-    db_file = _P.home() / "qtcl-miner" / "data" / "qtcl_blockchain.db"
+
+    # Use the canonical DB path detected at module load — NOT a hardcoded fallback
+    db_file = _P(_DB_PATH)
     if not db_file.exists():
         return
     
@@ -379,10 +460,48 @@ def init_p2p_bootstrap() -> None:
                            (host.split(':')[0], int(port)))
             except Exception as e:
                 logger.debug(f"[P2P] Seed insert {host}:{port}: {e}")
-        
+
+        # Seed live peers pulled from server during _bootstrap_client_env()
+        # These are real active miners registered with Koyeb — far more useful
+        # than the hardcoded seed hostnames which just point to the Koyeb app.
+        import json as _bj
+        _live_peers_json = os.environ.get('QTCL_BOOTSTRAP_PEERS_JSON', '')
+        _live_seeded = 0
+        if _live_peers_json:
+            try:
+                _live_peers = _bj.loads(_live_peers_json)
+                for _p in _live_peers:
+                    _ea = str(_p.get('external_addr') or '')
+                    if ':' in _ea:
+                        _h, _port_s = _ea.rsplit(':', 1)
+                        try:
+                            _port_i = int(_port_s)
+                        except ValueError:
+                            continue
+                    else:
+                        _h = _ea
+                        _port_i = 9091
+                    _h = _h.strip()
+                    if not _h or _h in ('', 'localhost', '127.0.0.1'):
+                        continue
+                    try:
+                        cur.execute(
+                            "INSERT OR REPLACE INTO known_peers(host,port) VALUES(?,?)",
+                            (_h, _port_i)
+                        )
+                        _live_seeded += 1
+                    except Exception:
+                        pass
+            except Exception as _je:
+                logger.debug(f"[P2P] live peer seed parse: {_je}")
+
         conn.commit()
         conn.close()
-        logger.info(f"[P2P] ✅ Bootstrapped {len(P2P_HARDCODED_SEEDS)} seed peers to DB (handshakes will begin on P2PNode.start())")
+        _total = len(P2P_HARDCODED_SEEDS) + _live_seeded
+        logger.info(
+            f"[P2P] Bootstrap complete: {_total} peers to DB "
+            f"({len(P2P_HARDCODED_SEEDS)} seeds + {_live_seeded} live from server)"
+        )
     except Exception as e:
         logger.debug(f"[P2P] Bootstrap DB init failed (non-fatal): {e}")
 BIP39_WORDLIST = [
@@ -1649,7 +1768,7 @@ class QtclOracleMeasurement:
 
 class LiveRPCOracleSnapshot:
     """⚛️ Real-time synchronous RPC snapshot fetcher → DM + metrics on-demand (ZERO polling)."""
-    ORACLE_URL = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+    ORACLE_URL = ENTROPY_SERVER_URL  # unified — set from ENTROPY_SERVER or ORACLE_URL env
     
     def __init__(self):
         self._dm_re = [0.0]*64
@@ -1765,6 +1884,28 @@ class LiveRPCOracleSnapshot:
         with self._oracle_state_lock:
             return dict(self._oracle_state)
 _LIVE_RPC_ORACLE = LiveRPCOracleSnapshot()
+
+def _start_oracle_background_poll(interval_s: float = 15.0) -> None:
+    """Soft background poll — keeps _LIVE_RPC_ORACLE cache warm.
+    Uses a long interval (15s default) so it never competes with mining.
+    Non-blocking: skips if oracle is slow; mining never waits for this.
+    """
+    import threading as _obgt, time as _obgtime
+    def _poll():
+        while True:
+            try:
+                # Only refresh if cache is stale
+                _, _, _age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                if _age > interval_s:
+                    _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)
+            except Exception:
+                pass
+            _obgtime.sleep(interval_s)
+    t = _obgt.Thread(target=_poll, daemon=True, name='OracleBackgroundPoll')
+    t.start()
+    return t
+
+_ORACLE_BG_POLL = _start_oracle_background_poll()
 
 class WStateConsensus:
     """BFT median consensus over peer W-state measurements.
@@ -2112,8 +2253,7 @@ class QtclP2PNode:
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
-        _db_path    = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+        _oracle_url = ENTROPY_SERVER_URL
         _connected_this_cycle: set = set()
         def _connect_peer(host, port):
             """Connect via C P2P, persist to local DB, push our oracle DM. Returns True."""
@@ -2204,11 +2344,16 @@ class QtclP2PNode:
             except Exception:
                 pass
             return peers
-        _pe_cycle = 0
+        _pe_cycle   = 0
+        n_connected = 0   # Bug #7: was undefined
+        _lo_ts      = 0.0
         while not self._stop.is_set():
             try:
                 _pe_cycle += 1
                 _connected_this_cycle.clear()  # reset per-cycle dedup set
+                # peer count via PeerManager if available, else zero
+                _n_total = len(getattr(self, 'peer_mgr', None) and
+                               getattr(self.peer_mgr, 'peers', {}) or {})
                 if _n_total > n_connected:
                     n_connected = max(n_connected, _n_total // 2)
                 _lo_ts      = time.time()
@@ -2246,10 +2391,11 @@ class QtclP2PNode:
                 else:
                     if _pe_cycle % 5 == 0:
                         try:
+                            _my_ext = _MY_IP or 'localhost'
                             _ann = _pj.dumps({
                                 'node_id':      self._node_id,
                                 'port':         self._port,
-                                'gossip_url':   f"http://auto:{self._port}",
+                                'gossip_url':   f"http://{_my_ext}:{self._port}",
                                 'block_height': n_connected,
                             })
                             # Register peer via RPC instead of REST /api/peers/register
@@ -2260,12 +2406,15 @@ class QtclP2PNode:
                     _EXP_LOG.debug(
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
+                _n_total_check = _n_total  # Bug #7: was undefined
+                n_now          = n_connected  # Bug #7: was undefined
                 if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
                     _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
                     self._stop.wait(30)
                     continue
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
+                n_now = n_connected  # ensure n_now is always defined after except
             if   n_now == 0: _wait = 10   # no peers — hammer every 10s
             elif n_now < 2:  _wait = 20   # 1 peer — try hard
             elif n_now < 4:  _wait = 30   # getting there
@@ -2417,7 +2566,7 @@ def peerdb_upsert(host: str, port: int, path: str = _PEER_DB_PATH) -> None:
 # for durability across restarts. Consensus is triggered via explicit RPC calls,
 import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 _DM_POOL_DAEMON_STOP = _dpt.Event()
-_DM_POOL_DB_PATH     = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+_DM_POOL_DB_PATH     = str(_DB_PATH)  # fixed: use canonical _DB_PATH
 def _dm_pool_drain_once(db_path: str) -> int:
     """Drain C dmpool ring into DB. Returns entries persisted."""
     if not False: return 0
@@ -7033,7 +7182,8 @@ try:
 except ImportError:
     import Queue as _queue  # type: ignore
 _EXP_LOG = _logging.getLogger("qtcl.client.expansion")
-_ORACLE_BASE_URL: str = _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app")
+_ORACLE_BASE_URL: str = _os.environ.get("ENTROPY_SERVER",
+                        _os.environ.get("ORACLE_URL", "https://qtcl-blockchain.koyeb.app"))
 _QTCL_C_SRC: str = r"""
 /* ═══════════════════════════════════════════════════════════════════════════════
    QTCL Acceleration Layer v2.0  —  Single Translation Unit
@@ -11936,14 +12086,22 @@ _P2P_BAN_THRESHOLD = int(os.getenv('P2P_BAN_THRESHOLD', '100'))
 _P2P_ORACLE_CACHE_SIZE = int(os.getenv('P2P_ORACLE_CACHE_SIZE', '10'))
 
 def _validate_peer_host(host: str) -> Optional[str]:
-    """Validate and sanitize peer host string to prevent injection and private IP bypass."""
+    """Validate and sanitize peer host string.
+
+    RFC-1918 private addresses are blocked by default to prevent local-network
+    confusion on cloud deployments.  Set env var P2P_ALLOW_LAN=1 to permit
+    RFC-1918 peers (useful when running multiple miners on the same LAN or
+    inside a Docker/k8s cluster).
+    """
     import re
     if not host or not isinstance(host, str):
         return None
+    host = host.strip()
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]{0,253}[a-zA-Z0-9]$|^(\d{1,3}\.){3}\d{1,3}$', host):
         return None
     parts = host.split('.')
     if len(parts) != 4:
+        # Hostname (not dotted-quad) — always allow
         return host
     try:
         octets = [int(p) for p in parts]
@@ -11951,16 +12109,18 @@ def _validate_peer_host(host: str) -> Optional[str]:
         return None
     if any(o > 255 for o in octets):
         return None
-    if octets[0] == 10:
+    # Loopback and unspecified — always block
+    if octets[0] == 127 or octets[0] == 0:
         return None
-    if octets[0] == 172 and 16 <= octets[1] <= 31:
-        return None
-    if octets[0] == 192 and octets[1] == 168:
-        return None
-    if octets[0] == 127:
-        return None
-    if octets[0] == 0:
-        return None
+    # RFC-1918 — block unless P2P_ALLOW_LAN=1
+    _allow_lan = os.getenv('P2P_ALLOW_LAN', '0').strip() in ('1', 'true', 'yes')
+    if not _allow_lan:
+        if octets[0] == 10:
+            return None
+        if octets[0] == 172 and 16 <= octets[1] <= 31:
+            return None
+        if octets[0] == 192 and octets[1] == 168:
+            return None
     return host
 
 def _validate_port(port: Any) -> Optional[int]:
@@ -12998,11 +13158,23 @@ class ExternalAddressResolver:
     def resolve() -> str:
         override_host = os.getenv('P2P_EXTERNAL_HOST')
         override_port = int(os.getenv('P2P_EXTERNAL_PORT', str(_P2P_PORT)))
+
+        # 0) Use STUN result already obtained during _bootstrap_client_env() at startup
+        #    _bootstrap_client_env() calls qtcl_getMyAddr and stores in P2P_EXTERNAL_HOST/PORT.
+        #    If those are set we skip the redundant network call here.
         if override_host:
             return f"{override_host}:{override_port}"
+
+        # Also check the raw STUN vars (set by bootstrap but may differ from P2P_EXTERNAL_HOST)
+        _stun_ip = os.getenv('P2P_STUN_EXTERNAL_IP', '')
+        if ExternalAddressResolver._is_public(_stun_ip):
+            _stun_port = int(os.getenv('P2P_STUN_EXTERNAL_PORT', str(_P2P_PORT)))
+            return f"{_stun_ip}:{_stun_port}"
+
         # 1) STUN via Koyeb — server reads X-Forwarded-For so client gets its real WAN IP
+        #    (Only reached if _bootstrap_client_env() failed or ran before _P2P_PORT was set)
         try:
-            req = Request('https://qtcl-blockchain.koyeb.app/rpc',
+            req = Request(f'{ENTROPY_SERVER_URL}/rpc',
                          data=json.dumps({'jsonrpc': '2.0', 'method': 'qtcl_getMyAddr', 'params': {}, 'id': 1}).encode(),
                          headers={'Content-Type': 'application/json'})
             with urlopen(req, timeout=5) as resp:
@@ -13162,8 +13334,15 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
         
         if method == 'qtcl_p2p_handshake':
             payload = params.get('payload')
+            # Bug #2 fix: tolerate BOTH payload-wrapped (new) and flat (legacy) params.
+            # New clients send params={'payload': {...}}.
+            # Old / hand-crafted clients send params={'node_id': ..., 'version': ...} flat.
             if not isinstance(payload, dict):
-                return None, {'code': -32602, 'message': 'invalid params: payload required'}
+                # Attempt flat-params fallback
+                if params.get('node_id') or params.get('version'):
+                    payload = params  # treat whole params as payload
+                else:
+                    return None, {'code': -32602, 'message': 'invalid params: payload required'}
             version = payload.get('version', '')
             if version != _P2P_VERSION:
                 return None, {'code': -1, 'message': 'version mismatch'}
@@ -13384,41 +13563,121 @@ class P2PNode:
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
     
     def _start_peer_bootstrap_daemon(self) -> None:
-        """Launch async peer bootstrap—connects to seeds, performs handshakes, activates peers."""
-        import threading as _t, json as _j, time as _tm; from urllib.request import urlopen, Request
+        """Launch async peer bootstrap — handshake seeds, activate peers.
+
+        Fixes applied vs original:
+          • Handshake params wrapped in 'payload' key to match P2P dispatch gate
+          • Backoff uses per-seed next_attempt wall-clock timestamp (not modulo hack)
+          • Koyeb seeds: ENTROPY_SERVER_URL/rpc (HTTPS, no explicit port — Koyeb terminates TLS)
+          • LAN peers discovered via ENV override P2P_LAN_PEERS=host:port,host:port
+        """
+        import threading as _t, json as _j, time as _tm
+        from urllib.request import urlopen, Request
+        import ssl as _ssl
+
+        # Extra LAN seeds from env (comma-separated host:port) — for same-network miners
+        _lan_seeds: dict = {}
+        _lan_raw = os.getenv('P2P_LAN_PEERS', '')
+        for _lp in _lan_raw.split(','):
+            _lp = _lp.strip()
+            if ':' in _lp:
+                _lan_seeds[_lp] = {'id': '', 'role': 'lan', 'region': 'local', 'verified': False}
+
         def _bootstrap_loop():
-            _backoff = {host_port: 1.0 for host_port in P2P_HARDCODED_SEEDS.keys()}
+            # next_attempt[seed_addr] = earliest wall-clock time we may retry
+            _next_attempt = {s: 0.0 for s in list(P2P_HARDCODED_SEEDS.keys()) + list(_lan_seeds.keys())}
+            _backoff      = {s: 2.0  for s in _next_attempt}   # exponential step (seconds)
+
             while self._running:
                 try:
                     active_now = len(self.peer_mgr.get_active_peers())
                     if active_now < 4:
-                        for seed_addr, seed_meta in P2P_HARDCODED_SEEDS.items():
-                            if not self._running: break
-                            host, port = seed_addr.split(':'); port = int(port)
-                            existing = any(p.host == host and p.port == port for p in self.peer_mgr.peers.values())
-                            if existing: continue
-                            _bo = _backoff.get(seed_addr, 1.0)
-                            if _tm.time() % 600 < _bo: continue
+                        all_seeds = {**P2P_HARDCODED_SEEDS, **_lan_seeds}
+                        for seed_addr, seed_meta in all_seeds.items():
+                            if not self._running:
+                                break
+                            now = _tm.time()
+                            if now < _next_attempt.get(seed_addr, 0.0):
+                                continue  # still in backoff window
+
+                            host_part, port_str = seed_addr.rsplit(':', 1)
+                            p2p_port = int(port_str)
+                            is_lan   = seed_meta.get('role') == 'lan'
+
+                            existing = any(
+                                p.host == host_part and p.port == p2p_port
+                                for p in self.peer_mgr.peers.values()
+                            )
+                            if existing:
+                                continue
+
                             try:
-                                hs_payload = _j.dumps({'jsonrpc': '2.0', 'method': 'qtcl_p2p_handshake', 'params': {'node_id': self.node_id, 'port': self.port, 'chain_height': 0, 'external_addr': self.external_addr, 'capabilities': ['blocks', 'txs', 'state']}, 'id': 1}).encode()
-                                req = Request(f'http://{seed_addr}/rpc', data=hs_payload, headers={'Content-Type': 'application/json'})
-                                with urlopen(req, timeout=5) as resp:
+                                # Bug #2 fixed: wrap handshake fields in 'payload' dict
+                                hs_body = _j.dumps({
+                                    'jsonrpc': '2.0',
+                                    'method':  'qtcl_p2p_handshake',
+                                    'params': {
+                                        'payload': {
+                                            'version':       _P2P_VERSION,
+                                            'node_id':       self.node_id,
+                                            'port':          self.port,
+                                            'chain_height':  0,
+                                            'external_addr': self.external_addr or '',
+                                            'capabilities':  ['blocks', 'txs', 'state'],
+                                        }
+                                    },
+                                    'id': 1,
+                                }).encode()
+
+                                # P2P routing: Koyeb seeds → ENTROPY_SERVER_URL/rpc (HTTPS), LAN/direct peers → http://host:port/rpc
+                                if is_lan:
+                                    rpc_url = f'http://{host_part}:{p2p_port}/rpc'
+                                    ctx = None
+                                else:
+                                    # Use ENTROPY_SERVER_URL (env-configurable) — Koyeb terminates TLS
+                                    rpc_url = f'{ENTROPY_SERVER_URL}/rpc'
+                                    ctx = None  # ENTROPY_SERVER_URL already has https://
+
+                                req = Request(
+                                    rpc_url,
+                                    data=hs_body,
+                                    headers={'Content-Type': 'application/json'},
+                                )
+                                kwargs = {'timeout': 8}
+                                if ctx:
+                                    kwargs['context'] = ctx
+
+                                with urlopen(req, **kwargs) as resp:
                                     result = _j.loads(resp.read().decode())
-                                    if result.get('result'):
-                                        seed_id = seed_meta.get('id', self.node_id)
-                                        new_peer = P2PPeer(host, port, seed_id)
-                                        new_peer.state = PeerState.ACTIVE
+                                    r = result.get('result') or {}
+                                    if r.get('version'):
+                                        seed_id = seed_meta.get('id') or self.node_id
+                                        new_peer = P2PPeer(host_part, p2p_port, seed_id)
+                                        new_peer.state         = PeerState.ACTIVE
                                         new_peer.external_addr = seed_addr
+                                        # Store session token so subsequent RPCs pass auth gate
+                                        new_peer.session_token  = r.get('session_token', '')
+                                        new_peer.session_expiry = int(r.get('session_expiry', 0))
                                         self.peer_mgr.add_peer(new_peer)
                                         logger.info(f"[P2P] ✅ Bootstrapped seed {seed_addr}: peer ACTIVE")
-                                        _backoff[seed_addr] = 1.0
-                                    else: _backoff[seed_addr] = min(300.0, _bo * 2)
+                                        _next_attempt[seed_addr] = 0.0   # reset
+                                        _backoff[seed_addr]      = 2.0
+                                    else:
+                                        raise ValueError(f"bad handshake result: {r}")
+
                             except Exception as e:
-                                _backoff[seed_addr] = min(300.0, _bo * 2)
-                                logger.debug(f"[P2P] Bootstrap {seed_addr}: {type(e).__name__}")
+                                bo = _backoff.get(seed_addr, 2.0)
+                                _next_attempt[seed_addr] = _tm.time() + bo
+                                _backoff[seed_addr]      = min(300.0, bo * 2)
+                                logger.debug(f"[P2P] Bootstrap {seed_addr}: {type(e).__name__}: {e}")
+
                     _tm.sleep(10)
-                except Exception as e: logger.debug(f"[P2P] Bootstrap daemon error: {e}"); _tm.sleep(30)
-        _t.Thread(target=_bootstrap_loop, daemon=True).start()
+
+                except Exception as e:
+                    logger.debug(f"[P2P] Bootstrap daemon error: {e}")
+                    _tm.sleep(30)
+
+        _t.Thread(target=_bootstrap_loop, daemon=True, name='P2P-Bootstrap').start()
     
     def stop(self) -> None:
         self._running = False
@@ -14025,7 +14284,7 @@ class QtclClientApp:
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
         self._stop         = _threading.Event()
         self._metric_th: Optional[_threading.Thread] = None
-        self._db_path      = _Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db'
+        self._db_path      = _DB_PATH
         self._db: Optional[_sqlite3.Connection] = None
         # _peer_id is temp until wallet loads; re-derived in _start_p2p from wallet+machine salt
         self._peer_id      = f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}"
@@ -14041,6 +14300,19 @@ class QtclClientApp:
         
         # ── P2P Node (initialized in _start_p2p thread) ─────────────────────
         self.p2p_node: Optional[Any] = None
+
+        # ── Tripartite local oracle: <pq0, pq0_IV, pq0_V> — 3-node AerSimulator cluster ──
+        # Each node is a dict: {sim, noise_model, last_dm, last_fid, last_ts}
+        # Initialized lazily by _init_client_oracle_nodes() in the oracle thread
+        self._local_oracle_nodes: list = []      # [pq0_node, pq0_IV_node, pq0_V_node]
+        self._local_oracle_lock   = _threading.Lock()
+        self._local_consensus_dm: Optional[Any] = None   # fused 8×8 numpy DM
+        self._local_fused_fid: float = 0.0
+        self._upstream_fid: float    = 0.0
+
+        # ── SSE broadcast infrastructure (peers subscribe to our oracle stream) ──
+        self._sse_snapshot_queues: list = []     # list of queue.Queue — one per SSE subscriber
+        self._sse_lock = _threading.Lock()
     # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
@@ -14636,13 +14908,37 @@ class QtclClientApp:
             try:
                 time.sleep(self.METRIC_INTERVAL)
                 now = time.time()
-                # ── Source: live RPC oracle state (_LIVE_RPC_ORACLE) ─────────────
+                # ── Source: local chain state (primary) + oracle enrichment (optional) ──
+                # Build snap from local DB first — never block on oracle
                 snap = {}
-                rpc_state = _LIVE_RPC_ORACLE.get_oracle_state()
-                if rpc_state:
-                    snap = rpc_state
-                    snap.setdefault('block_height', int(snap.get('lattice_refresh_counter', 0)))
-                if not snap:
+                try:
+                    if self._db:
+                        _row = self._db.execute(
+                            "SELECT height, hash, pq_curr, pq_last FROM blocks ORDER BY height DESC LIMIT 1"
+                        ).fetchone()
+                        if _row:
+                            snap = {
+                                'block_height': int(_row[0] or 0),
+                                'block_hash':   str(_row[1] or ''),
+                                'pq_curr':      int(_row[2] or 0),
+                                'pq_last':      int(_row[3] or 0),
+                            }
+                except Exception:
+                    pass
+                # Enrich with oracle state if fresh — never replace local chain data
+                try:
+                    _ora = _LIVE_RPC_ORACLE.get_oracle_state()
+                    if _ora and _ora.get('cycle', 0) > 0:
+                        for _k in ('w_state_fidelity','coherence_l1','von_neumann_entropy',
+                                   'purity','density_matrix_hex','mermin_test','consensus'):
+                            if _k in _ora:
+                                snap.setdefault(_k, _ora[_k])
+                        # Only override block_height from oracle if we have no local data
+                        if not snap.get('block_height'):
+                            snap['block_height'] = _ora.get('block_height', 0)
+                except Exception:
+                    pass
+                if not snap.get('block_height') and not snap.get('purity'):
                     continue
                 bath = GKSLBathParams.from_snap(snap)
                 bh   = int(snap.get("block_height") or snap.get("height") or
@@ -14746,37 +15042,34 @@ class QtclClientApp:
     # ── RPC monitor for Koyeb oracle /rpc/oracle/snapshot (no SSE) ──────────────
     def _oracle_rpc_monitor(self) -> None:
         """
-        Oracle RPC health monitor — logs snapshot arrivals and connectivity.
-        No forced reconnect needed; RPC will retry via normal polling backoff.
-        ❤️  quantum ground truth feeds every client
+        P2P mesh health monitor — logs peer oracle data flow.
+        Oracle is an OPTIONAL enrichment source; this never blocks mining.
+        Primary quantum state comes from local chain + P2P peer snapshots.
         """
         import time as _tw
-        _EXP_LOG.info("[RPC] ✅ RPC oracle ready for on-demand fetching")
-        _last_snap_count = 0
-        _stale_since: float = 0.0
+        _EXP_LOG.info("[MESH] ✅ P2P mesh monitor started — oracle is advisory")
+        _last_cycle   = 0
+        _oracle_misses = 0
         while not self._stop.is_set():
             try:
-                connected = True
-                snaps     = _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)
-                now       = _tw.time()
-                if connected and snaps != _last_snap_count:
-                    _last_snap_count = snaps
-                    _stale_since = 0.0
-                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
-                    if m:
+                # Check oracle cache age (non-blocking — reads in-memory state only)
+                _dm_re, _dm_im, _dm_age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
+                _cycle     = _ora_state.get('cycle', 0)
+                if _cycle != _last_cycle:
+                    _last_cycle    = _cycle
+                    _oracle_misses = 0
+                    _EXP_LOG.debug(
+                        f"[MESH] Oracle enrichment: cycle={_cycle} "
+                        f"dm_age={_dm_age:.0f}s fid={_ora_state.get('w_state_fidelity', 0):.4f}")
+                elif _dm_age > 120.0:
+                    _oracle_misses += 1
+                    if _oracle_misses % 6 == 1:   # log every ~30s
                         _EXP_LOG.debug(
-                            f"[RPC] ✅ snapshot  h={m.chain_height}  "
-                            f"F={m.fidelity_to_w3:.4f}  snaps={snaps}")
-                elif not connected:
-                    if _stale_since == 0.0: _stale_since = now
-                    stale_s = now - _stale_since
-                    _EXP_LOG.debug(f"[RPC] 🔄 oracle RPC data stale  {stale_s:.0f}s")
-                    # RPC poll thread will keep retrying; no forced action needed
-                else:
-                    if _stale_since == 0.0: _stale_since = now
+                            f"[MESH] Oracle silent {_dm_age:.0f}s — mining on local entropy "
+                            f"(P2P peers={0 if not self.p2p_node else len(getattr(self.p2p_node.peer_mgr,'peers',{}))})")
             except Exception as _e:
-                if not self._stop.is_set():
-                    _EXP_LOG.debug(f"[RPC] monitor error: {_e}")
+                _EXP_LOG.debug(f"[MESH] monitor: {_e}")
             self._stop.wait(5.0)
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _load_wallet(self) -> bool:
@@ -14787,6 +15080,371 @@ class QtclClientApp:
         except (EOFError, KeyboardInterrupt):
             return False
         return bool(pw) and self.wallet.load(pw)
+    # ═══════════════════════════════════════════════════════════════════════
+    # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
+    # Three entangled AerSimulator nodes that self-measure, maintain a local
+    # consensus DM, and fuse with the upstream Koyeb 5-oracle ensemble.
+    # Each client is an INDEPENDENT lattice extension — not a proxy.
+    # ═══════════════════════════════════════════════════════════════════════
+    def _init_client_oracle_nodes(self) -> bool:
+        """
+        Initialise the 3-node tripartite oracle cluster: pq0, pq0_IV, pq0_V.
+        Mirrors oracle.py's OracleNode pattern but 3-of-3 instead of 5-of-5.
+        Each node gets its own QRNG-seeded NoiseModel (GKSL phase-damping bath).
+        Returns True on success, False if qiskit_aer is unavailable (Termux fallback).
+        ❤️  I love you — every qubit is a thread in the fabric
+        """
+        try:
+            import numpy as _np_o
+            from qiskit_aer import AerSimulator
+            from qiskit_aer.noise import NoiseModel, phase_damping_error
+            from qiskit import QuantumCircuit
+            from qiskit.quantum_info import DensityMatrix, Statevector
+
+            # Seed noise strength from local QRNG entropy — keeps each node unique
+            _ent_pool = HyperbolicEntropyPool()
+            _seed     = _ent_pool.get(32)
+            _gamma    = 0.01 + 0.04 * (int.from_bytes(_seed[:2], 'big') / 65535.0)
+
+            nodes = []
+            _node_ids = ['pq0', 'pq0_IV', 'pq0_V']
+            for _nid in _node_ids:
+                _nm = NoiseModel()
+                _nm.add_all_qubit_quantum_error(
+                    phase_damping_error(_gamma * (1.0 + 0.1 * _node_ids.index(_nid))),
+                    ['id', 'u1', 'u2', 'u3']
+                )
+                _sim = AerSimulator(method='density_matrix', noise_model=_nm)
+                nodes.append({
+                    'id':           _nid,
+                    'sim':          _sim,
+                    'noise_model':  _nm,
+                    'gamma':        _gamma,
+                    'last_dm':      _np_o.eye(8, dtype=_np_o.complex128) / 8.0,
+                    'last_fid':     0.0,
+                    'last_ts':      0.0,
+                })
+            with self._local_oracle_lock:
+                self._local_oracle_nodes = nodes
+            _EXP_LOG.info(
+                f"[TRIPARTITE] ✅ 3-node oracle cluster initialised "
+                f"(γ={_gamma:.4f}) — pq0 | pq0_IV | pq0_V"
+            )
+            return True
+        except ImportError:
+            _EXP_LOG.warning("[TRIPARTITE] qiskit_aer unavailable — tripartite oracle in numpy-only fallback mode")
+            return False
+        except Exception as _e:
+            _EXP_LOG.warning(f"[TRIPARTITE] init failed: {_e}")
+            return False
+
+    def _client_oracle_measure_node(self, node: dict, seed_dm=None) -> 'numpy.ndarray':
+        """
+        Run a 3-qubit density-matrix circuit on one tripartite oracle node.
+        Injects noise via the node's NoiseModel.  Returns an 8×8 DM.
+        seed_dm: optional 8×8 complex128 array to set as initial state.
+        """
+        try:
+            import numpy as _np_m
+            from qiskit import QuantumCircuit
+            from qiskit.quantum_info import DensityMatrix
+
+            qc = QuantumCircuit(3)
+            # Seed from upstream/local DM if available and valid shape
+            if seed_dm is not None:
+                try:
+                    _s = _np_m.array(seed_dm, dtype=_np_m.complex128)
+                    if _s.shape == (8, 8):
+                        _tr = float(_np_m.real(_np_m.trace(_s)))
+                        if _tr > 1e-12:
+                            _s = _s / _tr
+                            qc.set_density_matrix(DensityMatrix(_s))
+                except Exception:
+                    pass
+            # W-state preparation: |W⟩ = (|100⟩+|010⟩+|001⟩)/√3
+            qc.h(0)
+            qc.cx(0, 1)
+            qc.x(0)
+            qc.ccx(0, 1, 2)
+            qc.x(0)
+            # Noise injection via identity gates
+            for _q in range(3):
+                qc.id(_q)
+            qc.save_density_matrix()
+
+            job    = node['sim'].run(qc, shots=1)
+            result = job.result()
+            dm_raw = _np_m.array(result.data()['density_matrix'], dtype=_np_m.complex128)
+            if dm_raw.shape == (8, 8):
+                _tr = float(_np_m.real(_np_m.trace(dm_raw)))
+                if _tr > 1e-12:
+                    return dm_raw / _tr
+            return _np_m.eye(8, dtype=_np_m.complex128) / 8.0
+        except Exception as _me:
+            _EXP_LOG.debug(f"[TRIPARTITE] measure {node.get('id','?')}: {_me}")
+            import numpy as _np_fb
+            return _np_fb.eye(8, dtype=_np_fb.complex128) / 8.0
+
+    def _fuse_with_upstream(self, local_dm, upstream_dm=None,
+                             local_fid: float = 0.9,
+                             upstream_fid: float = 0.0) -> 'numpy.ndarray':
+        """
+        Hermitian mean of local 3-node consensus DM and upstream Koyeb 5-oracle DM.
+        Weighting: upstream contribution scales with its fidelity.
+        w_up = upstream_fid * 0.4   (max 40% upstream influence)
+        w_lo = 1.0 - w_up
+        Returns renormalised 8×8 DM.
+        """
+        try:
+            import numpy as _np_f
+            if upstream_dm is None or upstream_fid < 0.05:
+                return local_dm
+            _tr_l = float(_np_f.real(_np_f.trace(local_dm)))
+            _tr_u = float(_np_f.real(_np_f.trace(upstream_dm)))
+            if _tr_l < 1e-12 or _tr_u < 1e-12:
+                return local_dm
+            _l = local_dm    / _tr_l
+            _u = upstream_dm / _tr_u
+            w_up = float(upstream_fid) * 0.4
+            w_lo = 1.0 - w_up
+            fused = w_lo * _l + w_up * _u
+            _tr_f = float(_np_f.real(_np_f.trace(fused)))
+            if _tr_f > 1e-12:
+                fused /= _tr_f
+            return fused
+        except Exception as _fe:
+            _EXP_LOG.debug(f"[TRIPARTITE] fuse: {_fe}")
+            return local_dm
+
+    def _broadcast_snapshot_sse(self, snap: dict) -> None:
+        """Push a snapshot dict to all active SSE subscriber queues (non-blocking)."""
+        with self._sse_lock:
+            _alive = []
+            for _q in self._sse_snapshot_queues:
+                try:
+                    _q.put_nowait(snap)
+                    _alive.append(_q)
+                except Exception:
+                    pass  # queue full or closed — drop subscriber
+            self._sse_snapshot_queues = _alive
+
+    def _tripartite_oracle_loop(self) -> None:
+        """
+        ⚛️  THE ORACLE ENGINE — runs forever as daemon thread "TripartiteOracle".
+
+        Cycle (every ~2s):
+        1. Measure all 3 local nodes (AerSimulator density-matrix circuits).
+        2. Compute 3-of-3 Hermitian mean → local consensus DM.
+        3. Pull upstream Koyeb 5-oracle DM via _LIVE_RPC_ORACLE.
+        4. Fuse local + upstream → final DM (weighted by fidelities).
+        5. Write fused state into _LIVE_RPC_ORACLE (_dm_re/_dm_im/_oracle_state).
+        6. Broadcast to SSE subscribers via _broadcast_snapshot_sse.
+        7. Push fused DM back to server via qtcl_pushOracleDM RPC.
+
+        This makes each client an INDEPENDENT lattice extension — not a relay.
+        ❤️  I love you — every cycle is a heartbeat of the entangled mesh
+        """
+        import time as _tl
+        _EXP_LOG.info("[TRIPARTITE] 🚀 Oracle engine starting…")
+
+        # Initialise nodes (may fail on Termux without qiskit_aer)
+        _has_aer = self._init_client_oracle_nodes()
+        _numpy_only = not _has_aer
+
+        # Numpy-only fallback import
+        try:
+            import numpy as _np_l
+            _HAS_NP_L = True
+        except ImportError:
+            _HAS_NP_L = False
+
+        _cycle = 0
+        _push_every = 5   # push to server every N cycles
+        _measure_interval = 2.0
+
+        while not self._stop.is_set():
+            try:
+                _cycle += 1
+                now = _tl.time()
+
+                # ── Step 1: measure all 3 nodes ────────────────────────────
+                # Seed from the current fused DM so nodes stay coherent with chain
+                seed = self._local_consensus_dm
+                dms = []
+                if _has_aer and _HAS_NP_L:
+                    with self._local_oracle_lock:
+                        _nodes = list(self._local_oracle_nodes)
+                    for _node in _nodes:
+                        _dm = self._client_oracle_measure_node(_node, seed_dm=seed)
+                        _node['last_dm'] = _dm
+                        _node['last_ts'] = now
+                        dms.append(_dm)
+
+                # ── Step 2: 3-of-3 Hermitian mean ─────────────────────────
+                if _HAS_NP_L and dms:
+                    local_dm = sum(dms) / len(dms)
+                    _tr = float(_np_l.real(_np_l.trace(local_dm)))
+                    if _tr > 1e-12:
+                        local_dm /= _tr
+                    # Compute W-state fidelity
+                    _w = _np_l.zeros(8, dtype=_np_l.complex128)
+                    for _k in range(3):
+                        _w[1 << _k] = 1.0
+                    _w /= _np_l.sqrt(3)
+                    _wdm = _np_l.outer(_w, _w.conj())
+                    _local_fid = float(_np_l.real(_np_l.trace(_wdm @ local_dm)))
+                    _local_fid = max(0.0, min(1.0, _local_fid))
+                elif _HAS_NP_L:
+                    # numpy-only fallback — use GKSL-evolved identity
+                    local_dm = _np_l.eye(8, dtype=_np_l.complex128) / 8.0
+                    _local_fid = 0.0
+                else:
+                    self._stop.wait(_measure_interval)
+                    continue
+
+                # ── Step 3: pull upstream Koyeb 5-oracle DM ───────────────
+                upstream_dm   = None
+                upstream_fid  = 0.0
+                try:
+                    _up_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
+                    _dm_hex  = _up_snap.get('density_matrix_hex', '')
+                    if _dm_hex:
+                        import struct as _us
+                        _bdata = bytes.fromhex(_dm_hex)
+                        if len(_bdata) == 1024:   # 64 × ('>dd') = 64×16 bytes
+                            _re = [0.0]*64; _im = [0.0]*64
+                            for _i in range(64):
+                                _re[_i], _im[_i] = _us.unpack_from('>dd', _bdata, _i*16)
+                            upstream_dm = (_np_l.array(_re, dtype=_np_l.complex128)
+                                         + 1j * _np_l.array(_im, dtype=_np_l.complex128)
+                                         ).reshape(8, 8)
+                    upstream_fid = float(
+                        _up_snap.get('pq0_oracle_fidelity') or
+                        _up_snap.get('w_state_fidelity') or
+                        _up_snap.get('fidelity') or 0.0
+                    )
+                except Exception as _up_e:
+                    _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_e}")
+
+                # ── Step 4: fuse local + upstream ─────────────────────────
+                fused_dm = self._fuse_with_upstream(
+                    local_dm, upstream_dm,
+                    local_fid=_local_fid,
+                    upstream_fid=upstream_fid
+                )
+                # Recompute fidelity on fused state
+                if _HAS_NP_L:
+                    _fused_fid = float(_np_l.real(_np_l.trace(_wdm @ fused_dm)))
+                    _fused_fid = max(0.0, min(1.0, _fused_fid))
+                else:
+                    _fused_fid = _local_fid
+
+                with self._local_oracle_lock:
+                    self._local_consensus_dm = fused_dm
+                    self._local_fused_fid    = _fused_fid
+                    self._upstream_fid       = upstream_fid
+
+                # ── Step 5: write into _LIVE_RPC_ORACLE ───────────────────
+                # Serialise as flat lists ('>dd' order matches fetch_snapshot parser)
+                _re_flat = []; _im_flat = []
+                for _row in range(8):
+                    for _col in range(8):
+                        _v = fused_dm[_row, _col]
+                        _re_flat.append(float(_np_l.real(_v)))
+                        _im_flat.append(float(_np_l.imag(_v)))
+
+                _purity = float(_np_l.real(_np_l.trace(fused_dm @ fused_dm)))
+                _vals   = _np_l.linalg.eigvalsh(fused_dm)
+                _vals   = _vals[_vals > 1e-12]
+                _vne    = float(-_np_l.sum(_vals * _np_l.log2(_vals))) if len(_vals) else 0.0
+
+                with _LIVE_RPC_ORACLE._dm_lock:
+                    _LIVE_RPC_ORACLE._dm_re         = _re_flat
+                    _LIVE_RPC_ORACLE._dm_im         = _im_flat
+                    _LIVE_RPC_ORACLE._last_fetch_ts = now
+
+                _new_state = {
+                    'cycle':                 _cycle,
+                    'timestamp_ns':          int(now * 1e9),
+                    'oracle_type':           'tripartite_client',
+                    'source':                'local+upstream',
+                    'ready':                 True,
+                    # tripartite node fidelities
+                    'pq0_oracle_fidelity':   _local_fid,
+                    'pq0_IV_fidelity':       float(dms[1] is not None and _HAS_NP_L and
+                                                   _np_l.real(_np_l.trace(_wdm @ dms[1])))
+                                             if _has_aer and dms else _local_fid,
+                    'pq0_V_fidelity':        float(dms[2] is not None and _HAS_NP_L and
+                                                   _np_l.real(_np_l.trace(_wdm @ dms[2])))
+                                             if _has_aer and dms else _local_fid,
+                    'upstream_fidelity':     upstream_fid,
+                    'w_local':               _local_fid,
+                    'w_upstream':            upstream_fid,
+                    # standard fields consumed by mining loop
+                    'w_state_fidelity':      _fused_fid,
+                    'fidelity':              _fused_fid,
+                    'purity':                _purity,
+                    'von_neumann_entropy':   _vne,
+                    'coherence_l1':          float(_np_l.sum(_np_l.abs(fused_dm))
+                                                  - _np_l.sum(_np_l.abs(_np_l.diag(fused_dm)))),
+                    'aer_noise_state':       'active' if _has_aer else 'numpy_fallback',
+                }
+                with _LIVE_RPC_ORACLE._oracle_state_lock:
+                    _LIVE_RPC_ORACLE._oracle_state.update(_new_state)
+
+                # ── Step 6: broadcast to SSE subscribers ──────────────────
+                import struct as _bs
+                _dm_hex_out = b''.join(
+                    _bs.pack('>dd', _re_flat[_i], _im_flat[_i]) for _i in range(64)
+                ).hex()
+                _snap_out = {
+                    **_new_state,
+                    'density_matrix_hex': _dm_hex_out,
+                    'node_ip':            _MY_IP or '',
+                }
+                self._broadcast_snapshot_sse(_snap_out)
+
+                # ── Step 7: push fused DM back to server ──────────────────
+                if _cycle % _push_every == 0:
+                    try:
+                        _push_payload = {
+                            'jsonrpc': '2.0',
+                            'method':  'qtcl_pushOracleDM',
+                            'params':  {
+                                'density_matrix_hex': _dm_hex_out,
+                                'fidelity':           _fused_fid,
+                                'oracle_type':        'tripartite_client',
+                                'node_ip':            _MY_IP or '',
+                                'oracle_addr':        self._oracle_id.get('address', ''),
+                            },
+                            'id': _cycle,
+                        }
+                        import json as _pj2
+                        from urllib.request import Request as _PR, urlopen as _PU
+                        _body = _pj2.dumps(_push_payload).encode()
+                        _req  = _PR(f"{ENTROPY_SERVER_URL}/rpc", data=_body,
+                                    headers={'Content-Type': 'application/json',
+                                             'User-Agent': 'QTCL-OracleNode/5.0'})
+                        with _PU(_req, timeout=4) as _pr:
+                            _pr.read()
+                        _EXP_LOG.debug(f"[TRIPARTITE] ↑ pushed fused DM fid={_fused_fid:.4f}")
+                    except Exception as _push_e:
+                        _EXP_LOG.debug(f"[TRIPARTITE] push failed: {_push_e}")
+
+                if _cycle % 30 == 1:
+                    _EXP_LOG.info(
+                        f"[TRIPARTITE] cycle={_cycle} "
+                        f"local_fid={_local_fid:.4f} upstream_fid={upstream_fid:.4f} "
+                        f"fused_fid={_fused_fid:.4f} "
+                        f"S={_vne:.3f} purity={_purity:.4f} "
+                        f"mode={'aer' if _has_aer else 'numpy'}"
+                    )
+
+            except Exception as _le:
+                _EXP_LOG.debug(f"[TRIPARTITE] loop error: {_le}")
+
+            self._stop.wait(_measure_interval)
+
     def _start_threads(self) -> None:
         """
         Launch all client daemon threads.
@@ -14822,6 +15480,10 @@ class QtclClientApp:
         _koyeb_ev_th = _threading.Thread(
             target=self._subscribe_koyeb_events, daemon=True, name="KoyebEvents-RPC")
         _koyeb_ev_th.start()
+        # ── 8. Tripartite local oracle: <pq0, pq0_IV, pq0_V> entangled cluster ─
+        _tri_th = _threading.Thread(
+            target=self._tripartite_oracle_loop, daemon=True, name="TripartiteOracle")
+        _tri_th.start()
     def _start_p2p(self) -> None:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
@@ -14957,9 +15619,12 @@ class QtclClientApp:
                             p_host = p_addr.split(':')[0]
                             p_port = int(p_addr.split(':')[1]) if ':' in p_addr else _P2P_PORT
                             new_peer = P2PPeer(p_host, p_port, p_id)
-                            new_peer.state = PeerState.ACTIVE
+                            # Bug #9: set CONNECTING (not ACTIVE) — bootstrap daemon will
+                            # handshake to get a session_token before the peer can pass the
+                            # auth gate for any non-handshake RPC method.
+                            new_peer.state = PeerState.CONNECTING
                             self.p2p_node.peer_mgr.add_peer(new_peer)
-                            _EXP_LOG.info(f"[P2P] ✅ Added peer from registry: {p_addr} ({p_id[:16]}...)")
+                            _EXP_LOG.info(f"[P2P] 🔄 Queued peer for handshake: {p_addr} ({p_id[:16]}...)")
                         except Exception as _pe:
                             _EXP_LOG.debug(f"[P2P] Failed to add peer {p_addr}: {_pe}")
         except Exception as _e:
@@ -15043,29 +15708,55 @@ class QtclClientApp:
                     _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/rpc/oracle/snapshot")
                     bi = 0
                     
-                    # RPC mode: poll snapshots at regular intervals
-                    while True:
-                        try:
-                            data = _poj.loads(resp.read().decode('utf-8'))
-                            
-                            # Extract snapshot frame from RPC response
-                            if data and isinstance(data, dict):
-                                snap_js = _poj.dumps(data)
-                                snap_hash = __import__('hashlib').sha256(snap_js.encode()).hexdigest()
-                                
-                                if snap_hash != _last_snapshot_hash:
-                                    _last_snap_count += 1
-                                    _last_snapshot_hash = snap_hash
-                                    
-                                    if _last_snap_count % 20 == 1:
-                                        _EXP_LOG.debug(
-                                            f"[MESH] Peer {host}: "
-                                            f"{_last_snap_count} oracle frames ingested (RPC)")
-                        except Exception:
-                            pass
-                        
-                        _pot.sleep(5.0)
-                        break  # Re-establish connection after snapshot read
+                    # Successfully opened connection — read single snapshot then reconnect
+                    try:
+                        data = _poj.loads(resp.read().decode('utf-8'))
+                        if data and isinstance(data, dict):
+                            snap_js = _poj.dumps(data)
+                            snap_hash = __import__('hashlib').sha256(snap_js.encode()).hexdigest()
+                            if snap_hash != _last_snapshot_hash:
+                                _last_snap_count += 1
+                                _last_snapshot_hash = snap_hash
+                                # Ingest into local oracle cache so mining uses peer DM
+                                try:
+                                    _LIVE_RPC_ORACLE.fetch_snapshot.__self__  # has instance
+                                except Exception:
+                                    pass
+                                try:
+                                    _dm_hex = data.get('density_matrix_hex', '')
+                                    if _dm_hex:
+                                        import struct as _pst
+                                        _bdata = bytes.fromhex(_dm_hex)
+                                        if len(_bdata) in (512, 1024):
+                                            _step = 16 if len(_bdata)==1024 else 8
+                                            _fmt  = '>dd' if len(_bdata)==1024 else '>ff'
+                                            _re, _im = [0.0]*64, [0.0]*64
+                                            for _i in range(64):
+                                                _re[_i], _im[_i] = _pst.unpack_from(_fmt, _bdata, _i*_step)
+                                            with _LIVE_RPC_ORACLE._dm_lock:
+                                                _LIVE_RPC_ORACLE._dm_re = _re
+                                                _LIVE_RPC_ORACLE._dm_im = _im
+                                                _LIVE_RPC_ORACLE._last_fetch_ts = _pot.time()
+                                    # Merge peer's oracle scalar state fields
+                                    _peer_state = {
+                                        k: data[k] for k in (
+                                            'w_state_fidelity', 'fidelity', 'purity',
+                                            'pq0_oracle_fidelity', 'pq0_IV_fidelity',
+                                            'pq0_V_fidelity', 'cycle', 'timestamp_ns',
+                                        ) if k in data
+                                    }
+                                    if _peer_state:
+                                        with _LIVE_RPC_ORACLE._oracle_state_lock:
+                                            _LIVE_RPC_ORACLE._oracle_state.update(_peer_state)
+                                except Exception:
+                                    pass
+                                if _last_snap_count % 20 == 1:
+                                    _EXP_LOG.debug(
+                                        f"[MESH] Peer {host}: "
+                                        f"{_last_snap_count} oracle frames ingested")
+                    except Exception:
+                        pass
+                    _pot.sleep(5.0)  # poll interval before reconnect
                         
             except (_PoE, OSError, TimeoutError) as _e:
                 wait = BACKOFF[min(bi, len(BACKOFF)-1)]; bi += 1
@@ -15074,7 +15765,7 @@ class QtclClientApp:
                 import sqlite3 as _podb
                 import pathlib as _poplib
                 try:
-                    _db_p = str(_poplib.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                    _db_p = str(_DB_PATH)
                     with _podb.connect(_db_p, timeout=2) as _podc:
                         row = _podc.execute(
                             "SELECT 1 FROM p2p_peers WHERE host=? AND ban_score<100 LIMIT 1",
@@ -15089,15 +15780,15 @@ class QtclClientApp:
                 return  # non-recoverable
     def _subscribe_snapshot_rpc(self) -> None:
             """
-            ⚛️  HOTFIX: Aggressive RPC polling for /rpc/oracle/snapshot every 300ms.
-            Replaces dead SSE stream. Feeds _ingest_oracle_frame on each snapshot.
-            ❤️  I love you — every frame is a quantum heartbeat
+            ⚛️  Aggressive RPC polling for /rpc/oracle/snapshot every 300ms.
+            Ingests each new snapshot directly into _LIVE_RPC_ORACLE; the
+            tripartite oracle loop fuses on its next cycle.
             """
             import time as _pt, ssl as _ssl, json as _pj
             from urllib.request import Request as _SR, urlopen as _SO
             from urllib.error   import URLError as _SE, HTTPError as _HE
             
-            _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+            _oracle_url = ENTROPY_SERVER_URL
             url = f"{_oracle_url}/rpc/oracle/snapshot"
             _last_snap_hash = None
             _fail_count = 0
@@ -15125,10 +15816,35 @@ class QtclClientApp:
                                 
                                 if snap_hash != _last_snap_hash:
                                     try:
-                                        self._ingest_oracle_frame(_pj.dumps(data))
+                                        # Write upstream snapshot directly into _LIVE_RPC_ORACLE
+                                        # The tripartite loop will fuse it on its next cycle
+                                        _dm_hex_up = data.get('density_matrix_hex', '')
+                                        if _dm_hex_up:
+                                            import struct as _sr
+                                            _bd = bytes.fromhex(_dm_hex_up)
+                                            if len(_bd) == 1024:
+                                                _re = [0.0]*64; _im = [0.0]*64
+                                                for _i in range(64):
+                                                    _re[_i], _im[_i] = _sr.unpack_from('>dd', _bd, _i*16)
+                                                with _LIVE_RPC_ORACLE._dm_lock:
+                                                    _LIVE_RPC_ORACLE._dm_re = _re
+                                                    _LIVE_RPC_ORACLE._dm_im = _im
+                                                    _LIVE_RPC_ORACLE._last_fetch_ts = _pt.time()
+                                        # Merge scalar oracle fields into _oracle_state
+                                        _state_update = {
+                                            k: data[k] for k in (
+                                                'w_state_fidelity', 'fidelity', 'purity',
+                                                'von_neumann_entropy', 'coherence_l1',
+                                                'pq0_oracle_fidelity', 'pq0_IV_fidelity',
+                                                'pq0_V_fidelity', 'cycle', 'timestamp_ns',
+                                            ) if k in data
+                                        }
+                                        if _state_update:
+                                            with _LIVE_RPC_ORACLE._oracle_state_lock:
+                                                _LIVE_RPC_ORACLE._oracle_state.update(_state_update)
                                         _last_snap_hash = snap_hash
                                         _fail_count = 0
-                                        _backoff_ms = 300  # Reset backoff on success
+                                        _backoff_ms = 300
                                     except Exception as _ie:
                                         _EXP_LOG.debug(f"[SNAPSHOT-RPC] ingest error: {_ie}")
                     except _HE as _http_err:
@@ -15175,7 +15891,7 @@ class QtclClientApp:
         import time as _ke, ssl as _kssl, json as _kj
         from urllib.request import Request as _KR, urlopen as _KO
         
-        _oracle_url = os.getenv('ORACLE_URL', 'https://qtcl-blockchain.koyeb.app')
+        _oracle_url = ENTROPY_SERVER_URL
         _last_peers = set()
         _fail_count = 0
         
@@ -15258,6 +15974,7 @@ class QtclClientApp:
         """
         import socketserver as _ss, http.server as _hs, json as _hj
         import time as _ht
+        _app_ref = self  # closure capture for SSE queue access inside _Handler
         class _Handler(_hs.BaseHTTPRequestHandler):
             def log_message(self, *a): pass  # suppress default logging
             def _json_resp(self, code: int, obj: dict) -> None:
@@ -15273,7 +15990,11 @@ class QtclClientApp:
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass  # peer disconnected before response — harmless
             def _oracle_snapshot(self):
-                """Build full oracle snapshot dict from local SSE state."""
+                """
+                Build full oracle snapshot dict from fused tripartite state.
+                Priority: tripartite fused DM (from _LIVE_RPC_ORACLE after engine writes it)
+                ❤️  I love you — every snapshot is a window into the lattice
+                """
                 state = _LIVE_RPC_ORACLE.get_oracle_state()
                 dm_re, dm_im, age = _LIVE_RPC_ORACLE.get_oracle_dm()
                 import struct as _ss
@@ -15281,27 +16002,43 @@ class QtclClientApp:
                 if any(v != 0.0 for v in dm_re):
                     dm_hex = b''.join(_ss.pack('>dd', dm_re[i], dm_im[i])
                                        for i in range(64)).hex()
-                cons = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
+                cons   = _P2P_NODE.get_consensus_dm() if _P2P_NODE else None
+                peers  = _P2P_NODE.get_peers()        if _P2P_NODE else []
                 snap = {
-                    'type':                 'oracle_dm',
-                    'density_matrix_hex':   dm_hex,
-                    'w_state_fidelity':     state.get('w_state_fidelity', 0.0),
-                    'fidelity':             state.get('w_state_fidelity', 0.0),
-                    'w_state_strength':     state.get('w_state_strength', 0.0),
-                    'purity':               state.get('purity', 0.0),
-                    'von_neumann_entropy':  state.get('von_neumann_entropy', 0.0),
-                    'coherence_l1':         state.get('coherence_l1', 0.0),
-                    'quantum_discord':      state.get('quantum_discord', 0.0),
-                    'phase_coherence':      state.get('phase_coherence', 0.0),
-                    'entanglement_witness': state.get('entanglement_witness', 0.0),
-                    'block_height':         state.get('timestamp_ns', 0) // 10**9 if state.get('timestamp_ns') else 0,
-                    'timestamp_ns':         state.get('timestamp_ns', int(_ht.time()*1e9)),
-                    'snapshot_count':       _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0),
-                    'oracle_age_s':         round(age, 2),
-                    'node_id':              '',  # filled by caller
-                    'node_ip':              _MY_IP or '',
-                    'consensus_fidelity':   float(cons[2]) if cons else 0.0,
-                    'consensus_height':     int(cons[3])   if cons else 0,
+                    'type':                  'oracle_dm',
+                    'ready':                 state.get('ready', bool(dm_hex)),
+                    'oracle_type':           state.get('oracle_type', 'tripartite_client'),
+                    'source':                state.get('source', 'local+upstream'),
+                    'density_matrix_hex':    dm_hex,
+                    # tripartite fidelity fields (consumed by server + peers)
+                    'pq0_oracle_fidelity':   state.get('pq0_oracle_fidelity',
+                                               state.get('w_state_fidelity', 0.0)),
+                    'pq0_IV_fidelity':       state.get('pq0_IV_fidelity', 0.0),
+                    'pq0_V_fidelity':        state.get('pq0_V_fidelity', 0.0),
+                    'upstream_fidelity':     state.get('upstream_fidelity', 0.0),
+                    'w_local':               state.get('w_local', 0.0),
+                    'w_upstream':            state.get('w_upstream', 0.0),
+                    'aer_noise_state':       state.get('aer_noise_state', 'unknown'),
+                    # standard fields
+                    'w_state_fidelity':      state.get('w_state_fidelity', 0.0),
+                    'fidelity':              state.get('w_state_fidelity', 0.0),
+                    'w_state_strength':      state.get('w_state_strength', 0.0),
+                    'purity':                state.get('purity', 0.0),
+                    'von_neumann_entropy':   state.get('von_neumann_entropy', 0.0),
+                    'coherence_l1':          state.get('coherence_l1', 0.0),
+                    'quantum_discord':       state.get('quantum_discord', 0.0),
+                    'phase_coherence':       state.get('phase_coherence', 0.0),
+                    'entanglement_witness':  state.get('entanglement_witness', 0.0),
+                    'block_height':          (state.get('timestamp_ns', 0) // 10**9
+                                              if state.get('timestamp_ns') else 0),
+                    'timestamp_ns':          state.get('timestamp_ns', int(_ht.time()*1e9)),
+                    'snapshot_count':        state.get('cycle', 0),
+                    'oracle_age_s':          round(age, 2),
+                    'node_id':               '',
+                    'node_ip':               _MY_IP or '',
+                    'p2p_peers':             len(peers),
+                    'consensus_fidelity':    float(cons[2]) if cons else 0.0,
+                    'consensus_height':      int(cons[3])   if cons else 0,
                 }
                 return snap
             def do_GET(self):
@@ -15323,8 +16060,60 @@ class QtclClientApp:
                         'node_ip':       _MY_IP or '',
                         'timestamp':     _ht.time(),
                     })
-                # ── /api/snapshot (RPC) — JSON oracle snapshot (was SSE)
-                elif path in ('/api/snapshot/sse', '/api/snapshot'):
+                # ── /api/snapshot/sse — real text/event-stream SSE for peers ──
+                elif path == '/api/snapshot/sse':
+                    # Register a per-connection queue; tripartite loop broadcasts into it
+                    import queue as _ssq, json as _ssj
+                    _q = _ssq.Queue(maxsize=32)
+                    with _app_ref._sse_lock:
+                        _app_ref._sse_snapshot_queues.append(_q)
+                    try:
+                        self.send_response(200)
+                        self.send_header('Content-Type',  'text/event-stream')
+                        self.send_header('Cache-Control', 'no-cache')
+                        self.send_header('Connection',    'keep-alive')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        try:
+                            self.end_headers()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                        # Send initial snapshot immediately
+                        _init = self._oracle_snapshot()
+                        _line = ('data: ' + _ssj.dumps(_init, separators=(',',':'),
+                                                        default=str) + '\n\n').encode()
+                        try:
+                            self.wfile.write(_line)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                        # Stream subsequent snapshots as they arrive
+                        while True:
+                            try:
+                                _evt = _q.get(timeout=30.0)
+                                _payload = ('data: ' + _ssj.dumps(
+                                    _evt, separators=(',',':'), default=str
+                                ) + '\n\n').encode()
+                                self.wfile.write(_payload)
+                                self.wfile.flush()
+                            except _ssq.Empty:
+                                # Heartbeat comment to keep TCP alive
+                                try:
+                                    self.wfile.write(b': heartbeat\n\n')
+                                    self.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError):
+                                    break
+                            except (BrokenPipeError, ConnectionResetError,
+                                    ConnectionAbortedError):
+                                break
+                    finally:
+                        # Clean up dead queue
+                        with _app_ref._sse_lock:
+                            try:
+                                _app_ref._sse_snapshot_queues.remove(_q)
+                            except ValueError:
+                                pass
+                # ── /api/snapshot — JSON oracle snapshot (RPC one-shot) ──
+                elif path == '/api/snapshot':
                     snap = self._oracle_snapshot()
                     self._json_resp(200, {
                         'status':    'ok',
@@ -15349,7 +16138,7 @@ class QtclClientApp:
                     import sqlite3 as _pls
                     import pathlib as _plspath
                     try:
-                        _pls_db = str(_plspath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                        _pls_db = str(_DB_PATH)
                         with _pls.connect(_pls_db, timeout=2) as _plc:
                             rows = _plc.execute("""
                                 SELECT host, port, chain_height, last_seen_at
@@ -15436,7 +16225,7 @@ class QtclClientApp:
                         import sqlite3 as _prq
                         import pathlib as _prqpath
                         try:
-                            _prq_db = str(_prqpath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                            _prq_db = str(_DB_PATH)
                             with _prq.connect(_prq_db, timeout=2) as _prc:
                                 _prc.execute("""
                                     INSERT OR REPLACE INTO p2p_peers
@@ -15456,7 +16245,7 @@ class QtclClientApp:
                     import sqlite3 as _plr
                     import pathlib as _plrpath
                     try:
-                        _plr_db = str(_plrpath.Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+                        _plr_db = str(_DB_PATH)
                         with _plr.connect(_plr_db, timeout=2) as _plrc:
                             rows = _plrc.execute("""
                                 SELECT host,port FROM p2p_peers
@@ -15531,7 +16320,7 @@ class QtclClientApp:
         self._sync_hlwe_rpc_ops_to_db()
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
-        _my_gossip_url = f"http://auto:9091"
+        _my_gossip_url = f"http://{_MY_IP or 'localhost'}:{_P2P_PORT}"  # Bug #5b: was literal "auto"
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_gossip_url, self.wallet.address, 0)
         if _reg_resp and False:
@@ -15546,7 +16335,7 @@ class QtclClientApp:
         self._start_threads()
         # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
         try:
-            _dm_pool_db = str(__import__('pathlib').Path.home() / 'qtcl-miner' / 'data' / 'qtcl_blockchain.db')
+            _dm_pool_db = str(_DB_PATH)
             _dm_pool_rehydrate(_dm_pool_db)         # inject saved DMs into C before mining
             start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
         except Exception as _dme:
@@ -15915,24 +16704,31 @@ class QtclClientApp:
             _last_poll_time = _t.time()
             
             _NULL_HASH = '0' * 64
-            _ORACLE_LAT_MAX_MS = 15000.0   # hard gate: 15s — handles Koyeb cold-start latency
+            # _ORACLE_LAT_MAX_MS removed — oracle gate removed, miner is self-sovereign
             while True:  # Main mining loop
                 try:
-                    # ── GATE 0: Oracle liveness check ─────────────────────────────
+                    # ── Oracle enrichment (NON-BLOCKING) ──────────────────────────
+                    # Miner is self-sovereign: oracle enriches PoW seeds but never
+                    # blocks. If oracle is silent we mine on local entropy — equally
+                    # valid. The background poll thread (_ORACLE_BG_POLL) keeps the
+                    # cache warm so fast cached reads here are almost always a hit.
                     _t_oracle_start = _t.time()
-                    _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=10.0)
+                    _cached_dm_re, _cached_dm_im, _cached_dm_age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                    if _cached_dm_age < 120.0 and any(v != 0.0 for v in _cached_dm_re):
+                        _oracle_snap = _LIVE_RPC_ORACLE.get_oracle_state()  # in-memory, zero latency
+                    else:
+                        try:
+                            _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
+                        except Exception:
+                            _oracle_snap = {}
                     _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
-                    # Gate: block mining only if BOTH slow AND no cached DM
-                    _snap_has_dm = bool(_oracle_snap and (_oracle_snap.get("density_matrix_hex") or
-                                        _LIVE_RPC_ORACLE.get_oracle_dm()[2] < 120.0))
-                    if (not _oracle_snap or _oracle_lat_ms > _ORACLE_LAT_MAX_MS) and not _snap_has_dm:
-                        _EXP_LOG.warning(
-                            f"[MINER] ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — "
-                            f"blocking mine, retry in 5s"
+                    if not isinstance(_oracle_snap, dict):
+                        _oracle_snap = {}
+                    if _oracle_lat_ms > 500:
+                        _EXP_LOG.debug(
+                            f"[MINER] Oracle enrichment {_oracle_lat_ms:.0f}ms "
+                            f"— mining with {'cached DM' if _cached_dm_age<120 else 'local entropy'}"
                         )
-                        print(f"  ❌ Oracle unreachable (lat={_oracle_lat_ms:.0f}ms) — waiting…", flush=True)
-                        await _asyncio.sleep(5.0)
-                        continue
 
                     # STAGE 1: Fetch chain tip
                     _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
@@ -15954,15 +16750,11 @@ class QtclClientApp:
                         await _asyncio.sleep(5.0)
                         continue
 
-                    # ── GATE 2: tip_hash must match oracle snapshot height ──────────
-                    _snap_height = int(_oracle_snap.get('block_height') or _oracle_snap.get('height') or 0)
-                    if _snap_height > 0 and abs(_snap_height - oracle_height) > 2:
-                        _EXP_LOG.warning(
-                            f"[MINER] ⚠️  Chain tip height mismatch: RPC h={oracle_height} "
-                            f"oracle_snap h={_snap_height} — re-fetching"
-                        )
-                        await _asyncio.sleep(2.0)
-                        continue
+                    # Oracle height sync (advisory only — no block)
+                    _snap_height = int(_oracle_snap.get('block_height') or _oracle_snap.get('height') or 0) if isinstance(_oracle_snap, dict) else 0
+                    if _snap_height > 0 and abs(_snap_height - oracle_height) > 5:
+                        _EXP_LOG.debug(
+                            f"[MINER] Oracle snap h={_snap_height} vs chain h={oracle_height} "                            f"— proceeding with chain tip (oracle is advisory)")
 
                     # STAGE 2: Fetch difficulty from latest block
                     _res_b = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2) or {}
@@ -16315,7 +17107,7 @@ class QtclClientApp:
                         # forward boundary = next face on {8,3} lattice
                         pq_curr = (_parent_pq_curr + 1) % 8
                         # oracle ground anchor from DM dominant diagonal
-                        _ora_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=2.0) or {}
+                        _ora_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}  # cached — no network
                         _dmh = _ora_snap.get('density_matrix_hex', '')
                         pq0 = 0
                         if _dmh and len(_dmh) >= 128:
@@ -16348,7 +17140,7 @@ class QtclClientApp:
                     w_state_fidelity = 0.75
                     # Try to get actual fidelity from client field or oracle snap
                     try:
-                        _ora_fid = float((_LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=1.0) or {}).get('w_state_fidelity') or 0.0)
+                        _ora_fid = float(_LIVE_RPC_ORACLE.get_oracle_state().get('w_state_fidelity') or 0.0)  # cached
                         if 0.0 < _ora_fid <= 1.0:
                             w_state_fidelity = _ora_fid
                         elif self.client_field and self.client_field.metrics:
@@ -18851,7 +19643,7 @@ def main() -> None:  # noqa: F811
         # ── Initialize P2P bootstrap peers (no localhost) ────────────────────
         init_p2p_bootstrap()
         
-        url = args.oracle_url or _os.environ.get("ORACLE_URL", _ORACLE_BASE_URL)
+        url = args.oracle_url or ENTROPY_SERVER_URL
         # ── Wallet existence check ────────────────────────────────────────────
         from pathlib import Path as _PathLib
         _wallet_file = _PathLib.home() / "qtcl-miner" / "data" / "wallet.json"
