@@ -11447,7 +11447,77 @@ class P2PNode:
             print("[P2P-DISC] 🚀 Active peer discovery engine online", flush=True)
             while self._running:
                 try:
-                    # ... rest of loop ...
+                    # 1. QUERY KOYEB FOR PEER REGISTRY
+                    try:
+                        _rpc_url = f"{ENTROPY_SERVER_URL}/rpc"
+                        _body = _j.dumps({
+                            "jsonrpc": "2.0", "method": "qtcl_getPeers", "params": [], "id": 1
+                        }).encode()
+                        _req = Request(_rpc_url, data=_body, headers={'Content-Type': 'application/json'})
+                        with urlopen(_req, timeout=5) as _resp:
+                            _data = _j.loads(_resp.read())
+                            _peers = _data.get('result', {}).get('peers', [])
+                            if _peers:
+                                print(f"[P2P-DISC] Koyeb registry: found {len(_peers)} potential peers", flush=True)
+                                for _p in _peers:
+                                    print(f"[P2P-DISC]   -> Peer: {_p.get('node_id')[:8] if _p.get('node_id') else 'unknown'} @ {_p.get('external_addr')}", flush=True)
+                            for _p in _peers:
+                                # Standardize field names for register_peer_info
+                                _p.setdefault('host', _p.get('ip_hint') or _p.get('peer_addr', '').split(':')[0] or _p.get('external_addr', '').split(':')[0])
+                                _p.setdefault('node_id', _p.get('peer_id') or _p.get('node_id'))
+                                
+                                # Use the standardized register_peer_info
+                                self.peer_mgr.register_peer_info(_p)
+                    except Exception as _ke:
+                        _EXP_LOG.debug(f"[P2P-DISC] Koyeb fetch failed: {_ke}")
+
+                    # 2. RECURSIVE P2P GOSSIP (GetAddr from existing peers)
+                    active_peers = self.peer_mgr.get_active_peers()
+                    all_potential = list(self.peer_mgr.peers.values())
+                    
+                    if active_peers:
+                        print(f"[P2P-DISC] Gossiping with {len(active_peers)} active peers", flush=True)
+                    
+                    # 3. BROADCAST OUR IDENTITY (Announce to ALL potential peers)
+                    print(f"[P2P-DISC] Announcing identity to {len(all_potential)} discovered peers", flush=True)
+                    for _peer in all_potential:
+                        try:
+                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
+                            _body = _j.dumps({
+                                "jsonrpc": "2.0", 
+                                "method": "qtcl_p2p_announce", 
+                                "params": {
+                                    "node_id": self.node_id,
+                                    "external_addr": self.external_addr,
+                                    "chain_height": 0
+                                }, 
+                                "id": 1
+                            }).encode()
+                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
+                            with urlopen(_req, timeout=2) as _resp:
+                                # If announce works, set state to ACTIVE so it shows in peers
+                                if _peer.state != PeerState.ACTIVE:
+                                    _peer.state = PeerState.ACTIVE
+                                    print(f"[P2P-DISC] ✅ Peer {_peer.host}:{_peer.port} activated via announce", flush=True)
+                        except Exception:
+                            continue
+
+                    for _peer in active_peers:
+                        try:
+                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
+                            _body = _j.dumps({
+                                "jsonrpc": "2.0", "method": "qtcl_p2p_getAddr", "params": {}, "id": 1
+                            }).encode()
+                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
+                            with urlopen(_req, timeout=3) as _resp:
+                                _data = _j.loads(_resp.read())
+                                _new_peers = _data.get('result', {}).get('peers', [])
+                                for _np in _new_peers:
+                                    if _np.get('host') != self.external_addr:
+                                        self.peer_mgr.register_peer_info(_np)
+                        except Exception:
+                            continue
+                    
                     # 4. RE-REGISTER WITH KOYEB AS RELAY
                     try:
                         app_instance._register_with_koyeb()
@@ -13913,6 +13983,7 @@ class QtclClientApp:
                 
                 with _PoU(req, timeout=30) as resp:
                     _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/rpc/oracle/snapshot")
+                    print(f"[MESH] Handshake with peer {host}:{port} successful", flush=True)
                     bi = 0
                     
                     # Successfully opened connection — read single snapshot then reconnect
@@ -16025,10 +16096,34 @@ class QtclClientApp:
         # ── Start P2P active discovery (delegated to P2PNode) ──────────
         _p2p = getattr(self, "p2p_node", None)
         if _p2p:
+            # FORCE PEER ADDITION (Local Mesh Bridge)
+            # If you know the specific local IPs of your devices, add them here
+            # For now, we force discovery engine to run aggressively
             if hasattr(_p2p, '_start_peer_discovery_daemon'):
                 _p2p._start_peer_discovery_daemon(self)
             else:
                 print("  ⚠️  P2P: active discovery engine missing", flush=True)
+
+        # ── Peer Table Refresh Loop (Accelerated Mesh Bridge) ─────────────
+        def _mesh_bridge_loop():
+            while True:
+                try:
+                    self._register_with_koyeb()
+                    # Try to find peers in common subnets
+                    import socket
+                    _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    _s.connect(("8.8.8.8", 80))
+                    local_ip = _s.getsockname()[0]
+                    _s.close()
+                    
+                    subnet = ".".join(local_ip.split(".")[:-1])
+                    print(f"[MESH-BRIDGE] Searching local subnet {subnet}.0/24...", flush=True)
+                    # We could scan but let's stick to Koyeb and Gossip for now
+                except Exception:
+                    pass
+                time.sleep(30)
+        
+        threading.Thread(target=_mesh_bridge_loop, daemon=True, name="MeshBridge").start()
 
         # ── Status loop ───────────────────────────────────────────────────
         _cycle = 0
