@@ -3114,6 +3114,7 @@ class LocalBlockchainDB:
             )""",
             """CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                epoch                   INTEGER NOT NULL DEFAULT 0,
                 block_height            INTEGER NOT NULL DEFAULT 0,
                 pq0                     INTEGER NOT NULL DEFAULT 0,
                 oracle_ids              TEXT    NOT NULL DEFAULT '',
@@ -3178,12 +3179,16 @@ class LocalBlockchainDB:
                 pass
         # ── ALTER TABLE migrations for existing databases ───────────────────────
         # Migrate pq0_entanglement_log: add missing columns
-        # Note: existing databases may have local_pq0/server_pq0/epsilon_matrix_hex
-        # but code uses pq0/entanglement_matrix_hex
+        # epoch NOT NULL DEFAULT 0 handles old DBs that have epoch NOT NULL without DEFAULT
         try:
             _cols = {r[1] for r in cursor.execute("PRAGMA table_info(pq0_entanglement_log)").fetchall()}
-            for _col, _defn in [("pq0","INTEGER DEFAULT 0"),("block_height","INTEGER DEFAULT 0"),
-                                ("oracle_ids","TEXT DEFAULT ''"),("entanglement_matrix_hex","TEXT DEFAULT ''")]:
+            for _col, _defn in [
+                ("epoch",                   "INTEGER NOT NULL DEFAULT 0"),
+                ("pq0",                     "INTEGER NOT NULL DEFAULT 0"),
+                ("block_height",            "INTEGER NOT NULL DEFAULT 0"),
+                ("oracle_ids",              "TEXT NOT NULL DEFAULT ''"),
+                ("entanglement_matrix_hex", "TEXT NOT NULL DEFAULT ''"),
+            ]:
                 if _col not in _cols:
                     cursor.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
         except Exception:
@@ -11864,7 +11869,7 @@ class QtclClientApp:
         if self.wallet.is_loaded():
             return True
         try:
-            pw = getpass.getpass("  Wallet password: ").strip()
+            pw = _silent_getpass("  Wallet password: ").strip()
         except (EOFError, KeyboardInterrupt):
             return False
         return bool(pw) and self.wallet.load(pw)
@@ -16266,14 +16271,37 @@ class QtclClientApp:
         elif choice == "6": self.run_node_mode()
         else:               self.run_mine_mode()
 def _silent_getpass(prompt: str) -> str:
-    """Temporarily suppress all loggers during getpass to prevent log injection."""
-    root_logger = logging.getLogger()
-    old_level = root_logger.level
-    root_logger.setLevel(logging.CRITICAL)
+    """Suppress every logging handler across ALL loggers during getpass.
+
+    Setting root logger level to CRITICAL is insufficient: child loggers that
+    received their own StreamHandler via get_logger() fire their handlers
+    independently of the root level.  We must clamp every handler directly.
+    """
+    import logging as _lg
+    _all_loggers: list[_lg.Logger] = [_lg.getLogger()]
+    for _name in list(_lg.Logger.manager.loggerDict.keys()):
+        try:
+            _l = _lg.getLogger(_name)
+            if isinstance(_l, _lg.Logger):
+                _all_loggers.append(_l)
+        except Exception:
+            pass
+    # Save and mute every handler on every logger
+    _saved: list[tuple[_lg.Handler, int]] = []
+    for _log in _all_loggers:
+        for _h in list(_log.handlers):
+            _saved.append((_h, _h.level))
+            _h.setLevel(_lg.CRITICAL + 1)
+    # Also clamp root level so any future dynamically-added handlers are silent
+    _root = _lg.getLogger()
+    _root_lvl = _root.level
+    _root.setLevel(_lg.CRITICAL + 1)
     try:
         return getpass.getpass(prompt)
     finally:
-        root_logger.setLevel(old_level)
+        _root.setLevel(_root_lvl)
+        for _h, _lvl in _saved:
+            _h.setLevel(_lvl)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # NODE RPC MESH SERVER — Full JSON-RPC 2.0 node on port 9091
@@ -16483,7 +16511,8 @@ class NodeRPCMeshServer:
             # ═══════════════════════════════════════════════════════════════════════
             conn.execute("""CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height            INTEGER NOT NULL,
+                epoch                   INTEGER NOT NULL DEFAULT 0,
+                block_height            INTEGER NOT NULL DEFAULT 0,
                 pq0                     INTEGER NOT NULL DEFAULT 0,
                 oracle_ids              TEXT NOT NULL DEFAULT '',
                 entanglement_matrix_hex TEXT NOT NULL DEFAULT '',
@@ -16491,14 +16520,17 @@ class NodeRPCMeshServer:
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)")
-            # Migrate: add missing columns for existing databases
-            # First check if pq0 column exists
+            # Migrate: add missing columns for existing databases (handles epoch NOT NULL from old schema)
             _cursor = conn.execute("PRAGMA table_info(pq0_entanglement_log)")
             _existing_cols = {row[1] for row in _cursor.fetchall()}
             logger.info(f"[DB] pq0_entanglement_log columns: {_existing_cols}")
-            
-            for _col, _defn in [("pq0","INTEGER DEFAULT 0"),("block_height","INTEGER DEFAULT 0"),
-                                ("oracle_ids","TEXT DEFAULT ''"),("entanglement_matrix_hex","TEXT DEFAULT ''")]:
+            for _col, _defn in [
+                ("epoch",                   "INTEGER NOT NULL DEFAULT 0"),
+                ("pq0",                     "INTEGER NOT NULL DEFAULT 0"),
+                ("block_height",            "INTEGER NOT NULL DEFAULT 0"),
+                ("oracle_ids",              "TEXT NOT NULL DEFAULT ''"),
+                ("entanglement_matrix_hex", "TEXT NOT NULL DEFAULT ''"),
+            ]:
                 if _col not in _existing_cols:
                     try:
                         conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
@@ -16652,12 +16684,13 @@ class NodeRPCMeshServer:
             try:
                 conn.execute("""
                     INSERT INTO pq0_entanglement_log
-                      (block_height, pq0, oracle_ids, entanglement_matrix_hex)
-                    VALUES (?,?,?,?)
+                      (epoch, block_height, pq0, oracle_ids, entanglement_matrix_hex)
+                    VALUES (?,?,?,?,?)
                 """, (
+                    epoch,
                     block_height,
-                    server_pq0,   # pq0 value
-                    ",".join(oracle_ids[:self.ORACLE_COUNT]),  # comma-separated oracle IDs
+                    server_pq0,
+                    ",".join(oracle_ids[:self.ORACLE_COUNT]),
                     epsilon.hex(),
                 ))
                 # Prune to last 10000 entries
@@ -16677,7 +16710,10 @@ class NodeRPCMeshServer:
                 f"pq0={server_pq0}  F={fidelity:.4f}"
             )
         except Exception as _e:
-            logger.error(f"[MESH-ENT] record_entanglement failed: {_e}")
+            _fc = getattr(self, '_ent_fail_count', 0) + 1
+            self._ent_fail_count = _fc
+            if _fc == 1 or _fc % 10 == 0:
+                logger.warning(f"[MESH-ENT] record_entanglement failed (#{_fc}): {_e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # HTTP helpers
