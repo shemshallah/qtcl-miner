@@ -16481,6 +16481,12 @@ class QtclClientApp:
                 _nmt_time.sleep(10 if _cycle > 2 else 3)
                 _cycle += 1
                 
+                # ── Refresh koyeb_state metrics each cycle ────────────────────────
+                try:
+                    self.koyeb_state.refresh_metrics(self.client_field)
+                except Exception:
+                    pass
+                
                 # Check if TripartiteOracle thread is running
                 import threading as _th
                 _oracle_thread = None
@@ -16499,11 +16505,24 @@ class QtclClientApp:
                     self._start_tripartite_oracle()
                     _nmt_time.sleep(3)
                 
-                # RECOVERY: ensure upstream_fid is visible to display
-                _upf = getattr(self, "_upstream_fid", 0.0)
-                if _upf == 0 and hasattr(_LIVE_RPC_ORACLE, '_oracle_state'):
-                    _os_up = _LIVE_RPC_ORACLE.get_oracle_state()
-                    _upf = float(_os_up.get('fidelity') or _os_up.get('w_state_fidelity') or 0.0)
+                # ── Get upstream fidelity from server ────────────────────────────────
+                _upf = 0.0
+                try:
+                    _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
+                    if _snap:
+                        _upf = float(_snap.get('w_state_fidelity') or 
+                                   _snap.get('fidelity') or 
+                                   (_snap.get('w_state') or {}).get('fidelity') or 
+                                   0.0)
+                except Exception:
+                    pass
+                
+                # RECOVERY: fallback to stored if still 0
+                if _upf == 0:
+                    _upf = getattr(self, "_upstream_fid", 0.0)
+                    if _upf == 0 and hasattr(_LIVE_RPC_ORACLE, '_oracle_state'):
+                        _os_up = _LIVE_RPC_ORACLE.get_oracle_state()
+                        _upf = float(_os_up.get('fidelity') or _os_up.get('w_state_fidelity') or 0.0)
                 
                 # RE-INJECT into self for UI thread
                 self._upstream_fid = _upf
