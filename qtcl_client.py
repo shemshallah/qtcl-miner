@@ -7247,7 +7247,7 @@ class NumPyEntanglementEngine:
             
             # Apply Born rule measurement to get classical outcome
             outcome, post_dm = _born.measure(dm, use_qrng=True)
-            print(f"[QUANTUM] Node {node_id}: Born measurement outcome = {outcome}", flush=True)
+            _EXP_LOG.debug(f"[QUANTUM] Node {node_id}: Born measurement outcome = {outcome}")
             
             local_dms.append(dm)
         
@@ -7263,7 +7263,7 @@ class NumPyEntanglementEngine:
         # Verify entanglement with witness
         _witness = EntanglementWitness()
         is_entangled, wit_val = _witness.compute_witness(local_dm, partition=[{0,1}, {2}])
-        print(f"[QUANTUM] Entanglement witness: {is_entangled}, value={wit_val:.4f}", flush=True)
+        _EXP_LOG.debug(f"[QUANTUM] Entanglement witness: {is_entangled}, value={wit_val:.4f}")
         
         w4_local = self._partial_trace(joint_dm, keep=[0, 1, 2], N=4)
         w4_local = 0.5 * (w4_local + w4_local.conj().T)
@@ -7564,7 +7564,7 @@ class BornRuleMeasurement:
         probs = _np.clip(probs, 0, 1)
         probs = probs / _np.sum(probs)
         
-        print(f"[BornRule] Computed {len(probs)} basis probabilities")
+        _EXP_LOG.debug(f"[BornRule] Computed {len(probs)} basis probabilities")
         return probs
     
     def measure(self, dm: "np.ndarray", use_qrng: bool = True) -> Tuple[int, "np.ndarray"]:
@@ -7602,7 +7602,7 @@ class BornRuleMeasurement:
         basis_vec[outcome] = 1.0
         post_dm = _np.outer(basis_vec, basis_vec.conj())
         
-        print(f"[BornRule] Measurement outcome: {outcome} (prob={probs[outcome]:.4f})")
+        _EXP_LOG.debug(f"[BornRule] Measurement outcome: {outcome} (prob={probs[outcome]:.4f})")
         return outcome, post_dm
     
     def measure_state_vector(self, state: "np.ndarray") -> Tuple[int, "np.ndarray"]:
@@ -7941,7 +7941,7 @@ class DephasingChannel:
         purity_before = float(_np.real(_np.trace(dm @ dm)))
         purity_after = float(_np.real(_np.trace(result @ result)))
         
-        print(f"[Dephasing] p={p:.4f}, purity: {purity_before:.4f} → {purity_after:.4f}")
+        _EXP_LOG.debug(f"[Dephasing] p={p:.4f}, purity: {purity_before:.4f} → {purity_after:.4f}")
         
         return result
     
@@ -8059,7 +8059,7 @@ class EntanglementWitness:
         # Negative witness indicates genuine entanglement
         is_entangled = witness < -0.01
         
-        print(f"[Entanglement] Party A (qubits {party_a_qubits}): dim={d_A}, witness={witness:.4f}, entangled={is_entangled}")
+        _EXP_LOG.debug(f"[Entanglement] Party A (qubits {party_a_qubits}): dim={d_A}, witness={witness:.4f}, entangled={is_entangled}")
         
         return is_entangled, witness
     
@@ -8157,8 +8157,8 @@ class EntanglementWitness:
         
         is_entangled = witness_val < 0
         
-        print(f"[Entanglement] Genuine multipartite entanglement: {is_entangled}")
-        print(f"[Entanglement] Witness value: {witness_val:.6f}")
+        _EXP_LOG.debug(f"[Entanglement] Genuine multipartite entanglement: {is_entangled}")
+        _EXP_LOG.debug(f"[Entanglement] Witness value: {witness_val:.6f}")
         
         return is_entangled
     
@@ -8207,7 +8207,7 @@ class EntanglementWitness:
         
         C = max(0, eigvals[0] - eigvals[1] - eigvals[2] - eigvals[3])
         
-        print(f"[Entanglement] Concurrence: {C:.6f}")
+        _EXP_LOG.debug(f"[Entanglement] Concurrence: {C:.6f}")
         
         return float(C)
 
@@ -12760,7 +12760,7 @@ class QtclClientApp:
                           name="OracleRegBroadcast").start()
         _mode_tag = ("🔐 wallet-bound" if _oid.get("mode") == "wallet_bound"
                      else "👻 anonymous")
-        _EXP_LOG.info(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
+        _EXP_LOG.debug(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
                       f"cert_valid={_cert_valid}  ip={_ip_hint or '?'}")
     # ── DB ─────────────────────────────────────────────────────────────────────
     def _verify_db_schema(self) -> None:
