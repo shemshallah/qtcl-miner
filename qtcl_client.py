@@ -13478,9 +13478,10 @@ class QtclClientApp:
         self._sync_hlwe_rpc_ops_to_db()
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
-        _my_gossip_url = f"http://{_MY_IP or 'localhost'}:{_LOCAL_HTTP_PORT}"  # Local HTTP server port for gossip/health
+        # Register with P2P RPC port (9091) for peer-to-peer communication
+        _my_rpc_url = f"http://{_MY_IP or 'localhost'}:{_P2P_PORT}"  # P2P RPC port for peer communication
         _reg_resp = self.api.register_peer(
-            self._peer_id, _my_gossip_url, self.wallet.address, 0)
+            self._peer_id, _my_rpc_url, self.wallet.address, 0)
         if _reg_resp and False:
             for _bp in (_reg_resp.get('live_peers') or [])[:32]:
                 _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
@@ -16709,19 +16710,20 @@ class NodeRPCMeshServer:
             peers = table.get("peers", [])
             conn = self._db_conn()
             new_count = 0
+            now = int(time.time())
             try:
                 for p in peers:
                     pid = p.get("peer_id")
                     addr = p.get("external_addr")
                     if pid and addr:
                         conn.execute("""
-                            INSERT INTO p2p_peers (node_id, host, port, height, last_seen)
-                            VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(node_id) DO UPDATE SET
-                                host      = EXCLUDED.host,
-                                height    = MAX(p2p_peers.height, EXCLUDED.height),
-                                last_seen = MAX(p2p_peers.last_seen, EXCLUDED.last_seen)
-                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), p.get("last_seen", time.time())))
+                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(node_id_hex) DO UPDATE SET
+                                host          = EXCLUDED.host,
+                                chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height),
+                                last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at)
+                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), now, now))
                         new_count += 1
                 conn.commit()
             finally:
