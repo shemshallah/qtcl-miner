@@ -12797,7 +12797,7 @@ class QtclClientApp:
             except Exception:
                 pass # skip failed peers silently
 
-    def _subscribe_peer_oracle_rpc(host: str, port: int) -> None:
+    def _subscribe_peer_oracle_rpc(self, host: str, port: int) -> None:
         """
         Subscribe to a P2P peer's local oracle via RPC polling (/rpc/oracle/snapshot).
         Every frame received is ingested into our own _LIVE_RPC_ORACLE and C DM pool,
@@ -14950,41 +14950,107 @@ class QtclClientApp:
             self._mesh_peer_dm_queue = _nmq.Queue(maxsize=16)
 
         # ═══════════════════════════════════════════════════════════════════
-        # CRITICAL: Register with server so other peers can discover us
+        # CRITICAL: Determine external IP for P2P (not private 172.16.x.x)
         # ═══════════════════════════════════════════════════════════════════
         
-        _my_ip = _MY_IP or '0.0.0.0'
-        _my_rpc_url = f"http://{_my_ip}:{_P2P_PORT}"
-        print(f"  Registering with server at {_my_rpc_url}...", flush=True)
+        # Try to get external IP, fall back to local IP
+        _external_ip = _MY_IP or '0.0.0.0'
+        if _external_ip.startswith(('172.16.', '192.168.', '10.', '127.')):
+            print(f"  ⚠️  Private IP detected: {_external_ip}", flush=True)
+            print(f"  ⚠️  Other peers may not be able to reach you directly", flush=True)
+            # Try to get external IP from bootstrap server
+            try:
+                from urllib.request import Request, urlopen
+                req = Request(f"http://ts4.zocomputer.io:10206/rpc", 
+                              data=json.dumps({"jsonrpc": "2.0", "method": "qtcl_nodeInfo", 
+                                               "params": [], "id": 1}).encode(),
+                              headers={"Content-Type": "application/json"})
+                with urlopen(req, timeout=5) as resp:
+                    pass  # If we can reach the server, use it as a relay
+            except Exception:
+                pass
         
+        _my_rpc_url = f"http://{_external_ip}:{_P2P_PORT}"
+        print(f"  P2P URL : {_my_rpc_url}", flush=True)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CRITICAL: Register with BOTH main server AND bootstrap server
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # 1. Register with main Koyeb server
+        print(f"  Registering with main server...", flush=True)
         try:
             _reg_resp = self.api.register_peer(
                 self._peer_id, _my_rpc_url, 
                 getattr(self.wallet, 'address', ''), 0)
             if _reg_resp:
-                print(f"  ✅ Registered with server", flush=True)
-                # Get initial peer list from server
+                print(f"  ✅ Registered with main server", flush=True)
                 live_peers = _reg_resp.get('live_peers') or []
                 if live_peers:
-                    print(f"  📡 Received {len(live_peers)} peers from server", flush=True)
+                    print(f"  📡 Received {len(live_peers)} peers from main server", flush=True)
                     for _bp in live_peers[:8]:
                         _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
                         _bport = int(_bp.get('port') or 9091)
-                        if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _my_ip):
+                        if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _external_ip):
                             try:
                                 self._db.execute("""
                                     INSERT OR REPLACE INTO p2p_peers 
                                     (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
-                                    VALUES (?, ?, ?, ?, 'server_bootstrap', ?, ?)
+                                    VALUES (?, ?, ?, ?, 'koyeb_bootstrap', ?, ?)
                                 """, (str(_bp.get('node_id', _bhost)), _bhost, _bport, 
                                       int(_bp.get('block_height', 0)),
                                       int(_nmt_time.time()), int(_nmt_time.time())))
                                 print(f"    + {_bhost}:{_bport}", flush=True)
-                            except Exception as _pe:
+                            except Exception:
                                 pass
                     self._db.commit()
         except Exception as _re:
-            print(f"  ⚠️  Server registration failed: {_re}", flush=True)
+            print(f"  ⚠️  Main server registration failed: {_re}", flush=True)
+        
+        # 2. Register with bootstrap server (ts4.zocomputer.io:10206)
+        print(f"  Registering with bootstrap server ts4.zocomputer.io:10206...", flush=True)
+        try:
+            from urllib.request import Request, urlopen
+            import json as _bj
+            _bootstrap_url = "http://ts4.zocomputer.io:10206/rpc"
+            _reg_payload = _bj.dumps({
+                "jsonrpc": "2.0",
+                "method": "qtcl_registerPeer",
+                "params": [{
+                    "external_addr": f"{_external_ip}:{_P2P_PORT}",
+                    "node_id": self._peer_id,
+                    "pubkey": self._peer_id,
+                    "chain_height": 0
+                }],
+                "id": 1
+            }).encode()
+            _req = Request(_bootstrap_url, data=_reg_payload, 
+                          headers={"Content-Type": "application/json"})
+            with urlopen(_req, timeout=10) as _resp:
+                _reg_result = _bj.loads(_resp.read())
+                if _reg_result.get("result", {}).get("live_peers"):
+                    _bpeers = _reg_result["result"]["live_peers"]
+                    print(f"  ✅ Bootstrap server returned {len(_bpeers)} peers", flush=True)
+                    for _bp in _bpeers:
+                        _bhost = str(_bp.get('ip_address') or _bp.get('host') or _bp.get('external_addr', '').split(':')[0] or '')
+                        _bport = int(_bp.get('port', 9091))
+                        if ':' in str(_bp.get('external_addr', '')):
+                            _bhost = _bp['external_addr'].split(':')[0]
+                            _bport = int(_bp['external_addr'].split(':')[1])
+                        if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _external_ip):
+                            self._db.execute("""
+                                INSERT OR REPLACE INTO p2p_peers 
+                                (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
+                                VALUES (?, ?, ?, ?, 'bootstrap', ?, ?)
+                            """, (str(_bp.get('node_id', _bp.get('peer_id', _bhost))), 
+                                  _bhost, _bport, int(_bp.get('chain_height', 0)),
+                                  int(_nmt_time.time()), int(_nmt_time.time())))
+                            print(f"    + {_bhost}:{_bport}", flush=True)
+                    self._db.commit()
+                else:
+                    print(f"  ⚠️  Bootstrap returned no peers", flush=True)
+        except Exception as _be:
+            print(f"  ⚠️  Bootstrap server error: {_be}", flush=True)
 
         # ═══════════════════════════════════════════════════════════════════
         # Start heartbeat loop (sends heartbeat + DHT fan-out every 30s)
