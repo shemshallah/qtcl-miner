@@ -8483,6 +8483,10 @@ class KoyebAPIClient:
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
         return None
+
+    def rpc(self, method: str, params: list = None, timeout: int = None, retries: int = 2) -> Optional[dict]:
+        """Alias for _rpc for backwards compatibility."""
+        return self._rpc(method, params, timeout, retries)
     def get_chain_tip(self) -> Optional[dict]:
         """Get chain tip via JSON-RPC (qtcl_getBlockHeight).
         
