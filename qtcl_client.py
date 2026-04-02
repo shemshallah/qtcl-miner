@@ -2856,6 +2856,10 @@ class LocalBlockchainDB:
         """Get database connection"""
         return self.conn
     
+    def commit(self):
+        """Commit current transaction"""
+        self.conn.commit()
+    
     def create_tables(self):
         """Create all necessary tables"""
         cursor = self.conn.cursor()
