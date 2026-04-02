@@ -12703,51 +12703,37 @@ class QtclClientApp:
           • Update P2P consensus height
           • Upsert self into local DB p2p_peers table
           • Refresh P2P peers from Koyeb
-        ❤️  I love you — heartbeat keeps us alive in the network
+          • Fan-out DHT table to all known peers
         """
         import time as _th
         _peer_refresh_counter = 0
         while not self._stop.is_set():
             try:
                 bh = int(self.koyeb_state.block_height or 0)
-                _ext = (self.p2p_node.external_addr
-                        if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
-                        else None)
+                # Determine external address for P2P
+                _self_ip = _MY_IP or '0.0.0.0'
+                _ext = f"http://{_self_ip}:{_P2P_PORT}"
                 self.api.send_heartbeat(self._peer_id, bh, external_addr=_ext)
                 
                 # Refresh P2P peers every 60 seconds
                 _peer_refresh_counter += 1
                 if _peer_refresh_counter >= 2:
                     _peer_refresh_counter = 0
-                    if hasattr(self, 'p2p_node') and self.p2p_node and getattr(self.p2p_node, '_running', False):
-                        self._register_with_koyeb()
+                    self._register_with_koyeb()
                 
                 if self._db:
                     try:
-                        _self_ip = _MY_IP or 'localhost'
-                        # prefer p2p_node.node_id (wallet+machine deterministic) over stale _peer_id
-                        _nid = (self.p2p_node.node_id
-                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.node_id)
-                                else self._peer_id)
-                        _ext = (self.p2p_node.external_addr
-                                if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
-                                else f"{_self_ip}:9091")
-                        _ext_host = _ext.split(':')[0] if ':' in _ext else _self_ip
+                        _nid = self._peer_id
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (_nid, _ext_host, 9091, bh,
+                        """, (_nid, _self_ip, _P2P_PORT, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
                     except Exception: pass
-                if _P2P_NODE and _P2P_NODE._started and False:
-                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
-                    if m:
-                        try: _P2P_NODE.gossip_measurement(m)
-                        except Exception: pass
                 
                 # ── ENTERPRISE DHT FAN-OUT ──
                 try:
@@ -14915,6 +14901,7 @@ class QtclClientApp:
           • P2P gossip relay        — forward blocks/txs between peers
           • Oracle snapshot server  — serve local DM to other clients
           • Mesh heartbeat          — broadcast fused_fid + DM to all peers
+          • DHT fan-out             — propagate peer list to all known peers
 
         Invoke:   python qtcl_client.py --node
         """
@@ -14924,28 +14911,92 @@ class QtclClientApp:
 
         print("⚛️  QTCL NODE — quantum mesh relay mode", flush=True)
         print(f"  Oracle  : {ENTROPY_SERVER_URL}", flush=True)
-        print(f"  P2P     : {P2P_BOOTSTRAP_PEERS[0][0]}:{P2P_BOOTSTRAP_PEERS[0][1]}", flush=True)
+        print(f"  P2P     : 0.0.0.0:{_P2P_PORT}", flush=True)
         print("  Mining  : DISABLED", flush=True)
         print("  Role    : W4 party-3 relay + oracle forwarder", flush=True)
         print("─" * 70, flush=True)
 
-        # ── Init mesh queue (if not already done) ─────────────────────────
+        # ═══════════════════════════════════════════════════════════════════
+        # CRITICAL: Initialize wallet, DB, and peer identity for P2P
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Load wallet to derive peer identity
+        if not self.wallet.is_loaded():
+            if not self._load_wallet():
+                print("  ⚠️  No wallet — using anonymous node ID", flush=True)
+                # Generate anonymous peer_id from machine salt
+                _m_salt = _get_machine_salt()
+                self._peer_id = _hashlib.sha256(
+                    f"ANON|{_m_salt}|QTCL_P2P_IDENTITY_v2".encode()
+                ).hexdigest()
+                self._peer_id_final = True
+            else:
+                _w_addr = getattr(self.wallet, 'address', '') or ''
+                _m_salt = _get_machine_salt()
+                self._peer_id = _hashlib.sha256(
+                    f"{_w_addr}|{_m_salt}|QTCL_P2P_IDENTITY_v2".encode()
+                ).hexdigest()
+                self._peer_id_final = True
+                print(f"  ✅ Wallet: {_w_addr[:20]}...", flush=True)
+        
+        print(f"  Node ID : {self._peer_id[:16]}...", flush=True)
+        
+        # Initialize database
+        self._init_db()
+        
+        # Initialize mesh queue
         if not hasattr(self, "_mesh_peer_dm_queue"):
             import queue as _nmq
             self._mesh_peer_dm_queue = _nmq.Queue(maxsize=16)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # CRITICAL: Register with server so other peers can discover us
+        # ═══════════════════════════════════════════════════════════════════
+        
+        _my_ip = _MY_IP or '0.0.0.0'
+        _my_rpc_url = f"http://{_my_ip}:{_P2P_PORT}"
+        print(f"  Registering with server at {_my_rpc_url}...", flush=True)
+        
+        try:
+            _reg_resp = self.api.register_peer(
+                self._peer_id, _my_rpc_url, 
+                getattr(self.wallet, 'address', ''), 0)
+            if _reg_resp:
+                print(f"  ✅ Registered with server", flush=True)
+                # Get initial peer list from server
+                live_peers = _reg_resp.get('live_peers') or []
+                if live_peers:
+                    print(f"  📡 Received {len(live_peers)} peers from server", flush=True)
+                    for _bp in live_peers[:8]:
+                        _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
+                        _bport = int(_bp.get('port') or 9091)
+                        if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _my_ip):
+                            try:
+                                self._db.execute("""
+                                    INSERT OR REPLACE INTO p2p_peers 
+                                    (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
+                                    VALUES (?, ?, ?, ?, 'server_bootstrap', ?, ?)
+                                """, (str(_bp.get('node_id', _bhost)), _bhost, _bport, 
+                                      int(_bp.get('block_height', 0)),
+                                      int(_nmt_time.time()), int(_nmt_time.time())))
+                                print(f"    + {_bhost}:{_bport}", flush=True)
+                            except Exception as _pe:
+                                pass
+                    self._db.commit()
+        except Exception as _re:
+            print(f"  ⚠️  Server registration failed: {_re}", flush=True)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Start heartbeat loop (sends heartbeat + DHT fan-out every 30s)
+        # ═══════════════════════════════════════════════════════════════════
+        
+        _hb_th = _nmt.Thread(target=self._heartbeat_loop, daemon=True, name="Heartbeat")
+        _hb_th.start()
+        print(f"  ✅ Heartbeat loop started (DHT fan-out every 30s)", flush=True)
+
         # ── Start tripartite oracle (joint W4 with Koyeb as party-3) ───────
         self._start_tripartite_oracle()
         _nmt_time.sleep(2)  # let oracle complete one cycle before status
-
-        # ── Start P2P gossip relay ────────────────────────────────────────
-        _p2p = getattr(self, "p2p_node", None)
-        if _p2p:
-            try:
-                _p2p.start()
-                print("  ✅ P2P gossip relay started", flush=True)
-            except Exception as _pe:
-                print(f"  ⚠️  P2P: {_pe}", flush=True)
 
         # ── Subscribe to peer oracle snapshots (pulls DMs into mesh queue) ─
         def _node_mesh_subscriber():
@@ -14953,18 +15004,21 @@ class QtclClientApp:
             _active_subs = set()
             while True:
                 try:
-                    _p2p_n = getattr(self, "p2p_node", None)
-                    if _p2p_n and _p2p_n.peer_mgr:
-                        for _peer in _p2p_n.peer_mgr.get_active_peers():
-                            _key = (_peer.host, _peer.port)
-                            if _key not in _active_subs:
-                                _active_subs.add(_key)
-                                _nmt.Thread(
-                                    target=self._subscribe_peer_oracle_rpc,
-                                    args=(_peer.host, _peer.port),
-                                    daemon=True,
-                                    name=f"MeshSub-{_peer.host}"
-                                ).start()
+                    rows = self._db.fetchall(
+                        "SELECT host, port FROM p2p_peers WHERE last_seen_at > ? AND host NOT IN ('', '127.0.0.1', 'localhost') LIMIT 16",
+                        (int(_nmt_time.time()) - 600,)
+                    )
+                    for row in rows:
+                        _host, _port = row[0], row[1]
+                        _key = (_host, _port)
+                        if _key not in _active_subs:
+                            _active_subs.add(_key)
+                            _nmt.Thread(
+                                target=self._subscribe_peer_oracle_rpc,
+                                args=(_host, _port),
+                                daemon=True,
+                                name=f"MeshSub-{_host[:16]}"
+                            ).start()
                 except Exception:
                     pass
                 _nmt_time.sleep(30)
@@ -14981,24 +15035,27 @@ class QtclClientApp:
                 _lff  = getattr(self, "_local_fused_fid", 0.0)
                 _upf  = getattr(self, "_upstream_fid", 0.0)
                 _ks   = self.koyeb_state
-                _qsz  = getattr(self, "_mesh_peer_dm_queue",
-                                _nmt_json.loads("{}")).qsize() if hasattr(
-                                    getattr(self,"_mesh_peer_dm_queue",None),
-                                    "qsize") else 0
-                _peers = 0
+                _qsz  = self._mesh_peer_dm_queue.qsize() if hasattr(self, "_mesh_peer_dm_queue") else 0
+                
+                # Get actual peer count from SQLite
                 try:
-                    _p2p_n = getattr(self, "p2p_node", None)
-                    if _p2p_n and _p2p_n.peer_mgr:
-                        _peers = len(_p2p_n.peer_mgr.get_active_peers())
+                    _peer_rows = self._db.fetchall(
+                        "SELECT COUNT(*) FROM p2p_peers WHERE last_seen_at > ?",
+                        (int(_nmt_time.time()) - 600,)
+                    )
+                    _peers = int(_peer_rows[0][0]) if _peer_rows else 0
                 except Exception:
-                    pass
-                _jdim = 16 if getattr(self,"_joint_dm_16",None) is not None else 0
+                    _peers = 0
+                
+                # Joint dimension from tripartite oracle
+                _jdim = 16 if getattr(self,"_local_consensus_dm",None) is not None else 0
+                
                 print(_sep, flush=True)
                 print(
                     f"  ⚛️  QTCL NODE  cycle={_cycle}\n"
                     f"  W4-fused : {_lff:.4f}   upstream : {_upf:.4f}   bridge : {_ks.bridge_fidelity:.4f}\n"
                     f"  peers    : {_peers}        mesh-queue: {_qsz}       joint-dim: {_jdim}×{_jdim}\n"
-                    f"  lat      : {_ks.channel_latency_ms:.0f}ms",
+                    f"  node_ip  : {_MY_IP or 'unknown'}     port: {_P2P_PORT}",
                     flush=True
                 )
         except KeyboardInterrupt:
@@ -16109,11 +16166,17 @@ class NodeRPCMeshServer:
     # Schema — pq0_entanglement_log table (idempotent)
     # ─────────────────────────────────────────────────────────────────────────
     def _ensure_mesh_schema(self) -> None:
-        import sqlite3  # NodeRPCMeshServer scope — all other imports are aliased
+        """Create/update all tables needed for mesh P2P node."""
+        import sqlite3
         try:
             conn = sqlite3.connect(str(self._db_path), timeout=10,
                                    check_same_thread=False)
+            conn.row_factory = sqlite3.Row  # Enable dict-like access
             conn.execute("PRAGMA journal_mode=WAL")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # pq0_entanglement_log — tripartite oracle entanglement tracking
+            # ═══════════════════════════════════════════════════════════════
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
                     id                  INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -16127,19 +16190,118 @@ class NodeRPCMeshServer:
                     tripartite_fidelity REAL     NOT NULL DEFAULT 0.0,
                     consensus_score     REAL     NOT NULL DEFAULT 0.0,
                     node_id_hex         TEXT     NOT NULL DEFAULT '',
-                    created_at          INTEGER  NOT NULL
-                                        DEFAULT (strftime('%s','now'))
+                    created_at          INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
                 )
             """)
+            
+            # Add missing columns to existing pq0_entanglement_log tables
+            for col, typ in [
+                ("local_pq0", "INTEGER DEFAULT 0"),
+                ("server_pq0", "INTEGER DEFAULT 0"),
+                ("oracle_ids", "TEXT DEFAULT '[]'"),
+                ("quorum_hashes", "TEXT DEFAULT '[]'"),
+                ("epsilon_matrix_hex", "TEXT DEFAULT ''"),
+                ("tripartite_fidelity", "REAL DEFAULT 0.0"),
+                ("consensus_score", "REAL DEFAULT 0.0"),
+                ("node_id_hex", "TEXT DEFAULT ''"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+            
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_elog_epoch ON pq0_entanglement_log (epoch DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_elog_height ON pq0_entanglement_log (block_height DESC)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # wstate_consensus_log — W-state consensus tracking
+            # ═══════════════════════════════════════════════════════════════
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_pq0_elog_epoch
-                    ON pq0_entanglement_log (epoch DESC)
+                CREATE TABLE IF NOT EXISTS wstate_consensus_log (
+                    id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+                    block_height    INTEGER  NOT NULL,
+                    w_state_hash    TEXT     NOT NULL DEFAULT '',
+                    fidelity        REAL     NOT NULL DEFAULT 0.0,
+                    node_count      INTEGER  NOT NULL DEFAULT 0,
+                    consensus_score REAL     NOT NULL DEFAULT 0.0,
+                    oracle_ids      TEXT     NOT NULL DEFAULT '[]',
+                    created_at      INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
+                )
             """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_wstate_height ON wstate_consensus_log (block_height DESC)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # blocks — local chain mirror (Bitcoin full node style)
+            # ═══════════════════════════════════════════════════════════════
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_pq0_elog_height
-                    ON pq0_entanglement_log (block_height DESC)
+                CREATE TABLE IF NOT EXISTS blocks (
+                    id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+                    height          INTEGER  UNIQUE NOT NULL,
+                    hash            TEXT     UNIQUE NOT NULL,
+                    parent_hash     TEXT     DEFAULT '',
+                    timestamp       INTEGER  DEFAULT 0,
+                    nonce           INTEGER  DEFAULT 0,
+                    difficulty      REAL     DEFAULT 4.0,
+                    miner_address   TEXT     DEFAULT '',
+                    pq_curr         INTEGER  DEFAULT 0,
+                    pq_last         INTEGER  DEFAULT 0,
+                    pq0             INTEGER  DEFAULT 0,
+                    merkle_root     TEXT     DEFAULT '',
+                    tx_count        INTEGER  DEFAULT 0,
+                    data            TEXT     DEFAULT '',
+                    synced_from_server INTEGER DEFAULT 0,
+                    created_at      INTEGER  DEFAULT (strftime('%s','now'))
+                )
             """)
-            # mesh_rpc_log — audit trail of every RPC call served by this node
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks (height DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks (hash)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # p2p_peers — known peers for P2P mesh
+            # ═══════════════════════════════════════════════════════════════
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS p2p_peers (
+                    node_id_hex     TEXT     PRIMARY KEY,
+                    host            TEXT     NOT NULL,
+                    port            INTEGER  NOT NULL DEFAULT 9091,
+                    services        INTEGER  NOT NULL DEFAULT 1,
+                    protocol_version INTEGER NOT NULL DEFAULT 2,
+                    chain_height    INTEGER  NOT NULL DEFAULT 0,
+                    last_fidelity   REAL     NOT NULL DEFAULT 0.0,
+                    latency_ms      REAL     NOT NULL DEFAULT 0.0,
+                    ban_score       INTEGER  NOT NULL DEFAULT 0,
+                    advertised_host TEXT,
+                    advertised_port INTEGER,
+                    source          TEXT     NOT NULL DEFAULT 'self_register',
+                    first_seen_at   INTEGER  NOT NULL DEFAULT 0,
+                    last_seen_at    INTEGER  NOT NULL DEFAULT 0,
+                    last_heartbeat_at INTEGER
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_peers_seen ON p2p_peers (last_seen_at DESC)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # transactions — local chain transactions
+            # ═══════════════════════════════════════════════════════════════
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+                    txid        TEXT     UNIQUE NOT NULL,
+                    block_height INTEGER,
+                    from_addr   TEXT,
+                    to_addr     TEXT,
+                    amount      REAL,
+                    fee         REAL    DEFAULT 0.0,
+                    timestamp   INTEGER,
+                    status      TEXT    DEFAULT 'pending'
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_txs_height ON transactions (block_height)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_txs_status ON transactions (status)")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # mesh_rpc_log — audit trail
+            # ═══════════════════════════════════════════════════════════════
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS mesh_rpc_log (
                     id          INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -16148,16 +16310,14 @@ class NodeRPCMeshServer:
                     result_ok   INTEGER  NOT NULL DEFAULT 1,
                     latency_ms  REAL     NOT NULL DEFAULT 0.0,
                     peer_addr   TEXT     NOT NULL DEFAULT '',
-                    ts          INTEGER  NOT NULL
-                                DEFAULT (strftime('%s','now'))
+                    ts          INTEGER  NOT NULL DEFAULT (strftime('%s','now'))
                 )
             """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method
-                    ON mesh_rpc_log (method, ts DESC)
-            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method ON mesh_rpc_log (method, ts DESC)")
+            
             conn.commit()
             conn.close()
+            logger.info(f"[MESH] ✅ Schema initialized at {self._db_path}")
         except Exception as _e:
             logger.error(f"[MESH] Schema init failed: {_e}")
 
@@ -16324,10 +16484,12 @@ class NodeRPCMeshServer:
 
     def _db_conn(self) -> sqlite3.Connection:
         """Open a fresh per-request read connection (thread-safe)."""
-        import sqlite3  # NodeRPCMeshServer scope
-        conn = sqlite3.connect(str(self._db_path), timeout=10,
-                               check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        import sqlite3
+        db_path = str(self._db_path)
+        if not os.path.exists(db_path):
+            logger.warning(f"[MESH] DB file not found: {db_path}, creating...")
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        conn.row_factory = sqlite3.Row  # Enable dict-like access: row["column"]
         return conn
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -16692,62 +16854,6 @@ class NodeRPCMeshServer:
                     last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at),
                     chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height)
             """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), now, now))
-            conn.commit()
-            return {"status": "ok", "timestamp": time.time()}
-        finally:
-            conn.close()
-
-    def _rpc_receiveDHTTable(self, params: list) -> dict:
-        """qtcl_receiveDHTTable — inbound gossip from another peer."""
-        if not params: return {"error": "params required"}
-        data = params[0] if isinstance(params, list) else params
-        dht_table = data.get("dht_table")
-        if not dht_table: return {"error": "dht_table required"}
-        
-        try:
-            import json
-            table = json.loads(dht_table)
-            peers = table.get("peers", [])
-            conn = self._db_conn()
-            new_count = 0
-            now = int(time.time())
-            try:
-                for p in peers:
-                    pid = p.get("peer_id")
-                    addr = p.get("external_addr")
-                    if pid and addr:
-                        conn.execute("""
-                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(node_id_hex) DO UPDATE SET
-                                host          = EXCLUDED.host,
-                                chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height),
-                                last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at)
-                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), now, now))
-                        new_count += 1
-                conn.commit()
-            finally:
-                conn.close()
-            return {"status": "accepted", "new_peers": new_count}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _rpc_peerHeartbeat(self, params: list) -> dict:
-        """qtcl_peerHeartbeat — direct ping from another peer."""
-        if not params: return {"error": "params required"}
-        p = params[0] if isinstance(params, list) else params
-        pid = p.get("peer_id")
-        if not pid: return {"error": "peer_id required"}
-        
-        conn = self._db_conn()
-        try:
-            conn.execute("""
-                INSERT INTO p2p_peers (node_id, host, port, height, last_seen)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET
-                    last_seen = MAX(p2p_peers.last_seen, EXCLUDED.last_seen),
-                    height    = MAX(p2p_peers.height, EXCLUDED.height)
-            """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), time.time()))
             conn.commit()
             return {"status": "ok", "timestamp": time.time()}
         finally:
