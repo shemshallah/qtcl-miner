@@ -12748,9 +12748,69 @@ class QtclClientApp:
                     if m:
                         try: _P2P_NODE.gossip_measurement(m)
                         except Exception: pass
+                
+                # ── ENTERPRISE DHT FAN-OUT ──
+                try:
+                    self._p2p_broadcast_dht()
+                except Exception as _e:
+                    _EXP_LOG.debug(f"[HB] DHT fan-out: {_e}")
+
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
+
+    def _p2p_broadcast_dht(self) -> None:
+        """
+        Fan-out broadcast local DHT table to all known peers.
+        This ensures the network converges on a shared peer list without a central tracker.
+        """
+        if not self._db: return
+        import json as _hj
+        from urllib.request import Request as _HR, urlopen as _HU
+        
+        # 1. Fetch live peers from local DB
+        cutoff = int(time.time()) - 600
+        rows = self._db.fetchall(
+            "SELECT node_id_hex, host, port, chain_height, last_seen_at FROM p2p_peers WHERE last_seen_at > ? LIMIT 100",
+            (cutoff,)
+        )
+        if len(rows) < 2: return # don't broadcast if it's just us or empty
+        
+        dht_table = {
+            "version": 1,
+            "timestamp": time.time(),
+            "peer_count": len(rows),
+            "peers": [
+                {
+                    "peer_id": r[0], "external_addr": r[1], "port": r[2],
+                    "chain_height": r[3], "last_seen": r[4]
+                } for r in rows
+            ]
+        }
+        dht_json = _hj.dumps(dht_table)
+        
+        # 2. Fan-out to top 8 peers (Gossip style)
+        targets = rows[:8]
+        for t in targets:
+            peer_host, peer_port = t[1], t[2]
+            # Don't broadcast to self
+            if peer_host in ('localhost', '127.0.0.1', _MY_IP): continue
+            
+            try:
+                url = f"http://{peer_host}:{peer_port}/rpc"
+                payload = _hj.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "qtcl_receiveDHTTable",
+                    "params": {"dht_table": dht_json},
+                    "id": 1
+                }).encode()
+                req = _HR(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                with _HU(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        _EXP_LOG.debug(f"[P2P-DHT] Fan-out success → {peer_host}:{peer_port}")
+            except Exception:
+                pass # skip failed peers silently
+
     def _subscribe_peer_oracle_rpc(host: str, port: int) -> None:
         """
         Subscribe to a P2P peer's local oracle via RPC polling (/rpc/oracle/snapshot).
@@ -13270,6 +13330,16 @@ class QtclClientApp:
                     payload = _hj.loads(body_bytes.decode('utf-8', errors='replace'))
                 except Exception:
                     payload = {}
+                
+                # ── ENTERPRISE P2P RPC DISPATCHER ──
+                if path in ('/rpc', '/api/rpc'):
+                    # Forward to NodeRPCMeshServer dispatcher if running
+                    instance = getattr(sys.modules[__name__], '_MESH_SERVER_INSTANCE', None)
+                    if instance:
+                        response, status = instance._dispatch(body_bytes, self.client_address[0])
+                        self._json_resp(status, response)
+                        return
+                
                 if path in ('/gossip', '/api/gossip'):
                     ev = payload.get('event', '')
                     if ev == 'chain_reset' and int(payload.get('new_height', -1)) == 0:
@@ -14951,12 +15021,35 @@ class QtclClientApp:
             return "█" * filled + "░" * (width - filled)
         def _fetch_all():
             """Fetch all metrics via JSON-RPC 2.0 (pure RPC, no REST)."""
-            tip      = kapi._rpc("qtcl_getBlock", [])              or {}
-            metrics  = kapi._rpc("qtcl_getQuantumMetrics", [])     or {}
-            health   = kapi._rpc("qtcl_getHealth", [])             or {}
-            snap     = metrics  # quantum metrics = snapshot
-            peers    = kapi._rpc("qtcl_getPeers", [])              or {}
-            mempool  = kapi._rpc("qtcl_getMempoolStats", [])       or {}
+            # Use separate instance to avoid blocking shared KoyebAPIClient
+            api_node = KoyebAPIClient("http://127.0.0.1:9091")
+            
+            # Chain Tip (Local First, Fallback to Oracle)
+            tip = api_node._rpc("qtcl_getBlock", [])
+            if not tip or "error" in str(tip):
+                tip = kapi._rpc("qtcl_getBlock", []) or {}
+            
+            # Quantum Metrics
+            metrics = api_node._rpc("qtcl_getQuantumMetrics", [])
+            if not metrics or "error" in str(metrics):
+                metrics = kapi._rpc("qtcl_getQuantumMetrics", []) or {}
+            
+            # Health / Diagnostics
+            health = api_node._rpc("qtcl_getHealth", [])
+            if not health or "error" in str(health):
+                health = kapi._rpc("qtcl_getHealth", []) or {}
+            
+            snap = metrics
+            
+            # P2P Peers (Local Mesh Table)
+            peers = api_node._rpc("qtcl_getDHTTable", [])
+            if not peers or "error" in str(peers):
+                peers = kapi._rpc("qtcl_getPeers", []) or {}
+            
+            # Mempool
+            mempool = api_node._rpc("qtcl_getMempoolStats", [])
+            if not mempool or "error" in str(mempool):
+                mempool = kapi._rpc("qtcl_getMempoolStats", []) or {}
             
             # Extract fields for compatibility
             w_state  = metrics.get('w_state', {}) if isinstance(metrics, dict) else {}
@@ -16522,6 +16615,142 @@ class NodeRPCMeshServer:
         ).digest(32)
         return {"entropy_hex": mixed.hex()}
 
+    # ── NEW: P2P DHT RPC Methods (Enterprise Grade) ──────────────────────────
+
+    def _rpc_getDHTTable(self, params: list) -> dict:
+        """qtcl_getDHTTable — return all known peers for node-to-node discovery."""
+        conn = self._db_conn()
+        try:
+            cutoff = int(time.time()) - 600  # 10 min
+            rows = conn.execute(
+                "SELECT * FROM p2p_peers WHERE last_seen_at > ? ORDER BY last_seen_at DESC LIMIT 100",
+                (cutoff,)
+            ).fetchall()
+            peers = []
+            for r in rows:
+                peers.append({
+                    "peer_id":       r["node_id_hex"],
+                    "external_addr": r["host"],
+                    "port":          r["port"],
+                    "chain_height":  r["chain_height"],
+                    "last_seen":     r["last_seen_at"]
+                })
+            return {"peers": peers, "count": len(peers), "timestamp": time.time()}
+        finally:
+            conn.close()
+
+    def _rpc_receiveDHTTable(self, params: list) -> dict:
+        """qtcl_receiveDHTTable — inbound gossip from another peer."""
+        if not params: return {"error": "params required"}
+        data = params[0] if isinstance(params, list) else params
+        dht_table_json = data.get("dht_table")
+        if not dht_table_json: return {"error": "dht_table required"}
+        
+        try:
+            import json
+            table = json.loads(dht_table_json)
+            peers = table.get("peers", [])
+            conn = self._db_conn()
+            new_count = 0
+            now = int(time.time())
+            try:
+                for p in peers:
+                    pid = p.get("peer_id")
+                    addr = p.get("external_addr")
+                    if pid and addr:
+                        conn.execute("""
+                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(node_id_hex) DO UPDATE SET
+                                host          = EXCLUDED.host,
+                                chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height),
+                                last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at)
+                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), int(p.get("last_seen", now)), now))
+                        new_count += 1
+                conn.commit()
+            finally:
+                conn.close()
+            return {"status": "accepted", "new_peers": new_count}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _rpc_peerHeartbeat(self, params: list) -> dict:
+        """qtcl_peerHeartbeat — direct ping from another peer."""
+        if not params: return {"error": "params required"}
+        p = params[0] if isinstance(params, list) else params
+        pid = p.get("peer_id")
+        if not pid: return {"error": "peer_id required"}
+        
+        conn = self._db_conn()
+        now = int(time.time())
+        try:
+            conn.execute("""
+                INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id_hex) DO UPDATE SET
+                    last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at),
+                    chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height)
+            """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), now, now))
+            conn.commit()
+            return {"status": "ok", "timestamp": time.time()}
+        finally:
+            conn.close()
+
+    def _rpc_receiveDHTTable(self, params: list) -> dict:
+        """qtcl_receiveDHTTable — inbound gossip from another peer."""
+        if not params: return {"error": "params required"}
+        data = params[0] if isinstance(params, list) else params
+        dht_table = data.get("dht_table")
+        if not dht_table: return {"error": "dht_table required"}
+        
+        try:
+            import json
+            table = json.loads(dht_table)
+            peers = table.get("peers", [])
+            conn = self._db_conn()
+            new_count = 0
+            try:
+                for p in peers:
+                    pid = p.get("peer_id")
+                    addr = p.get("external_addr")
+                    if pid and addr:
+                        conn.execute("""
+                            INSERT INTO p2p_peers (node_id, host, port, height, last_seen)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(node_id) DO UPDATE SET
+                                host      = EXCLUDED.host,
+                                height    = MAX(p2p_peers.height, EXCLUDED.height),
+                                last_seen = MAX(p2p_peers.last_seen, EXCLUDED.last_seen)
+                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), p.get("last_seen", time.time())))
+                        new_count += 1
+                conn.commit()
+            finally:
+                conn.close()
+            return {"status": "accepted", "new_peers": new_count}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _rpc_peerHeartbeat(self, params: list) -> dict:
+        """qtcl_peerHeartbeat — direct ping from another peer."""
+        if not params: return {"error": "params required"}
+        p = params[0] if isinstance(params, list) else params
+        pid = p.get("peer_id")
+        if not pid: return {"error": "peer_id required"}
+        
+        conn = self._db_conn()
+        try:
+            conn.execute("""
+                INSERT INTO p2p_peers (node_id, host, port, height, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    last_seen = MAX(p2p_peers.last_seen, EXCLUDED.last_seen),
+                    height    = MAX(p2p_peers.height, EXCLUDED.height)
+            """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), time.time()))
+            conn.commit()
+            return {"status": "ok", "timestamp": time.time()}
+        finally:
+            conn.close()
+
     def _rpc_submitBlock(self, params: list) -> dict:
         """Forward block to main server and apply locally."""
         block = params[0] if params else {}
@@ -16815,6 +17044,9 @@ NodeRPCMeshServer._METHODS = {
     "qtcl_syncStatus":          NodeRPCMeshServer._rpc_getSyncStatus,
     "qtcl_nodeInfo":            NodeRPCMeshServer._rpc_nodeInfo,
     "qtcl_getEntropy":          NodeRPCMeshServer._rpc_getEntropy,
+    "qtcl_getDHTTable":         NodeRPCMeshServer._rpc_getDHTTable,
+    "qtcl_receiveDHTTable":     NodeRPCMeshServer._rpc_receiveDHTTable,
+    "qtcl_peerHeartbeat":       NodeRPCMeshServer._rpc_peerHeartbeat,
     "qtcl_submitBlock":         NodeRPCMeshServer._rpc_submitBlock,
     "qtcl_submitTransaction":   NodeRPCMeshServer._rpc_submitTransaction,
 }
