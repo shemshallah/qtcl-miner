@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging as _suppress_logging
-for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
+for _name in ['aiohttp', 'urllib3.connectionpool', 'botocore']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
 import os
@@ -8718,9 +8718,13 @@ class KoyebAPIClient:
         """Ingest gossip via JSON-RPC (not REST)."""
         return self._rpc("qtcl_gossipIngest", [payload])
     def oracle_register(self, miner_id: str, miner_address: str) -> Optional[dict]:
-        """Register oracle via JSON-RPC (not REST)."""
-        return self._rpc("qtcl_registerOracle",
-                        [{"miner_id": miner_id, "address": miner_address}])
+        """Register oracle via JSON-RPC (not REST).
+        
+        Uses qtcl_submitOracleReg to register oracle on-chain via mempool.
+        Format: {"wallet_address": "qtcl1...", "oracle_addr": "qtcl1..."}
+        """
+        return self._rpc("qtcl_submitOracleReg",
+                        [{"wallet_address": miner_address, "oracle_addr": miner_address}])
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
         """Check if oracle is reachable via JSON-RPC health call. Caches result for 10 seconds."""
         now = time.time()
@@ -10194,10 +10198,11 @@ class P2PPeer:
 
 class PeerManager:
     """Manages peer connections, state machine, and discovery"""
-    def __init__(self, max_peers: int = _P2P_MAX_PEERS, db = None):
+    def __init__(self, max_peers: int = _P2P_MAX_PEERS, db = None, kademlia_table = None):
         self.max_peers = max_peers
         self.max_outbound = _P2P_MAX_OUTBOUND
         self.db = db
+        self.kademlia_table = kademlia_table
         self.peers = {}
         self.pending = {}
         self.lock = _threading.Lock()
@@ -10229,6 +10234,57 @@ class PeerManager:
     def get_active_peers(self) -> List[P2PPeer]:
         with self.lock:
             return [p for p in self.peers.values() if p.state == PeerState.ACTIVE]
+    
+    def get_target_peers(self, count: int = None) -> List[P2PPeer]:
+        """Get target peers for gossiping, prioritized by KademliaRoutingTable proximity.
+        
+        When Kademlia routing table is available, peers are selected by XOR-distance
+        to our node_id, ensuring efficient DHT-based peer selection for block/tx gossip.
+        Falls back to active peers if no Kademlia table is configured.
+        """
+        count = count or self.max_outbound
+        with self.lock:
+            active = [p for p in self.peers.values() if p.state == PeerState.ACTIVE]
+        
+        if not self.kademlia_table or not active:
+            return active[:count]
+        
+        try:
+            k_closest = self.kademlia_table.find_closest(self.kademlia_table.local_node_id, count=count)
+            k_node_ids = {n.node_id for n in k_closest}
+            
+            kademlia_peers = [p for p in active if p.node_id in k_node_ids]
+            remaining = [p for p in active if p.node_id not in k_node_ids]
+            
+            return (kademlia_peers + remaining)[:count]
+        except Exception:
+            return active[:count]
+    
+    def inject_dht_peer(self, node_id: str, host: str, port: int) -> None:
+        """Immediately inject a DHT-discovered peer into the active peer pool.
+        
+        Called when KademliaRoutingTable or DHTManager discovers a new peer
+        via qtcl_dhtPing or qtcl_dhtFindNode responses.
+        """
+        if not node_id or not host:
+            return
+        with self.lock:
+            if node_id == getattr(self, 'node_id', None):
+                return
+            for existing in self.peers.values():
+                if existing.node_id == node_id:
+                    existing.last_seen = int(time.time())
+                    if existing.state == PeerState.UNKNOWN:
+                        existing.state = PeerState.CONNECTING
+                    return
+                if existing.host == host and existing.port == port:
+                    existing.last_seen = int(time.time())
+                    return
+        
+        peer = P2PPeer(host, port, node_id)
+        peer.state = PeerState.CONNECTING
+        peer.last_seen = int(time.time())
+        self.add_peer(peer)
     
     def register_peer_info(self, info: dict) -> None:
         """Register a peer from raw info dict (discovery)"""
@@ -11161,9 +11217,11 @@ class ExternalAddressResolver:
 
 class DHTManager:
     """Kademlia-over-HTTP DHT for peer discovery"""
-    def __init__(self, db = None):
+    def __init__(self, db = None, peer_mgr = None, kademlia_table = None):
         self.db = db
         self.node_id = None
+        self.peer_mgr = peer_mgr
+        self.kademlia_table = kademlia_table
     
     def find_node(self, target_id: str, count: int = 20) -> List[dict]:
         """Find closest nodes to target_id"""
@@ -11177,9 +11235,33 @@ class DHTManager:
             nodes = []
             for row in cursor.fetchall():
                 dist = self._xor_distance(row[0], target_id)
-                nodes.append({'node_id': row[0], 'addr': row[1], 'distance': dist})
+                node_entry = {'node_id': row[0], 'addr': row[1], 'distance': dist}
+                nodes.append(node_entry)
+                self._inject_peer_from_dht_result(row[0], row[1])
             return sorted(nodes, key=lambda x: x['distance'])[:count]
         except: return []
+    
+    def _inject_peer_from_dht_result(self, node_id: str, addr: str) -> None:
+        """Immediately inject a DHT-discovered peer into the active peer pool."""
+        if not addr or not node_id:
+            return
+        if ':' in addr:
+            parts = addr.rsplit(':', 1)
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except ValueError:
+                port = _P2P_PORT
+        else:
+            host = addr
+            port = _P2P_PORT
+        if self.peer_mgr:
+            self.peer_mgr.inject_dht_peer(node_id, host, port)
+        if self.kademlia_table:
+            try:
+                self.kademlia_table.add_node(KademliaNode(node_id=node_id, host=host, port=port))
+            except Exception:
+                pass
     
     def store(self, key: str, value: str, ttl: int = 3600) -> bool:
         """Store value in DHT"""
@@ -11476,6 +11558,18 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             count = min(params.get('count', 20), 100)
             if dht:
                 nodes = dht.find_node(target_id, count)
+                for _n in nodes:
+                    _nid = _n.get('node_id', '')
+                    _addr = _n.get('addr', '')
+                    if _nid and _addr and peer_mgr:
+                        if ':' in _addr:
+                            _h, _p = _addr.rsplit(':', 1)
+                            try: _p = int(_p)
+                            except: _p = _P2P_PORT
+                        else:
+                            _h = _addr
+                            _p = _P2P_PORT
+                        peer_mgr.inject_dht_peer(_nid, _h, _p)
                 return {'nodes': nodes}, None
             return {'nodes': []}, None
         
@@ -11516,12 +11610,14 @@ class P2PNode:
         self.seen_blocks = LRUCache(10000)
         self.seen_txs = LRUCache(50000)
         self.sessions = SessionManager()
-        self.peer_mgr = PeerManager(max_peers=_P2P_MAX_PEERS, db=db)
+        self.kademlia_table = KademliaRoutingTable(local_node_id=self.node_id)
+        self.peer_mgr = PeerManager(max_peers=_P2P_MAX_PEERS, db=db, kademlia_table=self.kademlia_table)
+        self.peer_mgr.node_id = self.node_id
         self.lattice = PQ0LatticeManager(db=db)
         self.propagator = BlockPropagator(None, self.lattice)
         self.tx_relay = TxRelay(None)
         self.sync_mgr = SyncManager(self.peer_mgr)
-        self.dht = DHTManager(db=db)
+        self.dht = DHTManager(db=db, peer_mgr=self.peer_mgr, kademlia_table=self.kademlia_table)
         self.dht.node_id = self.node_id
         self.external_addr = None
         self._running = False
@@ -11548,51 +11644,52 @@ class P2PNode:
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
     
     def _start_peer_discovery_daemon(self, app_instance) -> None:
-        """World-first P2P active discovery: Queries Koyeb AND recursively gossips with peers."""
+        """DHT-driven active peer discovery: uses KademliaRoutingTable for peer discovery."""
         import threading as _t, time as _tm, json as _j
         from urllib.request import urlopen, Request
         
         def _discovery_loop():
-            print("[P2P-DISC] 🚀 Active peer discovery engine online", flush=True)
+            print("[P2P-DISC] DHT-driven peer discovery engine online", flush=True)
             while self._running:
                 try:
-                    # 1. QUERY KOYEB FOR PEER REGISTRY
-                    try:
-                        _rpc_url = f"{ENTROPY_SERVER_URL}/rpc"
-                        _body = _j.dumps({
-                            "jsonrpc": "2.0", "method": "qtcl_getPeers", "params": [200], "id": 1
-                        }).encode()
-                        _req = Request(_rpc_url, data=_body, headers={'Content-Type': 'application/json'})
-                        with urlopen(_req, timeout=5) as _resp:
-                            _data = _j.loads(_resp.read())
-                            _peers = _data.get('result', {}).get('peers', [])
-                            if _peers:
-                                print(f"[P2P-DISC] Koyeb registry: found {len(_peers)} potential peers", flush=True)
-                                # FORCE ACTIVE - Assume peers on registry are reachable
-                                for _p in _peers:
-                                    _p.setdefault('host', _p.get('ip_hint') or _p.get('peer_addr', '').split(':')[0] or _p.get('external_addr', '').split(':')[0])
-                                    _p.setdefault('node_id', _p.get('peer_id') or _p.get('node_id'))
-                                    
-                                    _host = _p.get('host')
-                                    _node_id = _p.get('node_id')
-                                    if _host and _node_id and _node_id != self.node_id:
-                                        print(f"[P2P-DISC]   ⚡ ACTIVATING peer: {_node_id[:8]} @ {_host}", flush=True)
-                                        # Force peer into ACTIVE state immediately for testing visibility
-                                        _new_p = P2PPeer(_host, _p.get('port', 9091), _node_id)
-                                        _new_p.state = PeerState.ACTIVE
-                                        self.peer_mgr.add_peer(_new_p)
-                    except Exception as _ke:
-                        _EXP_LOG.debug(f"[P2P-DISC] Koyeb fetch failed: {_ke}")
-
-                    # 2. RECURSIVE P2P GOSSIP (GetAddr from existing peers)
                     active_peers = self.peer_mgr.get_active_peers()
                     all_potential = list(self.peer_mgr.peers.values())
                     
                     if active_peers:
                         print(f"[P2P-DISC] Gossiping with {len(active_peers)} active peers", flush=True)
                     
-                    # 3. BROADCAST OUR IDENTITY (Announce to ALL potential peers)
-                    print(f"[P2P-DISC] Announcing identity to {len(all_potential)} discovered peers", flush=True)
+                    for _peer in active_peers:
+                        try:
+                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
+                            _body = _j.dumps({
+                                "jsonrpc": "2.0", "method": "qtcl_dht_findNode",
+                                "params": {"target_id": self.node_id, "count": 20}, "id": 1
+                            }).encode()
+                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
+                            with urlopen(_req, timeout=3) as _resp:
+                                _data = _j.loads(_resp.read())
+                                _nodes = _data.get('result', {}).get('nodes', [])
+                                for _n in _nodes:
+                                    _nid = _n.get('node_id', '')
+                                    _addr = _n.get('addr', '') or _n.get('host', '')
+                                    if not _nid or not _addr:
+                                        continue
+                                    if ':' in _addr:
+                                        _h, _p = _addr.rsplit(':', 1)
+                                        try: _p = int(_p)
+                                        except: _p = _P2P_PORT
+                                    else:
+                                        _h = _addr
+                                        _p = _P2P_PORT
+                                    if _nid != self.node_id:
+                                        self.peer_mgr.inject_dht_peer(_nid, _h, _p)
+                                        try:
+                                            self.kademlia_table.add_node(KademliaNode(node_id=_nid, host=_h, port=_p))
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            continue
+                    
                     for _peer in all_potential:
                         try:
                             _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
@@ -11608,13 +11705,12 @@ class P2PNode:
                             }).encode()
                             _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
                             with urlopen(_req, timeout=2) as _resp:
-                                # If announce works, set state to ACTIVE so it shows in peers
                                 if _peer.state != PeerState.ACTIVE:
                                     _peer.state = PeerState.ACTIVE
-                                    print(f"[P2P-DISC] ✅ Peer {_peer.host}:{_peer.port} activated via announce", flush=True)
+                                    print(f"[P2P-DISC] Peer {_peer.host}:{_peer.port} activated via announce", flush=True)
                         except Exception:
                             continue
-
+                    
                     for _peer in active_peers:
                         try:
                             _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
@@ -11631,7 +11727,6 @@ class P2PNode:
                         except Exception:
                             continue
                     
-                    # 4. RE-REGISTER WITH KOYEB AS RELAY
                     try:
                         app_instance._register_with_koyeb()
                     except Exception:
@@ -11640,7 +11735,7 @@ class P2PNode:
                 except Exception as _le:
                     _EXP_LOG.debug(f"[P2P-DISC] Loop error: {_le}")
                 
-                _tm.sleep(30) # Discovery cycle every 30s
+                _tm.sleep(30)
 
         _t.Thread(target=_discovery_loop, daemon=True, name="P2PActiveDiscovery").start()
     
@@ -14000,14 +14095,15 @@ class QtclClientApp:
             # ── CRITICAL: Add SELF to local p2p_peers DB for self-recognition ──
             try:
                 import sqlite3
-                if self._db:
+                with sqlite3.connect(str(_DB_PATH), timeout=5) as conn:
                     host = ext_addr.split(':')[0] if ':' in ext_addr else ext_addr
                     port = int(ext_addr.split(':')[1]) if ':' in ext_addr else _P2P_PORT
-                    self._db.execute("""
+                    conn.execute("""
                         INSERT OR REPLACE INTO p2p_peers
                         (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (node_id[:16], host, port, height, int(time.time()), 0))
+                    conn.commit()
                     _EXP_LOG.info(f"[P2P] 🪞 SELF added to local DB: {node_id[:16]}… at {host}:{port}")
             except Exception as _dbe:
                 _EXP_LOG.debug(f"[P2P] Failed to add self to local DB: {_dbe}")
@@ -14016,18 +14112,42 @@ class QtclClientApp:
             peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
             if peers_resp and peers_resp.get('peers'):
                 _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
+                # ── DHT Fan-out: ping each peer directly ──
+                def _dht_fanout(peers, my_id, my_addr):
+                    for peer in peers:
+                        p_addr = peer.get('external_addr') or peer.get('host', '')
+                        p_id   = peer.get('node_id', '')
+                        if not p_addr or not p_id or p_id == my_id:
+                            continue
+                        try:
+                            h, p = p_addr.rsplit(':', 1)
+                            p = int(p) if p.isdigit() else _P2P_PORT
+                            payload = {
+                                "jsonrpc": "2.0",
+                                "method": "qtcl_dhtPing",
+                                "params": {"node_id": my_id, "external_addr": my_addr},
+                                "id": 1
+                            }
+                            import urllib.request as _ur
+                            import urllib.error as _ue
+                            body = json.dumps(payload).encode()
+                            req = _ur.Request(f"http://{h}:{p}/rpc", data=body,
+                                              headers={"Content-Type": "application/json"}, method="POST")
+                            with _ur.urlopen(req, timeout=3) as _r:
+                                _r.read()
+                            _EXP_LOG.info(f"[P2P] 🤝 DHT ping → {p_addr} ({p_id[:16]}...)")
+                        except Exception:
+                            pass
+                threading.Thread(target=_dht_fanout, args=(peers_resp['peers'], node_id, ext_addr), daemon=True).start()
+                # ── Also add to local peer manager ──
                 for peer in peers_resp['peers']:
                     p_addr = peer.get('external_addr') or peer.get('host', '')
                     p_id   = peer.get('node_id', '')
-                    # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
                     if p_addr and p_id and p_id != node_id:
                         try:
                             p_host = p_addr.split(':')[0]
                             p_port = int(p_addr.split(':')[1]) if ':' in p_addr else _P2P_PORT
                             new_peer = P2PPeer(p_host, p_port, p_id)
-                            # Bug #9: set CONNECTING (not ACTIVE) — bootstrap daemon will
-                            # handshake to get a session_token before the peer can pass the
-                            # auth gate for any non-handshake RPC method.
                             new_peer.state = PeerState.CONNECTING
                             self.p2p_node.peer_mgr.add_peer(new_peer)
                             _EXP_LOG.info(f"[P2P] 🔄 Queued peer for handshake: {p_addr} ({p_id[:16]}...)")
@@ -14082,12 +14202,6 @@ class QtclClientApp:
                         _EXP_LOG.debug(f"[P2P] 🪞 SELF heartbeat: {_nid[:16]}… at {_ext_host}:{_ext_port} h={bh}")
                     except Exception as _dbe:
                         _EXP_LOG.debug(f"[P2P] Heartbeat DB update failed: {_dbe}")
-                    except Exception: pass
-                if _P2P_NODE and _P2P_NODE._started and False:
-                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
-                    if m:
-                        try: _P2P_NODE.gossip_measurement(m)
-                        except Exception: pass
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
@@ -17453,6 +17567,12 @@ class NodeRPCMeshServer:
         self._pq0_epoch    = 0
         self._entangle_log: list = []   # ring buffer, last 256 epochs
         self._node_registry: dict = {}  # cached peer node registry
+        self._kademlia_table: Optional[KademliaRoutingTable] = None
+        self._dht_store: dict = {}  # local DHT key-value store
+        try:
+            self._kademlia_table = KademliaRoutingTable(local_node_id=self._node_id)
+        except Exception as _ke:
+            logger.warning(f"[MESH] KademliaRoutingTable init failed: {_ke} — DHT disabled")
         self._ensure_mesh_schema()
         self._register_onchain()
         logger.info(
@@ -17460,390 +17580,18 @@ class NodeRPCMeshServer:
             f"port={self._port}  server={self._server_url}"
         )
     
-    def _register_onchain(self) -> bool:
-        """Register this node on-chain via null entanglement transaction"""
-        try:
-            import time as _treg
-            _ts = int(_treg.time_ns())
-            _reg_payload = {
-                'node_id': self._node_id,
-                'port': self._port,
-                'pubkey': self._node_secret.hex()[:40],
-                'registered_at': _ts,
-                'mesh_version': self.MESH_VERSION,
-            }
-            _reg_hash = hashlib.sha3_256(json.dumps(_reg_payload, sort_keys=True).encode()).hexdigest()
-            _null_tx = {
-                'tx_type': 'node_register',
-                'from_address': f"mesh:{self._node_id[:16]}",
-                'to_address': '0000000000000000000000000000000000000000',
-                'amount': 0.0,
-                'fee': 0.0,
-                'timestamp_ns': str(_ts),
-                'node_id': self._node_id,
-                'node_registry_payload': json.dumps(_reg_payload),
-                'registry_hash': _reg_hash,
-            }
-            self._last_registry_tx = _null_tx
-            logger.info(f"[MESH] 📜 Node registered on-chain: tx_type=node_register hash={_reg_hash[:16]}...")
-            return True
-        except Exception as _e:
-            logger.warning(f"[MESH] ⚠️  On-chain registration failed: {_e}")
-            return False
-    
-    def submit_node_registry(self) -> Optional[dict]:
-        """Submit node registry transaction to main server"""
-        if not hasattr(self, '_last_registry_tx'):
-            self._register_onchain()
-        if hasattr(self, '_last_registry_tx'):
-            try:
-                import requests as _req
-                _url = f"{self._server_url}/rpc"
-                _payload = {
-                    'jsonrpc': '2.0',
-                    'method': 'qtcl_submitTransaction',
-                    'params': [self._last_registry_tx],
-                    'id': 1
-                }
-                _resp = _req.post(_url, json=_payload, timeout=5)
-                if _resp.status_code == 200:
-                    _result = _resp.json()
-                    logger.info(f"[MESH] 📜 Node registry submitted: {_result.get('result', {}).get('tx_hash', 'unknown')[:16]}...")
-                    return _result
-            except Exception as _e:
-                logger.debug(f"[MESH] Registry submission: {_e}")
-        return None
-    
-    def register_peer_node(self, peer_id: str, peer_info: dict) -> bool:
-        """Register a peer node in the local mesh registry"""
-        try:
-            self._node_registry[peer_id] = {
-                'peer_id': peer_id,
-                'host': peer_info.get('host', ''),
-                'port': peer_info.get('port', 0),
-                'pubkey': peer_info.get('pubkey', ''),
-                'registered_at': int(time.time() * 1e9),
-                'last_seen': int(time.time() * 1e9),
-                'fidelity': peer_info.get('fidelity', 0.0),
-                'entropy': peer_info.get('entropy', 0.0),
-            }
-            logger.debug(f"[MESH] Peer registered: {peer_id[:16]}... fidelity={peer_info.get('fidelity', 0):.4f}")
-            return True
-        except Exception as _e:
-            logger.warning(f"[MESH] Peer registration failed: {_e}")
-            return False
-    
-    def get_mesh_peers(self) -> list:
-        """Get all registered mesh peers"""
-        return list(self._node_registry.values())
-    
-    def broadcast_heartbeat(self) -> dict:
-        """Broadcast node heartbeat with current quantum state"""
-        return {
-            'node_id': self._node_id[:16],
-            'port': self._port,
-            'timestamp_ns': int(time.time() * 1e9),
-            'fidelity': getattr(self, '_last_fidelity', 0.0),
-            'entropy': getattr(self, '_last_entropy', 0.0),
-            'peers': len(self._node_registry),
-            'registry_hash': getattr(self, '_last_registry_tx', {}).get('registry_hash', ''),
-        }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Schema — pq0_entanglement_log table (idempotent)
-    # ─────────────────────────────────────────────────────────────────────────
-    def _ensure_mesh_schema(self) -> None:
-        import sqlite3  # NodeRPCMeshServer scope — all other imports are aliased
-        try:
-            conn = sqlite3.connect(str(self._db_path), timeout=10,
-                                   check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
-                    id                  INTEGER  PRIMARY KEY AUTOINCREMENT,
-                    epoch               INTEGER  NOT NULL,
-                    block_height        INTEGER  NOT NULL DEFAULT 0,
-                    local_pq0           INTEGER  NOT NULL DEFAULT 0,
-                    server_pq0          INTEGER  NOT NULL DEFAULT 0,
-                    oracle_ids          TEXT     NOT NULL DEFAULT '[]',
-                    quorum_hashes       TEXT     NOT NULL DEFAULT '[]',
-                    epsilon_matrix_hex  TEXT     NOT NULL DEFAULT '',
-                    tripartite_fidelity REAL     NOT NULL DEFAULT 0.0,
-                    consensus_score     REAL     NOT NULL DEFAULT 0.0,
-                    node_id_hex         TEXT     NOT NULL DEFAULT '',
-                    created_at          INTEGER  NOT NULL
-                                        DEFAULT (strftime('%s','now'))
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_pq0_elog_epoch
-                    ON pq0_entanglement_log (epoch DESC)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_pq0_elog_height
-                    ON pq0_entanglement_log (block_height DESC)
-            """)
-            # mesh_rpc_log — audit trail of every RPC call served by this node
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS mesh_rpc_log (
-                    id          INTEGER  PRIMARY KEY AUTOINCREMENT,
-                    method      TEXT     NOT NULL DEFAULT '',
-                    params_hash TEXT     NOT NULL DEFAULT '',
-                    result_ok   INTEGER  NOT NULL DEFAULT 1,
-                    latency_ms  REAL     NOT NULL DEFAULT 0.0,
-                    peer_addr   TEXT     NOT NULL DEFAULT '',
-                    ts          INTEGER  NOT NULL
-                                DEFAULT (strftime('%s','now'))
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method
-                    ON mesh_rpc_log (method, ts DESC)
-            """)
-            conn.commit()
-            conn.close()
-        except Exception as _e:
-            logger.error(f"[MESH] Schema init failed: {_e}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # pq0 Entanglement Engine
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_epsilon_matrix(self, quorum_hashes: list) -> bytes:
-        """
-        Compute the 5×5 entanglement coefficient matrix.
-        ε_ij = HMAC-SHA3-256(quorum_hash_i ‖ quorum_hash_j, node_secret)
-        Result: 25 × 32 bytes = 800 bytes, row-major.
-        Diagonal ε_ii = HMAC(h_i ‖ h_i, node_secret) — self-entanglement.
-        """
-        n   = len(quorum_hashes)
-        out = bytearray()
-        for i in range(n):
-            for j in range(n):
-                hi = quorum_hashes[i].encode() if isinstance(quorum_hashes[i], str) \
-                     else quorum_hashes[i]
-                hj = quorum_hashes[j].encode() if isinstance(quorum_hashes[j], str) \
-                     else quorum_hashes[j]
-                msg     = hi + hj
-                epsilon = hmac.new(self._node_secret, msg,
-                                   hashlib.sha3_256).digest()
-                out.extend(epsilon)
-        return bytes(out)
-
-    def _tripartite_fidelity(self, epsilon_matrix: bytes) -> float:
-        """
-        Scalar fidelity of the tripartite link:
-          F = mean(|ε_ij|) over off-diagonal elements normalised to [0,1].
-        Uses the first byte of each 32-byte ε_ij coefficient as the amplitude.
-        """
-        n     = self.ORACLE_COUNT
-        total = n * n
-        cell  = 32   # bytes per ε_ij
-        if len(epsilon_matrix) < total * cell:
-            return 0.0
-        off_diag_vals = []
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    offset = (i * n + j) * cell
-                    byte   = epsilon_matrix[offset]
-                    off_diag_vals.append(byte / 255.0)
-        return sum(off_diag_vals) / len(off_diag_vals) if off_diag_vals else 0.0
-
-    def _poll_oracle_and_entangle(self) -> None:
-        """
-        Background daemon: pulls oracle snapshot every PQ0_POLL_SEC seconds,
-        computes ε matrix, persists to pq0_entanglement_log.
-        """
-        while not self._stop.is_set():
-            try:
-                snap = self._fetch_server_rpc("qtcl_getQuantumMetrics", [])
-                if snap:
-                    with self._oracle_lock:
-                        self._oracle_state = snap
-                    self._record_entanglement(snap)
-            except Exception as _pe:
-                logger.debug(f"[MESH-ENT] poll error: {_pe}")
-            self._stop.wait(self.PQ0_POLL_SEC)
-
-    def _record_entanglement(self, snap: dict) -> None:
-        """Derive and persist one epoch of the pq0 tripartite entanglement log."""
-        import sqlite3  # NodeRPCMeshServer scope
-        try:
-            block_height  = int(snap.get("block_height") or snap.get("height") or 0)
-            server_pq0    = int(snap.get("pq_curr") or snap.get("pq0") or block_height)
-            oracle_ids    = snap.get("oracle_ids") or \
-                            [f"oracle_{i+1}" for i in range(self.ORACLE_COUNT)]
-            # Build quorum hash list — use per-oracle hashes if present,
-            # else derive deterministically from snapshot quorum_hash
-            base_qhash    = snap.get("quorum_hash_hex") or \
-                            snap.get("consensus", {}).get("quorum_hash") or \
-                            hashlib.sha3_256(
-                                json.dumps(snap, sort_keys=True,
-                                           default=str).encode()
-                            ).hexdigest()
-            quorum_hashes = []
-            for i in range(self.ORACLE_COUNT):
-                # Oracle-specific quorum hash: HMAC(base_qhash, oracle_id_i)
-                oracle_key   = f"oracle_{i+1}".encode()
-                oracle_qhash = hmac.new(
-                    base_qhash.encode() if isinstance(base_qhash, str)
-                    else base_qhash,
-                    oracle_key, hashlib.sha3_256
-                ).hexdigest()
-                quorum_hashes.append(oracle_qhash)
-
-            epsilon = self._compute_epsilon_matrix(quorum_hashes)
-            fidelity = self._tripartite_fidelity(epsilon)
-            consensus_score = float(
-                snap.get("consensus", {}).get("agreement_score") or
-                snap.get("w_state_fidelity") or 0.0
-            )
-            self._pq0_epoch += 1
-            epoch = self._pq0_epoch
-
-            # Persist
-            conn = sqlite3.connect(str(self._db_path), timeout=10,
-                                   check_same_thread=False)
-            try:
-                conn.execute("""
-                    INSERT INTO pq0_entanglement_log
-                      (epoch, block_height, local_pq0, server_pq0,
-                       oracle_ids, quorum_hashes, epsilon_matrix_hex,
-                       tripartite_fidelity, consensus_score, node_id_hex)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    epoch, block_height,
-                    server_pq0,   # local_pq0 mirrors server until local mining diverges
-                    server_pq0,
-                    json.dumps(oracle_ids[:self.ORACLE_COUNT]),
-                    json.dumps(quorum_hashes),
-                    epsilon.hex(),
-                    fidelity,
-                    consensus_score,
-                    self._node_id,
-                ))
-                # Prune to last 10 000 epochs
-                conn.execute("""
-                    DELETE FROM pq0_entanglement_log
-                    WHERE id NOT IN (
-                        SELECT id FROM pq0_entanglement_log
-                        ORDER BY epoch DESC LIMIT 10000
-                    )
-                """)
-                conn.commit()
-            finally:
-                conn.close()
-
-            logger.debug(
-                f"[MESH-ENT] epoch={epoch}  h={block_height}  "
-                f"pq0={server_pq0}  F={fidelity:.4f}"
-            )
-        except Exception as _e:
-            logger.error(f"[MESH-ENT] record_entanglement failed: {_e}")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # HTTP helpers
-    # ─────────────────────────────────────────────────────────────────────────
-    def _fetch_server_rpc(self, method: str, params: list,
-                          timeout: float = 8.0) -> Any:
-        """Execute a JSON-RPC 2.0 call against the main server."""
-        payload = {"jsonrpc": "2.0", "method": method,
-                   "params": params, "id": 1}
-        try:
-            req = Request(
-                f"{self._server_url}/rpc",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read())
-            result = body.get("result")
-            if result is None and "error" in body:
-                logger.debug(f"[MESH-RPC] server error {method}: {body['error']}")
-            return result
-        except Exception as _e:
-            logger.debug(f"[MESH-RPC] {method} server call failed: {_e}")
-            return None
-
-    def _db_conn(self) -> sqlite3.Connection:
-        """Open a fresh per-request read connection (thread-safe)."""
-        import sqlite3  # NodeRPCMeshServer scope
-        conn = sqlite3.connect(str(self._db_path), timeout=10,
-                               check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RPC method implementations
-    # ─────────────────────────────────────────────────────────────────────────
-    def _rpc_getBlockHeight(self, params: list) -> dict:
-        conn = self._db_conn()
-        try:
-            row = conn.execute(
-                "SELECT MAX(height) AS h, hash FROM blocks "
-                "WHERE height=(SELECT MAX(height) FROM blocks)"
-            ).fetchone()
-            h    = int(row["h"] or 0) if row else 0
-            tip  = str(row["hash"] or "") if row else ""
-            return {"height": h, "tip_hash": tip}
-        finally:
-            conn.close()
-
-    def _rpc_getBestBlockHash(self, params: list) -> dict:
-        conn = self._db_conn()
-        try:
-            row = conn.execute(
-                "SELECT hash FROM blocks ORDER BY height DESC LIMIT 1"
-            ).fetchone()
-            return {"hash": str(row["hash"]) if row else ""}
-        finally:
-            conn.close()
-
-    def _rpc_getBlock(self, params: list) -> Optional[dict]:
-        height = int(params[0]) if params else 0
-        conn   = self._db_conn()
-        try:
-            row = conn.execute(
-                "SELECT * FROM blocks WHERE height=?", (height,)
-            ).fetchone()
-            if not row:
-                return None
-            blk  = dict(row)
-            data = blk.get("data")
-            if data:
-                try:
-                    blk.update(json.loads(data))
-                except Exception:
-                    pass
-            # Attach transactions
-            txs = conn.execute(
-                "SELECT * FROM transactions WHERE block_height=?", (height,)
-            ).fetchall()
-            blk["transactions"] = [dict(t) for t in txs]
-            return blk
-        finally:
-            conn.close()
-
     def _rpc_getBlockRange(self, params: list) -> dict:
-        start = int(params[0]) if len(params) > 0 else 0
-        end   = int(params[1]) if len(params) > 1 else start + 99
-        conn  = self._db_conn()
+        """Return a range of blocks with transactions."""
+        conn = self._db_conn()
         try:
-            rows  = conn.execute(
-                "SELECT * FROM blocks WHERE height BETWEEN ? AND ? "
-                "ORDER BY height ASC",
-                (start, end),
-            ).fetchall()
+            start = int(params[0]) if params else 0
+            limit = int(params[1]) if len(params) > 1 else 100
             blocks = []
-            for row in rows:
-                blk  = dict(row)
-                data = blk.get("data")
-                if data:
-                    try:
-                        blk.update(json.loads(data))
-                    except Exception:
-                        pass
+            for row in conn.execute(
+                "SELECT * FROM blocks WHERE height >= ? ORDER BY height ASC LIMIT ?",
+                (start, limit),
+            ).fetchall():
+                blk = dict(row)
                 txs = conn.execute(
                     "SELECT * FROM transactions WHERE block_height=?",
                     (blk["height"],),
@@ -18180,31 +17928,32 @@ class NodeRPCMeshServer:
             
             ingested = 0
             self_ingested = False
+            new_peers = []
             try:
                 import sqlite3
-                conn = sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False)
-                for p in peers[:32]:  # limit to prevent spam
-                    try:
-                        node_id = str(p.get('node_id') or '')
-                        host = str(p.get('host') or '')
-                        port = int(p.get('port') or 9091)
-                        chain_height = int(p.get('chain_height') or 0)
-                        
-                        if node_id and host and len(node_id) >= 8:
-                            # Check if this is self
-                            is_self_peer = (self_node_id and node_id == self_node_id)
-                            conn.execute("""
-                                INSERT OR REPLACE INTO p2p_peers
-                                (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
-                            ingested += 1
-                            if is_self_peer:
-                                self_ingested = True
-                    except Exception:
-                        continue
-                conn.commit()
-                conn.close()
+                with sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False) as conn:
+                    for p in peers[:32]:  # limit to prevent spam
+                        try:
+                            node_id = str(p.get('node_id') or '')
+                            host = str(p.get('host') or '')
+                            port = int(p.get('port') or 9091)
+                            chain_height = int(p.get('chain_height') or 0)
+                            
+                            if node_id and host and len(node_id) >= 8:
+                                is_self_peer = (self_node_id and node_id == self_node_id)
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO p2p_peers
+                                    (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                """, (node_id, host, port, chain_height, int(time.time()), 0))
+                                ingested += 1
+                                if is_self_peer:
+                                    self_ingested = True
+                                else:
+                                    new_peers.append((node_id, host, port))
+                        except Exception:
+                            continue
+                    conn.commit()
                 if self_ingested:
                     _EXP_LOG.info(f"[MESH-P2P] 🪞 SELF in announced table: ingested {ingested}/{len(peers)} peers (self included)")
                 else:
@@ -18212,9 +17961,162 @@ class NodeRPCMeshServer:
             except Exception as e:
                 _EXP_LOG.debug(f"[MESH-P2P] Announce ingest failed: {e}")
             
+            # ── CHAIN REACTION: relay newly discovered peers to Kademlia + mesh ──
+            if new_peers:
+                def _relay_announced(peers_list):
+                    for nid, h, p in peers_list:
+                        # Add to Kademlia routing table
+                        if hasattr(self, '_kademlia_table') and self._kademlia_table:
+                            try:
+                                self._kademlia_table.add_node(KademliaNode(node_id=nid, host=h, port=p))
+                            except Exception:
+                                pass
+                        # Fan-out to other known peers (TTL=1, avoid echo)
+                        try:
+                            import sqlite3 as _sq
+                            with _sq.connect(str(self._db_path), timeout=3) as c:
+                                for row in c.execute("SELECT node_id_hex, host, port FROM p2p_peers WHERE ban_score < 100 AND node_id_hex != ? ORDER BY last_seen_at DESC LIMIT 5", (nid,)):
+                                    rh, rp = row[1], row[2]
+                                    if rh == h and rp == p:
+                                        continue
+                                    try:
+                                        payload = {
+                                            "jsonrpc": "2.0",
+                                            "method": "qtcl_announcePeerTable",
+                                            "params": [{"peers": [{"node_id": nid, "host": h, "port": p}]}],
+                                            "id": 1
+                                        }
+                                        import urllib.request as _ur
+                                        body = json.dumps(payload).encode()
+                                        req = _ur.Request(f"http://{rh}:{rp}/rpc", data=body,
+                                                          headers={"Content-Type": "application/json"}, method="POST")
+                                        with _ur.urlopen(req, timeout=2) as _r:
+                                            _r.read()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                threading.Thread(target=_relay_announced, args=(new_peers,), daemon=True).start()
+            
             return {"ingested": ingested, "total": len(peers), "self_ingested": self_ingested}
         except Exception as e:
             return {"ingested": 0, "error": str(e)}
+
+    def _rpc_dhtPing(self, params: list) -> dict:
+        """qtcl_dhtPing — Kademlia PING: update routing table and return closest nodes."""
+        try:
+            p = params[0] if params and isinstance(params[0], dict) else {}
+            node_id = str(p.get("node_id", ""))
+            ext_addr = str(p.get("external_addr", ""))
+            if not node_id or not ext_addr:
+                return {"pinged": False, "reason": "missing node_id or external_addr"}
+            # Add to Kademlia routing table
+            if hasattr(self, '_kademlia_table') and self._kademlia_table:
+                host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
+                try: port = int(port_s)
+                except: port = 9091
+                remote_node = KademliaNode(node_id=node_id, host=host, port=port)
+                self._kademlia_table.add_node(remote_node)
+            # Also sync to mesh peer registry
+            if hasattr(self, '_node_registry'):
+                host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
+                try: port = int(port_s)
+                except: port = 9091
+                self._node_registry[node_id] = {
+                    'peer_id': node_id, 'host': host, 'port': port,
+                    'registered_at': int(time.time() * 1e9),
+                    'last_seen': int(time.time() * 1e9),
+                }
+            # Also persist to DB (full node_id, not truncated)
+            try:
+                import sqlite3
+                host = ext_addr.split(':')[0] if ':' in ext_addr else ext_addr
+                port = int(ext_addr.split(':')[1]) if ':' in ext_addr else 9091
+                with sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False) as conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO p2p_peers
+                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (node_id, host, port, 0, int(time.time()), 0))
+                    conn.commit()
+            except Exception:
+                pass
+            # ── CHAIN REACTION: fan-out to known peers ──
+            def _dht_relay(new_nid, new_addr, my_nid):
+                try:
+                    known_peers = []
+                    if hasattr(self, '_kademlia_table') and self._kademlia_table:
+                        try:
+                            known_peers = self._kademlia_table.find_closest(my_nid, count=10)
+                        except Exception:
+                            pass
+                    if not known_peers:
+                        import sqlite3 as _sq
+                        try:
+                            with _sq.connect(str(self._db_path), timeout=3) as c:
+                                for row in c.execute("SELECT node_id_hex, host, port FROM p2p_peers WHERE ban_score < 100 ORDER BY last_seen_at DESC LIMIT 10"):
+                                    known_peers.append(type('_', (), {'node_id': row[0], 'host': row[1], 'port': row[2]})())
+                        except Exception:
+                            pass
+                    for peer in known_peers:
+                        p_nid = getattr(peer, 'node_id', '')
+                        p_host = getattr(peer, 'host', '')
+                        p_port = getattr(peer, 'port', 9091)
+                        if not p_host or p_nid == new_nid or p_nid == my_nid:
+                            continue
+                        try:
+                            payload = {
+                                "jsonrpc": "2.0",
+                                "method": "qtcl_dhtPing",
+                                "params": [{"node_id": new_nid, "external_addr": new_addr}],
+                                "id": 1
+                            }
+                            import urllib.request as _ur
+                            body = json.dumps(payload).encode()
+                            req = _ur.Request(f"http://{p_host}:{p_port}/rpc", data=body,
+                                              headers={"Content-Type": "application/json"}, method="POST")
+                            with _ur.urlopen(req, timeout=2) as _r:
+                                _r.read()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            threading.Thread(target=_dht_relay, args=(node_id, ext_addr, self._node_id), daemon=True).start()
+            _EXP_LOG.info(f"[MESH-DHT] 🤝 dhtPing from {node_id[:16]}… at {ext_addr} → relaying to mesh")
+            return {"pinged": True, "node_id": self._node_id[:16]}
+        except Exception as e:
+            return {"pinged": False, "error": str(e)}
+
+    def _rpc_dhtFindNode(self, params: list) -> dict:
+        """qtcl_dhtFindNode — return k closest nodes to target_id from routing table."""
+        try:
+            p = params[0] if params and isinstance(params[0], dict) else {}
+            target_id = str(p.get("target_id", ""))
+            count = int(p.get("count", 20))
+            if not target_id:
+                return {"nodes": []}
+            nodes = []
+            if hasattr(self, '_kademlia_table') and self._kademlia_table:
+                closest = self._kademlia_table.find_closest(target_id, count=min(count, 20))
+                nodes = [{"node_id": n.node_id, "host": n.host, "port": n.port} for n in closest]
+            return {"nodes": nodes, "count": len(nodes)}
+        except Exception as e:
+            return {"nodes": [], "error": str(e)}
+
+    def _rpc_dhtAnnounce(self, params: list) -> dict:
+        """qtcl_dhtAnnounce — store a value in local DHT state."""
+        try:
+            p = params[0] if params and isinstance(params[0], dict) else {}
+            key = str(p.get("key", ""))
+            value = p.get("value")
+            if not key:
+                return {"stored": False, "reason": "key required"}
+            if not hasattr(self, '_dht_store'):
+                self._dht_store = {}
+            self._dht_store[key] = {"value": value, "ts": time.time()}
+            return {"stored": True, "key": key[:32]}
+        except Exception as e:
+            return {"stored": False, "error": str(e)}
 
     # ─────────────────────────────────────────────────────────────────────────
     # RPC dispatcher
@@ -18464,6 +18366,10 @@ NodeRPCMeshServer._METHODS = {
     "qtcl_getEntropy":          NodeRPCMeshServer._rpc_getEntropy,
     "qtcl_submitBlock":         NodeRPCMeshServer._rpc_submitBlock,
     "qtcl_submitTransaction":   NodeRPCMeshServer._rpc_submitTransaction,
+    # ── DHT / Kademlia RPC ────────────────────────────────────────────────────
+    "qtcl_dhtPing":             NodeRPCMeshServer._rpc_dhtPing,
+    "qtcl_dhtFindNode":         NodeRPCMeshServer._rpc_dhtFindNode,
+    "qtcl_dhtAnnounce":         NodeRPCMeshServer._rpc_dhtAnnounce,
 }
 
 _MESH_SERVER_INSTANCE: Optional["NodeRPCMeshServer"] = None
