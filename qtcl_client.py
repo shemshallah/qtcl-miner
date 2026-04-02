@@ -12769,9 +12769,96 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[ORACLE-REG] Koyeb gossip: {_be}")
         _threading.Thread(target=_do_broadcast, daemon=True,
                           name="OracleRegBroadcast").start()
+        
+        # ── Register as peer with Koyeb ─────────────────────────────────────────
+        def _register_with_koyeb_peer():
+            try:
+                if hasattr(self, 'p2p_node') and self.p2p_node:
+                    ext_addr = self.p2p_node.external_addr
+                    node_id = self._oracle_id.get('address', '')
+                    pubkey = self._oracle_id.get('public_key', '')
+                    height = int(self.koyeb_state.block_height or 0) if hasattr(self, 'koyeb_state') else 0
+                    
+                    _EXP_LOG.info(f"[ORACLE-REG] Registering as peer with Koyeb: {ext_addr}")
+                    reg_resp = self.api._rpc("qtcl_registerPeer", {
+                        "external_addr": ext_addr,
+                        "pubkey": pubkey,
+                        "chain_height": height,
+                        "node_id": node_id,
+                        "is_node": True,
+                        "is_relay": True,
+                        "oracle_mode": _oid.get("mode", "anonymous"),
+                    })
+                    if reg_resp and reg_resp.get("registered"):
+                        _EXP_LOG.info(f"[ORACLE-REG] ✅ Peer registered with Koyeb: {node_id[:16]}...")
+                    else:
+                        _EXP_LOG.warning(f"[ORACLE-REG] Peer registration failed: {reg_resp}")
+            except Exception as _pe:
+                _EXP_LOG.warning(f"[ORACLE-REG] Koyeb peer registration failed: {_pe}")
+        
+        _threading.Thread(target=_register_with_koyeb_peer, daemon=True,
+                          name="OracleKoyebPeerReg").start()
+        
+        # ── Subscribe to server measurement broadcasts ────────────────────────
+        def _subscribe_to_measurements():
+            try:
+                client_id = f"oracle_{self._oracle_id.get('address', 'unknown')}"
+                callback_url = f"http://{_ip_hint or '127.0.0.1'}:9091/rpc" if _ip_hint else None
+                
+                _EXP_LOG.info(f"[ORACLE-REG] Subscribing to measurement broadcasts: client_id={client_id}")
+                
+                sub_resp = self.api._rpc("qtcl_registerMeasurementSubscriber", {
+                    "client_id": client_id,
+                    "callback_url": callback_url or "http://localhost:9091/rpc",
+                    "burst_mode": True,
+                })
+                if sub_resp and sub_resp.get("subscribed"):
+                    _EXP_LOG.info(f"[ORACLE-REG] ✅ Subscribed to measurement broadcasts")
+                else:
+                    _EXP_LOG.warning(f"[ORACLE-REG] Measurement subscription failed: {sub_resp}")
+            except Exception as _ms:
+                _EXP_LOG.warning(f"[ORACLE-REG] Measurement subscription failed: {_ms}")
+        
+        _threading.Thread(target=_subscribe_to_measurements, daemon=True,
+                          name="OracleMeasurementSub").start()
+        
+        # ── Submit on-chain oracle registration (null tx, info-only, no value) ────
+        def _submit_onchain_reg():
+            try:
+                oracle_addr = _oid.get('address', '')
+                wallet_addr = _oid.get('wallet_addr', oracle_addr)
+                oracle_pub = _oid.get('public_key', '')
+                
+                if not oracle_addr:
+                    _EXP_LOG.warning(f"[ORACLE-REG] No oracle address, skipping on-chain reg")
+                    return
+                
+                _EXP_LOG.info(f"[ORACLE-REG] Submitting on-chain registration: {oracle_addr}")
+                
+                onchain_resp = self.api._rpc("qtcl_submitOracleReg", [{
+                    "wallet_address": wallet_addr,
+                    "oracle_addr": oracle_addr,
+                    "oracle_pub": oracle_pub,
+                    "mode": _oid.get("mode", "anonymous"),
+                    "ip_hint": _ip_hint,
+                    "action": "register",
+                }])
+                
+                if onchain_resp and onchain_resp.get("status") in ("submitted", "tx_template_issued"):
+                    _EXP_LOG.info(f"[ORACLE-REG] ✅ On-chain registration submitted: {onchain_resp.get('tx_hash', 'N/A')}")
+                    if onchain_resp.get("status") == "tx_template_issued":
+                        _EXP_LOG.info(f"[ORACLE-REG] TX template issued - needs signature before resubmit")
+                else:
+                    _EXP_LOG.warning(f"[ORACLE-REG] On-chain registration failed: {onchain_resp}")
+            except Exception as _oc:
+                _EXP_LOG.warning(f"[ORACLE-REG] On-chain registration exception: {_oc}")
+        
+        _threading.Thread(target=_submit_onchain_reg, daemon=True,
+                          name="OracleOnChainReg").start()
+        
         _mode_tag = ("🔐 wallet-bound" if _oid.get("mode") == "wallet_bound"
                      else "👻 anonymous")
-        _EXP_LOG.debug(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
+        _EXP_LOG.info(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
                       f"cert_valid={_cert_valid}  ip={_ip_hint or '?'}")
     # ── DB ─────────────────────────────────────────────────────────────────────
     def _verify_db_schema(self) -> None:
