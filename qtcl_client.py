@@ -13996,6 +13996,22 @@ class QtclClientApp:
                             "node_id": node_id
                         })
                 _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
+            
+            # ── CRITICAL: Add SELF to local p2p_peers DB for self-recognition ──
+            try:
+                import sqlite3
+                if self._db:
+                    host = ext_addr.split(':')[0] if ':' in ext_addr else ext_addr
+                    port = int(ext_addr.split(':')[1]) if ':' in ext_addr else _P2P_PORT
+                    self._db.execute("""
+                        INSERT OR REPLACE INTO p2p_peers
+                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (node_id[:16], host, port, height, int(time.time()), 0))
+                    _EXP_LOG.info(f"[P2P] 🪞 SELF added to local DB: {node_id[:16]}… at {host}:{port}")
+            except Exception as _dbe:
+                _EXP_LOG.debug(f"[P2P] Failed to add self to local DB: {_dbe}")
+            
             # Get peers from Koyeb
             peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
             if peers_resp and peers_resp.get('peers'):
@@ -14053,15 +14069,19 @@ class QtclClientApp:
                                 if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
                                 else f"{_self_ip}:9091")
                         _ext_host = _ext.split(':')[0] if ':' in _ext else _self_ip
+                        _ext_port = int(_ext.split(':')[1]) if ':' in _ext else 9091
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (_nid, _ext_host, 9091, bh,
+                        """, (_nid, _ext_host, _ext_port, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
+                        _EXP_LOG.debug(f"[P2P] 🪞 SELF heartbeat: {_nid[:16]}… at {_ext_host}:{_ext_port} h={bh}")
+                    except Exception as _dbe:
+                        _EXP_LOG.debug(f"[P2P] Heartbeat DB update failed: {_dbe}")
                     except Exception: pass
                 if _P2P_NODE and _P2P_NODE._started and False:
                     m = _LIVE_RPC_ORACLE.get_latest_measurement()
