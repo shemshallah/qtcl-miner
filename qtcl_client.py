@@ -2193,11 +2193,34 @@ class QtclP2PNode:
                     # Fan-out our current peer table to all connected peers
                     try:
                         _my_peers = _load_local_peers(max_age_s=600)  # recent peers only
-                        if _my_peers and len(_my_peers) > 2:
-                            _peer_table_payload = [
-                                {'node_id': p[0][:16], 'host': p[0], 'port': int(p[1])}
-                                for p in _my_peers[:24]
-                            ]
+                        # Build peer table payload: include SELF for debug visibility
+                        _peer_table_payload = []
+                        # Add self first
+                        if hasattr(self, 'p2p_node') and self.p2p_node:
+                            try:
+                                _self_ext = self.p2p_node.external_addr or ''
+                                if ':' in _self_ext:
+                                    _self_host, _self_port_str = _self_ext.rsplit(':', 1)
+                                    _peer_table_payload.append({
+                                        'node_id': self.p2p_node.node_id[:16],
+                                        'host': _self_host,
+                                        'port': int(_self_port_str),
+                                        'chain_height': int(self.koyeb_state.block_height or 0)
+                                    })
+                            except Exception:
+                                pass
+                        # Add other known peers
+                        if _my_peers:
+                            for p in _my_peers[:23]:  # leave room for self (24 total max)
+                                try:
+                                    _peer_table_payload.append({
+                                        'node_id': p[0][:16],
+                                        'host': p[0],
+                                        'port': int(p[1])
+                                    })
+                                except Exception:
+                                    pass
+                        if _peer_table_payload and len(_peer_table_payload) > 1:
                             for host, port in _my_peers[:8]:  # gossip to up to 8 random peers
                                 _gossip_peer_table_to_peer(host, port, _peer_table_payload)
                     except Exception:
@@ -18068,6 +18091,7 @@ class NodeRPCMeshServer:
     def _rpc_registerPeer(self, params: list) -> dict:
         """Register a peer announcing itself to this node's peer table.
         Peer gossip entry point — used by other nodes to introduce themselves.
+        Also allows self-registration for debug purposes (recognizing own node ID).
         
         Params: [{"node_id": "...", "host": "...", "port": 9091, "chain_height": N}]
         """
@@ -18081,6 +18105,14 @@ class NodeRPCMeshServer:
             if not node_id or not host or len(node_id) < 8:
                 return {"registered": False, "error": "invalid peer info"}
             
+            # Check if this is self registration
+            is_self = False
+            try:
+                if hasattr(self, '_app') and hasattr(self._app, 'p2p_node') and self._app.p2p_node:
+                    is_self = (node_id == self._app.p2p_node.node_id)
+            except Exception:
+                pass
+            
             # Upsert to local DB
             try:
                 import sqlite3
@@ -18092,11 +18124,14 @@ class NodeRPCMeshServer:
                 """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
                 conn.commit()
                 conn.close()
-                _EXP_LOG.debug(f"[MESH-P2P] Peer registered: {node_id[:16]}… at {host}:{port}")
+                if is_self:
+                    _EXP_LOG.info(f"[MESH-P2P] 🪞 SELF recognized: {node_id[:16]}… at {host}:{port}")
+                else:
+                    _EXP_LOG.debug(f"[MESH-P2P] Peer registered: {node_id[:16]}… at {host}:{port}")
             except Exception as e:
                 _EXP_LOG.debug(f"[MESH-P2P] DB upsert failed: {e}")
             
-            return {"registered": True, "node_id": node_id[:16]}
+            return {"registered": True, "node_id": node_id[:16], "is_self": is_self}
         except Exception as e:
             return {"registered": False, "error": str(e)}
 
@@ -18104,6 +18139,7 @@ class NodeRPCMeshServer:
         """Ingest a peer table broadcast from another node (P2P gossip).
         
         Used to propagate known peers through the network mesh.
+        Also ingests self if included in announcement (for debug visibility).
         Params: [{"peers": [{"node_id": "...", "host": "...", "port": 9091}, ...]}]
         """
         try:
@@ -18113,7 +18149,16 @@ class NodeRPCMeshServer:
             if not isinstance(peers, list):
                 return {"ingested": 0, "error": "peers must be list"}
             
+            # Get self node_id for logging
+            self_node_id = None
+            try:
+                if hasattr(self, '_app') and hasattr(self._app, 'p2p_node') and self._app.p2p_node:
+                    self_node_id = self._app.p2p_node.node_id
+            except Exception:
+                pass
+            
             ingested = 0
+            self_ingested = False
             try:
                 import sqlite3
                 conn = sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False)
@@ -18125,21 +18170,28 @@ class NodeRPCMeshServer:
                         chain_height = int(p.get('chain_height') or 0)
                         
                         if node_id and host and len(node_id) >= 8:
+                            # Check if this is self
+                            is_self_peer = (self_node_id and node_id == self_node_id)
                             conn.execute("""
                                 INSERT OR REPLACE INTO p2p_peers
                                 (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
                                 VALUES (?, ?, ?, ?, ?, ?)
                             """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
                             ingested += 1
+                            if is_self_peer:
+                                self_ingested = True
                     except Exception:
                         continue
                 conn.commit()
                 conn.close()
-                _EXP_LOG.debug(f"[MESH-P2P] Announced peer table: ingested {ingested}/{len(peers)} peers")
+                if self_ingested:
+                    _EXP_LOG.info(f"[MESH-P2P] 🪞 SELF in announced table: ingested {ingested}/{len(peers)} peers (self included)")
+                else:
+                    _EXP_LOG.debug(f"[MESH-P2P] Announced peer table: ingested {ingested}/{len(peers)} peers")
             except Exception as e:
                 _EXP_LOG.debug(f"[MESH-P2P] Announce ingest failed: {e}")
             
-            return {"ingested": ingested, "total": len(peers)}
+            return {"ingested": ingested, "total": len(peers), "self_ingested": self_ingested}
         except Exception as e:
             return {"ingested": 0, "error": str(e)}
 
