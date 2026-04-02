@@ -11526,7 +11526,7 @@ class P2PNode:
         self.external_addr = None
         self._running = False
     
-    def start(self) -> None:
+    def start(self, app_instance=None) -> None:
         if self._running:
             return
         self.external_addr = ExternalAddressResolver.resolve()
@@ -11543,7 +11543,8 @@ class P2PNode:
         self._running = True
         self.sync_mgr.start_daemon()
         self._start_peer_bootstrap_daemon()
-        self._start_peer_discovery_daemon()
+        if app_instance:
+            self._start_peer_discovery_daemon(app_instance)
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
     
     def _start_peer_discovery_daemon(self, app_instance) -> None:
@@ -13924,7 +13925,7 @@ class QtclClientApp:
             _bind_port = _port
             for _attempt in range(3):
                 try:
-                    self.p2p_node.start()
+                    self.p2p_node.start(app_instance=self)
                     _bind_success = True
                     break
                 except OSError as _bind_err:
