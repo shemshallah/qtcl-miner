@@ -13771,8 +13771,7 @@ class QtclClientApp:
                     _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_err}")
 
                 # Run full entanglement cycle
-                print(f"[ORACLE] Cycle {_cycle}: Calling entanglement engine...", flush=True)
-                _EXP_LOG.debug(f"[TRIPARTITE] Calling run_entanglement_cycle...")
+                _EXP_LOG.debug(f"[ORACLE] Cycle {_cycle}: Calling entanglement engine...")
                 try:
                     _result = _ent_engine.run_entanglement_cycle(
                         upstream_dm=_upstream_dm,
@@ -17571,21 +17570,17 @@ class QtclClientApp:
         print("║  P2P     : 9092 RPC (JSON-RPC 2.0 — NO REST API)           ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
-        print()
         # ── Show oracle identity status in banner ─────────────────────────────
         _oid = self._oracle_id
         if _oid.get("mode") == "wallet_bound":
-            print(f"  🔐 Oracle: {_oid['address']}")
-            print(f"     Wallet: {_oid.get('wallet_addr', '?')}")
-            _cv = (self._verify_oracle_cert(
-                       _oid["public_key"], _oid.get("wallet_addr",""), _oid.get("cert") or {})
-                   if _oid.get("cert") else False)
-            print(f"     Cert  : {'✅ valid' if _cv else '⚠  invalid'}")
+            logger.info(f"Oracle: {_oid['address']} [wallet-bound] wallet={_oid.get('wallet_addr', '?')}")
         else:
-            print(f"  👻 Oracle: {_oid['address']} (anonymous — no wallet binding)")
-        print()
+            logger.info(f"Oracle: {_oid['address']} [anonymous]")
+        
+        # Start registration in background thread
         _threading.Thread(target=self._broadcast_oracle_registration,
                           daemon=True, name="OracleRegBoot").start()
+        
         print("  ┌──────────────────────────────────────────────────────────┐")
         print("  │  1.) ⛏️   Mine                                            │")
         print("  │  2.) 💸  Transact       (+ live Pyth prices)             │")
