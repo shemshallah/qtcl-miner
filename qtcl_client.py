@@ -12369,13 +12369,20 @@ class QtclClientApp:
                                              ).reshape(8, 8)
                             else:
                                 _EXP_LOG.warning(f"[TRIPARTITE] upstream DM has no finite values")
+                    def _nv_t(v):
+                        try:
+                            f = float(v)
+                            return f if (_math.isfinite(f) and abs(f) < 1e15) else None
+                        except Exception:
+                            return None
                     upstream_fid = float(
-                        _up_snap.get('pq0_oracle_fidelity') or
-                        _up_snap.get('w_state_fidelity') or
-                        _up_snap.get('fidelity') or 0.0
+                        _nv_t(_up_snap.get('pq0_oracle_fidelity')) or
+                        _nv_t(_up_snap.get('w_state_fidelity')) or
+                        _nv_t(_up_snap.get('fidelity')) or
+                        _nv_t((_up_snap.get('w_state') or {}).get('fidelity')) or
+                        _nv_t((_up_snap.get('lattice') or {}).get('fidelity')) or
+                        _nv_t(_up_snap.get('client_fused_fidelity')) or 0.0
                     )
-                    if not _math.isfinite(upstream_fid):
-                        upstream_fid = 0.0
                 except Exception as _up_e:
                     _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_e}")
 
@@ -15178,6 +15185,21 @@ class QtclClientApp:
         # ── Start tripartite oracle (joint W4 with Koyeb as party-3) ───────
         self._start_tripartite_oracle()
         _nmt_time.sleep(2)  # let oracle complete one cycle before status
+
+        # ── Koyeb state sync loop — populates bridge_fidelity + upstream fid ──
+        def _koyeb_sync_loop():
+            """Sync koyeb_state every 15s so bridge/upstream display correctly."""
+            while True:
+                try:
+                    self.koyeb_state.sync(self.client_field, timeout=6)
+                    # Mirror upstream fidelity from koyeb_state if tripartite hasn't set it
+                    _ks_fid = self.koyeb_state.w_state_fidelity
+                    if _ks_fid > 0.0 and getattr(self, '_upstream_fid', 0.0) == 0.0:
+                        self._upstream_fid = _ks_fid
+                except Exception as _kse:
+                    _EXP_LOG.debug(f"[NODE] koyeb_sync: {_kse}")
+                _nmt_time.sleep(15)
+        _nmt.Thread(target=_koyeb_sync_loop, daemon=True, name="NodeKoyebSync").start()
 
         # ── Subscribe to peer oracle snapshots (pulls DMs into mesh queue) ─
         def _node_mesh_subscriber():
