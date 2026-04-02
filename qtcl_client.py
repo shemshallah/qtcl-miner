@@ -16399,9 +16399,9 @@ class NodeRPCMeshServer:
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_expires ON mempool(expires_at)")
             
-        # ═══════════════════════════════════════════════════════════════════════
-        # 9. pq0_entanglement_log — Tripartite pq0 entanglement chain
-        # ═══════════════════════════════════════════════════════════════════════
+            # ═══════════════════════════════════════════════════════════════════════
+            # 9. pq0_entanglement_log — Tripartite pq0 entanglement chain
+            # ═══════════════════════════════════════════════════════════════════════
             conn.execute("""CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 block_height            INTEGER NOT NULL,
@@ -16413,18 +16413,21 @@ class NodeRPCMeshServer:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)")
             # Migrate: add missing columns for existing databases
-            _pq0_cols = {
-                "pq0": "INTEGER DEFAULT 0",
-                "block_height": "INTEGER DEFAULT 0",
-                "oracle_ids": "TEXT DEFAULT ''",
-                "entanglement_matrix_hex": "TEXT DEFAULT ''",
-            }
-            for _col, _defn in _pq0_cols.items():
-                try:
-                    conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
-                    logger.debug(f"[DB] Added column pq0_entanglement_log.{_col}")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists - expected for existing DBs
+            # First check if pq0 column exists
+            _cursor = conn.execute("PRAGMA table_info(pq0_entanglement_log)")
+            _existing_cols = {row[1] for row in _cursor.fetchall()}
+            logger.info(f"[DB] pq0_entanglement_log columns: {_existing_cols}")
+            
+            for _col, _defn in [("pq0","INTEGER DEFAULT 0"),("block_height","INTEGER DEFAULT 0"),
+                                ("oracle_ids","TEXT DEFAULT ''"),("entanglement_matrix_hex","TEXT DEFAULT ''")]:
+                if _col not in _existing_cols:
+                    try:
+                        conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
+                        logger.info(f"[DB] ✅ Added column pq0_entanglement_log.{_col}")
+                    except Exception as _e:
+                        logger.warning(f"[DB] ALTER failed for {_col}: {_e}")
+                else:
+                    logger.debug(f"[DB] Column pq0_entanglement_log.{_col} already exists")
             
             # ═══════════════════════════════════════════════════════════════════════
             # 10. wstate_consensus_log — W-state BFT consensus log
