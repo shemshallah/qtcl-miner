@@ -3112,12 +3112,105 @@ class LocalBlockchainDB:
                 payload     TEXT    NOT NULL DEFAULT '',
                 ts          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             )""",
+            """CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_height            INTEGER NOT NULL DEFAULT 0,
+                pq0                     INTEGER NOT NULL DEFAULT 0,
+                oracle_ids              TEXT    NOT NULL DEFAULT '',
+                entanglement_matrix_hex TEXT    NOT NULL DEFAULT '',
+                created_at              REAL    DEFAULT (strftime('%s','now'))
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)""",
+            """CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)""",
+            """CREATE TABLE IF NOT EXISTS p2p_peers (
+                node_id_hex     TEXT    PRIMARY KEY,
+                host            TEXT    NOT NULL DEFAULT '',
+                port            INTEGER NOT NULL DEFAULT 9091,
+                chain_height    INTEGER NOT NULL DEFAULT 0,
+                last_seen_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                last_heartbeat_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                ban_score       INTEGER NOT NULL DEFAULT 0,
+                last_fidelity   REAL    NOT NULL DEFAULT 0.0,
+                latency_ms      REAL    NOT NULL DEFAULT 0.0,
+                services        INTEGER NOT NULL DEFAULT 1,
+                protocol_version INTEGER NOT NULL DEFAULT 2,
+                source          TEXT    NOT NULL DEFAULT 'unknown',
+                external_addr   TEXT    NOT NULL DEFAULT '',
+                capabilities    TEXT    NOT NULL DEFAULT '[]'
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_peer_host ON p2p_peers(host)""",
+            """CREATE INDEX IF NOT EXISTS idx_peer_last_seen ON p2p_peers(last_seen_at DESC)""",
+            """CREATE INDEX IF NOT EXISTS idx_peer_chain_height ON p2p_peers(chain_height DESC)""",
+            """CREATE TABLE IF NOT EXISTS wstate_consensus_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_height     INTEGER NOT NULL DEFAULT 0,
+                median_fidelity  REAL    NOT NULL DEFAULT 0.0,
+                agreement_score  REAL    NOT NULL DEFAULT 0.0,
+                peer_count       INTEGER NOT NULL DEFAULT 0,
+                quorum_hash_hex  TEXT    NOT NULL DEFAULT '',
+                pow_seed         TEXT    NOT NULL DEFAULT '',
+                created_at       REAL    DEFAULT (strftime('%s','now'))
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_wscl_height ON wstate_consensus_log(block_height)""",
+            """CREATE INDEX IF NOT EXISTS idx_wscl_fidelity ON wstate_consensus_log(median_fidelity)""",
+            """CREATE TABLE IF NOT EXISTS snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_height    INTEGER,
+                oracle_pub      TEXT,
+                sig_hex         TEXT,
+                created_at      REAL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_snap_height ON snapshots(block_height)""",
+            """CREATE INDEX IF NOT EXISTS idx_snap_oracle ON snapshots(oracle_pub)""",
+            """CREATE TABLE IF NOT EXISTS mempool (
+                tx_hash      TEXT PRIMARY KEY,
+                raw_hex      TEXT NOT NULL,
+                received_at  REAL DEFAULT (strftime('%s','now')),
+                expires_at   REAL DEFAULT 0.0
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_mempool_expires ON mempool(expires_at)""",
         ]
         for _tbl_sql in _extended_tables:
             try:
                 cursor.execute(_tbl_sql)
             except Exception:
                 pass
+        # ── ALTER TABLE migrations for existing databases ───────────────────────
+        # Migrate pq0_entanglement_log: add missing columns
+        # Note: existing databases may have local_pq0/server_pq0/epsilon_matrix_hex
+        # but code uses pq0/entanglement_matrix_hex
+        try:
+            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(pq0_entanglement_log)").fetchall()}
+            for _col, _defn in [("pq0","INTEGER DEFAULT 0"),("block_height","INTEGER DEFAULT 0"),
+                                ("oracle_ids","TEXT DEFAULT ''"),("entanglement_matrix_hex","TEXT DEFAULT ''")]:
+                if _col not in _cols:
+                    cursor.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
+        except Exception:
+            pass
+        # Migrate wstate_consensus_log: add missing columns
+        try:
+            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(wstate_consensus_log)").fetchall()}
+            for _col, _defn in [("median_fidelity","REAL DEFAULT 0"),("agreement_score","REAL DEFAULT 0"),
+                                ("peer_count","INTEGER DEFAULT 0"),("quorum_hash_hex","TEXT DEFAULT ''"),
+                                ("pow_seed","TEXT DEFAULT ''")]:
+                if _col not in _cols:
+                    cursor.execute(f"ALTER TABLE wstate_consensus_log ADD COLUMN {_col} {_defn}")
+        except Exception:
+            pass
+        # Migrate p2p_peers: add missing columns
+        try:
+            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(p2p_peers)").fetchall()}
+            for _col, _defn in [("chain_height","INTEGER DEFAULT 0"),("last_seen_at","INTEGER DEFAULT 0"),
+                                ("first_seen_at","INTEGER DEFAULT 0"),("last_heartbeat_at","INTEGER DEFAULT 0"),
+                                ("ban_score","INTEGER DEFAULT 0"),("last_fidelity","REAL DEFAULT 0.0"),
+                                ("latency_ms","REAL DEFAULT 0.0"),("services","INTEGER DEFAULT 1"),
+                                ("protocol_version","INTEGER DEFAULT 2"),("source","TEXT DEFAULT 'unknown'"),
+                                ("external_addr","TEXT DEFAULT ''"),("capabilities","TEXT DEFAULT '[]'")]:
+                if _col not in _cols:
+                    cursor.execute(f"ALTER TABLE p2p_peers ADD COLUMN {_col} {_defn}")
+        except Exception:
+            pass
         # ── Server-mirrored tables (from SQL patches) ──────────────────────────
         _server_mirror_tables = [
             # wallet_addresses — mirrors server PostgreSQL wallet_addresses table
@@ -14970,16 +15063,22 @@ class QtclClientApp:
                     with urllib.request.urlopen(svc, timeout=5) as resp:
                         ip = resp.read().decode().strip()
                         if ip and '.' in ip:
+                            print(f"  [DEBUG] External IP from {svc}: {ip}", flush=True)
                             return ip
-                except Exception:
+                except Exception as e:
+                    print(f"  [DEBUG] Failed to get IP from {svc}: {e}", flush=True)
                     continue
+            print(f"  [DEBUG] All external IP services failed", flush=True)
             return ""
         
         # Try to get real external IP
+        global _MY_IP  # Update the module-level _MY_IP with detected external IP
         _detected_ip = _get_external_ip()
         if _detected_ip:
             _external_ip = _detected_ip
+            _MY_IP = _detected_ip  # Update global so all code uses the public IP
             print(f"  ✅ External IP detected: {_external_ip}", flush=True)
+            print(f"  [DEBUG] _MY_IP updated to: {_MY_IP}", flush=True)
         else:
             _external_ip = _MY_IP or '0.0.0.0'
             if _external_ip.startswith(('172.16.', '192.168.', '10.', '127.')):
@@ -15008,17 +15107,14 @@ class QtclClientApp:
                         _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
                         _bport = int(_bp.get('port') or 9091)
                         if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _external_ip):
-                            try:
-                                self._db.execute("""
-                                    INSERT OR REPLACE INTO p2p_peers 
-                                    (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
-                                    VALUES (?, ?, ?, ?, 'koyeb_bootstrap', ?, ?)
-                                """, (str(_bp.get('node_id', _bhost)), _bhost, _bport, 
-                                      int(_bp.get('block_height', 0)),
-                                      int(_nmt_time.time()), int(_nmt_time.time())))
-                                print(f"    + {_bhost}:{_bport}", flush=True)
-                            except Exception:
-                                pass
+                            self._db.execute("""
+                                INSERT OR REPLACE INTO p2p_peers 
+                                (node_id_hex, host, port, chain_height, last_seen_at)
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (str(_bp.get('node_id', _bhost)), _bhost, _bport,
+                                  int(_bp.get('block_height', 0)),
+                                  int(_nmt_time.time())))
+                            print(f"    + {_bhost}:{_bport}", flush=True)
                     self._db.commit()
         except Exception as _re:
             print(f"  ⚠️  Main server registration failed: {_re}", flush=True)
@@ -15056,28 +15152,11 @@ class QtclClientApp:
                         if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _external_ip):
                             self._db.execute("""
                                 INSERT OR REPLACE INTO p2p_peers 
-                                (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
-                                VALUES (?, ?, ?, ?, 'bootstrap', ?, ?)
-                            """, (str(_bp.get('node_id', _bp.get('peer_id', _bhost))), 
+                                (node_id_hex, host, port, chain_height, last_seen_at)
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (str(_bp.get('node_id', _bp.get('peer_id', _bhost))),
                                   _bhost, _bport, int(_bp.get('chain_height', 0)),
-                                  int(_nmt_time.time()), int(_nmt_time.time())))
-                            print(f"    + {_bhost}:{_bport}", flush=True)
-                    self._db.commit()
-                else:
-                    print(f"  ⚠️  Bootstrap returned no peers", flush=True)
-        except Exception as _be:
-            print(f"  ⚠️  Bootstrap server error: {_be}", flush=True)
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # CRITICAL: Add bootstrap server directly to peer list
-        # ═══════════════════════════════════════════════════════════════════
-        try:
-            self._db.execute("""
-                INSERT OR REPLACE INTO p2p_peers 
-                (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?, 'bootstrap_hardcoded', ?, ?)
-            """, ("bootstrap-zocomputer-ts4", "ts4.zocomputer.io", 10206, 0,
-                  int(_nmt_time.time()), int(_nmt_time.time())))
+                                  int(_nmt_time.time())))
             self._db.commit()
             print(f"  ✅ Bootstrap server added: ts4.zocomputer.io:10206", flush=True)
         except Exception:
@@ -15152,7 +15231,7 @@ class QtclClientApp:
                     f"  ⚛️  QTCL NODE  cycle={_cycle}\n"
                     f"  W4-fused : {_lff:.4f}   upstream : {_upf:.4f}   bridge : {_ks.bridge_fidelity:.4f}\n"
                     f"  peers    : {_peers}        mesh-queue: {_qsz}       joint-dim: {_jdim}×{_jdim}\n"
-                    f"  node_ip  : {_MY_IP or 'unknown'}     port: {_P2P_PORT}",
+                    f"  node_ip  : {_external_ip or _MY_IP or 'unknown'}     port: {_P2P_PORT}",
                     flush=True
                 )
         except KeyboardInterrupt:
@@ -16961,13 +17040,13 @@ class NodeRPCMeshServer:
                     addr = p.get("external_addr")
                     if pid and addr:
                         conn.execute("""
-                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at)
+                            VALUES (?, ?, ?, ?, ?)
                             ON CONFLICT(node_id_hex) DO UPDATE SET
                                 host          = EXCLUDED.host,
                                 chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height),
                                 last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at)
-                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), int(p.get("last_seen", now)), now))
+                        """, (pid, addr, p.get("port", 9091), p.get("chain_height", 0), int(p.get("last_seen", now))))
                         new_count += 1
                 conn.commit()
             finally:
@@ -16987,12 +17066,12 @@ class NodeRPCMeshServer:
         now = int(time.time())
         try:
             conn.execute("""
-                INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at, first_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(node_id_hex) DO UPDATE SET
                     last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at),
                     chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height)
-            """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), now, now))
+            """, (pid, p.get("external_addr"), p.get("port", 9091), p.get("chain_height", 0), now))
             conn.commit()
             return {"status": "ok", "timestamp": time.time()}
         finally:
