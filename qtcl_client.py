@@ -2013,26 +2013,59 @@ class QtclP2PNode:
                 _EXP_LOG.debug(f"[P2P] drain_loop: {_e}")
     def _peer_exchange(self) -> None:
         """
-        Priority-ordered peer discovery loop. Runs at startup then every 90s.
-        Priority on each cycle:
-          1. LOCAL  qtcl_blockchain.db  p2p_peers table  (freshest — zero latency)
-          2. P2P    already-connected peers' known-peer gossip  (C layer)
-          3. KOYEB  /api/p2p/peer_exchange + /api/peers/list  (only if local is
-                    stale OR we have fewer than 2 connected peers)
-        DM freshness gate: if the oracle DM age < 30s we have a live SSE source
-        and local P2P peers are preferred.  If DM age > 60s the oracle is stale
-        so we aggressively re-query koyeb/supabase for fresh peers.
-        Every new peer is persisted back to qtcl_blockchain.db immediately.
-        ❤️  The more peers the more entangled the network
+        Pure HTTP RPC peer discovery loop — runs every 90s after startup.
+        
+        Workflow per cycle:
+          1. Load local peers from qtcl_blockchain.db (freshest, zero latency)
+          2. For each local peer: dial HTTP to their P2P mesh port 9091
+          3. If peer responds: call their qtcl_broadcastPeerTable RPC
+          4. Ingest returned peers into local DB (dedup by node_id)
+          5. Attempt to dial new peers discovered via RPC
+          6. Register self with Koyeb bootstrap
+          7. Fetch canonical peer list from Koyeb via qtcl_broadcastPeerTable
+          8. Fan-out our peer table to all reachable peers (gossip)
+        
+        Every new peer is persisted to qtcl_blockchain.db immediately.
+        This creates a self-healing mesh where peers discover each other
+        via both local DB and remote peer table broadcasts.
         """
         import json as _pj, time as _pt, sqlite3 as _psq
-        _oracle_url = ENTROPY_SERVER_URL
+        from urllib.request import Request as _Rq, urlopen as _uo
+        from urllib.error import URLError as _UE
+        
         _connected_this_cycle: set = set()
-        def _connect_peer(host, port): return False
-        def _load_local_peers(max_age_s=7200):
-            """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
+        _dial_timeout = 3.0
+        
+        def _dial_peer_and_fetch_table(host: str, port: int) -> list:
+            """
+            HTTP dial to peer's mesh port 9091.
+            Call qtcl_broadcastPeerTable RPC.
+            Return enriched peer list or empty list on failure.
+            """
+            if not host or port <= 0:
+                return []
             try:
-                _already = set()
+                url = f"http://{host}:{port}/rpc"
+                payload = _pj.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "qtcl_broadcastPeerTable",
+                    "params": {"limit": 32},
+                    "id": 1
+                }).encode('utf-8')
+                req = _Rq(url, data=payload, headers={'Content-Type': 'application/json'})
+                with _uo(req, timeout=_dial_timeout) as resp:
+                    data = _pj.loads(resp.read().decode('utf-8'))
+                    if data.get('result') and data['result'].get('peers'):
+                        return data['result']['peers']
+            except (_UE, TimeoutError, OSError, _pj.JSONDecodeError) as _de:
+                _EXP_LOG.debug(f"[P2P] Failed to dial {host}:{port}: {type(_de).__name__}")
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] Unexpected error dialing {host}:{port}: {_e}")
+            return []
+        
+        def _load_local_peers(max_age_s=7200):
+            """Read p2p_peers from qtcl_blockchain.db, skip loopback."""
+            try:
                 cutoff = int(_pt.time()) - max_age_s
                 with _psq.connect(_db_path, timeout=3) as _c:
                     rows = _c.execute("""
@@ -2040,84 +2073,143 @@ class QtclP2PNode:
                         WHERE last_seen_at > ? AND ban_score < 100
                           AND host NOT IN ('127.0.0.1','localhost','')
                         ORDER BY chain_height DESC, last_seen_at DESC
-                        LIMIT 64
+                        LIMIT 32
                     """, (cutoff,)).fetchall()
                 return [(r[0], r[1]) for r in rows if r[0]]
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
                 return []
-        def _fetch_koyeb_peers():
-            """POST to koyeb peer_exchange + peers/list. Returns raw peer dicts."""
-            from urllib.request import Request as _Rq, urlopen as _uo
-            peers = []
+        
+        def _upsert_peer_to_db(node_id: str, host: str, port: int, chain_height: int = 0):
+            """Persist discovered peer to local DB."""
             try:
-                # Use RPC: qtcl_getPeers instead of REST /api/peers/list
-                rpc_resp = self._rpc_client.call("qtcl_getPeers", {"limit": 50}) if hasattr(self, '_rpc_client') else None
-                if rpc_resp and "result" in rpc_resp:
-                    peers += rpc_resp["result"] if isinstance(rpc_resp["result"], list) else []
+                with _psq.connect(_db_path, timeout=3) as _c:
+                    _c.execute("""
+                        INSERT OR REPLACE INTO p2p_peers
+                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (node_id[:16], host, port, chain_height, int(_pt.time()), 0))
+                    _c.commit()
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] DB upsert failed {node_id[:16]}…: {_e}")
+        
+        def _fetch_koyeb_peer_table():
+            """Fetch enriched peer table from Koyeb bootstrap via qtcl_broadcastPeerTable."""
+            try:
+                if hasattr(self, '_rpc_client') and self._rpc_client:
+                    resp = self._rpc_client.call("qtcl_broadcastPeerTable", {"limit": 48})
+                    if resp and "result" in resp and resp["result"].get("peers"):
+                        return resp["result"]["peers"]
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] Koyeb peer table fetch failed: {_e}")
+            return []
+        
+        def _gossip_peer_table_to_peer(host: str, port: int, peer_table: list):
+            """
+            Fan-out peer table to a single peer via qtcl_announcePeerTable RPC.
+            Asynchronous fire-and-forget.
+            """
+            if not host or port <= 0 or not peer_table:
+                return
+            try:
+                url = f"http://{host}:{port}/rpc"
+                payload = _pj.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "qtcl_announcePeerTable",
+                    "params": {"peers": peer_table},
+                    "id": 1
+                }).encode('utf-8')
+                req = _Rq(url, data=payload, headers={'Content-Type': 'application/json'})
+                # Non-blocking: spawn thread to prevent blocking the main loop
+                import threading as _th
+                _th.Thread(target=lambda: (
+                    _uo(req, timeout=_dial_timeout) if _uo else None
+                ), daemon=True).start()
             except Exception:
-                pass
-            return peers
-        _pe_cycle   = 0
-        n_connected = 0   # Bug #7: was undefined
-        _lo_ts      = 0.0
+                pass  # silent — gossip is best-effort
+        
+        _pe_cycle = 0
         while not self._stop.is_set():
             try:
                 _pe_cycle += 1
-                _connected_this_cycle.clear()  # reset per-cycle dedup set
-                # peer count via PeerManager if available, else zero
-                _n_total = len(getattr(self, 'peer_mgr', None) and
-                               getattr(self.peer_mgr, 'peers', {}) or {})
-                if _n_total > n_connected:
-                    n_connected = max(n_connected, _n_total // 2)
-                _lo_ts      = time.time()
-                dm_age      = _pt.time() - _lo_ts
-                dm_fresh    = _lo_ts > 1e9 and dm_age < 30.0 and dm_age < 86400
-                need_peers  = n_connected < 4           # want at least 4 peers
-                dm_stale    = (not dm_fresh) or dm_age > 60.0
-                new_connections = 0
-                # ── Priority 1: local qtcl_blockchain.db ─────────────────────
+                _connected_this_cycle.clear()
+                new_dials = 0
+                new_ingests = 0
+                
+                # ── Priority 1: Local DB peers ──────────────────────────
                 local_peers = _load_local_peers(max_age_s=7200)
+                for host, port in local_peers:
+                    peer_key = f"{host}:{port}"
+                    if peer_key in _connected_this_cycle:
+                        continue
+                    _connected_this_cycle.add(peer_key)
+                    
+                    # Dial and fetch their peer table
+                    remote_peers = _dial_peer_and_fetch_table(host, port)
+                    if remote_peers:
+                        new_dials += 1
+                        # Ingest remote peers into local DB
+                        for rp in remote_peers:
+                            try:
+                                rp_host = rp.get('host') or ''
+                                rp_port = rp.get('port') or 9091
+                                rp_id = rp.get('node_id', '')
+                                rp_height = rp.get('chain_height', 0)
+                                if rp_host and rp_id and rp_id != (self.p2p_node.node_id if hasattr(self, 'p2p_node') and self.p2p_node else ''):
+                                    _upsert_peer_to_db(rp_id, rp_host, int(rp_port), int(rp_height))
+                                    new_ingests += 1
+                            except Exception:
+                                pass
+                
                 if local_peers:
-                    for host, port in local_peers:
-                        if _connect_peer(host, port):
-                            new_connections += 1
-                    _dm_age_str = f"{dm_age:.0f}s" if dm_fresh or (dm_age < 86400 and _lo_ts > 1e9) else "cold"
-                    if local_peers:
-                        _already_n = len(local_peers) - new_connections - (len(local_peers) - len([p for p in local_peers if p]))
-                        _EXP_LOG.info(
-                            f"[P2P] 🗄️  DB: {new_connections} new / {len(local_peers)} stored "
-                            f"(dm_age={_dm_age_str})")
-                if need_peers or dm_stale or not local_peers:
-                    koyeb_peers = _fetch_koyeb_peers()
-                    kc = 0
-                    for p in koyeb_peers[:48]:
-                        host = str(p.get('host') or p.get('ip_address') or
-                                   p.get('ip') or '')
-                        port = int(p.get('port') or 9091)
-                        if _connect_peer(host, port):
-                            kc += 1
-                    new_connections += kc
-                    if kc:
-                        _EXP_LOG.info(
-                            f"[P2P] 🌐 koyeb: {kc}/{len(koyeb_peers)} new peers "
-                            f"(need_peers={need_peers}, dm_stale={dm_stale})")
-                else:
-                    if _pe_cycle % 5 == 0:
-                        try:
-                            _my_ext = _MY_IP or 'localhost'
-                            _ann = _pj.dumps({
-                                'node_id':      self._node_id,
-                                'port':         self._port,
-                                'gossip_url':   f"http://{_my_ext}:{self._port}",
-                                'block_height': n_connected,
-                            })
-                            # Register peer via RPC instead of REST /api/peers/register
-                            if hasattr(self, '_rpc_client') and self._rpc_client:
-                                self._rpc_client.call("qtcl_registerPeer", _ann)
-                        except Exception:
-                            pass
-                    _EXP_LOG.debug(
+                    _EXP_LOG.info(f"[P2P] 🗄️  Local DB: {new_dials} peers dialed, {new_ingests} new peers ingested")
+                
+                # ── Priority 2: Fetch from Koyeb bootstrap ──────────────
+                if _pe_cycle % 2 == 0 or new_ingests < 2:  # every other cycle or if we're hungry
+                    koyeb_peers = _fetch_koyeb_peer_table()
+                    if koyeb_peers:
+                        for kp in koyeb_peers:
+                            try:
+                                kp_host = kp.get('host') or ''
+                                kp_port = kp.get('port') or 9091
+                                kp_id = kp.get('node_id', '')
+                                kp_height = kp.get('chain_height', 0)
+                                peer_key = f"{kp_host}:{kp_port}"
+                                if kp_host and kp_id and peer_key not in _connected_this_cycle:
+                                    _connected_this_cycle.add(peer_key)
+                                    _upsert_peer_to_db(kp_id, kp_host, int(kp_port), int(kp_height))
+                            except Exception:
+                                pass
+                        _EXP_LOG.info(f"[P2P] 🌐 Koyeb: {len(koyeb_peers)} peers updated")
+                
+                # ── Priority 3: Register self + gossip ──────────────────
+                if _pe_cycle % 3 == 0:
+                    try:
+                        if hasattr(self, '_register_with_koyeb'):
+                            self._register_with_koyeb()
+                    except Exception:
+                        pass
+                    
+                    # Fan-out our current peer table to all connected peers
+                    try:
+                        _my_peers = _load_local_peers(max_age_s=600)  # recent peers only
+                        if _my_peers and len(_my_peers) > 2:
+                            _peer_table_payload = [
+                                {'node_id': p[0][:16], 'host': p[0], 'port': int(p[1])}
+                                for p in _my_peers[:24]
+                            ]
+                            for host, port in _my_peers[:8]:  # gossip to up to 8 random peers
+                                _gossip_peer_table_to_peer(host, port, _peer_table_payload)
+                    except Exception:
+                        pass
+                
+                _EXP_LOG.debug(f"[P2P] ✅ Peer exchange cycle {_pe_cycle} complete")
+                _pt.sleep(90.0)  # wait 90s before next cycle
+                
+            except Exception as _pe:
+                _EXP_LOG.error(f"[P2P] Peer exchange fatal error: {_pe}")
+                _pt.sleep(10.0)
+
                         f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
                         f"local-only cycle")
                 _n_total_check = _n_total  # Bug #7: was undefined
@@ -17991,6 +18083,84 @@ class NodeRPCMeshServer:
         result = self._fetch_server_rpc("qtcl_submitTransaction", [tx])
         return result or {"accepted": False, "error": "main server unreachable"}
 
+    def _rpc_registerPeer(self, params: list) -> dict:
+        """Register a peer announcing itself to this node's peer table.
+        Peer gossip entry point — used by other nodes to introduce themselves.
+        
+        Params: [{"node_id": "...", "host": "...", "port": 9091, "chain_height": N}]
+        """
+        try:
+            peer_info = params[0] if params and isinstance(params[0], dict) else {}
+            node_id = str(peer_info.get('node_id') or '')
+            host = str(peer_info.get('host') or '')
+            port = int(peer_info.get('port') or 9091)
+            chain_height = int(peer_info.get('chain_height') or 0)
+            
+            if not node_id or not host or len(node_id) < 8:
+                return {"registered": False, "error": "invalid peer info"}
+            
+            # Upsert to local DB
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False)
+                conn.execute("""
+                    INSERT OR REPLACE INTO p2p_peers
+                    (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
+                conn.commit()
+                conn.close()
+                _EXP_LOG.debug(f"[MESH-P2P] Peer registered: {node_id[:16]}… at {host}:{port}")
+            except Exception as e:
+                _EXP_LOG.debug(f"[MESH-P2P] DB upsert failed: {e}")
+            
+            return {"registered": True, "node_id": node_id[:16]}
+        except Exception as e:
+            return {"registered": False, "error": str(e)}
+
+    def _rpc_announcePeerTable(self, params: list) -> dict:
+        """Ingest a peer table broadcast from another node (P2P gossip).
+        
+        Used to propagate known peers through the network mesh.
+        Params: [{"peers": [{"node_id": "...", "host": "...", "port": 9091}, ...]}]
+        """
+        try:
+            announce = params[0] if params and isinstance(params[0], dict) else {}
+            peers = announce.get('peers') or []
+            
+            if not isinstance(peers, list):
+                return {"ingested": 0, "error": "peers must be list"}
+            
+            ingested = 0
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False)
+                for p in peers[:32]:  # limit to prevent spam
+                    try:
+                        node_id = str(p.get('node_id') or '')
+                        host = str(p.get('host') or '')
+                        port = int(p.get('port') or 9091)
+                        chain_height = int(p.get('chain_height') or 0)
+                        
+                        if node_id and host and len(node_id) >= 8:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO p2p_peers
+                                (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
+                            ingested += 1
+                    except Exception:
+                        continue
+                conn.commit()
+                conn.close()
+                _EXP_LOG.debug(f"[MESH-P2P] Announced peer table: ingested {ingested}/{len(peers)} peers")
+            except Exception as e:
+                _EXP_LOG.debug(f"[MESH-P2P] Announce ingest failed: {e}")
+            
+            return {"ingested": ingested, "total": len(peers)}
+        except Exception as e:
+            return {"ingested": 0, "error": str(e)}
+
     # ─────────────────────────────────────────────────────────────────────────
     # RPC dispatcher
     # ─────────────────────────────────────────────────────────────────────────
@@ -18229,6 +18399,8 @@ NodeRPCMeshServer._METHODS = {
     "qtcl_getPq0Matrix":        NodeRPCMeshServer._rpc_getPq0Matrix,
     "qtcl_getConsensusSnapshot":NodeRPCMeshServer._rpc_getConsensusSnapshot,
     "qtcl_getPeers":            NodeRPCMeshServer._rpc_getPeers,
+    "qtcl_registerPeer":        NodeRPCMeshServer._rpc_registerPeer,        # ← P2P gossip entry
+    "qtcl_announcePeerTable":   NodeRPCMeshServer._rpc_announcePeerTable,   # ← P2P table broadcast
     "qtcl_getWalletBalance":    NodeRPCMeshServer._rpc_getWalletBalance,
     "qtcl_getBalance":          NodeRPCMeshServer._rpc_getWalletBalance,
     "qtcl_getMempoolInfo":      NodeRPCMeshServer._rpc_getMempoolInfo,
