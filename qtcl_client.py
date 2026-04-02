@@ -12775,12 +12775,15 @@ class QtclClientApp:
         }
         dht_json = _hj.dumps(dht_table)
         
-        # 2. Fan-out to top 8 peers (Gossip style)
-        targets = rows[:8]
+        # 2. Fan-out to top 8 peers + always include bootstrap server
+        targets = list(rows[:7])  # Leave room for bootstrap
+        # Always include bootstrap server in fan-out
+        targets.append(("bootstrap-zocomputer-ts4", "ts4.zocomputer.io", 10206, 0, 0))
+        
         for t in targets:
-            peer_host, peer_port = t[1], t[2]
+            peer_host, peer_port = t[1], int(t[2])
             # Don't broadcast to self
-            if peer_host in ('localhost', '127.0.0.1', _MY_IP): continue
+            if peer_host in ('localhost', '127.0.0.1', _MY_IP, ''): continue
             
             try:
                 url = f"http://{peer_host}:{peer_port}/rpc"
@@ -14950,25 +14953,38 @@ class QtclClientApp:
             self._mesh_peer_dm_queue = _nmq.Queue(maxsize=16)
 
         # ═══════════════════════════════════════════════════════════════════
-        # CRITICAL: Determine external IP for P2P (not private 172.16.x.x)
+        # CRITICAL: Detect REAL external IP for P2P (not private 172.16.x.x)
         # ═══════════════════════════════════════════════════════════════════
         
-        # Try to get external IP, fall back to local IP
-        _external_ip = _MY_IP or '0.0.0.0'
-        if _external_ip.startswith(('172.16.', '192.168.', '10.', '127.')):
-            print(f"  ⚠️  Private IP detected: {_external_ip}", flush=True)
-            print(f"  ⚠️  Other peers may not be able to reach you directly", flush=True)
-            # Try to get external IP from bootstrap server
-            try:
-                from urllib.request import Request, urlopen
-                req = Request(f"http://ts4.zocomputer.io:10206/rpc", 
-                              data=json.dumps({"jsonrpc": "2.0", "method": "qtcl_nodeInfo", 
-                                               "params": [], "id": 1}).encode(),
-                              headers={"Content-Type": "application/json"})
-                with urlopen(req, timeout=5) as resp:
-                    pass  # If we can reach the server, use it as a relay
-            except Exception:
-                pass
+        def _get_external_ip() -> str:
+            """Query external services to discover our public IP."""
+            import urllib.request
+            services = [
+                "https://api.ipify.org",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip",
+                "https://checkip.amazonaws.com",
+            ]
+            for svc in services:
+                try:
+                    with urllib.request.urlopen(svc, timeout=5) as resp:
+                        ip = resp.read().decode().strip()
+                        if ip and '.' in ip:
+                            return ip
+                except Exception:
+                    continue
+            return ""
+        
+        # Try to get real external IP
+        _detected_ip = _get_external_ip()
+        if _detected_ip:
+            _external_ip = _detected_ip
+            print(f"  ✅ External IP detected: {_external_ip}", flush=True)
+        else:
+            _external_ip = _MY_IP or '0.0.0.0'
+            if _external_ip.startswith(('172.16.', '192.168.', '10.', '127.')):
+                print(f"  ⚠️  Could not detect external IP, using: {_external_ip}", flush=True)
+                print(f"  ⚠️  P2P may not work without port forwarding", flush=True)
         
         _my_rpc_url = f"http://{_external_ip}:{_P2P_PORT}"
         print(f"  P2P URL : {_my_rpc_url}", flush=True)
@@ -15051,6 +15067,21 @@ class QtclClientApp:
                     print(f"  ⚠️  Bootstrap returned no peers", flush=True)
         except Exception as _be:
             print(f"  ⚠️  Bootstrap server error: {_be}", flush=True)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # CRITICAL: Add bootstrap server directly to peer list
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            self._db.execute("""
+                INSERT OR REPLACE INTO p2p_peers 
+                (node_id_hex, host, port, chain_height, source, first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, 'bootstrap_hardcoded', ?, ?)
+            """, ("bootstrap-zocomputer-ts4", "ts4.zocomputer.io", 10206, 0,
+                  int(_nmt_time.time()), int(_nmt_time.time())))
+            self._db.commit()
+            print(f"  ✅ Bootstrap server added: ts4.zocomputer.io:10206", flush=True)
+        except Exception:
+            pass
 
         # ═══════════════════════════════════════════════════════════════════
         # Start heartbeat loop (sends heartbeat + DHT fan-out every 30s)
@@ -16368,24 +16399,32 @@ class NodeRPCMeshServer:
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_expires ON mempool(expires_at)")
             
-            # ═══════════════════════════════════════════════════════════════════════
-            # 9. pq0_entanglement_log — Tripartite pq0 entanglement chain
-            # ═══════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════════
+        # 9. pq0_entanglement_log — Tripartite pq0 entanglement chain
+        # ═══════════════════════════════════════════════════════════════════════
             conn.execute("""CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 block_height            INTEGER NOT NULL,
-                pq0                     INTEGER NOT NULL,
-                oracle_ids              TEXT NOT NULL,
-                entanglement_matrix_hex TEXT NOT NULL,
+                pq0                     INTEGER NOT NULL DEFAULT 0,
+                oracle_ids              TEXT NOT NULL DEFAULT '',
+                entanglement_matrix_hex TEXT NOT NULL DEFAULT '',
                 created_at              REAL DEFAULT (strftime('%s','now'))
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)")
-            # Migrate existing tables
-            for col, defn in [("pq0","INTEGER DEFAULT 0"),("oracle_ids","TEXT DEFAULT ''"),
-                              ("entanglement_matrix_hex","TEXT DEFAULT ''")]:
-                try: conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {col} {defn}")
-                except: pass
+            # Migrate: add missing columns for existing databases
+            _pq0_cols = {
+                "pq0": "INTEGER DEFAULT 0",
+                "block_height": "INTEGER DEFAULT 0",
+                "oracle_ids": "TEXT DEFAULT ''",
+                "entanglement_matrix_hex": "TEXT DEFAULT ''",
+            }
+            for _col, _defn in _pq0_cols.items():
+                try:
+                    conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
+                    logger.debug(f"[DB] Added column pq0_entanglement_log.{_col}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists - expected for existing DBs
             
             # ═══════════════════════════════════════════════════════════════════════
             # 10. wstate_consensus_log — W-state BFT consensus log
