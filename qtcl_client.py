@@ -15924,16 +15924,18 @@ class QtclClientApp:
         print("  │  3.) 🔑  Wallet         (+ live Pyth prices)             │")
         print("  │  4.) 🔭  Oracle Audit   (live server state + full hashes)│")
         print("  │  5.) 🔮  Market Explorer (Pyth × HLWE oracle-signed)     │")
+        print("  │  6.) ⚛️   Node           (quantum mesh relay mode)        │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
         try:
-            choice = input("  Enter choice [1/2/3/4/5]: ").strip()
+            choice = input("  Enter choice [1/2/3/4/5/6]: ").strip()
         except (EOFError, KeyboardInterrupt):
             choice = "1"
         if   choice == "2": self.run_transact_mode()
         elif choice == "3": self.run_wallet_mode()
         elif choice == "4": self.run_oracle_mode()
         elif choice == "5": self.run_market_explorer()
+        elif choice == "6": self.run_node_mode()
         else:               self.run_mine_mode()
 def _silent_getpass(prompt: str) -> str:
     """Temporarily suppress all loggers during getpass to prevent log injection."""
