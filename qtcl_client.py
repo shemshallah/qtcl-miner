@@ -2210,24 +2210,6 @@ class QtclP2PNode:
                 _EXP_LOG.error(f"[P2P] Peer exchange fatal error: {_pe}")
                 _pt.sleep(10.0)
 
-                        f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
-                        f"local-only cycle")
-                _n_total_check = _n_total  # Bug #7: was undefined
-                n_now          = n_connected  # Bug #7: was undefined
-                if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
-                    _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
-                    self._stop.wait(30)
-                    continue
-            except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
-                n_now = n_connected  # ensure n_now is always defined after except
-            if   n_now == 0: _wait = 10   # no peers — hammer every 10s
-            elif n_now < 2:  _wait = 20   # 1 peer — try hard
-            elif n_now < 4:  _wait = 30   # getting there
-            else:            _wait = 60   # healthy — relax
-            _EXP_LOG.debug(
-                f"[P2P] discovery cycle {_pe_cycle}: connected={n_now} → next in {_wait}s")
-            self._stop.wait(_wait)
     def get_consensus_dm(self):
         """
         Pull the latest N-peer consensus density matrix from the C layer.
