@@ -8731,8 +8731,15 @@ class KoyebAPIClient:
         Uses qtcl_submitOracleReg to register oracle on-chain via mempool.
         Format: {"wallet_address": "qtcl1...", "oracle_addr": "qtcl1..."}
         """
-        return self._rpc("qtcl_submitOracleReg",
-                        [{"wallet_address": miner_address, "oracle_addr": miner_address}])
+        _EXP_LOG.info(f"[ORACLE-REG] Submitting oracle registration: miner_id={miner_id}, address={miner_address}")
+        try:
+            result = self._rpc("qtcl_submitOracleReg",
+                            [{"wallet_address": miner_address, "oracle_addr": miner_address}])
+            _EXP_LOG.info(f"[ORACLE-REG] Registration result: {result}")
+            return result
+        except Exception as e:
+            _EXP_LOG.error(f"[ORACLE-REG] Registration failed with exception: {e}")
+            raise
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
         """Check if oracle is reachable via JSON-RPC health call. Caches result for 10 seconds."""
         now = time.time()
@@ -18068,7 +18075,11 @@ class NodeRPCMeshServer:
             node_id = str(p.get("node_id", ""))
             ext_addr = str(p.get("external_addr", ""))
             if not node_id or not ext_addr:
+                _EXP_LOG.warning(f"[DHT-PING-CLIENT] Missing node_id or ext_addr in params: {p}")
                 return {"pinged": False, "reason": "missing node_id or external_addr"}
+            
+            _EXP_LOG.info(f"[DHT-PING-CLIENT] ✅ RECEIVED ping from node_id={node_id[:16]}... at {ext_addr}")
+            
             # Add to Kademlia routing table
             if hasattr(self, '_kademlia_table') and self._kademlia_table:
                 host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
@@ -18076,6 +18087,7 @@ class NodeRPCMeshServer:
                 except: port = 9091
                 remote_node = KademliaNode(node_id=node_id, host=host, port=port)
                 self._kademlia_table.add_node(remote_node)
+                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Added to Kademlia routing table: {host}:{port}")
             # Also sync to mesh peer registry
             if hasattr(self, '_node_registry'):
                 host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
@@ -18086,6 +18098,7 @@ class NodeRPCMeshServer:
                     'registered_at': int(time.time() * 1e9),
                     'last_seen': int(time.time() * 1e9),
                 }
+                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Added to node registry: {host}:{port}")
             # Also persist to DB (full node_id, not truncated)
             try:
                 import sqlite3
@@ -18098,9 +18111,11 @@ class NodeRPCMeshServer:
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (node_id, host, port, 0, int(time.time()), 0))
                     conn.commit()
-            except Exception:
-                pass
+                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Persisted to DB: {host}:{port}")
+            except Exception as e:
+                _EXP_LOG.warning(f"[DHT-PING-CLIENT] DB persist failed: {e}")
             # ── CHAIN REACTION: fan-out to known peers ──
+            _EXP_LOG.info(f"[DHT-PING-CLIENT] Starting relay to mesh peers...")
             def _dht_relay(new_nid, new_addr, my_nid):
                 try:
                     known_peers = []
@@ -18136,10 +18151,11 @@ class NodeRPCMeshServer:
                                               headers={"Content-Type": "application/json"}, method="POST")
                             with _ur.urlopen(req, timeout=2) as _r:
                                 _r.read()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                            _EXP_LOG.info(f"[DHT-PING-CLIENT] ✅ Relay sent to {p_host}:{p_port}")
+                        except Exception as e:
+                            _EXP_LOG.debug(f"[DHT-PING-CLIENT] Relay to {p_host}:{p_port} failed: {e}")
+                except Exception as e:
+                    _EXP_LOG.warning(f"[DHT-PING-CLIENT] Relay error: {e}")
             threading.Thread(target=_dht_relay, args=(node_id, ext_addr, self._node_id), daemon=True).start()
             _EXP_LOG.info(f"[MESH-DHT] 🤝 dhtPing from {node_id[:16]}… at {ext_addr} → relaying to mesh")
             return {"pinged": True, "node_id": self._node_id[:16]}
