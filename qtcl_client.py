@@ -12836,6 +12836,9 @@ class QtclClientApp:
                 
                 _EXP_LOG.info(f"[ORACLE-REG] Submitting on-chain registration: {oracle_addr}")
                 
+                # Debug: log the raw response
+                _EXP_LOG.debug(f"[ORACLE-REG] Sending params: wallet={wallet_addr}, oracle={oracle_addr}")
+                
                 onchain_resp = self.api._rpc("qtcl_submitOracleReg", [{
                     "wallet_address": wallet_addr,
                     "oracle_addr": oracle_addr,
@@ -12844,6 +12847,8 @@ class QtclClientApp:
                     "ip_hint": _ip_hint,
                     "action": "register",
                 }])
+                
+                _EXP_LOG.debug(f"[ORACLE-REG] Raw response: {onchain_resp}")
                 
                 if onchain_resp and onchain_resp.get("status") in ("submitted", "tx_template_issued", "accepted"):
                     _EXP_LOG.info(f"[ORACLE-REG] ✅ On-chain registration submitted: {onchain_resp.get('tx_hash', 'N/A')}")
