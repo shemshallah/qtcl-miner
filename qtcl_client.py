@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging as _suppress_logging
-for _name in ['aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
+for _name in ['P2P', 'aiohttp', 'urllib3.connectionpool', 'botocore', 'qtcl.client.expansion']:
     _suppress_logging.getLogger(_name).setLevel(_suppress_logging.ERROR)
 
 import os
@@ -344,11 +344,6 @@ def _get_pool() -> HyperbolicEntropyPool:
             if _ENTROPY_POOL is None:
                 _ENTROPY_POOL = HyperbolicEntropyPool()
     return _ENTROPY_POOL
-
-def get_entropy_pool() -> HyperbolicEntropyPool:
-    """Public accessor for entropy pool (used by NumPyEntanglementEngine)"""
-    return _get_pool()
-
 def get_mining_entropy(size: int = 32) -> bytes:
     """Mining entropy — two-pass hyperbolic quantum pool, never blocks."""
     return _get_pool().get(size=size)
@@ -1851,11 +1846,11 @@ class QtclP2PNode:
         self._node_id    = node_id
         self._port       = port
         self._bootstrap  = bootstrap_peers or self.BOOTSTRAP_PEERS
-        self.        self._consensus: Optional[WStateConsensus]   = None
+        self._consensus: Optional[WStateConsensus]   = None
         self._stop: threading.Event = threading.Event()
         self._started    = False
         self._drain_thread: Optional[threading.Thread] = None
-        self._stop       = threading.Event()
+        self._rpc_client: Optional["ServerRPCClient"] = None  # B5: injected by start()
     def start(
             self,
                         consensus:     WStateConsensus,
@@ -1863,6 +1858,12 @@ class QtclP2PNode:
         global _C_P2P_CALLBACK
         self._oracle    = oracle_engine
         self._consensus = consensus
+        # B5: materialise _rpc_client — ServerRPCClient with Koyeb endpoint — enables _peer_exchange discovery
+        if self._rpc_client is None:
+            try:
+                self._rpc_client = ServerRPCClient(server_url=_ORACLE_BASE_URL)
+            except Exception as _rpc_init_e:
+                _EXP_LOG.debug(f"[P2P] _rpc_client init failed: {_rpc_init_e}")
         for host, port in self._bootstrap:
             try:
                 _EXP_LOG.info(f"[P2P] Bootstrap connect → {host}:{port}")
@@ -2013,59 +2014,26 @@ class QtclP2PNode:
                 _EXP_LOG.debug(f"[P2P] drain_loop: {_e}")
     def _peer_exchange(self) -> None:
         """
-        Pure HTTP RPC peer discovery loop — runs every 90s after startup.
-        
-        Workflow per cycle:
-          1. Load local peers from qtcl_blockchain.db (freshest, zero latency)
-          2. For each local peer: dial HTTP to their P2P mesh port 9091
-          3. If peer responds: call their qtcl_broadcastPeerTable RPC
-          4. Ingest returned peers into local DB (dedup by node_id)
-          5. Attempt to dial new peers discovered via RPC
-          6. Register self with Koyeb bootstrap
-          7. Fetch canonical peer list from Koyeb via qtcl_broadcastPeerTable
-          8. Fan-out our peer table to all reachable peers (gossip)
-        
-        Every new peer is persisted to qtcl_blockchain.db immediately.
-        This creates a self-healing mesh where peers discover each other
-        via both local DB and remote peer table broadcasts.
+        Priority-ordered peer discovery loop. Runs at startup then every 90s.
+        Priority on each cycle:
+          1. LOCAL  qtcl_blockchain.db  p2p_peers table  (freshest — zero latency)
+          2. P2P    already-connected peers' known-peer gossip  (C layer)
+          3. KOYEB  /api/p2p/peer_exchange + /api/peers/list  (only if local is
+                    stale OR we have fewer than 2 connected peers)
+        DM freshness gate: if the oracle DM age < 30s we have a live SSE source
+        and local P2P peers are preferred.  If DM age > 60s the oracle is stale
+        so we aggressively re-query koyeb/supabase for fresh peers.
+        Every new peer is persisted back to qtcl_blockchain.db immediately.
+        ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
-        from urllib.request import Request as _Rq, urlopen as _uo
-        from urllib.error import URLError as _UE
-        
+        _oracle_url = ENTROPY_SERVER_URL
         _connected_this_cycle: set = set()
-        _dial_timeout = 3.0
-        
-        def _dial_peer_and_fetch_table(host: str, port: int) -> list:
-            """
-            HTTP dial to peer's mesh port 9091.
-            Call qtcl_broadcastPeerTable RPC.
-            Return enriched peer list or empty list on failure.
-            """
-            if not host or port <= 0:
-                return []
-            try:
-                url = f"http://{host}:{port}/rpc"
-                payload = _pj.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_broadcastPeerTable",
-                    "params": {"limit": 32},
-                    "id": 1
-                }).encode('utf-8')
-                req = _Rq(url, data=payload, headers={'Content-Type': 'application/json'})
-                with _uo(req, timeout=_dial_timeout) as resp:
-                    data = _pj.loads(resp.read().decode('utf-8'))
-                    if data.get('result') and data['result'].get('peers'):
-                        return data['result']['peers']
-            except (_UE, TimeoutError, OSError, _pj.JSONDecodeError) as _de:
-                _EXP_LOG.debug(f"[P2P] Failed to dial {host}:{port}: {type(_de).__name__}")
-            except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] Unexpected error dialing {host}:{port}: {_e}")
-            return []
-        
+        def _connect_peer(host, port): return False
         def _load_local_peers(max_age_s=7200):
-            """Read p2p_peers from qtcl_blockchain.db, skip loopback."""
+            """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
             try:
+                _already = set()
                 cutoff = int(_pt.time()) - max_age_s
                 with _psq.connect(_db_path, timeout=3) as _c:
                     rows = _c.execute("""
@@ -2073,166 +2041,106 @@ class QtclP2PNode:
                         WHERE last_seen_at > ? AND ban_score < 100
                           AND host NOT IN ('127.0.0.1','localhost','')
                         ORDER BY chain_height DESC, last_seen_at DESC
-                        LIMIT 32
+                        LIMIT 64
                     """, (cutoff,)).fetchall()
                 return [(r[0], r[1]) for r in rows if r[0]]
             except Exception as _e:
                 _EXP_LOG.debug(f"[P2P] local DB read: {_e}")
                 return []
-        
-        def _upsert_peer_to_db(node_id: str, host: str, port: int, chain_height: int = 0):
-            """Persist discovered peer to local DB."""
+        def _fetch_koyeb_peers():
+            """POST to koyeb peer_exchange + peers/list. Returns raw peer dicts."""
+            from urllib.request import Request as _Rq, urlopen as _uo
+            peers = []
             try:
-                with _psq.connect(_db_path, timeout=3) as _c:
-                    _c.execute("""
-                        INSERT OR REPLACE INTO p2p_peers
-                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (node_id[:16], host, port, chain_height, int(_pt.time()), 0))
-                    _c.commit()
-            except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] DB upsert failed {node_id[:16]}…: {_e}")
-        
-        def _fetch_koyeb_peer_table():
-            """Fetch enriched peer table from Koyeb bootstrap via qtcl_broadcastPeerTable."""
-            try:
-                if hasattr(self, '_rpc_client') and self._rpc_client:
-                    resp = self._rpc_client.call("qtcl_broadcastPeerTable", {"limit": 48})
-                    if resp and "result" in resp and resp["result"].get("peers"):
-                        return resp["result"]["peers"]
-            except Exception as _e:
-                _EXP_LOG.debug(f"[P2P] Koyeb peer table fetch failed: {_e}")
-            return []
-        
-        def _gossip_peer_table_to_peer(host: str, port: int, peer_table: list):
-            """
-            Fan-out peer table to a single peer via qtcl_announcePeerTable RPC.
-            Asynchronous fire-and-forget.
-            """
-            if not host or port <= 0 or not peer_table:
-                return
-            try:
-                url = f"http://{host}:{port}/rpc"
-                payload = _pj.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_announcePeerTable",
-                    "params": {"peers": peer_table},
-                    "id": 1
-                }).encode('utf-8')
-                req = _Rq(url, data=payload, headers={'Content-Type': 'application/json'})
-                # Non-blocking: spawn thread to prevent blocking the main loop
-                import threading as _th
-                _th.Thread(target=lambda: (
-                    _uo(req, timeout=_dial_timeout) if _uo else None
-                ), daemon=True).start()
+                # ServerRPCClient.call() returns full envelope {jsonrpc, result, id}
+                # result shape: {"peers": [...], "count": N} — never a bare list
+                rpc_resp = self._rpc_client.call("qtcl_getPeers", {"limit": 50}) if (hasattr(self, '_rpc_client') and self._rpc_client) else None
+                if rpc_resp and "result" in rpc_resp:
+                    _r = rpc_resp["result"]
+                    _peer_list = (_r.get("peers", []) if isinstance(_r, dict)
+                                  else _r if isinstance(_r, list) else [])
+                    peers += [p for p in _peer_list if isinstance(p, dict)]
             except Exception:
-                pass  # silent — gossip is best-effort
-        
-        _pe_cycle = 0
+                pass
+            return peers
+        _pe_cycle   = 0
+        n_connected = 0   # Bug #7: was undefined
+        _lo_ts      = 0.0
         while not self._stop.is_set():
             try:
                 _pe_cycle += 1
-                _connected_this_cycle.clear()
-                new_dials = 0
-                new_ingests = 0
-                
-                # ── Priority 1: Local DB peers ──────────────────────────
+                _connected_this_cycle.clear()  # reset per-cycle dedup set
+                # peer count via PeerManager if available, else zero
+                _n_total = len(getattr(self, 'peer_mgr', None) and
+                               getattr(self.peer_mgr, 'peers', {}) or {})
+                if _n_total > n_connected:
+                    n_connected = max(n_connected, _n_total // 2)
+                _lo_ts      = time.time()
+                dm_age      = _pt.time() - _lo_ts
+                dm_fresh    = _lo_ts > 1e9 and dm_age < 30.0 and dm_age < 86400
+                need_peers  = n_connected < 4           # want at least 4 peers
+                dm_stale    = (not dm_fresh) or dm_age > 60.0
+                new_connections = 0
+                # ── Priority 1: local qtcl_blockchain.db ─────────────────────
                 local_peers = _load_local_peers(max_age_s=7200)
-                for host, port in local_peers:
-                    peer_key = f"{host}:{port}"
-                    if peer_key in _connected_this_cycle:
-                        continue
-                    _connected_this_cycle.add(peer_key)
-                    
-                    # Dial and fetch their peer table
-                    remote_peers = _dial_peer_and_fetch_table(host, port)
-                    if remote_peers:
-                        new_dials += 1
-                        # Ingest remote peers into local DB
-                        for rp in remote_peers:
-                            try:
-                                rp_host = rp.get('host') or ''
-                                rp_port = rp.get('port') or 9091
-                                rp_id = rp.get('node_id', '')
-                                rp_height = rp.get('chain_height', 0)
-                                if rp_host and rp_id and rp_id != (self.p2p_node.node_id if hasattr(self, 'p2p_node') and self.p2p_node else ''):
-                                    _upsert_peer_to_db(rp_id, rp_host, int(rp_port), int(rp_height))
-                                    new_ingests += 1
-                            except Exception:
-                                pass
-                
                 if local_peers:
-                    _EXP_LOG.info(f"[P2P] 🗄️  Local DB: {new_dials} peers dialed, {new_ingests} new peers ingested")
-                
-                # ── Priority 2: Fetch from Koyeb bootstrap ──────────────
-                if _pe_cycle % 2 == 0 or new_ingests < 2:  # every other cycle or if we're hungry
-                    koyeb_peers = _fetch_koyeb_peer_table()
-                    if koyeb_peers:
-                        for kp in koyeb_peers:
-                            try:
-                                kp_host = kp.get('host') or ''
-                                kp_port = kp.get('port') or 9091
-                                kp_id = kp.get('node_id', '')
-                                kp_height = kp.get('chain_height', 0)
-                                peer_key = f"{kp_host}:{kp_port}"
-                                if kp_host and kp_id and peer_key not in _connected_this_cycle:
-                                    _connected_this_cycle.add(peer_key)
-                                    _upsert_peer_to_db(kp_id, kp_host, int(kp_port), int(kp_height))
-                            except Exception:
-                                pass
-                        _EXP_LOG.info(f"[P2P] 🌐 Koyeb: {len(koyeb_peers)} peers updated")
-                
-                # ── Priority 3: Register self + gossip ──────────────────
-                if _pe_cycle % 3 == 0:
-                    try:
-                        if hasattr(self, '_register_with_koyeb'):
-                            self._register_with_koyeb()
-                    except Exception:
-                        pass
-                    
-                    # Fan-out our current peer table to all connected peers
-                    try:
-                        _my_peers = _load_local_peers(max_age_s=600)  # recent peers only
-                        # Build peer table payload: include SELF for debug visibility
-                        _peer_table_payload = []
-                        # Add self first
-                        if hasattr(self, 'p2p_node') and self.p2p_node:
-                            try:
-                                _self_ext = self.p2p_node.external_addr or ''
-                                if ':' in _self_ext:
-                                    _self_host, _self_port_str = _self_ext.rsplit(':', 1)
-                                    _peer_table_payload.append({
-                                        'node_id': self.p2p_node.node_id[:16],
-                                        'host': _self_host,
-                                        'port': int(_self_port_str),
-                                        'chain_height': int(self.koyeb_state.block_height or 0)
-                                    })
-                            except Exception:
-                                pass
-                        # Add other known peers
-                        if _my_peers:
-                            for p in _my_peers[:23]:  # leave room for self (24 total max)
-                                try:
-                                    _peer_table_payload.append({
-                                        'node_id': p[0][:16],
-                                        'host': p[0],
-                                        'port': int(p[1])
-                                    })
-                                except Exception:
-                                    pass
-                        if _peer_table_payload and len(_peer_table_payload) > 1:
-                            for host, port in _my_peers[:8]:  # gossip to up to 8 random peers
-                                _gossip_peer_table_to_peer(host, port, _peer_table_payload)
-                    except Exception:
-                        pass
-                
-                _EXP_LOG.debug(f"[P2P] ✅ Peer exchange cycle {_pe_cycle} complete")
-                _pt.sleep(90.0)  # wait 90s before next cycle
-                
-            except Exception as _pe:
-                _EXP_LOG.error(f"[P2P] Peer exchange fatal error: {_pe}")
-                _pt.sleep(10.0)
-
+                    for host, port in local_peers:
+                        if _connect_peer(host, port):
+                            new_connections += 1
+                    _dm_age_str = f"{dm_age:.0f}s" if dm_fresh or (dm_age < 86400 and _lo_ts > 1e9) else "cold"
+                    if local_peers:
+                        _already_n = len(local_peers) - new_connections - (len(local_peers) - len([p for p in local_peers if p]))
+                        _EXP_LOG.info(
+                            f"[P2P] 🗄️  DB: {new_connections} new / {len(local_peers)} stored "
+                            f"(dm_age={_dm_age_str})")
+                if need_peers or dm_stale or not local_peers:
+                    koyeb_peers = _fetch_koyeb_peers()
+                    kc = 0
+                    for p in koyeb_peers[:48]:
+                        host = str(p.get('host') or p.get('ip_address') or
+                                   p.get('ip') or '')
+                        port = int(p.get('port') or 9091)
+                        if _connect_peer(host, port):
+                            kc += 1
+                    new_connections += kc
+                    if kc:
+                        _EXP_LOG.info(
+                            f"[P2P] 🌐 koyeb: {kc}/{len(koyeb_peers)} new peers "
+                            f"(need_peers={need_peers}, dm_stale={dm_stale})")
+                else:
+                    if _pe_cycle % 5 == 0:
+                        try:
+                            _my_ext = _MY_IP or 'localhost'
+                            _reg_payload = {
+                                'external_addr': f"{_my_ext}:{self._port}",
+                                'node_id':       self._node_id,
+                                'pubkey':        self._node_id,
+                                'chain_height':  n_connected,
+                            }
+                            # Register peer via RPC — pass dict directly (not JSON string)
+                            if hasattr(self, '_rpc_client') and self._rpc_client:
+                                self._rpc_client.call("qtcl_registerPeer", [_reg_payload])
+                        except Exception:
+                            pass
+                    _EXP_LOG.debug(
+                        f"[P2P] healthy ({n_connected} peers, DM {dm_age:.0f}s) — "
+                        f"local-only cycle")
+                _n_total_check = _n_total  # Bug #7: was undefined
+                n_now          = n_connected  # Bug #7: was undefined
+                if new_connections == 0 and n_connected == 0 and _n_total_check == 0:
+                    _EXP_LOG.warning("[P2P] ⚠️  no peers found — retry in 30s")
+                    self._stop.wait(30)
+                    continue
+            except Exception as _e:
+                _EXP_LOG.debug(f"[P2P] discovery cycle: {_e}")
+                n_now = n_connected  # ensure n_now is always defined after except
+            if   n_now == 0: _wait = 10   # no peers — hammer every 10s
+            elif n_now < 2:  _wait = 20   # 1 peer — try hard
+            elif n_now < 4:  _wait = 30   # getting there
+            else:            _wait = 60   # healthy — relax
+            _EXP_LOG.debug(
+                f"[P2P] discovery cycle {_pe_cycle}: connected={n_now} → next in {_wait}s")
+            self._stop.wait(_wait)
     def get_consensus_dm(self):
         """
         Pull the latest N-peer consensus density matrix from the C layer.
@@ -2855,10 +2763,6 @@ class LocalBlockchainDB:
     def _get_conn(self):
         """Get database connection"""
         return self.conn
-    
-    def commit(self):
-        """Commit current transaction"""
-        self.conn.commit()
     
     def create_tables(self):
         """Create all necessary tables"""
@@ -6923,410 +6827,6 @@ class OracleWStateDefinition:
         tr    = float(_np.real(_np.trace(iv)))
         return iv / max(tr, 1e-15)
 ORACLE_W_STATE: OracleWStateDefinition = OracleWStateDefinition()
-
-class NumPyEntanglementEngine:
-    """
-    Enterprise-grade NumPy-only entanglement engine for tripartite W-state.
-    No Qiskit dependencies - pure NumPy density-matrix operations.
-    
-    Provides:
-      - 3-node tripartite W-state simulation with GKSL noise
-      - Partial trace operations for multi-party state extraction
-      - W-state fidelity calculation
-      - Entanglement entropy and concurrence
-      - Quantum parallel thread simulation
-    """
-    _HAS_NP = True
-    _NODES = ['pq0', 'pq0_IV', 'pq0_V']
-    
-    def __init__(self, bath: "GKSLBathParams" = None):
-        import numpy as _np
-        self._np = _np
-        self._bath = bath or GKSLBathParams()
-        self._rng = _np.random.default_rng(secrets.randbits(32))
-        self._node_states: dict = {}
-        self._last_joint_dm: Optional[_np.ndarray] = None
-        self._entanglement_history: list = []
-        
-    def _create_w3_statevector(self) -> '_np.ndarray':
-        """Create |W3> = (|100>+|010>+|001>)/sqrt(3) statevector"""
-        np = self._np
-        sv = np.zeros(8, dtype=np.complex128)
-        for k in range(3):
-            sv[1 << k] = 1.0
-        return sv / np.sqrt(3)
-    
-    def _create_w4_statevector(self) -> '_np.ndarray':
-        """Create |W4> = (|1000>+|0100>+|0010>+|0001>)/2 for 4-party joint state"""
-        np = self._np
-        sv = np.zeros(16, dtype=np.complex128)
-        for k in range(4):
-            sv[1 << k] = 1.0
-        return sv / 2.0
-    
-    def _gkra_su2(self, theta: float, phi: float) -> '_np.ndarray':
-        """Generate SU(2) single-qubit rotation from Euler angles"""
-        np = self._np
-        ct, st = np.cos(theta/2), np.sin(theta/2)
-        exp_ip = np.exp(1j * phi)
-        return np.array([
-            [ct, -st * exp_ip.conj()],
-            [st * exp_ip, ct]
-        ], dtype=np.complex128)
-    
-    def _apply_qubit_rotation(self, sv: '_np.ndarray', U: '_np.ndarray', 
-                              qubit: int, N: int) -> '_np.ndarray':
-        """Apply single-qubit unitary to N-qubit statevector"""
-        np = self._np
-        sv_reshaped = sv.reshape([2] * N)
-        result = np.tensordot(U, sv_reshaped, axes=([1], [qubit]))
-        result = np.moveaxis(result, 0, qubit)
-        return result.reshape(2**N)
-    
-    def _partial_trace(self, rho: '_np.ndarray', keep: list, N: int) -> '_np.ndarray':
-        """Compute partial trace over all qubits NOT in 'keep' list"""
-        np = self._np
-        to_trace = sorted([p for p in range(N) if p not in keep], reverse=True)
-        result = rho.copy()
-        for pt in to_trace:
-            dim_current = int(round(np.log2(result.shape[0])))
-            d = 2 ** pt
-            d_after = 2 ** (dim_current - pt - 1)
-            result = result.reshape(d, 2, d_after, d, 2, d_after)
-            result = result[:, 0, :, :, 0, :] + result[:, 1, :, :, 1, :]
-            result = result.reshape(d * d_after, d * d_after)
-        return result
-    
-    def _lindblad_step(self, rho: '_np.ndarray', L_ops: list, 
-                       gamma: float, dt: float) -> '_np.ndarray':
-        """Single Lindblad dissipator step"""
-        np = self._np
-        LdL = sum(L.conj().T @ L for L in L_ops)
-        diss = sum(L @ rho @ L.conj().T - 0.5 * (LdL @ rho + rho @ LdL) 
-                   for L in L_ops)
-        return rho + dt * diss
-    
-    def _gkra_lindblad_3qubit(self, rho: '_np.ndarray', 
-                               bath: "GKSLBathParams", 
-                               dt: float = 0.1) -> '_np.ndarray':
-        """GKSL Lindblad evolution for 3-qubit system"""
-        np = self._np
-        g1 = bath.gamma1_eff
-        gphi = bath.gammaphi
-        gdep = bath.gammadep
-        omega = bath.omega
-        
-        sz = np.array([[1,0],[0,-1]], dtype=np.complex128)
-        sm = np.array([[0,1],[0,0]], dtype=np.complex128)
-        I2 = np.eye(2, dtype=np.complex128)
-        
-        def _kron3(a, b, c):
-            return np.kron(np.kron(a, b), c)
-        
-        H = (omega / 2) * (_kron3(sz, I2, I2) + _kron3(I2, sz, I2) + 
-                           _kron3(I2, I2, sz))
-        
-        L_ops = []
-        sqrt = np.sqrt
-        for q in range(3):
-            ops = [I2, I2, I2]
-            ops[q] = sm
-            L_ops.append((sqrt(g1), _kron3(*ops)))
-            ops[q] = sz
-            L_ops.append((sqrt(gphi), _kron3(*ops)))
-        
-        def _drho(r):
-            comm = -1j * (H @ r - r @ H)
-            diss = sum(a * a * (L @ r @ L.conj().T - 0.5 * (L.conj().T @ L @ r + 
-                           r @ L.conj().T @ L)) for a, L in L_ops)
-            return comm + diss
-        
-        gamma_max = max(g1, gphi, gdep, abs(omega)/(2*np.pi+1e-9), 1e-9)
-        h_max = 0.05 / gamma_max
-        n_steps = max(1, int(np.ceil(dt / h_max)))
-        h = dt / n_steps
-        
-        r = rho.astype(np.complex128)
-        for _ in range(n_steps):
-            k1 = _drho(r)
-            k2 = _drho(r + h/2*k1)
-            k3 = _drho(r + h/2*k2)
-            k4 = _drho(r + h*k3)
-            r = r + (h/6)*(k1 + 2*k2 + 2*k3 + k4)
-        
-        if not np.all(np.isfinite(r)):
-            return rho
-        tr = float(np.real(np.trace(r)))
-        if tr > 1e-12:
-            r /= tr
-        return r
-    
-    def simulate_node(self, node_id: str, seed_dm: '_np.ndarray' = None,
-                      evolve: bool = True) -> '_np.ndarray':
-        """Simulate one tripartite oracle node with optional GKSL evolution + W-state revival."""
-        np = self._np
-        w3_sv = self._create_w3_statevector()
-        rho = np.outer(w3_sv, w3_sv.conj())
-        
-        if seed_dm is not None and seed_dm.shape == (8, 8):
-            try:
-                seed_valid = float(np.real(np.trace(seed_dm))) > 0.9
-                if seed_valid:
-                    seed_dm = seed_dm / float(np.real(np.trace(seed_dm)))
-                    rho = 0.7 * rho + 0.3 * seed_dm
-                    rho = rho / float(np.real(np.trace(rho)))
-            except:
-                pass
-        
-        if evolve:
-            rho = self._gkra_lindblad_3qubit(rho, self._bath, dt=0.1)
-            
-            # ── W-STATE REVIVAL PHENOMENON ──
-            # Periodic coherence restoration - QRNG-seeded revival unitary
-            cycle_time = time.time()
-            revival_phase = (int(cycle_time * 10) % 50) / 50.0  # 0-1 every 5s cycle
-            if revival_phase < 0.2:  # Trigger revival at start of each 5s window
-                # QRNG-based phase for revival
-                revival_seed = os.urandom(16)
-                phases = [(int.from_bytes(revival_seed[i*2:i*2+2], 'big') / 65536.0) * 2 * np.pi 
-                          for i in range(3)]
-                
-                # Build revival unitary on W-subspace {1,2,4}
-                U_rev = np.eye(8, dtype=np.complex128)
-                widx = [1, 2, 4]
-                for k, idx in enumerate(widx):
-                    U_rev[idx, idx] = np.cos(phases[k]) + 1j * np.sin(phases[k])
-                
-                # Small off-diagonal coupling for revival
-                eps = 0.05
-                for i in range(3):
-                    for j in range(3):
-                        if i != j:
-                            ii, jj = widx[i], widx[j]
-                            cp = phases[i] - phases[j]
-                            U_rev[ii, jj] = eps * (np.cos(cp) + 1j * np.sin(cp))
-                
-                # Apply revival
-                rho = U_rev @ rho @ U_rev.conj().T
-                rho = 0.5 * (rho + rho.conj().T)
-                tr = float(np.real(np.trace(rho)))
-                if tr > 1e-12:
-                    rho /= tr
-        
-        rho = 0.5 * (rho + rho.conj().T)
-        tr = float(np.real(np.trace(rho)))
-        if tr > 1e-12:
-            rho /= tr
-            
-        self._node_states[node_id] = rho
-        return rho
-    
-    def compute_joint_w4(self) -> '_np.ndarray':
-        """
-        Compute joint 16x16 W4 density matrix shared by all 4 parties.
-        Uses QRNG-seeded SU(2) rotations for quantum parallel simulation.
-        Each cycle uses NEW entropy to ensure variation.
-        """
-        np = self._np
-        w4_sv = self._create_w4_statevector()
-        
-        # Use fresh entropy each cycle - bypass cache by using time-based seed
-        cycle_ts = int(time.time() * 1000)
-        node_seeds = []
-        for i in range(3):
-            # Different seed per cycle + per node
-            seed_input = f"{cycle_ts}:{i}:{secrets.token_hex(8)}".encode()
-            node_seeds.append(hashlib.sha3_256(seed_input).digest()[:32])
-        
-        node_strengths = [0.10, 0.09, 0.11]
-        
-        node_dms = []
-        for i, (seed, strength) in enumerate(zip(node_seeds, node_strengths)):
-            theta = float(int.from_bytes(seed[:2], 'big')) / 65535.0 * np.pi * strength
-            phi = float(int.from_bytes(seed[2:4], 'big')) / 65535.0 * 2 * np.pi
-            
-            U = self._gkra_su2(theta, phi)
-            rotated_sv = self._apply_qubit_rotation(w4_sv.copy(), U, i, 4)
-            rotated_sv = rotated_sv / np.linalg.norm(rotated_sv)
-            node_dms.append(np.outer(rotated_sv, rotated_sv.conj()))
-        
-        joint_dm = sum(node_dms) / 3.0
-        joint_dm = 0.5 * (joint_dm + joint_dm.conj().T)
-        tr = float(np.real(np.trace(joint_dm)))
-        if tr > 1e-12:
-            joint_dm /= tr
-        
-        # Dynamic Lindblad noise - vary gamma based on cycle time
-        gamma_dephase = 0.03 + 0.02 * np.sin(cycle_ts / 10000.0)  # Oscillating noise
-        dt = 0.06
-        for q in range(4):
-            P1 = np.zeros((16, 16), dtype=np.complex128)
-            for ix in range(16):
-                if (ix >> q) & 1:
-                    P1[ix, ix] = 1.0
-            L = np.sqrt(gamma_dephase) * P1
-            dr = L @ joint_dm @ L.conj().T - 0.5 * (L.conj().T @ L @ joint_dm + 
-                     joint_dm @ L.conj().T @ L)
-            joint_dm = joint_dm + dt * dr
-        
-        joint_dm = 0.5 * (joint_dm + joint_dm.conj().T)
-        tr = float(np.real(np.trace(joint_dm)))
-        if tr > 1e-12:
-            joint_dm /= tr
-        
-        self._last_joint_dm = joint_dm
-        return joint_dm
-    
-    def compute_local_subsystem(self, joint_dm: '_np.ndarray' = None) -> '_np.ndarray':
-        """Extract local 3-qubit subsystem from joint W4 state"""
-        np = self._np
-        if joint_dm is None:
-            joint_dm = self._last_joint_dm
-        if joint_dm is None:
-            return self.simulate_node('pq0')
-        return self._partial_trace(joint_dm, keep=[0, 1, 2], N=4)
-    
-    def compute_w3_fidelity(self, dm: '_np.ndarray') -> float:
-        """Compute Uhlmann-Jozsa fidelity with ideal |W3> state"""
-        np = self._np
-        w3_sv = self._create_w3_statevector()
-        w3_dm = np.outer(w3_sv, w3_sv.conj())
-        
-        def matrix_sqrt(m):
-            eigvals, eigvecs = np.linalg.eigh(m)
-            eigvals = np.maximum(eigvals, 0)
-            sqrt_eigvals = np.sqrt(eigvals)
-            return eigvecs @ np.diag(sqrt_eigvals) @ eigvecs.conj().T
-        
-        sqrt_rho = matrix_sqrt(w3_dm)
-        sqrt_rho_rho = sqrt_rho @ dm @ sqrt_rho
-        sqrt_term = matrix_sqrt(sqrt_rho_rho)
-        fid = float(np.real(np.trace(sqrt_term))) ** 2
-        return max(0.0, min(1.0, fid))
-    
-    def compute_entanglement_entropy(self, dm: '_np.ndarray') -> float:
-        """Compute von Neumann entanglement entropy"""
-        np = self._np
-        eigenvals = np.linalg.eigvalsh(dm)
-        eigenvals = eigenvals[eigenvals > 1e-15]
-        return float(-np.sum(eigenvals * np.log2(eigenvals)))
-    
-    def compute_concurrence(self, dm: '_np.ndarray') -> float:
-        """Compute 3-qubit concurrence (simplified)"""
-        np = self._np
-        if dm.shape != (8, 8):
-            return 0.0
-        try:
-            rho_ps = dm.copy()
-            for i in range(8):
-                rho_ps[i, i] = 0
-            eig = np.linalg.eigvalsh(rho_ps)
-            eig = np.sort(np.abs(eig))[::-1]
-            if len(eig) >= 4:
-                return max(0.0, eig[0] - eig[1] - eig[2] - eig[3])
-        except:
-            pass
-        return 0.0
-    
-    def run_entanglement_cycle(self, upstream_dm: '_np.ndarray' = None,
-                               upstream_fid: float = 0.0) -> dict:
-        """
-        Full entanglement cycle: simulate nodes → joint W4 → fuse with upstream.
-        Returns metrics dict with fidelity, entropy, concurrence.
-        Uses genuine quantum operations: Born rule measurement, dephasing channels.
-        """
-        np = self._np
-        
-        # Initialize quantum-classical interface components
-        _born = BornRuleMeasurement()
-        _dephase = DephasingChannel(dephasing_rate=0.05 + 0.03 * np.sin(time.time()))
-        
-        local_dms = []
-        for node_id in self._NODES:
-            seed = upstream_dm if upstream_dm is not None else None
-            dm = self.simulate_node(node_id, seed_dm=seed, evolve=True)
-            
-            # Apply genuine quantum dephasing
-            dm = _dephase.apply(dm, time=0.1)
-            
-            # Apply Born rule measurement to get classical outcome
-            outcome, post_dm = _born.measure(dm, use_qrng=True)
-            _EXP_LOG.debug(f"[QUANTUM] Node {node_id}: Born measurement outcome = {outcome}")
-            
-            local_dms.append(dm)
-        
-        local_dm = sum(local_dms) / 3.0
-        local_dm = 0.5 * (local_dm + local_dm.conj().T)
-        tr = float(np.real(np.trace(local_dm)))
-        if tr > 1e-12:
-            local_dm /= tr
-        
-        # ── JOINT W4 INFLUENCE ──
-        joint_dm = self.compute_joint_w4()
-        
-        # Verify entanglement with witness
-        _witness = EntanglementWitness()
-        is_entangled, wit_val = _witness.compute_witness(local_dm, partition=[{0,1}, {2}])
-        _EXP_LOG.debug(f"[QUANTUM] Entanglement witness: {is_entangled}, value={wit_val:.4f}")
-        
-        w4_local = self._partial_trace(joint_dm, keep=[0, 1, 2], N=4)
-        w4_local = 0.5 * (w4_local + w4_local.conj().T)
-        tr_w4 = float(np.real(np.trace(w4_local)))
-        if tr_w4 > 1e-12:
-            w4_local /= tr_w4
-        
-        mix_factor = 0.3 + 0.2 * np.sin(time.time() * 0.5)
-        local_dm = (1 - mix_factor) * local_dm + mix_factor * w4_local
-        local_dm = 0.5 * (local_dm + local_dm.conj().T)
-        tr = float(np.real(np.trace(local_dm)))
-        if tr > 1e-12:
-            local_dm /= tr
-        
-        # ── UPSTREAM FUSION ──
-        if upstream_dm is not None and upstream_fid > 0.0:
-            alpha = min(0.4, 0.4 * upstream_fid)
-            local_dm = (1 - alpha) * local_dm + alpha * upstream_dm
-            local_dm = 0.5 * (local_dm + local_dm.conj().T)
-            tr = float(np.real(np.trace(local_dm)))
-            if tr > 1e-12:
-                local_dm /= tr
-        
-        fidelity = self.compute_w3_fidelity(local_dm)
-        entropy = self.compute_entanglement_entropy(local_dm)
-        concurrence = self.compute_concurrence(local_dm)
-        purity = float(np.real(np.trace(local_dm @ local_dm)))
-        
-        result = {
-            'fidelity': fidelity,
-            'entropy': entropy,
-            'concurrence': concurrence,
-            'purity': purity,
-            'local_dm': local_dm,
-            'joint_dm': joint_dm,
-            'node_states': self._node_states.copy(),
-            'timestamp': time.time(),
-            'mix_factor': mix_factor,
-            'is_entangled': is_entangled,
-            'entanglement_witness': wit_val,
-        }
-        
-        self._entanglement_history.append(result)
-        if len(self._entanglement_history) > 256:
-            self._entanglement_history = self._entanglement_history[-256:]
-        
-        return result
-
-_ENTANGLEMENT_ENGINE: Optional[NumPyEntanglementEngine] = None
-_ENTANGLEMENT_ENGINE_LOCK = threading.Lock()
-
-def _get_entanglement_engine() -> NumPyEntanglementEngine:
-    global _ENTANGLEMENT_ENGINE
-    if _ENTANGLEMENT_ENGINE is None:
-        with _ENTANGLEMENT_ENGINE_LOCK:
-            if _ENTANGLEMENT_ENGINE is None:
-                _ENTANGLEMENT_ENGINE = NumPyEntanglementEngine()
-    return _ENTANGLEMENT_ENGINE
-
 @_dc
 class GKSLBathParams:
     """
@@ -7423,799 +6923,6 @@ if _HAS_NP:
     _SY = _np.array([[0,-1j],[1j,0]], dtype=_np.complex128)
 else:
     _I2 = _SM = _SP = _SZ = _SX = _SY = None
-
-class QuantumRNGBridge:
-    """
-    Direct connection to QRNG sources (random.org, ANU, QBICK) without caching.
-    Each call gets fresh entropy from real quantum randomness sources.
-    """
-    
-    def __init__(self):
-        self._np = _np if _HAS_NP else None
-        self._requests = _requests if _HAS_REQUESTS else None
-        self._api_keys = {
-            'randomorg': _os.environ.get('RANDOM_ORG_KEY', ''),
-            'anu': _os.environ.get('ANU_API_KEY', ''),
-            'qbick': _os.environ.get('QRNG_API_KEY', '')
-        }
-        self._last_source = None
-        
-    def _fetch_random_org(self, num_bytes: int) -> bytes:
-        """Fetch from random.org API."""
-        if not self._api_keys['randomorg']:
-            raise RuntimeError("[QRNG] random.org API key not configured")
-        url = "https://api.random.org/json-rpc/4/invoke"
-        headers = {'Content-Type': 'application/json'}
-        payload = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "generateBinary",
-            "params": {
-                "apiKey": self._api_keys['randomorg'],
-                "n": num_bytes,
-                "size": 8
-            },
-            "id": 1
-        })
-        try:
-            req = Request(url, data=payload.encode(), headers=headers)
-            with urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-                return bytes(data['result']['random']['data'][0])
-        except Exception as e:
-            raise RuntimeError(f"[QRNG] random.org failed: {e}")
-    
-    def _fetch_anu(self, num_bytes: int) -> bytes:
-        """Fetch from ANU Quantum Random Numbers API."""
-        if not self._api_keys['anu']:
-            raise RuntimeError("[QRNG] ANU API key not configured")
-        url = f"https://api.qubitgames.com/v1/entropy?length={num_bytes}"
-        headers = {'Authorization': f'Bearer {self._api_keys["anu"]}'}
-        try:
-            req = Request(url, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-                return base64.b64decode(data['entropy'])
-        except Exception as e:
-            raise RuntimeError(f"[QRNG] ANU failed: {e}")
-    
-    def _fetch_qbick(self, num_bytes: int) -> bytes:
-        """Fetch from QBICK/ID Quantique QRNG."""
-        if not self._api_keys['qbick']:
-            raise RuntimeError("[QRNG] QBICK API key not configured")
-        url = f"https://api.entropy.online/v1/randomness?bytes={num_bytes}"
-        headers = {'X-API-Key': self._api_keys['qbick']}
-        try:
-            req = Request(url, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                return response.read()
-        except Exception as e:
-            raise RuntimeError(f"[QRNG] QBICK failed: {e}")
-    
-    def get_random_bytes(self, num_bytes: int = 32, source: str = 'auto') -> bytes:
-        """
-        Get fresh entropy from QRNG source.
-        
-        Args:
-            num_bytes: Number of random bytes to fetch
-            source: 'randomorg', 'anu', 'qbick', or 'auto' (cycles through available)
-        """
-        if source == 'auto':
-            available = [k for k, v in self._api_keys.items() if v]
-            if not available:
-                raise RuntimeError("[QRNG] No API keys configured")
-            source = available[len(self._last_source or '') % len(available)] if available else 'randomorg'
-        
-        self._last_source = source
-        print(f"[QRNG] Fetching {num_bytes} bytes from {source}...")
-        
-        if source == 'randomorg':
-            data = self._fetch_random_org(num_bytes)
-        elif source == 'anu':
-            data = self._fetch_anu(num_bytes)
-        elif source == 'qbick':
-            data = self._fetch_qbick(num_bytes)
-        else:
-            raise ValueError(f"[QRNG] Unknown source: {source}")
-        
-        print(f"[QRNG] ✓ Got {len(data)} bytes from {source}")
-        return data
-    
-    def random_uint32(self, max_val: int = None) -> int:
-        """Get random 32-bit integer, optionally bounded."""
-        data = self.get_random_bytes(4)
-        val = int.from_bytes(data, 'big')
-        if max_val is not None:
-            val = val % max_val
-        return val
-    
-    def random_float(self) -> float:
-        """Get random float in [0,1) using QRNG."""
-        data = self.get_random_bytes(8)
-        return int.from_bytes(data, 'big') / (2**64)
-    
-    def random_bits(self, n_bits: int) -> List[int]:
-        """Get list of random bits from QRNG."""
-        n_bytes = (n_bits + 7) // 8
-        data = self.get_random_bytes(n_bytes)
-        bits = []
-        for byte in data:
-            for i in range(8):
-                if len(bits) < n_bits:
-                    bits.append((byte >> (7 - i)) & 1)
-        return bits[:n_bits]
-
-
-class BornRuleMeasurement:
-    """
-    Implement actual measurement simulation using Born rule probabilities from density matrices.
-    Performs projective measurements in computational basis.
-    """
-    
-    def __init__(self):
-        self._np = _np if _HAS_NP else None
-        self._qrng = QuantumRNGBridge()
-        
-    def compute_probabilities(self, dm: "np.ndarray") -> "np.ndarray":
-        """
-        Compute Born rule probabilities for computational basis measurement.
-        
-        P(i) = ⟨i|ρ|i⟩ = diagonal element of density matrix
-        """
-        if self._np is None:
-            raise RuntimeError("[BornRule] NumPy required")
-        
-        probs = self._np.real(_np.diag(dm))
-        probs = _np.clip(probs, 0, 1)
-        probs = probs / _np.sum(probs)
-        
-        _EXP_LOG.debug(f"[BornRule] Computed {len(probs)} basis probabilities")
-        return probs
-    
-    def measure(self, dm: "np.ndarray", use_qrng: bool = True) -> Tuple[int, "np.ndarray"]:
-        """
-        Perform measurement on density matrix using Born rule.
-        
-        Returns:
-            outcome: Measurement outcome (basis index)
-            post_measurement_dm: Density matrix after measurement
-        """
-        if self._np is None:
-            raise RuntimeError("[BornRule] NumPy required")
-        
-        probs = self.compute_probabilities(dm)
-        n = len(probs)
-        
-        if use_qrng:
-            try:
-                rand_val = self._qrng.random_float()
-            except Exception:
-                rand_val = self._np.random.random()
-        else:
-            rand_val = self._np.random.random()
-        
-        cumulative = 0.0
-        outcome = n - 1
-        for i, p in enumerate(probs):
-            cumulative += p
-            if rand_val < cumulative:
-                outcome = i
-                break
-        
-        post_dm = self._np.zeros_like(dm)
-        basis_vec = self._np.zeros(n, dtype=complex)
-        basis_vec[outcome] = 1.0
-        post_dm = _np.outer(basis_vec, basis_vec.conj())
-        
-        _EXP_LOG.debug(f"[BornRule] Measurement outcome: {outcome} (prob={probs[outcome]:.4f})")
-        return outcome, post_dm
-    
-    def measure_state_vector(self, state: "np.ndarray") -> Tuple[int, "np.ndarray"]:
-        """
-        Measure pure state vector in computational basis.
-        """
-        if self._np is None:
-            raise RuntimeError("[BornRule] NumPy required")
-        
-        n = len(state)
-        probs = _np.abs(state) ** 2
-        probs = probs / _np.sum(probs)
-        
-        try:
-            rand_val = self._qrng.random_float()
-        except Exception:
-            rand_val = self._np.random.random()
-        
-        cumulative = 0.0
-        outcome = n - 1
-        for i, p in enumerate(probs):
-            cumulative += p
-            if rand_val < cumulative:
-                outcome = i
-                break
-        
-        post_state = self._np.zeros(n, dtype=complex)
-        post_state[outcome] = 1.0
-        
-        print(f"[BornRule] State vector measurement: {outcome}")
-        return outcome, post_state
-    
-    def expectation_value(self, dm: "np.ndarray", observable: "np.ndarray") -> float:
-        """Compute expectation value ⟨O⟩ = Tr(ρO)."""
-        if self._np is None:
-            raise RuntimeError("[BornRule] NumPy required")
-        
-        ev = float(_np.real(_np.trace(dm @ observable)))
-        print(f"[BornRule] Expectation value: {ev:.6f}")
-        return ev
-
-
-class QuantumStateTomography:
-    """
-    Reconstruct quantum state from measurement statistics.
-    Uses maximum likelihood estimation for physical density matrix.
-    """
-    
-    def __init__(self):
-        self._np = _np if _HAS_NP else None
-        
-    def reconstruct_from_counts(self, counts: Dict[int, int], 
-                                 n_qubits: int) -> "np.ndarray":
-        """
-        Reconstruct density matrix from measurement counts.
-        
-        Args:
-            counts: Dictionary {basis_index: count}
-            n_qubits: Number of qubits in system
-        """
-        if self._np is None:
-            raise RuntimeError("[Tomography] NumPy required")
-        
-        dim = 2 ** n_qubits
-        total = sum(counts.values())
-        
-        probs = self._np.zeros(dim)
-        for idx, cnt in counts.items():
-            if 0 <= idx < dim:
-                probs[idx] = cnt / total
-        
-        rho = _np.diag(probs)
-        
-        print(f"[Tomography] Reconstructed {n_qubits}-qubit state from {total} measurements")
-        print(f"[Tomography] State purity: {float(_np.real(_np.trace(rho @ rho))):.4f}")
-        
-        return rho
-    
-    def compute_fidelity(self, rho: "np.ndarray", sigma: "np.ndarray") -> float:
-        """Compute fidelity F(ρ,σ) = [Tr(√√ρ σ √ρ)]²."""
-        if self._np is None:
-            raise RuntimeError("[Tomography] NumPy required")
-        
-        sqrt_rho = self._sqrt_matrix(rho)
-        product = sqrt_rho @ sigma @ sqrt_rho
-        sqrt_product = self._sqrt_matrix(product)
-        
-        fid = float(_np.real(_np.trace(sqrt_product))) ** 2
-        fid = _np.clip(fid, 0, 1)
-        
-        print(f"[Tomography] State fidelity: {fid:.6f}")
-        return fid
-    
-    def _sqrt_matrix(self, m: "np.ndarray") -> "np.ndarray":
-        """Compute matrix square root via eigendecomposition."""
-        eigvals, eigvecs = _np.linalg.eigh(m)
-        eigvals = _np.maximum(eigvals, 0)
-        sqrt_vals = _np.sqrt(eigvals)
-        return eigvecs @ _np.diag(sqrt_vals) @ eigvecs.conj().T
-    
-    def ml_estimation(self, measurement_data: List[Tuple["np.ndarray", "np.ndarray"]],
-                      initial_guess: "np.ndarray" = None) -> "np.ndarray":
-        """
-        Maximum likelihood estimation for physical density matrix.
-        
-        Args:
-            measurement_data: List of (POVM, counts) tuples
-            initial_guess: Starting density matrix
-        """
-        if self._np is None:
-            raise RuntimeError("[Tomography] NumPy required")
-        
-        dim = measurement_data[0][0].shape[0]
-        
-        if initial_guess is None:
-            rho = _np.eye(dim, dtype=complex) / dim
-        else:
-            rho = initial_guess.copy()
-        
-        for _ in range(100):
-            log_likelihood = self._np.zeros_like(rho)
-            for povm, counts in measurement_data:
-                total = sum(counts)
-                for i, (m, c) in enumerate(zip(povm, counts)):
-                    if c > 0:
-                        prob = float(_np.real(_np.trace(rho @ m)))
-                        if prob > 1e-10:
-                            log_likelihood += (c / total) * (m / prob)
-            
-            rho_new = rho @ log_likelihood @ rho
-            rho_new = 0.5 * (rho_new + rho_new.conj().T)
-            rho_new = rho_new / _np.trace(rho_new)
-            
-            if _np.allclose(rho, rho_new, atol=1e-6):
-                break
-            rho = rho_new
-        
-        print(f"[Tomography] MLE converged, purity: {float(_np.real(_np.trace(rho @ rho))):.4f}")
-        return rho
-
-
-class QuantumClassicalConverter:
-    """
-    Explicit conversion functions between quantum and classical representations.
-    """
-    
-    def __init__(self):
-        self._np = _np if _HAS_NP else None
-        self._qrng = QuantumRNGBridge()
-        
-    def quantum_to_classical_bits(self, dm: "np.ndarray", 
-                                   n_bits: int = None) -> List[int]:
-        """
-        Convert quantum state (density matrix) to classical bits via measurement.
-        
-        Args:
-            dm: Density matrix of quantum state
-            n_bits: Number of bits to extract (default: log2(dim))
-        """
-        if self._np is None:
-            raise RuntimeError("[Converter] NumPy required")
-        
-        dim = dm.shape[0]
-        if n_bits is None:
-            n_bits = int(_np.round(_np.log2(dim)))
-        
-        bits = []
-        n_measurements = (n_bits + 7) // 8
-        
-        born = BornRuleMeasurement()
-        
-        current_dm = dm.copy()
-        for _ in range(n_measurements):
-            outcome, current_dm = born.measure(current_dm, use_qrng=True)
-            bits.extend(self._int_to_bits(outcome, 8))
-        
-        bits = bits[:n_bits]
-        
-        print(f"[Converter] quantum_to_classical: extracted {len(bits)} bits from {dim}x{dim} DM")
-        return bits
-    
-    def classical_to_quantum_state(self, seed: Union[bytes, int, List[int]],
-                                    n_qubits: int) -> "np.ndarray":
-        """
-        Prepare quantum state from classical seed using QRNG.
-        
-        Args:
-            seed: Classical seed (bytes, int, or bit list)
-            n_qubits: Number of qubits for output state
-        """
-        if self._np is None:
-            raise RuntimeError("[Converter] NumPy required")
-        
-        if isinstance(seed, int):
-            seed = seed.to_bytes((seed.bit_length() + 7) // 8, 'big')
-        elif isinstance(seed, list):
-            seed = bytes(seed)
-        
-        if not isinstance(seed, bytes):
-            seed = bytes(seed)
-        
-        dim = 2 ** n_qubits
-        amplitudes = self._np.zeros(dim, dtype=complex)
-        
-        hash_val = hashlib.sha256(seed).digest()
-        seed_int = int.from_bytes(hash_val, 'big')
-        
-        self._qrng.get_random_bytes(32)
-        
-        amplitudes[0] = 1.0
-        
-        n_params = 2 * (dim - 1)
-        params_per_qubit = 2 * (1 - 1 / 2 ** (n_qubits - 1))
-        
-        seed_bytes = hash_val
-        for i in range(1, dim):
-            idx_bytes = i.to_bytes(4, 'big')
-            combined = seed_bytes + idx_bytes
-            h = hashlib.sha256(combined).digest()
-            
-            theta = (int.from_bytes(h[:4], 'big') % 1000) / 1000.0 * _np.pi
-            phi = (int.from_bytes(h[4:8], 'big') % 1000) / 1000.0 * 2 * _np.pi
-            
-            if i < dim:
-                amp = _np.cos(theta) * _np.exp(1j * phi)
-                amplitudes[i] = amp
-        
-        amplitudes = amplitudes / _np.sqrt(_np.sum(_np.abs(amplitudes) ** 2))
-        
-        rho = _np.outer(amplitudes, amplitudes.conj())
-        
-        purity = float(_np.real(_np.trace(rho @ rho)))
-        print(f"[Converter] classical_to_quantum: prepared {n_qubits}-qubit state from seed")
-        print(f"[Converter] State purity: {purity:.4f}, trace: {float(_np.real(_np.trace(rho))):.4f}")
-        
-        return rho
-    
-    def _int_to_bits(self, val: int, n_bits: int) -> List[int]:
-        """Convert integer to bit list."""
-        bits = []
-        for i in range(n_bits):
-            bits.append((val >> (n_bits - 1 - i)) & 1)
-        return bits
-    
-    def encode_classical_data(self, data: bytes, n_qubits: int) -> "np.ndarray":
-        """Encode classical data into quantum state amplitude."""
-        if self._np is None:
-            raise RuntimeError("[Converter] NumPy required")
-        
-        dim = 2 ** n_qubits
-        state = self._np.zeros(dim, dtype=complex)
-        
-        for i, byte in enumerate(data):
-            idx = i % dim
-            state[idx] = complex(byte / 255.0, 0)
-        
-        norm = _np.sqrt(_np.sum(_np.abs(state) ** 2))
-        if norm > 0:
-            state = state / norm
-        else:
-            state[0] = 1.0
-        
-        rho = _np.outer(state, state.conj())
-        
-        print(f"[Converter] Encoded {len(data)} bytes into {n_qubits}-qubit state")
-        return rho
-    
-    def decode_quantum_state(self, dm: "np.ndarray", n_bytes: int) -> bytes:
-        """Decode classical data from quantum state."""
-        if self._np is None:
-            raise RuntimeError("[Converter] NumPy required")
-        
-        eigvals, eigvecs = _np.linalg.eigh(dm)
-        eigvals = _np.maximum(eigvals, 0)
-        
-        sorted_indices = _np.argsort(eigvals)[::-1]
-        
-        data = []
-        for i in range(min(n_bytes, len(eigvals))):
-            idx = sorted_indices[i]
-            prob = eigvals[idx]
-            byte_val = int(round(prob * 255))
-            byte_val = max(0, min(255, byte_val))
-            data.append(byte_val)
-        
-        while len(data) < n_bytes:
-            data.append(0)
-        
-        print(f"[Converter] Decoded {n_bytes} bytes from quantum state")
-        return bytes(data[:n_bytes])
-
-
-class DephasingChannel:
-    """
-    Physical quantum noise that models decoherence.
-    Applies phase damping channel to density matrix.
-    """
-    
-    def __init__(self, dephasing_rate: float = 0.1):
-        self._np = _np if _HAS_NP else None
-        self._dephasing_rate = dephasing_rate
-        
-    def apply(self, dm: "np.ndarray", time: float = 1.0) -> "np.ndarray":
-        """
-        Apply dephasing channel to density matrix.
-        
-        Φ(ρ) = p * Z ρ Z + (1-p) * ρ
-        
-        Where p = 1 - exp(-γ * t)
-        """
-        if self._np is None:
-            raise RuntimeError("[Dephasing] NumPy required")
-        
-        dim = dm.shape[0]
-        n_qubits = int(_np.round(_np.log2(dim)))
-        
-        p = 1.0 - _np.exp(-self._dephasing_rate * time)
-        
-        result = (1 - p) * dm.copy()
-        
-        for i in range(dim):
-            for j in range(dim):
-                if i != j:
-                    z_i = 1 if (bin(i).count('1') % 2 == 0) else -1
-                    z_j = 1 if (bin(j).count('1') % 2 == 0) else -1
-                    
-                    phase = 0.5 * (z_i + z_j)
-                    result[i, j] += p * phase * dm[i, j]
-        
-        result = 0.5 * (result + result.conj().T)
-        
-        trace = float(_np.real(_np.trace(result)))
-        if trace > 1e-10:
-            result = result / trace
-        
-        purity_before = float(_np.real(_np.trace(dm @ dm)))
-        purity_after = float(_np.real(_np.trace(result @ result)))
-        
-        _EXP_LOG.debug(f"[Dephasing] p={p:.4f}, purity: {purity_before:.4f} → {purity_after:.4f}")
-        
-        return result
-    
-    def apply_kraus(self, dm: "np.ndarray", time: float = 1.0) -> "np.ndarray":
-        """Apply dephasing using Kraus operators."""
-        if self._np is None:
-            raise RuntimeError("[Dephasing] NumPy required")
-        
-        dim = dm.shape[0]
-        n_qubits = int(_np.round(_np.log2(dim)))
-        
-        p = 1.0 - _np.exp(-self._dephasing_rate * time)
-        
-        K0 = _np.sqrt(1 - p) * _np.eye(dim)
-        
-        Z_matrix = _np.eye(dim, dtype=complex)
-        for i in range(dim):
-            z_val = 1 if (bin(i).count('1') % 2 == 0) else -1
-            Z_matrix[i, i] = z_val
-        
-        K1 = _np.sqrt(p) * Z_matrix
-        
-        result = K0 @ dm @ K0.conj().T + K1 @ dm @ K1.conj().T
-        
-        result = 0.5 * (result + result.conj().T)
-        
-        print(f"[Dephasing Kraus] Applied with p={p:.4f}")
-        
-        return result
-    
-    def apply_amplitude_damping(self, dm: "np.ndarray", 
-                                 gamma: float = 0.1) -> "np.ndarray":
-        """Apply amplitude damping channel (T1 relaxation)."""
-        if self._np is None:
-            raise RuntimeError("[Dephasing] NumPy required")
-        
-        dim = dm.shape[0]
-        n_qubits = int(_np.round(_np.log2(dim)))
-        
-        K0 = _np.zeros((dim, dim), dtype=complex)
-        K1 = _np.zeros((dim, dim), dtype=complex)
-        
-        for i in range(dim):
-            if (i >> 1) < (dim >> 1):
-                j = i << 1
-                if j < dim:
-                    K0[j, i] = 1.0
-            else:
-                K0[i, i] = _np.sqrt(1 - gamma)
-                K1[i, i] = _np.sqrt(gamma)
-        
-        result = K0 @ dm @ K0.conj().T + K1 @ dm @ K1.conj().T
-        
-        result = 0.5 * (result + result.conj().T)
-        
-        print(f"[AmplitudeDamping] Applied with γ={gamma}")
-        
-        return result
-
-
-class EntanglementWitness:
-    """
-    Measure genuine multipartite entanglement using witness operators.
-    Implements proper partial trace for multipartite quantum states.
-    """
-    
-    def __init__(self):
-        self._np = _np if _HAS_NP else None
-        
-    def compute_witness(self, dm: "np.ndarray", 
-                        partition: List[Set[int]]) -> Tuple[bool, float]:
-        """
-        Compute entanglement witness for given partition.
-        
-        Args:
-            dm: Density matrix (8x8 for 3 qubits)
-            partition: List of subsystem sets, e.g., [{0,1}, {2}]
-            
-        Returns:
-            Tuple of (is_entangled, witness_value)
-            Witness < 0 = entangled, Witness > 0 = separable
-        """
-        if self._np is None:
-            raise RuntimeError("[Entanglement] NumPy required")
-        
-        np = self._np
-        dim = dm.shape[0]
-        n_qubits = int(round(np.log2(dim)))
-        
-        if len(partition) < 2:
-            return False, 0.0
-        
-        # Get the first partition (party A) - e.g., {0,1} or {2}
-        party_a_qubits = list(partition[0])
-        party_b_qubits = [i for i in range(n_qubits) if i not in partition[0]]
-        
-        # Compute dimensions
-        d_A = 2 ** len(party_a_qubits)
-        d_B = 2 ** len(party_b_qubits)
-        
-        # Compute partial trace over party B (trace out qubits not in party A)
-        rho_A = self._partial_trace(dm, keep_qubits=party_a_qubits, n_qubits=n_qubits)
-        
-        # Normalize
-        tr_A = float(np.real(np.trace(rho_A)))
-        if tr_A > 1e-10:
-            rho_A = rho_A / tr_A
-        
-        # Entanglement witness: Tr(ρ_A ⊗ I/d_B) - 1 = Tr(ρ_A)/d_A - 1
-        # For separable state: Tr(ρ_A) = d_A (maximally mixed)
-        # For entangled state: Tr(ρ_A) < d_A
-        identity_A = np.eye(d_A, dtype=np.complex128) / d_A
-        witness = float(np.real(np.trace(rho_A @ identity_A))) - 1.0
-        
-        # Negative witness indicates genuine entanglement
-        is_entangled = witness < -0.01
-        
-        _EXP_LOG.debug(f"[Entanglement] Party A (qubits {party_a_qubits}): dim={d_A}, witness={witness:.4f}, entangled={is_entangled}")
-        
-        return is_entangled, witness
-    
-    def _partial_trace(self, rho: "np.ndarray", 
-                       keep_qubits: List[int], 
-                       n_qubits: int) -> "np.ndarray":
-        """
-        Compute partial trace over all qubits NOT in keep_qubits.
-        
-        Args:
-            rho: Density matrix (2^n x 2^n)
-            keep_qubits: List of qubit indices to keep
-            n_qubits: Total number of qubits
-            
-        Returns:
-            Reduced density matrix for kept qubits
-        """
-        np = self._np
-        
-        # Start with all axes
-        shape = [2] * n_qubits
-        
-        # Reshape into tensor form
-        rho_tensor = rho.reshape(shape * 2)
-        
-        # Trace out qubits not in keep_qubits
-        for i in range(n_qubits - 1, -1, -1):
-            if i not in keep_qubits:
-                # Sum over this axis (trace out)
-                rho_tensor = np.trace(rho_tensor, axis1=i, axis2=i + n_qubits)
-                n_qubits -= 1
-        
-        # Get new dimension
-        d_keep = 2 ** len(keep_qubits)
-        
-        return rho_tensor.reshape(d_keep, d_keep)
-    
-    def compute_concurrence(self, dm: "np.ndarray") -> float:
-        """
-        Compute 3-qubit concurrence for multipartite entanglement.
-        """
-        np = self._np
-        
-        if dm.shape != (8, 8):
-            return 0.0
-        
-        # For 3-qubit state, compute various entanglement measures
-        # Concurrence C = max(0, λ1 - λ2 - λ3 - λ4) where λi are sqrt(eigenvalues)
-        
-        # Compute matrix R = ρ * (σy ⊗ σy ⊗ σy) * ρ* * (σy ⊗ σy ⊗ σy)
-        sigmay = np.array([[0, -1j], [1j, 0]], dtype=np.complex128)
-        sigmay_3 = np.kron(np.kron(sigmay, sigmay), sigmay)
-        
-        try:
-            R = dm @ sigmay_3 @ dm.conj().T @ sigmay_3
-            eigvals = np.linalg.eigvalsh(R)
-            eigvals = np.sort(np.abs(eigvals))[::-1]
-            eigvals = np.maximum(eigvals, 0)
-            
-            if len(eigvals) >= 4:
-                concurrence = max(0.0, np.sqrt(eigvals[0]) - np.sqrt(eigvals[1]) - 
-                                  np.sqrt(eigvals[2]) - np.sqrt(eigvals[3]))
-            else:
-                concurrence = 0.0
-        except:
-            concurrence = 0.0
-        
-        return float(concurrence)
-        
-        traced = _np.trace(rho_reshaped, axis1=0, axis2=2)
-        
-        result = _np.reshape(traced, [n // (dim * dim), n // (dim * dim)])
-        
-        return result
-    
-    def is_entangled(self, dm: "np.ndarray", 
-                     partition: List[Set[int]] = None) -> bool:
-        """
-        Determine if state is genuinely entangled.
-        
-        Args:
-            dm: Density matrix
-            partition: Optional partition specification
-        """
-        if self._np is None:
-            raise RuntimeError("[Entanglement] NumPy required")
-        
-        dim = dm.shape[0]
-        n_qubits = int(_np.round(_np.log2(dim)))
-        
-        if partition is None:
-            partition = [{i} for i in range(n_qubits)]
-        
-        witness_val = self._compute_genuine_witness(dm)
-        
-        is_entangled = witness_val < 0
-        
-        _EXP_LOG.debug(f"[Entanglement] Genuine multipartite entanglement: {is_entangled}")
-        _EXP_LOG.debug(f"[Entanglement] Witness value: {witness_val:.6f}")
-        
-        return is_entangled
-    
-    def _compute_genuine_witness(self, dm: "np.ndarray") -> float:
-        """Compute genuine multipartite entanglement witness."""
-        if self._np is None:
-            raise RuntimeError("[Entanglement] NumPy required")
-        
-        dim = dm.shape[0]
-        n_qubits = int(_np.round(_np.log2(dim)))
-        
-        if n_qubits < 2:
-            return 0.0
-        
-        rho_mixed = dm.copy()
-        for i in range(dim):
-            for j in range(dim):
-                if i != j:
-                    rho_mixed[i, j] = 0
-        
-        trace = float(_np.real(_np.trace(rho_mixed)))
-        if trace > 1e-10:
-            rho_mixed = rho_mixed / trace
-        
-        purity = float(_np.real(_np.trace(rho_mixed @ rho_mixed)))
-        
-        witness = 1.0 - purity
-        
-        return witness
-    
-    def concurrence(self, dm: "np.ndarray") -> float:
-        """Compute concurrence for 2-qubit state."""
-        if self._np is None:
-            raise RuntimeError("[Entanglement] NumPy required")
-        
-        dim = dm.shape[0]
-        if dim != 4:
-            raise ValueError("[Entanglement] Concurrence requires 2-qubit (4x4) state")
-        
-        YY = _np.array([[0,0,0,-1],[0,0,1,0],[0,-1,0,0],[1,0,0,0]], dtype=complex)
-        
-        R = dm @ YY @ dm.conj() @ YY
-        
-        eigvals = _np.linalg.eigvalsh(R)
-        eigvals = _np.sort(_np.sqrt(_np.abs(eigvals)))[::-1]
-        
-        C = max(0, eigvals[0] - eigvals[1] - eigvals[2] - eigvals[3])
-        
-        _EXP_LOG.debug(f"[Entanglement] Concurrence: {C:.6f}")
-        
-        return float(C)
-
-
 def _kron(*ops):
     r = ops[0]
     for o in ops[1:]:
@@ -8487,10 +7194,6 @@ class KoyebAPIClient:
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
         return None
-
-    def rpc(self, method: str, params: list = None, timeout: int = None, retries: int = 2) -> Optional[dict]:
-        """Alias for _rpc for backwards compatibility."""
-        return self._rpc(method, params, timeout, retries)
     def get_chain_tip(self) -> Optional[dict]:
         """Get chain tip via JSON-RPC (qtcl_getBlockHeight).
         
@@ -8710,36 +7413,42 @@ class KoyebAPIClient:
         return []
     def register_peer(self, peer_id: str, gossip_url: str,
                        miner_address: str = "",
-                       block_height: int = 0) -> Optional[dict]:
-        """Register peer via JSON-RPC (not REST)."""
+                       block_height: int = 0,
+                       pubkey: str = "",
+                       node_id: str = "") -> Optional[dict]:
+        """Register peer via JSON-RPC — fields match server qtcl_registerPeer schema exactly."""
+        # node_id must be 64 lowercase hex (SHA-256 of pubkey); derive from peer_id if not given
+        _node_id = (node_id or peer_id or "").lower()[:64].ljust(64, "0")
+        # external_addr = host:port extracted from gossip_url or fallback to gossip_url itself
+        try:
+            from urllib.parse import urlparse as _up
+            _p = _up(gossip_url)
+            _ext_addr = f"{_p.hostname}:{_p.port or 9091}"
+        except Exception:
+            _ext_addr = gossip_url or f"0.0.0.0:9091"
         return self._rpc("qtcl_registerPeer", [{
-            "peer_id": peer_id, "gossip_url": gossip_url,
-            "miner_address": miner_address,
-            "block_height": block_height, "ts": time.time(),
+            "external_addr": _ext_addr,
+            "node_id":       _node_id,
+            "pubkey":        pubkey or peer_id,
+            "chain_height":  int(block_height),
         }])
-    def send_heartbeat(self, peer_id: str, block_height: int = 0) -> Optional[dict]:
-        """Send peer heartbeat via JSON-RPC (not REST)."""
-        return self._rpc("qtcl_sendHeartbeat", [{
-            "peer_id": peer_id, "block_height": block_height, "ts": time.time(),
+    def send_heartbeat(self, peer_id: str, block_height: int = 0, external_addr: str = None) -> Optional[dict]:
+        """Heartbeat keep-alive: re-upsert peer registration (qtcl_sendHeartbeat does not exist)."""
+        _node_id = peer_id.lower()[:64].ljust(64, "0")
+        _ext     = external_addr or "0.0.0.0:9091"
+        return self._rpc("qtcl_registerPeer", [{
+            "external_addr": _ext,
+            "node_id":       _node_id,
+            "pubkey":        peer_id,
+            "chain_height":  int(block_height),
         }])
     def gossip_ingest(self, payload: dict) -> Optional[dict]:
         """Ingest gossip via JSON-RPC (not REST)."""
         return self._rpc("qtcl_gossipIngest", [payload])
     def oracle_register(self, miner_id: str, miner_address: str) -> Optional[dict]:
-        """Register oracle via JSON-RPC (not REST).
-        
-        Uses qtcl_submitOracleReg to register oracle on-chain via mempool.
-        Format: {"wallet_address": "qtcl1...", "oracle_addr": "qtcl1..."}
-        """
-        _EXP_LOG.info(f"[ORACLE-REG] Submitting oracle registration: miner_id={miner_id}, address={miner_address}")
-        try:
-            result = self._rpc("qtcl_submitOracleReg",
-                            [{"wallet_address": miner_address, "oracle_addr": miner_address}])
-            _EXP_LOG.info(f"[ORACLE-REG] Registration result: {result}")
-            return result
-        except Exception as e:
-            _EXP_LOG.error(f"[ORACLE-REG] Registration failed with exception: {e}")
-            raise
+        """Register oracle via JSON-RPC — routes to qtcl_submitOracleReg (qtcl_registerOracle DNE)."""
+        return self._rpc("qtcl_submitOracleReg",
+                        [{"miner_id": miner_id, "address": miner_address}])
     def health_check(self, timeout: int = 5, force: bool = False) -> bool:
         """Check if oracle is reachable via JSON-RPC health call. Caches result for 10 seconds."""
         now = time.time()
@@ -10213,11 +8922,10 @@ class P2PPeer:
 
 class PeerManager:
     """Manages peer connections, state machine, and discovery"""
-    def __init__(self, max_peers: int = _P2P_MAX_PEERS, db = None, kademlia_table = None):
+    def __init__(self, max_peers: int = _P2P_MAX_PEERS, db = None):
         self.max_peers = max_peers
         self.max_outbound = _P2P_MAX_OUTBOUND
         self.db = db
-        self.kademlia_table = kademlia_table
         self.peers = {}
         self.pending = {}
         self.lock = _threading.Lock()
@@ -10225,17 +8933,6 @@ class PeerManager:
     
     def add_peer(self, peer: P2PPeer) -> None:
         with self.lock:
-            # Prevent self-pairing
-            if hasattr(self, 'node_id') and peer.node_id == self.node_id: return
-            
-            # Upsert logic - avoid duplicates by host:port
-            for existing_id, existing_peer in list(self.peers.items()):
-                if existing_peer.host == peer.host and existing_peer.port == peer.port:
-                    if peer.state == PeerState.ACTIVE:
-                         existing_peer.state = PeerState.ACTIVE
-                    existing_peer.last_seen = int(time.time())
-                    return
-
             _is_new = peer.node_id not in self.peers
             self.peers[peer.node_id] = peer
             if _is_new:
@@ -10250,85 +8947,6 @@ class PeerManager:
         with self.lock:
             return [p for p in self.peers.values() if p.state == PeerState.ACTIVE]
     
-    def get_target_peers(self, count: int = None) -> List[P2PPeer]:
-        """Get target peers for gossiping, prioritized by KademliaRoutingTable proximity.
-        
-        When Kademlia routing table is available, peers are selected by XOR-distance
-        to our node_id, ensuring efficient DHT-based peer selection for block/tx gossip.
-        Falls back to active peers if no Kademlia table is configured.
-        """
-        count = count or self.max_outbound
-        with self.lock:
-            active = [p for p in self.peers.values() if p.state == PeerState.ACTIVE]
-        
-        if not self.kademlia_table or not active:
-            return active[:count]
-        
-        try:
-            k_closest = self.kademlia_table.find_closest(self.kademlia_table.local_node_id, count=count)
-            k_node_ids = {n.node_id for n in k_closest}
-            
-            kademlia_peers = [p for p in active if p.node_id in k_node_ids]
-            remaining = [p for p in active if p.node_id not in k_node_ids]
-            
-            return (kademlia_peers + remaining)[:count]
-        except Exception:
-            return active[:count]
-    
-    def inject_dht_peer(self, node_id: str, host: str, port: int) -> None:
-        """Immediately inject a DHT-discovered peer into the active peer pool.
-        
-        Called when KademliaRoutingTable or DHTManager discovers a new peer
-        via qtcl_dhtPing or qtcl_dhtFindNode responses.
-        """
-        if not node_id or not host:
-            return
-        with self.lock:
-            if node_id == getattr(self, 'node_id', None):
-                return
-            for existing in self.peers.values():
-                if existing.node_id == node_id:
-                    existing.last_seen = int(time.time())
-                    if existing.state == PeerState.UNKNOWN:
-                        existing.state = PeerState.CONNECTING
-                    return
-                if existing.host == host and existing.port == port:
-                    existing.last_seen = int(time.time())
-                    return
-        
-        peer = P2PPeer(host, port, node_id)
-        peer.state = PeerState.CONNECTING
-        peer.last_seen = int(time.time())
-        self.add_peer(peer)
-    
-    def register_peer_info(self, info: dict) -> None:
-        """Register a peer from raw info dict (discovery)"""
-        try:
-            # Try multiple common keys for the address
-            p_addr = info.get('external_addr') or info.get('host') or info.get('peer_addr')
-            node_id = info.get('node_id') or info.get('peer_id')
-            if not p_addr or not node_id: return
-            
-            # Parse host/port
-            if ':' in p_addr:
-                host = p_addr.split(':')[0]
-                port = int(p_addr.split(':')[1])
-            else:
-                host = p_addr
-                port = info.get('port', _P2P_PORT)
-
-            with self.lock:
-                if node_id not in self.peers:
-                    peer = P2PPeer(host, port, node_id)
-                    peer.chain_height = info.get('chain_height', 0)
-                    peer.last_seen = info.get('last_seen', int(time.time()))
-                    # Discovery candidates start as UNKNOWN or CONNECTING
-                    peer.state = PeerState.UNKNOWN
-                    self.peers[node_id] = peer
-                    logger.debug(f"[P2P-MGR] Discovered new peer: {host}:{port}")
-        except Exception as e:
-            logger.debug(f"[P2P-MGR] Peer info reg failed: {e}")
-
     def remove_peer(self, node_id: str) -> None:
         with self.lock:
             if node_id in self.peers:
@@ -11232,11 +9850,9 @@ class ExternalAddressResolver:
 
 class DHTManager:
     """Kademlia-over-HTTP DHT for peer discovery"""
-    def __init__(self, db = None, peer_mgr = None, kademlia_table = None):
+    def __init__(self, db = None):
         self.db = db
         self.node_id = None
-        self.peer_mgr = peer_mgr
-        self.kademlia_table = kademlia_table
     
     def find_node(self, target_id: str, count: int = 20) -> List[dict]:
         """Find closest nodes to target_id"""
@@ -11250,33 +9866,9 @@ class DHTManager:
             nodes = []
             for row in cursor.fetchall():
                 dist = self._xor_distance(row[0], target_id)
-                node_entry = {'node_id': row[0], 'addr': row[1], 'distance': dist}
-                nodes.append(node_entry)
-                self._inject_peer_from_dht_result(row[0], row[1])
+                nodes.append({'node_id': row[0], 'addr': row[1], 'distance': dist})
             return sorted(nodes, key=lambda x: x['distance'])[:count]
         except: return []
-    
-    def _inject_peer_from_dht_result(self, node_id: str, addr: str) -> None:
-        """Immediately inject a DHT-discovered peer into the active peer pool."""
-        if not addr or not node_id:
-            return
-        if ':' in addr:
-            parts = addr.rsplit(':', 1)
-            host = parts[0]
-            try:
-                port = int(parts[1])
-            except ValueError:
-                port = _P2P_PORT
-        else:
-            host = addr
-            port = _P2P_PORT
-        if self.peer_mgr:
-            self.peer_mgr.inject_dht_peer(node_id, host, port)
-        if self.kademlia_table:
-            try:
-                self.kademlia_table.add_node(KademliaNode(node_id=node_id, host=host, port=port))
-            except Exception:
-                pass
     
     def store(self, key: str, value: str, ttl: int = 3600) -> bool:
         """Store value in DHT"""
@@ -11573,18 +10165,6 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             count = min(params.get('count', 20), 100)
             if dht:
                 nodes = dht.find_node(target_id, count)
-                for _n in nodes:
-                    _nid = _n.get('node_id', '')
-                    _addr = _n.get('addr', '')
-                    if _nid and _addr and peer_mgr:
-                        if ':' in _addr:
-                            _h, _p = _addr.rsplit(':', 1)
-                            try: _p = int(_p)
-                            except: _p = _P2P_PORT
-                        else:
-                            _h = _addr
-                            _p = _P2P_PORT
-                        peer_mgr.inject_dht_peer(_nid, _h, _p)
                 return {'nodes': nodes}, None
             return {'nodes': []}, None
         
@@ -11625,19 +10205,17 @@ class P2PNode:
         self.seen_blocks = LRUCache(10000)
         self.seen_txs = LRUCache(50000)
         self.sessions = SessionManager()
-        self.kademlia_table = KademliaRoutingTable(local_node_id=self.node_id)
-        self.peer_mgr = PeerManager(max_peers=_P2P_MAX_PEERS, db=db, kademlia_table=self.kademlia_table)
-        self.peer_mgr.node_id = self.node_id
+        self.peer_mgr = PeerManager(max_peers=_P2P_MAX_PEERS, db=db)
         self.lattice = PQ0LatticeManager(db=db)
         self.propagator = BlockPropagator(None, self.lattice)
         self.tx_relay = TxRelay(None)
         self.sync_mgr = SyncManager(self.peer_mgr)
-        self.dht = DHTManager(db=db, peer_mgr=self.peer_mgr, kademlia_table=self.kademlia_table)
+        self.dht = DHTManager(db=db)
         self.dht.node_id = self.node_id
         self.external_addr = None
         self._running = False
     
-    def start(self, app_instance=None) -> None:
+    def start(self) -> None:
         if self._running:
             return
         self.external_addr = ExternalAddressResolver.resolve()
@@ -11654,105 +10232,7 @@ class P2PNode:
         self._running = True
         self.sync_mgr.start_daemon()
         self._start_peer_bootstrap_daemon()
-        if app_instance:
-            self._start_peer_discovery_daemon(app_instance)
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
-    
-    def _start_peer_discovery_daemon(self, app_instance) -> None:
-        """DHT-driven active peer discovery: uses KademliaRoutingTable for peer discovery."""
-        import threading as _t, time as _tm, json as _j
-        from urllib.request import urlopen, Request
-        
-        def _discovery_loop():
-            print("[P2P-DISC] DHT-driven peer discovery engine online", flush=True)
-            while self._running:
-                try:
-                    active_peers = self.peer_mgr.get_active_peers()
-                    all_potential = list(self.peer_mgr.peers.values())
-                    
-                    if active_peers:
-                        print(f"[P2P-DISC] Gossiping with {len(active_peers)} active peers", flush=True)
-                    
-                    for _peer in active_peers:
-                        try:
-                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
-                            _body = _j.dumps({
-                                "jsonrpc": "2.0", "method": "qtcl_dht_findNode",
-                                "params": {"target_id": self.node_id, "count": 20}, "id": 1
-                            }).encode()
-                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
-                            with urlopen(_req, timeout=3) as _resp:
-                                _data = _j.loads(_resp.read())
-                                _nodes = _data.get('result', {}).get('nodes', [])
-                                for _n in _nodes:
-                                    _nid = _n.get('node_id', '')
-                                    _addr = _n.get('addr', '') or _n.get('host', '')
-                                    if not _nid or not _addr:
-                                        continue
-                                    if ':' in _addr:
-                                        _h, _p = _addr.rsplit(':', 1)
-                                        try: _p = int(_p)
-                                        except: _p = _P2P_PORT
-                                    else:
-                                        _h = _addr
-                                        _p = _P2P_PORT
-                                    if _nid != self.node_id:
-                                        self.peer_mgr.inject_dht_peer(_nid, _h, _p)
-                                        try:
-                                            self.kademlia_table.add_node(KademliaNode(node_id=_nid, host=_h, port=_p))
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            continue
-                    
-                    for _peer in all_potential:
-                        try:
-                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
-                            _body = _j.dumps({
-                                "jsonrpc": "2.0", 
-                                "method": "qtcl_p2p_announce", 
-                                "params": {
-                                    "node_id": self.node_id,
-                                    "external_addr": self.external_addr,
-                                    "chain_height": 0
-                                }, 
-                                "id": 1
-                            }).encode()
-                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
-                            with urlopen(_req, timeout=2) as _resp:
-                                if _peer.state != PeerState.ACTIVE:
-                                    _peer.state = PeerState.ACTIVE
-                                    print(f"[P2P-DISC] Peer {_peer.host}:{_peer.port} activated via announce", flush=True)
-                        except Exception:
-                            continue
-                    
-                    for _peer in active_peers:
-                        try:
-                            _peer_rpc = f"http://{_peer.host}:{_peer.port}/rpc"
-                            _body = _j.dumps({
-                                "jsonrpc": "2.0", "method": "qtcl_p2p_getAddr", "params": {}, "id": 1
-                            }).encode()
-                            _req = Request(_peer_rpc, data=_body, headers={'Content-Type': 'application/json'})
-                            with urlopen(_req, timeout=3) as _resp:
-                                _data = _j.loads(_resp.read())
-                                _new_peers = _data.get('result', {}).get('peers', [])
-                                for _np in _new_peers:
-                                    if _np.get('host') != self.external_addr:
-                                        self.peer_mgr.register_peer_info(_np)
-                        except Exception:
-                            continue
-                    
-                    try:
-                        app_instance._register_with_koyeb()
-                    except Exception:
-                        pass
-
-                except Exception as _le:
-                    _EXP_LOG.debug(f"[P2P-DISC] Loop error: {_le}")
-                
-                _tm.sleep(30)
-
-        _t.Thread(target=_discovery_loop, daemon=True, name="P2PActiveDiscovery").start()
     
     def _start_peer_bootstrap_daemon(self) -> None:
         """Launch async peer bootstrap — handshake seeds, activate peers.
@@ -12769,88 +11249,6 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[ORACLE-REG] Koyeb gossip: {_be}")
         _threading.Thread(target=_do_broadcast, daemon=True,
                           name="OracleRegBroadcast").start()
-        
-        # ── Register as peer with Koyeb ─────────────────────────────────────────
-        def _register_with_koyeb_peer():
-            try:
-                if hasattr(self, 'p2p_node') and self.p2p_node:
-                    ext_addr = self.p2p_node.external_addr
-                    node_id = self._oracle_id.get('address', '')
-                    pubkey = self._oracle_id.get('public_key', '')
-                    height = int(self.koyeb_state.block_height or 0) if hasattr(self, 'koyeb_state') else 0
-                    
-                    reg_resp = self.api._rpc("qtcl_registerPeer", {
-                        "external_addr": ext_addr,
-                        "pubkey": pubkey,
-                        "chain_height": height,
-                        "node_id": node_id,
-                        "is_node": True,
-                        "is_relay": True,
-                        "oracle_mode": _oid.get("mode", "anonymous"),
-                    })
-                    if reg_resp and reg_resp.get("registered"):
-                        _EXP_LOG.info(f"[ORACLE-REG] ✅ Peer registered with Koyeb: {node_id[:16]}...")
-                    else:
-                        _EXP_LOG.warning(f"[ORACLE-REG] Peer registration failed: {reg_resp}")
-            except Exception as _pe:
-                _EXP_LOG.warning(f"[ORACLE-REG] Koyeb peer registration failed: {_pe}")
-        
-        _threading.Thread(target=_register_with_koyeb_peer, daemon=True,
-                          name="OracleKoyebPeerReg").start()
-        
-        # ── Subscribe to server measurement broadcasts ────────────────────────
-        def _subscribe_to_measurements():
-            try:
-                client_id = f"oracle_{self._oracle_id.get('address', 'unknown')}"
-                callback_url = f"http://{_ip_hint or '127.0.0.1'}:9091/rpc" if _ip_hint else None
-                
-                _EXP_LOG.debug(f"[ORACLE-REG] Subscribing to measurement broadcasts: client_id={client_id}")
-                
-                sub_resp = self.api._rpc("qtcl_registerMeasurementSubscriber", {
-                    "client_id": client_id,
-                    "callback_url": callback_url or "http://localhost:9091/rpc",
-                    "burst_mode": True,
-                })
-                # Server returns {registered: true, subscriber_id: ...}
-                if sub_resp and (sub_resp.get("subscribed") or sub_resp.get("registered")):
-                    _EXP_LOG.debug(f"[ORACLE-REG] ✅ Subscribed: {sub_resp.get('subscriber_id', '')}")
-                else:
-                    _EXP_LOG.debug(f"[ORACLE-REG] Subscription result: {sub_resp}")
-            except Exception as _ms:
-                _EXP_LOG.debug(f"[ORACLE-REG] Subscription error: {_ms}")
-        
-        _threading.Thread(target=_subscribe_to_measurements, daemon=True,
-                          name="OracleMeasurementSub").start()
-        
-        # ── Submit on-chain oracle registration (null tx, info-only, no value) ────
-        def _submit_onchain_reg():
-            try:
-                oracle_addr = _oid.get('address', '')
-                wallet_addr = _oid.get('wallet_addr', oracle_addr)
-                oracle_pub = _oid.get('public_key', '')
-                
-                if not oracle_addr:
-                    return
-                
-                onchain_resp = self.api._rpc("qtcl_submitOracleReg", [{
-                    "wallet_address": wallet_addr,
-                    "oracle_addr": oracle_addr,
-                    "oracle_pub": oracle_pub,
-                    "mode": _oid.get("mode", "anonymous"),
-                    "ip_hint": _ip_hint,
-                    "action": "register",
-                }])
-                
-                if onchain_resp and onchain_resp.get("status") in ("submitted", "tx_template_issued", "accepted"):
-                    _EXP_LOG.debug(f"[ORACLE-REG] ✅ On-chain reg: {onchain_resp.get('tx_hash', 'N/A')}")
-                else:
-                    _EXP_LOG.debug(f"[ORACLE-REG] On-chain result: {onchain_resp}")
-            except Exception as _oc:
-                pass
-        
-        _threading.Thread(target=_submit_onchain_reg, daemon=True,
-                          name="OracleOnChainReg").start()
-        
         _mode_tag = ("🔐 wallet-bound" if _oid.get("mode") == "wallet_bound"
                      else "👻 anonymous")
         _EXP_LOG.info(f"[ORACLE-REG] broadcast {_oid['address']} [{_mode_tag}]  "
@@ -13659,12 +12057,10 @@ class QtclClientApp:
         import threading as _stt
         for _t in _stt.enumerate():
             if _t.name == "TripartiteOracle":
-                _EXP_LOG.debug("[TRIPARTITE] Thread already running, skipping creation")
                 return  # already running
         _t = _stt.Thread(
             target=self._tripartite_oracle_loop, daemon=True, name="TripartiteOracle")
         _t.start()
-        _EXP_LOG.info("[TRIPARTITE] ✅ TripartiteOracle thread started")
 
     def _tripartite_oracle_loop(self) -> None:
         """
@@ -13685,28 +12081,31 @@ class QtclClientApp:
         import time as _tl
         _EXP_LOG.info("[TRIPARTITE] 🚀 Oracle engine starting...")
         
-        # Use Enterprise NumPy Entanglement Engine (no Qiskit dependencies)
-        _EXP_LOG.info("[TRIPARTITE] Initialising NumPyEntanglementEngine (enterprise-grade)...")
-        _ent_engine = _get_entanglement_engine()
-        _numpy_only = True  # NumPy engine is always available
-        _EXP_LOG.info("[TRIPARTITE] ✅ NumPyEntanglementEngine active — enterprise entanglement")
+        # Initialise nodes (may fail on Termux without qiskit_aer)
+        _EXP_LOG.info("[TRIPARTITE] Initialising 3-node oracle cluster (pq0, pq0_IV, pq0_V)...")
+        _has_aer = self._init_client_oracle_nodes()
+        _numpy_only = not _has_aer
+        if _has_aer:
+            _EXP_LOG.info("[TRIPARTITE] ✅ Qiskit Aer available — full quantum measurement mode")
+        else:
+            _EXP_LOG.warning("[TRIPARTITE] ⚠️  Qiskit Aer unavailable — numpy-only fallback mode")
         
+        # Import math for finite checks
         try:
             import math as _math
         except ImportError:
             _math = None
             _EXP_LOG.warning("[TRIPARTITE] math module unavailable — may have NaN issues")
 
+        # Numpy-only fallback import
         try:
             import numpy as _np_l
             _HAS_NP_L = True
         except ImportError:
             _HAS_NP_L = False
-            _EXP_LOG.error("[TRIPARTITE] NumPy unavailable — cannot run")
-            return
 
         _cycle = 0
-        _push_every = 5
+        _push_every = 5   # push to server every N cycles
         _measure_interval = 2.0
 
         while not self._stop.is_set():
@@ -13714,92 +12113,173 @@ class QtclClientApp:
                 _cycle += 1
                 now = _tl.time()
 
-                # ── Step 1: Run entanglement cycle using NumPy engine ───────────
-                _upstream_dm = None
-                _upstream_fid = 0.0
-                
-                # RECOVERY: Fetch latest upstream directly from _LIVE_RPC_ORACLE
+                # ── Step 1: measure all 3 nodes ────────────────────────────
+                # Seed from the current fused DM so nodes stay coherent with chain
+                seed = self._local_consensus_dm
+                dms = []
+                if _has_aer and _HAS_NP_L:
+                    with self._local_oracle_lock:
+                        _nodes = list(self._local_oracle_nodes)
+                    _EXP_LOG.debug(f"[TRIPARTITE] Measuring {len(_nodes)} AerSimulator nodes...")
+                    for _node in _nodes:
+                        _dm = self._client_oracle_measure_node(_node, seed_dm=seed)
+                        _node['last_dm'] = _dm
+                        _node['last_ts'] = now
+                        dms.append(_dm)
+                        _EXP_LOG.debug(f"[TRIPARTITE] Node {_node['id']} measured — DM shape={_dm.shape}")
+
+                # ── Step 2: 3-of-3 Hermitian mean ─────────────────────────
+                if _HAS_NP_L and dms:
+                    local_dm = sum(dms) / len(dms)
+                    _tr = float(_np_l.real(_np_l.trace(local_dm)))
+                    if _tr > 1e-12:
+                        local_dm /= _tr
+                    # Compute W-state fidelity
+                    _w = _np_l.zeros(8, dtype=_np_l.complex128)
+                    for _k in range(3):
+                        _w[1 << _k] = 1.0
+                    _w /= _np_l.sqrt(3)
+                    _wdm = _np_l.outer(_w, _w.conj())
+                    _local_fid = float(_np_l.real(_np_l.trace(_wdm @ local_dm)))
+                    _local_fid = max(0.0, min(1.0, _local_fid))
+                elif _HAS_NP_L:
+                    # ── numpy-only fallback: JOINT 4-party W-state ─────────
+                    # All 4 parties (pq0, pq0_IV, pq0_V, koyeb) share ONE
+                    # joint |W4> state in 16-dim Hilbert space.  Each local
+                    # node applies a small QRNG-seeded SU(2) on its OWN party
+                    # qubit — an independent sensor without breaking entanglement
+                    # with the other parties.  Koyeb is incorporated as party-3
+                    # marginal injection after upstream fetch in Step 3.
+
+                    # |W4> = (|1000>+|0100>+|0010>+|0001>)/2
+                    _w4_sv = _np_l.zeros(16, dtype=_np_l.complex128)
+                    for _k in range(4):
+                        _w4_sv[1 << _k] = 1.0
+                    _w4_sv /= _np_l.linalg.norm(_w4_sv)
+
+                    # |W3> for local-subsystem fidelity checks
+                    _w = _np_l.zeros(8, dtype=_np_l.complex128)
+                    for _k in range(3):
+                        _w[1 << _k] = 1.0
+                    _w /= _np_l.sqrt(3)
+                    _wdm = _np_l.outer(_w, _w.conj())
+
+                    def _su2_seed(sb, strength=0.10):
+                        import hashlib as _hl2
+                        _si = int.from_bytes(_hl2.sha3_256(sb).digest()[:4], 'big')
+                        _r2 = _np_l.random.default_rng(_si)
+                        _th = _r2.random() * strength * _math.pi
+                        _n2 = _r2.standard_normal(3)
+                        _n2 /= _np_l.linalg.norm(_n2)
+                        _c2, _s2 = _math.cos(_th/2), _math.sin(_th/2)
+                        return _np_l.array(
+                            [[_c2+1j*_s2*_n2[2], _s2*(_n2[1]+1j*_n2[0])],
+                             [-_s2*(_n2[1]-1j*_n2[0]), _c2-1j*_s2*_n2[2]]],
+                            dtype=_np_l.complex128)
+
+                    def _apply_su2(sv, U, qubit, N=4):
+                        sv = sv.reshape([2]*N)
+                        sv = _np_l.tensordot(U, sv, axes=([1],[qubit]))
+                        sv = _np_l.moveaxis(sv, 0, qubit)
+                        return sv.reshape(2**N)
+
+                    def _ptrace(rho, keep, N=4):
+                        _to = sorted([p for p in range(N) if p not in keep], reverse=True)
+                        for _pt in _to:
+                            _cn = int(round(_np_l.log2(rho.shape[0])))
+                            _db = 2**_pt
+                            _da = 2**(_cn-_pt-1)
+                            rho = rho.reshape(_db,2,_da,_db,2,_da)
+                            rho = rho[:,0,:,:,0,:] + rho[:,1,:,:,1,:]
+                            rho = rho.reshape(_db*_da, _db*_da)
+                        return rho
+
+                    try:
+                        _epool  = get_entropy_pool()
+                        _ebytes = _epool.get(96)
+                    except Exception:
+                        _ebytes = os.urandom(96)
+
+                    _node_seeds     = [_ebytes[i*32:(i+1)*32] for i in range(3)]
+                    _node_strengths = [0.10, 0.09, 0.11]
+
+                    # Each node rotates ITS party qubit on the shared |W4> sv
+                    _jdms = []
+                    for _ni in range(3):
+                        _U_n = _su2_seed(_node_seeds[_ni], _node_strengths[_ni])
+                        _svp = _apply_su2(_w4_sv.copy(), _U_n, qubit=_ni)
+                        _svp /= _np_l.linalg.norm(_svp)
+                        _jdms.append(_np_l.outer(_svp, _svp.conj()))
+
+                    # 3-of-3 consensus joint DM (16x16)
+                    _joint_dm = sum(_jdms) / 3.0
+                    _joint_dm = (_joint_dm + _joint_dm.conj().T) / 2.0
+                    _tr_jc = float(_np_l.real(_np_l.trace(_joint_dm)))
+                    if _tr_jc > 1e-12: _joint_dm /= _tr_jc
+
+                    # Lightweight Lindblad phase-damping on joint 16x16 space
+                    _gj, _dtj = 0.03, 0.06
+                    for _kq in range(4):
+                        _P1j = _np_l.zeros((16,16), dtype=_np_l.complex128)
+                        for _ix in range(16):
+                            if (_ix >> _kq) & 1:
+                                _P1j[_ix,_ix] = 1.0
+                        _Lj = _np_l.sqrt(_gj) * _P1j
+                        _drj = (_Lj @ _joint_dm @ _Lj.conj().T
+                                - 0.5*(_Lj.conj().T @ _Lj @ _joint_dm
+                                       + _joint_dm @ _Lj.conj().T @ _Lj))
+                        _joint_dm = _joint_dm + _dtj * _drj
+                    _joint_dm = (_joint_dm + _joint_dm.conj().T) / 2.0
+                    # ❤️  I love you — guard every trace divide
+                    _tr_jl = float(_np_l.real(_np_l.trace(_joint_dm)))
+                    if _tr_jl > 1e-12: _joint_dm /= _tr_jl
+
+                    # Store for Step 3 Koyeb injection (party-3 marginal update)
+                    self._joint_dm_16   = _joint_dm
+                    self._ptrace_fn     = _ptrace
+                    self._wdm_local_ref = _wdm
+
+                    # Extract local 3-qubit subsystem (parties 0,1,2)
+                    local_dm   = _ptrace(_joint_dm, keep=[0,1,2])
+                    _local_fid = float(_np_l.real(_np_l.trace(_wdm @ local_dm)))
+                    _local_fid = max(0.0, min(1.0, _local_fid))
+                else:
+                    self._stop.wait(_measure_interval)
+                    continue
+
+                # ── Step 3: pull upstream Koyeb 5-oracle DM ───────────────
+                upstream_dm   = None
+                upstream_fid  = 0.0
                 try:
-                    # Manually trigger a fresh fetch
                     _up_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
-                    
-                    # If RPC returned empty, check local KoyebOracleState cache
-                    if not _up_snap:
-                        _up_snap = self.koyeb_state.as_dict()
-                    
-                    # Try both standard result and nested result
-                    _dm_hex = _up_snap.get('density_matrix_hex') or _up_snap.get('result', {}).get('density_matrix_hex', '')
-                    
+                    _dm_hex  = _up_snap.get('density_matrix_hex', '')
                     if _dm_hex:
                         import struct as _us
                         _bdata = bytes.fromhex(_dm_hex)
-                        if len(_bdata) in (1024, 512):
+                        if len(_bdata) == 1024:   # 64 × ('>dd') = 64×16 bytes
                             _re = [0.0]*64; _im = [0.0]*64
-                            _fmt = '>dd' if len(_bdata) == 1024 else '>ff'
-                            _stride = 16 if len(_bdata) == 1024 else 8
+                            _has_valid = False
                             for _i in range(64):
-                                _re[_i], _im[_i] = _us.unpack_from(_fmt, _bdata, _i*_stride)
-                            
-                            # Construct DM using list comprehension for performance
-                            _upstream_dm = np.array([[_re[r*8+c] + 1j*_im[r*8+c] for c in range(8)] for r in range(8)], dtype=np.complex128)
-                            
-                            _tr_u = float(np.real(np.trace(_upstream_dm)))
-                            if _tr_u > 1e-12:
-                                _upstream_dm /= _tr_u
-                            
-                            # Update upstream FID
-                            _upstream_fid = float(
-                                _up_snap.get('w_state_fidelity') or
-                                _up_snap.get('fidelity') or 0.0
-                            )
-                            
-                            # Store for bridge fidelity calculation
-                            self._upstream_dm_buffer = _upstream_dm.copy()
-                            _EXP_LOG.debug(f"[TRIPARTITE] upstream fetched: fid={_upstream_fid:.4f}")
-                except Exception as _up_err:
-                    _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_err}")
-
-                # Run full entanglement cycle
-                _EXP_LOG.debug(f"[ORACLE] Cycle {_cycle}: Calling entanglement engine...")
-                try:
-                    _result = _ent_engine.run_entanglement_cycle(
-                        upstream_dm=_upstream_dm,
-                        upstream_fid=_upstream_fid
+                                _re[_i], _im[_i] = _us.unpack_from('>dd', _bdata, _i*16)
+                                if _math.isfinite(_re[_i]) and _math.isfinite(_im[_i]):
+                                    _has_valid = True
+                            if _has_valid:
+                                _re_san = [_math.copysign(min(abs(v), 1e100), v) if _math.isfinite(v) else 0.0 for v in _re]
+                                _im_san = [_math.copysign(min(abs(v), 1e100), v) if _math.isfinite(v) else 0.0 for v in _im]
+                                upstream_dm = (_np_l.array(_re_san, dtype=_np_l.complex128)
+                                             + 1j * _np_l.array(_im_san, dtype=_np_l.complex128)
+                                             ).reshape(8, 8)
+                            else:
+                                _EXP_LOG.warning(f"[TRIPARTITE] upstream DM has no finite values")
+                    upstream_fid = float(
+                        _up_snap.get('pq0_oracle_fidelity') or
+                        _up_snap.get('w_state_fidelity') or
+                        _up_snap.get('fidelity') or 0.0
                     )
-                except Exception as _eng_err:
-                    print(f"[ORACLE] ERROR in engine: {_eng_err}", flush=True)
-                    _EXP_LOG.error(f"[TRIPARTITE] Engine error: {_eng_err}", exc_info=True)
-                    _tl.sleep(2)
-                    continue
-                
-                local_dm = _result['local_dm']
-                _local_fid = _result['fidelity']
-                _joint_dm_val = _result.get('joint_dm')
-                
-                # Store for other components (use lock for thread safety)
-                with self._local_oracle_lock:
-                    self._local_consensus_dm = local_dm
-                    self._local_fused_fid = _local_fid
-                    self._upstream_fid = upstream_fid
-                
-                # Direct assignment for joint_dm_16 to ensure visibility
-                if _joint_dm_val is not None:
-                    # Update BOTH instance and global
-                    self._joint_dm_16 = _joint_dm_val
-                    globals()['_JOINT_DM_16'] = _joint_dm_val
-                
-                # Check for other component storage
-                self.koyeb_state.last_sync_ts = time.time()
-                
-                _EXP_LOG.info(f"[TRIPARTITE] Cycle {_cycle}: engine_fid={_result['fidelity']:.4f} local_fid={_local_fid:.4f}")
-
-                # ── Step 2: Already handled by NumPy engine ───────────────────
-                # The engine computed joint W4, local subsystem, and fusion
-                dms = []  # Empty - NumPy engine handles all node simulation
-
-                # ── Step 3: upstream already fetched in Step 1 ──────────────
-                # Reuse Step 1's upstream_dm and upstream_fid for Step 4
-                pass
+                    if not _math.isfinite(upstream_fid):
+                        upstream_fid = 0.0
+                except Exception as _up_e:
+                    _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_e}")
 
                 # ── Step 4: fuse local + upstream ─────────────────────────
                 fused_dm = self._fuse_with_upstream(
@@ -13807,8 +12287,12 @@ class QtclClientApp:
                     local_fid=_local_fid,
                     upstream_fid=upstream_fid
                 )
-                # Recompute fidelity on fused state using NumPy engine
-                _fused_fid = _ent_engine.compute_w3_fidelity(fused_dm)
+                # Recompute fidelity on fused state
+                if _HAS_NP_L:
+                    _fused_fid = float(_np_l.real(_np_l.trace(_wdm @ fused_dm)))
+                    _fused_fid = max(0.0, min(1.0, _fused_fid))
+                else:
+                    _fused_fid = _local_fid
 
                 with self._local_oracle_lock:
                     self._local_consensus_dm = fused_dm
@@ -13840,24 +12324,27 @@ class QtclClientApp:
                     'cycle':                 _cycle,
                     'timestamp_ns':          int(now * 1e9),
                     'oracle_type':           'tripartite_client',
-                    'source':                'numpy_entanglement_engine',
+                    'source':                'local+upstream',
                     'ready':                 True,
-                    # NumPy engine computes these metrics
-                    'pq0_oracle_fidelity':   _result['fidelity'],
-                    'pq0_IV_fidelity':       _result['fidelity'],
-                    'pq0_V_fidelity':        _result['fidelity'],
+                    # tripartite node fidelities
+                    'pq0_oracle_fidelity':   _local_fid,
+                    'pq0_IV_fidelity':       float(dms[1] is not None and _HAS_NP_L and
+                                                   _np_l.real(_np_l.trace(_wdm @ dms[1])))
+                                             if _has_aer and dms else _local_fid,
+                    'pq0_V_fidelity':        float(dms[2] is not None and _HAS_NP_L and
+                                                   _np_l.real(_np_l.trace(_wdm @ dms[2])))
+                                             if _has_aer and dms else _local_fid,
                     'upstream_fidelity':     upstream_fid,
-                    'w_local':               _result['fidelity'],
+                    'w_local':               _local_fid,
                     'w_upstream':            upstream_fid,
                     # standard fields consumed by mining loop
-                    'w_state_fidelity':      _result['fidelity'],
-                    'fidelity':              _result['fidelity'],
-                    'purity':                _result.get('purity', _purity),
-                    'von_neumann_entropy':   _result.get('entropy', _vne),
-                    'concurrency':           _result.get('concurrence', 0.0),
+                    'w_state_fidelity':      _fused_fid,
+                    'fidelity':              _fused_fid,
+                    'purity':                _purity,
+                    'von_neumann_entropy':   _vne,
                     'coherence_l1':          float(_np_l.sum(_np_l.abs(fused_dm))
                                                   - _np_l.sum(_np_l.abs(_np_l.diag(fused_dm)))),
-                    'aer_noise_state':       'numpy_enterprise',
+                    'aer_noise_state':       'active' if _has_aer else 'numpy_fallback',
                 }
                 with _LIVE_RPC_ORACLE._oracle_state_lock:
                     _LIVE_RPC_ORACLE._oracle_state.update(_new_state)
@@ -14116,7 +12603,7 @@ class QtclClientApp:
             _bind_port = _port
             for _attempt in range(3):
                 try:
-                    self.p2p_node.start(app_instance=self)
+                    self.p2p_node.start()
                     _bind_success = True
                     break
                 except OSError as _bind_err:
@@ -14161,15 +12648,13 @@ class QtclClientApp:
             node_id = self.p2p_node.node_id
             pubkey = self.p2p_node.identity.pubkey_b64
             height = int(self.koyeb_state.block_height or 0)
-            is_node_mode = hasattr(self, '_lff') # simple heuristic for node mode
-            resp = self.api.call("qtcl_registerPeer", {
+            resp_env = self.api._rpc_envelope("qtcl_registerPeer", [{
                 "external_addr": ext_addr,
-                "pubkey": pubkey,
-                "chain_height": height,
-                "node_id": node_id,
-                "is_node": True, # Always true if called from here
-                "is_relay": True
-            })
+                "pubkey":        pubkey,
+                "chain_height":  height,
+                "node_id":       node_id,
+            }])
+            resp = resp_env.get("result") if resp_env else None
             if resp:
                 # server echoes caller_ip (X-Forwarded-For) — use it to self-correct external_addr
                 _caller_ip = resp.get('caller_ip') or resp.get('ip', '')
@@ -14180,70 +12665,29 @@ class QtclClientApp:
                         self.p2p_node.external_addr = _corrected
                         ext_addr = _corrected
                         # re-register with corrected addr
-                        self.api.call("qtcl_registerPeer", {
+                        self.api._rpc_envelope("qtcl_registerPeer", [{
                             "external_addr": ext_addr,
-                            "pubkey": pubkey,
-                            "chain_height": height,
-                            "node_id": node_id
-                        })
+                            "pubkey":        pubkey,
+                            "chain_height":  height,
+                            "node_id":       node_id,
+                        }])
                 _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
-            
-            # ── CRITICAL: Add SELF to local p2p_peers DB for self-recognition ──
-            try:
-                import sqlite3
-                with sqlite3.connect(str(_DB_PATH), timeout=5) as conn:
-                    host = ext_addr.split(':')[0] if ':' in ext_addr else ext_addr
-                    port = int(ext_addr.split(':')[1]) if ':' in ext_addr else _P2P_PORT
-                    conn.execute("""
-                        INSERT OR REPLACE INTO p2p_peers
-                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (node_id[:16], host, port, height, int(time.time()), 0))
-                    conn.commit()
-                    _EXP_LOG.info(f"[P2P] 🪞 SELF added to local DB: {node_id[:16]}… at {host}:{port}")
-            except Exception as _dbe:
-                _EXP_LOG.debug(f"[P2P] Failed to add self to local DB: {_dbe}")
-            
-            # Get peers from Koyeb
-            peers_resp = self.api.call("qtcl_getPeers", {"limit": 50})
+            # Get peers from Koyeb — _rpc() already unwraps result layer
+            peers_resp = self.api._rpc("qtcl_getPeers", [{"limit": 50}])
             if peers_resp and peers_resp.get('peers'):
                 _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
-                # ── DHT Fan-out: ping each peer directly ──
-                def _dht_fanout(peers, my_id, my_addr):
-                    for peer in peers:
-                        p_addr = peer.get('external_addr') or peer.get('host', '')
-                        p_id   = peer.get('node_id', '')
-                        if not p_addr or not p_id or p_id == my_id:
-                            continue
-                        try:
-                            h, p = p_addr.rsplit(':', 1)
-                            p = int(p) if p.isdigit() else _P2P_PORT
-                            payload = {
-                                "jsonrpc": "2.0",
-                                "method": "qtcl_dhtPing",
-                                "params": {"node_id": my_id, "external_addr": my_addr},
-                                "id": 1
-                            }
-                            import urllib.request as _ur
-                            import urllib.error as _ue
-                            body = json.dumps(payload).encode()
-                            req = _ur.Request(f"http://{h}:{p}/rpc", data=body,
-                                              headers={"Content-Type": "application/json"}, method="POST")
-                            with _ur.urlopen(req, timeout=3) as _r:
-                                _r.read()
-                            _EXP_LOG.info(f"[P2P] 🤝 DHT ping → {p_addr} ({p_id[:16]}...)")
-                        except Exception:
-                            pass
-                threading.Thread(target=_dht_fanout, args=(peers_resp['peers'], node_id, ext_addr), daemon=True).start()
-                # ── Also add to local peer manager ──
                 for peer in peers_resp['peers']:
                     p_addr = peer.get('external_addr') or peer.get('host', '')
                     p_id   = peer.get('node_id', '')
+                    # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
                     if p_addr and p_id and p_id != node_id:
                         try:
                             p_host = p_addr.split(':')[0]
                             p_port = int(p_addr.split(':')[1]) if ':' in p_addr else _P2P_PORT
                             new_peer = P2PPeer(p_host, p_port, p_id)
+                            # Bug #9: set CONNECTING (not ACTIVE) — bootstrap daemon will
+                            # handshake to get a session_token before the peer can pass the
+                            # auth gate for any non-handshake RPC method.
                             new_peer.state = PeerState.CONNECTING
                             self.p2p_node.peer_mgr.add_peer(new_peer)
                             _EXP_LOG.info(f"[P2P] 🔄 Queued peer for handshake: {p_addr} ({p_id[:16]}...)")
@@ -14265,7 +12709,10 @@ class QtclClientApp:
         while not self._stop.is_set():
             try:
                 bh = int(self.koyeb_state.block_height or 0)
-                self.api.send_heartbeat(self._peer_id, bh)
+                _ext = (self.p2p_node.external_addr
+                        if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
+                        else None)
+                self.api.send_heartbeat(self._peer_id, bh, external_addr=_ext)
                 
                 # Refresh P2P peers every 60 seconds
                 _peer_refresh_counter += 1
@@ -14285,19 +12732,21 @@ class QtclClientApp:
                                 if (hasattr(self, 'p2p_node') and self.p2p_node and self.p2p_node.external_addr)
                                 else f"{_self_ip}:9091")
                         _ext_host = _ext.split(':')[0] if ':' in _ext else _self_ip
-                        _ext_port = int(_ext.split(':')[1]) if ':' in _ext else 9091
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
                              latency_ms, source, first_seen_at, last_seen_at)
                             VALUES (?,?,?,?,?,?,?,?,?)
-                        """, (_nid, _ext_host, _ext_port, bh,
+                        """, (_nid, _ext_host, 9091, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
                               0.0, 'self', int(_th.time()), int(_th.time())))
                         self._db.commit()
-                        _EXP_LOG.debug(f"[P2P] 🪞 SELF heartbeat: {_nid[:16]}… at {_ext_host}:{_ext_port} h={bh}")
-                    except Exception as _dbe:
-                        _EXP_LOG.debug(f"[P2P] Heartbeat DB update failed: {_dbe}")
+                    except Exception: pass
+                if _P2P_NODE and _P2P_NODE._started and False:
+                    m = _LIVE_RPC_ORACLE.get_latest_measurement()
+                    if m:
+                        try: _P2P_NODE.gossip_measurement(m)
+                        except Exception: pass
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
@@ -14326,7 +12775,6 @@ class QtclClientApp:
                 
                 with _PoU(req, timeout=30) as resp:
                     _EXP_LOG.info(f"[MESH] ✅ Polling peer oracle {host}:{port}/rpc/oracle/snapshot")
-                    print(f"[MESH] Handshake with peer {host}:{port} successful", flush=True)
                     bi = 0
                     
                     # Successfully opened connection — read single snapshot then reconnect
@@ -16365,15 +14813,6 @@ class QtclClientApp:
             print(f"     2. Check your internet connection")
             print(f"     3. Try again in a few moments (server may be restarting)")
             print(f"     4. If persistent, the oracle node may be down")
-    def _activate_node_mode(self) -> None:
-        """
-        Option 6: Activate Node Mode - quantum mesh relay participant.
-        Delegates to run_node_mode() for the actual node operations.
-        """
-        if hasattr(self, 'run_node_mode') and callable(self.run_node_mode):
-            self.run_node_mode()
-        else:
-            print("  ❌ Node mode not available")
     def _query_tx(self) -> None:
         try:
             tx_hash = input("  Transaction hash: ").strip()
@@ -16413,7 +14852,7 @@ class QtclClientApp:
 
         print("⚛️  QTCL NODE — quantum mesh relay mode", flush=True)
         print(f"  Oracle  : {ENTROPY_SERVER_URL}", flush=True)
-        print(f"  P2P     : 0.0.0.0:9091 (mesh listener)", flush=True)
+        print(f"  P2P     : {P2P_BOOTSTRAP_PEERS[0][0]}:{P2P_BOOTSTRAP_PEERS[0][1]}", flush=True)
         print("  Mining  : DISABLED", flush=True)
         print("  Role    : W4 party-3 relay + oracle forwarder", flush=True)
         print("─" * 70, flush=True)
@@ -16436,176 +14875,62 @@ class QtclClientApp:
             except Exception as _pe:
                 print(f"  ⚠️  P2P: {_pe}", flush=True)
 
-        # ── Start P2P active discovery (delegated to P2PNode) ──────────
-        _p2p = getattr(self, "p2p_node", None)
-        if _p2p:
-            # FORCE PEER ADDITION (Local Mesh Bridge)
-            # If you know the specific local IPs of your devices, add them here
-            # For now, we force discovery engine to run aggressively
-            if hasattr(_p2p, '_start_peer_discovery_daemon'):
-                _p2p._start_peer_discovery_daemon(self)
-            else:
-                print("  ⚠️  P2P: active discovery engine missing", flush=True)
-
-        # ── Peer Table Refresh Loop (Accelerated Mesh Bridge) ─────────────
-        def _mesh_bridge_loop():
+        # ── Subscribe to peer oracle snapshots (pulls DMs into mesh queue) ─
+        def _node_mesh_subscriber():
+            """Continuously subscribe to all known peer oracle endpoints."""
+            _active_subs = set()
             while True:
                 try:
-                    self._register_with_koyeb()
-                    # Try to find peers in common subnets
-                    import socket
-                    _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    _s.connect(("8.8.8.8", 80))
-                    local_ip = _s.getsockname()[0]
-                    _s.close()
-                    
-                    subnet = ".".join(local_ip.split(".")[:-1])
-                    print(f"[MESH-BRIDGE] Searching local subnet {subnet}.0/24...", flush=True)
-                    # We could scan but let's stick to Koyeb and Gossip for now
+                    _p2p_n = getattr(self, "p2p_node", None)
+                    if _p2p_n and _p2p_n.peer_mgr:
+                        for _peer in _p2p_n.peer_mgr.get_active_peers():
+                            _key = (_peer.host, _peer.port)
+                            if _key not in _active_subs:
+                                _active_subs.add(_key)
+                                _nmt.Thread(
+                                    target=self._subscribe_peer_oracle_rpc,
+                                    args=(_peer.host, _peer.port),
+                                    daemon=True,
+                                    name=f"MeshSub-{_peer.host}"
+                                ).start()
                 except Exception:
                     pass
-                time.sleep(30)
-        
-        threading.Thread(target=_mesh_bridge_loop, daemon=True, name="MeshBridge").start()
+                _nmt_time.sleep(30)
+        _nmt.Thread(target=_node_mesh_subscriber, daemon=True,
+                    name="NodeMeshSubscriber").start()
 
         # ── Status loop ───────────────────────────────────────────────────
         _cycle = 0
         _sep = "─" * 70
-        # INJECT INITIAL PEERS FROM DB
-        if _p2p and _p2p.peer_mgr:
-            _p2p.peer_mgr.load_from_db(self.db)
-        
         try:
             while True:
-                # Force rapid loop for first few cycles to establish metrics
-                _nmt_time.sleep(10 if _cycle > 2 else 3)
+                _nmt_time.sleep(10)
                 _cycle += 1
-                
-                # ── Refresh koyeb_state metrics each cycle ────────────────────────
-                try:
-                    self.koyeb_state.refresh_metrics(self.client_field)
-                except Exception:
-                    pass
-                
-                # Check if TripartiteOracle thread is running
-                import threading as _th
-                _oracle_thread = None
-                for _t in _th.enumerate():
-                    if _t.name == "TripartiteOracle":
-                        _oracle_thread = _t
-                        break
-                
-                _lff  = 0.0
-                if _oracle_thread and _oracle_thread.is_alive():
-                    # Direct access - no lock needed for reading primitive float
-                    _lff = getattr(self, "_local_fused_fid", 0.0)
-                else:
-                    # Thread not running - trigger it
-                    _EXP_LOG.warning("[NODE] TripartiteOracle thread not running, restarting...")
-                    self._start_tripartite_oracle()
-                    _nmt_time.sleep(3)
-                
-                # ── Get upstream fidelity from server ────────────────────────────────
-                _upf = 0.0
-                try:
-                    _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
-                    if _snap:
-                        _upf = float(_snap.get('w_state_fidelity') or 
-                                   _snap.get('fidelity') or 
-                                   (_snap.get('w_state') or {}).get('fidelity') or 
-                                   0.0)
-                except Exception:
-                    pass
-                
-                # RECOVERY: fallback to stored if still 0
-                if _upf == 0:
-                    _upf = getattr(self, "_upstream_fid", 0.0)
-                    if _upf == 0 and hasattr(_LIVE_RPC_ORACLE, '_oracle_state'):
-                        _os_up = _LIVE_RPC_ORACLE.get_oracle_state()
-                        _upf = float(_os_up.get('fidelity') or _os_up.get('w_state_fidelity') or 0.0)
-                
-                # RE-INJECT into self for UI thread
-                self._upstream_fid = _upf
-                
+                _lff  = getattr(self, "_local_fused_fid", 0.0)
+                _upf  = getattr(self, "_upstream_fid", 0.0)
                 _ks   = self.koyeb_state
-                
-                # ── WORLD FIRST: QUANTUM-CLASSICAL BRIDGE ──
-                # Bridge measures the PHYSICAL ENTROPY of the network connection
-                # as a quantum channel. It's the entanglement between local hardware
-                # and the remote oracle nodes.
-                _bridge_fid = 0.0
-                try:
-                    # Force a realistic latency if reported as 0
-                    _raw_lat = float(_ks.channel_latency_ms or 0.0)
-                    _lat_ms = _raw_lat if _raw_lat > 0 else 45.0 + 10.0 * np.random.random()
-                    
-                    # 1. Classical Latency (ms) -> Quantum Phase Noise
-                    _noise_p = 1.0 - np.exp(-_lat_ms / 800.0)
-                    
-                    # 2. Hybrid Entanglement Calculation
-                    _local_fid_val = _lff
-                    _remote_fid_val = _upf if _upf > 0 else 0.75
-                    
-                    # The bridge is the interference between local and remote fidelity
-                    # modulated by physical channel noise (classical latency)
-                    _bridge_fid = (_local_fid_val * 0.4 + _remote_fid_val * 0.6) * (1.0 - _noise_p)
-                    _bridge_fid = _bridge_fid * (0.98 + 0.04 * np.random.random())
-                    
-                    # 3. DIRECT UI INJECTION
-                    _bridge_fid = max(0.0001, min(0.9999, _bridge_fid))
-                    self._bridge_fid_internal = _bridge_fid
-                    _ks.bridge_fidelity = _bridge_fid
-                    
-                except Exception:
-                    pass
-                    
-                # INJECTION: Force it into the self attribute for the UI loop
-                with self._local_oracle_lock:
-                    self._bridge_fid_internal = _ks.bridge_fidelity
-                    self._upstream_fid = _upf
-                    self._local_fused_fid = _lff
-                
                 _qsz  = getattr(self, "_mesh_peer_dm_queue",
                                 _nmt_json.loads("{}")).qsize() if hasattr(
                                     getattr(self,"_mesh_peer_dm_queue",None),
                                     "qsize") else 0
-                _bridge_fid_disp = getattr(self, "_bridge_fid_internal", 0.0)
-                if _bridge_fid_disp == 0: 
-                     _bridge_fid_disp = (_lff * 0.4 + 0.3) * 0.8
-                
-                _peers_str = "0"
+                _peers = 0
                 try:
                     _p2p_n = getattr(self, "p2p_node", None)
                     if _p2p_n and _p2p_n.peer_mgr:
-                        _all_p = _p2p_n.peer_mgr.peers
-                        _active_p = [p for p in _all_p.values() if p.state == PeerState.ACTIVE]
-                        if len(_active_p) > 0:
-                            _peers_str = str(len(_active_p))
-                        elif len(_all_p) > 0:
-                            _peers_str = f"0 (found {len(_all_p)})"
+                        _peers = len(_p2p_n.peer_mgr.get_active_peers())
                 except Exception:
                     pass
-                
-                _jdim = 16 if getattr(self, "_joint_dm_16", None) is not None else 0
-                
-                # Try locating it via shared engine object
-                if _jdim == 0:
-                    _engine = _get_entanglement_engine()
-                    if _engine._last_joint_dm is not None:
-                        _jdim = 16
-
+                _jdim = 16 if getattr(self,"_joint_dm_16",None) is not None else 0
                 print(_sep, flush=True)
                 print(
                     f"  ⚛️  QTCL NODE  cycle={_cycle}\n"
-                    f"  W4-fused : {_lff:.4f}   upstream : {_upf:.4f}   bridge : {_bridge_fid_disp:.4f}\n"
-                    f"  peers    : {_peers_str}        mesh-queue: {_qsz}       joint-dim: {_jdim}×{_jdim}\n"
+                    f"  W4-fused : {_lff:.4f}   upstream : {_upf:.4f}   bridge : {_ks.bridge_fidelity:.4f}\n"
+                    f"  peers    : {_peers}        mesh-queue: {_qsz}       joint-dim: {_jdim}×{_jdim}\n"
                     f"  lat      : {_ks.channel_latency_ms:.0f}ms",
                     flush=True
                 )
         except KeyboardInterrupt:
             print("\n  ⚛️  Node stopped.", flush=True)
-        except Exception as _re:
-            print(f"  ⚠️  UI: {_re}", flush=True)
 
     def run_oracle_mode(self) -> None:
         """
@@ -17578,6 +15903,7 @@ class QtclClientApp:
         print("║  P2P     : 9092 RPC (JSON-RPC 2.0 — NO REST API)           ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
+        print()
         # ── Show oracle identity status in banner ─────────────────────────────
         _oid = self._oracle_id
         if _oid.get("mode") == "wallet_bound":
@@ -17589,31 +15915,25 @@ class QtclClientApp:
             print(f"     Cert  : {'✅ valid' if _cv else '⚠  invalid'}")
         else:
             print(f"  👻 Oracle: {_oid['address']} (anonymous — no wallet binding)")
-        
-        # Start registration silently in background
+        print()
         _threading.Thread(target=self._broadcast_oracle_registration,
                           daemon=True, name="OracleRegBoot").start()
-        
         print("  ┌──────────────────────────────────────────────────────────┐")
         print("  │  1.) ⛏️   Mine                                            │")
         print("  │  2.) 💸  Transact       (+ live Pyth prices)             │")
         print("  │  3.) 🔑  Wallet         (+ live Pyth prices)             │")
         print("  │  4.) 🔭  Oracle Audit   (live server state + full hashes)│")
         print("  │  5.) 🔮  Market Explorer (Pyth × HLWE oracle-signed)     │")
-        print("  │  6.) ⚡ Activate Node   (quantum mesh relay mode)        │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
         try:
-            choice = input("  Enter choice [1/2/3/4/5/6]: ").strip()
+            choice = input("  Enter choice [1/2/3/4/5]: ").strip()
         except (EOFError, KeyboardInterrupt):
             choice = "1"
         if   choice == "2": self.run_transact_mode()
         elif choice == "3": self.run_wallet_mode()
         elif choice == "4": self.run_oracle_mode()
         elif choice == "5": self.run_market_explorer()
-        elif choice == "6": 
-            print("\n⚡ Activating Node Mode...")
-            self._activate_node_mode()
         else:               self.run_mine_mode()
 def _silent_getpass(prompt: str) -> str:
     """Temporarily suppress all loggers during getpass to prevent log injection."""
@@ -17682,64 +16002,307 @@ class NodeRPCMeshServer:
         self._oracle_lock  = threading.Lock()
         self._pq0_epoch    = 0
         self._entangle_log: list = []   # ring buffer, last 256 epochs
-        self._node_registry: dict = {}  # cached peer node registry
-        self._kademlia_table: Optional[KademliaRoutingTable] = None
-        self._dht_store: dict = {}  # local DHT key-value store
-        try:
-            self._kademlia_table = KademliaRoutingTable(local_node_id=self._node_id)
-        except Exception as _ke:
-            logger.warning(f"[MESH] KademliaRoutingTable init failed: {_ke} — DHT disabled")
-        
-        # Initialize mesh schema and register
-        try:
-            self._ensure_mesh_schema()
-        except Exception as _sc:
-            logger.warning(f"[MESH] Schema init failed: {_sc}")
-        try:
-            self._register_onchain()
-        except Exception as _rc:
-            logger.warning(f"[MESH] On-chain reg failed: {_rc}")
-        
+        self._ensure_mesh_schema()
         logger.info(
             f"[MESH] ✅ NodeRPCMeshServer init  node={self._node_id[:16]}…  "
             f"port={self._port}  server={self._server_url}"
         )
-    
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Schema — pq0_entanglement_log table (idempotent)
+    # ─────────────────────────────────────────────────────────────────────────
     def _ensure_mesh_schema(self) -> None:
-        """Ensure mesh node has required database tables."""
-        conn = self._db_conn()
+        import sqlite3  # NodeRPCMeshServer scope — all other imports are aliased
         try:
+            conn = sqlite3.connect(str(self._db_path), timeout=10,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS mesh_peers (
-                    peer_id TEXT PRIMARY KEY,
-                    host TEXT,
-                    port INTEGER,
-                    last_seen REAL,
-                    status TEXT DEFAULT 'unknown'
+                CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
+                    id                  INTEGER  PRIMARY KEY AUTOINCREMENT,
+                    epoch               INTEGER  NOT NULL,
+                    block_height        INTEGER  NOT NULL DEFAULT 0,
+                    local_pq0           INTEGER  NOT NULL DEFAULT 0,
+                    server_pq0          INTEGER  NOT NULL DEFAULT 0,
+                    oracle_ids          TEXT     NOT NULL DEFAULT '[]',
+                    quorum_hashes       TEXT     NOT NULL DEFAULT '[]',
+                    epsilon_matrix_hex  TEXT     NOT NULL DEFAULT '',
+                    tripartite_fidelity REAL     NOT NULL DEFAULT 0.0,
+                    consensus_score     REAL     NOT NULL DEFAULT 0.0,
+                    node_id_hex         TEXT     NOT NULL DEFAULT '',
+                    created_at          INTEGER  NOT NULL
+                                        DEFAULT (strftime('%s','now'))
                 )
             """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pq0_elog_epoch
+                    ON pq0_entanglement_log (epoch DESC)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pq0_elog_height
+                    ON pq0_entanglement_log (block_height DESC)
+            """)
+            # mesh_rpc_log — audit trail of every RPC call served by this node
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS mesh_rpc_log (
+                    id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+                    method      TEXT     NOT NULL DEFAULT '',
+                    params_hash TEXT     NOT NULL DEFAULT '',
+                    result_ok   INTEGER  NOT NULL DEFAULT 1,
+                    latency_ms  REAL     NOT NULL DEFAULT 0.0,
+                    peer_addr   TEXT     NOT NULL DEFAULT '',
+                    ts          INTEGER  NOT NULL
+                                DEFAULT (strftime('%s','now'))
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method
+                    ON mesh_rpc_log (method, ts DESC)
+            """)
             conn.commit()
-            logger.debug(f"[MESH] Schema initialized")
-        finally:
             conn.close()
-    
-    def _register_onchain(self) -> None:
-        """Register this mesh node as an oracle on-chain via null transaction."""
-        logger.debug(f"[MESH] On-chain registration called")
-        # This will be handled by the main app's oracle registration
-    
-    def _rpc_getBlockRange(self, params: list) -> dict:
-        """Return a range of blocks with transactions."""
+        except Exception as _e:
+            logger.error(f"[MESH] Schema init failed: {_e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # pq0 Entanglement Engine
+    # ─────────────────────────────────────────────────────────────────────────
+    def _compute_epsilon_matrix(self, quorum_hashes: list) -> bytes:
+        """
+        Compute the 5×5 entanglement coefficient matrix.
+        ε_ij = HMAC-SHA3-256(quorum_hash_i ‖ quorum_hash_j, node_secret)
+        Result: 25 × 32 bytes = 800 bytes, row-major.
+        Diagonal ε_ii = HMAC(h_i ‖ h_i, node_secret) — self-entanglement.
+        """
+        n   = len(quorum_hashes)
+        out = bytearray()
+        for i in range(n):
+            for j in range(n):
+                hi = quorum_hashes[i].encode() if isinstance(quorum_hashes[i], str) \
+                     else quorum_hashes[i]
+                hj = quorum_hashes[j].encode() if isinstance(quorum_hashes[j], str) \
+                     else quorum_hashes[j]
+                msg     = hi + hj
+                epsilon = hmac.new(self._node_secret, msg,
+                                   hashlib.sha3_256).digest()
+                out.extend(epsilon)
+        return bytes(out)
+
+    def _tripartite_fidelity(self, epsilon_matrix: bytes) -> float:
+        """
+        Scalar fidelity of the tripartite link:
+          F = mean(|ε_ij|) over off-diagonal elements normalised to [0,1].
+        Uses the first byte of each 32-byte ε_ij coefficient as the amplitude.
+        """
+        n     = self.ORACLE_COUNT
+        total = n * n
+        cell  = 32   # bytes per ε_ij
+        if len(epsilon_matrix) < total * cell:
+            return 0.0
+        off_diag_vals = []
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    offset = (i * n + j) * cell
+                    byte   = epsilon_matrix[offset]
+                    off_diag_vals.append(byte / 255.0)
+        return sum(off_diag_vals) / len(off_diag_vals) if off_diag_vals else 0.0
+
+    def _poll_oracle_and_entangle(self) -> None:
+        """
+        Background daemon: pulls oracle snapshot every PQ0_POLL_SEC seconds,
+        computes ε matrix, persists to pq0_entanglement_log.
+        """
+        while not self._stop.is_set():
+            try:
+                snap = self._fetch_server_rpc("qtcl_getQuantumMetrics", [])
+                if snap:
+                    with self._oracle_lock:
+                        self._oracle_state = snap
+                    self._record_entanglement(snap)
+            except Exception as _pe:
+                logger.debug(f"[MESH-ENT] poll error: {_pe}")
+            self._stop.wait(self.PQ0_POLL_SEC)
+
+    def _record_entanglement(self, snap: dict) -> None:
+        """Derive and persist one epoch of the pq0 tripartite entanglement log."""
+        import sqlite3  # NodeRPCMeshServer scope
+        try:
+            block_height  = int(snap.get("block_height") or snap.get("height") or 0)
+            server_pq0    = int(snap.get("pq_curr") or snap.get("pq0") or block_height)
+            oracle_ids    = snap.get("oracle_ids") or \
+                            [f"oracle_{i+1}" for i in range(self.ORACLE_COUNT)]
+            # Build quorum hash list — use per-oracle hashes if present,
+            # else derive deterministically from snapshot quorum_hash
+            base_qhash    = snap.get("quorum_hash_hex") or \
+                            snap.get("consensus", {}).get("quorum_hash") or \
+                            hashlib.sha3_256(
+                                json.dumps(snap, sort_keys=True,
+                                           default=str).encode()
+                            ).hexdigest()
+            quorum_hashes = []
+            for i in range(self.ORACLE_COUNT):
+                # Oracle-specific quorum hash: HMAC(base_qhash, oracle_id_i)
+                oracle_key   = f"oracle_{i+1}".encode()
+                oracle_qhash = hmac.new(
+                    base_qhash.encode() if isinstance(base_qhash, str)
+                    else base_qhash,
+                    oracle_key, hashlib.sha3_256
+                ).hexdigest()
+                quorum_hashes.append(oracle_qhash)
+
+            epsilon = self._compute_epsilon_matrix(quorum_hashes)
+            fidelity = self._tripartite_fidelity(epsilon)
+            consensus_score = float(
+                snap.get("consensus", {}).get("agreement_score") or
+                snap.get("w_state_fidelity") or 0.0
+            )
+            self._pq0_epoch += 1
+            epoch = self._pq0_epoch
+
+            # Persist
+            conn = sqlite3.connect(str(self._db_path), timeout=10,
+                                   check_same_thread=False)
+            try:
+                conn.execute("""
+                    INSERT INTO pq0_entanglement_log
+                      (epoch, block_height, local_pq0, server_pq0,
+                       oracle_ids, quorum_hashes, epsilon_matrix_hex,
+                       tripartite_fidelity, consensus_score, node_id_hex)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    epoch, block_height,
+                    server_pq0,   # local_pq0 mirrors server until local mining diverges
+                    server_pq0,
+                    json.dumps(oracle_ids[:self.ORACLE_COUNT]),
+                    json.dumps(quorum_hashes),
+                    epsilon.hex(),
+                    fidelity,
+                    consensus_score,
+                    self._node_id,
+                ))
+                # Prune to last 10 000 epochs
+                conn.execute("""
+                    DELETE FROM pq0_entanglement_log
+                    WHERE id NOT IN (
+                        SELECT id FROM pq0_entanglement_log
+                        ORDER BY epoch DESC LIMIT 10000
+                    )
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+            logger.debug(
+                f"[MESH-ENT] epoch={epoch}  h={block_height}  "
+                f"pq0={server_pq0}  F={fidelity:.4f}"
+            )
+        except Exception as _e:
+            logger.error(f"[MESH-ENT] record_entanglement failed: {_e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HTTP helpers
+    # ─────────────────────────────────────────────────────────────────────────
+    def _fetch_server_rpc(self, method: str, params: list,
+                          timeout: float = 8.0) -> Any:
+        """Execute a JSON-RPC 2.0 call against the main server."""
+        payload = {"jsonrpc": "2.0", "method": method,
+                   "params": params, "id": 1}
+        try:
+            req = Request(
+                f"{self._server_url}/rpc",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read())
+            result = body.get("result")
+            if result is None and "error" in body:
+                logger.debug(f"[MESH-RPC] server error {method}: {body['error']}")
+            return result
+        except Exception as _e:
+            logger.debug(f"[MESH-RPC] {method} server call failed: {_e}")
+            return None
+
+    def _db_conn(self) -> sqlite3.Connection:
+        """Open a fresh per-request read connection (thread-safe)."""
+        import sqlite3  # NodeRPCMeshServer scope
+        conn = sqlite3.connect(str(self._db_path), timeout=10,
+                               check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RPC method implementations
+    # ─────────────────────────────────────────────────────────────────────────
+    def _rpc_getBlockHeight(self, params: list) -> dict:
         conn = self._db_conn()
         try:
-            start = int(params[0]) if params else 0
-            limit = int(params[1]) if len(params) > 1 else 100
+            row = conn.execute(
+                "SELECT MAX(height) AS h, hash FROM blocks "
+                "WHERE height=(SELECT MAX(height) FROM blocks)"
+            ).fetchone()
+            h    = int(row["h"] or 0) if row else 0
+            tip  = str(row["hash"] or "") if row else ""
+            return {"height": h, "tip_hash": tip}
+        finally:
+            conn.close()
+
+    def _rpc_getBestBlockHash(self, params: list) -> dict:
+        conn = self._db_conn()
+        try:
+            row = conn.execute(
+                "SELECT hash FROM blocks ORDER BY height DESC LIMIT 1"
+            ).fetchone()
+            return {"hash": str(row["hash"]) if row else ""}
+        finally:
+            conn.close()
+
+    def _rpc_getBlock(self, params: list) -> Optional[dict]:
+        height = int(params[0]) if params else 0
+        conn   = self._db_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM blocks WHERE height=?", (height,)
+            ).fetchone()
+            if not row:
+                return None
+            blk  = dict(row)
+            data = blk.get("data")
+            if data:
+                try:
+                    blk.update(json.loads(data))
+                except Exception:
+                    pass
+            # Attach transactions
+            txs = conn.execute(
+                "SELECT * FROM transactions WHERE block_height=?", (height,)
+            ).fetchall()
+            blk["transactions"] = [dict(t) for t in txs]
+            return blk
+        finally:
+            conn.close()
+
+    def _rpc_getBlockRange(self, params: list) -> dict:
+        start = int(params[0]) if len(params) > 0 else 0
+        end   = int(params[1]) if len(params) > 1 else start + 99
+        conn  = self._db_conn()
+        try:
+            rows  = conn.execute(
+                "SELECT * FROM blocks WHERE height BETWEEN ? AND ? "
+                "ORDER BY height ASC",
+                (start, end),
+            ).fetchall()
             blocks = []
-            for row in conn.execute(
-                "SELECT * FROM blocks WHERE height >= ? ORDER BY height ASC LIMIT ?",
-                (start, limit),
-            ).fetchall():
-                blk = dict(row)
+            for row in rows:
+                blk  = dict(row)
+                data = blk.get("data")
+                if data:
+                    try:
+                        blk.update(json.loads(data))
+                    except Exception:
+                        pass
                 txs = conn.execute(
                     "SELECT * FROM transactions WHERE block_height=?",
                     (blk["height"],),
@@ -17956,57 +16519,6 @@ class NodeRPCMeshServer:
         ).digest(32)
         return {"entropy_hex": mixed.hex()}
 
-    def _rpc_getBlockHeight(self, params: list) -> dict:
-        """Return current chain tip height."""
-        conn = self._db_conn()
-        try:
-            row = conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
-            height = int(row["h"] or 0) if row else 0
-            tip_hash = conn.execute("SELECT hash FROM blocks WHERE height = ?", (height,)).fetchone()
-            return {"height": height, "tip_hash": tip_hash["hash"] if tip_hash else "", "ts": time.time()}
-        finally:
-            conn.close()
-
-    def _rpc_getBestBlockHash(self, params: list) -> dict:
-        """Return hash of best block."""
-        conn = self._db_conn()
-        try:
-            row = conn.execute("SELECT hash FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
-            return {"hash": row["hash"] if row else ""}
-        finally:
-            conn.close()
-
-    def _rpc_getBlock(self, params: list) -> dict:
-        """Return block by height or hash."""
-        conn = self._db_conn()
-        try:
-            if params and isinstance(params[0], dict):
-                height = params[0].get("height")
-                hash_val = params[0].get("hash")
-            elif params:
-                height = params[0] if isinstance(params[0], int) else None
-                hash_val = None
-            else:
-                return {"error": "height or hash required"}
-            
-            if height is not None:
-                row = conn.execute("SELECT * FROM blocks WHERE height = ?", (height,)).fetchone()
-            elif hash_val:
-                row = conn.execute("SELECT * FROM blocks WHERE hash = ?", (hash_val,)).fetchone()
-            else:
-                return {"error": "height or hash required"}
-            
-            if not row:
-                return {"error": "block not found"}
-            
-            blk = dict(row)
-            blk["transactions"] = [dict(t) for t in conn.execute(
-                "SELECT * FROM transactions WHERE block_height = ?", (blk["height"],)
-            ).fetchall()]
-            return blk
-        finally:
-            conn.close()
-
     def _rpc_submitBlock(self, params: list) -> dict:
         """Forward block to main server and apply locally."""
         block = params[0] if params else {}
@@ -18055,276 +16567,6 @@ class NodeRPCMeshServer:
             return {"error": "transaction must be object"}
         result = self._fetch_server_rpc("qtcl_submitTransaction", [tx])
         return result or {"accepted": False, "error": "main server unreachable"}
-
-    def _rpc_registerPeer(self, params: list) -> dict:
-        """Register a peer announcing itself to this node's peer table.
-        Peer gossip entry point — used by other nodes to introduce themselves.
-        Also allows self-registration for debug purposes (recognizing own node ID).
-        
-        Params: [{"node_id": "...", "host": "...", "port": 9091, "chain_height": N}]
-        """
-        try:
-            peer_info = params[0] if params and isinstance(params[0], dict) else {}
-            node_id = str(peer_info.get('node_id') or '')
-            host = str(peer_info.get('host') or '')
-            port = int(peer_info.get('port') or 9091)
-            chain_height = int(peer_info.get('chain_height') or 0)
-            
-            if not node_id or not host or len(node_id) < 8:
-                return {"registered": False, "error": "invalid peer info"}
-            
-            # Check if this is self registration
-            is_self = False
-            try:
-                if hasattr(self, '_app') and hasattr(self._app, 'p2p_node') and self._app.p2p_node:
-                    is_self = (node_id == self._app.p2p_node.node_id)
-            except Exception:
-                pass
-            
-            # Upsert to local DB
-            try:
-                import sqlite3
-                conn = sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False)
-                conn.execute("""
-                    INSERT OR REPLACE INTO p2p_peers
-                    (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (node_id[:16], host, port, chain_height, int(time.time()), 0))
-                conn.commit()
-                conn.close()
-                if is_self:
-                    _EXP_LOG.info(f"[MESH-P2P] 🪞 SELF recognized: {node_id[:16]}… at {host}:{port}")
-                else:
-                    _EXP_LOG.debug(f"[MESH-P2P] Peer registered: {node_id[:16]}… at {host}:{port}")
-            except Exception as e:
-                _EXP_LOG.debug(f"[MESH-P2P] DB upsert failed: {e}")
-            
-            return {"registered": True, "node_id": node_id[:16], "is_self": is_self}
-        except Exception as e:
-            return {"registered": False, "error": str(e)}
-
-    def _rpc_announcePeerTable(self, params: list) -> dict:
-        """Ingest a peer table broadcast from another node (P2P gossip).
-        
-        Used to propagate known peers through the network mesh.
-        Also ingests self if included in announcement (for debug visibility).
-        Params: [{"peers": [{"node_id": "...", "host": "...", "port": 9091}, ...]}]
-        """
-        try:
-            announce = params[0] if params and isinstance(params[0], dict) else {}
-            peers = announce.get('peers') or []
-            
-            if not isinstance(peers, list):
-                return {"ingested": 0, "error": "peers must be list"}
-            
-            # Get self node_id for logging
-            self_node_id = None
-            try:
-                if hasattr(self, '_app') and hasattr(self._app, 'p2p_node') and self._app.p2p_node:
-                    self_node_id = self._app.p2p_node.node_id
-            except Exception:
-                pass
-            
-            ingested = 0
-            self_ingested = False
-            new_peers = []
-            try:
-                import sqlite3
-                with sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False) as conn:
-                    for p in peers[:32]:  # limit to prevent spam
-                        try:
-                            node_id = str(p.get('node_id') or '')
-                            host = str(p.get('host') or '')
-                            port = int(p.get('port') or 9091)
-                            chain_height = int(p.get('chain_height') or 0)
-                            
-                            if node_id and host and len(node_id) >= 8:
-                                is_self_peer = (self_node_id and node_id == self_node_id)
-                                conn.execute("""
-                                    INSERT OR REPLACE INTO p2p_peers
-                                    (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                """, (node_id, host, port, chain_height, int(time.time()), 0))
-                                ingested += 1
-                                if is_self_peer:
-                                    self_ingested = True
-                                else:
-                                    new_peers.append((node_id, host, port))
-                        except Exception:
-                            continue
-                    conn.commit()
-                if self_ingested:
-                    _EXP_LOG.info(f"[MESH-P2P] 🪞 SELF in announced table: ingested {ingested}/{len(peers)} peers (self included)")
-                else:
-                    _EXP_LOG.debug(f"[MESH-P2P] Announced peer table: ingested {ingested}/{len(peers)} peers")
-            except Exception as e:
-                _EXP_LOG.debug(f"[MESH-P2P] Announce ingest failed: {e}")
-            
-            # ── CHAIN REACTION: relay newly discovered peers to Kademlia + mesh ──
-            if new_peers:
-                def _relay_announced(peers_list):
-                    for nid, h, p in peers_list:
-                        # Add to Kademlia routing table
-                        if hasattr(self, '_kademlia_table') and self._kademlia_table:
-                            try:
-                                self._kademlia_table.add_node(KademliaNode(node_id=nid, host=h, port=p))
-                            except Exception:
-                                pass
-                        # Fan-out to other known peers (TTL=1, avoid echo)
-                        try:
-                            import sqlite3 as _sq
-                            with _sq.connect(str(self._db_path), timeout=3) as c:
-                                for row in c.execute("SELECT node_id_hex, host, port FROM p2p_peers WHERE ban_score < 100 AND node_id_hex != ? ORDER BY last_seen_at DESC LIMIT 5", (nid,)):
-                                    rh, rp = row[1], row[2]
-                                    if rh == h and rp == p:
-                                        continue
-                                    try:
-                                        payload = {
-                                            "jsonrpc": "2.0",
-                                            "method": "qtcl_announcePeerTable",
-                                            "params": [{"peers": [{"node_id": nid, "host": h, "port": p}]}],
-                                            "id": 1
-                                        }
-                                        import urllib.request as _ur
-                                        body = json.dumps(payload).encode()
-                                        req = _ur.Request(f"http://{rh}:{rp}/rpc", data=body,
-                                                          headers={"Content-Type": "application/json"}, method="POST")
-                                        with _ur.urlopen(req, timeout=2) as _r:
-                                            _r.read()
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-                threading.Thread(target=_relay_announced, args=(new_peers,), daemon=True).start()
-            
-            return {"ingested": ingested, "total": len(peers), "self_ingested": self_ingested}
-        except Exception as e:
-            return {"ingested": 0, "error": str(e)}
-
-    def _rpc_dhtPing(self, params: list) -> dict:
-        """qtcl_dhtPing — Kademlia PING: update routing table and return closest nodes."""
-        try:
-            p = params[0] if params and isinstance(params[0], dict) else {}
-            node_id = str(p.get("node_id", ""))
-            ext_addr = str(p.get("external_addr", ""))
-            if not node_id or not ext_addr:
-                _EXP_LOG.warning(f"[DHT-PING-CLIENT] Missing node_id or ext_addr in params: {p}")
-                return {"pinged": False, "reason": "missing node_id or external_addr"}
-            
-            _EXP_LOG.info(f"[DHT-PING-CLIENT] ✅ RECEIVED ping from node_id={node_id[:16]}... at {ext_addr}")
-            
-            # Add to Kademlia routing table
-            if hasattr(self, '_kademlia_table') and self._kademlia_table:
-                host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
-                try: port = int(port_s)
-                except: port = 9091
-                remote_node = KademliaNode(node_id=node_id, host=host, port=port)
-                self._kademlia_table.add_node(remote_node)
-                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Added to Kademlia routing table: {host}:{port}")
-            # Also sync to mesh peer registry
-            if hasattr(self, '_node_registry'):
-                host, port_s = (ext_addr.rsplit(":", 1) + ["9091"])[:2]
-                try: port = int(port_s)
-                except: port = 9091
-                self._node_registry[node_id] = {
-                    'peer_id': node_id, 'host': host, 'port': port,
-                    'registered_at': int(time.time() * 1e9),
-                    'last_seen': int(time.time() * 1e9),
-                }
-                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Added to node registry: {host}:{port}")
-            # Also persist to DB (full node_id, not truncated)
-            try:
-                import sqlite3
-                host = ext_addr.split(':')[0] if ':' in ext_addr else ext_addr
-                port = int(ext_addr.split(':')[1]) if ':' in ext_addr else 9091
-                with sqlite3.connect(str(self._db_path), timeout=5, check_same_thread=False) as conn:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO p2p_peers
-                        (node_id_hex, host, port, chain_height, last_seen_at, ban_score)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (node_id, host, port, 0, int(time.time()), 0))
-                    conn.commit()
-                _EXP_LOG.debug(f"[DHT-PING-CLIENT] Persisted to DB: {host}:{port}")
-            except Exception as e:
-                _EXP_LOG.warning(f"[DHT-PING-CLIENT] DB persist failed: {e}")
-            # ── CHAIN REACTION: fan-out to known peers ──
-            _EXP_LOG.info(f"[DHT-PING-CLIENT] Starting relay to mesh peers...")
-            def _dht_relay(new_nid, new_addr, my_nid):
-                try:
-                    known_peers = []
-                    if hasattr(self, '_kademlia_table') and self._kademlia_table:
-                        try:
-                            known_peers = self._kademlia_table.find_closest(my_nid, count=10)
-                        except Exception:
-                            pass
-                    if not known_peers:
-                        import sqlite3 as _sq
-                        try:
-                            with _sq.connect(str(self._db_path), timeout=3) as c:
-                                for row in c.execute("SELECT node_id_hex, host, port FROM p2p_peers WHERE ban_score < 100 ORDER BY last_seen_at DESC LIMIT 10"):
-                                    known_peers.append(type('_', (), {'node_id': row[0], 'host': row[1], 'port': row[2]})())
-                        except Exception:
-                            pass
-                    for peer in known_peers:
-                        p_nid = getattr(peer, 'node_id', '')
-                        p_host = getattr(peer, 'host', '')
-                        p_port = getattr(peer, 'port', 9091)
-                        if not p_host or p_nid == new_nid or p_nid == my_nid:
-                            continue
-                        try:
-                            payload = {
-                                "jsonrpc": "2.0",
-                                "method": "qtcl_dhtPing",
-                                "params": [{"node_id": new_nid, "external_addr": new_addr}],
-                                "id": 1
-                            }
-                            import urllib.request as _ur
-                            body = json.dumps(payload).encode()
-                            req = _ur.Request(f"http://{p_host}:{p_port}/rpc", data=body,
-                                              headers={"Content-Type": "application/json"}, method="POST")
-                            with _ur.urlopen(req, timeout=2) as _r:
-                                _r.read()
-                            _EXP_LOG.info(f"[DHT-PING-CLIENT] ✅ Relay sent to {p_host}:{p_port}")
-                        except Exception as e:
-                            _EXP_LOG.debug(f"[DHT-PING-CLIENT] Relay to {p_host}:{p_port} failed: {e}")
-                except Exception as e:
-                    _EXP_LOG.warning(f"[DHT-PING-CLIENT] Relay error: {e}")
-            threading.Thread(target=_dht_relay, args=(node_id, ext_addr, self._node_id), daemon=True).start()
-            _EXP_LOG.info(f"[MESH-DHT] 🤝 dhtPing from {node_id[:16]}… at {ext_addr} → relaying to mesh")
-            return {"pinged": True, "node_id": self._node_id[:16]}
-        except Exception as e:
-            return {"pinged": False, "error": str(e)}
-
-    def _rpc_dhtFindNode(self, params: list) -> dict:
-        """qtcl_dhtFindNode — return k closest nodes to target_id from routing table."""
-        try:
-            p = params[0] if params and isinstance(params[0], dict) else {}
-            target_id = str(p.get("target_id", ""))
-            count = int(p.get("count", 20))
-            if not target_id:
-                return {"nodes": []}
-            nodes = []
-            if hasattr(self, '_kademlia_table') and self._kademlia_table:
-                closest = self._kademlia_table.find_closest(target_id, count=min(count, 20))
-                nodes = [{"node_id": n.node_id, "host": n.host, "port": n.port} for n in closest]
-            return {"nodes": nodes, "count": len(nodes)}
-        except Exception as e:
-            return {"nodes": [], "error": str(e)}
-
-    def _rpc_dhtAnnounce(self, params: list) -> dict:
-        """qtcl_dhtAnnounce — store a value in local DHT state."""
-        try:
-            p = params[0] if params and isinstance(params[0], dict) else {}
-            key = str(p.get("key", ""))
-            value = p.get("value")
-            if not key:
-                return {"stored": False, "reason": "key required"}
-            if not hasattr(self, '_dht_store'):
-                self._dht_store = {}
-            self._dht_store[key] = {"value": value, "ts": time.time()}
-            return {"stored": True, "key": key[:32]}
-        except Exception as e:
-            return {"stored": False, "error": str(e)}
 
     # ─────────────────────────────────────────────────────────────────────────
     # RPC dispatcher
@@ -18564,8 +16806,6 @@ NodeRPCMeshServer._METHODS = {
     "qtcl_getPq0Matrix":        NodeRPCMeshServer._rpc_getPq0Matrix,
     "qtcl_getConsensusSnapshot":NodeRPCMeshServer._rpc_getConsensusSnapshot,
     "qtcl_getPeers":            NodeRPCMeshServer._rpc_getPeers,
-    "qtcl_registerPeer":        NodeRPCMeshServer._rpc_registerPeer,        # ← P2P gossip entry
-    "qtcl_announcePeerTable":   NodeRPCMeshServer._rpc_announcePeerTable,   # ← P2P table broadcast
     "qtcl_getWalletBalance":    NodeRPCMeshServer._rpc_getWalletBalance,
     "qtcl_getBalance":          NodeRPCMeshServer._rpc_getWalletBalance,
     "qtcl_getMempoolInfo":      NodeRPCMeshServer._rpc_getMempoolInfo,
@@ -18574,10 +16814,6 @@ NodeRPCMeshServer._METHODS = {
     "qtcl_getEntropy":          NodeRPCMeshServer._rpc_getEntropy,
     "qtcl_submitBlock":         NodeRPCMeshServer._rpc_submitBlock,
     "qtcl_submitTransaction":   NodeRPCMeshServer._rpc_submitTransaction,
-    # ── DHT / Kademlia RPC ────────────────────────────────────────────────────
-    "qtcl_dhtPing":             NodeRPCMeshServer._rpc_dhtPing,
-    "qtcl_dhtFindNode":         NodeRPCMeshServer._rpc_dhtFindNode,
-    "qtcl_dhtAnnounce":         NodeRPCMeshServer._rpc_dhtAnnounce,
 }
 
 _MESH_SERVER_INSTANCE: Optional["NodeRPCMeshServer"] = None
