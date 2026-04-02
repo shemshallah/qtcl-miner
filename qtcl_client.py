@@ -17808,6 +17808,57 @@ class NodeRPCMeshServer:
         ).digest(32)
         return {"entropy_hex": mixed.hex()}
 
+    def _rpc_getBlockHeight(self, params: list) -> dict:
+        """Return current chain tip height."""
+        conn = self._db_conn()
+        try:
+            row = conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
+            height = int(row["h"] or 0) if row else 0
+            tip_hash = conn.execute("SELECT hash FROM blocks WHERE height = ?", (height,)).fetchone()
+            return {"height": height, "tip_hash": tip_hash["hash"] if tip_hash else "", "ts": time.time()}
+        finally:
+            conn.close()
+
+    def _rpc_getBestBlockHash(self, params: list) -> dict:
+        """Return hash of best block."""
+        conn = self._db_conn()
+        try:
+            row = conn.execute("SELECT hash FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
+            return {"hash": row["hash"] if row else ""}
+        finally:
+            conn.close()
+
+    def _rpc_getBlock(self, params: list) -> dict:
+        """Return block by height or hash."""
+        conn = self._db_conn()
+        try:
+            if params and isinstance(params[0], dict):
+                height = params[0].get("height")
+                hash_val = params[0].get("hash")
+            elif params:
+                height = params[0] if isinstance(params[0], int) else None
+                hash_val = None
+            else:
+                return {"error": "height or hash required"}
+            
+            if height is not None:
+                row = conn.execute("SELECT * FROM blocks WHERE height = ?", (height,)).fetchone()
+            elif hash_val:
+                row = conn.execute("SELECT * FROM blocks WHERE hash = ?", (hash_val,)).fetchone()
+            else:
+                return {"error": "height or hash required"}
+            
+            if not row:
+                return {"error": "block not found"}
+            
+            blk = dict(row)
+            blk["transactions"] = [dict(t) for t in conn.execute(
+                "SELECT * FROM transactions WHERE block_height = ?", (blk["height"],)
+            ).fetchall()]
+            return blk
+        finally:
+            conn.close()
+
     def _rpc_submitBlock(self, params: list) -> dict:
         """Forward block to main server and apply locally."""
         block = params[0] if params else {}
