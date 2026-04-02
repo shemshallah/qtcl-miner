@@ -12672,6 +12672,7 @@ class QtclClientApp:
                             "node_id":       node_id,
                         }])
                 _EXP_LOG.info(f"[P2P] ✅ Registered with Koyeb: {ext_addr}")
+            
             # Get peers from Koyeb — _rpc() already unwraps result layer
             peers_resp = self.api._rpc("qtcl_getPeers", [{"limit": 50}])
             if peers_resp and peers_resp.get('peers'):
