@@ -9745,9 +9745,25 @@ class _MiningTelemetry:
                 if dt > 0:
                     self.hash_rate = (n1 - n0) / dt
     def record_block(self, block: dict) -> None:
+        """
+        Record solved block with full quantum attestation metrics.
+        ❤️  Preserves pq0/pq_curr/pq_last/mermin values through telemetry pipeline
+        for server validation and display (FIX-D).
+        """
         with self._lock:
             self.blocks_found  += 1
-            self.last_block     = dict(block)
+            
+            # ── Enrich block with quantum metrics for logging/submission ──
+            # pq0, pq_curr, pq_last are sealed in PoW — preserve them
+            self.last_block = {
+                **block,
+                "w_fidelity": block.get("fidelity", 0.75),
+                "pq0": block.get("pq0", 0),
+                "pq_curr": block.get("pq_curr", block.get("height", 0)),
+                "pq_last": block.get("pq_last", max(0, block.get("height", 0) - 1)),
+                "mermin_value": block.get("mermin_value", 0.0),
+                "mermin_violated": block.get("mermin_violated", False),
+            }
             self.last_block_ts  = time.time()
             self.state          = "SOLVED"
     def mark_submitting(self) -> None:
@@ -16426,6 +16442,23 @@ class QtclClientApp:
             _MINE_TELEM.mark_idle()
             _POLL_EVERY_S = 2.0
             _last_poll_time = _t.time()
+            
+            # ❤️  PRE-WARM ORACLE SNAPSHOT BEFORE MARKING IDLE (FIX-C)
+            # This ensures metrics aren't zero on first TUI render of MINING state
+            _oracle_warmup_snap = {}
+            try:
+                _oracle_warmup_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
+                if _oracle_warmup_snap and _oracle_warmup_snap.get("density_matrix_hex"):
+                    _cached_dm_re, _cached_dm_im, _cached_dm_age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                    _EXP_LOG.info(
+                        f"[MINER] 🔬 Oracle pre-warmed: DM age={_cached_dm_age:.1f}s "
+                        f"re_sum={sum(_cached_dm_re[:8]):.4f}"
+                    )
+                else:
+                    _oracle_warmup_snap = {}
+            except Exception as _owarm_err:
+                _EXP_LOG.debug(f"[MINER] Oracle pre-warm (non-fatal): {_owarm_err}")
+            
             class _SubmissionPipeline:
                 """⚛️ Enterprise RPC submission with atomic quantum state locking."""
                 RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]  # 61s window
