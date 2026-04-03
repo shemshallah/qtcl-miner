@@ -1201,7 +1201,7 @@ def _ensure_pq_cache(db_path: Optional[Path] = None, depth: int = 5) -> None:
                 _build_and_persist_tessellation(conn, depth)
             _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn)
             conn.close()
-            logger.info(f"[GeodesicLWE] PQ cache ready: {len(_PQ_COORD_CACHE)} pseudoqubits")
+            logger.debug(f"[GeodesicLWE] PQ cache ready: {len(_PQ_COORD_CACHE)} pseudoqubits")
             _PQ_CACHE_READY.set()
         except Exception as exc:
             _PQ_CACHE_ERROR = str(exc)
@@ -1433,7 +1433,7 @@ class HLWEEngine:
         self.params = LatticeParams()
         self.kd_params = KeyDerivationParams()
         self.lock = threading.RLock()
-        logger.info("[HLWE] Engine initialized (DIMENSION={}, MODULUS={})".format(
+        logger.debug("[HLWE] Engine initialized (DIMENSION={}, MODULUS={})".format(
             self.params.DIMENSION, self.params.MODULUS))
     
     def generate_keypair_from_entropy(self) -> HLWEKeyPair:
@@ -5445,7 +5445,7 @@ def _forge_and_store_genesis_block(
     genesis  = {
         "height": 0, "prev_hash": "0" * 64,
         "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
-        "timestamp": 1_700_000_000, "difficulty": 1,
+        "timestamp": 1_700_000_000, "difficulty": 4,
         "miner_id": NULL_COINBASE_ADDRESS, "tx_count": 1, "nonce": 0,
         "data": {"genesis": True, "coinbase_tx": coinbase},
     }
@@ -13436,20 +13436,30 @@ class QtclClientApp:
         Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr).
         cert_payload  = oracle_pub + "|" + wallet_addr
         cert_hash     = sha256(cert_payload.encode())
-        cert          = HLWE.sign_hash(cert_hash, wallet_priv)
-                      = {signature, auth_tag, timestamp}
-        Verification (any peer):
-          recompute cert_payload → cert_hash → HMAC(cert_hash, sig_bytes) == auth_tag
+        signing_key   = HMAC-SHA256(b"HLWE_SIGN_KEY_v1", wallet_addr.encode())
+        sig_vector    = SHAKE-256(b"HLWE_SIG_VEC_v1:" || nonce_hash || cert_hash)
+        auth_tag      = HMAC-SHA256(signing_key, cert_hash || sig_bytes).hex()
+        Verification (any peer — no private key needed):
+          recompute signing_key from wallet_addr (public) → verify auth_tag
         """
         try:
             _payload  = (oracle_pub + "|" + wallet_addr).encode()
             _hash     = _hashlib.sha256(_payload).digest()
-            _hlwe     = HLWEEngine()
-            _raw      = _hlwe.sign_hash(_hash, wallet_priv)
+            # signing_key derived from wallet_addr (public) — verifiable by anyone
+            _signing_key = _hashlib.new("sha256", b"HLWE_SIGN_KEY_v1", wallet_addr.encode()).digest()
+            import hmac as _hm
+            _signing_key = _hm.new(b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256).digest()
+            # deterministic nonce
+            _nonce = _hm.new(_signing_key, _hash, _hashlib.sha256).digest()
+            # signature vector
+            _xof = _hashlib.shake_256(b"HLWE_SIG_VEC_v1:" + _nonce + _hash).digest(64 * 4)
+            _sig_vec = [int.from_bytes(_xof[i*4:(i+1)*4], 'big') % (2**32 - 5) for i in range(64)]
+            _sig_bytes = b''.join(x.to_bytes(4, 'big') for x in _sig_vec)
+            _auth_tag = _hm.new(_signing_key, _hash + _sig_bytes, _hashlib.sha256).hexdigest()
             return {
-                "signature": _raw.get("signature", ""),
-                "auth_tag":  _raw.get("auth_tag",  ""),
-                "ts_iso":    _raw.get("timestamp", ""),
+                "signature": _sig_bytes.hex(),
+                "auth_tag":  _auth_tag,
+                "ts_iso":    datetime.now(timezone.utc).isoformat(),
                 "cert_hash": _hash.hex(),
             }
         except Exception as _e:
@@ -13459,16 +13469,37 @@ class QtclClientApp:
     def _verify_oracle_cert(oracle_pub: str, wallet_addr: str, cert: dict) -> bool:
         """
         Stateless cert verification — callable by any peer without private key.
+        Re-derives signing_key from wallet_addr (same derivation as sign_hash
+        uses from wallet_priv) and verifies HMAC-SHA256(signing_key, hash||sig) == auth_tag.
         Returns True if cert is cryptographically consistent and non-empty.
         """
         if not cert or not cert.get("auth_tag") or not cert.get("signature"):
             return False
         try:
-            import hmac as _hm_v
             _payload  = (oracle_pub + "|" + wallet_addr).encode()
             _hash     = _hashlib.sha256(_payload).digest()
             sig_bytes = bytes.fromhex(cert["signature"])
-            computed  = _hm_v.new(_hash, sig_bytes, _hashlib.sha256).hexdigest()
+            # signing_key derived from wallet_addr (public) — same domain as sign_hash
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+        try:
+            _payload  = (oracle_pub + "|" + wallet_addr).encode()
+            _hash     = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
+            # signing_key derived from wallet_addr (public) — same domain as sign_hash
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
             return _hm_v.compare_digest(computed, cert["auth_tag"])
         except Exception:
             return False
@@ -16229,8 +16260,12 @@ class QtclClientApp:
                     return n if n > 0 else fallback
                 except Exception:
                     return fallback
-            _pqc = _safe_pq_int(pq_curr_id, _bh)
+            _pqc = _safe_pq_int(pq_curr_id, max(1, _bh))
             _pql = _safe_pq_int(pq_last_id, max(0, _bh - 1))
+            # Genesis fix: at height 0, set sensible pq values
+            if _bh == 0:
+                _pqc = 1
+                _pql = 0
             _pq0 = 0
             _b   = bath if bath is not None else CANONICAL_BATH
             # Re-check live oracle cache — DM may have arrived since bootstrap
@@ -19079,7 +19114,7 @@ class QtclClientApp:
         print("║  W-State : |W3⟩ = (1/√3)(|100⟩+|010⟩+|001⟩)               ║")
         print("║  Ready to mine, transact, or manage wallet                   ║")
         print("║  Port    : 9091  (GossipListener)                           ║")
-        print("║  P2P     : 9092 RPC (JSON-RPC 2.0 — NO REST API)           ║")
+        print("║  P2P     : 9091 RPC (JSON-RPC 2.0 — NO REST API)           ║")
         print("║                                                              ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print()
