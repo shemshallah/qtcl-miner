@@ -9185,54 +9185,192 @@ def _validate_node_id(node_id: str) -> bool:
     return all(c in '0123456789abcdef' for c in node_id)
 
 def _get_machine_salt() -> str:
-    """Return stable per-machine salt: /etc/machine-id → MAC → hostname+homedir.
-    Never changes across reboots on the same machine. ❤️ I love you."""
+    """Return stable per-machine salt used to derive node_id.
+    Never changes across reboots on the same machine.
+
+    Android/Termux: uuid.getnode() returns randomized MAC — falls through
+    to build fingerprint, serial number, or Termux persistent salt file.
+    ❤️  I love you.
+    """
+    # Priority 1: /etc/machine-id (desktop Linux, stable systemd ID)
     try:
         mid = Path('/etc/machine-id').read_text().strip()
         if mid and len(mid) >= 8:
             return mid
-    except Exception: pass
+    except Exception:
+        pass
+
+    # Priority 2: Android build fingerprint — globally unique per device image
+    try:
+        import subprocess as _sp2
+        _fp = _sp2.check_output(
+            ['getprop', 'ro.build.fingerprint'], stderr=_sp2.DEVNULL, timeout=2
+        ).decode().strip()
+        if _fp and len(_fp) > 8:
+            return hashlib.sha256(f"ANDROID_FP_SALT|{_fp}".encode()).hexdigest()
+    except Exception:
+        pass
+
+    # Priority 3: Android serial number
+    try:
+        import subprocess as _sp3
+        _ser = _sp3.check_output(
+            ['getprop', 'ro.serialno'], stderr=_sp3.DEVNULL, timeout=2
+        ).decode().strip()
+        if _ser and _ser not in ('', 'unknown', '0'):
+            return hashlib.sha256(f"ANDROID_SN_SALT|{_ser}".encode()).hexdigest()
+    except Exception:
+        pass
+
+    # Priority 4: Termux persistent salt file — created once, stable forever
+    # Survives app restarts, network changes, and MAC randomization
+    try:
+        _prefix = os.environ.get('PREFIX', '/data/data/com.termux/files/usr')
+        _salt_path = Path(_prefix) / 'etc' / 'qtcl_machine_salt'
+        if _salt_path.exists():
+            _stored = _salt_path.read_text().strip()
+            if _stored and len(_stored) >= 32:
+                return _stored
+        # Create it once with cryptographic randomness
+        import secrets as _sec4
+        _new_salt = _sec4.token_hex(32)  # 64-char hex
+        _salt_path.parent.mkdir(parents=True, exist_ok=True)
+        _salt_path.write_text(_new_salt)
+        return _new_salt
+    except Exception:
+        pass
+
+    # Priority 5: uuid.getnode() — valid on desktop, unreliable on Android
     try:
         import uuid as _uuid
         mac = _uuid.getnode()
-        if mac and mac != (1 << 48) - 1:  # not all-ones (unknown MAC sentinel)
-            return format(mac, '012x')
-    except Exception: pass
+        if mac and mac != (1 << 48) - 1:
+            _mac_hex = format(mac, '012x')
+            # Reject Android randomized prefix
+            if not _mac_hex.startswith('02'):
+                return _mac_hex
+    except Exception:
+        pass
+
+    # Priority 6: hostname + homedir hash
     import socket as _sk
-    return hashlib.sha256(((_sk.gethostname() or '') + str(Path.home())).encode()).hexdigest()[:32]
+    return hashlib.sha256(
+        ((_sk.gethostname() or '') + str(Path.home())).encode()
+    ).hexdigest()[:32]
 
 def _get_mac_address() -> str:
     """Return the primary NIC MAC address as 12-char lowercase hex string.
     Used for per-device identification behind shared NAT.
-    Falls back to uuid.getnode() then machine-id hash."""
+
+    Android/Termux aware: Android 10+ randomizes per-network MAC per session,
+    so uuid.getnode() and /sys/class/net return garbage for NAT grouping.
+    On Android we fall through to machine-id / build fingerprint / hostname hash,
+    all of which ARE stable across reboots and give true per-device identity.
+    """
     import uuid as _uuid
-    # Priority 1: scan real NICs via /sys/class/net (Linux)
+
+    def _is_real(mac: str) -> bool:
+        """Reject all-zero, broadcast, and Android randomized sentinels."""
+        if not mac or len(mac) != 12:
+            return False
+        if mac in ('000000000000', 'ffffffffffff'):
+            return False
+        # Android randomized MACs: locally administered bit set (bit 1 of first octet)
+        # Real hardware MACs have that bit clear for OUI-assigned addresses.
+        # We allow locally-administered only if it's our own stable derivation below.
+        _first_byte = int(mac[:2], 16)
+        if (_first_byte & 0x02) and mac.startswith('02'):
+            return False  # Android randomized prefix pattern
+        return all(c in '0123456789abcdef' for c in mac)
+
+    # Priority 1: scan real NICs via /sys/class/net (Linux/Termux)
+    # Filter out loopback, docker, veth, and Android randomized wlan0 (02:xx pattern)
     try:
         import glob as _glob
         for _iface in sorted(_glob.glob('/sys/class/net/*/address')):
             try:
                 _mac = Path(_iface).read_text().strip().replace(':', '').lower()
-                if len(_mac) == 12 and all(c in '0123456789abcdef' for c in _mac):
-                    # skip loopback (000000000000) and virtual docker/veth
-                    if _mac != '000000000000' and 'docker' not in _iface and 'veth' not in _iface:
-                        return _mac
-            except Exception: continue
-    except Exception: pass
-    # Priority 2: uuid.getnode() — gets MAC of a real NIC on most OS
+                _skip = ('docker' in _iface or 'veth' in _iface or
+                         'lo' in _iface or 'dummy' in _iface or
+                         'tun' in _iface or 'tap' in _iface)
+                if not _skip and _is_real(_mac):
+                    return _mac
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Priority 2: uuid.getnode() — valid on desktop Linux/macOS/Windows
+    # Skip on Android: returns randomized 02:00:00:00:00:00 or per-session random
+    _is_android = False
     try:
-        mac = _uuid.getnode()
-        if mac and mac != (1 << 48) - 1:  # not sentinel
-            return format(mac, '012x')
-    except Exception: pass
-    # Priority 3: machine-id hash (deterministic per machine)
+        import platform as _plat
+        _is_android = 'android' in (_plat.system() or '').lower() or \
+                      Path('/system/build.prop').exists() or \
+                      Path('/data/data').exists()
+    except Exception:
+        pass
+
+    if not _is_android:
+        try:
+            mac = _uuid.getnode()
+            _mac_hex = format(mac, '012x')
+            if mac and mac != (1 << 48) - 1 and _is_real(_mac_hex):
+                return _mac_hex
+        except Exception:
+            pass
+
+    # Priority 3: Android build fingerprint — stable per physical device
+    try:
+        import subprocess as _sp
+        _fp = _sp.check_output(
+            ['getprop', 'ro.build.fingerprint'], stderr=_sp.DEVNULL, timeout=2
+        ).decode().strip()
+        if _fp and len(_fp) > 8:
+            return hashlib.sha256(f"ANDROID_FP|{_fp}".encode()).hexdigest()[:12]
+    except Exception:
+        pass
+
+    # Priority 4: Android serial number
+    try:
+        import subprocess as _sp
+        _ser = _sp.check_output(
+            ['getprop', 'ro.serialno'], stderr=_sp.DEVNULL, timeout=2
+        ).decode().strip()
+        if _ser and _ser not in ('', 'unknown', '0'):
+            return hashlib.sha256(f"ANDROID_SN|{_ser}".encode()).hexdigest()[:12]
+    except Exception:
+        pass
+
+    # Priority 5: /etc/machine-id (desktop Linux, also present in some Termux setups)
     try:
         mid = Path('/etc/machine-id').read_text().strip()
         if mid and len(mid) >= 8:
-            return hashlib.sha256(mid.encode()).hexdigest()[:12]
-    except Exception: pass
-    # Priority 4: hostname fallback
+            return hashlib.sha256(f"MACHINE_ID|{mid}".encode()).hexdigest()[:12]
+    except Exception:
+        pass
+
+    # Priority 6: Termux $PREFIX/etc identity file — create once, stable forever
+    try:
+        _termux_id_path = Path(os.environ.get('PREFIX', '/data/data/com.termux/files/usr')) / 'etc' / 'qtcl_device_id'
+        if _termux_id_path.exists():
+            _tid = _termux_id_path.read_text().strip()
+            if _tid and len(_tid) == 12 and all(c in '0123456789abcdef' for c in _tid):
+                return _tid
+        # Create it once
+        import secrets as _sec
+        _new_id = _sec.token_hex(6)  # 12 hex chars
+        _termux_id_path.parent.mkdir(parents=True, exist_ok=True)
+        _termux_id_path.write_text(_new_id)
+        return _new_id
+    except Exception:
+        pass
+
+    # Priority 7: hostname + homedir hash (last resort, stable per user account)
     import socket as _sk
-    return hashlib.sha256((_sk.gethostname() or 'unknown').encode()).hexdigest()[:12]
+    _hostname = _sk.gethostname() or 'unknown'
+    _home = str(Path.home()) if Path.home() else '/tmp'
+    return hashlib.sha256(f"HOST_FALLBACK|{_hostname}|{_home}".encode()).hexdigest()[:12]
 
 
 def _get_device_id(wallet_addr: str = '') -> str:
@@ -12465,9 +12603,13 @@ class QtclClientApp:
         self._metric_th: Optional[_threading.Thread] = None
         self._db_path      = _DB_PATH
         self._db: Optional[_sqlite3.Connection] = None
-        # _peer_id is temp until wallet loads; re-derived in _start_p2p from wallet+machine salt
-        self._peer_id      = f"client_{_hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]}"
-        self._peer_id_final = False  # flag: True once derived from wallet+machine
+        # _peer_id: stable 64-hex from machine salt — valid for server registration immediately.
+        # Re-derived from wallet+machine once wallet loads (_start_p2p / _load_wallet path).
+        _pre_salt = _get_machine_salt()
+        self._peer_id = _hashlib.sha256(
+            f"QTCL_PRE_WALLET|{_pre_salt}|PEER_IDENTITY_v2".encode()
+        ).hexdigest()  # always 64 lowercase hex — passes server validation
+        self._peer_id_final = False  # True once wallet-bound node_id replaces this
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
         
         # ── Client configuration (used by RPC daemon threads) ─────────────────
@@ -14041,6 +14183,14 @@ class QtclClientApp:
         _tri_th = _threading.Thread(
             target=self._tripartite_oracle_loop, daemon=True, name="TripartiteOracle")
         _tri_th.start()
+        # ── 9. Mobile carrier NAT churn watcher ───────────────────────────
+        # On Android/Termux the WAN IP changes when switching WiFi↔LTE or
+        # roaming between towers.  This thread detects the change via STUN
+        # and immediately re-registers with the corrected external_addr so
+        # NAT-group peer discovery stays accurate.
+        _mobile_th = _threading.Thread(
+            target=self._mobile_nat_churn_watcher, daemon=True, name="MobileNATChurn")
+        _mobile_th.start()
     def _start_p2p(self) -> None:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
@@ -14290,11 +14440,15 @@ class QtclClientApp:
         while not self._stop.is_set():
             try:
                 bh = int(self.koyeb_state.block_height or 0)
-                # Determine external address for P2P
-                _self_ip = _MY_IP or '0.0.0.0'
+                # Determine external address for P2P — prefer public IP over LAN
+                _p2p_ext = getattr(self.p2p_node, 'external_addr', None) if hasattr(self, 'p2p_node') and self.p2p_node else None
+                _self_ip = (_p2p_ext or '').split(':')[0] if _p2p_ext else ''
+                if not _self_ip or not ExternalAddressResolver._is_public(_self_ip):
+                    _self_ip = _MY_IP or '0.0.0.0'
                 _ext = f"http://{_self_ip}:{_P2P_PORT}"
                 _mac = _get_mac_address()
-                _dev_id = _get_device_id(getattr(self.wallet, 'address', '') if hasattr(self, 'wallet') and self.wallet else '')
+                _w_addr_hb = getattr(self.wallet, 'address', '') if hasattr(self, 'wallet') and self.wallet else ''
+                _dev_id = _get_device_id(_w_addr_hb)
                 self.api.send_heartbeat(self._peer_id, bh, external_addr=_ext, mac_address=_mac, device_id=_dev_id)
                 
                 # Refresh P2P peers every 60 seconds
@@ -14306,14 +14460,17 @@ class QtclClientApp:
                 if self._db:
                     try:
                         _nid = self._peer_id
+                        _now_hb = int(_th.time())
                         self._db.execute("""
                             INSERT OR REPLACE INTO p2p_peers
                             (node_id_hex, host, port, chain_height, last_fidelity,
-                             latency_ms, source, first_seen_at, last_seen_at)
-                            VALUES (?,?,?,?,?,?,?,?,?)
+                             latency_ms, source, mac_address, device_id,
+                             first_seen_at, last_seen_at, last_heartbeat_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                         """, (_nid, _self_ip, _P2P_PORT, bh,
                               float(self.koyeb_state.pq0_fidelity or 0),
-                              0.0, 'self', int(_th.time()), int(_th.time())))
+                              0.0, 'self', _mac, _dev_id,
+                              _now_hb, _now_hb, _now_hb))
                         self._db.commit()
                     except Exception: pass
                 
@@ -14326,6 +14483,148 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[HB] heartbeat: {_e}")
             self._stop.wait(30.0)
+
+    def _mobile_nat_churn_watcher(self) -> None:
+        """
+        ⚛️  MOBILE CARRIER NAT CHURN WATCHER
+
+        Android/Termux nodes switch WAN IP when:
+          • WiFi ↔ LTE handoff
+          • Roaming between cell towers
+          • DHCP lease renewal on same interface
+          • Hotspot sharing changes the NAT layer
+
+        Every 20 seconds:
+          1. STUN qtcl_getMyAddr → server returns X-Forwarded-For observed IP
+          2. Compare to current p2p_node.external_addr
+          3. On change: update external_addr, re-register with new IP+mac+device_id,
+             log the churn event, and update the local SQLite peer record.
+          4. Also refreshes the Termux persistent device ID file if it went missing.
+        """
+        import time as _mnt
+        _last_wan_ip = ''
+        _stun_failures = 0
+        _STUN_FAIL_BACKOFF = 60  # seconds to wait after repeated STUN failures
+        _MAC_REFRESH_INTERVAL = 300  # re-derive mac every 5 min in case iface changed
+        _last_mac_refresh = 0.0
+
+        while not self._stop.is_set():
+            try:
+                _now = _mnt.time()
+
+                # Refresh MAC periodically — interface may have changed (WiFi→LTE)
+                if _now - _last_mac_refresh > _MAC_REFRESH_INTERVAL:
+                    _current_mac = _get_mac_address()
+                    _last_mac_refresh = _now
+                else:
+                    _current_mac = _get_mac_address()
+
+                # STUN: ask server what WAN IP it sees from us
+                _observed_ip = ''
+                try:
+                    from urllib.request import urlopen as _uo_m, Request as _Rq_m
+                    import json as _jm
+                    _stun_body = _jm.dumps({
+                        'jsonrpc': '2.0', 'method': 'qtcl_getMyAddr', 'params': {}, 'id': 1
+                    }).encode()
+                    _stun_req = _Rq_m(
+                        f'{ENTROPY_SERVER_URL}/rpc', data=_stun_body,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    with _uo_m(_stun_req, timeout=6) as _sr:
+                        _stun_res = _jm.loads(_sr.read())
+                        _observed_ip = (_stun_res.get('result') or {}).get('ip', '')
+                    _stun_failures = 0
+                except Exception as _stun_e:
+                    _stun_failures += 1
+                    _EXP_LOG.debug(f"[MOBILE-NAT] STUN failed ({_stun_failures}): {_stun_e}")
+                    if _stun_failures >= 3:
+                        # Fallback: public echo services
+                        for _svc in ExternalAddressResolver._WAN_SERVICES:
+                            try:
+                                from urllib.request import urlopen as _uof, Request as _Rqf
+                                _fr = _Rqf(_svc, headers={'User-Agent': 'QTCL-Mobile/2.0'})
+                                with _uof(_fr, timeout=4) as _fres:
+                                    _observed_ip = _fres.read().decode().strip()
+                                if ExternalAddressResolver._is_public(_observed_ip):
+                                    _stun_failures = 0
+                                    break
+                            except Exception:
+                                continue
+
+                if not _observed_ip or not ExternalAddressResolver._is_public(_observed_ip):
+                    self._stop.wait(20.0)
+                    continue
+
+                # Compare to current registered addr
+                _current_ext = getattr(
+                    self.p2p_node, 'external_addr', None
+                ) if hasattr(self, 'p2p_node') and self.p2p_node else None
+                _current_ext_ip = (_current_ext or '').split(':')[0]
+
+                if _observed_ip != _current_ext_ip and _observed_ip != _last_wan_ip:
+                    _new_ext = f"{_observed_ip}:{_P2P_PORT}"
+                    _EXP_LOG.info(
+                        f"[MOBILE-NAT] 📡 WAN IP churn detected: "
+                        f"{_current_ext_ip or 'unknown'} → {_observed_ip} "
+                        f"(mac={_current_mac[:8]}...)"
+                    )
+                    # Update P2P node external addr
+                    if hasattr(self, 'p2p_node') and self.p2p_node:
+                        self.p2p_node.external_addr = _new_ext
+
+                    # Re-register with corrected addr + current mac/device_id
+                    _w_addr_m = getattr(self.wallet, 'address', '') if hasattr(self, 'wallet') and self.wallet else ''
+                    _dev_id_m = _get_device_id(_w_addr_m)
+                    _node_id_m = (
+                        self.p2p_node.node_id if hasattr(self, 'p2p_node') and self.p2p_node
+                        else self._peer_id
+                    )
+                    _pubkey_m = (
+                        self.p2p_node.identity.pubkey_b64
+                        if hasattr(self, 'p2p_node') and self.p2p_node
+                        else _node_id_m
+                    )
+                    try:
+                        _bh_m = int(self.koyeb_state.block_height or 0)
+                        self.api._rpc_envelope("qtcl_registerPeer", [{
+                            "external_addr": _new_ext,
+                            "node_id":       _node_id_m,
+                            "pubkey":        _pubkey_m,
+                            "chain_height":  _bh_m,
+                            "mac_address":   _current_mac,
+                            "device_id":     _dev_id_m,
+                        }])
+                        _EXP_LOG.info(f"[MOBILE-NAT] ✅ Re-registered: {_new_ext} mac={_current_mac[:8]}...")
+                    except Exception as _re_e:
+                        _EXP_LOG.debug(f"[MOBILE-NAT] Re-register failed: {_re_e}")
+
+                    # Update local SQLite so NAT-group queries reflect new addr
+                    if self._db:
+                        try:
+                            _now_m = int(_mnt.time())
+                            self._db.execute("""
+                                INSERT OR REPLACE INTO p2p_peers
+                                (node_id_hex, host, port, chain_height, mac_address,
+                                 device_id, source, last_seen_at, last_heartbeat_at, first_seen_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?)
+                            """, (_node_id_m, _observed_ip, _P2P_PORT,
+                                  int(self.koyeb_state.block_height or 0),
+                                  _current_mac, _dev_id_m, 'self',
+                                  _now_m, _now_m, _now_m))
+                            self._db.commit()
+                        except Exception: pass
+
+                    _last_wan_ip = _observed_ip
+
+                elif _observed_ip == _current_ext_ip:
+                    # IP stable — update last_seen heartbeat silently
+                    _last_wan_ip = _observed_ip
+
+            except Exception as _e:
+                _EXP_LOG.debug(f"[MOBILE-NAT] loop error: {_e}")
+
+            self._stop.wait(20.0)  # check every 20s — fast enough to catch handoff
 
     def _p2p_broadcast_dht(self) -> None:
         """
@@ -15050,7 +15349,15 @@ class QtclClientApp:
         _hlwe_report = self._get_hlwe_integrity_report()
         _EXP_LOG.info(f"[HLWE] Integrity: {_hlwe_report['summary']}")
         # Register with P2P RPC port (9091) for peer-to-peer communication
-        _my_rpc_url = f"http://{_MY_IP or 'localhost'}:{_P2P_PORT}"  # P2P RPC port for peer communication
+        # Use public external IP — not _MY_IP which may be LAN/private
+        _ext_ip_for_reg = (
+            getattr(self.p2p_node, 'external_addr', None) or ''
+        ).split(':')[0] if hasattr(self, 'p2p_node') and self.p2p_node else ''
+        if not _ext_ip_for_reg or not ExternalAddressResolver._is_public(_ext_ip_for_reg):
+            _ext_ip_for_reg = ExternalAddressResolver.resolve().split(':')[0] if ExternalAddressResolver.resolve() else ''
+        if not _ext_ip_for_reg or not ExternalAddressResolver._is_public(_ext_ip_for_reg):
+            _ext_ip_for_reg = _MY_IP or 'localhost'
+        _my_rpc_url = f"http://{_ext_ip_for_reg}:{_P2P_PORT}"
         _mac = _get_mac_address()
         _dev_id = _get_device_id(_w_addr)
         _reg_resp = self.api.register_peer(
