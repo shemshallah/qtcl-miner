@@ -16589,6 +16589,8 @@ class QtclClientApp:
                         continue
                     oracle_height = int(_res_h.get('height', 0))
                     oracle_hash = str(_res_h.get('tip_hash') or _NULL_HASH)
+                    # Get server's current difficulty (from block height response or dedicated call)
+                    _server_difficulty = int(_res_h.get('difficulty', 0) or 0)
 
                     # ── GATE 1: Refuse null parent — would fork the chain ──────────
                     if oracle_hash == _NULL_HASH:
@@ -16610,10 +16612,15 @@ class QtclClientApp:
                         _EXP_LOG.debug(
                             f"[MINER] Oracle snap h={_snap_height} vs chain h={oracle_height} "                            f"— proceeding with chain tip (oracle is advisory)")
 
-                    # STAGE 2: Fetch difficulty from latest block
+                    # STAGE 2: Fetch difficulty — prefer server's current difficulty over stored block
                     _res_b_raw = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2)
                     _res_b = (_res_b_raw if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw else {})
-                    difficulty_bits = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 4)))
+                    _block_diff = int(_res_b.get('difficulty_bits', _res_b.get('difficulty', 0)) or 0)
+                    # Use the higher of server's current difficulty vs block's stored difficulty
+                    if _server_difficulty > 0:
+                        difficulty_bits = max(_server_difficulty, _block_diff)
+                    else:
+                        difficulty_bits = _block_diff if _block_diff > 0 else 4
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
@@ -17015,6 +17022,39 @@ class QtclClientApp:
                     except Exception:
                         pass
                     
+                    # ── Mermin quantum proof: compute from density matrix ──
+                    mermin_value = 0.0
+                    mermin_violated = False
+                    try:
+                        _dmh = _ora_snap.get('density_matrix_hex', '') if _ora_snap else ''
+                        if _dmh and len(_dmh) >= 128:
+                            import numpy as _np_m
+                            # Parse density matrix from hex
+                            _bdata = bytes.fromhex(_dmh)
+                            _n = int((len(_bdata) / 16) ** 0.5)  # 16 bytes per complex128 element
+                            if _n >= 2:
+                                _dm = _np_m.zeros((_n, _n), dtype=complex)
+                                for _i in range(_n):
+                                    for _j in range(_n):
+                                        _off = (_i * _n + _j) * 16
+                                        if _off + 16 <= len(_bdata):
+                                            _re = _np_m.frombuffer(_bdata[_off:_off+8], dtype=_np_m.float64)[0]
+                                            _im = _np_m.frombuffer(_bdata[_off+8:_off+16], dtype=_np_m.float64)[0]
+                                            _dm[_i, _j] = _re + 1j * _im
+                                # Mermin-Klyshko inequality for 3-qubit W state
+                                sx = _np_m.array([[0,1],[1,0]], dtype=complex)
+                                sy = _np_m.array([[0,-1j],[1j,0]], dtype=complex)
+                                def _op(a,b,c):
+                                    return _np_m.kron(_np_m.kron(a,b),c)
+                                M3 = (_op(sx,sx,sx)
+                                    - _op(sx,sy,sy)
+                                    - _op(sy,sx,sy)
+                                    - _op(sy,sy,sx))
+                                mermin_value = float(_np_m.real(_np_m.trace(_dm @ M3)))
+                                mermin_violated = abs(mermin_value) > 2.0
+                    except Exception as _mermin_err:
+                        _EXP_LOG.debug(f"[MINER] Mermin computation: {_mermin_err}")
+                    
                     submit_payload = {
                         "header": {
                             "height": target_height,
@@ -17030,9 +17070,28 @@ class QtclClientApp:
                             "pq0": pq0,
                             "pq_curr": pq_curr,
                             "pq_last": pq_last,
+                            "mermin_value": round(mermin_value, 6),
+                            "mermin_violated": mermin_violated,
                         },
                         "transactions": _block_txs,
                     }
+                    
+                    # ── HLWE-sign the block ──
+                    try:
+                        if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
+                            _hlwe_adapter = HLWEIntegrationAdapter()
+                            _block_dict_for_sig = submit_payload["header"].copy()
+                            _sig = _hlwe_adapter.sign_block(_block_dict_for_sig, self.wallet.private_key)
+                            if _sig and not _sig.get('error'):
+                                submit_payload["hlwe_signature"] = _sig
+                                submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
+                                _EXP_LOG.info(f"[MINER] HLWE-signed block h={target_height}")
+                            else:
+                                _EXP_LOG.warning(f"[MINER] HLWE signing failed: {_sig}")
+                        else:
+                            _EXP_LOG.warning("[MINER] No wallet loaded — block will be rejected (HLWE required)")
+                    except Exception as _hlwe_sign_err:
+                        _EXP_LOG.warning(f"[MINER] HLWE signing error: {_hlwe_sign_err}")
                     
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
