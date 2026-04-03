@@ -15497,6 +15497,9 @@ class QtclClientApp:
                             f"Waiting for valid tip…"
                         )
                         print(f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip", flush=True)
+                        print(f"     Server blockchain is empty (height=0, tip=all zeros).", flush=True)
+                        print(f"     Possible causes: DB reset, migration, or manual wipe.", flush=True)
+                        print(f"     A valid block must exist on the server before mining can start.", flush=True)
                         await _asyncio.sleep(5.0)
                         continue
 
