@@ -1892,9 +1892,9 @@ class SupabaseAPI:
     def __init__(self):
         self.config = SupabaseConfig()
         self.lock = threading.RLock()
-        
-        if not self.config.URL or not self.config.KEY:
-            logger.warning("[Supabase] URL or KEY not configured; DB operations disabled")
+        self._disabled = not bool(self.config.URL and self.config.KEY)
+        if self._disabled:
+            logger.debug("[Supabase] URL or KEY not configured; DB operations disabled (client uses server API)")
     
     def _make_request(
         self,
@@ -1903,6 +1903,8 @@ class SupabaseAPI:
         data: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:
         """Make HTTP request to Supabase REST API"""
+        if self._disabled:
+            return None
         with self.lock:
             try:
                 url = f"{self.config.URL}{endpoint}"
@@ -14292,10 +14294,10 @@ class QtclClientApp:
                 # Small off-diagonal coupling for revival
                 _eps = 0.03
                 for _i in range(3):
-                    for _j in range(3):
-                        if _i != _j:
-                            _ii, _jj = _widx[_i], _widx[_j]
-                            _cp = _phases[_i] - _phases[_j]
+                    for _k2 in range(3):
+                        if _i != _k2:
+                            _ii, _jj = _widx[_i], _widx[_k2]
+                            _cp = _phases[_i] - _phases[_k2]
                             _U[_ii, _jj] = _eps * (_m.cos(_cp) + 1j * _m.sin(_cp))
                 
                 # Apply revival
@@ -17034,13 +17036,13 @@ class QtclClientApp:
                             _n = int((len(_bdata) / 16) ** 0.5)  # 16 bytes per complex128 element
                             if _n >= 2:
                                 _dm = _np_m.zeros((_n, _n), dtype=complex)
-                                for _i in range(_n):
-                                    for _j in range(_n):
-                                        _off = (_i * _n + _j) * 16
+                                for _ri in range(_n):
+                                    for _ci in range(_n):
+                                        _off = (_ri * _n + _ci) * 16
                                         if _off + 16 <= len(_bdata):
                                             _re = _np_m.frombuffer(_bdata[_off:_off+8], dtype=_np_m.float64)[0]
                                             _im = _np_m.frombuffer(_bdata[_off+8:_off+16], dtype=_np_m.float64)[0]
-                                            _dm[_i, _j] = _re + 1j * _im
+                                            _dm[_ri, _ci] = _re + 1j * _im
                                 # Mermin-Klyshko inequality for 3-qubit W state
                                 sx = _np_m.array([[0,1],[1,0]], dtype=complex)
                                 sy = _np_m.array([[0,-1j],[1j,0]], dtype=complex)
