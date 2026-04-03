@@ -8639,16 +8639,13 @@ class KoyebAPIClient:
         ent  = (_nv(snap.get("entropy")) or _nv(snap.get("von_neumann_entropy")) or 0.0)
         raw_curr = snap.get("pq_curr") or snap.get("pq_current")
         raw_last = snap.get("pq_last")
-        # pq_curr/pq_last are 0-7 pseudoqubit sector indices (height mod 8)
-        # Never store raw block height — that breaks the Poincaré disk overlay
+        # pq_curr/pq_last are raw block height values (pq_curr = height, pq_last = height - 1)
         if bh > 0:
-            pq_curr = str(bh % 8)
-            pq_last = str(max(0, bh - 1) % 8)
+            pq_curr = str(bh)
+            pq_last = str(max(0, bh - 1))
         elif raw_curr is not None:
-            _rc = int(raw_curr) if str(raw_curr).isdigit() else 0
-            _rl = int(raw_last) if raw_last is not None and str(raw_last).isdigit() else 0
-            pq_curr = str(_rc % 8)
-            pq_last = str(_rl % 8)
+            pq_curr = str(raw_curr)
+            pq_last = str(raw_last if raw_last is not None else "0")
         else:
             pq_curr = "0"
             pq_last = "0"
@@ -16191,8 +16188,8 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[BOOTSTRAP] Could not fetch height from server: {_e}")
         
-        pq_curr_id = str(bh % 8) if bh > 0 else str(snap.get('pq_curr') or snap.get('pq_curr_id') or '0')
-        pq_last_id = str((bh - 1) % 8) if bh > 0 else str(snap.get('pq_last') or snap.get('pq_last_id') or '7')
+        pq_curr_id = str(bh) if bh > 0 else str(snap.get('pq_curr') or snap.get('pq_curr_id') or '0')
+        pq_last_id = str(bh - 1) if bh > 0 else str(snap.get('pq_last') or snap.get('pq_last_id') or '0')
         # Fetch actual pq_curr/pq_last from server block record — they are sealed
         # by the block sealer and may differ from a local modulo estimate.
         try:
@@ -16959,17 +16956,16 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # pq0   = oracle ground anchor — dominant eigenstate of the DM
                     #         (index 0-7 of max diagonal element)
-                    # pq_last = forward boundary of parent block (parent's pq_curr)
-                    # pq_curr = next face on {8,3} lattice = (pq_last + 1) % 8
-                    # These define the geodesic triangle of the blockfield object.
+                    # pq_last = parent block height (or 0)
+                    # pq_curr = current block height = parent height + 1
                     try:
                         _parent_pq_curr = int(_res_b.get('pq_curr') or 0)
                         _parent_pq_last = int(_res_b.get('pq_last') or 0)
                         # Blockfield boundary evolution:
-                        # rear boundary = parent's forward boundary
-                        pq_last = _parent_pq_curr % 8
-                        # forward boundary = next face on {8,3} lattice
-                        pq_curr = (_parent_pq_curr + 1) % 8
+                        # rear boundary = parent's pq_curr (raw block height)
+                        pq_last = _parent_pq_curr
+                        # forward boundary = parent's pq_curr + 1 (next block height)
+                        pq_curr = _parent_pq_curr + 1
                         # oracle ground anchor from DM dominant diagonal
                         _ora_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}  # cached — no network
                         _dmh = _ora_snap.get('density_matrix_hex', '')
@@ -16997,8 +16993,8 @@ class QtclClientApp:
                             pq0 = max(_diag, key=lambda x: x[0])[1] if _diag else 0
                     except Exception as _pq_e:
                         _EXP_LOG.debug(f"[MINER] pq boundary derivation: {_pq_e}")
-                        pq_last = int(_res_b.get('pq_curr') or 0) % 8
-                        pq_curr = (pq_last + 1) % 8
+                        pq_last = int(_res_b.get('pq_curr') or 0)
+                        pq_curr = pq_last + 1
                         pq0 = 0
 
                     # Fidelity priority:
@@ -17501,8 +17497,8 @@ class QtclClientApp:
                     bh = int(_fb)
             except Exception:
                 pass
-        pq_curr = str(bh % 8)          if bh > 0 else "0"
-        pq_last = str((bh - 1) % 8)    if bh > 0 else "0"
+        pq_curr = str(bh)          if bh > 0 else "0"
+        pq_last = str(bh - 1)      if bh > 0 else "0"
         dm_curr = _decode_dm_8x8(snap)
         if dm_curr is None:
             dm_curr = _reconstruct_dm_from_bloch(snap)
