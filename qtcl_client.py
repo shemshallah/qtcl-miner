@@ -16765,30 +16765,41 @@ class QtclClientApp:
             """
             import time as _ta
             _rpc_errors = []  # Track which calls failed for display
+            _rpc_ok_count = 0  # Track successful calls for status
             
-            def _safe_rpc(method, params=None, label=None):
-                """Call kapi._rpc, log errors, return result or {}"""
-                _r = kapi._rpc(method, params)
-                if _r is None:
-                    _rpc_errors.append((label or method, kapi._last_error or "timeout/connection failed"))
-                    logger.debug(f"[ORACLE-MODE] RPC {method} failed: {kapi._last_error}")
-                    return {}
-                if isinstance(_r, dict) and "error" in _r:
-                    _err_msg = str(_r.get("error", ""))[:80]
-                    _rpc_errors.append((label or method, _err_msg))
-                    logger.debug(f"[ORACLE-MODE] RPC {method} returned error: {_err_msg}")
-                    return {}
-                return _r if _r else {}
+            def _safe_rpc(method, params=None, label=None, retries=2):
+                """Call kapi._rpc with retry, log errors, return result or {}
+                
+                Critical calls (dm_snapshot, quantum_metrics) get 3 retries.
+                Non-critical calls get 1 retry (default).
+                """
+                nonlocal _rpc_ok_count
+                _last_err = None
+                for _attempt in range(retries):
+                    _r = kapi._rpc(method, params)
+                    if _r is not None:
+                        if not (isinstance(_r, dict) and "error" in _r):
+                            _rpc_ok_count += 1
+                            return _r
+                        _last_err = str(_r.get("error", ""))[:80]
+                    else:
+                        _last_err = kapi._last_error or "timeout"
+                    if _attempt < retries - 1:
+                        _ta.sleep(0.5)  # Brief pause before retry
+                # All attempts failed
+                _rpc_errors.append((label or method, _last_err or "failed"))
+                logger.debug(f"[ORACLE-MODE] RPC {method} failed after {retries} attempts: {_last_err}")
+                return {}
             
             # Always query Koyeb server first (authoritative source)
             # even when P2P node is not running yet
-            # Step 1: get latest block height
+            # Step 1: get latest block height (3 retries — critical)
             tip = {}
-            _bh_resp = _safe_rpc("qtcl_getBlockHeight", [], "block_height")
+            _bh_resp = _safe_rpc("qtcl_getBlockHeight", [], "block_height", retries=3)
             if isinstance(_bh_resp, dict):
                 _latest_h = int(_bh_resp.get("height", 0) or 0)
                 if _latest_h > 0:
-                    # Step 2: fetch the full block at that height
+                    # Step 2: fetch the full block at that height (2 retries)
                     _block_resp = _safe_rpc("qtcl_getBlock", [_latest_h], "get_block")
                     if isinstance(_block_resp, dict):
                         tip = _block_resp
@@ -16798,16 +16809,17 @@ class QtclClientApp:
                         tip.setdefault("block_height", _latest_h)
                         tip.setdefault("height", _latest_h)
             
-            # Quantum Metrics (W-state consensus + pq0 anchor from server)
-            metrics = _safe_rpc("qtcl_getQuantumMetrics", [], "quantum_metrics")
+            # Quantum Metrics (W-state consensus + pq0 anchor from server) — 3 retries
+            metrics = _safe_rpc("qtcl_getQuantumMetrics", [], "quantum_metrics", retries=3)
             
-            # Health / Diagnostics
+            # Health / Diagnostics (non-critical, 1 retry)
             health = _safe_rpc("qtcl_getHealth", [], "health")
             
-            # Oracle snapshot (full DM + pq0 values — the definitive source)
-            snap = _safe_rpc("qtcl_getLatestDMSnapshot", [], "dm_snapshot")
+            # Oracle snapshot (full DM + pq0 values — DEFINITIVE source for pq0/mermin/dm)
+            # This is critical for the pq0 anchor, mermin test, and density matrix
+            snap = _safe_rpc("qtcl_getLatestDMSnapshot", [], "dm_snapshot", retries=3)
             
-            # Server peer registry
+            # Server peer registry (2 retries)
             server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
             
             # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
@@ -16822,7 +16834,7 @@ class QtclClientApp:
                         "mac_address": _get_mac_address(),
                     }], "nat_group")
             
-            # Mempool
+            # Mempool (1 retry — non-critical)
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
             
             # Local P2P node (only query if running — use only for live peer state)
@@ -16934,15 +16946,19 @@ class QtclClientApp:
             a("║" + f"  Server: {self.oracle_url}".ljust(W - 2) + "║")
             a("╚" + "═" * (W - 2) + "╝")
             # ── Connection error banner (when RPC calls fail) ────────────────
-            if rpc_errors and len(rpc_errors) >= 3:
+            _critical_fail = any(e[0] in ("block_height", "get_block", "quantum_metrics", "dm_snapshot") 
+                                 for e in rpc_errors)
+            if rpc_errors and (_critical_fail or len(rpc_errors) >= 3):
                 a(HR)
-                a(f"  ⚠️  CONNECTION ISSUE — {len(rpc_errors)} RPC call(s) failed to {self.oracle_url}")
-                a(f"     Server may be unreachable or slow. Check network/firewall.")
-                a(f"     Retrying every refresh cycle...")
-                _failed = [e[0] for e in rpc_errors[:5]]
-                a(f"     Failed: {', '.join(_failed)}")
+                _crit_names = [e[0] for e in rpc_errors if e[0] in ("block_height", "get_block", "quantum_metrics", "dm_snapshot")]
+                if _crit_names:
+                    a(f"  ⚠️  CRITICAL RPC FAILURE — {', '.join(_crit_names)} failed")
+                else:
+                    a(f"  ⚠️  {len(rpc_errors)} RPC call(s) failed — partial data shown")
+                a(f"     Server: {self.oracle_url}")
+                a(f"     Hit Enter to retry, q to quit")
             elif rpc_errors:
-                a(f"  ⚠️  {len(rpc_errors)} RPC error(s): {', '.join(e[0] for e in rpc_errors[:3])}")
+                a(f"  ⚠️  {len(rpc_errors)} non-critical error(s): {', '.join(e[0] for e in rpc_errors[:3])}")
             # ── Chain ──────────────────────────────────────────────
             height    = tip.get("block_height") or tip.get("height") or "?"
             parent    = tip.get("parent_hash")  or tip.get("hash")   or "—"
@@ -16960,13 +16976,19 @@ class QtclClientApp:
             a(f"  Miner address : {tip_miner}")
             a(f"  Difficulty    : {tip_diff}   Timestamp: {tip_ts}")
             # ── Oracle W-state consensus ────────────────────────────
-            fid  = float(w_state.get("fidelity") or w_state.get("w_state_fidelity") or
-                         w_state.get("w3_fidelity") or 0)
-            coh  = min(1.0, max(0.0, float(w_state.get("coherence") or
-                                           w_state.get("coherence_l1") or 0)))
-            pur  = min(1.0, max(0.0, float(w_state.get("purity") or 0)))
+            # Use explicit None-checks (not `or`) since 0.0 is valid
+            _fid_val = w_state.get("fidelity")
+            if _fid_val is None:
+                _fid_val = w_state.get("w_state_fidelity") or w_state.get("w3_fidelity")
+            fid = float(_fid_val) if _fid_val is not None else 0.0
+            _coh_val = w_state.get("coherence")
+            if _coh_val is None:
+                _coh_val = w_state.get("coherence_l1")
+            coh = min(1.0, max(0.0, float(_coh_val) if _coh_val is not None else 0.0))
+            _pur_val = w_state.get("purity")
+            pur = min(1.0, max(0.0, float(_pur_val) if _pur_val is not None else 0.0))
             _ent_srv = w_state.get("entropy") or w_state.get("von_neumann_entropy")
-            if _ent_srv:
+            if _ent_srv is not None:
                 ent = float(_ent_srv)
             else:
                 try:
@@ -17082,10 +17104,14 @@ class QtclClientApp:
                 bloch_y = pq0.get("bloch_y") or "—"
                 bloch_z = pq0.get("bloch_z") or "—"
                 bloch_raw = "—"
-            pq0_fid = (pq0.get("pq0_oracle_fidelity") or pq0.get("pq0_fidelity") or
-                       pq0.get("fidelity") or w_state.get("pq0_oracle_fidelity") or "—")
-            pq0_iv = w_state.get("pq0_IV_fidelity") or pq0.get("pq0_IV_fidelity") or "—"
-            pq0_v  = w_state.get("pq0_V_fidelity")  or pq0.get("pq0_V_fidelity")  or "—"
+            # Use None-check (not `or`) because 0.0 is a valid fidelity value
+            _pfo = pq0.get("pq0_oracle_fidelity")
+            _pfw = w_state.get("pq0_oracle_fidelity")
+            pq0_fid = _pfo if _pfo is not None else (_pfw if _pfw is not None else "—")
+            _piv = w_state.get("pq0_IV_fidelity") or pq0.get("pq0_IV_fidelity")
+            pq0_iv = _piv if _piv is not None else "—"
+            _pvv = w_state.get("pq0_V_fidelity") or pq0.get("pq0_V_fidelity")
+            pq0_v = _pvv if _pvv is not None else "—"
             a(HR)
             a("  pq0 ORACLE ANCHOR  (Poincaré origin — {8,3} hyperbolic lattice)")
             a(f"  Bloch (θ,φ)   : {bloch_raw}")
