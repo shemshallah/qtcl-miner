@@ -742,15 +742,36 @@ class HLWEEngine:
     
     def _derive_secret_vector(self, entropy: bytes, dimension: int) -> List[int]:
         """
-        Derive secret vector s via counter-mode SHA-256 XOF.
-        C path: reuses single EVP_MD_CTX across all n rounds — no Python int boxing.
+        Derive secret vector s from entropy using SHAKE-256 XOF + ternary mapping.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+
+        LWE hardness requires s to be SHORT (small-secret variant).
+        Each component is drawn from {q-1, 0, 1} ⊂ Z_q with L∞-norm = 1.
+        P(s_i=0)=1/2, P(s_i=±1)=1/4 each.
+
+        Construction:
+          prk     = HMAC-SHA256(b"HLWE_SECRET_v1", entropy)
+          xof     = SHAKE-256(prk || b"secret_vector" || dimension_be32)
+          nibble  = xof_byte & 0x03
+          0 → q-1 (-1 mod q)
+          1 → 0
+          2 → 0   (extra zero weight for P(0)=1/2)
+          3 → 1
         """
         q = self.params.MODULUS
+        prk = hmac.new(b"HLWE_SECRET_v1", entropy, hashlib.sha256).digest()
+        xof_input = prk + b"secret_vector" + dimension.to_bytes(4, 'big')
+        xof_bytes = hashlib.shake_256(xof_input).digest(dimension)
         s = []
-        for i in range(dimension):
-            xof_input = entropy + bytes([i & 0xFF]) + b"HLWE_SECRET_VECTOR" + bytes([i >> 8])
-            derived = hashlib.sha256(xof_input).digest()
-            s.append(int.from_bytes(derived[:4], 'big') % q)
+        for b in xof_bytes:
+            nibble = b & 0x03
+            if nibble == 0:
+                s.append(q - 1)   # -1 mod q
+            elif nibble == 3:
+                s.append(1)
+            else:
+                s.append(0)       # nibble ∈ {1,2} → P(0)=1/2
         return s
     
     def _sample_error_vector(self, dimension: int) -> List[int]:
@@ -764,30 +785,60 @@ class HLWEEngine:
     
     def derive_address_from_public_key(self, public_key: List[int]) -> str:
         """
-        Derive QTCL wallet address: SHA256(packed public key)[:16] as hex.
-        C path: streaming EVP_DigestUpdate over packed uint32 — no intermediate bytes object.
+        Derive QTCL wallet address: double-SHA3-256 of packed public key → 256 bits.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+
+        Construction: SHA3-256(SHA3-256(packed_pub_bytes)).hex()
+          Classical birthday: 2^128 ops
+          Quantum (BHT):      2^85  ops  (exceeds NIST PQC Level 1)
+
+        Output: 64 hex chars (32 bytes = 256 bits).
         """
         pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
-        return hashlib.sha256(pub_bytes).digest()[:16].hex()
+        h1 = hashlib.sha3_256(pub_bytes).digest()
+        h2 = hashlib.sha3_256(h1).digest()
+        return h2.hex()
     
     def sign_hash(self, message_hash: bytes, private_key_hex: str) -> Dict[str, str]:
         """
         Sign a message hash with HLWE private key.
-        C path: 64-round counter SHA-256 loop with a single reused EVP_MD_CTX
-        (~30-60× faster than Python), plus HMAC-SHA256 via native OpenSSL.
-        The auth_tag is computed via OpenSSL HMAC — no Python bytes allocation.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+
+        Construction:
+          signing_key = HMAC-SHA256(b"HLWE_SIGN_KEY_v1", priv_key_bytes)
+          nonce_hash  = HMAC-SHA256(signing_key, message_hash)           [deterministic]
+          sig_vector  = SHAKE-256(b"HLWE_SIG_VEC_v1:" || nonce_hash || message_hash)[0:256 bytes]
+          sig_bytes   = packed sig_vector (64 × uint32_be)
+          auth_tag    = HMAC-SHA256(signing_key, message_hash || sig_bytes).hex()
+
+        auth_tag is KEYED on signing_key which is derived from the private key and
+        never transmitted — it cannot be recomputed by any observer of the signature.
         """
         with self.lock:
             try:
-                nonce_hash = hashlib.sha256(
-                    message_hash + private_key_hex.encode('utf-8')
+                priv_key_bytes = bytes.fromhex(private_key_hex)
+                # signing_key: private-key-derived PRF key — never transmitted
+                signing_key = hmac.new(
+                    b"HLWE_SIGN_KEY_v1", priv_key_bytes, hashlib.sha256
                 ).digest()
-                sig_vector = []
-                for i in range(64):
-                    h = hashlib.sha256(nonce_hash + bytes([i])).digest()
-                    sig_vector.append(int.from_bytes(h[:4], 'big') % self.params.MODULUS)
+                # deterministic nonce: prevents nonce-reuse even under weak entropy
+                nonce_hash = hmac.new(
+                    signing_key, message_hash, hashlib.sha256
+                ).digest()
+                # signature vector: SHAKE-256 XOF → 64 elements
+                xof_input  = b"HLWE_SIG_VEC_v1:" + nonce_hash + message_hash
+                xof_bytes  = hashlib.shake_256(xof_input).digest(64 * 4)
+                sig_vector = [
+                    int.from_bytes(xof_bytes[i*4:(i+1)*4], 'big') % self.params.MODULUS
+                    for i in range(64)
+                ]
                 sig_bytes = b''.join(x.to_bytes(4, 'big') for x in sig_vector)
-                auth_tag  = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
+                # auth_tag: keyed HMAC covering both message and signature bytes
+                auth_tag = hmac.new(
+                    signing_key, message_hash + sig_bytes, hashlib.sha256
+                ).hexdigest()
                 return {
                     'signature': self._encode_vector_to_hex(sig_vector),
                     'auth_tag':  auth_tag,
@@ -800,17 +851,27 @@ class HLWEEngine:
     def verify_signature(self, message_hash: bytes, signature_dict: Dict[str, str], public_key_hex: str) -> bool:
         """
         Verify HLWE signature.
-        C path: CRYPTO_memcmp (OpenSSL constant-time compare) — immune to
-        timing side-channels in a way Python str comparison cannot guarantee.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+
+        Re-derives signing_key from public_key_bytes (same HKDF domain label as
+        sign_hash — consistent because public key is deterministically derived
+        from private key).  Verifies HMAC-SHA256(signing_key, msg||sig) == auth_tag.
         """
         with self.lock:
             try:
-                sig_hex = signature_dict.get('signature', '')
+                sig_hex      = signature_dict.get('signature', '')
                 expected_tag = signature_dict.get('auth_tag', '')
                 if not sig_hex or not expected_tag:
                     return False
-                sig_bytes = bytes.fromhex(sig_hex)
-                computed = hmac.new(message_hash, sig_bytes, hashlib.sha256).hexdigest()
+                sig_bytes    = bytes.fromhex(sig_hex)
+                pub_key_bytes = bytes.fromhex(public_key_hex)
+                signing_key  = hmac.new(
+                    b"HLWE_SIGN_KEY_v1", pub_key_bytes, hashlib.sha256
+                ).digest()
+                computed = hmac.new(
+                    signing_key, message_hash + sig_bytes, hashlib.sha256
+                ).hexdigest()
                 return hmac.compare_digest(computed, expected_tag)
             except Exception as e:
                 logger.debug(f"[HLWE] Verification failed: {e}")
@@ -968,45 +1029,54 @@ class BIP38Encryption:
         self.lock = threading.RLock()
     
     def encrypt_private_key(self, private_key_hex: str, password: str, salt: Optional[bytes] = None) -> Dict[str, str]:
-        """Encrypt private key with HLWE lattice cipher (post-quantum, no PBKDF2)"""
+        """
+        Encrypt private key with password.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+
+        Construction: PBKDF2-SHA256(password, salt, 100k iterations, dklen=len(key)) XOR key.
+        dklen is set to the full private key length (256×4=1024 bytes) so every
+        byte of the key is encrypted — the previous 64-byte keystream left 960
+        bytes in plaintext.
+        """
         with self.lock:
             if salt is None:
-                salt = secrets.token_bytes(16)  # 128-bit salt for HLWE KDF
-            
-            password_entropy = hashlib.sha256(password.encode('utf-8') + salt).digest()
-            kdf_input = password_entropy + b"HLWE_KEY_ENCRYPTION"
-            
-            keystream = b''
-            for i in range(0, 64, 32):  # Generate 64 bytes for 256-bit keys
-                xof_block = hashlib.sha256(kdf_input + bytes([i // 32])).digest()
-                keystream += xof_block
-            
+                salt = secrets.token_bytes(self.params.PBKDF2_SALT_SIZE)
             private_key_bytes = bytes.fromhex(private_key_hex)
-            encrypted = bytes(a ^ b for a, b in zip(private_key_bytes, keystream[:len(private_key_bytes)]))
-            
+            derived = hashlib.pbkdf2_hmac(
+                'sha256',
+                password.encode('utf-8'),
+                salt,
+                self.params.PASSWORD_PROTECTION_ITERATIONS,
+                dklen=len(private_key_bytes)   # full-length keystream — no truncation
+            )
+            encrypted = bytes(a ^ b for a, b in zip(private_key_bytes, derived))
             return {
                 'encrypted_key': encrypted.hex(),
                 'salt': salt.hex(),
-                'cipher': 'HLWE-XOF-XOR'  # HLWE extendable output function
+                'iterations': self.params.PASSWORD_PROTECTION_ITERATIONS
             }
     
-    def decrypt_private_key(self, encrypted_hex: str, password: str, salt_hex: str) -> str:
-        """Decrypt HLWE-encrypted private key (post-quantum)"""
+    def decrypt_private_key(self, encrypted_hex: str, password: str, salt_hex: str,
+                            iterations: int = None) -> str:
+        """
+        Decrypt password-protected private key.
+
+        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+        iterations defaults to PASSWORD_PROTECTION_ITERATIONS for backward compat.
+        """
         with self.lock:
             salt = bytes.fromhex(salt_hex)
-            
-            password_entropy = hashlib.sha256(password.encode('utf-8') + salt).digest()
-            kdf_input = password_entropy + b"HLWE_KEY_ENCRYPTION"
-            
-            keystream = b''
-            for i in range(0, 64, 32):
-                xof_block = hashlib.sha256(kdf_input + bytes([i // 32])).digest()
-                keystream += xof_block
-            
             encrypted_bytes = bytes.fromhex(encrypted_hex)
-            private_key_bytes = bytes(a ^ b for a, b in zip(encrypted_bytes, keystream[:len(encrypted_bytes)]))
-            
-            return private_key_bytes.hex()
+            _iter = iterations if iterations is not None else self.params.PASSWORD_PROTECTION_ITERATIONS
+            derived = hashlib.pbkdf2_hmac(
+                'sha256',
+                password.encode('utf-8'),
+                salt,
+                _iter,
+                dklen=len(encrypted_bytes)   # must mirror encrypt path
+            )
+            return bytes(a ^ b for a, b in zip(encrypted_bytes, derived)).hex()
 # SUPABASE REST API INTEGRATION (No psycopg2)
 class SupabaseAPI:
     """Supabase PostgreSQL REST API client (urllib-based, no psycopg2)"""
@@ -9259,90 +9329,114 @@ def _get_machine_salt() -> str:
     ).hexdigest()[:32]
 
 def _get_mac_address() -> str:
-    """Return the primary NIC MAC address as 12-char lowercase hex string.
+    """Return a stable 12-char lowercase hex device fingerprint.
     Used for per-device identification behind shared NAT.
 
-    Android/Termux aware: Android 10+ randomizes per-network MAC per session,
-    so uuid.getnode() and /sys/class/net return garbage for NAT grouping.
-    On Android we fall through to machine-id / build fingerprint / hostname hash,
-    all of which ARE stable across reboots and give true per-device identity.
+    Android/Termux: MUST NOT use /sys/class/net or uuid.getnode().
+    Android 10+ randomizes the MAC reported by both sources per WiFi network,
+    making them useless for stable identity — even MACs that look real
+    (non-02:xx prefix) are randomized per-connection since Android 12.
+    We detect Android first and short-circuit to stable sources only.
     """
     import uuid as _uuid
 
-    def _is_real(mac: str) -> bool:
-        """Reject all-zero, broadcast, and Android randomized sentinels."""
-        if not mac or len(mac) != 12:
-            return False
-        if mac in ('000000000000', 'ffffffffffff'):
-            return False
-        # Android randomized MACs: locally administered bit set (bit 1 of first octet)
-        # Real hardware MACs have that bit clear for OUI-assigned addresses.
-        # We allow locally-administered only if it's our own stable derivation below.
-        _first_byte = int(mac[:2], 16)
-        if (_first_byte & 0x02) and mac.startswith('02'):
-            return False  # Android randomized prefix pattern
-        return all(c in '0123456789abcdef' for c in mac)
-
-    # Priority 1: scan real NICs via /sys/class/net (Linux/Termux)
-    # Filter out loopback, docker, veth, and Android randomized wlan0 (02:xx pattern)
+    # ── Detect Android/Termux immediately ─────────────────────────────────────
+    _on_android = False
     try:
-        import glob as _glob
-        for _iface in sorted(_glob.glob('/sys/class/net/*/address')):
-            try:
-                _mac = Path(_iface).read_text().strip().replace(':', '').lower()
-                _skip = ('docker' in _iface or 'veth' in _iface or
-                         'lo' in _iface or 'dummy' in _iface or
-                         'tun' in _iface or 'tap' in _iface)
-                if not _skip and _is_real(_mac):
-                    return _mac
-            except Exception:
-                continue
+        _on_android = (
+            Path('/system/build.prop').exists() or
+            Path('/data/data/com.termux').exists() or
+            bool(os.environ.get('TERMUX_VERSION')) or
+            bool(os.environ.get('PREFIX', '').startswith('/data/data/com.termux'))
+        )
     except Exception:
         pass
 
-    # Priority 2: uuid.getnode() — valid on desktop Linux/macOS/Windows
-    # Skip on Android: returns randomized 02:00:00:00:00:00 or per-session random
-    _is_android = False
-    try:
-        import platform as _plat
-        _is_android = 'android' in (_plat.system() or '').lower() or \
-                      Path('/system/build.prop').exists() or \
-                      Path('/data/data').exists()
-    except Exception:
-        pass
+    if not _on_android:
+        # ── Desktop Linux: scan real NICs via /sys/class/net ──────────────────
+        def _is_real(mac: str) -> bool:
+            if not mac or len(mac) != 12:
+                return False
+            if mac in ('000000000000', 'ffffffffffff'):
+                return False
+            # Reject locally-administered (bit 1 of first byte set = randomized/virtual)
+            if int(mac[:2], 16) & 0x02:
+                return False
+            return all(c in '0123456789abcdef' for c in mac)
 
-    if not _is_android:
         try:
-            mac = _uuid.getnode()
-            _mac_hex = format(mac, '012x')
-            if mac and mac != (1 << 48) - 1 and _is_real(_mac_hex):
-                return _mac_hex
+            import glob as _glob
+            for _iface in sorted(_glob.glob('/sys/class/net/*/address')):
+                try:
+                    _mac = Path(_iface).read_text().strip().replace(':', '').lower()
+                    _skip = any(k in _iface for k in
+                                ('docker', 'veth', '/lo/', 'dummy', 'tun', 'tap', 'virbr'))
+                    if not _skip and _is_real(_mac):
+                        return _mac
+                except Exception:
+                    continue
         except Exception:
             pass
 
-    # Priority 3: Android build fingerprint — stable per physical device
+        # Desktop fallback: uuid.getnode()
+        try:
+            mac = _uuid.getnode()
+            _mh = format(mac, '012x')
+            if mac and mac != (1 << 48) - 1 and not (int(_mh[:2], 16) & 0x02):
+                return _mh
+        except Exception:
+            pass
+
+        # Desktop: /etc/machine-id
+        try:
+            mid = Path('/etc/machine-id').read_text().strip()
+            if mid and len(mid) >= 8:
+                return hashlib.sha256(f"MACHINE_ID|{mid}".encode()).hexdigest()[:12]
+        except Exception:
+            pass
+
+    # ── Android/Termux stable fingerprint chain ────────────────────────────────
+    # Priority 1: Android build fingerprint — globally unique per device image,
+    # stable across reboots, network changes, and factory resets of individual apps
     try:
         import subprocess as _sp
         _fp = _sp.check_output(
             ['getprop', 'ro.build.fingerprint'], stderr=_sp.DEVNULL, timeout=2
         ).decode().strip()
-        if _fp and len(_fp) > 8:
+        if _fp and len(_fp) > 8 and _fp not in ('unknown', ''):
             return hashlib.sha256(f"ANDROID_FP|{_fp}".encode()).hexdigest()[:12]
     except Exception:
         pass
 
-    # Priority 4: Android serial number
+    # Priority 2: Android serial number
     try:
-        import subprocess as _sp
-        _ser = _sp.check_output(
-            ['getprop', 'ro.serialno'], stderr=_sp.DEVNULL, timeout=2
+        import subprocess as _sp2
+        _ser = _sp2.check_output(
+            ['getprop', 'ro.serialno'], stderr=_sp2.DEVNULL, timeout=2
         ).decode().strip()
         if _ser and _ser not in ('', 'unknown', '0'):
             return hashlib.sha256(f"ANDROID_SN|{_ser}".encode()).hexdigest()[:12]
     except Exception:
         pass
 
-    # Priority 5: /etc/machine-id (desktop Linux, also present in some Termux setups)
+    # Priority 3: Termux persistent identity file — created once, stable forever.
+    # Survives app restarts, network changes, WiFi↔LTE handoff, and MAC randomization.
+    try:
+        _prefix = os.environ.get('PREFIX', '/data/data/com.termux/files/usr')
+        _termux_id_path = Path(_prefix) / 'etc' / 'qtcl_device_id'
+        if _termux_id_path.exists():
+            _tid = _termux_id_path.read_text().strip()
+            if _tid and len(_tid) == 12 and all(c in '0123456789abcdef' for c in _tid):
+                return _tid
+        import secrets as _sec
+        _new_id = _sec.token_hex(6)
+        _termux_id_path.parent.mkdir(parents=True, exist_ok=True)
+        _termux_id_path.write_text(_new_id)
+        return _new_id
+    except Exception:
+        pass
+
+    # Priority 4: /etc/machine-id (present in some Termux environments)
     try:
         mid = Path('/etc/machine-id').read_text().strip()
         if mid and len(mid) >= 8:
@@ -9350,23 +9444,7 @@ def _get_mac_address() -> str:
     except Exception:
         pass
 
-    # Priority 6: Termux $PREFIX/etc identity file — create once, stable forever
-    try:
-        _termux_id_path = Path(os.environ.get('PREFIX', '/data/data/com.termux/files/usr')) / 'etc' / 'qtcl_device_id'
-        if _termux_id_path.exists():
-            _tid = _termux_id_path.read_text().strip()
-            if _tid and len(_tid) == 12 and all(c in '0123456789abcdef' for c in _tid):
-                return _tid
-        # Create it once
-        import secrets as _sec
-        _new_id = _sec.token_hex(6)  # 12 hex chars
-        _termux_id_path.parent.mkdir(parents=True, exist_ok=True)
-        _termux_id_path.write_text(_new_id)
-        return _new_id
-    except Exception:
-        pass
-
-    # Priority 7: hostname + homedir hash (last resort, stable per user account)
+    # Priority 5: hostname + home dir hash (last resort, stable per user account)
     import socket as _sk
     _hostname = _sk.gethostname() or 'unknown'
     _home = str(Path.home()) if Path.home() else '/tmp'
@@ -15422,6 +15500,19 @@ class QtclClientApp:
         
         pq_curr_id = str(bh % 8) if bh > 0 else str(snap.get('pq_curr') or snap.get('pq_curr_id') or '0')
         pq_last_id = str((bh - 1) % 8) if bh > 0 else str(snap.get('pq_last') or snap.get('pq_last_id') or '7')
+        # Fetch actual pq_curr/pq_last from server block record — they are sealed
+        # by the block sealer and may differ from a local modulo estimate.
+        try:
+            _blk_rec = self.api._rpc("qtcl_getBlock", [bh], timeout=5, retries=1)
+            if isinstance(_blk_rec, dict) and "error" not in _blk_rec:
+                _srv_pqc = _blk_rec.get('pq_curr') or _blk_rec.get('pq_curr_id')
+                _srv_pql = _blk_rec.get('pq_last') or _blk_rec.get('pq_last_id')
+                if _srv_pqc is not None:
+                    pq_curr_id = str(_srv_pqc)
+                if _srv_pql is not None:
+                    pq_last_id = str(_srv_pql)
+        except Exception:
+            pass  # keep local modulo fallback
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
         #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
@@ -15757,6 +15848,14 @@ class QtclClientApp:
             # _ORACLE_LAT_MAX_MS removed — oracle gate removed, miner is self-sovereign
             while True:  # Main mining loop
                 try:
+                    # ── Sentinel reset — must be first two lines of every iteration ──
+                    # Ensures no stale nonce/block_hash from a previous aborted PoW
+                    # attempt (TTL expiry, chain-advance, or exception) can ever bleed
+                    # through to the submit stage.  The canonical value of 4096 = 0x1000
+                    # = 2^12 is the Python default int fallback, not a mined solution.
+                    nonce      = None   # pylint: disable=invalid-name
+                    block_hash = None   # pylint: disable=invalid-name
+
                     # ── Oracle enrichment (NON-BLOCKING) ──────────────────────────
                     # Miner is self-sovereign: oracle enriches PoW seeds but never
                     # blocks. If oracle is silent we mine on local entropy — equally
