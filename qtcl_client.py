@@ -2015,6 +2015,12 @@ class LiveRPCOracleSnapshot:
                         'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
                         'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
                         'latency_ms': round((time.time() - _t0) * 1000.0, 1),
+                        'pq0_oracle_fidelity': float(snap.get('pq0_oracle_fidelity') or
+                                                     (snap.get('aer_noise_state') or {}).get('pq0_oracle_fidelity') or 0.0),
+                        'pq0_IV_fidelity':     float(snap.get('pq0_IV_fidelity') or
+                                                     (snap.get('aer_noise_state') or {}).get('pq0_IV_fidelity') or 0.0),
+                        'pq0_V_fidelity':      float(snap.get('pq0_V_fidelity') or
+                                                     (snap.get('aer_noise_state') or {}).get('pq0_V_fidelity') or 0.0),
                     }
             
             snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
@@ -13709,10 +13715,43 @@ class QtclClientApp:
                 except Exception as _up_e:
                     _EXP_LOG.debug(f"[TRIPARTITE] upstream fetch: {_up_e}")
 
+                # ── Step 3b: compute server-aligned pq0 values ────────────
+                # Pull server's live pq0 values (these have real decay/revival dynamics)
+                _srv_pq0   = float(_up_snap.get('pq0_oracle_fidelity', 0.0) or 0.0)
+                _srv_pqIV  = float(_up_snap.get('pq0_IV_fidelity', 0.0) or 0.0)
+                _srv_pqV   = float(_up_snap.get('pq0_V_fidelity', 0.0) or 0.0)
+                _srv_cycle = int(_up_snap.get('cycle', 0) or 0)
+
+                if _has_aer and dms and len(dms) == 3:
+                    _node0_fid = float(_np_l.real(_np_l.trace(_wdm @ dms[0]))) if dms[0] is not None else _srv_pq0
+                    _node1_fid = float(_np_l.real(_np_l.trace(_wdm @ dms[1]))) if dms[1] is not None else _srv_pqIV
+                    _node2_fid = float(_np_l.real(_np_l.trace(_wdm @ dms[2]))) if dms[2] is not None else _srv_pqV
+                    _pq0_oracle_fid  = max(0.0, min(1.0, 0.4 * _srv_pq0  + 0.6 * _node0_fid))
+                    _pq0_IV_fid      = max(0.0, min(1.0, 0.4 * _srv_pqIV + 0.6 * _node1_fid))
+                    _pq0_V_fid       = max(0.0, min(1.0, 0.4 * _srv_pqV  + 0.6 * _node2_fid))
+                else:
+                    _noise_scale = 0.015
+                    try:
+                        _ep = get_entropy_pool()
+                        _eb = _ep.get(16) or os.urandom(16)
+                    except Exception:
+                        _eb = os.urandom(16)
+                    _nh = hashlib.sha256(_eb + str(_cycle).encode()).digest()
+                    _noise = ((int.from_bytes(_nh[:4], 'big') % 1000) / 1000.0 - 0.5) * 2 * _noise_scale
+                    _pq0_oracle_fid = max(0.0, min(1.0, _srv_pq0  + _noise))
+                    _pq0_IV_fid     = max(0.0, min(1.0, _srv_pqIV + _noise * 0.9))
+                    _pq0_V_fid      = max(0.0, min(1.0, _srv_pqV  + _noise * 1.1))
+
+                _srv_reviving = (_srv_cycle % 8 == 0) if _srv_cycle > 0 else False
+                if _srv_reviving:
+                    _pq0_oracle_fid = _srv_pq0
+                    _pq0_IV_fid     = _srv_pqIV
+                    _pq0_V_fid      = _srv_pqV
+
                 # ── Step 4: fuse local + upstream ─────────────────────────
                 fused_dm = self._fuse_with_upstream(
                     local_dm, upstream_dm,
-                    local_fid=_local_fid,
+                    local_fid=_pq0_oracle_fid,
                     upstream_fid=upstream_fid
                 )
                 # Recompute fidelity on fused state
@@ -13754,16 +13793,11 @@ class QtclClientApp:
                     'oracle_type':           'tripartite_client',
                     'source':                'local+upstream',
                     'ready':                 True,
-                    # tripartite node fidelities
-                    'pq0_oracle_fidelity':   _local_fid,
-                    'pq0_IV_fidelity':       float(dms[1] is not None and _HAS_NP_L and
-                                                   _np_l.real(_np_l.trace(_wdm @ dms[1])))
-                                             if _has_aer and dms else _local_fid,
-                    'pq0_V_fidelity':        float(dms[2] is not None and _HAS_NP_L and
-                                                   _np_l.real(_np_l.trace(_wdm @ dms[2])))
-                                             if _has_aer and dms else _local_fid,
+                    'pq0_oracle_fidelity':   _pq0_oracle_fid,
+                    'pq0_IV_fidelity':       _pq0_IV_fid,
+                    'pq0_V_fidelity':        _pq0_V_fid,
                     'upstream_fidelity':     upstream_fid,
-                    'w_local':               _local_fid,
+                    'w_local':               _pq0_oracle_fid,
                     'w_upstream':            upstream_fid,
                     # standard fields consumed by mining loop
                     'w_state_fidelity':      _fused_fid,
@@ -13801,6 +13835,9 @@ class QtclClientApp:
                                 'oracle_type':        'tripartite_client',
                                 'node_ip':            _MY_IP or '',
                                 'oracle_addr':        self._oracle_id.get('address', ''),
+                                'pq0_oracle_fidelity': _pq0_oracle_fid,
+                                'pq0_IV_fidelity':     _pq0_IV_fid,
+                                'pq0_V_fidelity':      _pq0_V_fid,
                             },
                             'id': _cycle,
                         }
