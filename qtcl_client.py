@@ -2911,18 +2911,57 @@ class LiveRPCOracleSnapshot:
                                 snap.get('fidelity') or
                                 snap.get('client_fused_fidelity') or 0.0)
                     _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
+                    # Use explicit None-checks — 0.0 is a valid value, don't fall through
+                    _pur_raw = w_state.get('purity')
+                    if _pur_raw is None:
+                        _pur_raw = _lattice.get('purity')
+                    if _pur_raw is None:
+                        _pur_raw = 0.0
+                    # Clamp purity to valid [0,1] range — reject garbage values
+                    try:
+                        _pur_val = float(_pur_raw)
+                        if not (0.0 <= _pur_val <= 1.0):
+                            _pur_val = 0.0
+                    except (TypeError, ValueError):
+                        _pur_val = 0.0
+                    
+                    _vne_raw = w_state.get('entropy')
+                    if _vne_raw is None:
+                        _vne_raw = w_state.get('von_neumann_entropy')
+                    if _vne_raw is None:
+                        _vne_raw = _lattice.get('entropy')
+                    if _vne_raw is None:
+                        _vne_raw = 0.0
+                    try:
+                        _vne_val = float(_vne_raw)
+                        if not (0.0 <= _vne_val <= 10.0):
+                            _vne_val = 0.0
+                    except (TypeError, ValueError):
+                        _vne_val = 0.0
+                    
+                    _pq_curr_raw = snap.get('pq_curr')
+                    _pq_last_raw = snap.get('pq_last')
+                    if _pq_curr_raw is None:
+                        _pq_curr_raw = snap.get('pq_curr_id')
+                    if _pq_last_raw is None:
+                        _pq_last_raw = snap.get('pq_last_id')
+                    # pq_curr = forward boundary number of current block
+                    # pq_last = read boundary number (previous block's boundary)
+                    _pq_curr = int(_pq_curr_raw) if _pq_curr_raw is not None else (_bh_snap + 1)
+                    _pq_last = int(_pq_last_raw) if _pq_last_raw is not None else _bh_snap
+                    
                     self._oracle_state = {
                         'w_state_fidelity': float(_fid_raw),
                         'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
-                        'von_neumann_entropy': float(w_state.get('entropy') or 0.0),
-                        'purity': float(w_state.get('purity') or _lattice.get('fidelity') or 0.0),
+                        'von_neumann_entropy': _vne_val,
+                        'purity': _pur_val,
                         'cycle': snap.get('cycle', 0),
                         'consensus': snap.get('consensus', False),
                         'mermin_test': snap.get('mermin_test', {}),
                         'block_height': _bh_snap,
                         'density_matrix_hex': snap.get('density_matrix_hex', ''),
-                        'pq_curr': int(snap.get('pq_curr') or snap.get('pq_curr_id') or _bh_snap or 0),
-                        'pq_last': int(snap.get('pq_last') or snap.get('pq_last_id') or max(0, _bh_snap - 1)),
+                        'pq_curr': _pq_curr,
+                        'pq_last': _pq_last,
                         'latency_ms': round((time.time() - _t0) * 1000.0, 1),
                         'pq0_oracle_fidelity': float(snap.get('pq0_oracle_fidelity') or
                                                      (snap.get('aer_noise_state') or {}).get('pq0_oracle_fidelity') or 0.0),
@@ -17302,11 +17341,15 @@ class QtclClientApp:
                 _fid = _ora_state.get('w_state_fidelity', 0.0)
                 _purity = _ora_state.get('purity', 0.0)
                 _vne = _ora_state.get('von_neumann_entropy', 0.0)
-                _mode = _ora_state.get('aer_noise_state', 'unknown')
+                _mode_raw = _ora_state.get('aer_noise_state', 'unknown')
+                _mode = _mode_raw if isinstance(_mode_raw, str) else 'active'
                 _pq0_f = _ora_state.get('pq0_oracle_fidelity', 0.0)
                 _pq0_iv_f = _ora_state.get('pq0_IV_fidelity', 0.0)
                 _pq0_v_f = _ora_state.get('pq0_V_fidelity', 0.0)
                 _up_f = _ora_state.get('upstream_fidelity', 0.0)
+                # Clamp display values to sane ranges
+                _purity = max(0.0, min(1.0, _purity)) if isinstance(_purity, (int, float)) else 0.0
+                _vne = max(0.0, min(10.0, _vne)) if isinstance(_vne, (int, float)) else 0.0
                 print(f"  ⚛️  Oracle: cycle={_cycle} mode={_mode} fused_fid={_fid:.4f} purity={_purity:.4f} S={_vne:.3f}")
                 print(f"          pq0={_pq0_f:.4f}  pq0_IV={_pq0_iv_f:.4f}  pq0_V={_pq0_v_f:.4f}  upstream={_up_f:.4f}")
             elif _has_local:
