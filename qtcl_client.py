@@ -16571,8 +16571,14 @@ class QtclClientApp:
                         _bhost = str(_bp.get('ip_address') or _bp.get('host') or _bp.get('external_addr', '').split(':')[0] or '')
                         _bport = int(_bp.get('port', 9091))
                         if ':' in str(_bp.get('external_addr', '')):
-                            _bhost = _bp['external_addr'].split(':')[0]
-                            _bport = int(_bp['external_addr'].split(':')[1])
+                            _ext = _bp['external_addr']
+                            if _ext.startswith('http://'):
+                                _ext = _ext[7:]
+                            elif _ext.startswith('https://'):
+                                _ext = _ext[8:]
+                            _bparts = _ext.split(':')
+                            _bhost = _bparts[0]
+                            _bport = int(_bparts[1]) if len(_bparts) > 1 else 9091
                         if _bhost and _bhost not in ('', '127.0.0.1', 'localhost', _external_ip):
                             self._db.execute("""
                                 INSERT OR REPLACE INTO p2p_peers 
@@ -16685,6 +16691,36 @@ class QtclClientApp:
         Press Enter to refresh, q+Enter to quit, l+Enter for log tail.
         Full hex strings printed for auditability — nothing truncated.
         """
+        # ── Bootstrap: init DB + start P2P node in background ────────────────
+        # Initialize database (idempotent — safe to call multiple times)
+        if not hasattr(self, '_db') or self._db is None:
+            self._init_db()
+        
+        # Load wallet if available (needed for HLWE signing)
+        if not getattr(self.wallet, 'loaded', False):
+            self._load_wallet()
+        
+        # Start P2P node if not already running
+        if not hasattr(self, 'p2p_node') or self.p2p_node is None:
+            _wallet_addr = getattr(self.wallet, 'address', '') or ''
+            self.p2p_node = P2PNode(port=_P2P_PORT, db=self._db, wallet_addr=_wallet_addr)
+            self._peer_id = self.p2p_node.node_id
+            self._peer_id_final = True
+        
+        # Start P2P server + gossip + NAT discovery in background
+        if self.p2p_node and not getattr(self.p2p_node, '_running', False):
+            def _start_p2p_bg():
+                try:
+                    self.p2p_node.start()
+                    self._register_with_koyeb()
+                except Exception as _e:
+                    logger.warning(f"[ORACLE-MODE] P2P start failed: {_e}")
+            _t = threading.Thread(target=_start_p2p_bg, daemon=True, name='Oracle-P2P-Boot')
+            _t.start()
+        
+        # Give P2P node a moment to start before first refresh
+        time.sleep(0.5)
+        
         import os as _osa
         kapi = KoyebAPIClient(self.oracle_url)
         def _pad(s: str, w: int) -> str:
@@ -16709,10 +16745,11 @@ class QtclClientApp:
             try:
                 _bh_resp = kapi._rpc("qtcl_getBlockHeight", [])
                 if isinstance(_bh_resp, dict) and "result" in _bh_resp:
-                    _latest_h = int(_bh_resp["result"])
+                    _bh_result = _bh_resp["result"]
+                    _latest_h = int(_bh_result.get("height", 0) or 0) if isinstance(_bh_result, dict) else int(_bh_result or 0)
                     if _latest_h > 0:
                         # Step 2: fetch the full block at that height
-                        _block_resp = kapi._rpc("qtcl_getBlock", [{"height": _latest_h}])
+                        _block_resp = kapi._rpc("qtcl_getBlock", [_latest_h])
                         if isinstance(_block_resp, dict):
                             if "result" in _block_resp:
                                 _r = _block_resp.get("result") or {}
@@ -16775,11 +16812,11 @@ class QtclClientApp:
             
             # Local P2P node (only query if running — use only for live peer state)
             api_node = KoyebAPIClient("http://127.0.0.1:9091")
-            local_peers = {}
+            local_p2p_stats = {}
             try:
-                _lp = api_node._rpc("qtcl_getDHTTable", [])
+                _lp = api_node._rpc("qtcl_p2p_getNetworkStats", [])
                 if _lp and "error" not in str(_lp):
-                    local_peers = _lp
+                    local_p2p_stats = _lp
             except Exception:
                 pass
             
@@ -16802,15 +16839,43 @@ class QtclClientApp:
             
             # Merge snap into metrics for w_state / pq0 extraction
             if snap and isinstance(snap, dict):
+                # Extract pq0 values — they live in aer_noise_state nested dict on the server
+                _aer = snap.get("aer_noise_state") or {}
+                if not isinstance(_aer, dict):
+                    _aer = {}
+                _bf = _aer.get("block_field") or {}
+                
                 if "w_state" not in metrics:
                     metrics["w_state"] = {}
                 if isinstance(metrics.get("w_state"), dict):
+                    # Pull W-state values from snap top-level AND block_field
                     metrics["w_state"].update({k: v for k, v in snap.items() 
                                               if k in ("fidelity", "w_state_fidelity", "coherence",
                                                        "coherence_l1", "purity", "entropy",
                                                        "von_neumann_entropy", "density_matrix_hex",
                                                        "oracle_id", "oracle_role", "block_height",
-                                                       "mermin_test", "bell_test")})
+                                                       "mermin_test", "bell_test",
+                                                       "pq_curr", "pq_last")})
+                    # Override with block_field values when metrics has None or missing
+                    # block_field_fidelity is the authoritative W-state fidelity
+                    # Use explicit None-check: setdefault doesn't override existing None
+                    if not metrics["w_state"].get("fidelity"):
+                        metrics["w_state"]["fidelity"] = _bf.get("block_field_fidelity")
+                    if not metrics["w_state"].get("coherence"):
+                        metrics["w_state"]["coherence"] = _bf.get("block_field_coherence")
+                    if not metrics["w_state"].get("entropy"):
+                        metrics["w_state"]["entropy"] = _bf.get("block_field_entropy")
+                    if not metrics["w_state"].get("purity"):
+                        metrics["w_state"]["purity"] = _bf.get("block_field_purity")
+                    # Per-node breakdown from block_field
+                    if _bf.get("per_node"):
+                        metrics["w_state"]["per_node"] = _bf.get("per_node")
+                    # pq0 from aer_noise_state
+                    metrics["w_state"].update({
+                        "pq0_oracle_fidelity": _aer.get("pq0_oracle_fidelity", 0.0),
+                        "pq0_IV_fidelity":     _aer.get("pq0_IV_fidelity", 0.0),
+                        "pq0_V_fidelity":      _aer.get("pq0_V_fidelity", 0.0),
+                    })
                 if "pq0" not in metrics:
                     metrics["pq0"] = {}
                 if isinstance(metrics.get("pq0"), dict):
@@ -16819,6 +16884,12 @@ class QtclClientApp:
                                                    "pq0_IV_fidelity", "pq0_V_fidelity",
                                                    "theta", "phi", "bloch_x", "bloch_y", "bloch_z",
                                                    "pq0_bloch_theta", "pq0_bloch_phi")})
+                    # Also pull from aer_noise_state nested dict
+                    metrics["pq0"].update({
+                        "pq0_oracle_fidelity": _aer.get("pq0_oracle_fidelity", 0.0),
+                        "pq0_IV_fidelity":     _aer.get("pq0_IV_fidelity", 0.0),
+                        "pq0_V_fidelity":      _aer.get("pq0_V_fidelity", 0.0),
+                    })
             
             # Extract w_state and pq0 from metrics (supports nested + flat schemas)
             w_state = metrics.get("w_state", {}) if isinstance(metrics, dict) else {}
@@ -16831,7 +16902,7 @@ class QtclClientApp:
             diag = health
             
             return (tip, w_state, pq0, diag, snap, _all_display_peers, mempool,
-                    local_peers, _bh)
+                    local_p2p_stats, _bh)
         def _render(tip, w_state, pq0, diag, snap, peers, mempool, local_peers=None, bh=0):
             # ── terminal width ─────────────────────────────────────
             try:
@@ -16996,7 +17067,13 @@ class QtclClientApp:
             a(f"  Cartesian     : x={bloch_x}  y={bloch_y}  z={bloch_z}")
             a(f"  pq0 fidelity  : oracle={pq0_fid}  IV={pq0_iv}  V={pq0_v}")
             # ── Mempool ────────────────────────────────────────────
-            pending = mempool.get("transactions") or mempool.get("pending") or []
+            # qtcl_getMempool returns a list directly, not a dict with "transactions" key
+            if isinstance(mempool, list):
+                pending = mempool
+            elif isinstance(mempool, dict):
+                pending = mempool.get("transactions") or mempool.get("pending") or []
+            else:
+                pending = []
             a(HR)
             a(f"  MEMPOOL  —  {len(pending)} pending transaction(s)")
             for tx in pending[:8]:
@@ -17107,8 +17184,14 @@ class QtclClientApp:
                     a(f"  {'HOST':<22} {'PORT':<6} {'CHAIN':>6} {'MAC':>12} {'NODE_ID':<18}")
                     a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*12} {'─'*18}")
                     for _pp in _sp_list[:8]:
-                        _pph = str(_pp.get("external_addr") or _pp.get("host") or "?").split(":")[0][:22]
-                        _ppo2 = str(_pp.get("external_addr") or "9091").split(":")[1] if ":" in str(_pp.get("external_addr", "")) else "9091"
+                        _ext = str(_pp.get("external_addr") or "")
+                        if _ext.startswith('http://'):
+                            _ext = _ext[7:]
+                        elif _ext.startswith('https://'):
+                            _ext = _ext[8:]
+                        _pparts = _ext.split(":")
+                        _pph = _pparts[0][:22]
+                        _ppo2 = _pparts[1] if len(_pparts) > 1 else "9091"
                         _pch2 = str(_pp.get("chain_height", "—"))[:6]
                         _pmac2 = str(_pp.get("mac_address", "—"))[:12]
                         _pnid = str(_pp.get("node_id", "—"))[:16]
@@ -17181,7 +17264,7 @@ class QtclClientApp:
             elif cmd == "l":
                 tip = last_data[0]
                 height = tip.get("block_height") or tip.get("height") or "?"
-                bh_data = kapi._rpc("qtcl_getBlock", [{"height": int(height) if isinstance(height, int) and height != "?" else height}]) or tip
+                bh_data = kapi._rpc("qtcl_getBlock", [int(height) if isinstance(height, int) and height != "?" else height]) or tip
                 print("\n" + "═" * 70)
                 print(f"  BLOCK {height} — full detail")
                 for k, v in bh_data.items():
