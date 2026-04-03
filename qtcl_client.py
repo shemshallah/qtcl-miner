@@ -11538,6 +11538,7 @@ class P2PNode:
         self.sync_mgr.start_daemon()
         self._start_peer_bootstrap_daemon()
         self._start_nat_group_discovery()
+        self._start_peer_connector_daemon()
         logger.info(f"[P2P] ✅ Node started: {self.external_addr} (node_id: {self.node_id[:16]}...)")
         # Register gossip handlers
         self.gossip.register_handler('block_announce', self._on_gossip_block)
@@ -11743,6 +11744,64 @@ class P2PNode:
                     logger.debug(f"[NAT-DISC] Loop error: {_e}")
 
         _t2.Thread(target=_nat_discovery_loop, daemon=True, name='NAT-Group-Disc').start()
+
+    def _start_peer_connector_daemon(self) -> None:
+        """Background daemon: attempt handshake with CONNECTING peers."""
+        import urllib.request as _ur
+        import json as _j
+        import time as _tmo
+        def _connector_loop():
+            while self._running:
+                try:
+                    _tmo.sleep(10)  # pause between cycles
+                    # Get all CONNECTING peers
+                    with self.peer_mgr.lock:
+                        _connecting = [p for p in self.peer_mgr.peers.values()
+                                      if p.state == PeerState.CONNECTING]
+                    if not _connecting:
+                        continue
+                    # Try up to 3 peers per cycle
+                    for peer in _connecting[:3]:
+                        if peer.state != PeerState.CONNECTING:
+                            continue
+                        try:
+                            _url = f'http://{peer.host}:{peer.port}/rpc'
+                            _body = _j.dumps({
+                                'jsonrpc': '2.0',
+                                'method': 'qtcl_p2p_handshake',
+                                'params': {
+                                    'payload': {
+                                        'version': _P2P_VERSION,
+                                        'node_id': self.node_id,
+                                        'port': self.port,
+                                        'chain_height': 0,
+                                        'external_addr': self.external_addr or '',
+                                        'capabilities': ['blocks', 'txs', 'state'],
+                                        'mac_address': _get_mac_address(),
+                                        'device_id': _get_device_id(self.wallet_addr),
+                                    }
+                                },
+                                'id': int(_tmo.time())
+                            }).encode()
+                            _req = _ur.Request(_url, data=_body, headers={'Content-Type': 'application/json'})
+                            with _ur.urlopen(_req, timeout=8) as _resp:
+                                _result = _j.loads(_resp.read().decode())
+                                _r = _result.get('result') or {}
+                                if _r.get('version'):
+                                    peer.session_token = _r.get('session_token', '')
+                                    peer.session_expiry = int(_r.get('session_expiry', 0))
+                                    peer.mac_address = _r.get('mac_address', '')
+                                    peer.device_id = _r.get('device_id', '')
+                                    peer.chain_height = _r.get('chain_height', peer.chain_height)
+                                    peer.state = PeerState.ACTIVE
+                                    self.peer_mgr.save_to_db(self.db)
+                                    logger.info(f"[P2P-CONN] Handshake success: {peer.host}:{peer.port} -> ACTIVE")
+                        except Exception as _e:
+                            logger.debug(f"[P2P-CONN] Handshake failed to {peer.host}:{peer.port}: {_e}")
+                except Exception as _loop_e:
+                    logger.debug(f"[P2P-CONN] Loop error: {_loop_e}")
+        _t = _threading.Thread(target=_connector_loop, daemon=True, name='P2P-Connector')
+        _t.start()
 
     def stop(self) -> None:
         self._running = False
@@ -14147,26 +14206,33 @@ class QtclClientApp:
             # Get peers from Koyeb — _rpc() already unwraps result layer
             peers_resp = self.api._rpc("qtcl_getPeers", [{"limit": 50}])
             if peers_resp and peers_resp.get('peers'):
-                _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
-                for peer in peers_resp['peers']:
-                    p_addr = peer.get('external_addr') or peer.get('host', '')
-                    p_id   = peer.get('node_id', '')
-                    # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
-                    if p_addr and p_id and p_id != node_id:
-                        try:
-                            p_host = p_addr.split(':')[0]
-                            p_port = int(p_addr.split(':')[1]) if ':' in p_addr else _P2P_PORT
-                            new_peer = P2PPeer(p_host, p_port, p_id)
-                            new_peer.mac_address = peer.get('mac_address', '')
-                            new_peer.device_id = peer.get('device_id', '')
-                            # Bug #9: set CONNECTING (not ACTIVE) — bootstrap daemon will
-                            # handshake to get a session_token before the peer can pass the
-                            # auth gate for any non-handshake RPC method.
-                            new_peer.state = PeerState.CONNECTING
-                            self.p2p_node.peer_mgr.add_peer(new_peer)
-                            _EXP_LOG.info(f"[P2P] 🔄 Queued peer for handshake: {p_addr} ({p_id[:16]}...)")
-                        except Exception as _pe:
-                            _EXP_LOG.debug(f"[P2P] Failed to add peer {p_addr}: {_pe}")
+                 _EXP_LOG.info(f"[P2P] 📡 Got {len(peers_resp['peers'])} peers from Koyeb")
+                 for peer in peers_resp['peers']:
+                     p_addr = peer.get('external_addr') or peer.get('host', '')
+                     p_id   = peer.get('node_id', '')
+                     # filter by node_id NOT ext_addr — two miners on same NAT share WAN IP
+                     if p_addr and p_id and p_id != node_id:
+                         try:
+                             # Strip http:// or https:// prefix if present (server may include scheme)
+                             if p_addr.startswith('http://'):
+                                 p_addr_clean = p_addr[7:]
+                             elif p_addr.startswith('https://'):
+                                 p_addr_clean = p_addr[8:]
+                             else:
+                                 p_addr_clean = p_addr
+                             p_host = p_addr_clean.split(':')[0]
+                             p_port = int(p_addr_clean.split(':')[1]) if ':' in p_addr_clean else _P2P_PORT
+                             new_peer = P2PPeer(p_host, p_port, p_id)
+                             new_peer.mac_address = peer.get('mac_address', '')
+                             new_peer.device_id = peer.get('device_id', '')
+                             # Bug #9: set CONNECTING (not ACTIVE) — bootstrap daemon will
+                             # handshake to get a session_token before the peer can pass the
+                             # auth gate for any non-handshake RPC method.
+                             new_peer.state = PeerState.CONNECTING
+                             self.p2p_node.peer_mgr.add_peer(new_peer)
+                             _EXP_LOG.info(f"[P2P] 🔄 Queued peer for handshake: {p_addr_clean} ({p_id[:16]}...)")
+                         except Exception as _pe:
+                             _EXP_LOG.debug(f"[P2P] Failed to add peer {p_addr}: {_pe}")
 
             # ── NAT-group discovery: find other devices behind the same NAT ──
             # This is critical when multiple miners share a WAN IP — the server
@@ -14181,24 +14247,31 @@ class QtclClientApp:
                     }])
                     nat_peers = (nat_resp or {}).get('peers', [])
                     if nat_peers:
-                        _EXP_LOG.info(f"[P2P] 🏠 Found {len(nat_peers)} NAT-group peers (same WAN IP: {_caller_ip})")
-                        for np in nat_peers:
-                            np_id = np.get('node_id', '')
-                            np_addr = np.get('external_addr', '')
-                            np_mac = np.get('mac_address', '')
-                            if np_id and np_id != node_id and np_addr:
-                                try:
-                                    np_host = np_addr.split(':')[0]
-                                    np_port = int(np_addr.split(':')[1]) if ':' in np_addr else _P2P_PORT
-                                    # NAT-group peers share our WAN IP — try LAN routing first
-                                    nat_peer = P2PPeer(np_host, np_port, np_id)
-                                    nat_peer.mac_address = np_mac
-                                    nat_peer.device_id = np.get('device_id', '')
-                                    nat_peer.state = PeerState.CONNECTING
-                                    self.p2p_node.peer_mgr.add_peer(nat_peer)
-                                    _EXP_LOG.info(f"[P2P] 🏠 Queued NAT-group peer: {np_host}:{np_port} mac={np_mac[:8]}...")
-                                except Exception as _npe:
-                                    _EXP_LOG.debug(f"[P2P] Failed to add NAT-group peer: {_npe}")
+                         _EXP_LOG.info(f"[P2P] 🏠 Found {len(nat_peers)} NAT-group peers (same WAN IP: {_caller_ip})")
+                         for np in nat_peers:
+                             np_id = np.get('node_id', '')
+                             np_addr = np.get('external_addr', '')
+                             np_mac = np.get('mac_address', '')
+                             if np_id and np_id != node_id and np_addr:
+                                 try:
+                                     # Strip http:// or https:// prefix if present
+                                     if np_addr.startswith('http://'):
+                                         np_addr_clean = np_addr[7:]
+                                     elif np_addr.startswith('https://'):
+                                         np_addr_clean = np_addr[8:]
+                                     else:
+                                         np_addr_clean = np_addr
+                                     np_host = np_addr_clean.split(':')[0]
+                                     np_port = int(np_addr_clean.split(':')[1]) if ':' in np_addr_clean else _P2P_PORT
+                                     # NAT-group peers share our WAN IP — try LAN routing first
+                                     nat_peer = P2PPeer(np_host, np_port, np_id)
+                                     nat_peer.mac_address = np_mac
+                                     nat_peer.device_id = np.get('device_id', '')
+                                     nat_peer.state = PeerState.CONNECTING
+                                     self.p2p_node.peer_mgr.add_peer(nat_peer)
+                                     _EXP_LOG.info(f"[P2P] 🏠 Queued NAT-group peer: {np_addr_clean} mac={np_mac[:8]}...")
+                                 except Exception as _npe:
+                                     _EXP_LOG.debug(f"[P2P] Failed to add NAT-group peer: {_npe}")
             except Exception as _ne:
                 _EXP_LOG.debug(f"[P2P] NAT-group discovery: {_ne}")
         except Exception as _e:
