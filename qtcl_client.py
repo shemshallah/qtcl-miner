@@ -16691,35 +16691,59 @@ class QtclClientApp:
         Press Enter to refresh, q+Enter to quit, l+Enter for log tail.
         Full hex strings printed for auditability — nothing truncated.
         """
-        # ── Bootstrap: init DB + start P2P node in background ────────────────
+        # ── Bootstrap: init DB (skip wallet + P2P for pure audit) ─────────────
         # Initialize database (idempotent — safe to call multiple times)
         if not hasattr(self, '_db') or self._db is None:
             self._init_db()
         
-        # Load wallet if available (needed for HLWE signing)
+        # Oracle audit mode does NOT require a wallet — skip password prompt
+        # Wallet is only needed for mining/signing, not for reading server state
         if not getattr(self.wallet, 'loaded', False):
-            self._load_wallet()
+            try:
+                _wf = Path.home() / "qtcl-miner" / "data" / "wallet.json"
+                if _wf.exists():
+                    logger.info("[ORACLE-MODE] Wallet found but not loading (audit mode — no password prompt)")
+                else:
+                    logger.info("[ORACLE-MODE] No wallet found — running in audit-only mode")
+            except Exception:
+                pass
         
-        # Start P2P node if not already running
+        # Try P2P node, but don't block if port is in use
+        self._p2p_available = False
         if not hasattr(self, 'p2p_node') or self.p2p_node is None:
-            _wallet_addr = getattr(self.wallet, 'address', '') or ''
-            self.p2p_node = P2PNode(port=_P2P_PORT, db=self._db, wallet_addr=_wallet_addr)
-            self._peer_id = self.p2p_node.node_id
-            self._peer_id_final = True
+            try:
+                _wallet_addr = getattr(self.wallet, 'address', '') or ''
+                self.p2p_node = P2PNode(port=_P2P_PORT, db=self._db, wallet_addr=_wallet_addr)
+                self._peer_id = self.p2p_node.node_id
+                self._peer_id_final = True
+            except OSError as _oe:
+                if "Address already in use" in str(_oe) or _oe.errno == 98:
+                    logger.info(f"[ORACLE-MODE] Port {_P2P_PORT} in use — running in read-only audit mode (another node is active)")
+                else:
+                    logger.warning(f"[ORACLE-MODE] P2P init failed: {_oe}")
+                self.p2p_node = None
+            except Exception as _e:
+                logger.warning(f"[ORACLE-MODE] P2P init failed: {_e}")
+                self.p2p_node = None
         
-        # Start P2P server + gossip + NAT discovery in background
+        # Start P2P server + gossip + NAT discovery in background (only if node created)
         if self.p2p_node and not getattr(self.p2p_node, '_running', False):
             def _start_p2p_bg():
                 try:
                     self.p2p_node.start()
+                    self._p2p_available = True
                     self._register_with_koyeb()
+                except OSError as _oe:
+                    if "Address already in use" in str(_oe) or _oe.errno == 98:
+                        logger.info("[ORACLE-MODE] Port already in use — skipping P2P startup")
+                    else:
+                        logger.warning(f"[ORACLE-MODE] P2P start failed: {_oe}")
                 except Exception as _e:
                     logger.warning(f"[ORACLE-MODE] P2P start failed: {_e}")
             _t = threading.Thread(target=_start_p2p_bg, daemon=True, name='Oracle-P2P-Boot')
             _t.start()
-        
-        # Give P2P node a moment to start before first refresh
-        time.sleep(0.5)
+            # Brief wait for P2P to start (non-blocking feel)
+            time.sleep(0.3)
         
         import os as _osa
         kapi = KoyebAPIClient(self.oracle_url)
@@ -16735,80 +16759,71 @@ class QtclClientApp:
             source for chain tip, oracle state, peer registry, and mempool.
             Only queries the local P2P node (127.0.0.1:9091) when mining is active
             and the local node has live data that supersedes server state.
+            
+            Returns: (tip, w_state, pq0, diag, snap, peers, mempool, local_stats, bh, errors)
+            where errors is a list of (method, reason) strings for failed RPC calls.
             """
             import time as _ta
+            _rpc_errors = []  # Track which calls failed for display
+            
+            def _safe_rpc(method, params=None, label=None):
+                """Call kapi._rpc, log errors, return result or {}"""
+                _r = kapi._rpc(method, params)
+                if _r is None:
+                    _rpc_errors.append((label or method, kapi._last_error or "timeout/connection failed"))
+                    logger.debug(f"[ORACLE-MODE] RPC {method} failed: {kapi._last_error}")
+                    return {}
+                if isinstance(_r, dict) and "error" in _r:
+                    _err_msg = str(_r.get("error", ""))[:80]
+                    _rpc_errors.append((label or method, _err_msg))
+                    logger.debug(f"[ORACLE-MODE] RPC {method} returned error: {_err_msg}")
+                    return {}
+                return _r if _r else {}
             
             # Always query Koyeb server first (authoritative source)
             # even when P2P node is not running yet
             # Step 1: get latest block height
             tip = {}
-            try:
-                _bh_resp = kapi._rpc("qtcl_getBlockHeight", [])
-                if isinstance(_bh_resp, dict) and "result" in _bh_resp:
-                    _bh_result = _bh_resp["result"]
-                    _latest_h = int(_bh_result.get("height", 0) or 0) if isinstance(_bh_result, dict) else int(_bh_result or 0)
-                    if _latest_h > 0:
-                        # Step 2: fetch the full block at that height
-                        _block_resp = kapi._rpc("qtcl_getBlock", [_latest_h])
-                        if isinstance(_block_resp, dict):
-                            if "result" in _block_resp:
-                                _r = _block_resp.get("result") or {}
-                                if isinstance(_r, dict):
-                                    tip = _r
-                            elif "blocks" in _block_resp:
-                                _blocks = _block_resp.get("blocks") or []
-                                if _blocks:
-                                    tip = _blocks[0]
-                        # Also store height for pq_curr/last computation
-                        if not tip:
-                            tip = {"block_height": _latest_h, "height": _latest_h}
-                        else:
-                            tip.setdefault("block_height", _latest_h)
-                            tip.setdefault("height", _latest_h)
-            except Exception:
-                pass
+            _bh_resp = _safe_rpc("qtcl_getBlockHeight", [], "block_height")
+            if isinstance(_bh_resp, dict):
+                _latest_h = int(_bh_resp.get("height", 0) or 0)
+                if _latest_h > 0:
+                    # Step 2: fetch the full block at that height
+                    _block_resp = _safe_rpc("qtcl_getBlock", [_latest_h], "get_block")
+                    if isinstance(_block_resp, dict):
+                        tip = _block_resp
+                    if not tip:
+                        tip = {"block_height": _latest_h, "height": _latest_h}
+                    else:
+                        tip.setdefault("block_height", _latest_h)
+                        tip.setdefault("height", _latest_h)
             
             # Quantum Metrics (W-state consensus + pq0 anchor from server)
-            metrics = kapi._rpc("qtcl_getQuantumMetrics", []) or {}
-            if isinstance(metrics, dict) and "error" in metrics:
-                metrics = {}
+            metrics = _safe_rpc("qtcl_getQuantumMetrics", [], "quantum_metrics")
             
             # Health / Diagnostics
-            health = kapi._rpc("qtcl_getHealth", []) or {}
-            if isinstance(health, dict) and "error" in health:
-                health = {}
+            health = _safe_rpc("qtcl_getHealth", [], "health")
             
             # Oracle snapshot (full DM + pq0 values — the definitive source)
-            snap = kapi._rpc("qtcl_getLatestDMSnapshot", []) or {}
-            if isinstance(snap, dict) and "error" in snap:
-                snap = {}
+            snap = _safe_rpc("qtcl_getLatestDMSnapshot", [], "dm_snapshot")
             
             # Server peer registry
-            server_peers = kapi._rpc("qtcl_getPeers", [{"limit": 50}]) or {}
-            if isinstance(server_peers, dict) and "error" in server_peers:
-                server_peers = {}
+            server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
             
             # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
             # First resolve our external IP from the server's perspective
             nat_peers = {}
-            try:
-                _my_addr_resp = kapi._rpc("qtcl_getMyAddr", [])
-                if isinstance(_my_addr_resp, dict) and "result" in _my_addr_resp:
-                    _my_ip = (_my_addr_resp.get("result") or {}).get("ip", "")
-                    if _my_ip:
-                        nat_peers = kapi._rpc("qtcl_getPeersByNatGroup", [{
-                            "caller_ip": _my_ip,
-                            "mac_address": _get_mac_address(),
-                        }]) or {}
-                        if isinstance(nat_peers, dict) and "error" in nat_peers:
-                            nat_peers = {}
-            except Exception:
-                pass
+            _my_addr_resp = _safe_rpc("qtcl_getMyAddr", [], "get_my_addr")
+            if isinstance(_my_addr_resp, dict):
+                _my_ip = _my_addr_resp.get("ip", "")
+                if _my_ip:
+                    nat_peers = _safe_rpc("qtcl_getPeersByNatGroup", [{
+                        "caller_ip": _my_ip,
+                        "mac_address": _get_mac_address(),
+                    }], "nat_group")
             
             # Mempool
-            mempool = kapi._rpc("qtcl_getMempool", [100]) or {}
-            if isinstance(mempool, dict) and "error" in mempool:
-                mempool = {}
+            mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
             
             # Local P2P node (only query if running — use only for live peer state)
             api_node = KoyebAPIClient("http://127.0.0.1:9091")
@@ -16902,8 +16917,8 @@ class QtclClientApp:
             diag = health
             
             return (tip, w_state, pq0, diag, snap, _all_display_peers, mempool,
-                    local_p2p_stats, _bh)
-        def _render(tip, w_state, pq0, diag, snap, peers, mempool, local_peers=None, bh=0):
+                    local_p2p_stats, _bh, _rpc_errors)
+        def _render(tip, w_state, pq0, diag, snap, peers, mempool, local_peers=None, bh=0, rpc_errors=None):
             # ── terminal width ─────────────────────────────────────
             try:
                 cols = _osa.get_terminal_size().columns
@@ -16918,6 +16933,16 @@ class QtclClientApp:
             a("║" + "  ⚛️  QTCL ORACLE AUDIT PANEL  —  live server state".center(W - 2) + "║")
             a("║" + f"  Server: {self.oracle_url}".ljust(W - 2) + "║")
             a("╚" + "═" * (W - 2) + "╝")
+            # ── Connection error banner (when RPC calls fail) ────────────────
+            if rpc_errors and len(rpc_errors) >= 3:
+                a(HR)
+                a(f"  ⚠️  CONNECTION ISSUE — {len(rpc_errors)} RPC call(s) failed to {self.oracle_url}")
+                a(f"     Server may be unreachable or slow. Check network/firewall.")
+                a(f"     Retrying every refresh cycle...")
+                _failed = [e[0] for e in rpc_errors[:5]]
+                a(f"     Failed: {', '.join(_failed)}")
+            elif rpc_errors:
+                a(f"  ⚠️  {len(rpc_errors)} RPC error(s): {', '.join(e[0] for e in rpc_errors[:3])}")
             # ── Chain ──────────────────────────────────────────────
             height    = tip.get("block_height") or tip.get("height") or "?"
             parent    = tip.get("parent_hash")  or tip.get("hash")   or "—"
@@ -19232,10 +19257,11 @@ def main() -> None:  # noqa: F811
         init_p2p_bootstrap()
         
         url = args.oracle_url or ENTROPY_SERVER_URL
-        # ── Wallet existence check ────────────────────────────────────────────
+        # ── Wallet existence check (skip for oracle-audit mode) ───────────────
         from pathlib import Path as _PathLib
         _wallet_file = _PathLib.home() / "qtcl-miner" / "data" / "wallet.json"
-        if not _wallet_file.exists():
+        _is_oracle_audit = getattr(args, "oracle_audit", False)
+        if not _wallet_file.exists() and not _is_oracle_audit:
             print()
             print("  ┌──────────────────────────────────────────────────────────┐")
             print("  │  🔑  Wallet Setup                                        │")
@@ -19268,45 +19294,48 @@ def main() -> None:  # noqa: F811
                     print("  ⚠  Wallet creation skipped — continuing as guest")
                 except Exception as _cwe:
                     print(f"  ❌ Wallet creation error: {_cwe} — continuing as guest")
-        # ── Oracle mode prompt ────────────────────────────────────────────────
+        # ── Oracle mode prompt (skip for --oracle-audit) ──────────────────────
         oracle_context = None
-        print()
-        print("  ┌──────────────────────────────────────────────────────────┐")
-        print("  │  🔮  Oracle Signing Mode  (optional)                     │")
-        print("  │                                                          │")
-        print("  │  Run as a registered signing oracle?                     │")
-        print("  │  Your price attestations will be HLWE-signed and         │")
-        print("  │  cryptographically bound to your QTCL wallet address.    │")
-        print("  │  This requires your wallet password.                     │")
-        print("  │                                                          │")
-        print("  │  Skip (N) = mine/transact normally, anonymous signing.   │")
-        print("  └──────────────────────────────────────────────────────────┘")
-        try:
-            _oracle_ans = input("  Register as oracle? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            _oracle_ans = "n"
-        if _oracle_ans == "y":
-            print()
-            _tmp_wallet = QTCLWallet()
-            try:
-                _pw_oi = _silent_getpass("  Wallet password: ")
-                if _tmp_wallet.load(_pw_oi):
-                    oracle_context = {
-                        "wallet_addr": _tmp_wallet.address,
-                        "wallet_priv": _tmp_wallet.private_key,
-                        "wallet_pub":  _tmp_wallet.public_key,
-                    }
-                    print(f"  ✅ Oracle bound to wallet: {_tmp_wallet.address}")
-                    _pw_oi = "0" * len(_pw_oi)
-                    del _pw_oi
-                else:
-                    print("  ❌ Wallet load failed — running anonymous oracle")
-            except (EOFError, KeyboardInterrupt):
-                print("  ⚠  Skipped — running anonymous oracle")
-            except Exception as _oe:
-                print(f"  ❌ Wallet error ({_oe}) — running anonymous oracle")
+        if _is_oracle_audit:
+            print("  👻 Oracle-audit mode: skipping wallet prompts (read-only panel)", flush=True)
         else:
-            print("  👻 Running anonymous oracle (no wallet binding)")
+            print()
+            print("  ┌──────────────────────────────────────────────────────────┐")
+            print("  │  🔮  Oracle Signing Mode  (optional)                     │")
+            print("  │                                                          │")
+            print("  │  Run as a registered signing oracle?                     │")
+            print("  │  Your price attestations will be HLWE-signed and         │")
+            print("  │  cryptographically bound to your QTCL wallet address.    │")
+            print("  │  This requires your wallet password.                     │")
+            print("  │                                                          │")
+            print("  │  Skip (N) = mine/transact normally, anonymous signing.   │")
+            print("  └──────────────────────────────────────────────────────────┘")
+            try:
+                _oracle_ans = input("  Register as oracle? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _oracle_ans = "n"
+            if _oracle_ans == "y":
+                print()
+                _tmp_wallet = QTCLWallet()
+                try:
+                    _pw_oi = _silent_getpass("  Wallet password: ")
+                    if _tmp_wallet.load(_pw_oi):
+                        oracle_context = {
+                            "wallet_addr": _tmp_wallet.address,
+                            "wallet_priv": _tmp_wallet.private_key,
+                            "wallet_pub":  _tmp_wallet.public_key,
+                        }
+                        print(f"  ✅ Oracle bound to wallet: {_tmp_wallet.address}")
+                        _pw_oi = "0" * len(_pw_oi)
+                        del _pw_oi
+                    else:
+                        print("  ❌ Wallet load failed — running anonymous oracle")
+                except (EOFError, KeyboardInterrupt):
+                    print("  ⚠  Skipped — running anonymous oracle")
+                except Exception as _oe:
+                    print(f"  ❌ Wallet error ({_oe}) — running anonymous oracle")
+            else:
+                print("  👻 Running anonymous oracle (no wallet binding)")
         print()
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
         # (Moved here after interactive prompts to prevent log injection during password input)
@@ -19320,25 +19349,28 @@ def main() -> None:  # noqa: F811
         except Exception as _rpc_err:
             logger.warning(f"[RPC] ⚠️  Could not initialize dual-mode RPC: {_rpc_err}")
 
-        # ── RPC Mesh Node (port 9091) ─────────────────────────────────────────
+        # ── RPC Mesh Node (port 9091) — skip for oracle-audit ─────────────────
         # Full JSON-RPC 2.0 node serving local SQLite mirror of the main Lattice.
         # pq0 tripartite entanglement chain links this node to the 5-oracle quorum.
-        try:
-            _mesh_port = int(_os.environ.get("MESH_PORT", "9091"))
-            _mesh_srv  = _start_mesh_rpc_node(
-                db_path=_db_file,
-                main_server_url=_os.environ.get(
-                    "ENTROPY_SERVER", "https://qtcl-blockchain.koyeb.app"
-                ),
-                port=_mesh_port,
-            )
-            globals()['_MESH_SERVER'] = _mesh_srv
-            logger.info(
-                f"[MESH] ✅ RPC mesh node started on port {_mesh_port} — "
-                f"pq0 tripartite entanglement active"
-            )
-        except Exception as _mesh_err:
-            logger.warning(f"[MESH] ⚠️  Mesh node startup failed: {_mesh_err}")
+        if not _is_oracle_audit:
+            try:
+                _mesh_port = int(_os.environ.get("MESH_PORT", "9091"))
+                _mesh_srv  = _start_mesh_rpc_node(
+                    db_path=_db_file,
+                    main_server_url=_os.environ.get(
+                        "ENTROPY_SERVER", "https://qtcl-blockchain.koyeb.app"
+                    ),
+                    port=_mesh_port,
+                )
+                globals()['_MESH_SERVER'] = _mesh_srv
+                logger.info(
+                    f"[MESH] ✅ RPC mesh node started on port {_mesh_port} — "
+                    f"pq0 tripartite entanglement active"
+                )
+            except Exception as _mesh_err:
+                logger.warning(f"[MESH] ⚠️  Mesh node startup failed: {_mesh_err}")
+        else:
+            logger.info("[ORACLE-AUDIT] Skipping mesh node (port 9091 reserved for P2P)")
 
         print("✅ Ready for input", flush=True)
     except Exception as e:
