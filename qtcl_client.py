@@ -17086,7 +17086,9 @@ class QtclClientApp:
                             _sig = _hlwe_adapter.sign_block(_block_dict_for_sig, self.wallet.private_key)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hlwe_signature"] = _sig
-                                submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
+                                # HLWE verification derives signing_key from the key bytes,
+                                # so we send the private_key as the "public key" for verification
+                                submit_payload["miner_public_key_hex"] = self.wallet.private_key or ""
                                 _EXP_LOG.info(f"[MINER] HLWE-signed block h={target_height}")
                             else:
                                 _EXP_LOG.warning(f"[MINER] HLWE signing failed: {_sig}")
