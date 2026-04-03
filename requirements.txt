@@ -1,28 +1,52 @@
-# QTCL Client Standalone — Python Package Requirements
-# Python 3.8+
-
-# === CORE (Required for production) ===
-python-socketio>=5.9.0          # P2P gossip/messaging
-python-engineio>=4.8.0          # WebSocket transport
-requests>=2.31.0                # HTTP client (cleaner than urllib)
-
-# === NETWORKING & ASYNC ===
-aiohttp>=3.9.0                  # Async HTTP for DHT peer discovery
-pythclient>=0.1.8       # Pyth official Python SDK
-cffi>=1.15.0            # already required
-numpy>=1.24.0       
-
-# === OPTIONAL (Development, Testing, Monitoring) ===
-pytest>=7.4.0                   # Unit test framework
-pytest-asyncio>=0.21.0          # Async test support
-
-
-# === Installation ===
-# pip install -r requirements.txt
+# ══════════════════════════════════════════════════════════════════════════════
+# QTCL SERVER — requirements.txt
+# Koyeb deployment (Python 3.12, linux/amd64)
 #
-# === Production Deployment ===
-# pip install --no-dev -r requirements.txt
-# 
-# === Docker ===
-# COPY requirements.txt .
-# RUN pip install --no-cache-dir -r requirements.txt
+# CRITICAL PIN: cffi must stay < 2.0.0
+#   cffi 2.0.0 has no pre-built wheel for all Koyeb runtime images.
+#   Without a wheel, pip compiles from source and needs libssl-dev headers
+#   which are absent in Koyeb's runtime container → fatal build crash:
+#     openssl/evp.h: No such file or directory
+#   cffi 1.x has guaranteed manylinux wheels — no compilation needed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Build tools ───────────────────────────────────────────────────────────────
+setuptools>=68.0.0
+wheel>=0.41.0
+
+# ── CRITICAL: cffi pinned below 2.0.0 ────────────────────────────────────────
+cffi>=1.15.1,<2.0.0
+
+# ── Web framework + WSGI ──────────────────────────────────────────────────────
+flask>=3.0.0
+gunicorn>=21.2.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+psycopg2-binary>=2.9.9
+
+# ── Quantum simulation ────────────────────────────────────────────────────────
+qiskit>=1.0.0
+qiskit-aer>=0.14.0
+
+# ── Scientific stack ──────────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.11.0
+mpmath>=1.3.0
+
+# ── Networking + serialisation ────────────────────────────────────────────────
+requests>=2.31.0
+urllib3>=2.0.0
+msgpack>=1.0.7
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic>=2.0.0
+
+# NOTE: 'cryptography' package intentionally excluded — requires libssl-dev
+# at build time (absent on Koyeb runtime). Not used in server stack.
+
+# ── JSON-RPC 2.0 + Pyth Network oracle ───────────────────────────────────────
+# No additional dependencies required:
+#   • JSON-RPC 2.0 engine: pure Python (json, threading, dataclasses)
+#   • Pyth Hermes API:     urllib.request (stdlib) — zero external deps
+#   • Byzantine filter:    statistics (stdlib)
+# All integrations are self-contained within oracle.py + server.py.
