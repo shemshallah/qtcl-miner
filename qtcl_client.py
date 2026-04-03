@@ -16693,44 +16693,146 @@ class QtclClientApp:
             filled = max(0, min(width, int(v * width)))
             return "█" * filled + "░" * (width - filled)
         def _fetch_all():
-            """Fetch all metrics via JSON-RPC 2.0 (pure RPC, no REST)."""
-            # Use separate instance to avoid blocking shared KoyebAPIClient
-            api_node = KoyebAPIClient("http://127.0.0.1:9091")
+            """Fetch all metrics via JSON-RPC 2.0 (pure RPC, no REST).
             
-            # Chain Tip (Local First, Fallback to Oracle)
-            tip = api_node._rpc("qtcl_getBlock", [])
-            if not tip or "error" in str(tip):
-                tip = kapi._rpc("qtcl_getBlock", []) or {}
+            Always queries the Koyeb server directly FIRST — it is the authoritative
+            source for chain tip, oracle state, peer registry, and mempool.
+            Only queries the local P2P node (127.0.0.1:9091) when mining is active
+            and the local node has live data that supersedes server state.
+            """
+            import time as _ta
             
-            # Quantum Metrics
-            metrics = api_node._rpc("qtcl_getQuantumMetrics", [])
-            if not metrics or "error" in str(metrics):
-                metrics = kapi._rpc("qtcl_getQuantumMetrics", []) or {}
+            # Always query Koyeb server first (authoritative source)
+            # even when P2P node is not running yet
+            # Step 1: get latest block height
+            tip = {}
+            try:
+                _bh_resp = kapi._rpc("qtcl_getBlockHeight", [])
+                if isinstance(_bh_resp, dict) and "result" in _bh_resp:
+                    _latest_h = int(_bh_resp["result"])
+                    if _latest_h > 0:
+                        # Step 2: fetch the full block at that height
+                        _block_resp = kapi._rpc("qtcl_getBlock", [{"height": _latest_h}])
+                        if isinstance(_block_resp, dict):
+                            if "result" in _block_resp:
+                                _r = _block_resp.get("result") or {}
+                                if isinstance(_r, dict):
+                                    tip = _r
+                            elif "blocks" in _block_resp:
+                                _blocks = _block_resp.get("blocks") or []
+                                if _blocks:
+                                    tip = _blocks[0]
+                        # Also store height for pq_curr/last computation
+                        if not tip:
+                            tip = {"block_height": _latest_h, "height": _latest_h}
+                        else:
+                            tip.setdefault("block_height", _latest_h)
+                            tip.setdefault("height", _latest_h)
+            except Exception:
+                pass
+            
+            # Quantum Metrics (W-state consensus + pq0 anchor from server)
+            metrics = kapi._rpc("qtcl_getQuantumMetrics", []) or {}
+            if isinstance(metrics, dict) and "error" in metrics:
+                metrics = {}
             
             # Health / Diagnostics
-            health = api_node._rpc("qtcl_getHealth", [])
-            if not health or "error" in str(health):
-                health = kapi._rpc("qtcl_getHealth", []) or {}
+            health = kapi._rpc("qtcl_getHealth", []) or {}
+            if isinstance(health, dict) and "error" in health:
+                health = {}
             
-            snap = metrics
+            # Oracle snapshot (full DM + pq0 values — the definitive source)
+            snap = kapi._rpc("qtcl_getLatestDMSnapshot", []) or {}
+            if isinstance(snap, dict) and "error" in snap:
+                snap = {}
             
-            # P2P Peers (Local Mesh Table)
-            peers = api_node._rpc("qtcl_getDHTTable", [])
-            if not peers or "error" in str(peers):
-                peers = kapi._rpc("qtcl_getPeers", []) or {}
+            # Server peer registry
+            server_peers = kapi._rpc("qtcl_getPeers", [{"limit": 50}]) or {}
+            if isinstance(server_peers, dict) and "error" in server_peers:
+                server_peers = {}
+            
+            # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
+            # First resolve our external IP from the server's perspective
+            nat_peers = {}
+            try:
+                _my_addr_resp = kapi._rpc("qtcl_getMyAddr", [])
+                if isinstance(_my_addr_resp, dict) and "result" in _my_addr_resp:
+                    _my_ip = (_my_addr_resp.get("result") or {}).get("ip", "")
+                    if _my_ip:
+                        nat_peers = kapi._rpc("qtcl_getPeersByNatGroup", [{
+                            "caller_ip": _my_ip,
+                            "mac_address": _get_mac_address(),
+                        }]) or {}
+                        if isinstance(nat_peers, dict) and "error" in nat_peers:
+                            nat_peers = {}
+            except Exception:
+                pass
             
             # Mempool
-            mempool = api_node._rpc("qtcl_getMempoolStats", [])
-            if not mempool or "error" in str(mempool):
-                mempool = kapi._rpc("qtcl_getMempoolStats", []) or {}
+            mempool = kapi._rpc("qtcl_getMempool", [100]) or {}
+            if isinstance(mempool, dict) and "error" in mempool:
+                mempool = {}
             
-            # Extract fields for compatibility
-            w_state  = metrics.get('w_state', {}) if isinstance(metrics, dict) else {}
-            pq0      = metrics.get('pq0', {}) if isinstance(metrics, dict) else {}
-            diag     = health
+            # Local P2P node (only query if running — use only for live peer state)
+            api_node = KoyebAPIClient("http://127.0.0.1:9091")
+            local_peers = {}
+            try:
+                _lp = api_node._rpc("qtcl_getDHTTable", [])
+                if _lp and "error" not in str(_lp):
+                    local_peers = _lp
+            except Exception:
+                pass
             
-            return tip, w_state, pq0, diag, snap, peers, mempool
-        def _render(tip, w_state, pq0, diag, snap, peers, mempool):
+            # Get block height for pq_curr/pq_last computation
+            _bh = tip.get("block_height") or tip.get("height") or 0
+            try:
+                _bh = int(_bh)
+            except (ValueError, TypeError):
+                _bh = 0
+            
+            # Merge server peers + NAT-group peers for display
+            _srv_peer_list = server_peers.get("peers", []) if isinstance(server_peers, dict) else []
+            _nat_peer_list = (nat_peers.get("peers", []) if isinstance(nat_peers, dict) else [])
+            _all_display_peers = {
+                "peers": _srv_peer_list + _nat_peer_list,
+                "server_count": len(_srv_peer_list),
+                "nat_count": len(_nat_peer_list),
+                "nat_group": (nat_peers.get("nat_group") or "") if isinstance(nat_peers, dict) else "",
+            }
+            
+            # Merge snap into metrics for w_state / pq0 extraction
+            if snap and isinstance(snap, dict):
+                if "w_state" not in metrics:
+                    metrics["w_state"] = {}
+                if isinstance(metrics.get("w_state"), dict):
+                    metrics["w_state"].update({k: v for k, v in snap.items() 
+                                              if k in ("fidelity", "w_state_fidelity", "coherence",
+                                                       "coherence_l1", "purity", "entropy",
+                                                       "von_neumann_entropy", "density_matrix_hex",
+                                                       "oracle_id", "oracle_role", "block_height",
+                                                       "mermin_test", "bell_test")})
+                if "pq0" not in metrics:
+                    metrics["pq0"] = {}
+                if isinstance(metrics.get("pq0"), dict):
+                    metrics["pq0"].update({k: v for k, v in snap.items()
+                                          if k in ("pq_curr", "pq_last", "pq0_oracle_fidelity",
+                                                   "pq0_IV_fidelity", "pq0_V_fidelity",
+                                                   "theta", "phi", "bloch_x", "bloch_y", "bloch_z",
+                                                   "pq0_bloch_theta", "pq0_bloch_phi")})
+            
+            # Extract w_state and pq0 from metrics (supports nested + flat schemas)
+            w_state = metrics.get("w_state", {}) if isinstance(metrics, dict) else {}
+            pq0     = metrics.get("pq0", {})     if isinstance(metrics, dict) else {}
+            if not w_state:
+                w_state = {k: v for k, v in metrics.items()
+                            if k not in ("peers", "blocks", "count", "server_count", "nat_count")}
+            if not pq0:
+                pq0 = {}
+            diag = health
+            
+            return (tip, w_state, pq0, diag, snap, _all_display_peers, mempool,
+                    local_peers, _bh)
+        def _render(tip, w_state, pq0, diag, snap, peers, mempool, local_peers=None, bh=0):
             # ── terminal width ─────────────────────────────────────
             try:
                 cols = _osa.get_terminal_size().columns
@@ -16794,10 +16896,14 @@ class QtclClientApp:
             if mermin > 4.0:
                 mermin = 0.0; _mq = False; _mverd = "(field error — check M_value key)"
             _bf  = w_state.get("block_field") or {}
+            # Use server-reported block height for pq_curr/last, with local bh as fallback
+            _pq_bh = int(w_state.get("block_height") or pq0.get("block_height") or tip.get("block_height") or bh or 0)
             pq_c = str(_bf.get("pq_curr") or w_state.get("pq_curr") or
-                       w_state.get("pq_current") or pq0.get("pq_curr") or "?")
+                       w_state.get("pq_current") or pq0.get("pq_curr") or
+                       (str(_pq_bh % 8) if _pq_bh > 0 else "?"))
             pq_l = str(_bf.get("pq_last") or w_state.get("pq_last") or
-                       pq0.get("pq_last") or "?")
+                       pq0.get("pq_last") or
+                       (str((_pq_bh - 1) % 8) if _pq_bh > 0 else "?"))
             dm_hex = (w_state.get("density_matrix_hex") or
                       pq0.get("density_matrix_hex") or "—")
             oracle_addr = (w_state.get("oracle_id") or pq0.get("oracle_id") or
@@ -16909,19 +17015,44 @@ class QtclClientApp:
                 if tx_wit and tx_wit != "—":
                     a(f"      proof: {str(tx_wit)[:96]}…")
             # ── DHT peers ──────────────────────────────────────────
-            peer_list = peers.get("peers") or []
+            _srv_peers = peers.get("peers", []) if isinstance(peers, dict) else []
+            _nat_grp   = peers.get("nat_group", "") if isinstance(peers, dict) else ""
+            _nat_cnt   = peers.get("nat_count", 0) if isinstance(peers, dict) else 0
+            _srv_cnt   = peers.get("server_count", 0) if isinstance(peers, dict) else len(_srv_peers) if _srv_peers else 0
             a(HR)
-            a(f"  DHT PEERS  —  {len(peer_list)} known")
-            for p in peer_list[:12]:
+            _peer_note = f"NAT-group={_nat_grp}" if _nat_grp else ""
+            a(f"  DHT PEERS  —  {_srv_cnt} server  +  {_nat_cnt} NAT-group  {'(' + _peer_note + ')' if _peer_note else ''}")
+            for p in _srv_peers[:12]:
                 pid  = p.get("node_id") or p.get("id") or "—"
-                purl = p.get("url") or p.get("gossip_url") or "—"
+                paddr = p.get("external_addr") or p.get("host") or "—"
+                pmac = p.get("mac_address", "")[:8]
                 plat = p.get("last_seen") or "?"
-                a(f"  {pid}  {purl}  last={plat}")
+                if isinstance(plat, (int, float)):
+                    import time as _tpa
+                    plat = _tpa.strftime("%Y-%m-%d %H:%M:%S", _tpa.localtime(plat))
+                a(f"  🌐 {paddr}  node={pid[:16]}… mac={pmac}…  last={plat}")
+            if _nat_cnt > 0:
+                a(f"  ── NAT-group peers (same WAN IP, different MAC) ──")
+                for p in _srv_peers[_srv_cnt:_srv_cnt+_nat_cnt]:
+                    pid   = p.get("node_id", "")[:16]
+                    paddr = p.get("external_addr", "—")
+                    pmac  = p.get("mac_address", "")[:12]
+                    pdev  = p.get("device_id", "")[:16]
+                    a(f"  🏠 {paddr}  device={pdev}…  mac={pmac}")
             # ── P2P Ouroboros network status ───────────────────────
             a(HR)
             a(f"  P2P OUROBOROS NETWORK  —  port {_P2P_PORT} RPC")
             _p2p_node = getattr(self, 'p2p_node', None)
             _p2p_running = _p2p_node is not None and getattr(_p2p_node, '_running', False)
+            
+            # Always show server peer registry — even before P2P node starts
+            _srv_pcnt = len(peers.get("peers", [])) if isinstance(peers, dict) else 0
+            _nat_pcnt = peers.get("nat_count", 0) if isinstance(peers, dict) else 0
+            _nat_grp  = peers.get("nat_group", "") if isinstance(peers, dict) else ""
+            a(f"  Server peers   : {_srv_pcnt} registered  +  {_nat_pcnt} NAT-group")
+            if _nat_grp:
+                a(f"  NAT WAN IP     : {_nat_grp}  (same IP = same network)")
+            
             if _p2p_running:
                 try:
                     _ext_addr = getattr(_p2p_node, 'external_addr', 'unknown')
@@ -16930,13 +17061,22 @@ class QtclClientApp:
                     _active_peers = _peer_mgr.get_active_peers() if _peer_mgr else []
                     _n_peers = len(_active_peers)
                     _lattice = getattr(_p2p_node, 'lattice', None)
+                    _gossip_eng = getattr(_p2p_node, 'gossip', None)
+                    _rep_eng = getattr(_p2p_node, 'reputation', None)
                     a(f"  Status         : ✅ RUNNING")
                     a(f"  Protocol       : RPC-only (JSON-RPC 2.0) — NO REST API")
                     a(f"  Listen addr    : {_ext_addr}")
                     a(f"  Node ID        : {_node_id}")
-                    a(f"  Active peers   : {_n_peers}")
+                    a(f"  Active peers   : {_n_peers}  (bootstrap in progress…)")
                     if _lattice:
                         a(f"  PQ0 Lattice    : ✅ tripartite consensus active")
+                    if _gossip_eng:
+                        _gstats = _gossip_eng.get_stats()
+                        a(f"  Gossip         : sent={_gstats.get('sent',0)} recv={_gstats.get('received',0)} relay={_gstats.get('relayed',0)}")
+                    if _rep_eng:
+                        _top = _rep_eng.get_top_peers(3)
+                        if _top:
+                            a(f"  Top reputation : " + "  ".join(f"{p['node_id'][:12]}…={p['score']:.2f}" for p in _top))
                     if _active_peers:
                         a(f"  {'HOST':<22} {'PORT':<6} {'H':>6} {'BAN':>5} {'STATE':<10}")
                         a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*5} {'─'*10}")
@@ -16956,11 +17096,25 @@ class QtclClientApp:
                 except Exception as _pe:
                     a(f"  Status         : ⚠️  Error: {_pe}")
             else:
-                _why = "starting..." if _p2p_node else "not initialized — enter Mine mode to activate"
-                a(f"  Status         : ⚠️  {_why}")
-                a(f"  Protocol       : RPC-only (JSON-RPC 2.0)")
+                _why = "starting..." if _p2p_node else "not initialized"
+                a(f"  Local P2P      : ⚠️  {_why} — Mine mode starts the node")
                 a(f"  Port           : {_P2P_PORT}")
-                a("  To activate    : enter Mine mode (option 1) to start P2P node")
+                a(f"  Server peers   : {_srv_pcnt} registered on Koyeb")
+                a(f"  NAT peers      : {_nat_pcnt} on same WAN {_nat_grp}")
+                # Show server peers even when local node is not running
+                _sp_list = peers.get("peers", []) if isinstance(peers, dict) else []
+                if _sp_list:
+                    a(f"  {'HOST':<22} {'PORT':<6} {'CHAIN':>6} {'MAC':>12} {'NODE_ID':<18}")
+                    a(f"  {'─'*22} {'─'*6} {'─'*6} {'─'*12} {'─'*18}")
+                    for _pp in _sp_list[:8]:
+                        _pph = str(_pp.get("external_addr") or _pp.get("host") or "?").split(":")[0][:22]
+                        _ppo2 = str(_pp.get("external_addr") or "9091").split(":")[1] if ":" in str(_pp.get("external_addr", "")) else "9091"
+                        _pch2 = str(_pp.get("chain_height", "—"))[:6]
+                        _pmac2 = str(_pp.get("mac_address", "—"))[:12]
+                        _pnid = str(_pp.get("node_id", "—"))[:16]
+                        a(f"  {_pph:<22} {_ppo2:<6} {_pch2:>6} {_pmac2:>12} {_pnid:<18}")
+                elif _srv_pcnt == 0:
+                    a("  No peers registered on server yet — start mining to bootstrap")
             # ── PQ0 Lattice Status ───────────────────────────────────────
             a(HR)
             a("  PQ0 TRIPARTITE LATTICE")
@@ -16979,7 +17133,28 @@ class QtclClientApp:
                 except Exception as _lq:
                     a(f"  Lattice query : {_lq}")
             else:
-                a("  Status         : waiting for P2P node")
+                # No local node — show server's tripartite state from snap/metrics
+                _pq0_oracle = w_state.get("pq0_oracle_fidelity") or pq0.get("pq0_oracle_fidelity", "—")
+                _pq0_iv    = w_state.get("pq0_IV_fidelity")     or pq0.get("pq0_IV_fidelity", "—")
+                _pq0_v     = w_state.get("pq0_V_fidelity")       or pq0.get("pq0_V_fidelity", "—")
+                _pq0_cycle = w_state.get("cycle") or pq0.get("cycle") or "—"
+                _pq0_bh    = w_state.get("block_height") or pq0.get("block_height") or bh or "—"
+                a(f"  Status         : server-side (P2P node not running)")
+                a(f"  Block height   : {_pq0_bh}  cycle={_pq0_cycle}")
+                if _pq0_oracle != "—" and _pq0_iv != "—" and _pq0_v != "—":
+                    a(f"  pq0 oracle     : {_pq0_oracle:.4f}" if isinstance(_pq0_oracle, float) else f"  pq0 oracle     : {_pq0_oracle}")
+                    a(f"  pq0 IV        : {_pq0_iv:.4f}"     if isinstance(_pq0_iv, float)    else f"  pq0 IV        : {_pq0_iv}")
+                    a(f"  pq0 V         : {_pq0_v:.4f}"      if isinstance(_pq0_v, float)     else f"  pq0 V         : {_pq0_v}")
+                    _pq_avg = sum(filter(lambda x: isinstance(x, float), [_pq0_oracle, _pq0_iv, _pq0_v])) / 3
+                    a(f"  Average        : {_pq_avg:.4f}")
+                    _pq_max = max(filter(lambda x: isinstance(x, float), [_pq0_oracle, _pq0_iv, _pq0_v]))
+                    _pq_min = min(filter(lambda x: isinstance(x, float), [_pq0_oracle, _pq0_iv, _pq0_v]))
+                    a(f"  Spread         : {_pq_max:.4f} - {_pq_min:.4f} = {_pq_max - _pq_min:.4f}")
+                else:
+                    a(f"  pq0 oracle     : {_pq0_oracle}")
+                    a(f"  pq0 IV         : {_pq0_iv}")
+                    a(f"  pq0 V          : {_pq0_v}")
+                a(f"  Local node     : activate Mine mode for tripartite consensus")
             # ── Diagnostics ──────────────────────────────────────────────
             if diag:
                 a(HR)
@@ -17006,7 +17181,7 @@ class QtclClientApp:
             elif cmd == "l":
                 tip = last_data[0]
                 height = tip.get("block_height") or tip.get("height") or "?"
-                bh_data = kapi._rpc("qtcl_getBlock", [int(height) if isinstance(height, int) else height]) or tip
+                bh_data = kapi._rpc("qtcl_getBlock", [{"height": int(height) if isinstance(height, int) and height != "?" else height}]) or tip
                 print("\n" + "═" * 70)
                 print(f"  BLOCK {height} — full detail")
                 for k, v in bh_data.items():
