@@ -1809,9 +1809,9 @@ class BIP39Mnemonics:
                     get_index_by_word(word)
                 except ValueError:
                     raise ValueError(f"Word '{word}' not in BIP39 wordlist")
-                password = mnemonic.encode('utf-8')
-                salt     = ('mnemonic' + passphrase).encode('utf-8')
-                seed     = hashlib.pbkdf2_hmac('sha512', password, salt, 2048)
+            password = mnemonic.encode('utf-8')
+            salt     = ('mnemonic' + passphrase).encode('utf-8')
+            seed     = hashlib.pbkdf2_hmac('sha512', password, salt, 2048)
             logger.info(f"[BIP39] Converted {len(words)}-word mnemonic to 64-byte seed")
             return seed
     def generate_mnemonic(self, strength: MnemonicStrength = MnemonicStrength.STANDARD) -> str:
