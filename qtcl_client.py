@@ -17652,24 +17652,30 @@ class QtclClientApp:
             "block_height":    self.koyeb_state.block_height,
             "w_state_fidelity": self.koyeb_state.w_state_fidelity,
         }
-        tx_id = _hashlib.sha3_256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
-        tx["tx_id"] = tx_id
-        
-        import time as _tw
-        
-        # ── SIGNATURE GENERATION (COMPREHENSIVE FORMAT) ──────────────────
+        # ── SIGNATURE GENERATION (HLWE CANONICAL) ──────────────────
         if self.wallet.private_key:
-            sig_hex = _hashlib.sha3_256(
-                (tx_id + self.wallet.private_key).encode()
-            ).hexdigest()
+            # Reconstruct exactly what the mempool will verify
+            tx_to_sign = {
+                'sender': self.wallet.address,
+                'recipient': to_addr,
+                'amount': float(amount),
+                'nonce': tx['nonce']
+            }
             
-            tx["signature"] = _json.dumps({
-                "signature_hex": sig_hex,
-                "method": "sha3_256_with_private_key",
-                "public_key": self.wallet.public_key or "",
-                "timestamp_ns": str(_tw.time_ns()),
-                "format": "hlwe_json"
-            })
+            # Sign using the canonical HLWE engine
+            sig_dict = hlwe_sign_transaction(tx_to_sign, self.wallet.private_key)
+            
+            # Send the public key derived from the private key for proper verification
+            from hlwe_engine import HLWEEngine
+            engine = HLWEEngine()
+            public_key_hex = engine.derive_public_key(self.wallet.private_key)
+            sig_dict["public_key_hex"] = public_key_hex
+            
+            tx["signature"] = _json.dumps(sig_dict)
+            
+        # Standard tx_id for display
+        tx_id = _hashlib.sha256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
+        tx["tx_id"] = tx_id
         
         tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
