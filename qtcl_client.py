@@ -1455,7 +1455,7 @@ class HLWEEngine:
         Uses TRUE lattice keygen:
           private_key = 32-byte entropy seed (64 hex chars)
           public_key  = b = As + e (mod q) packed as hex
-          address     = SHA3-256(SHA3-256(public_key_bytes))
+          address     = "qtcl1" + SHA3-256(pubkey_bytes)[:20].hex()
         """
         with self.lock:
             try:
@@ -9769,7 +9769,8 @@ class QTCLWallet:
         self.private_key = wd.get("private_key")
         self.public_key  = wd.get("public_key")
         if self.private_key and not self.public_key:
-            self.public_key = _hashlib.sha3_256(self.private_key.encode()).hexdigest()
+            engine = HLWEEngine()
+            self.public_key = engine.derive_public_key(self.private_key)
             self._backup()
             self._atomic_save(self.wallet_file, password,
                 {"address": self.address, "private_key": self.private_key,
@@ -9831,9 +9832,10 @@ class QTCLWallet:
         key, chain = self._bip32_master(seed)
         for idx in self.HD_PATH:
             key, chain = self._bip32_child(key, chain, idx)
-        self.private_key = _hashlib.sha3_256(key).hexdigest()
-        self.public_key  = _hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        pub_bytes    = bytes.fromhex(self.public_key)
+        self.private_key = key.hex()
+        engine = HLWEEngine()
+        self.public_key = engine.derive_public_key(self.private_key)
+        pub_bytes = bytes.fromhex(self.public_key)
         self.address = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
     def _encrypt(self, password: str, payload: dict) -> dict:
         """Encrypt wallet with HLWE lattice cipher (post-quantum, no PBKDF2)"""
@@ -13631,13 +13633,14 @@ class QtclClientApp:
         if _want_wallet:
             _wpriv = oracle_context["wallet_priv"]
             _waddr = oracle_context["wallet_addr"]
+            engine = HLWEEngine()
             private_key = _hashlib.sha3_256(
                 _wpriv.encode() + b"QTCL_ORACLE_DELEGATE_v1"
             ).hexdigest()
-            public_key  = _hashlib.sha3_256(private_key.encode()).hexdigest()
-            pub_bytes   = bytes.fromhex(public_key)
-            address     = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-            cert        = self._create_oracle_cert(public_key, _waddr, _wpriv)
+            public_key = engine.derive_public_key(private_key)
+            pub_bytes = bytes.fromhex(public_key)
+            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            cert = self._create_oracle_cert(public_key, _waddr, _wpriv)
             identity    = {
                 "address":     address,
                 "private_key": private_key,
@@ -13650,13 +13653,14 @@ class QtclClientApp:
             }
             _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
         else:
-            entropy     = _secrets.token_bytes(32)
+            entropy = _secrets.token_bytes(32)
             private_key = _hashlib.sha3_256(
                 entropy + b"QTCL_ORACLE_SIGNING_KEY_v1"
             ).hexdigest()
-            public_key  = _hashlib.sha3_256(private_key.encode()).hexdigest()
-            pub_bytes   = bytes.fromhex(public_key)
-            address     = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            engine = HLWEEngine()
+            public_key = engine.derive_public_key(private_key)
+            pub_bytes = bytes.fromhex(public_key)
+            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
             identity    = {
                 "address":     address,
                 "private_key": private_key,
