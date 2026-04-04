@@ -14284,7 +14284,9 @@ class QtclClientApp:
                         _s = _s / float(_np_m.real(_np_m.trace(_s)))
                         # Mix with seed for entanglement with upstream
                         _ideal_wdm = 0.6 * _ideal_wdm + 0.4 * _s
-                        _ideal_wdm = _ideal_wdm / float(_np_m.real(_np_m.trace(_ideal_wdm)))
+                        _tr_ideal = float(_np_m.real(_np_m.trace(_ideal_wdm)))
+                        if _tr_ideal > 1e-12:
+                            _ideal_wdm = _ideal_wdm / _tr_ideal
                 except Exception:
                     pass
             
@@ -14330,7 +14332,9 @@ class QtclClientApp:
                     _revived = _revived / _tr
                     # Mix for coherence preservation
                     _ideal_wdm = 0.85 * _ideal_wdm + 0.15 * _revived
-                    _ideal_wdm = _ideal_wdm / float(_np_m.real(_np_m.trace(_ideal_wdm)))
+                    _tr_ideal = float(_np_m.real(_np_m.trace(_ideal_wdm)))
+                    if _tr_ideal > 1e-12:
+                        _ideal_wdm = _ideal_wdm / _tr_ideal
             except Exception as _rev_err:
                 _EXP_LOG.debug(f"[TRIPARTITE] Revival: {_rev_err}")
             
