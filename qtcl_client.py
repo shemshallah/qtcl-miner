@@ -9588,7 +9588,11 @@ class QTCLWallet:
         self.private_key = wd.get("private_key")
         self.public_key  = wd.get("public_key")
         if self.private_key and not self.public_key:
-            self.public_key = _hashlib.sha3_256(self.private_key.encode()).hexdigest()
+            # ← FIX: Use canonical HLWE derive_public_key
+            import hmac as _hmac_fix
+            priv_bytes = bytes.fromhex(self.private_key)
+            pub_bytes = _hmac_fix.new(b"HLWE_SIGN_KEY_v1", priv_bytes, _hashlib.sha256).digest()
+            self.public_key = pub_bytes.hex()
             self._backup()
             self._atomic_save(self.wallet_file, password,
                 {"address": self.address, "private_key": self.private_key,
@@ -9597,8 +9601,11 @@ class QTCLWallet:
             _EXP_LOG.error("[WALLET] incomplete fields after decrypt")
             self._clear()
             return False
-        pub_bytes = bytes.fromhex(self.public_key)
-        expected  = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+        # ← FIX: Use canonical address derivation
+        pub_key_bytes = bytes.fromhex(self.public_key)
+        h1 = _hashlib.sha3_256(pub_key_bytes).digest()
+        h2 = _hashlib.sha3_256(h1).digest()
+        expected  = self.PREFIX + h2.hex()[:40]
         if self.address != expected:
             self.address = expected
             self._backup()
@@ -9651,9 +9658,16 @@ class QTCLWallet:
         for idx in self.HD_PATH:
             key, chain = self._bip32_child(key, chain, idx)
         self.private_key = _hashlib.sha3_256(key).hexdigest()
-        self.public_key  = _hashlib.sha3_256(self.private_key.encode()).hexdigest()
-        pub_bytes    = bytes.fromhex(self.public_key)
-        self.address = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+        # ← FIX: Use canonical HLWE derive_public_key instead of SHA3-256(private_key)
+        import hmac as _hmac_fix
+        priv_bytes = bytes.fromhex(self.private_key)
+        pub_bytes = _hmac_fix.new(b"HLWE_SIGN_KEY_v1", priv_bytes, _hashlib.sha256).digest()
+        self.public_key = pub_bytes.hex()
+        # ← Now derive address using canonical derive_address_from_public_key
+        pub_key_bytes = bytes.fromhex(self.public_key)
+        h1 = _hashlib.sha3_256(pub_key_bytes).digest()
+        h2 = _hashlib.sha3_256(h1).digest()
+        self.address = self.PREFIX + h2.hex()[:40]
     def _encrypt(self, password: str, payload: dict) -> dict:
         """Encrypt wallet with HLWE lattice cipher (post-quantum, no PBKDF2)"""
         salt = _secrets.token_bytes(self.SALT_BYTES)
