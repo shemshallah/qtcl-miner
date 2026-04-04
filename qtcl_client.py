@@ -1575,60 +1575,49 @@ class HLWEEngine:
                 s.append(0)       # nibble ∈ {1,2} → P(0)=1/2
         return s
     
-    def _sample_error_vector(self, dimension: int) -> List[int]:
+    def _sample_error_vector(self, dimension: int, seed: bytes = None) -> List[int]:
         """
-        Horoball-centered error distribution (GeodesicLWE).
+        Deterministic error vector e from seed.
 
-        Errors are small in hyperbolic metric, not Euclidean.
-        For a pseudoqubit at Poincaré coord (px, py) the horoball radius at that
-        point scales as σ_hyp = σ_euclid · (1 - px²-py²) / 2  (conformal factor).
-        This shrinks errors near the boundary (high-curvature region) and expands
-        them near the origin — giving a physically correct horoball distribution.
+        CANONICAL — identical to hlwe_engine.py.
 
-        Construction per component e_i:
-          1. Fetch pq coord i → (px, py); compute conformal factor f = (1-r²)/2.
-          2. Scale error bound: B_i = max(1, round(ERROR_BOUND * f)).
-          3. Sample e_i uniformly from [-B_i, B_i], map to Z_q.
-
-        Falls back to Euclidean uniform if PQ cache unavailable.
+        Construction:
+          prk  = HKDF-Extract(salt=b"HLWE_ERROR_v1", ikm=seed)
+          xof  = SHAKE-256(prk ‖ b"error" ‖ dimension_be32)
+          Each component: (xof_byte mod (2·B+1)) − B  → uniform in [−B, B]
         """
         q = self.params.MODULUS
-        B_default = self.params.ERROR_BOUND
-        cache_ready = _PQ_CACHE_READY.is_set()
+        B = self.params.ERROR_BOUND
+        if seed is None:
+            seed = os.urandom(32)
+        prk = hmac.new(b"HLWE_ERROR_v1", seed, hashlib.sha256).digest()
+        xof_input = prk + b"error" + dimension.to_bytes(4, 'big')
+        xof_bytes = hashlib.shake_256(xof_input).digest(dimension)
         e = []
-        import math as _ml
-        for k in range(dimension):
-            if cache_ready:
-                try:
-                    px, py = _pq_get_coord(k)
-                    r2 = px*px + py*py
-                    # conformal factor — shrinks to 0 at boundary, =0.5 at origin
-                    f = max(0.001, (1.0 - r2) / 2.0)
-                    B = max(1, round(B_default * f))
-                except Exception:
-                    B = B_default
-            else:
-                B = B_default
-            val = secrets.randbelow(2 * B + 1) - B   # uniform ∈ [-B, B]
+        for byte in xof_bytes:
+            val = (byte % (2 * B + 1)) - B
             e.append(val % q)
         return e
     
-    def derive_address_from_public_key(self, public_key: List[int]) -> str:
+    def derive_address_from_public_key(self, public_key) -> str:
         """
-        Derive QTCL wallet address: double-SHA3-256 of packed public key → 256 bits.
+        Derive QTCL wallet address from HLWE public key.
 
-        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
+        CANONICAL — must match oracle.py, mempool.py, hlwe_engine.py exactly.
 
-        Construction: SHA3-256(SHA3-256(packed_pub_bytes)).hex()
-          Classical birthday: 2^128 ops
-          Quantum (BHT):      2^85  ops  (exceeds NIST PQC Level 1)
+        Construction: "qtcl1" + SHA3-256(pubkey_bytes)[:20].hex()
+          - hash: SHA3-256 (Keccak), applied ONCE
+          - truncation: 20 bytes (160 bits)
+          - prefix: "qtcl1" — QTCL canonical address prefix
 
-        Output: 64 hex chars (32 bytes = 256 bits).
+        Accepts both List[int] (vector) and bytes (packed) input.
+        Output: 45 chars ("qtcl1" + 40 hex chars).
         """
-        pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
-        h1 = hashlib.sha3_256(pub_bytes).digest()
-        h2 = hashlib.sha3_256(h1).digest()
-        return h2.hex()
+        if isinstance(public_key, bytes):
+            pub_bytes = public_key
+        else:
+            pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
+        return "qtcl1" + hashlib.sha3_256(pub_bytes).digest()[:20].hex()
     
     def sign_hash(self, message_hash: bytes, private_key_hex: str) -> Dict[str, str]:
         """
@@ -1765,7 +1754,7 @@ class HLWEEngine:
         q = self.params.MODULUS
         A = self._derive_lattice_basis_from_pubkey(None)
         s = self._derive_secret_vector_from_key(priv_seed, n)
-        e = self._sample_error_vector(n)
+        e = self._sample_error_vector(n, priv_seed)
         b = LatticeMath.matrix_vector_mult(A, s, q)
         b = LatticeMath.vector_add(b, e, q)
         return b''.join(x.to_bytes(4, 'big') for x in b)
