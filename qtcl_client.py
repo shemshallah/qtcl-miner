@@ -17864,10 +17864,10 @@ class QtclClientApp:
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
             srv = result.get("tx_hash", result.get("txid", tx_id))
-            print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
+            print(f"\n  ✅ Submitted  │  hash: {srv}")
             print(f"  Status: {result.get('status','pending')}  │  "
                   f"donation: {result.get('fee', fee):.8f}  │  "
-                  f"query: /api/transactions/{srv[:16]}…")
+                  f"query: /api/transactions/{srv}")
             try:
                 pass  # SSE removed - RPC only
             except Exception:
