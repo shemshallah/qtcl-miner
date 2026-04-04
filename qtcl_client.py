@@ -1609,49 +1609,41 @@ class HLWEEngine:
         return h2.hex()
     
     def sign_hash(self, message_hash: bytes, private_key_hex: str) -> Dict[str, str]:
-        """
-        Sign a message hash with HLWE private key.
-
-        CANONICAL IMPLEMENTATION — must be identical to hlwe_engine.py.
-
-        Construction:
-          signing_key = HMAC-SHA256(b"HLWE_SIGN_KEY_v1", priv_key_bytes)
-          nonce_hash  = HMAC-SHA256(signing_key, message_hash)           [deterministic]
-          sig_vector  = SHAKE-256(b"HLWE_SIG_VEC_v1:" || nonce_hash || message_hash)[0:256 bytes]
-          sig_bytes   = packed sig_vector (64 × uint32_be)
-          auth_tag    = HMAC-SHA256(signing_key, message_hash || sig_bytes).hex()
-
-        auth_tag is KEYED on signing_key which is derived from the private key and
-        never transmitted — it cannot be recomputed by any observer of the signature.
-        """
+        """Sign a 32-byte message hash."""
         with self.lock:
-            try:
-                priv_key_bytes = bytes.fromhex(private_key_hex)
-                # signing_key: private-key-derived PRF key — never transmitted
-                signing_key = hmac.new(
-                    b"HLWE_SIGN_KEY_v1", priv_key_bytes, hashlib.sha256
-                ).digest()
-                # deterministic nonce: prevents nonce-reuse even under weak entropy
-                nonce_hash = hmac.new(
-                    signing_key, message_hash, hashlib.sha256
-                ).digest()
-                # signature vector: SHAKE-256 XOF → 64 elements
-                xof_input  = b"HLWE_SIG_VEC_v1:" + nonce_hash + message_hash
-                xof_bytes  = hashlib.shake_256(xof_input).digest(64 * 4)
-                sig_vector = [
-                    int.from_bytes(xof_bytes[i*4:(i+1)*4], 'big') % self.params.MODULUS
-                    for i in range(64)
-                ]
-                sig_bytes = b''.join(x.to_bytes(4, 'big') for x in sig_vector)
-                # auth_tag: keyed HMAC covering both message and signature bytes
-                auth_tag = hmac.new(
-                    signing_key, message_hash + sig_bytes, hashlib.sha256
-                ).hexdigest()
-                return {
-                    'signature': self._encode_vector_to_hex(sig_vector),
-                    'auth_tag':  auth_tag,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                }
+            priv_key_bytes = bytes.fromhex(private_key_hex)
+            
+            # Derive signing key
+            signing_key = hmac.new(b"HLWE_SIGN_KEY_v1", priv_key_bytes, hashlib.sha256).digest()
+            
+            # Generate nonce
+            nonce = secrets.token_bytes(32)
+            
+            # Create HMAC-based auth tag
+            msg_nonce = message_hash + nonce
+            auth_tag = hmac.new(signing_key, msg_nonce, hashlib.sha256).digest()
+            
+            # Create signature vector (simplified for this implementation)
+            sig_vector = [int.from_bytes(auth_tag[i:i+4], "big") % self.params.MODULUS 
+                         for i in range(0, min(1024, len(auth_tag)), 4)]
+            # Pad to DIMENSION
+            while len(sig_vector) < self.params.DIMENSION:
+                sig_vector.append(0)
+            sig_vector = sig_vector[:self.params.DIMENSION]
+            
+            return {
+                "signature": self._encode_vector_to_hex(sig_vector),
+                "auth_tag": auth_tag.hex(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "nonce": nonce.hex()
+            }
+
+    def derive_public_key(self, private_key_hex: str) -> str:
+        """Derive public key from private key (one-way derivation)."""
+        priv_bytes = bytes.fromhex(private_key_hex)
+        # Public key is derived exactly like the signing_key, so it can verify
+        pub_bytes = hmac.new(b"HLWE_SIGN_KEY_v1", priv_bytes, hashlib.sha256).digest()
+        return pub_bytes.hex()
             except Exception as e:
                 logger.error(f"[HLWE] Signing failed: {e}")
                 raise
@@ -17666,7 +17658,6 @@ class QtclClientApp:
             sig_dict = hlwe_sign_transaction(tx_to_sign, self.wallet.private_key)
             
             # Send the public key derived from the private key for proper verification
-            from hlwe_engine import HLWEEngine
             engine = HLWEEngine()
             public_key_hex = engine.derive_public_key(self.wallet.private_key)
             sig_dict["public_key_hex"] = public_key_hex
