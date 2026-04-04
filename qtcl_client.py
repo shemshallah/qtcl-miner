@@ -8720,16 +8720,17 @@ class KoyebRPCNodule:
                         elif 'error' in result:
                             # Return the full error dict so callers can handle rejections
                             return result
-            except _ur.HTTPError as e:
-                try:
-                    # Try to parse error from HTTP error body
-                    result = _json.loads(e.read().decode('utf-8'))
-                    if isinstance(result, dict) and 'error' in result:
-                        return result
-                except: pass
-                last_error = f"HTTP {e.code}"
             except Exception as e:
-                last_error = str(e)
+                # Check if it's an HTTP error from urllib (not defined when using requests)
+                if '_ur' in dir() and hasattr(_ur, 'HTTPError') and isinstance(e, _ur.HTTPError):
+                    try:
+                        result = _json.loads(e.read().decode('utf-8'))
+                        if isinstance(result, dict) and 'error' in result:
+                            return result
+                    except: pass
+                    last_error = f"HTTP {e.code}"
+                else:
+                    last_error = str(e)
                 if attempt < retries - 1:
                     backoff = 2 ** attempt
                     _EXP_LOG.debug(f"[RPC] {method} attempt {attempt+1}/{retries} failed: {e}. Retrying...")
@@ -16891,7 +16892,7 @@ class QtclClientApp:
                     except Exception:
                         _miner_reward    = 720
                         base_treasury_reward = 80
-                        _treasury_addr = self.koyeb_state.treasury_address or 'qtcl1d1ae7c762036f3731a16d84c8ec4be75912edb9d'
+                        _treasury_addr = self.koyeb_state.treasury_address or 'qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1'
                     
                     # Sum all transaction donations (formerly fees) for the treasury
                     total_donations = 0
