@@ -1644,9 +1644,6 @@ class HLWEEngine:
         # Public key is derived exactly like the signing_key, so it can verify
         pub_bytes = hmac.new(b"HLWE_SIGN_KEY_v1", priv_bytes, hashlib.sha256).digest()
         return pub_bytes.hex()
-            except Exception as e:
-                logger.error(f"[HLWE] Signing failed: {e}")
-                raise
     
     def verify_signature(self, message_hash: bytes, signature_dict: Dict[str, str], public_key_hex: str) -> bool:
         """
