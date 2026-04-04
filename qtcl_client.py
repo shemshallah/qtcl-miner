@@ -8717,7 +8717,7 @@ class KoyebAPIClient:
             from_addr = payload.get("from_address", "")
             to_addr = payload.get("to_address", "")
             amount = payload.get("amount", 0)
-            fee = payload.get("fee", 0.001)
+            fee = payload.get("fee", 0.0)
             nonce = payload.get("nonce", 0)
             ts = payload.get("timestamp_ns", _t2.time_ns())
             tx_data = f"{from_addr}:{to_addr}:{amount}:{fee}:{nonce}:{ts}"
@@ -8765,7 +8765,7 @@ class KoyebAPIClient:
                 
                 # If we have sufficient balance, note that TX system needs server upgrade
                 amount = float(payload.get('amount', 0))
-                fee = float(payload.get('fee', 0.001))
+                fee = float(payload.get('fee', 0.0))
                 if balance >= amount + fee:
                     _EXP_LOG.warning(f"[TX-FALLBACK] ⚠️ Balance sufficient but server lacks qtcl_submitTransaction. Server needs upgrade.")
                     return {
@@ -9261,6 +9261,7 @@ class KoyebOracleState:
     pq_curr_id:         str   = ""
     pq_last_id:         str   = ""
     block_height:       int   = 0
+    treasury_address:   str   = ""
     connected:          bool  = False
     last_sync_ts:       float = 0.0
     _api:               Any   = _field(default=None, repr=False)
@@ -9337,6 +9338,13 @@ class KoyebOracleState:
         _coh_raw = float(coh)
         self.oracle_coherence = float(min(1.0, _coh_raw / 16.0))
         self.block_height     = bh
+        # Pull treasury address from server if missing
+        if not self.treasury_address:
+            try:
+                _res_t = self._api._rpc("qtcl_getTreasuryAddress", [], timeout=5)
+                if isinstance(_res_t, dict) and _res_t.get("treasury_address"):
+                    self.treasury_address = _res_t["treasury_address"]
+            except Exception: pass
         self.bath_params      = GKSLBathParams.from_snap(snap)
         self.pq_curr_id       = str(bh) if bh > 0 else str(snap.get("pq_curr", ""))
         self.pq_last_id       = str(max(0, bh-1)) if bh > 0 else str(snap.get("pq_last", ""))
@@ -16687,12 +16695,26 @@ class QtclClientApp:
                         from globals import TessellationRewardSchedule as _TRS
                         # ❤️  BASE UNITS
                         _miner_reward    = _TRS.get_miner_reward_base(target_height)
-                        _treasury_reward = _TRS.get_treasury_reward_base(target_height)
-                        _treasury_addr = _TRS.TREASURY_ADDRESS
+                        base_treasury_reward = _TRS.get_treasury_reward_base(target_height)
+                        # Prefer treasury address pulled from server
+                        _treasury_addr = self.koyeb_state.treasury_address or _TRS.TREASURY_ADDRESS
                     except Exception:
                         _miner_reward    = 720
-                        _treasury_reward = 80
-                        _treasury_addr = 'qtcl110fc58e3c441106cc1e54ae41da5d15868525a87'
+                        base_treasury_reward = 80
+                        _treasury_addr = self.koyeb_state.treasury_address or 'qtcl1d1ae7c762036f3731a16d84c8ec4be75912edb9d'
+                    
+                    # Sum all transaction donations (formerly fees) for the treasury
+                    total_donations = 0
+                    for tx in _pending_user_txs:
+                        # fee is in float QTCL in mempool records usually, or 'fee' field
+                        f = tx.get('fee', 0)
+                        if isinstance(f, (float, str)):
+                            try: total_donations += int(round(float(f) * 100))
+                            except: pass
+                        else:
+                            total_donations += int(f)
+                    
+                    _treasury_reward = base_treasury_reward + total_donations
                     
                     # Create miner coinbase transaction
                     _miner_cb_id = _hl.sha3_256(
@@ -17591,7 +17613,13 @@ class QtclClientApp:
         try:
             to_addr = input("  To address (qtcl1…): ").strip()
             amount  = float(input("  Amount (QTCL): ").strip())
-            fee     = float(input("  Fee [default 0.001]: ").strip() or "0.001")
+            
+            # Use existing fee structure for network donations
+            donate = input("  Donate to the network? [y/N]: ").strip().lower()
+            if donate == 'y':
+                fee = float(input("  Donation amount [default 0.001]: ").strip() or "0.001")
+            else:
+                fee = 0.0
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled"); return
         if not to_addr.startswith("qtcl1"):
@@ -17633,7 +17661,7 @@ class QtclClientApp:
             srv = result.get("tx_hash", result.get("txid", tx_id))
             print(f"\n  ✅ Submitted  │  hash: {srv[:40]}…")
             print(f"  Status: {result.get('status','pending')}  │  "
-                  f"fee: {result.get('fee', amount*0.001):.8f}  │  "
+                  f"donation: {result.get('fee', fee):.8f}  │  "
                   f"query: /api/transactions/{srv[:16]}…")
             try:
                 pass  # SSE removed - RPC only
