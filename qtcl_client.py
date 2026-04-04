@@ -17615,6 +17615,7 @@ class QtclClientApp:
         _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
     def _send_tx_wizard(self) -> None:
+        import time as _tw
         try:
             to_addr = input("  To address (qtcl1…): ").strip()
             amount  = float(input("  Amount (QTCL): ").strip())
