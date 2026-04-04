@@ -5163,7 +5163,7 @@ class LocalBlockchainDB:
         except Exception as _me:
             logger.error(f"[IBD-MIGRATE] ❌ Schema migration failed: {_me}")
 
-    def sync_chain_from_server(self, kapi: "KoyebAPIClient",
+    def sync_chain_from_server(self, kapi: "KoyebRPCNodule",
                                 progress_cb: "Optional[Callable]" = None) -> int:
         """Initial Block Download — fetch all blocks from server, genesis to tip.
 
@@ -5171,7 +5171,7 @@ class LocalBlockchainDB:
         linkage at every step. Stores blocks + transactions in local SQLite.
 
         Args:
-            kapi: KoyebAPIClient with _rpc() method
+            kapi: KoyebRPCNodule with _rpc() method
             progress_cb: optional callback(current_height, server_height) for UI
 
         Returns:
@@ -5408,7 +5408,7 @@ class LocalBlockchainDB:
         except Exception as e:
             logger.error(f"[IBD] Wipe failed: {e}")
 
-    def sync_wallet_balance(self, kapi: "KoyebAPIClient", address: str) -> Optional[float]:
+    def sync_wallet_balance(self, kapi: "KoyebRPCNodule", address: str) -> Optional[float]:
         """Sync a single wallet balance from server via RPC."""
         result = kapi._rpc("qtcl_getBalance", [address])
         if isinstance(result, dict) and "balance" in result:
@@ -8487,8 +8487,8 @@ def _reconstruct_dm_from_bloch(snap: dict):
     return dm
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
 # SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
-# γ-SWARM  KoyebAPIClient  (endpoints verified vs GossipHTTPHandler)
-class KoyebAPIClient:
+# γ-SWARM  KoyebRPCNodule  (endpoints verified vs GossipHTTPHandler)
+class KoyebRPCNodule:
     """Thread-safe JSON-RPC 2.0 client for qtcl-blockchain.koyeb.app (https/443). RPC-only, no REST."""
     TIMEOUT: int = 10
     def __init__(self, base_url: str = None, timeout: int = 10):
@@ -8526,10 +8526,16 @@ class KoyebAPIClient:
                         if 'result' in result:
                             return result.get('result')
                         elif 'error' in result:
-                            _err = result['error']
-                            last_error = _err.get('message') if isinstance(_err, dict) else str(_err)
-                            _EXP_LOG.debug(f"[RPC] {method} → error: {last_error}")
-                            return None  # server JSON-RPC error — not a valid result
+                            # Return the full error dict so callers can handle rejections
+                            return result
+                    else:
+                        # Attempt to parse error from body even on non-200
+                        try:
+                            result = r.json()
+                            if isinstance(result, dict) and 'error' in result:
+                                return result
+                        except: pass
+                        
                     _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
                     last_error = f"HTTP {r.status_code}"
                 else:
@@ -8542,10 +8548,16 @@ class KoyebAPIClient:
                         if 'result' in result:
                             return result.get('result')
                         elif 'error' in result:
-                            _err = result['error']
-                            last_error = _err.get('message') if isinstance(_err, dict) else str(_err)
-                            _EXP_LOG.debug(f"[RPC] {method} → error: {last_error}")
-                            return None  # server JSON-RPC error — not a valid result
+                            # Return the full error dict so callers can handle rejections
+                            return result
+            except _ur.HTTPError as e:
+                try:
+                    # Try to parse error from HTTP error body
+                    result = _json.loads(e.read().decode('utf-8'))
+                    if isinstance(result, dict) and 'error' in result:
+                        return result
+                except: pass
+                last_error = f"HTTP {e.code}"
             except Exception as e:
                 last_error = str(e)
                 if attempt < retries - 1:
@@ -8976,8 +8988,8 @@ class KoyebAPIClient:
     def get_diagnostics(self) -> str:
         """Return a human-readable diagnostic report."""
         lines = []
-        lines.append("  🔍 ORACLE DIAGNOSTICS")
-        lines.append(f"     Oracle URL: {self.base_url}")
+        lines.append("  🔍 RPC NODULE DIAGNOSTICS")
+        lines.append(f"     RPC URL:    {self.base_url}")
         lines.append(f"     Timeout:    {self.timeout}s")
         
         try:
@@ -8990,14 +9002,14 @@ class KoyebAPIClient:
             lines.append(f"     Network:    ❌ Unreachable ({e})")
         
         if self.health_check(timeout=3, force=True):
-            lines.append(f"     Health:     ✅ API responding")
+            lines.append(f"     Health:     ✅ RPC nodule responding")
         else:
-            lines.append(f"     Health:     ❌ API not responding")
+            lines.append(f"     Health:     ❌ RPC nodule not responding")
             if self._last_error:
                 lines.append(f"     Last Error: {self._last_error}")
         
         return "\n".join(lines)
-_KOYEB: "KoyebAPIClient" = KoyebAPIClient()
+_KOYEB: "KoyebRPCNodule" = KoyebRPCNodule()
 def _vn_entropy(dm) -> float:
     """Von Neumann entropy S(ρ) = -Tr(ρ log₂ ρ).
     Eigendecomposition stays in numpy/LAPACK — dispatching for 8 eigenvalues
@@ -9267,7 +9279,7 @@ class KoyebOracleState:
     _api:               Any   = _field(default=None, repr=False)
     def __post_init__(self):
         if self._api is None:
-            self._api = KoyebAPIClient(self.oracle_url)
+            self._api = KoyebRPCNodule(self.oracle_url)
     def refresh_metrics(self, client_field: "ClientFieldState" = None) -> bool:
         """RPC-based metric refresh — always does a live fetch to measure real latency."""
         try:
@@ -9711,7 +9723,7 @@ class QTCLWallet:
         for i in range(0, 12, 3):
             print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
         print("═" * 60 + "\n")
-# Patches AsyncOracleMiner.mine_block() to use KoyebAPIClient when the
+# Patches AsyncOracleMiner.mine_block() to use KoyebRPCNodule when the
 class _MiningTelemetry:
     """Thread-safe mining statistics with reward tracking."""
     def __init__(self):
@@ -13353,7 +13365,7 @@ class QtclClientApp:
         wallet.  When absent the oracle runs in anonymous mode.
         """
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
-        self.api           = KoyebAPIClient(self.oracle_url)
+        self.api           = KoyebRPCNodule(self.oracle_url)
         
         # ── RPC snapshot consumer now on-demand via _LIVE_RPC_ORACLE ────────
         
@@ -16450,7 +16462,7 @@ class QtclClientApp:
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
 
-            kapi = KoyebAPIClient()
+            kapi = KoyebRPCNodule()
             _MINE_TELEM.mark_idle()
             _POLL_EVERY_S = 2.0
             _last_poll_time = _t.time()
@@ -17676,7 +17688,7 @@ class QtclClientApp:
             code = result.get("code", "")
             print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
         else:
-            print("  ❌ Submission failed — no response from oracle")
+            print("  ❌ Submission failed — no response from RPC nodule")
             print("")
             print(self.api.get_diagnostics())
             print("")
@@ -17690,7 +17702,7 @@ class QtclClientApp:
             print(f"     1. Verify {self.oracle_url} is online")
             print(f"     2. Check your internet connection")
             print(f"     3. Try again in a few moments (server may be restarting)")
-            print(f"     4. If persistent, the oracle node may be down")
+            print(f"     4. If persistent, the RPC nodule may be down")
     def _query_tx(self) -> None:
         try:
             tx_hash = input("  Transaction hash: ").strip()
@@ -18051,7 +18063,7 @@ class QtclClientApp:
             time.sleep(0.3)
         
         import os as _osa
-        kapi = KoyebAPIClient(self.oracle_url)
+        kapi = KoyebRPCNodule(self.oracle_url)
         def _pad(s: str, w: int) -> str:
             return s.ljust(w)[:w]
         def _bar(v: float, width: int = 24) -> str:
@@ -18143,7 +18155,7 @@ class QtclClientApp:
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
             
             # Local P2P node (only query if running — use only for live peer state)
-            api_node = KoyebAPIClient("http://127.0.0.1:9091")
+            api_node = KoyebRPCNodule("http://127.0.0.1:9091")
             local_p2p_stats = {}
             try:
                 _lp = api_node._rpc("qtcl_p2p_getNetworkStats", [])
