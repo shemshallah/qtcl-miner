@@ -1197,8 +1197,26 @@ def _ensure_pq_cache(db_path: Optional[Path] = None, depth: int = 5) -> None:
             conn = _sqlite3.connect(str(path), check_same_thread=False, timeout=30)
             _ensure_lattice_tables(conn)
             if not _check_geometry_integrity(conn, depth):
-                logger.info("[GeodesicLWE] Geometry missing or stale — rebuilding…")
-                _build_and_persist_tessellation(conn, depth)
+                logger.info("[GeodesicLWE] Geometry missing or stale — rebuilding (background, mining not blocked)…")
+                # Build tessellation in a daemon thread — mining proceeds without waiting
+                def _rebuild():
+                    try:
+                        _build_and_persist_tessellation(conn, depth)
+                        conn.close()
+                        # Reload cache after rebuild
+                        conn2 = _sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+                        global _PQ_COORD_CACHE
+                        _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn2)
+                        conn2.close()
+                        logger.info(f"[GeodesicLWE] Tessellation rebuilt: {len(_PQ_COORD_CACHE)} pseudoqubits")
+                        _PQ_CACHE_READY.set()
+                    except Exception as e:
+                        logger.error(f"[GeodesicLWE] Tessellation rebuild failed: {e}")
+                import threading
+                t = threading.Thread(target=_rebuild, daemon=True, name="TessellationRebuild")
+                t.start()
+                # Don't wait — return now, cache will be ready later
+                return
             _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn)
             conn.close()
             logger.debug(f"[GeodesicLWE] PQ cache ready: {len(_PQ_COORD_CACHE)} pseudoqubits")
