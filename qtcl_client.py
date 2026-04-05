@@ -1438,6 +1438,135 @@ class LatticeMath:
         if len(v1) != len(v2):
             raise ValueError("Vector dimensions must match")
         return [(s * a + b) % q for a, b in zip(v1, v2)]
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# HYPERBOLIC GEOMETRY INTEGRATION (from qtcl_blockchain.db)
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+import sqlite3
+import math
+import struct
+import json
+from pathlib import Path
+
+class HyperbolicGeometry:
+    """Read hyperbolic triangles from qtcl_blockchain.db and provide geometry-based hashing."""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = HyperbolicGeometry()
+            return cls._instance
+    
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or os.getenv('QTCL_DB_PATH', str(_lattice_db_path()))
+        self._geometry_hash_cache = None
+        self._lock = threading.Lock()
+        logger.info(f"[HyperbolicGeometry] Initialized with DB: {self.db_path}")
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """Return a connection to the SQLite database."""
+        if not Path(self.db_path).exists():
+            raise FileNotFoundError(f"Hyperbolic geometry database not found: {self.db_path}")
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def fetch_all_triangles(self, max_depth: int = 5) -> List[Dict[str, Any]]:
+        """Fetch hyperbolic triangles up to max_depth."""
+        try:
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT triangle_id, depth, parent_id,
+                       v0_x, v0_y, v0_name,
+                       v1_x, v1_y, v1_name,
+                       v2_x, v2_y, v2_name,
+                       area, perimeter
+                FROM hyperbolic_triangles
+                WHERE depth <= ?
+                ORDER BY triangle_id
+            """, (max_depth,))
+            rows = cur.fetchall()
+            triangles = []
+            for row in rows:
+                tri = {
+                    'id': row['triangle_id'],
+                    'depth': row['depth'],
+                    'parent_id': row['parent_id'],
+                    'v0': (float(row['v0_x']), float(row['v0_y']), row['v0_name']),
+                    'v1': (float(row['v1_x']), float(row['v1_y']), row['v1_name']),
+                    'v2': (float(row['v2_x']), float(row['v2_y']), row['v2_name']),
+                    'area': float(row['area']) if row['area'] is not None else 0.0,
+                    'perimeter': float(row['perimeter']) if row['perimeter'] is not None else 0.0,
+                }
+                triangles.append(tri)
+            conn.close()
+            return triangles
+        except Exception as e:
+            logger.error(f"[HyperbolicGeometry] Failed to fetch triangles: {e}")
+            raise
+    
+    def compute_geometry_hash(self, max_depth: int = 5) -> bytes:
+        """Compute SHA3-256 hash of hyperbolic geometry (cached)."""
+        with self._lock:
+            if self._geometry_hash_cache is not None:
+                return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            # Encode triangles deterministically
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                # Encode vertices as 8-byte doubles (big endian)
+                for vx, vy, _ in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+                encoded += struct.pack('>d', tri['area'])
+                encoded += struct.pack('>d', tri['perimeter'])
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+    
+    def hyperbolic_hash(self, msg: bytes) -> bytes:
+        """Return SHA3-256(msg || geometry_hash). Uses hyperbolic geometry as salt."""
+        geom_hash = self.compute_geometry_hash()
+        return hashlib.sha3_256(msg + geom_hash).digest()
+    
+    def hyperbolic_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+        """Compute hyperbolic distance between two points in Poincaré disk."""
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        d2 = dx*dx + dy*dy
+        # Euclidean distance squared
+        if d2 < 1e-14:
+            return 0.0
+        # Denominator using Poincaré metric
+        denom = (1.0 - x1*x1 - y1*y1) * (1.0 - x2*x2 - y2*y2)
+        if denom <= 0.0:
+            # Points on boundary (should not happen for interior points)
+            return float('inf')
+        # Hyperbolic distance formula
+        cosh_dist = 1.0 + 2.0 * d2 / denom
+        # Ensure cosh_dist >= 1.0
+        if cosh_dist < 1.0:
+            cosh_dist = 1.0
+        return math.acosh(cosh_dist)
+
+# Global instance
+_hyperbolic_geometry = None
+
+def get_hyperbolic_geometry() -> HyperbolicGeometry:
+    global _hyperbolic_geometry
+    if _hyperbolic_geometry is None:
+        _hyperbolic_geometry = HyperbolicGeometry()
+    return _hyperbolic_geometry
+
 class HLWEEngine:
     """Post-quantum cryptographic engine using HLWE"""
     
@@ -1454,10 +1583,10 @@ class HLWEEngine:
 
         CANONICAL LATTICE KEYGEN:
           1. entropy = get_system_entropy() → 32 bytes
-          2. private_key = entropy.hex() (64 hex chars)
-          3. A = SHAKE-256(b"QTCL_FS_BASIS_v1" ‖ entropy) → n×n lattice basis
+          2. priv_seed = entropy[:32]
+          3. A = FIXED public lattice basis (protocol constant)
           4. s = HKDF-Extract→SHAKE-256 XOF(entropy) → ternary {q-1, 0, 1}
-          5. b = A·s mod q (public key vector)
+          5. b = A·s mod q (public key vector, NO error)
           6. pubkey_bytes = b.to_bytes(4, big) per element
           7. address = SHA3-256(SHA3-256(pubkey_bytes)).hex()
 
@@ -1475,13 +1604,13 @@ class HLWEEngine:
                 n = self.params.DIMENSION
                 q = self.params.MODULUS
                 
-                # ════ DERIVE LATTICE BASIS A ════
-                A = self._derive_lattice_basis_from_entropy(priv_seed)
+                # ════ DERIVE FIXED LATTICE BASIS A (protocol constant) ════
+                A = self._derive_fixed_lattice_basis()
                 
                 # ════ DERIVE SECRET VECTOR s (ternary) ════
                 s = self._derive_secret_vector(priv_seed, n)
                 
-                # ════ COMPUTE PUBLIC KEY b = A·s mod q ════
+                # ════ COMPUTE PUBLIC KEY b = A·s mod q (NO error) ════
                 b = LatticeMath.matrix_vector_mult(A, s, q)
                 pub_bytes = b''.join(x.to_bytes(4, 'big') for x in b)
                 public_key_hex = pub_bytes.hex()
@@ -1501,9 +1630,64 @@ class HLWEEngine:
                 logger.error(f"[HLWE] Keypair generation failed: {e}")
                 raise
     
+    def _derive_fixed_lattice_basis(self) -> List[List[int]]:
+        """
+        Derive n×n lattice basis A from a FIXED protocol constant.
+
+        A is a PUBLIC SYSTEM PARAMETER (like an elliptic curve generator),
+        NOT derived from per-key material. This ensures all parties compute
+        the same A regardless of which key pair they're using — critical
+        for signature verification to succeed.
+
+        Construction:
+          xof = SHAKE-256(b"QTCL_HLWE_BASIS_FIXED_v2")
+          A[i][j] = xof.read(4) as big-endian uint32 mod q
+        """
+        n = self.params.DIMENSION
+        q = self.params.MODULUS
+        xof = hashlib.shake_256(b"QTCL_HLWE_BASIS_FIXED_v2")
+        xof_bytes = xof.digest(n * n * 4)
+        A = []
+        for i in range(n):
+            row = []
+            for j in range(n):
+                offset = (i * n + j) * 4
+                val = int.from_bytes(xof_bytes[offset:offset+4], 'big') % q
+                row.append(val)
+            A.append(row)
+        return A
+
+    def _derive_fixed_lattice_basis(self) -> List[List[int]]:
+        """
+        Derive n×n lattice basis A from a FIXED protocol constant.
+
+        A is a PUBLIC SYSTEM PARAMETER (like an elliptic curve generator),
+        NOT derived from per-key material. This ensures all parties compute
+        the same A regardless of which key pair they're using — critical
+        for signature verification to succeed.
+
+        Construction:
+          xof = SHAKE-256(b"QTCL_HLWE_BASIS_FIXED_v2")
+          A[i][j] = xof.read(4) as big-endian uint32 mod q
+        """
+        n = self.params.DIMENSION
+        q = self.params.MODULUS
+        xof = hashlib.shake_256(b"QTCL_HLWE_BASIS_FIXED_v2")
+        xof_bytes = xof.digest(n * n * 4)
+        A = []
+        for i in range(n):
+            row = []
+            for j in range(n):
+                offset = (i * n + j) * 4
+                val = int.from_bytes(xof_bytes[offset:offset+4], 'big') % q
+                row.append(val)
+            A.append(row)
+        return A
+
     def _derive_lattice_basis_from_entropy(self, entropy: bytes) -> List[List[int]]:
         """
         GeodesicLWE: derive n×n lattice basis A from entropy + hyperbolic DB geometry.
+        Used only for keypair generation — NOT for sign/verify.
 
         Each row i is a Möbius geodesic displacement vector in the Poincaré disk,
         seeded by the i-th pseudoqubit coordinate, then quantised to Z_q.
@@ -1648,12 +1832,12 @@ class HLWEEngine:
         Sign a 32-byte message hash using TRUE HLWE Fiat-Shamir lattice signature.
 
         CANONICAL LATTICE FIAT-SHAMIR (post-quantum hardness):
-          1. s = HKDF-Extract→SHAKE-256 XOF, ternary {q-1, 0, 1}
-          2. A = SHAKE-256(b"QTCL_FS_BASIS_v1" ‖ entropy), n×n lattice basis
-          3. b = A·s mod q (public key)
+          1. A = FIXED public lattice basis (protocol constant, same for all keys)
+          2. s = HKDF-Extract→SHAKE-256 XOF, ternary {q-1, 0, 1} from priv_seed
+          3. b = A·s mod q (public key vector)
           4. y = fresh HKDF-Extract→SHAKE-256 XOF, ternary {q-1, 0, 1}
           5. w = A·y mod q (commitment)
-          6. c = (SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w) mod 3) - 1 ∈ {-1, 0, 1}
+          6. c = 2*(SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w ‖ geom_hash)[0] & 1) - 1
           7. z = c·s + y mod q (Fiat-Shamir response)
 
         Output: {z, c_hash, w, public_key, address}
@@ -1661,12 +1845,18 @@ class HLWEEngine:
         """
         with self.lock:
             try:
+                # ════ VALIDATE INPUTS ════
+                if len(message_hash) != 32:
+                    raise ValueError(f"message_hash must be 32 bytes, got {len(message_hash)}")
+                if len(private_key_hex) != 64:
+                    raise ValueError(f"private_key_hex must be 64 hex chars, got {len(private_key_hex)}")
+
                 n = self.params.DIMENSION
                 q = self.params.MODULUS
                 priv_seed = bytes.fromhex(private_key_hex)
 
-                # ════ DERIVE LATTICE BASIS A ════
-                A = self._derive_lattice_basis_from_entropy(priv_seed)
+                # ════ DERIVE FIXED LATTICE BASIS A (protocol constant) ════
+                A = self._derive_fixed_lattice_basis()
 
                 # ════ DERIVE SECRET VECTOR s (ternary) ════
                 s = self._derive_secret_vector(priv_seed, n)
@@ -1685,15 +1875,15 @@ class HLWEEngine:
                 w = LatticeMath.matrix_vector_mult(A, y, q)
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
 
-                # ════ FIAT-SHAMIR CHALLENGE c ∈ {-1,0,1} ════
+                # ════ FIAT-SHAMIR CHALLENGE c ∈ {-1, 1} ════
                 c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
 
                 # ════ RESPONSE z = c·s + y mod q ════
                 z = [(c_scalar * s[i] + y[i]) % q for i in range(n)]
 
-                # ════ CHALLENGE COMMITMENT ════
+                # ════ CHALLENGE COMMITMENT (includes msg_hash to prevent replay) ════
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
-                c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + c_bytes).digest()
+                c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + message_hash + c_bytes).digest()
 
                 return {
                     "z": self._encode_vector_to_hex(z),
@@ -1710,16 +1900,25 @@ class HLWEEngine:
 
     def _hash_to_challenge_scalar(self, msg_hash: bytes, w_bytes: bytes) -> int:
         """
-        Deterministic challenge scalar c ∈ {-1, 0, 1} from message + commitment.
-
-        CANONICAL — identical to hlwe_engine.py.
+        Deterministic challenge scalar c ∈ {-1, 1} from message + commitment,
+        incorporating hyperbolic geometry from qtcl_blockchain.db.
 
         Construction:
-          h = SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w)
-          c = (h[0] mod 3) − 1  → {-1, 0, 1} with uniform probability.
+          geom_hash = hyperbolic_geometry_hash(msg_hash)
+          h = SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w ‖ geom_hash)
+          c = 2 * (h[0] & 1) - 1  → {-1, 1} with UNIFORM probability.
+
+        Zero challenge is eliminated to prevent forgery: when c=0,
+        w' = w regardless of the public key, allowing any key to pass.
+        Using uniform {-1, 1} also eliminates the P(c=1)=2/3 bias from mod 3.
         """
-        h = hashlib.sha256(b"HLWE_CHALLENGE_v1" + msg_hash + w_bytes).digest()
-        return (h[0] % 3) - 1
+        try:
+            hyper_geo = get_hyperbolic_geometry()
+            geom_hash = hyper_geo.hyperbolic_hash(msg_hash)
+        except Exception:
+            raise RuntimeError("Hyperbolic geometry database missing; cannot compute challenge scalar")
+        h = hashlib.sha256(b"HLWE_CHALLENGE_v1" + msg_hash + w_bytes + geom_hash).digest()
+        return 2 * (h[0] & 1) - 1  # uniform {-1, 1}
 
     def _derive_secret_vector_from_key(self, key_seed: bytes, dimension: int) -> List[int]:
         """
@@ -1780,49 +1979,29 @@ class HLWEEngine:
 
     def _compute_public_key_bytes(self, priv_seed: bytes) -> bytes:
         """
-        Compute HLWE public key b = A·s + e (mod q) from private seed.
-
-        CANONICAL — identical to hlwe_engine.py.
+        Compute HLWE public key b = A·s mod q from private seed.
+        Uses FIXED public lattice basis A (protocol constant).
         """
         n = self.params.DIMENSION
         q = self.params.MODULUS
-        A = self._derive_lattice_basis_from_pubkey(None)
+        A = self._derive_fixed_lattice_basis()
         s = self._derive_secret_vector_from_key(priv_seed, n)
-        e = self._sample_error_vector(n, priv_seed)
         b = LatticeMath.matrix_vector_mult(A, s, q)
-        b = LatticeMath.vector_add(b, e, q)
         return b''.join(x.to_bytes(4, 'big') for x in b)
 
     def _derive_lattice_basis_from_pubkey(self, pub_key_bytes: bytes) -> List[List[int]]:
         """
-        Derive n×n lattice basis A from a fixed protocol constant.
-
-        CANONICAL — identical to hlwe_engine.py.
+        Derive n×n lattice basis A from a FIXED protocol constant.
 
         A is a PUBLIC SYSTEM PARAMETER (like an elliptic curve), not derived
         from per-key material.  This ensures all parties compute the same A
         regardless of which key pair they're using.
         """
-        n = self.params.DIMENSION
-        q = self.params.MODULUS
-
-        xof = hashlib.shake_256(b"QTCL_HLWE_BASIS_FIXED_v1")
-        xof_bytes = xof.digest(n * n * 4)
-
-        A = []
-        for i in range(n):
-            row = []
-            for j in range(n):
-                offset = (i * n + j) * 4
-                val = int.from_bytes(xof_bytes[offset:offset+4], 'big') % q
-                row.append(val)
-            A.append(row)
-        return A
+        return self._derive_fixed_lattice_basis()
 
     def derive_public_key(self, private_key_hex: str) -> str:
         """
-        Derive full HLWE public key (b = As + e) from private key seed.
-
+        Derive full HLWE public key (b = A·s mod q) from private key seed.
         Returns hex of packed public key vector (n × 4 bytes).
         """
         priv_seed = bytes.fromhex(private_key_hex)
@@ -1835,9 +2014,9 @@ class HLWEEngine:
 
         CANONICAL LATTICE VERIFICATION:
           Input: (z, c_hash, w, public_key) from signature
-          1. c_scalar = derive_challenge_scalar(msg, w) — deterministic
-          2. Verify c_hash == SHA-256(b"HLWE_CHALLENGE_v1" ‖ c_scalar_bytes)
-          3. Recompute A from public_key
+          1. A = FIXED public lattice basis (same as signing)
+          2. c_scalar = derive_challenge_scalar(msg, w) — deterministic
+          3. Verify c_hash == SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg_hash ‖ c_scalar_bytes)
           4. w' = A·z - b·c mod q
           5. Check w' is close to w (within ERROR_BOUND * |c|)
 
@@ -1849,12 +2028,34 @@ class HLWEEngine:
                 n = self.params.DIMENSION
                 q = self.params.MODULUS
 
+                # ════ VALIDATE INPUTS ════
+                if len(message_hash) != 32:
+                    return False
+
                 # ════ PARSE SIGNATURE ════
                 z_hex = signature_dict.get('z', '')
                 c_hex = signature_dict.get('c_hash', '')
                 w_hex = signature_dict.get('w', '')
                 
                 if not z_hex or not c_hex or not w_hex:
+                    return False
+
+                # ════ VALIDATE SIGNATURE SIZES ════
+                expected_vec_hex_len = n * 8
+                if len(z_hex) != expected_vec_hex_len:
+                    return False
+                if len(w_hex) != expected_vec_hex_len:
+                    return False
+                if len(c_hex) != 64:
+                    return False
+
+                # ════ VALIDATE PUBLIC KEY FORMAT ════
+                expected_pubkey_hex_len = n * 8
+                if len(public_key_hex) != expected_pubkey_hex_len:
+                    return False
+                try:
+                    bytes.fromhex(public_key_hex)
+                except ValueError:
                     return False
 
                 # ════ DECODE VECTORS ════
@@ -1865,21 +2066,18 @@ class HLWEEngine:
                     return False
 
                 # ════ DECODE PUBLIC KEY ════
-                if len(public_key_hex) < n * 8:
-                    return False
                 b = self._decode_vector_from_hex(public_key_hex)
                 if len(b) != n:
                     return False
 
-                # ════ RECOMPUTE LATTICE BASIS A ════
-                pub_key_bytes = bytes.fromhex(public_key_hex)
-                A = self._derive_lattice_basis_from_entropy(pub_key_bytes)
+                # ════ DERIVE FIXED LATTICE BASIS A (protocol constant — same as signing) ════
+                A = self._derive_fixed_lattice_basis()
 
                 # ════ VERIFY FIAT-SHAMIR CHALLENGE ════
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
                 c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
-                expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + c_bytes).digest()
+                expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + message_hash + c_bytes).digest()
                 
                 if not hmac.compare_digest(expected_c_hash.hex(), c_hex):
                     return False
@@ -1893,7 +2091,75 @@ class HLWEEngine:
                 bound = self.params.ERROR_BOUND * max(abs(c_scalar), 1)
                 for i in range(n):
                     diff = (w_prime[i] - w[i]) % q
-                    # Centered absolute value (handle q/2 wraparound)
+                    centered = diff if diff <= q // 2 else q - diff
+                    if centered > bound + 1:
+                        return False
+
+                return True
+
+            except Exception as e:
+                logger.debug(f"[HLWE] Verification error: {e}")
+                return False
+
+                # ════ PARSE SIGNATURE ════
+                z_hex = signature_dict.get('z', '')
+                c_hex = signature_dict.get('c_hash', '')
+                w_hex = signature_dict.get('w', '')
+                
+                if not z_hex or not c_hex or not w_hex:
+                    return False
+
+                # ════ VALIDATE SIGNATURE SIZES ════
+                expected_vec_hex_len = n * 8
+                if len(z_hex) != expected_vec_hex_len:
+                    return False
+                if len(w_hex) != expected_vec_hex_len:
+                    return False
+                if len(c_hex) != 64:
+                    return False
+
+                # ════ VALIDATE PUBLIC KEY FORMAT ════
+                expected_pubkey_hex_len = n * 8
+                if len(public_key_hex) != expected_pubkey_hex_len:
+                    return False
+                try:
+                    bytes.fromhex(public_key_hex)
+                except ValueError:
+                    return False
+
+                # ════ DECODE VECTORS ════
+                z = self._decode_vector_from_hex(z_hex)
+                w = self._decode_vector_from_hex(w_hex)
+                
+                if len(z) != n or len(w) != n:
+                    return False
+
+                # ════ DECODE PUBLIC KEY ════
+                b = self._decode_vector_from_hex(public_key_hex)
+                if len(b) != n:
+                    return False
+
+                # ════ DERIVE FIXED LATTICE BASIS A (protocol constant — same as signing) ════
+                A = self._derive_fixed_lattice_basis()
+
+                # ════ VERIFY FIAT-SHAMIR CHALLENGE ════
+                w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
+                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
+                c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
+                expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + message_hash + c_bytes).digest()
+                
+                if not hmac.compare_digest(expected_c_hash.hex(), c_hex):
+                    return False
+
+                # ════ VERIFY LATTICE RELATION w' = A·z - b·c ════
+                Az = LatticeMath.matrix_vector_mult(A, z, q)
+                bc = [(c_scalar * bi) % q for bi in b]
+                w_prime = [(Az[i] - bc[i]) % q for i in range(n)]
+
+                # ════ CHECK w' ≈ w (within error bound) ════
+                bound = self.params.ERROR_BOUND * max(abs(c_scalar), 1)
+                for i in range(n):
+                    diff = (w_prime[i] - w[i]) % q
                     centered = diff if diff <= q // 2 else q - diff
                     if centered > bound + 1:
                         return False
