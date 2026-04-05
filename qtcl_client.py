@@ -1480,11 +1480,12 @@ class HyperbolicGeometry:
             return cls._instance
     
     def __init__(self, db_path: Optional[str] = None):
+        # Client is ALWAYS SQLite — never Supabase
         self.db_path = db_path or os.getenv('QTCL_DB_PATH', str(_lattice_db_path()))
         self._geometry_hash_cache = None
         self._cache_timestamp = 0.0
         self._lock = threading.Lock()
-        logger.info(f"[HyperbolicGeometry] Initialized with DB: {self.db_path}")
+        logger.info(f"[HyperbolicGeometry] Client mode: SQLite at {self.db_path}")
     
     def _get_connection(self) -> sqlite3.Connection:
         """Return a connection to the SQLite database."""
