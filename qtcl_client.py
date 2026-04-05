@@ -2051,14 +2051,14 @@ class HLWEEngine:
           h = SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w ‖ pubkey ‖ geom_hash)
           c = 2 * (h[0] & 1) - 1  → {-1, 1} with UNIFORM probability.
 
-        Including public_key_bytes prevents cross-key attacks where an attacker
-        could reuse a signature across different keys with the same (msg, w).
+        If hyperbolic geometry is unavailable, falls back to SHA-256 without geometry.
         """
         try:
             hyper_geo = get_hyperbolic_geometry()
             geom_hash = hyper_geo.hyperbolic_hash(msg_hash)
         except Exception:
-            raise RuntimeError("Hyperbolic geometry database missing; cannot compute challenge scalar")
+            # Fallback: sign without hyperbolic geometry
+            geom_hash = hashlib.sha3_256(b"QTCL_GEOMETRY_UNAVAILABLE").digest()
         h = hashlib.sha256(b"HLWE_CHALLENGE_v1" + msg_hash + w_bytes + public_key_bytes + geom_hash).digest()
         return 2 * (h[0] & 1) - 1  # uniform {-1, 1}
 
