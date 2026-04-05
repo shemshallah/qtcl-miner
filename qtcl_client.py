@@ -1187,7 +1187,8 @@ def _load_pq_cache_from_sqlite(conn: '_sqlite3.Connection') -> Dict[int, Tuple[f
     return cache
 
 def _ensure_pq_cache(db_path: Optional[Path] = None, depth: int = 5) -> None:
-    """Thread-safe lazy init: check → build if needed → load → signal ready."""
+    """Thread-safe lazy init: check → load if exists → signal ready.
+    Rebuild tessellation in background if missing — mining is NOT blocked."""
     global _PQ_COORD_CACHE, _PQ_CACHE_ERROR
     with _PQ_CACHE_LOCK:
         if _PQ_CACHE_READY.is_set():
@@ -1196,15 +1197,20 @@ def _ensure_pq_cache(db_path: Optional[Path] = None, depth: int = 5) -> None:
             path = db_path or _lattice_db_path()
             conn = _sqlite3.connect(str(path), check_same_thread=False, timeout=30)
             _ensure_lattice_tables(conn)
-            if not _check_geometry_integrity(conn, depth):
-                logger.info("[GeodesicLWE] Geometry missing or stale — rebuilding (background, mining not blocked)…")
-                # Build tessellation in a daemon thread — mining proceeds without waiting
+            if _check_geometry_integrity(conn, depth):
+                _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn)
+                conn.close()
+                logger.debug(f"[GeodesicLWE] PQ cache ready: {len(_PQ_COORD_CACHE)} pseudoqubits")
+                _PQ_CACHE_READY.set()
+            else:
+                # Geometry missing/stale — rebuild in background, DON'T block
+                logger.info("[GeodesicLWE] Geometry missing/stale — rebuilding in background…")
+                conn.close()
                 def _rebuild():
                     try:
-                        _build_and_persist_tessellation(conn, depth)
-                        conn.close()
-                        # Reload cache after rebuild
                         conn2 = _sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+                        _ensure_lattice_tables(conn2)
+                        _build_and_persist_tessellation(conn2, depth)
                         global _PQ_COORD_CACHE
                         _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn2)
                         conn2.close()
@@ -1213,14 +1219,7 @@ def _ensure_pq_cache(db_path: Optional[Path] = None, depth: int = 5) -> None:
                     except Exception as e:
                         logger.error(f"[GeodesicLWE] Tessellation rebuild failed: {e}")
                 import threading
-                t = threading.Thread(target=_rebuild, daemon=True, name="TessellationRebuild")
-                t.start()
-                # Don't wait — return now, cache will be ready later
-                return
-            _PQ_COORD_CACHE = _load_pq_cache_from_sqlite(conn)
-            conn.close()
-            logger.debug(f"[GeodesicLWE] PQ cache ready: {len(_PQ_COORD_CACHE)} pseudoqubits")
-            _PQ_CACHE_READY.set()
+                threading.Thread(target=_rebuild, daemon=True, name="TessellationRebuild").start()
         except Exception as exc:
             _PQ_CACHE_ERROR = str(exc)
             logger.error(f"[GeodesicLWE] PQ cache init failed: {exc}")
@@ -18232,7 +18231,12 @@ class QtclClientApp:
         if not self._load_wallet():
             print("  ❌ Wallet required"); return
         self._init_db()
-        snap    = self.api.get_oracle_pq0_bloch() or {}
+        # Non-blocking oracle fetch with timeout
+        snap = {}
+        try:
+            snap = self.api.get_oracle_pq0_bloch() or {}
+        except Exception as e:
+            logger.warning(f"[tx_mode] Oracle fetch failed (degraded mode): {e}")
         bath    = GKSLBathParams.from_snap(snap)
         bh      = int(snap.get("block_height") or snap.get("height") or 0)
         if bh == 0:
