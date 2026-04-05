@@ -1479,6 +1479,14 @@ class HyperbolicGeometry:
                 cls._instance = HyperbolicGeometry()
             return cls._instance
     
+    @classmethod
+    def reset_instance(cls):
+        """Reset the global instance (for testing or recovery)."""
+        global _hyperbolic_geometry
+        with cls._lock:
+            cls._instance = None
+            _hyperbolic_geometry = None
+    
     def __init__(self, db_path: Optional[str] = None):
         # Client is ALWAYS SQLite — never Supabase
         self.db_path = db_path or os.getenv('QTCL_DB_PATH', str(_lattice_db_path()))
@@ -1492,8 +1500,15 @@ class HyperbolicGeometry:
         self._lock = threading.Lock()
         logger.info(f"[HyperbolicGeometry] Client mode: SQLite at {self.db_path}")
     
+    @property
+    def is_initialized(self) -> bool:
+        """Return True if the database path is set and valid."""
+        return self.db_path is not None and isinstance(self.db_path, str) and self.db_path.strip() != ""
+    
     def _get_connection(self) -> sqlite3.Connection:
         """Return a connection to the SQLite database."""
+        if self.db_path is None:
+            raise RuntimeError("HyperbolicGeometry database path is None. Instance may be stale.")
         if not Path(self.db_path).exists():
             raise FileNotFoundError(f"Hyperbolic geometry database not found: {self.db_path}")
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
@@ -1590,7 +1605,7 @@ _hyperbolic_geometry = None
 
 def get_hyperbolic_geometry() -> HyperbolicGeometry:
     global _hyperbolic_geometry
-    if _hyperbolic_geometry is None:
+    if _hyperbolic_geometry is None or not _hyperbolic_geometry.is_initialized:
         _hyperbolic_geometry = HyperbolicGeometry()
     return _hyperbolic_geometry
 
