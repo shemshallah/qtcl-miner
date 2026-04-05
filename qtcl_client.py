@@ -1482,6 +1482,11 @@ class HyperbolicGeometry:
     def __init__(self, db_path: Optional[str] = None):
         # Client is ALWAYS SQLite — never Supabase
         self.db_path = db_path or os.getenv('QTCL_DB_PATH', str(_lattice_db_path()))
+        if self.db_path is None:
+            raise RuntimeError(
+                "HyperbolicGeometry database path is None. "
+                "Set QTCL_DB_PATH environment variable or ensure _lattice_db_path() returns a valid path."
+            )
         self._geometry_hash_cache = None
         self._cache_timestamp = 0.0
         self._lock = threading.Lock()
@@ -1552,127 +1557,6 @@ class HyperbolicGeometry:
         with self._lock:
             self._geometry_hash_cache = None
             self._cache_timestamp = 0.0
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            self._cache_timestamp = now
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-    
-    def invalidate_cache(self):
-        """Force geometry hash recomputation on next call."""
-        with self._lock:
-            self._geometry_hash_cache = None
-            self._cache_timestamp = 0.0
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            # Encode triangles deterministically
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                # Encode vertices as 8-byte doubles (big endian)
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
-            triangles = self.fetch_all_triangles(max_depth)
-            # Encode triangles deterministically
-            encoded = b''
-            for tri in triangles:
-                encoded += struct.pack('>Q', tri['id'])
-                encoded += struct.pack('>I', tri['depth'])
-                # Encode vertices as 8-byte doubles (big endian)
-                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
-                    encoded += struct.pack('>d', vx)
-                    encoded += struct.pack('>d', vy)
-            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
-            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
-            return self._geometry_hash_cache
     
     def hyperbolic_hash(self, msg: bytes) -> bytes:
         """Return SHA3-256(domain ‖ msg ‖ geometry_hash). Uses hyperbolic geometry as salt."""
