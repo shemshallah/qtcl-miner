@@ -1450,30 +1450,47 @@ class HLWEEngine:
     
     def generate_keypair_from_entropy(self) -> HLWEKeyPair:
         """
-        Generate HLWE keypair seeded from system entropy (API-backed).
+        Generate HLWE keypair seeded from system entropy.
 
-        Uses TRUE lattice keygen:
-          private_key = 32-byte entropy seed (64 hex chars)
-          public_key  = b = As + e (mod q) packed as hex
-          address     = "qtcl1" + SHA3-256(pubkey_bytes)[:20].hex()
+        CANONICAL LATTICE KEYGEN:
+          1. entropy = get_system_entropy() → 32 bytes
+          2. private_key = entropy.hex() (64 hex chars)
+          3. A = SHAKE-256(b"QTCL_FS_BASIS_v1" ‖ entropy) → n×n lattice basis
+          4. s = HKDF-Extract→SHAKE-256 XOF(entropy) → ternary {q-1, 0, 1}
+          5. b = A·s mod q (public key vector)
+          6. pubkey_bytes = b.to_bytes(4, big) per element
+          7. address = SHA3-256(SHA3-256(pubkey_bytes)).hex()
+
+        Returns: HLWEKeyPair(public_key, private_key, address)
         """
         with self.lock:
             try:
                 entropy = get_system_entropy()
                 if len(entropy) < 32:
                     entropy = entropy + secrets.token_bytes(32 - len(entropy))
+                
                 priv_seed = entropy[:32]
-
                 private_key_hex = priv_seed.hex()
-                public_key_hex = self.derive_public_key(private_key_hex)
-
-                pub_bytes = bytes.fromhex(public_key_hex)
-                pub_vector = [int.from_bytes(pub_bytes[i:i+4], 'big')
-                              for i in range(0, len(pub_bytes), 4)]
-                address = self.derive_address_from_public_key(pub_vector)
-
+                
+                n = self.params.DIMENSION
+                q = self.params.MODULUS
+                
+                # ════ DERIVE LATTICE BASIS A ════
+                A = self._derive_lattice_basis_from_entropy(priv_seed)
+                
+                # ════ DERIVE SECRET VECTOR s (ternary) ════
+                s = self._derive_secret_vector(priv_seed, n)
+                
+                # ════ COMPUTE PUBLIC KEY b = A·s mod q ════
+                b = LatticeMath.matrix_vector_mult(A, s, q)
+                pub_bytes = b''.join(x.to_bytes(4, 'big') for x in b)
+                public_key_hex = pub_bytes.hex()
+                
+                # ════ DERIVE ADDRESS (double-SHA3-256) ════
+                address = self.derive_address_from_public_key(b)
+                
                 logger.info(f"[HLWE] Generated keypair: {address[:16]}... (lattice, entropy-seeded)")
-
+                
                 return HLWEKeyPair(
                     public_key=public_key_hex,
                     private_key=private_key_hex,
@@ -1601,73 +1618,90 @@ class HLWEEngine:
     
     def derive_address_from_public_key(self, public_key) -> str:
         """
-        Derive QTCL wallet address from HLWE public key.
+        Derive QTCL wallet address from HLWE public key vector.
 
-        CANONICAL — must match oracle.py, mempool.py, hlwe_engine.py exactly.
+        CANONICAL SPEC:
+          pubkey_bytes = b''.join(x.to_bytes(4, byteorder='big') for x in public_key)
+          address = SHA3-256(SHA3-256(pubkey_bytes)).hex()
 
-        Construction: "qtcl1" + SHA3-256(pubkey_bytes)[:20].hex()
-          - hash: SHA3-256 (Keccak), applied ONCE
-          - truncation: 20 bytes (160 bits)
-          - prefix: "qtcl1" — QTCL canonical address prefix
+        Output: 64 hex characters (256 bits = 32 bytes) — post-quantum secure.
 
+        Security:
+          • Classical birthday attack: 2^128 operations
+          • Quantum (BHT algorithm): 2^85 operations (exceeds NIST PQC Level 1)
+          • Double-hash prevents length-extension attacks
+          • SHA3-256 (Keccak) structurally independent from SHA-256
+        
         Accepts both List[int] (vector) and bytes (packed) input.
-        Output: 45 chars ("qtcl1" + 40 hex chars).
         """
         if isinstance(public_key, bytes):
             pub_bytes = public_key
         else:
             pub_bytes = b''.join(x.to_bytes(4, 'big') for x in public_key)
-        return "qtcl1" + hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+        
+        h1 = hashlib.sha3_256(pub_bytes).digest()
+        h2 = hashlib.sha3_256(h1).digest()
+        return h2.hex()
     
     def sign_hash(self, message_hash: bytes, private_key_hex: str) -> Dict[str, str]:
         """
         Sign a 32-byte message hash using TRUE HLWE Fiat-Shamir lattice signature.
 
-        CANONICAL — identical to hlwe_engine.py HLWEEngine.sign_hash.
+        CANONICAL LATTICE FIAT-SHAMIR (post-quantum hardness):
+          1. s = HKDF-Extract→SHAKE-256 XOF, ternary {q-1, 0, 1}
+          2. A = SHAKE-256(b"QTCL_FS_BASIS_v1" ‖ entropy), n×n lattice basis
+          3. b = A·s mod q (public key)
+          4. y = fresh HKDF-Extract→SHAKE-256 XOF, ternary {q-1, 0, 1}
+          5. w = A·y mod q (commitment)
+          6. c = (SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w) mod 3) - 1 ∈ {-1, 0, 1}
+          7. z = c·s + y mod q (Fiat-Shamir response)
 
-        Construction (Fiat-Shamir over LWE):
-          1. s   = HKDF-expand(seed, ...) → ternary secret
-          2. A   = SHAKE-256(b"QTCL_HLWE_BASIS_v1" ‖ pub_key) → lattice basis
-          3. y   = random ternary masking vector
-          4. w   = A·y  (mod q) — commitment
-          5. c   = SHA-256(msg ‖ w) mapped to {−1, 0, 1} — challenge scalar
-          6. z   = c·s + y  (mod q) — response
-          7. sig = (z, c_hash, w)
+        Output: {z, c_hash, w, public_key, address}
+        Verification: w' = A·z - b·c should equal w (within error bound)
         """
         with self.lock:
             try:
                 n = self.params.DIMENSION
                 q = self.params.MODULUS
-
                 priv_seed = bytes.fromhex(private_key_hex)
-                pub_key_bytes = self._compute_public_key_bytes(priv_seed)
-                A = self._derive_lattice_basis_from_pubkey(pub_key_bytes)
-                s = self._derive_secret_vector_from_key(priv_seed, n)
 
-                y = [secrets.randbelow(3) - 1 for _ in range(n)]
+                # ════ DERIVE LATTICE BASIS A ════
+                A = self._derive_lattice_basis_from_entropy(priv_seed)
 
+                # ════ DERIVE SECRET VECTOR s (ternary) ════
+                s = self._derive_secret_vector(priv_seed, n)
+
+                # ════ COMPUTE PUBLIC KEY b = A·s mod q ════
+                b = LatticeMath.matrix_vector_mult(A, s, q)
+                pub_bytes = b''.join(x.to_bytes(4, 'big') for x in b)
+
+                # ════ DERIVE ADDRESS (double-SHA3-256) ════
+                address = self.derive_address_from_public_key(b)
+
+                # ════ SAMPLE MASKING VECTOR y (ternary, deterministic for this msg) ════
+                y = self._sample_masking_vector(message_hash, priv_seed, n)
+
+                # ════ COMPUTE COMMITMENT w = A·y mod q ════
                 w = LatticeMath.matrix_vector_mult(A, y, q)
-
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
+
+                # ════ FIAT-SHAMIR CHALLENGE c ∈ {-1,0,1} ════
                 c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
 
+                # ════ RESPONSE z = c·s + y mod q ════
                 z = [(c_scalar * s[i] + y[i]) % q for i in range(n)]
 
-                address = self.derive_address_from_public_key(
-                    [int.from_bytes(pub_key_bytes[i:i+4], 'big')
-                     for i in range(0, len(pub_key_bytes), 4)]
-                )
+                # ════ CHALLENGE COMMITMENT ════
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
-                c_hash = hashlib.sha256(c_bytes).digest()
+                c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + c_bytes).digest()
 
                 return {
-                    "signature": self._encode_vector_to_hex(z),
-                    "auth_tag": c_hash.hex(),
+                    "z": self._encode_vector_to_hex(z),
+                    "c_hash": c_hash.hex(),
                     "w": self._encode_vector_to_hex(w),
-                    "nonce": secrets.token_bytes(16).hex(),
-                    "public_key_hex": pub_key_bytes.hex(),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "public_key": pub_bytes.hex(),
                     "address": address,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
             except Exception as e:
@@ -1799,52 +1833,67 @@ class HLWEEngine:
         """
         Verify TRUE HLWE Fiat-Shamir lattice signature.
 
-        CANONICAL — identical to hlwe_engine.py HLWEEngine.verify_signature.
+        CANONICAL LATTICE VERIFICATION:
+          Input: (z, c_hash, w, public_key) from signature
+          1. c_scalar = derive_challenge_scalar(msg, w) — deterministic
+          2. Verify c_hash == SHA-256(b"HLWE_CHALLENGE_v1" ‖ c_scalar_bytes)
+          3. Recompute A from public_key
+          4. w' = A·z - b·c mod q
+          5. Check w' is close to w (within ERROR_BOUND * |c|)
 
-        Verification:
-          1. Parse (z, w, c) from signature
-          2. Verify c = f(msg, w) — Fiat-Shamir hash binding
-          3. Verify w' = A·z − b·c is close to w — lattice relation
+        Lattice relation security: |w' - w| > bound ⟹ forgery (LWE hard problem).
+        Return: True if signature is valid, False otherwise.
         """
         with self.lock:
             try:
                 n = self.params.DIMENSION
                 q = self.params.MODULUS
 
-                z_hex = signature_dict.get('signature', '')
-                c_hex = signature_dict.get('auth_tag', '')
+                # ════ PARSE SIGNATURE ════
+                z_hex = signature_dict.get('z', '')
+                c_hex = signature_dict.get('c_hash', '')
                 w_hex = signature_dict.get('w', '')
+                
                 if not z_hex or not c_hex or not w_hex:
                     return False
 
+                # ════ DECODE VECTORS ════
                 z = self._decode_vector_from_hex(z_hex)
                 w = self._decode_vector_from_hex(w_hex)
+                
                 if len(z) != n or len(w) != n:
                     return False
 
+                # ════ DECODE PUBLIC KEY ════
                 if len(public_key_hex) < n * 8:
                     return False
                 b = self._decode_vector_from_hex(public_key_hex)
                 if len(b) != n:
                     return False
 
+                # ════ RECOMPUTE LATTICE BASIS A ════
                 pub_key_bytes = bytes.fromhex(public_key_hex)
-                A = self._derive_lattice_basis_from_pubkey(pub_key_bytes)
+                A = self._derive_lattice_basis_from_entropy(pub_key_bytes)
 
+                # ════ VERIFY FIAT-SHAMIR CHALLENGE ════
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
                 c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
-                expected_c_hash = hashlib.sha256(c_bytes).digest()
+                expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + c_bytes).digest()
+                
                 if not hmac.compare_digest(expected_c_hash.hex(), c_hex):
                     return False
 
+                # ════ VERIFY LATTICE RELATION w' = A·z - b·c ════
                 Az = LatticeMath.matrix_vector_mult(A, z, q)
                 bc = [(c_scalar * bi) % q for bi in b]
                 w_prime = [(Az[i] - bc[i]) % q for i in range(n)]
 
+                # ════ CHECK w' ≈ w (within error bound) ════
                 bound = self.params.ERROR_BOUND * max(abs(c_scalar), 1)
                 for i in range(n):
                     diff = (w_prime[i] - w[i]) % q
+                    # Centered absolute value (handle q/2 wraparound)
                     centered = diff if diff <= q // 2 else q - diff
                     if centered > bound + 1:
                         return False
