@@ -1453,6 +1453,7 @@ class HyperbolicGeometry:
     
     _instance = None
     _lock = threading.Lock()
+    _CACHE_TTL_SECONDS = 300  # 5 minutes
     
     @classmethod
     def get_instance(cls):
@@ -1464,6 +1465,7 @@ class HyperbolicGeometry:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or os.getenv('QTCL_DB_PATH', str(_lattice_db_path()))
         self._geometry_hash_cache = None
+        self._cache_timestamp = 0.0
         self._lock = threading.Lock()
         logger.info(f"[HyperbolicGeometry] Initialized with DB: {self.db_path}")
     
@@ -1482,10 +1484,9 @@ class HyperbolicGeometry:
             cur = conn.cursor()
             cur.execute("""
                 SELECT triangle_id, depth, parent_id,
-                       v0_x, v0_y, v0_name,
-                       v1_x, v1_y, v1_name,
-                       v2_x, v2_y, v2_name,
-                       area, perimeter
+                       v0_x, v0_y,
+                       v1_x, v1_y,
+                       v2_x, v2_y
                 FROM hyperbolic_triangles
                 WHERE depth <= ?
                 ORDER BY triangle_id
@@ -1497,11 +1498,9 @@ class HyperbolicGeometry:
                     'id': row['triangle_id'],
                     'depth': row['depth'],
                     'parent_id': row['parent_id'],
-                    'v0': (float(row['v0_x']), float(row['v0_y']), row['v0_name']),
-                    'v1': (float(row['v1_x']), float(row['v1_y']), row['v1_name']),
-                    'v2': (float(row['v2_x']), float(row['v2_y']), row['v2_name']),
-                    'area': float(row['area']) if row['area'] is not None else 0.0,
-                    'perimeter': float(row['perimeter']) if row['perimeter'] is not None else 0.0,
+                    'v0': (float(row['v0_x']), float(row['v0_y'])),
+                    'v1': (float(row['v1_x']), float(row['v1_y'])),
+                    'v2': (float(row['v2_x']), float(row['v2_y'])),
                 }
                 triangles.append(tri)
             conn.close()
@@ -1511,10 +1510,125 @@ class HyperbolicGeometry:
             raise
     
     def compute_geometry_hash(self, max_depth: int = 5) -> bytes:
-        """Compute SHA3-256 hash of hyperbolic geometry (cached)."""
+        """Compute SHA3-256 hash of hyperbolic geometry (cached with TTL)."""
+        import time
         with self._lock:
-            if self._geometry_hash_cache is not None:
+            now = time.time()
+            if self._geometry_hash_cache is not None and (now - self._cache_timestamp) < self._CACHE_TTL_SECONDS:
                 return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            self._cache_timestamp = now
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+    
+    def invalidate_cache(self):
+        """Force geometry hash recomputation on next call."""
+        with self._lock:
+            self._geometry_hash_cache = None
+            self._cache_timestamp = 0.0
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            self._cache_timestamp = now
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+    
+    def invalidate_cache(self):
+        """Force geometry hash recomputation on next call."""
+        with self._lock:
+            self._geometry_hash_cache = None
+            self._cache_timestamp = 0.0
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
             triangles = self.fetch_all_triangles(max_depth)
             # Encode triangles deterministically
             encoded = b''
@@ -1522,19 +1636,30 @@ class HyperbolicGeometry:
                 encoded += struct.pack('>Q', tri['id'])
                 encoded += struct.pack('>I', tri['depth'])
                 # Encode vertices as 8-byte doubles (big endian)
-                for vx, vy, _ in (tri['v0'], tri['v1'], tri['v2']):
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
                     encoded += struct.pack('>d', vx)
                     encoded += struct.pack('>d', vy)
-                encoded += struct.pack('>d', tri['area'])
-                encoded += struct.pack('>d', tri['perimeter'])
+            self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
+            logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
+            return self._geometry_hash_cache
+            triangles = self.fetch_all_triangles(max_depth)
+            # Encode triangles deterministically
+            encoded = b''
+            for tri in triangles:
+                encoded += struct.pack('>Q', tri['id'])
+                encoded += struct.pack('>I', tri['depth'])
+                # Encode vertices as 8-byte doubles (big endian)
+                for vx, vy in (tri['v0'], tri['v1'], tri['v2']):
+                    encoded += struct.pack('>d', vx)
+                    encoded += struct.pack('>d', vy)
             self._geometry_hash_cache = hashlib.sha3_256(encoded).digest()
             logger.info(f"[HyperbolicGeometry] Computed geometry hash from {len(triangles)} triangles")
             return self._geometry_hash_cache
     
     def hyperbolic_hash(self, msg: bytes) -> bytes:
-        """Return SHA3-256(msg || geometry_hash). Uses hyperbolic geometry as salt."""
+        """Return SHA3-256(domain ‖ msg ‖ geometry_hash). Uses hyperbolic geometry as salt."""
         geom_hash = self.compute_geometry_hash()
-        return hashlib.sha3_256(msg + geom_hash).digest()
+        return hashlib.sha3_256(b"QTCL_HYPERBOLIC_HASH_v1" + msg + geom_hash).digest()
     
     def hyperbolic_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         """Compute hyperbolic distance between two points in Poincaré disk."""
@@ -1876,7 +2001,7 @@ class HLWEEngine:
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
 
                 # ════ FIAT-SHAMIR CHALLENGE c ∈ {-1, 1} ════
-                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
+                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes, pub_bytes)
 
                 # ════ RESPONSE z = c·s + y mod q ════
                 z = [(c_scalar * s[i] + y[i]) % q for i in range(n)]
@@ -1898,26 +2023,25 @@ class HLWEEngine:
                 logger.error(f"[HLWE] Signing failed: {e}")
                 raise
 
-    def _hash_to_challenge_scalar(self, msg_hash: bytes, w_bytes: bytes) -> int:
+    def _hash_to_challenge_scalar(self, msg_hash: bytes, w_bytes: bytes, public_key_bytes: bytes = b'') -> int:
         """
         Deterministic challenge scalar c ∈ {-1, 1} from message + commitment,
         incorporating hyperbolic geometry from qtcl_blockchain.db.
 
         Construction:
           geom_hash = hyperbolic_geometry_hash(msg_hash)
-          h = SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w ‖ geom_hash)
+          h = SHA-256(b"HLWE_CHALLENGE_v1" ‖ msg ‖ w ‖ pubkey ‖ geom_hash)
           c = 2 * (h[0] & 1) - 1  → {-1, 1} with UNIFORM probability.
 
-        Zero challenge is eliminated to prevent forgery: when c=0,
-        w' = w regardless of the public key, allowing any key to pass.
-        Using uniform {-1, 1} also eliminates the P(c=1)=2/3 bias from mod 3.
+        Including public_key_bytes prevents cross-key attacks where an attacker
+        could reuse a signature across different keys with the same (msg, w).
         """
         try:
             hyper_geo = get_hyperbolic_geometry()
             geom_hash = hyper_geo.hyperbolic_hash(msg_hash)
         except Exception:
             raise RuntimeError("Hyperbolic geometry database missing; cannot compute challenge scalar")
-        h = hashlib.sha256(b"HLWE_CHALLENGE_v1" + msg_hash + w_bytes + geom_hash).digest()
+        h = hashlib.sha256(b"HLWE_CHALLENGE_v1" + msg_hash + w_bytes + public_key_bytes + geom_hash).digest()
         return 2 * (h[0] & 1) - 1  # uniform {-1, 1}
 
     def _derive_secret_vector_from_key(self, key_seed: bytes, dimension: int) -> List[int]:
@@ -2075,7 +2199,8 @@ class HLWEEngine:
 
                 # ════ VERIFY FIAT-SHAMIR CHALLENGE ════
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
-                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
+                pub_bytes_verify = bytes.fromhex(public_key_hex)
+                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes, pub_bytes_verify)
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
                 expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + message_hash + c_bytes).digest()
                 
@@ -2144,7 +2269,8 @@ class HLWEEngine:
 
                 # ════ VERIFY FIAT-SHAMIR CHALLENGE ════
                 w_bytes = b''.join(x.to_bytes(4, 'big') for x in w)
-                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes)
+                pub_bytes_verify = bytes.fromhex(public_key_hex)
+                c_scalar = self._hash_to_challenge_scalar(message_hash, w_bytes, pub_bytes_verify)
                 c_bytes = c_scalar.to_bytes(4, 'big', signed=True)
                 expected_c_hash = hashlib.sha256(b"HLWE_CHALLENGE_v1" + message_hash + c_bytes).digest()
                 
@@ -2171,17 +2297,21 @@ class HLWEEngine:
                 return False
     
     def _encode_vector_to_hex(self, vector: List[int]) -> str:
-        """Encode vector to hex string"""
+        """Encode vector to hex string with range validation."""
         return ''.join(x.to_bytes(4, byteorder='big').hex() for x in vector)
     
     def _decode_vector_from_hex(self, hex_str: str) -> List[int]:
-        """Decode vector from hex string"""
+        """Decode vector from hex string with strict validation."""
         vector = []
         for i in range(0, len(hex_str), 8):
             chunk = hex_str[i:i+8]
-            if len(chunk) == 8:
+            if len(chunk) != 8:
+                raise ValueError(f"Invalid hex chunk at position {i}: '{chunk}' (need 8 chars)")
+            try:
                 val = int(chunk, 16)
-                vector.append(val)
+            except ValueError:
+                raise ValueError(f"Invalid hex chunk at position {i}: '{chunk}'")
+            vector.append(val)
         return vector
 class BIP32KeyDerivation:
     """BIP32 Hierarchical Deterministic (HD) key derivation"""
@@ -14023,8 +14153,6 @@ class QtclClientApp:
         try:
             _payload  = (oracle_pub + "|" + wallet_addr).encode()
             _hash     = _hashlib.sha256(_payload).digest()
-            # signing_key derived from wallet_addr (public) — verifiable by anyone
-            _signing_key = _hashlib.new("sha256", b"HLWE_SIGN_KEY_v1", wallet_addr.encode()).digest()
             import hmac as _hm
             _signing_key = _hm.new(b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256).digest()
             # deterministic nonce
@@ -14047,8 +14175,8 @@ class QtclClientApp:
     def _verify_oracle_cert(oracle_pub: str, wallet_addr: str, cert: dict) -> bool:
         """
         Stateless cert verification — callable by any peer without private key.
-        Re-derives signing_key from wallet_addr (same derivation as sign_hash
-        uses from wallet_priv) and verifies HMAC-SHA256(signing_key, hash||sig) == auth_tag.
+        Re-derives signing_key from wallet_addr (same derivation as _create_oracle_cert)
+        and verifies HMAC-SHA256(signing_key, hash||sig) == auth_tag.
         Returns True if cert is cryptographically consistent and non-empty.
         """
         if not cert or not cert.get("auth_tag") or not cert.get("signature"):
@@ -14057,7 +14185,6 @@ class QtclClientApp:
             _payload  = (oracle_pub + "|" + wallet_addr).encode()
             _hash     = _hashlib.sha256(_payload).digest()
             sig_bytes = bytes.fromhex(cert["signature"])
-            # signing_key derived from wallet_addr (public) — same domain as sign_hash
             signing_key = _hm_v.new(
                 b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
             ).digest()
@@ -14071,7 +14198,32 @@ class QtclClientApp:
             _payload  = (oracle_pub + "|" + wallet_addr).encode()
             _hash     = _hashlib.sha256(_payload).digest()
             sig_bytes = bytes.fromhex(cert["signature"])
-            # signing_key derived from wallet_addr (public) — same domain as sign_hash
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+        try:
+            _payload  = (oracle_pub + "|" + wallet_addr).encode()
+            _hash     = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+        try:
+            _payload  = (oracle_pub + "|" + wallet_addr).encode()
+            _hash     = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
             signing_key = _hm_v.new(
                 b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
             ).digest()
