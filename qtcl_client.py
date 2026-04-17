@@ -149,7 +149,7 @@ SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 # ═════════════════════════════════════════════════════════════════════════════════
 # CANONICAL DATA DIRECTORY — single source of truth for all DB paths
 # Detects repo root from this file's location, falls back to ~/qtcl-miner
-# DB always lives at <repo_root>/data/qtcl_blockchain.db
+# DB always lives at <repo_root>/data/qtcl.db
 # ═════════════════════════════════════════════════════════════════════════════════
 def _detect_repo_root() -> Path:
     """Detect repo root: directory containing this file (qtcl_client.py)."""
@@ -162,7 +162,7 @@ def _detect_repo_root() -> Path:
 
 _REPO_ROOT: Path = _detect_repo_root()
 _DATA_DIR:  Path = _REPO_ROOT / 'data'
-_DB_PATH:   Path = _DATA_DIR / 'qtcl_blockchain.db'
+_DB_PATH:   Path = _DATA_DIR / 'qtcl.db'
 # Ensure data directory exists at import time
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2525,7 +2525,7 @@ _WSTATE_CONSENSUS: WStateConsensus = WStateConsensus()
 _P2P_NODE: Optional[QtclP2PNode]   = None
 # ── Python peer DB (uses built-in sqlite3 — no C dependency) ─────────────────
 import sqlite3 as _sq3, pathlib as _plib
-_PEER_DB_PATH = str(_plib.Path.home() / 'qtcl-miner' / 'qtcl_p2p_peers.db')
+_PEER_DB_PATH = str(_plib.Path('data') / 'qtcl_peers.db')
 def _peerdb_ensure(path: str) -> None:
     _plib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     with _sq3.connect(path) as c:
@@ -20127,7 +20127,7 @@ def main() -> None:  # noqa: F811
         from pathlib import Path as _init_Path
         _db_home = _init_Path.home() / "qtcl-miner" / "data"
         _db_home.mkdir(parents=True, exist_ok=True)
-        _db_file = _db_home / "qtcl_blockchain.db"
+        _db_file = _db_home / "qtcl.db"
         print(f"  ✅ Data directory ready: {_db_home}", flush=True)
 
         # ── Proactive schema migration: tables + columns ──────────────────────
