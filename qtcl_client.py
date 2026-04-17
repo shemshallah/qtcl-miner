@@ -20158,12 +20158,15 @@ def main() -> None:  # noqa: F811
                     import re as _schema_re
                     with open(_builder_path, 'r') as _f:
                         _builder_sql = _f.read()
-                    # Find all CREATE TABLE statements
-                    _create_stmts = _schema_re.findall(r'CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(', _builder_sql, _schema_re.IGNORECASE)
+                    # Find all CREATE TABLE statements (with or without IF NOT EXISTS)
+                    _create_stmts = _schema_re.findall(r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(\w+)\s*\(', _builder_sql, _schema_re.IGNORECASE)
                     # Execute each statement with SQLite compatibility transforms
                     _tables_created = 0
-                    for _stmt_match in _schema_re.finditer(r'CREATE TABLE IF NOT EXISTS\s+\w+\s*\([^;]+\)', _builder_sql, _schema_re.IGNORECASE | _schema_re.DOTALL):
+                    for _stmt_match in _schema_re.finditer(r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?\w+\s*\([^;]+\)', _builder_sql, _schema_re.IGNORECASE | _schema_re.DOTALL):
                         _raw_sql = _stmt_match.group(0)
+                        # Add IF NOT EXISTS if not present
+                        if 'IF NOT EXISTS' not in _raw_sql.upper():
+                            _raw_sql = _schema_re.sub(r'CREATE TABLE\s+', 'CREATE TABLE IF NOT EXISTS ', _raw_sql, count=1)
                         # Apply SQLite transforms (same as qtcl_db_builder)
                         _sql = _schema_re.sub(r'BIGSERIAL', 'INTEGER', _raw_sql)
                         _sql = _schema_re.sub(r'BIGINT\b', 'INTEGER', _sql)
