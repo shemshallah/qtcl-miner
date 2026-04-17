@@ -1400,6 +1400,8 @@ class HypGammaWallet:
         return self.keypair.to_dict() if self.keypair else {}
 
 
+_GLOBAL_HYP_ENGINE = None  # Module-level singleton
+
 class HypGammaEngine:
     """HypΓ cryptosystem — post-quantum signatures and encryption."""
     
@@ -1407,16 +1409,22 @@ class HypGammaEngine:
     _lock = threading.Lock()
     
     def __new__(cls):
-        """Singleton pattern."""
+        """Singleton pattern — reuse module-level engine."""
+        global _GLOBAL_HYP_ENGINE
+        if _GLOBAL_HYP_ENGINE is not None:
+            return _GLOBAL_HYP_ENGINE
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance._init_hyp()
+                    _GLOBAL_HYP_ENGINE = cls._instance
         return cls._instance
     
     def _init_hyp(self):
-        """Initialize HypΓ engine."""
+        """Initialize HypΓ engine (once)."""
+        if hasattr(self, '_hyp_engine'):
+            return  # Already initialized
         try:
             from hyp_engine import HypGammaEngine as HypEngine
             self._hyp_engine = HypEngine()
