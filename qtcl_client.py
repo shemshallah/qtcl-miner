@@ -16890,11 +16890,17 @@ class QtclClientApp:
         # _root_log.handlers = [_buf_handler]
         _EXP_LOG.warning("[MINER] 🚀 MINING THREAD STARTED — LOGS ENABLED TO STDOUT FOR DIAGNOSTICS")
         _LAST_BLOCK_REPORTED = [None]   # mutable cell so inner closure can write
+        _LAST_DASHBOARD_PRINT = [0.0]   # throttle dashboard output
         def _fmt_duration(secs: float) -> str:
             h, r = divmod(int(secs), 3600)
             m, s = divmod(r, 60)
             return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         def _print_dashboard(force_full: bool = False) -> None:
+            # Throttle: only print every 10 seconds unless forced
+            now = time.time()
+            if not force_full and (now - _LAST_DASHBOARD_PRINT[0]) < 10:
+                return
+            _LAST_DASHBOARD_PRINT[0] = now
             self.koyeb_state.refresh_metrics(self.client_field)
             
             ks2  = self.koyeb_state
