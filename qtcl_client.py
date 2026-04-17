@@ -15708,6 +15708,15 @@ class QtclClientApp:
         self._peer_id_final = True
         _EXP_LOG.info(f"[P2P] 🔑 node_id derived: {self._peer_id[:16]}... (wallet={_w_addr[:12]}... machine={_m_salt[:8]}...)")
         self._init_db()
+        # ── IBD: Sync blocks from server ────────────────────────────────────
+        try:
+            _ibd_synced = self._db.sync_chain_from_server(self.api)
+            if _ibd_synced > 0:
+                _EXP_LOG.info(f"[IBD] ✅ Synced {_ibd_synced} blocks from server")
+            else:
+                _EXP_LOG.info(f"[IBD] Chain up-to-date or server unavailable")
+        except Exception as _ibd_err:
+            _EXP_LOG.warning(f"[IBD] Sync failed (non-fatal): {_ibd_err}")
         self._sync_hyp_wallet_ops_to_db()
         self._sync_hyp_rpc_ops_to_db()
         _hyp_report = self._get_hyp_integrity_report()
