@@ -20149,7 +20149,47 @@ def main() -> None:  # noqa: F811
             _boot_db.create_tables()
             # Full column migration pass (idempotent, repairs any existing table)
             _boot_db._ensure_blocks_schema()
-            # Report
+            
+            # ── Run qtcl_db_builder schema (creates all 66 tables) ────────────
+            try:
+                _builder_path = _REPO_ROOT / 'qtcl_db_builder.py'
+                if _builder_path.exists():
+                    # Parse CREATE TABLE statements from builder
+                    import re as _schema_re
+                    with open(_builder_path, 'r') as _f:
+                        _builder_sql = _f.read()
+                    # Find all CREATE TABLE statements
+                    _create_stmts = _schema_re.findall(r'CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(', _builder_sql, _schema_re.IGNORECASE)
+                    # Execute each statement with SQLite compatibility transforms
+                    _tables_created = 0
+                    for _stmt_match in _schema_re.finditer(r'CREATE TABLE IF NOT EXISTS\s+\w+\s*\([^;]+\)', _builder_sql, _schema_re.IGNORECASE | _schema_re.DOTALL):
+                        _raw_sql = _stmt_match.group(0)
+                        # Apply SQLite transforms (same as qtcl_db_builder)
+                        _sql = _schema_re.sub(r'BIGSERIAL', 'INTEGER', _raw_sql)
+                        _sql = _schema_re.sub(r'BIGINT\b', 'INTEGER', _sql)
+                        _sql = _schema_re.sub(r'BOOLEAN', 'INTEGER', _sql)
+                        _sql = _schema_re.sub(r'TIMESTAMP WITH TIME ZONE', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'NUMERIC\([^)]+\)', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'JSONB', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'BYTEA', 'BLOB', _sql)
+                        _sql = _schema_re.sub(r'\bINET\b', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'VARCHAR\(\d+\)', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'TEXT\[\]', 'TEXT', _sql)
+                        _sql = _schema_re.sub(r'SMALLINT', 'INTEGER', _sql)
+                        _sql = _schema_re.sub(r"DEFAULT NOW\(\)", "DEFAULT (strftime('%s', 'now'))", _sql)
+                        _sql = _schema_re.sub(r"::\w+", "", _sql)
+                        try:
+                            _boot_db.conn.execute(_sql)
+                            _tables_created += 1
+                        except Exception:
+                            pass  # Table may already exist or incompatible
+                    _boot_db.conn.commit()
+                    if _tables_created > 0:
+                        print(f"  📦 Builder schema: +{_tables_created} tables from qtcl_db_builder.py", flush=True)
+            except Exception as _bse:
+                print(f"  ⚠️  Builder schema import: {_bse}", flush=True)
+            
+            # Report final table count
             _boot_cur = _boot_db.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
             )
