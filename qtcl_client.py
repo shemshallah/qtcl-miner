@@ -2363,14 +2363,14 @@ class QtclP2PNode:
         """
         Priority-ordered peer discovery loop. Runs at startup then every 90s.
         Priority on each cycle:
-          1. LOCAL  qtcl_blockchain.db  p2p_peers table  (freshest — zero latency)
+          1. LOCAL  qtcl.db  p2p_peers table  (freshest — zero latency)
           2. P2P    already-connected peers' known-peer gossip  (C layer)
           3. KOYEB  /api/p2p/peer_exchange + /api/peers/list  (only if local is
                     stale OR we have fewer than 2 connected peers)
         DM freshness gate: if the oracle DM age < 30s we have a live SSE source
         and local P2P peers are preferred.  If DM age > 60s the oracle is stale
         so we aggressively re-query koyeb/supabase for fresh peers.
-        Every new peer is persisted back to qtcl_blockchain.db immediately.
+        Every new peer is persisted back to qtcl.db immediately.
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
@@ -2378,7 +2378,7 @@ class QtclP2PNode:
         _connected_this_cycle: set = set()
         def _connect_peer(host, port): return False
         def _load_local_peers(max_age_s=7200):
-            """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
+            """Read p2p_peers from qtcl.db, skip already-connected."""
             try:
                 _already = set()
                 cutoff = int(_pt.time()) - max_age_s
@@ -2428,7 +2428,7 @@ class QtclP2PNode:
                 need_peers  = n_connected < 4           # want at least 4 peers
                 dm_stale    = (not dm_fresh) or dm_age > 60.0
                 new_connections = 0
-                # ── Priority 1: local qtcl_blockchain.db ─────────────────────
+                # ── Priority 1: local qtcl.db ────────────────────────────────
                 local_peers = _load_local_peers(max_age_s=7200)
                 if local_peers:
                     for host, port in local_peers:
@@ -12940,7 +12940,7 @@ class QtclClientApp:
     # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
-        """Return already-initialized sqlite3 connection (qtcl_blockchain.db)."""
+        """Return already-initialized sqlite3 connection (qtcl.db)."""
         if self._db is None:
             self._init_db()
         return self._db

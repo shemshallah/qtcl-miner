@@ -5,7 +5,7 @@
 # ║   Client-side Argon2id key-wrapping (NO external KMS required)               ║
 # ║                                                                                ║
 # ║   SERVER MODE  → export DATABASE_URL=postgresql://neondb_owner:<pw>@<host>/  ║
-# ║   CLIENT MODE  → no DATABASE_URL set → data/qtcl_blockchain.db local SQLite   ║
+# ║   CLIENT MODE  → no DATABASE_URL set → qtcl.db local SQLite                   ║
 # ║                                                                                ║
 # ║   KEY SECURITY MODEL (replaces Google/AWS KMS):                               ║
 # ║     passphrase + device_pepper → Argon2id → KEK (never stored)               ║
