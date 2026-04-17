@@ -1,0 +1,17 @@
+<script>
+var hex = "000000000000f03f0000000000000040"; // 1.0 + 2.0j
+var buf = new ArrayBuffer(8), view = new DataView(buf);
+var re, im;
+
+// Test real
+var off = 0;
+for(var b=0; b<8; b++) view.setUint8(b, parseInt(hex.substr(off + b*2, 2), 16));
+re = view.getFloat64(0, true);
+
+// Test imag
+off = 16;
+for(var b=0; b<8; b++) view.setUint8(b, parseInt(hex.substr(off + b*2, 2), 16));
+im = view.getFloat64(0, true);
+
+console.log("Re:", re, "Im:", im);
+</script>
