@@ -3160,11 +3160,10 @@ def _validate_and_init_schema(db_path: Path) -> bool:
         existing_cols = {row[1] for row in cursor.fetchall()}
         conn.close()
 
-        # Required columns (from qtcl_db_builder.py blocks table)
+        # Required columns (from qtcl_db_builder.py blocks table - PRIMARY: height, UNIQUE: block_hash)
         required_cols = {
             'height', 'block_hash', 'parent_hash', 'merkle_root', 'timestamp',
-            'tx_count', 'coherence_snapshot', 'fidelity_snapshot', 'miner_address',
-            'difficulty', 'nonce', 'pq_curr', 'pq_last'
+            'tx_count', 'miner_address', 'difficulty', 'nonce', 'pq_curr', 'pq_last'
         }
 
         if required_cols.issubset(existing_cols):
@@ -3312,41 +3311,27 @@ class LocalBlockchainDB:
     # ========= Block operations =========
     
     def insert_block(self, height: int, block_data: dict):
-        """Insert block — includes all P2P v2 hyperbolic geometry + consensus fields."""
-        import json as _json_ib, time as _t_ib
+        """Insert block using qtcl_db_builder.py schema (height PRIMARY, block_hash UNIQUE, parent_hash).
+        Only inserts essential columns - remaining fields use schema defaults."""
         self.execute("""
             INSERT OR REPLACE INTO blocks
-            (height, hash, parent_hash, timestamp, nonce, difficulty, miner_address,
-             pq_curr, pq_last, qubit_snapshot, w_state_fidelity,
-             pq0,
-             hyp_triangle_area, hyp_dist_0c, hyp_dist_cl, hyp_dist_0l,
-             oracle_quorum_hash, peer_measurement_count, consensus_agreement,
-             local_dm_hex, local_measurement_sig,
-             data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (height, block_hash, parent_hash, timestamp, merkle_root, tx_count,
+             miner_address, difficulty, nonce, pq_curr, pq_last, w_state_hash, finalized)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            height,
-            block_data.get('hash') or block_data.get('block_hash'),
-            block_data.get('parent_hash') or block_data.get('parent_hash') or block_data.get('previous_hash'),
-            block_data.get('timestamp') or block_data.get('timestamp_s'),
-            block_data.get('nonce'),
-            block_data.get('difficulty') or block_data.get('difficulty_bits'),
-            block_data.get('miner_address'),
-            block_data.get('pq_curr'),
-            block_data.get('pq_last'),
-            block_data.get('qubit_snapshot'),
-            block_data.get('w_state_fidelity'),
-            int(block_data.get('pq0') or 0),
-            float(block_data.get('hyp_triangle_area') or 0.0),
-            float(block_data.get('hyp_dist_0c') or 0.0),
-            float(block_data.get('hyp_dist_cl') or 0.0),
-            float(block_data.get('hyp_dist_0l') or 0.0),
-            block_data.get('oracle_quorum_hash'),
-            int(block_data.get('peer_measurement_count') or 1),
-            float(block_data.get('consensus_agreement') or block_data.get('agreement_score') or 0.0),
-            block_data.get('local_dm_hex'),
-            block_data.get('local_measurement_sig'),
-            _json_ib.dumps(block_data) if isinstance(block_data, dict) else str(block_data),
+            int(height),
+            block_data.get('block_hash') or block_data.get('hash') or '',
+            block_data.get('parent_hash') or block_data.get('previous_hash') or '',
+            int(block_data.get('timestamp') or block_data.get('timestamp_s') or 0),
+            block_data.get('merkle_root') or '',
+            int(block_data.get('tx_count') or 0),
+            block_data.get('miner_address') or '',
+            int(block_data.get('difficulty') or block_data.get('difficulty_bits') or 6),
+            int(block_data.get('nonce') or 0),
+            int(block_data.get('pq_curr') or 1),
+            int(block_data.get('pq_last') or 0),
+            block_data.get('w_state_hash') or '',
+            True,  # finalized=True by default
         ))
     def upsert_p2p_peer(self, node_id_hex: str, host: str, port: int,
                          chain_height: int = 0, last_fidelity: float = 0.0,
@@ -19298,14 +19283,16 @@ def main() -> None:  # noqa: F811
             _boot_tables = {r[0] for r in _boot_cur.fetchall()}
             _col_cur = _boot_db.conn.execute("PRAGMA table_info(blocks)")
             _live_cols = {row[1] for row in _col_cur.fetchall()}
-            _ibd_cols  = {'hash', 'merkle_root', 'tx_count', 'synced_from_server'}
-            _col_missing = _ibd_cols - _live_cols
+            # Check for columns from qtcl_db_builder.py schema
+            _required_cols = {'block_hash', 'parent_hash', 'height', 'timestamp', 'merkle_root', 'tx_count'}
+            _col_missing = _required_cols - _live_cols
             if _col_missing:
-                print(f"  ❌ FATAL: blocks still missing columns after migration: "
-                      f"{_col_missing}", flush=True)
+                print(f"  ❌ FATAL: blocks table missing critical columns: {_col_missing}", flush=True)
+                print(f"  Schema validation FAILED. Database is corrupted or incompatible.", flush=True)
+                sys.exit(1)
             else:
                 print(f"  ✅ DB schema OK — {len(_boot_tables)} tables, "
-                      f"all IBD columns present", flush=True)
+                      f"all required columns present", flush=True)
             _boot_db.conn.close()
         except Exception as _dbe:
             print(f"  ⚠️  DB schema check failed: {_dbe} — will retry on first use",
