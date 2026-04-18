@@ -213,7 +213,7 @@ class SSEStreamClient:
 
     def __init__(self, server_url: str):
         self.server_url = server_url
-        self.stream_endpoint = f"{server_url.rstrip('/')}/rpc/oracle/snapshot/stream"
+        self.stream_endpoint = f"{server_url.rstrip('/')}/rpc/oracle/snapshot"
         self.latest_server_snapshot = None
         self.lock = threading.RLock()
         self.running = False
@@ -15118,7 +15118,7 @@ class QtclClientApp:
         # ── SSE client already running — subscribed to server stream ──────────
         # No local SSE server needed. All clients subscribe to server's real-time
         # 16³ snapshots and participate in mesh consensus averaging.
-        _EXP_LOG.info(f"[BOOTSTRAP] ✅ SSE mesh client connected to {self.oracle_url}/rpc/oracle/snapshot/stream")
+        _EXP_LOG.info(f"[BOOTSTRAP] ✅ SSE mesh client connected to {self.oracle_url}/rpc/oracle/snapshot")
         # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
         # CRITICAL: DM persistence is essential for quantum consensus.
         try:
