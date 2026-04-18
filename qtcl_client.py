@@ -149,7 +149,7 @@ SYSTEM_ENTROPY_CACHE: dict = {'data': None, 'timestamp': 0.0, 'ttl_seconds': 30}
 # ═════════════════════════════════════════════════════════════════════════════════
 # CANONICAL DATA DIRECTORY — single source of truth for all DB paths
 # Detects repo root from this file's location, falls back to ~/qtcl-miner
-# DB always lives at <repo_root>/data/qtcl_blockchain.db
+# DB always lives at <repo_root>/data/qtcl.db (NEW schema)
 # ═════════════════════════════════════════════════════════════════════════════════
 def _detect_repo_root() -> Path:
     """Detect repo root: directory containing this file (qtcl_client.py)."""
@@ -162,7 +162,7 @@ def _detect_repo_root() -> Path:
 
 _REPO_ROOT: Path = _detect_repo_root()
 _DATA_DIR:  Path = _REPO_ROOT / 'data'
-_DB_PATH:   Path = _DATA_DIR / 'qtcl_blockchain.db'
+_DB_PATH:   Path = _DATA_DIR / 'qtcl.db'
 # Ensure data directory exists at import time
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2453,14 +2453,14 @@ class QtclP2PNode:
         """
         Priority-ordered peer discovery loop. Runs at startup then every 90s.
         Priority on each cycle:
-          1. LOCAL  qtcl_blockchain.db  p2p_peers table  (freshest — zero latency)
+          1. LOCAL  sqlite p2p_peers table  (freshest — zero latency)
           2. P2P    already-connected peers' known-peer gossip  (C layer)
           3. KOYEB  /api/p2p/peer_exchange + /api/peers/list  (only if local is
                     stale OR we have fewer than 2 connected peers)
         DM freshness gate: if the oracle DM age < 30s we have a live SSE source
         and local P2P peers are preferred.  If DM age > 60s the oracle is stale
         so we aggressively re-query koyeb/supabase for fresh peers.
-        Every new peer is persisted back to qtcl_blockchain.db immediately.
+        Every new peer is persisted back to local database immediately.
         ❤️  The more peers the more entangled the network
         """
         import json as _pj, time as _pt, sqlite3 as _psq
@@ -2468,7 +2468,7 @@ class QtclP2PNode:
         _connected_this_cycle: set = set()
         def _connect_peer(host, port): return False
         def _load_local_peers(max_age_s=7200):
-            """Read p2p_peers from qtcl_blockchain.db, skip already-connected."""
+            """Read p2p_peers from local sqlite database, skip already-connected."""
             try:
                 _already = set()
                 cutoff = int(_pt.time()) - max_age_s
@@ -2518,7 +2518,7 @@ class QtclP2PNode:
                 need_peers  = n_connected < 4           # want at least 4 peers
                 dm_stale    = (not dm_fresh) or dm_age > 60.0
                 new_connections = 0
-                # ── Priority 1: local qtcl_blockchain.db ─────────────────────
+                # ── Priority 1: local sqlite database ──────────────────────────
                 local_peers = _load_local_peers(max_age_s=7200)
                 if local_peers:
                     for host, port in local_peers:
@@ -12606,7 +12606,7 @@ class QtclClientApp:
     # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
-        """Return already-initialized sqlite3 connection (qtcl_blockchain.db)."""
+        """Return already-initialized sqlite3 connection to canonical database."""
         if self._db is None:
             self._init_db()
         return self._db
@@ -19810,13 +19810,8 @@ def main() -> None:  # noqa: F811
     try:
         print("⚛️  QTCL Client initializing...", flush=True)
         
-        # ── Ensure data directory exists ────────────────────────────────────
-        import sqlite3 as _init_sq3
-        from pathlib import Path as _init_Path
-        _db_home = _init_Path.home() / "qtcl-miner" / "data"
-        _db_home.mkdir(parents=True, exist_ok=True)
-        _db_file = _db_home / "qtcl_blockchain.db"
-        print(f"  ✅ Data directory ready: {_db_home}", flush=True)
+        # ── Ensure data directory exists (uses canonical _DATA_DIR and _DB_PATH) ─
+        print(f"  ✅ Data directory ready: {_DATA_DIR}", flush=True)
 
         # ── Proactive schema migration: tables + columns ──────────────────────
         # Always runs create_tables() AND _ensure_blocks_schema() regardless of
@@ -19951,7 +19946,7 @@ def main() -> None:  # noqa: F811
         # (Moved here after interactive prompts to prevent log injection during password input)
         import sqlite3 as _rpc_sq3
         try:
-            _rpc_db = _rpc_sq3.connect(str(_db_file), timeout=5.0, check_same_thread=False)
+            _rpc_db = _rpc_sq3.connect(str(_DB_PATH), timeout=5.0, check_same_thread=False)
             _rpc_client = ServerRPCClient(db_connection=_rpc_db)
             logger.info(f"[RPC] ✅ Dual-mode RPC initialized (HTTP + P2P gossip fallback)")
             # Make available globally for mining/oracle modes
@@ -19966,7 +19961,7 @@ def main() -> None:  # noqa: F811
             try:
                 _mesh_port = int(_os.environ.get("MESH_PORT", "9091"))
                 _mesh_srv  = _start_mesh_rpc_node(
-                    db_path=_db_file,
+                    db_path=_DB_PATH,
                     main_server_url=_os.environ.get(
                         "ENTROPY_SERVER", "https://qtcl-blockchain.koyeb.app"
                     ),
