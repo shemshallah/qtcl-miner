@@ -13359,10 +13359,10 @@ class QtclClientApp:
         """
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
         self.api           = KoyebRPCNodule(self.oracle_url)
-        
+
         # ── RPC snapshot consumer now on-demand via _LIVE_RPC_ORACLE ────────
-        
-        self.wallet        = QTCLWallet()
+
+        self.wallet        = HypGammaWallet(label="miner")
         self.client_field  = ClientFieldState()
         self.koyeb_state   = KoyebOracleState(oracle_url=self.oracle_url, _api=self.api)
         self._stop         = _threading.Event()
