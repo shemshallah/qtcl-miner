@@ -16193,9 +16193,9 @@ class QtclClientApp:
                     _sig = None
                     try:
                         if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
-                            # Sign the block payload (excluding signature field)
+                            # Sign the block payload (excluding signature field) using wallet's sign_transaction
                             _block_for_sig = {k: v for k, v in submit_payload.items() if k not in ('hyp_signature', 'hyp_sig', 'miner_pubkey')}
-                            _sig = self.wallet.sign_block(_block_for_sig, self.wallet.private_key)
+                            _sig = self.wallet.sign_transaction(_block_for_sig)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hyp_signature"] = _sig
                                 submit_payload["miner_pubkey"] = self.wallet.public_key or ""
