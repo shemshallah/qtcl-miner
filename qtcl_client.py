@@ -1431,6 +1431,13 @@ class HypGammaWallet:
             logger.warning(f"[HYP-WALLET] Signature verification failed: {e}")
             return False
     
+    def is_loaded(self) -> bool:
+        """Check if wallet is fully initialized with keypair."""
+        return (self.keypair is not None and
+                self.keypair.address is not None and
+                self.keypair.private_key is not None and
+                self.keypair.public_key is not None)
+
     def get_address(self) -> str:
         """Get wallet address."""
         return self.keypair.address if self.keypair else ""
@@ -4378,6 +4385,7 @@ class LocalBlockchainDB:
             # (column_name,  DDL fragment)
             ("hash",               "TEXT    UNIQUE NOT NULL DEFAULT ''"),
             ("parent_hash",        "TEXT    DEFAULT ''"),
+            ("prev_hash",          "TEXT    DEFAULT ''"),  # Alias for parent_hash
             ("timestamp",          "INTEGER DEFAULT 0"),
             ("nonce",              "INTEGER DEFAULT 0"),
             ("difficulty",         "REAL    DEFAULT 4.0"),
