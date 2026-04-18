@@ -1794,7 +1794,8 @@ class QuantumTemporalCoherenceLedgerServer:
                     self.cursor.execute(f"DROP TABLE IF EXISTS {tname} CASCADE;")
                     self._commit()
             else:
-                self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                # SQLite: skip internal tables like sqlite_sequence
+                self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
                 tables = [r[0] for r in self.cursor.fetchall()]
                 for tname in tables:
                     self.cursor.execute(f"DROP TABLE IF EXISTS {tname};")

@@ -3197,58 +3197,73 @@ except ImportError:
 
 # ── SCHEMA VALIDATION: Use qtcl_db_builder.py as single source of truth ───────
 def _validate_and_init_schema(db_path: Path) -> bool:
-    """Validate database schema against qtcl_db_builder.py. Run builder if mismatch.
+    """Validate database schema. If ANY critical table missing: DELETE old DB + rebuild fresh.
 
-    Checks for ALL critical tables, not just blocks. If ANY are missing, rebuilds.
+    No migrations, no repairs, no compatibility hacks. Either schema is perfect or DELETE and rebuild.
     Returns True if schema valid/fixed, False if error.
     """
     import subprocess
     import sqlite3 as _sqlite3
     try:
-        conn = _sqlite3.connect(str(db_path), timeout=10)
-        cursor = conn.cursor()
-
         # Critical tables that MUST exist (from qtcl_db_builder.py)
         critical_tables = {
             'blocks', 'transactions', 'wallet_addresses', 'pq0_entanglement_log',
             'wstate_consensus_log', 'hyperbolic_triangles', 'pseudoqubits'
         }
 
-        # Check which tables exist
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        existing_tables = {row[0] for row in cursor.fetchall()}
-
-        # Check blocks table columns specifically
-        cursor.execute("PRAGMA table_info(blocks)")
-        blocks_cols = {row[1] for row in cursor.fetchall()}
-        conn.close()
-
         required_blocks_cols = {
             'height', 'block_hash', 'parent_hash', 'merkle_root', 'timestamp',
             'tx_count', 'miner_address', 'difficulty', 'nonce', 'pq_curr', 'pq_last'
         }
 
-        # Schema is valid if:
-        # 1. All critical tables exist
-        # 2. Blocks table has all required columns
-        if critical_tables.issubset(existing_tables) and required_blocks_cols.issubset(blocks_cols):
-            logger.info("[DB-SCHEMA] ✅ All critical tables present, schema valid")
-            return True
+        # Check if DB exists and is valid
+        schema_valid = False
+        if db_path.exists():
+            try:
+                conn = _sqlite3.connect(str(db_path), timeout=10)
+                cursor = conn.cursor()
 
-        # Schema incomplete - run builder
-        missing_tables = critical_tables - existing_tables
-        missing_cols = required_blocks_cols - blocks_cols
+                # Check which tables exist
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                existing_tables = {row[0] for row in cursor.fetchall()}
 
-        if missing_tables or missing_cols:
-            logger.warning(f"[DB-SCHEMA] ⚠️  Missing tables: {missing_tables}, missing cols: {missing_cols}")
-            logger.info("[DB-SCHEMA] Running qtcl_db_builder.py to repair schema...")
+                # Check blocks table columns
+                cursor.execute("PRAGMA table_info(blocks)")
+                blocks_cols = {row[1] for row in cursor.fetchall()}
+                conn.close()
 
+                # Schema valid if all tables + cols present
+                if critical_tables.issubset(existing_tables) and required_blocks_cols.issubset(blocks_cols):
+                    logger.info("[DB-SCHEMA] ✅ Schema valid")
+                    return True
+
+                # Schema incomplete
+                missing_tables = critical_tables - existing_tables
+                missing_cols = required_blocks_cols - blocks_cols
+                logger.warning(f"[DB-SCHEMA] ⚠️  Missing: tables={missing_tables}, cols={missing_cols}")
+
+            except Exception as e:
+                logger.debug(f"[DB-SCHEMA] DB check failed: {e}")
+
+        # If we reach here: DB doesn't exist OR is broken. DELETE and rebuild.
+        if db_path.exists():
+            logger.warning(f"[DB-SCHEMA] 🔄 Deleting broken database: {db_path}")
+            db_path.unlink()
+            # Also delete WAL files if they exist
+            for wal_file in db_path.parent.glob(f"{db_path.name}*"):
+                try:
+                    wal_file.unlink()
+                except:
+                    pass
+
+        logger.info("[DB-SCHEMA] 🔨 Running qtcl_db_builder.py to create fresh schema...")
         builder_path = _REPO_ROOT / 'qtcl_db_builder.py'
+
         if not builder_path.exists():
             logger.error(f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}")
             return False
 
-        # Run builder to fix schema
+        # Run builder
         result = subprocess.run(
             [sys.executable, str(builder_path)],
             cwd=str(_REPO_ROOT),
@@ -3258,14 +3273,14 @@ def _validate_and_init_schema(db_path: Path) -> bool:
         )
 
         if result.returncode != 0:
-            logger.error(f"[DB-SCHEMA] ❌ Builder failed:\n{result.stderr[-500:]}")
+            logger.error(f"[DB-SCHEMA] ❌ Builder FAILED:\n{result.stderr[-1000:]}")
             return False
 
-        logger.info("[DB-SCHEMA] ✅ Schema repaired by qtcl_db_builder.py")
+        logger.info("[DB-SCHEMA] ✅ Fresh schema created successfully")
         return True
 
     except Exception as e:
-        logger.error(f"[DB-SCHEMA] ❌ Validation error: {e}")
+        logger.error(f"[DB-SCHEMA] ❌ FATAL validation error: {e}")
         return False
 
 class LocalBlockchainDB:
