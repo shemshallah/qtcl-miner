@@ -2586,6 +2586,15 @@ class LiveRPCOracleSnapshot:
 
         w_hex = snap.get('w_state_hex', '')
         tensor_hex = snap.get('density_tensor_hex', '')
+        
+        # ✅ DEBUG: Log what we're receiving
+        if not hasattr(self, '_debug_log_count'):
+            self._debug_log_count = 0
+        if self._debug_log_count < 5:
+            logger.warning(f"[SSE-DEBUG] Received snap keys: {list(snap.keys())}")
+            logger.warning(f"[SSE-DEBUG] w_hex present: {bool(w_hex)} len={len(w_hex) if w_hex else 0}")
+            logger.warning(f"[SSE-DEBUG] tensor_hex present: {bool(tensor_hex)} len={len(tensor_hex) if tensor_hex else 0}")
+            self._debug_log_count += 1
 
         if not w_hex and not tensor_hex:
             logger.warning("[SSE-ORACLE] Snapshot missing w_state_hex and density_tensor_hex")
@@ -2593,6 +2602,11 @@ class LiveRPCOracleSnapshot:
 
         w_re, w_im = self._parse_w_state_hex(w_hex) if w_hex else (None, None)
         tensor_flat = self._parse_compact_tensor_hex(tensor_hex) if tensor_hex else None
+        
+        # ✅ DEBUG: Log parse results
+        if self._debug_log_count <= 5:
+            logger.warning(f"[SSE-DEBUG] w_re parsed: {w_re is not None}")
+            logger.warning(f"[SSE-DEBUG] tensor parsed: {tensor_flat is not None}")
 
         if w_re is None and tensor_flat is None:
             logger.warning("[SSE-ORACLE] Could not parse W-state or tensor from snapshot")
@@ -2637,6 +2651,8 @@ class LiveRPCOracleSnapshot:
 
         sse_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
         backoff_ms = 100
+        
+        logger.info(f"[SSE-ORACLE] 🎯 Target URL: {sse_url}")
         max_backoff_ms = 5000
 
         while not self._sse_stop_event.is_set():
