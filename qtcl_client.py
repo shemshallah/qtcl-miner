@@ -204,7 +204,86 @@ RPC_ENDPOINTS = {
 # CLIENT-SIDE SSE SERVER FOR PEER DM SHARING
 # ────────────────────────────────────────────────────────────────────────────────
 
-# Removed: old SSE streaming server. Clients fetch snapshots directly via RPC.
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 16³ SSE STREAM CLIENT: Subscribe to server snapshots, process with local AER, broadcast
+# ════════════════════════════════════════════════════════════════════════════════════════
+
+class SSEStreamClient:
+    """Subscribe to server's 16³ SSE stream, process snapshots in real-time."""
+
+    def __init__(self, server_url: str):
+        self.server_url = server_url
+        self.stream_endpoint = f"{server_url.rstrip('/')}/rpc/oracle/snapshot/stream"
+        self.latest_server_snapshot = None
+        self.lock = threading.RLock()
+        self.running = False
+
+    def start(self):
+        """Start subscription in background thread."""
+        self.running = True
+        thread = threading.Thread(target=self._subscribe_loop, daemon=True, name="SSEClient")
+        thread.start()
+        _EXP_LOG.info(f"[SSE-CLIENT] 📡 Subscribed to {self.stream_endpoint}")
+
+    def _subscribe_loop(self):
+        """Continuously subscribe to SSE stream and process snapshots."""
+        consecutive_errors = 0
+        while self.running:
+            try:
+                import urllib.request as _ur
+                req = _ur.Request(self.stream_endpoint)
+                req.add_header('Accept', 'text/event-stream')
+                consecutive_errors = 0
+
+                with _ur.urlopen(req, timeout=30) as resp:
+                    for line in resp:
+                        if not self.running:
+                            break
+                        line_str = line.decode().strip()
+                        if line_str.startswith('data: '):
+                            try:
+                                payload = json.loads(line_str[6:])
+                                self._process_snapshot(payload)
+                            except json.JSONDecodeError:
+                                pass
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    _EXP_LOG.warning(f"[SSE-CLIENT] Connection failed: {e}")
+                if consecutive_errors > 10:
+                    _EXP_LOG.error(f"[SSE-CLIENT] ❌ Giving up after 10 consecutive errors")
+                    break
+                time.sleep(min(2 ** consecutive_errors, 30))
+
+    def _process_snapshot(self, payload: dict) -> None:
+        """Process incoming 16³ server snapshot."""
+        with self.lock:
+            self.latest_server_snapshot = payload
+
+        dm_hex = payload.get('density_tensor_hex', '')
+        ts = payload.get('timestamp_ns', 0)
+        if dm_hex:
+            _EXP_LOG.debug(f"[SSE-CLIENT] ✅ Received 16³ snapshot (ts={ts})")
+
+    def get_latest_snapshot(self) -> Optional[dict]:
+        """Get the most recent snapshot from server."""
+        with self.lock:
+            return self.latest_server_snapshot
+
+_sse_client = None
+
+def init_sse_client(server_url: str) -> SSEStreamClient:
+    """Initialize SSE stream client."""
+    global _sse_client
+    _sse_client = SSEStreamClient(server_url)
+    _sse_client.start()
+    return _sse_client
+
+def get_server_snapshot() -> Optional[dict]:
+    """Fetch latest snapshot from SSE stream."""
+    if _sse_client:
+        return _sse_client.get_latest_snapshot()
+    return None
 
 def fetch_peer_measurement(peer_host: str, peer_port: int = 9091, timeout_s: float = 5.0) -> Optional[str]:
     """Fetch a single measurement from peer's SSE endpoint."""
