@@ -2460,7 +2460,7 @@ class LiveRPCOracleSnapshot:
                         _body = _r.json()
                         snap = _body.get("result") or {}
                         if snap and snap.get('density_matrix_hex'):
-                            logger.info(f"[RPC-ORACLE] ✅ RPC fallback succeeded with 64³ DM")
+                            logger.debug(f"[RPC-ORACLE] ✅ RPC fallback succeeded with 64³ DM")
                 except Exception as _rpc_e:
                     logger.debug(f"[RPC-ORACLE] RPC fallback failed: {_rpc_e}")
 
