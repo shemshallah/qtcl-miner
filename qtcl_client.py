@@ -13442,13 +13442,39 @@ class QtclClientApp:
                 if _has_aer and _HAS_NP_L:
                     with self._local_oracle_lock:
                         _nodes = list(self._local_oracle_nodes)
-                    _EXP_LOG.debug(f"[TRIPARTITE] Measuring {len(_nodes)} AerSimulator nodes...")
+                    _EXP_LOG.debug(f"[TRIPARTITE] Measuring {len(_nodes)} AerSimulator nodes in parallel...")
+                    import threading as _mth
+                    _measure_results = {}
+
+                    def _measure_node_thread(_node_id, _node):
+                        """Run node measurement in thread to parallelize."""
+                        try:
+                            _dm = self._client_oracle_measure_node(_node, seed_dm=seed)
+                            _measure_results[_node_id] = (_dm, None)
+                        except Exception as _me:
+                            _measure_results[_node_id] = (None, _me)
+
+                    # Launch parallel measurement threads
+                    _threads = []
                     for _node in _nodes:
-                        _dm = self._client_oracle_measure_node(_node, seed_dm=seed)
-                        _node['last_dm'] = _dm
-                        _node['last_ts'] = now
-                        dms.append(_dm)
-                        _EXP_LOG.debug(f"[TRIPARTITE] Node {_node['id']} measured — DM shape={_dm.shape}")
+                        _t = _mth.Thread(target=_measure_node_thread, args=(_node['id'], _node), daemon=True)
+                        _t.start()
+                        _threads.append(_t)
+
+                    # Wait for all measurements (with timeout)
+                    for _t in _threads:
+                        _t.join(timeout=15.0)
+
+                    # Collect results
+                    for _node in _nodes:
+                        _result, _err = _measure_results.get(_node['id'], (None, None))
+                        if _result is not None:
+                            _node['last_dm'] = _result
+                            _node['last_ts'] = now
+                            dms.append(_result)
+                            _EXP_LOG.debug(f"[TRIPARTITE] Node {_node['id']} measured — DM shape={_result.shape}")
+                        else:
+                            _EXP_LOG.warning(f"[TRIPARTITE] Node {_node['id']} measurement failed: {_err}")
 
                 # ── Step 2: 3-of-3 Hermitian mean ─────────────────────────
                 if _HAS_NP_L and dms:
