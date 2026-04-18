@@ -14809,13 +14809,16 @@ class QtclClientApp:
             # Oracle DM available — build real blockfield
             _live_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0) or {}
             _dm_hex = _live_snap.get('density_matrix_hex', '')
+            if not _dm_hex or len(_dm_hex) < 32:
+                # NO fallback — must have density matrix
+                logger.error("[BLOCKFIELD] ❌ FATAL: No valid density matrix from RPC")
+                raise RuntimeError("RPC snapshot failed: no density matrix")
             _fid    = float(_live_snap.get('w_state_fidelity') or
                             _live_snap.get('fidelity') or 0.0)
             _ent    = get_mining_entropy(32)
+            # Fixed operator precedence: must hash DM bytes + block height together
             _pow_seed = hashlib.sha256(
-                _ent +
-                bytes.fromhex(_dm_hex[:64]) +
-                _bh.to_bytes(8, 'big') if _dm_hex else _ent
+                (_ent + bytes.fromhex(_dm_hex[:64]) + _bh.to_bytes(8, 'big'))
             ).digest()
             _meas = {
                 'block_height':    _bh,
