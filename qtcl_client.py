@@ -15350,11 +15350,26 @@ class QtclClientApp:
 
         # ── Load wallet before mining (required for block signatures) ──────────────
         if not self.wallet.is_loaded():
-            print("  🔑 Wallet password required for mining", flush=True)
-            if not self._load_wallet():
-                print("  ❌ Failed to load wallet — mining cannot proceed", flush=True)
-                raise RuntimeError("Wallet required for mining but failed to load")
-        print(f"  ✅ Wallet loaded: {self.wallet.address}", flush=True)
+            print("  🔑 Loading wallet for mining…", flush=True)
+            # Try environment variable first
+            import os as _os
+            wallet_pw = _os.environ.get('WALLET_PASSWORD', '').strip()
+            if wallet_pw:
+                if self.wallet.load(wallet_pw):
+                    print(f"  ✅ Wallet loaded from WALLET_PASSWORD env var: {self.wallet.address}", flush=True)
+                else:
+                    print("  ❌ Wallet password from WALLET_PASSWORD env var failed", flush=True)
+            # Try interactive if not loaded yet
+            if not self.wallet.is_loaded():
+                try:
+                    if self._load_wallet():
+                        print(f"  ✅ Wallet loaded: {self.wallet.address}", flush=True)
+                    else:
+                        print("  ⚠️  Wallet password prompt failed — continuing with unsigned blocks", flush=True)
+                except Exception as _walletload_err:
+                    print(f"  ⚠️  Wallet load error: {_walletload_err} — continuing with unsigned blocks", flush=True)
+        else:
+            print(f"  ✅ Wallet already loaded: {self.wallet.address}", flush=True)
 
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
