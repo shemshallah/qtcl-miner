@@ -15176,7 +15176,7 @@ class QtclClientApp:
         # Blocks in SQLite should MIRROR server's PostgreSQL, not be separate
         print("  🔄 Syncing blockchain from server (IBD)…")
         try:
-            _synced = self.db.sync_chain_from_server(self.api, batch_size=100)
+            _synced = self.db.sync_chain_from_server(self.api)
             if _synced > 0:
                 print(f"  ✅ IBD complete: synced {_synced} blocks")
                 # Re-query block height after sync
