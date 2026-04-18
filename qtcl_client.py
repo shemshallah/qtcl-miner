@@ -1420,10 +1420,62 @@ class HypGammaWallet:
     def get_address(self) -> str:
         """Get wallet address."""
         return self.keypair.address if self.keypair else ""
-    
+
     def export_keypair(self) -> Dict[str, str]:
         """Export keypair as dict."""
         return self.keypair.to_dict() if self.keypair else {}
+
+    # ── Compatibility properties for wallet menu ──────────────────────────
+    @property
+    def address(self) -> Optional[str]:
+        """Wallet address (compatible with QTCLWallet interface)."""
+        return self.keypair.address if self.keypair else None
+
+    @property
+    def public_key(self) -> Optional[str]:
+        """Public key (compatible with QTCLWallet interface)."""
+        return self.keypair.public_key if self.keypair else None
+
+    @property
+    def private_key(self) -> Optional[str]:
+        """Private key (compatible with QTCLWallet interface)."""
+        return self.keypair.private_key if self.keypair else None
+
+    @property
+    def wallet_file(self) -> Path:
+        """Return path to wallet file (for compatibility, not used)."""
+        data_dir = Path("data")
+        return data_dir / "wallet.json"
+
+    @property
+    def mnemonic_file(self) -> Path:
+        """Return path to mnemonic file (for compatibility, not used)."""
+        data_dir = Path("data")
+        return data_dir / "wallet_mnemonic.enc"
+
+    def is_loaded(self) -> bool:
+        """Check if wallet is loaded. HypGammaWallet always has keypair after init."""
+        return bool(self.keypair)
+
+    def create(self, password: str) -> str:
+        """Create new wallet. HypGammaWallet is singleton, so return current address."""
+        if not self.is_loaded():
+            raise RuntimeError("Wallet not initialized")
+        return self.address
+
+    def load(self, password: str) -> bool:
+        """Load wallet. HypGammaWallet auto-loads on init, so always True."""
+        return self.is_loaded()
+
+    def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
+        """Restore from mnemonic. Not supported by HypGammaWallet (no BIP-39)."""
+        logger.warning("[HYP-WALLET] restore_from_mnemonic not supported (HypΓ uses direct key generation)")
+        return False
+
+    def show_mnemonic(self, password: str) -> Optional[str]:
+        """Show mnemonic. HypGammaWallet doesn't use mnemonics."""
+        logger.warning("[HYP-WALLET] show_mnemonic not supported (HypΓ uses direct key generation)")
+        return None
 
 
 class HypGammaEngine:
@@ -17060,7 +17112,7 @@ class QtclClientApp:
                 if not pw:
                     print("  ❌ Password required"); continue
                 try:
-                    addr = QTCLWallet().create(pw)
+                    addr = HypGammaWallet().create(pw)
                     print(f"  ✅ Created: {addr}")
                 except Exception as e:
                     print(f"  ❌ {e}")
@@ -17075,7 +17127,7 @@ class QtclClientApp:
                 print(f"  wallet_mnemonic   : {self.wallet.mnemonic_file}")
                 print(f"  Encryption        : HypΓ lattice cipher (post-quantum)")
                 print(f"  Mnemonic stored   : Encrypted with HypΓ-XOF key derivation")
-                print(f"                      ({QTCLWallet.SALT_BYTES}-byte salt, post-quantum secure)")
+                print(f"                      (32-byte salt, post-quantum secure)")
                 print(f"  BIP-39 wordlist   : Embedded in qtcl_client.py (2048-word standard list)")
                 print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
             elif ch == "5":
@@ -17083,7 +17135,7 @@ class QtclClientApp:
                     pw = getpass.getpass("  Wallet password: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     continue
-                phrase = QTCLWallet().show_mnemonic(pw)
+                phrase = HypGammaWallet().show_mnemonic(pw)
                 if phrase:
                     words = phrase.split()
                     print("\n" + "═" * 60)
@@ -17097,30 +17149,11 @@ class QtclClientApp:
             elif ch == "6":
                 break
     def _recover_mnemonic(self) -> None:
-        print("\n  BIP-39 Recovery — enter 12 words space-separated")
-        try:
-            phrase = input("  Words: ").strip().lower()
-            pw     = getpass.getpass("  New password: ").strip()
-            pw2    = getpass.getpass("  Confirm     : ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("  ❌ Cancelled"); return
-        if pw != pw2:
-            print("  ❌ Passwords don't match"); return
-        if not pw:
-            print("  ❌ Password required"); return
-        words = phrase.split()
-        if len(words) != 12:
-            print(f"  ❌ Need 12 words, got {len(words)}"); return
-        bad = [w for w in words if w not in QTCLWallet._W]
-        if bad:
-            print(f"  ❌ Invalid BIP-39 word(s): {', '.join(bad[:5])}"); return
-        w = QTCLWallet()
-        if w.restore_from_mnemonic(phrase, pw):
-            self.wallet = w
-            print(f"  ✅ Recovered: {w.address}")
-            w._print_mnemonic()
-        else:
-            print("  ❌ Recovery failed")
+        print("\n  ⚠️  Mnemonic Recovery")
+        print("  HypΓ wallet uses direct key generation (not BIP-39).")
+        print("  Recovery from mnemonic is not supported.")
+        print("  ℹ️  Use 'Show address / public key' to view your current wallet.")
+        return
     _T_GRN  = "\033[92m"
     _T_RED  = "\033[91m"
     _T_YLW  = "\033[93m"
@@ -18995,7 +19028,7 @@ def main() -> None:  # noqa: F811
                         print("  ⚠  Empty password — using defaults")
                         _new_pw = "default_qtcl_password"
                     
-                    _tmp_create_wallet = QTCLWallet()
+                    _tmp_create_wallet = HypGammaWallet()
                     _new_addr = _tmp_create_wallet.create(_new_pw)
                     print(f"  ✅ Wallet created: {_new_addr}")
                     _new_pw = "0" * len(_new_pw)
@@ -19031,7 +19064,7 @@ def main() -> None:  # noqa: F811
                 logger.setLevel(_orig_level)
             if _oracle_ans == "y":
                 print()
-                _tmp_wallet = QTCLWallet()
+                _tmp_wallet = HypGammaWallet()
                 try:
                     _pw_oi = _silent_getpass("  Wallet password: ")
                     if _tmp_wallet.load(_pw_oi):
