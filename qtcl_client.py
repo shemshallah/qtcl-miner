@@ -16178,9 +16178,8 @@ class QtclClientApp:
                     # ── HypΓ-sign the block ──
                     try:
                         if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
-                            _hyp_adapter = HypGammaWallet()
                             _block_dict_for_sig = submit_payload["header"].copy()
-                            _sig = _hyp_adapter.sign_block(_block_dict_for_sig, self.wallet.private_key)
+                            _sig = self.wallet.sign_block(_block_dict_for_sig, self.wallet.private_key)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hyp_signature"] = _sig
                                 submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
