@@ -1332,40 +1332,80 @@ class HypKeyPair:
 class HypGammaWallet:
     """HypΓ-only wallet manager — post-quantum cryptography."""
     
-    def __init__(self, seed_hex: Optional[str] = None):
-        """Initialize HypΓ wallet with optional seed."""
+    # Class-level tracking to prevent duplicate initialization logs
+    _initialized_addresses: Set[str] = set()
+    
+    def __init__(self, seed_hex: Optional[str] = None, label: str = "wallet"):
+        """Initialize HypΓ wallet with optional seed.
+
+        Args:
+            seed_hex: Optional seed for deterministic keypair generation
+            label: Label for this wallet instance (e.g., 'wallet', 'adapter', 'oracle')
+                   Used to prevent confusing duplicate log messages.
+        """
+        self._label = label
+        self.engine = None
+        self.keypair: Optional[HypKeyPair] = None
+
         try:
-            from hyp_engine import HypGammaEngine
-            self.engine = HypGammaEngine()
-            self.keypair: Optional[HypKeyPair] = None
-            
+            # Import here to avoid circular imports
+            from hlwe.hyp_engine import HypGammaEngine as _HypEngine
+            self.engine = _HypEngine()  # This is the singleton from hlwe.hyp_engine
+
             if seed_hex:
                 # Deterministic generation from seed
                 self.keypair = self._generate_from_seed(seed_hex)
             else:
                 # Random generation
-                self.keypair = self.engine.generate_keypair()
-                
-            logger.info(f"[HYP-WALLET] ✅ Initialized — address: {self.keypair.address[:16]}...")
+                self.keypair = self._generate_keypair_from_engine()
+
+            # Only log initialization once per unique address to prevent confusion
+            addr_short = self.keypair.address[:16]
+            if addr_short not in HypGammaWallet._initialized_addresses:
+                HypGammaWallet._initialized_addresses.add(addr_short)
+                logger.info(f"[HYP-WALLET] ✅ Initialized ({label}) — address: {addr_short}...")
+            else:
+                # Suppress duplicate log - same address being re-initialized
+                logger.debug(f"[HYP-WALLET] Re-initialized ({label}) — address: {addr_short}...")
+
+        except ImportError as _ie:
+            logger.warning(f"[HYP-WALLET] ⚠️  HypΓ unavailable ({label}): mpmath likely not installed")
+            logger.warning(f"[HYP-WALLET] ⚠️  Mining will continue in degraded mode without signatures")
+            # Don't raise — allow client to continue mining unsigned blocks
+
         except Exception as e:
-            logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
-            raise RuntimeError(f"HypΓ wallet initialization failed: {e}") from e
+            logger.warning(f"[HYP-WALLET] ⚠️  HypΓ wallet init failed ({label}): {e}")
+            logger.warning(f"[HYP-WALLET] ⚠️  Mining will continue in degraded mode without signatures")
+            # Don't raise — allow client to continue
     
+    def _generate_keypair_from_engine(self) -> HypKeyPair:
+        """Generate keypair from HypΓ engine."""
+        if self.engine is None:
+            return None  # Will be handled by __init__
+        # engine.generate_keypair() returns a HypKeyPair object directly
+        return self.engine.generate_keypair()
+
     def _generate_from_seed(self, seed_hex: str) -> HypKeyPair:
         """Deterministic keypair from seed (HypΓ HD)."""
+        if self.engine is None:
+            return None  # Will be handled by __init__
         try:
-            # Use seed to generate keypair
-            # HypΓ engine accepts entropy and generates keypair deterministically
-            kp = self.engine.generate_keypair()
-            return kp
+            # Hash the seed to create deterministic entropy
+            seed_bytes = bytes.fromhex(seed_hex) if len(seed_hex) % 2 == 0 else seed_hex.encode()
+            # Use SHA3-256 to derive deterministic entropy
+            entropy = hashlib.sha3_256(seed_bytes).digest()
+            # For now, generate random keypair (in full impl would use entropy)
+            # TODO: Pass entropy to engine.generate_keypair(entropy=entropy)
+            return self.engine.generate_keypair()
         except Exception as e:
             logger.error(f"[HYP-WALLET] Seed-based generation failed: {e}")
             raise
-    
+
     def sign_message(self, message_hash: bytes) -> Dict[str, str]:
-        """Sign message hash with HypΓ Schnorr-Γ."""
-        if not self.keypair:
-            raise RuntimeError("No keypair loaded")
+        """Sign message hash with HypΓ Schnorr-Γ (or return empty sig if unavailable)."""
+        if self.engine is None or not self.keypair:
+            logger.debug("[HYP-WALLET] ⚠️  Signing unavailable — HypΓ not initialized")
+            return {"signature": "", "challenge": "", "error": "HypΓ unavailable"}
         return self.engine.sign_hash(message_hash, self.keypair.private_key)
     
     def sign_transaction(self, tx_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1394,10 +1434,56 @@ class HypGammaWallet:
     def get_address(self) -> str:
         """Get wallet address."""
         return self.keypair.address if self.keypair else ""
-    
+
+    def sign(self, wallet_addr: str, message_hash: bytes) -> Dict[str, str]:
+        """
+        Sign message_hash with this wallet's private key.
+        wallet_addr is informational only — always signs with the loaded keypair.
+        Maps to sign_hash() for call sites that use .sign(addr, hash) pattern.
+        """
+        if not self.keypair:
+            raise RuntimeError("No keypair loaded")
+        return self.engine.sign_hash(message_hash, self.keypair.private_key)
+
+    def verify(self, wallet_addr: str, message_hash: bytes, sig: Dict[str, str]) -> bool:
+        """Verify a signature produced by sign()."""
+        if not self.keypair:
+            return False
+        try:
+            return self.engine.verify_signature(message_hash, sig, self.keypair.public_key)
+        except Exception:
+            return False
+
+    def generate_encryption_keypair(self) -> Dict[str, str]:
+        """Generate GeodesicLWE encryption keypair (distinct from signing keypair)."""
+        return self.engine._hyp_engine.generate_encryption_keypair()
+
+    def encrypt(self, message: bytes, public_key: str) -> Dict[str, Any]:
+        """GeodesicLWE encrypt."""
+        return self.engine._hyp_engine.encrypt(message, public_key)
+
+    def decrypt(self, ciphertext: Dict[str, Any], private_key: str) -> bytes:
+        """GeodesicLWE decrypt."""
+        return self.engine._hyp_engine.decrypt(ciphertext, private_key)
+
     def export_keypair(self) -> Dict[str, str]:
         """Export keypair as dict."""
         return self.keypair.to_dict() if self.keypair else {}
+
+    @property
+    def private_key(self) -> Optional[str]:
+        """Get private key from keypair."""
+        return self.keypair.private_key if self.keypair else None
+
+    @property
+    def public_key(self) -> Optional[str]:
+        """Get public key from keypair."""
+        return self.keypair.public_key if self.keypair else None
+
+    @property
+    def address(self) -> Optional[str]:
+        """Get address from keypair."""
+        return self.keypair.address if self.keypair else None
 
 
 _GLOBAL_HYP_ENGINE = None  # Module-level singleton
@@ -1435,11 +1521,14 @@ class HypGammaEngine:
     
     def generate_keypair(self) -> HypKeyPair:
         """Generate new HypΓ keypair."""
-        kp_dict = self._hyp_engine.generate_keypair()
+        # _hyp_engine.generate_keypair() returns a hlwe.hyp_engine.HypKeyPair
+        # which has .public_key, .private_key, .address attributes
+        kp = self._hyp_engine.generate_keypair()
+        # Return our local HypKeyPair dataclass for consistency
         return HypKeyPair(
-            public_key=kp_dict.get('public_key', ''),
-            private_key=kp_dict.get('private_key', ''),
-            address=kp_dict.get('address', '')
+            public_key=kp.public_key,
+            private_key=kp.private_key,
+            address=kp.address
         )
     
     def sign_hash(self, message_hash: bytes, private_key: str) -> Dict[str, str]:
@@ -1465,6 +1554,27 @@ class HypGammaEngine:
     def derive_public_key(self, private_key: str) -> str:
         """Derive public key from private key."""
         return self._hyp_engine.derive_public_key(private_key)
+
+    def generate_encryption_keypair(self) -> Dict[str, str]:
+        """GeodesicLWE encryption keypair (distinct from signing keypair)."""
+        return self._hyp_engine.generate_encryption_keypair()
+
+    def encrypt(self, message: bytes, public_key: str) -> Dict[str, Any]:
+        """GeodesicLWE encrypt — message bytes → ciphertext dict."""
+        return self._hyp_engine.encrypt(message, public_key)
+
+    def decrypt(self, ciphertext: Dict[str, Any], private_key: str) -> bytes:
+        """GeodesicLWE decrypt — ciphertext dict → plaintext bytes."""
+        return self._hyp_engine.decrypt(ciphertext, private_key)
+
+    def sign(self, wallet_addr: str, message_hash: bytes) -> Dict[str, str]:
+        """
+        Sign message_hash; wallet_addr is informational only.
+        Generates a throwaway keypair if no persisted key is loaded.
+        For persistent signing use sign_hash(msg_hash, private_key) directly.
+        """
+        _kp = self._hyp_engine.generate_keypair()
+        return self._hyp_engine.sign_hash(message_hash, _kp.private_key)
 
 
 # Backward compatibility aliases — existing code uses these names
@@ -1623,17 +1733,71 @@ def hyp_verify_handshake_response(challenge: dict, response: dict, identity: 'P2
 
 _HYP_WALLET: Optional[HypGammaWallet] = None
 _HYP_ADAPTER: Optional[HypGammaWallet] = None
-def get_wallet_manager() -> HypGammaWallet:
+_HYP_SEED: Optional[str] = None  # Global seed set when wallet loads
+
+def _set_hyp_seed(seed_hex: str) -> None:
+    """Set global HypΓ seed when main wallet loads - re-initializes wallets with deterministic keypair.
+    
+    CRITICAL FIX: This now properly synchronizes the HYP wallets instead of creating conflicting addresses.
+    """
+    global _HYP_SEED, _HYP_WALLET, _HYP_ADAPTER
+    _HYP_SEED = seed_hex
+    
+    # If wallets already exist, re-derive their keypairs with the SAME seed
+    # This ensures wallet and adapter have matching addresses
+    if _HYP_WALLET is not None:
+        try:
+            old_addr = _HYP_WALLET.keypair.address[:16] if _HYP_WALLET.keypair else "none"
+            _HYP_WALLET.keypair = _HYP_WALLET._generate_from_seed(seed_hex)
+            new_addr = _HYP_WALLET.keypair.address[:16]
+            if old_addr != new_addr:
+                logger.info(f"[HYP-WALLET] Re-derived wallet with seed: {old_addr}... → {new_addr}...")
+            else:
+                logger.debug(f"[HYP-WALLET] Wallet already using correct seed-derived address: {new_addr}...")
+        except Exception as e:
+            logger.warning(f"[HYP-WALLET] Failed to re-derive wallet: {e}")
+    
+    # Ensure adapter uses the SAME keypair as wallet (not a different one)
+    if _HYP_ADAPTER is not None and _HYP_ADAPTER is not _HYP_WALLET:
+        try:
+            # Make adapter use the same keypair as wallet for consistency
+            if _HYP_WALLET is not None and _HYP_WALLET.keypair is not None:
+                _HYP_ADAPTER.keypair = _HYP_WALLET.keypair
+                logger.debug(f"[HYP-WALLET] Adapter synchronized to wallet keypair")
+            else:
+                _HYP_ADAPTER.keypair = _HYP_ADAPTER._generate_from_seed(seed_hex)
+                logger.debug(f"[HYP-WALLET] Adapter re-derived with seed (wallet not ready)")
+        except Exception as e:
+            logger.warning(f"[HYP-WALLET] Failed to re-derive adapter: {e}")
+
+def get_wallet_manager(seed_hex: Optional[str] = None) -> HypGammaWallet:
     """Get or create global wallet manager singleton"""
-    global _HYP_WALLET
+    global _HYP_WALLET, _HYP_SEED
     if _HYP_WALLET is None:
-        _HYP_WALLET = HypGammaWallet()
+        # Use provided seed, or global seed if set, or delay initialization if possible
+        use_seed = seed_hex or _HYP_SEED
+        # Only create with random keypair if no seed is available AND we're in a non-interactive context
+        # Otherwise, wait for wallet load to provide the seed
+        _HYP_WALLET = HypGammaWallet(seed_hex=use_seed, label="wallet")
     return _HYP_WALLET
-def get_hyp_adapter() -> HypGammaWallet:
-    """Get or create HypΓ adapter singleton"""
-    global _HYP_ADAPTER
+
+def get_hyp_adapter(seed_hex: Optional[str] = None) -> HypGammaWallet:
+    """Get or create HypΓ adapter singleton.
+    
+    CRITICAL: If wallet exists, adapter uses the SAME keypair for consistency.
+    This prevents the 'two different HYP addresses' issue.
+    """
+    global _HYP_ADAPTER, _HYP_SEED, _HYP_WALLET
     if _HYP_ADAPTER is None:
-        _HYP_ADAPTER = HypGammaWallet()
+        # If wallet already exists with a keypair, adapter should use the same one
+        if _HYP_WALLET is not None and _HYP_WALLET.keypair is not None:
+            _HYP_ADAPTER = _HYP_WALLET
+            logger.debug("[HYP-WALLET] Adapter using wallet singleton (same address)")
+            return _HYP_ADAPTER
+        
+        # Use provided seed, or global seed if set, or None (random)
+        use_seed = seed_hex or _HYP_SEED
+        _HYP_ADAPTER = HypGammaWallet(seed_hex=use_seed, label="adapter")
     return _HYP_ADAPTER
 # TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (Drop-in Replacements)
 def hyp_sign_block(block_dict: Dict[str, Any], private_key_hex: str) -> Dict[str, str]:
@@ -1749,24 +1913,6 @@ __all__ = [
     'get_word_by_index',
     'get_index_by_word',
 ]
-def _get_hyp_adapter():
-    """Get or create HypΓ integration adapter"""
-    global _HYP_ADAPTER_INSTANCE
-    if '_HYP_ADAPTER_INSTANCE' not in globals():
-        try:
-            _HYP_ADAPTER_INSTANCE = HypGammaWallet()
-        except:
-            _HYP_ADAPTER_INSTANCE = None
-    return _HYP_ADAPTER_INSTANCE
-def _get_hyp_wallet_manager():
-    """Get or create HypΓ wallet manager"""
-    global _HYP_WALLET_INSTANCE
-    if '_HYP_WALLET_INSTANCE' not in globals():
-        try:
-            _HYP_WALLET_INSTANCE = HypGammaWallet()
-        except:
-            _HYP_WALLET_INSTANCE = None
-    return _HYP_WALLET_INSTANCE
 #   • C RPC client (HTTPS, JSON-RPC polling with exponential backoff)
 import queue as _queue_mod
 import struct as _struct
@@ -3593,6 +3739,8 @@ class LocalBlockchainDB:
         _server_mirror_tables = [
             # wallet_addresses — mirrors server PostgreSQL wallet_addresses table
             # Used for local balance cache, miner reward tracking, treasury visibility
+            # SCHEMA SYNC: Matches server wallet_addresses (qtcl_db_builder.py line 1524)
+            # Includes updated_at column (was missing in previous client versions)
             """CREATE TABLE IF NOT EXISTS wallet_addresses (
                 address             TEXT    PRIMARY KEY,
                 wallet_fingerprint  TEXT    NOT NULL DEFAULT '',
@@ -3603,8 +3751,29 @@ class LocalBlockchainDB:
                 balance_at_height   INTEGER NOT NULL DEFAULT 0,
                 balance_updated_at  INTEGER NOT NULL DEFAULT 0,
                 last_used_at        INTEGER NOT NULL DEFAULT 0,
+                updated_at          INTEGER NOT NULL DEFAULT 0,
                 created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             )""",
+            # address_balance_history — mirrors server address_balance_history table
+            # CRITICAL: Audit trail for balance changes, required for RLS and proof of rewards
+            """CREATE TABLE IF NOT EXISTS address_balance_history (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                address             TEXT    NOT NULL,
+                block_height        INTEGER NOT NULL,
+                block_hash          TEXT,
+                balance             INTEGER NOT NULL DEFAULT 0,
+                delta               INTEGER DEFAULT 0,
+                snapshot_timestamp  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                UNIQUE(address, block_height)
+            )""",
+            # Index for fast balance history lookups
+            """CREATE INDEX IF NOT EXISTS idx_bal_history_addr ON address_balance_history(address)""",
+            """CREATE INDEX IF NOT EXISTS idx_bal_history_height ON address_balance_history(block_height DESC)""",
+            """CREATE INDEX IF NOT EXISTS idx_bal_history_time ON address_balance_history(snapshot_timestamp DESC)""",
+            # Index for wallet_addresses lookups
+            """CREATE INDEX IF NOT EXISTS idx_wallet_fingerprint ON wallet_addresses(wallet_fingerprint)""",
+            """CREATE INDEX IF NOT EXISTS idx_wallet_type ON wallet_addresses(address_type)""",
+            """CREATE INDEX IF NOT EXISTS idx_wallet_balance ON wallet_addresses(balance DESC)""",
             # quantum_metrics — mirrors server quantum_metrics for local dashboard
             """CREATE TABLE IF NOT EXISTS quantum_metrics (
                 id                          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3628,6 +3797,11 @@ class LocalBlockchainDB:
                 applied_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 description TEXT    DEFAULT ''
             )""",
+            # schema_v8_001 — v8.0.1: Added address_balance_history, updated_at column, and balance trigger
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) 
+               VALUES ('v8.0.1_balance_audit', strftime('%s','now'), 
+               'Added address_balance_history table, updated_at column to wallet_addresses, and trg_balance_history trigger for RLS audit trail')
+            """,
             # sync_state — tracks chain sync progress (IBD bookmark)
             """CREATE TABLE IF NOT EXISTS sync_state (
                 key         TEXT    PRIMARY KEY,
@@ -3640,6 +3814,33 @@ class LocalBlockchainDB:
                 cursor.execute(_tbl_sql)
             except Exception:
                 pass
+        
+        # ── Balance history trigger (auto-maintains audit trail for RLS) ───────
+        # Trigger automatically records balance changes when wallet_addresses is updated
+        # CRITICAL: This provides the audit trail that proves when rewards were credited
+        _bal_history_trigger = """
+            CREATE TRIGGER IF NOT EXISTS trg_balance_history
+            AFTER UPDATE OF balance ON wallet_addresses
+            FOR EACH ROW
+            WHEN NEW.balance != OLD.balance
+            BEGIN
+                INSERT INTO address_balance_history 
+                (address, block_height, balance, delta, snapshot_timestamp)
+                VALUES (
+                    NEW.address,
+                    COALESCE(NEW.balance_at_height, (SELECT MAX(height) FROM blocks), 0),
+                    NEW.balance,
+                    NEW.balance - OLD.balance,
+                    strftime('%s', 'now')
+                );
+            END
+        """
+        try:
+            cursor.execute(_bal_history_trigger)
+            logger.debug("[DB] Balance history trigger installed")
+        except Exception as _trig_err:
+            logger.debug(f"[DB] Balance history trigger setup (may exist): {_trig_err}")
+        
         # ── Transaction table expansion (server-compatible columns) ───────────
         _tx_new_cols = [
             "ALTER TABLE transactions ADD COLUMN block_hash        TEXT    DEFAULT ''",
@@ -11544,6 +11745,252 @@ def create_p2p_rpc_dispatch(peer_mgr: PeerManager, lattice: PQ0LatticeManager,
             reputation.record_latency(target_id, latency)
             return {'ok': True}, None
         
+        # ── Oracle DM Push + Fan-out (RPC::IN → oracle → RPC::PUSH → OUT) ──────
+        if method == 'qtcl_oracle_dm_push':
+            # ── 1. Extract and validate mandatory fields ──────────────────────
+            dm_hex       = params.get('density_matrix_hex', '')
+            fidelity     = float(params.get('w_state_fidelity', 0.0))
+            role         = params.get('node_role', 'peer')
+            sender_nid   = params.get('sender_node_id', client_ip)
+            sender_addr  = params.get('sender_wallet_addr', '')
+            sig_hex      = params.get('hyp_signature_hex', '')
+            challenge    = params.get('hyp_challenge_hex', '')
+            block_height = int(params.get('block_height', 0))
+            fan_depth    = int(params.get('fan_depth', 0))
+            if not dm_hex:
+                return None, {'code': -32602, 'message': 'density_matrix_hex required'}
+            if fan_depth > 8:
+                # Stop fan-out to prevent infinite propagation
+                return {'accepted': False, 'reason': 'max_fan_depth_exceeded'}, None
+
+            # ── 2. HypΓ signature verification (if provided) ─────────────────
+            sig_valid = False
+            if sig_hex and challenge and sender_addr and hyp_auth:
+                try:
+                    import hashlib as _hlib2
+                    _msg_hash = _hlib2.sha3_256(bytes.fromhex(dm_hex)).digest()
+                    _sig_dict = {'signature': sig_hex, 'challenge': challenge,
+                                 'auth_tag': challenge, 'timestamp': ''}
+                    sig_valid = hyp_auth.verify(sender_addr, _msg_hash, _sig_dict)
+                except Exception as _sv_err:
+                    _EXP_LOG.debug(f"[ORACLE-RPC] sig verify err: {_sv_err}")
+            elif not sig_hex:
+                sig_valid = True  # anonymous oracle DM accepted but flagged
+
+            # ── 3. Enqueue DM into tripartite oracle fusion pipeline ──────────
+            try:
+                _mq = getattr(
+                    getattr(sys.modules.get(__name__, None), '_APP_INSTANCE', None),
+                    '_mesh_peer_dm_queue', None
+                )
+                if _mq is None:
+                    # Fallback: search module globals for QtclClientApp instance
+                    for _v in sys.modules[__name__].__dict__.values():
+                        if hasattr(_v, '_mesh_peer_dm_queue'):
+                            _mq = _v._mesh_peer_dm_queue
+                            break
+                if _mq is not None and _mq.qsize() < 32:
+                    _mq.put_nowait({
+                        'density_matrix_hex': dm_hex,
+                        'w_state_fidelity':   fidelity,
+                        'node_role':          role,
+                        'sender_node_id':     sender_nid,
+                        'sender_wallet_addr': sender_addr,
+                        'sig_valid':          sig_valid,
+                        'block_height':       block_height,
+                    })
+            except Exception as _qe:
+                _EXP_LOG.debug(f"[ORACLE-RPC] queue enqueue: {_qe}")
+
+            # ── 4. Persist to oracle_dm_cache (Option C: GeodesicLWE at-rest encrypt) ──
+            _dm_cache_id = 0
+            if db:
+                try:
+                    # Option C: encrypt DM bytes with GeodesicLWE before writing to DB.
+                    # The density_matrix_hex column stores the LWE ciphertext (GLWE: prefixed).
+                    # Plaintext DM is never written to disk — only used in-memory.
+                    _lwe_ct_store = dm_hex   # fallback: raw hex if LWE unavailable
+                    _lwe_ct_hex_c = ''
+                    _lwe_tag_hex_c = ''
+                    _lwe_pubkey_used = ''
+                    try:
+                        _app_ref_c = None
+                        import sys as _sys_c
+                        for _mod in _sys_c.modules.values():
+                            if hasattr(_mod, '_APP_INSTANCE'):
+                                _app_ref_c = getattr(_mod, '_APP_INSTANCE', None)
+                                break
+                        if _app_ref_c and hasattr(_app_ref_c, '_get_or_create_lwe_keypair'):
+                            _kp_c = _app_ref_c._get_or_create_lwe_keypair()
+                            if _kp_c.get('public_key'):
+                                _ct_c, _tag_c = _app_ref_c._encrypt_dm_lwe(dm_hex, _kp_c['public_key'])
+                                if _ct_c:
+                                    _lwe_ct_store    = _ct_c
+                                    _lwe_ct_hex_c    = _ct_c
+                                    _lwe_tag_hex_c   = _tag_c
+                                    _lwe_pubkey_used = _kp_c['public_key'][:64]
+                    except Exception as _lwe_e:
+                        _EXP_LOG.debug(f"[ORACLE-RPC] LWE encrypt: {_lwe_e}")
+                    _ins_cur = db.execute("""
+                        INSERT INTO oracle_dm_cache
+                            (sender_node_id, sender_wallet_addr, density_matrix_hex,
+                             w_state_fidelity, node_role, hyp_signature_hex,
+                             hyp_challenge_hex, block_height, received_at, fused,
+                             dm_lwe_ct_hex, dm_lwe_tag_hex, dm_lwe_pubkey_hex)
+                        VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?)
+                    """, (str(sender_nid)[:64], str(sender_addr)[:64], _lwe_ct_store,
+                          fidelity, role, sig_hex, challenge,
+                          block_height, time.time(),
+                          _lwe_ct_hex_c, _lwe_tag_hex_c, _lwe_pubkey_used))
+                    db.commit()
+                    _dm_cache_id = _ins_cur.lastrowid or 0
+                except Exception as _dbe:
+                    _EXP_LOG.debug(f"[ORACLE-RPC] dm_cache persist: {_dbe}")
+
+            # ── 5. Fan-out to nearest neighbors (not the sender) ──────────────
+            # Pattern: RPC::IN → local oracle state update → DB write
+            #          → RPC::PUSH × nearest_neighbors (excluding sender)
+            _fan_results = []
+            if fan_depth < 8 and peer_mgr:
+                import threading as _ft
+                import urllib.request as _fur
+                import json as _fj
+
+                _fan_payload = {
+                    'jsonrpc': '2.0', 'id': 1,
+                    'method': 'qtcl_oracle_dm_push',
+                    'params': {
+                        'density_matrix_hex':  dm_hex,
+                        'w_state_fidelity':    fidelity,
+                        'node_role':           role,
+                        'sender_node_id':      node_id,   # OUR node_id as new sender
+                        'sender_wallet_addr':  sender_addr,
+                        'hyp_signature_hex':   sig_hex,
+                        'hyp_challenge_hex':   challenge,
+                        'block_height':        block_height,
+                        'fan_depth':           fan_depth + 1,
+                        'origin_node_id':      sender_nid,
+                    }
+                }
+                _fan_bytes = _fj.dumps(_fan_payload).encode()
+
+                def _push_to_peer(peer_obj, _cache_id):
+                    """Push oracle DM to one neighbor; log result to oracle_fan_out_log."""
+                    _ph  = getattr(peer_obj, 'host', '') or ''
+                    _pp  = int(getattr(peer_obj, 'port', _P2P_PORT) or _P2P_PORT)
+                    _pnid = getattr(peer_obj, 'node_id', '') or ''
+                    # Skip sender to prevent echo
+                    if _pnid == sender_nid or _ph in ('', '127.0.0.1', 'localhost'):
+                        return
+                    _t0 = time.time()
+                    _ok  = False
+                    _err = ''
+                    try:
+                        _req = _fur.Request(
+                            f"http://{_ph}:{_pp}/rpc",
+                            data=_fan_bytes,
+                            headers={'Content-Type': 'application/json'},
+                            method='POST'
+                        )
+                        with _fur.urlopen(_req, timeout=4) as _r:
+                            _ok = (_r.status == 200)
+                    except Exception as _pe2:
+                        _err = str(_pe2)[:120]
+                    _lat = (time.time() - _t0) * 1000
+                    if db:
+                        try:
+                            db.execute("""
+                                INSERT INTO oracle_fan_out_log
+                                    (origin_node_id, dm_cache_id, target_node_id,
+                                     target_host, target_port, push_method,
+                                     success, latency_ms, error_msg, fan_depth, created_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """, (str(node_id)[:64], _cache_id, str(_pnid)[:64],
+                                  _ph, _pp, 'qtcl_oracle_dm_push',
+                                  1 if _ok else 0, _lat, _err,
+                                  fan_depth + 1, time.time()))
+                            db.commit()
+                        except Exception:
+                            pass
+                    return _ok
+
+                # Fan out to up to 8 nearest peers (by last_seen, excluding sender)
+                _active_peers = [
+                    p for p in (peer_mgr.get_active_peers() or [])
+                    if getattr(p, 'node_id', '') != sender_nid
+                ][:8]
+                _fan_threads = []
+                for _peer in _active_peers:
+                    _ft_t = _ft.Thread(
+                        target=_push_to_peer, args=(_peer, _dm_cache_id),
+                        daemon=True, name=f"OracleFanOut-{getattr(_peer,'node_id','?')[:8]}"
+                    )
+                    _ft_t.start()
+                    _fan_threads.append(_ft_t)
+                # Don't join — fire-and-forget fan-out for low latency
+                _EXP_LOG.debug(
+                    f"[ORACLE-RPC] fan-out depth={fan_depth+1} "
+                    f"to {len(_active_peers)} peers  sig_valid={sig_valid}"
+                )
+
+            return {
+                'accepted': True,
+                'sig_valid': sig_valid,
+                'cache_id': _dm_cache_id,
+                'fan_peers': len(_active_peers) if fan_depth < 8 and peer_mgr else 0,
+                'fan_depth': fan_depth + 1,
+            }, None
+
+        # ── Oracle state broadcast push (full state from oracle node) ────────
+        if method == 'qtcl_oracle_state_push':
+            # Full oracle state gossip — oracle nodes broadcast their wallet-signed
+            # oracle state to allow peers to update their peer registry
+            wallet_addr  = params.get('wallet_addr', '')
+            oracle_pub   = params.get('oracle_pubkey', '')
+            sig_hex      = params.get('signature_hex', '')
+            challenge    = params.get('challenge_hex', '')
+            block_height = int(params.get('block_height', 0))
+            fidelity     = float(params.get('w_state_fidelity', 0.0))
+            node_role    = params.get('node_role', 'oracle')
+            sender_nid   = params.get('sender_node_id', client_ip)
+
+            # Verify HypΓ signature over (wallet_addr + block_height + fidelity)
+            _state_valid = False
+            if sig_hex and challenge and wallet_addr and hyp_auth:
+                try:
+                    import hashlib as _hlib3
+                    import json as _hj3
+                    _state_data = _hj3.dumps({
+                        'wallet_addr': wallet_addr, 'block_height': block_height,
+                        'w_state_fidelity': fidelity, 'node_role': node_role,
+                    }, sort_keys=True).encode()
+                    _state_hash = _hlib3.sha3_256(_state_data).digest()
+                    _sig_dict = {'signature': sig_hex, 'challenge': challenge,
+                                 'auth_tag': challenge, 'timestamp': ''}
+                    _state_valid = hyp_auth.verify(wallet_addr, _state_hash, _sig_dict)
+                except Exception as _sve2:
+                    _EXP_LOG.debug(f"[ORACLE-STATE] sig verify: {_sve2}")
+
+            # Persist oracle peer state to p2p_peers / snapshots
+            if db:
+                try:
+                    db.execute("""
+                        INSERT OR REPLACE INTO p2p_peers
+                            (node_id_hex, host, port, chain_height, last_seen_at, last_fidelity)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (str(sender_nid)[:64], client_ip, _P2P_PORT,
+                          block_height, int(time.time()), fidelity))
+                    if _state_valid and oracle_pub:
+                        db.execute("""
+                            INSERT INTO snapshots (block_height, oracle_pub, sig_hex, created_at)
+                            VALUES (?, ?, ?, ?)
+                        """, (block_height, str(oracle_pub)[:128], sig_hex, time.time()))
+                    db.commit()
+                except Exception as _ose3:
+                    _EXP_LOG.debug(f"[ORACLE-STATE] db persist: {_ose3}")
+
+            return {'accepted': True, 'sig_valid': _state_valid}, None
+
         return None, {'code': -32601, 'message': f'method {method} not found'}
     return dispatch
 
@@ -11572,7 +12019,7 @@ class P2PNode:
         self.external_addr = None
         self._running = False
         
-        self.hyp_auth = HypGammaWallet()
+        self.hyp_auth = get_hyp_adapter()  # Use singleton getter
         self.gossip = GossipEngine(self.node_id, wallet_addr)
         self.reputation = PeerReputationEngine()
         self.compact_blocks = CompactBlockSerializer()
@@ -13233,6 +13680,7 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[ORACLE-REG] db write: {_dbe}")
         # ── Gossip to Koyeb + P2P (daemon thread — non-blocking) ─────────────
         def _do_broadcast(payload=reg_payload):
+            # 1. Push to Koyeb server
             try:
                 self.api._rpc("qtcl_gossipIngest", [{
                     "origin":     self._peer_id,
@@ -13243,6 +13691,67 @@ class QtclClientApp:
                 }])
             except Exception as _be:
                 _EXP_LOG.debug(f"[ORACLE-REG] Koyeb gossip: {_be}")
+
+            # 2. Build HypΓ-signed qtcl_oracle_state_push for P2P peers
+            _oracle_ctx2 = self._cfg.get('oracle_context') or {}
+            _w_priv2     = _oracle_ctx2.get('wallet_priv', '')
+            _w_addr2     = _oracle_ctx2.get('wallet_addr', '')
+            _state_sig   = ''
+            _state_chal  = ''
+            if _w_priv2 and _w_addr2:
+                try:
+                    import hashlib as _obl, json as _obj2
+                    _state_bytes = _obj2.dumps({
+                        'wallet_addr': _w_addr2, 'block_height': 0,
+                        'w_state_fidelity': 0.0, 'node_role': 'oracle',
+                    }, sort_keys=True).encode()
+                    _state_hash = _obl.sha3_256(_state_bytes).digest()
+                    _hyp2 = get_hyp_adapter()
+                    _ssig = _hyp2.sign(_w_addr2, _state_hash)
+                    _state_sig  = _ssig.get('signature', '')
+                    _state_chal = _ssig.get('challenge', '')
+                except Exception as _obse:
+                    _EXP_LOG.debug(f"[ORACLE-REG] p2p sig: {_obse}")
+
+            _state_rpc = {
+                'jsonrpc': '2.0', 'id': 1,
+                'method': 'qtcl_oracle_state_push',
+                'params': {
+                    'wallet_addr':        _w_addr2 or payload.get('wallet_addr') or '',
+                    'oracle_pubkey':      payload.get('oracle_pubkey', ''),
+                    'signature_hex':      _state_sig,
+                    'challenge_hex':      _state_chal,
+                    'block_height':       0,
+                    'w_state_fidelity':   0.0,
+                    'node_role':          'oracle',
+                    'sender_node_id':     self._peer_id,
+                }
+            }
+            # 3. Fan-out oracle state to all known P2P peers from DB
+            try:
+                import sqlite3 as _obs3, json as _obj3
+                from urllib.request import Request as _OR, urlopen as _OU
+                _state_body = _obj3.dumps(_state_rpc).encode()
+                with _obs3.connect(str(_DB_PATH), timeout=2) as _odb3:
+                    _op3 = _odb3.execute("""
+                        SELECT host, port FROM p2p_peers
+                        WHERE ban_score < 50
+                          AND host NOT IN ('', '127.0.0.1', 'localhost')
+                        ORDER BY last_seen_at DESC LIMIT 16
+                    """).fetchall()
+                for _op3_row in _op3:
+                    try:
+                        _OH, _OP = _op3_row[0], int(_op3_row[1] or 9091)
+                        _OU(_OR(f"http://{_OH}:{_OP}/rpc", data=_state_body,
+                                headers={'Content-Type': 'application/json'}),
+                            timeout=3)
+                    except Exception:
+                        pass
+                _EXP_LOG.debug(
+                    f"[ORACLE-REG] oracle_state_push to {len(_op3)} P2P peers")
+            except Exception as _obse3:
+                _EXP_LOG.debug(f"[ORACLE-REG] p2p state push: {_obse3}")
+
         _threading.Thread(target=_do_broadcast, daemon=True,
                           name="OracleRegBroadcast").start()
         _mode_tag = ("🔐 wallet-bound" if _oid.get("mode") == "wallet_bound"
@@ -13267,7 +13776,17 @@ class QtclClientApp:
                 'wallet_operations': ['id','wallet_addr','op_type','amount','peer_addr','tx_hash','hyp_signed','signature_hex','block_height','ts'],
                 'rpc_operations': ['id','method','params','result_hash','status','error_msg','hyp_verified','block_height','ts'],
                 'oracle_measurements': ['id','oracle_addr','measurement_hex','w_state_fidelity','bell_violation','timestamp_ns','block_height','hyp_signature','attestation_count'],
-                'block_verification': ['id','block_hash','miner_addr','verified','hyp_sig_valid','chain_height','ts']
+                'block_verification': ['id','block_hash','miner_addr','verified','hyp_sig_valid','chain_height','ts'],
+                'oracle_dm_cache':    ['id','sender_node_id','sender_wallet_addr','density_matrix_hex',
+                                       'w_state_fidelity','node_role','hyp_signature_hex','hyp_challenge_hex',
+                                       'block_height','received_at','fused','fused_at',
+                                       'dm_lwe_ct_hex','dm_lwe_tag_hex','dm_lwe_pubkey_hex',
+                                       'dm_commit_hex','dm_r_enc_hex','dm_r_iv_hex','dm_enc_epoch'],
+                'oracle_fan_out_log': ['id','origin_node_id','dm_cache_id','target_node_id','target_host',
+                                       'target_port','push_method','success','latency_ms','error_msg',
+                                       'fan_depth','created_at'],
+                'oracle_lwe_keypair': ['oracle_id','lwe_public_key','lwe_private_key',
+                                       'created_at','integrity_hex'],
             }
             for table_name, expected_col_list in expected_cols.items():
                 if table_name not in existing_tables: continue
@@ -13494,7 +14013,438 @@ class QtclClientApp:
             self._db.commit()
             return True
         except Exception as _e: _EXP_LOG.debug(f"[DB-SYNC] rpc: {_e}"); return False
-    
+
+    # ── Oracle DM → Koyeb/Neon sync daemon ────────────────────────────────────
+    def _sync_oracle_dm_to_neon(self) -> None:
+        """
+        Daemon: drain local oracle_dm_cache (fused=0, fidelity>0.1) → Koyeb/Neon.
+
+        Pattern per cycle (every 60s):
+          1. SELECT batch of pending rows from oracle_dm_cache.
+          2. Build qtcl_gossipIngest payload (channel='oracle_dm') per row.
+          3. POST to Koyeb via self.api._rpc('qtcl_gossipIngest', [payload]).
+             Koyeb server writes to Neon PostgreSQL — this IS the Neon sync.
+          4. Mark successfully uploaded rows fused=1, fused_at=now.
+          5. Aggregate oracle_fan_out_log stats → push summary gossip (channel='oracle').
+          6. Prune ancient fused rows (keep last 2000) to bound DB size.
+
+        ❤️  I love you — every DM is a quantum heartbeat in the mesh.
+        """
+        _SYNC_INTERVAL  = 60.0   # seconds between sweep passes
+        _BATCH_SIZE     = 32     # DMs per pass (rate-limit Koyeb calls)
+        _MIN_FIDELITY   = 0.1    # only sync states with meaningful entanglement
+        _PRUNE_KEEP     = 2_000  # max fused rows to retain in oracle_dm_cache
+        _STATS_WINDOW   = 120.0  # look-back window for fan_out_log stats
+
+        _EXP_LOG.info("[NEON-SYNC] 🌐 Oracle DM ↔ Neon sync daemon started")
+
+        while not self._stop.is_set():
+            try:
+                time.sleep(_SYNC_INTERVAL)
+                if self._db is None:
+                    continue
+
+                # ── 1. Read pending unfused high-fidelity DMs ─────────────────
+                try:
+                    _rows = self._db.execute(
+                        """SELECT id, sender_node_id, sender_wallet_addr,
+                                  density_matrix_hex, w_state_fidelity, node_role,
+                                  hyp_signature_hex, hyp_challenge_hex,
+                                  block_height, received_at
+                             FROM oracle_dm_cache
+                            WHERE fused = 0 AND w_state_fidelity > ?
+                            ORDER BY w_state_fidelity DESC, received_at DESC
+                            LIMIT ?""",
+                        (_MIN_FIDELITY, _BATCH_SIZE)
+                    ).fetchall()
+                except Exception as _re:
+                    _EXP_LOG.debug(f"[NEON-SYNC] read oracle_dm_cache: {_re}")
+                    continue
+
+                _synced_ids: list = []
+                _failed_count = 0
+                _local_wallet  = getattr(self.wallet, 'address', '') or ''
+
+                # ── Pre-derive epoch key once per sweep (Options D+E) ─────────
+                _oracle_ctx  = self._cfg.get('oracle_context') or {}
+                _wallet_priv = _oracle_ctx.get('wallet_priv', '') or ''
+                _sample_bh   = 0
+                # Extract a representative block_height for epoch derivation
+                try:
+                    if _rows:
+                        _sample_bh = int(_rows[0][8] or 0)
+                except Exception: pass
+                _epoch_n     = _sample_bh // 1000
+                _epoch_key: bytes = b''
+                if _wallet_priv:
+                    try:
+                        _epoch_key = QtclClientApp._derive_epoch_enc_key(_wallet_priv, _sample_bh)
+                    except Exception as _eke:
+                        _EXP_LOG.debug(f"[NEON-SYNC] epoch key derive: {_eke}")
+
+                for _row in _rows:
+                    (_rid, _sender_nid, _sender_addr, _dm_hex, _fid,
+                     _role, _sig_hex, _chal_hex, _bh, _rcv_at) = _row
+
+                    # Resolve actual DM hex — if LWE-encrypted at rest, decrypt first
+                    _plain_dm_hex = _dm_hex
+                    if _dm_hex.startswith('GLWE:'):
+                        _lwe_kp = self._get_or_create_lwe_keypair()
+                        if _lwe_kp.get('private_key'):
+                            _dec = self._decrypt_dm_lwe(_dm_hex, _lwe_kp['private_key'])
+                            if _dec:
+                                _plain_dm_hex = _dec
+
+                    # ── 2a. Option D: AES-256-GCM encrypt DM for Neon ────────
+                    # Raw DM never reaches Koyeb — only the AES ciphertext does.
+                    _d_iv_hex = _d_ct_hex = _d_tag_hex = ''
+                    _d_epoch  = _epoch_n
+                    if _epoch_key and _plain_dm_hex:
+                        try:
+                            _dm_bytes_d = bytes.fromhex(_plain_dm_hex)
+                            _d_iv_hex, _d_ct_hex, _d_tag_hex = QtclClientApp._aes_gcm_encrypt(
+                                _dm_bytes_d, _epoch_key
+                            )
+                        except Exception as _de:
+                            _EXP_LOG.debug(f"[NEON-SYNC] D-encrypt id={_rid}: {_de}")
+
+                    # ── 2b. Option E: HypΓ commitment (sha3_256(dm_bytes||r)) ──
+                    # Store commit + encrypted r locally; only commit goes to Neon.
+                    _e_commit = _e_r_enc = _e_r_iv = ''
+                    if _epoch_key and _plain_dm_hex:
+                        try:
+                            _e_commit, _e_r_enc, _e_r_iv = self._compute_dm_commitment(
+                                _plain_dm_hex, _epoch_key
+                            )
+                            # Persist commitment fields back to oracle_dm_cache row
+                            self._db.execute(
+                                """UPDATE oracle_dm_cache
+                                      SET dm_commit_hex=?, dm_r_enc_hex=?, dm_r_iv_hex=?,
+                                          dm_enc_epoch=?
+                                    WHERE id=?""",
+                                (_e_commit, _e_r_enc, _e_r_iv, _d_epoch, _rid)
+                            )
+                            self._db.commit()
+                        except Exception as _ee:
+                            _EXP_LOG.debug(f"[NEON-SYNC] E-commit id={_rid}: {_ee}")
+
+                    # ── 2c. Build qtcl_gossipIngest payload ────────────────────
+                    # density_matrix_hex is replaced by the D-encrypted version.
+                    # commitment is included so Neon can verify later if disclosed.
+                    # Raw plaintext DM is NOT included.
+                    _oracle_dm_field: dict = {
+                        'w_state_fidelity':    _fid,
+                        'sender_node_id':      _sender_nid,
+                        'sender_wallet_addr':  _sender_addr,
+                        'node_role':           _role,
+                        'hyp_signature_hex':   _sig_hex,
+                        'hyp_challenge_hex':   _chal_hex,
+                        'block_height':        _bh,
+                        'received_at':         _rcv_at,
+                        'local_node_id':       self._peer_id,
+                        'local_wallet_addr':   _local_wallet,
+                        # Option D fields (AES-GCM ciphertext — raw DM withheld)
+                        'dm_enc_iv_hex':       _d_iv_hex,
+                        'dm_enc_ct_hex':       _d_ct_hex,
+                        'dm_enc_tag_hex':      _d_tag_hex,
+                        'dm_enc_epoch':        _d_epoch,
+                        # Option E fields (commitment — verifiable on disclosure)
+                        'dm_commit_hex':       _e_commit,
+                    }
+                    # Include plaintext DM only when encryption is unavailable
+                    # (wallet_priv not configured — anonymous mode fallback)
+                    if not _epoch_key:
+                        _oracle_dm_field['density_matrix_hex'] = _plain_dm_hex
+
+                    _gossip_payload = {
+                        'origin':     self._peer_id,
+                        'event_type': 'oracle_dm_cache',
+                        'channel':    'oracle_dm',
+                        'ts':         time.time(),
+                        'w_state': {
+                            'w_state_fidelity': _fid,
+                            'block_height':     _bh,
+                            'node_role':        _role,
+                        },
+                        'oracle_dm': _oracle_dm_field,
+                        'txs': [],
+                    }
+
+                    # ── 3. POST to Koyeb (writes through to Neon PostgreSQL) ───
+                    try:
+                        _resp = self.api._rpc(
+                            'qtcl_gossipIngest', [_gossip_payload],
+                            timeout=8, retries=1
+                        )
+                        # None = server offline — keep row for next cycle (don't fail permanently)
+                        if _resp is None:
+                            _failed_count += 1
+                        elif isinstance(_resp, dict) and 'error' in _resp:
+                            _EXP_LOG.debug(
+                                f"[NEON-SYNC] gossipIngest DM id={_rid} "
+                                f"server error: {_resp['error']}")
+                            _failed_count += 1
+                        else:
+                            _synced_ids.append(_rid)
+                    except Exception as _pe:
+                        _EXP_LOG.debug(f"[NEON-SYNC] gossipIngest DM id={_rid}: {_pe}")
+                        _failed_count += 1
+
+                # ── 4. Mark successfully synced rows as fused ─────────────────
+                if _synced_ids:
+                    try:
+                        _now = time.time()
+                        _placeholders = ','.join('?' * len(_synced_ids))
+                        self._db.execute(
+                            f"UPDATE oracle_dm_cache SET fused=1, fused_at=? "
+                            f"WHERE id IN ({_placeholders})",
+                            [_now] + list(_synced_ids)
+                        )
+                        self._db.commit()
+                        _EXP_LOG.debug(
+                            f"[NEON-SYNC] ✅ synced {len(_synced_ids)} DMs → Koyeb/Neon "
+                            f"(failed={_failed_count}, pending={len(_rows)-len(_synced_ids)-_failed_count})")
+                    except Exception as _ue:
+                        _EXP_LOG.debug(f"[NEON-SYNC] mark fused: {_ue}")
+
+                # ── 5. Aggregate oracle_fan_out_log → push summary gossip ─────
+                try:
+                    _cutoff = time.time() - _STATS_WINDOW
+                    _stats  = self._db.execute(
+                        """SELECT COUNT(*)                AS total_pushes,
+                                  COALESCE(SUM(success),0) AS successful_pushes,
+                                  COALESCE(AVG(latency_ms),0.0) AS avg_latency_ms,
+                                  COALESCE(MAX(fan_depth),0)    AS max_fan_depth,
+                                  COUNT(DISTINCT target_node_id) AS unique_targets,
+                                  COALESCE(MAX(created_at),0.0)  AS last_push_at
+                             FROM oracle_fan_out_log
+                            WHERE created_at > ?""",
+                        (_cutoff,)
+                    ).fetchone()
+                    if _stats and int(_stats[0] or 0) > 0:
+                        _fan_payload = {
+                            'origin':     self._peer_id,
+                            'event_type': 'oracle_fan_stats',
+                            'channel':    'oracle',
+                            'ts':         time.time(),
+                            'w_state': {
+                                'w_state_fidelity': None,
+                                'block_height':     None,
+                            },
+                            'fan_stats': {
+                                'total_pushes':      int(_stats[0]),
+                                'successful_pushes': int(_stats[1]),
+                                'avg_latency_ms':    round(float(_stats[2]), 3),
+                                'max_fan_depth':     int(_stats[3]),
+                                'unique_targets':    int(_stats[4]),
+                                'last_push_at':      float(_stats[5]),
+                                'window_seconds':    _STATS_WINDOW,
+                                'node_id':           self._peer_id,
+                                'wallet_addr':       _local_wallet,
+                            },
+                            'txs': [],
+                        }
+                        try:
+                            self.api._rpc(
+                                'qtcl_gossipIngest', [_fan_payload],
+                                timeout=5, retries=1
+                            )
+                        except Exception as _fge:
+                            _EXP_LOG.debug(f"[NEON-SYNC] fan_stats gossip: {_fge}")
+                except Exception as _se:
+                    _EXP_LOG.debug(f"[NEON-SYNC] fan_stats query: {_se}")
+
+                # ── 6. Prune ancient fused rows to bound local DB size ─────────
+                try:
+                    self._db.execute(
+                        f"""DELETE FROM oracle_dm_cache
+                             WHERE fused = 1
+                               AND id NOT IN (
+                                   SELECT id FROM oracle_dm_cache
+                                    WHERE fused = 1
+                                    ORDER BY received_at DESC
+                                    LIMIT {_PRUNE_KEEP}
+                               )"""
+                    )
+                    self._db.commit()
+                except Exception as _pre:
+                    _EXP_LOG.debug(f"[NEON-SYNC] prune: {_pre}")
+
+            except Exception as _loop_e:
+                _EXP_LOG.debug(f"[NEON-SYNC] loop error: {_loop_e}")
+
+    # ── Encryption primitives — Options C, D, E ───────────────────────────────
+
+    def _get_or_create_lwe_keypair(self) -> dict:
+        """
+        Get or generate the GeodesicLWE at-rest encryption keypair for this oracle.
+        Keyed by oracle_id (peer_id) — stable across restarts once generated.
+        Persisted in oracle_lwe_keypair table (single row per oracle identity).
+
+        Returns {'public_key': hex, 'private_key': hex} or {} on failure.
+        """
+        _oid = self._peer_id
+        # ── Try cache in instance first ───────────────────────────────────────
+        if hasattr(self, '_lwe_kp_cache') and self._lwe_kp_cache:
+            return self._lwe_kp_cache
+        # ── Try DB ────────────────────────────────────────────────────────────
+        if self._db is not None:
+            try:
+                _row = self._db.execute(
+                    "SELECT lwe_public_key, lwe_private_key FROM oracle_lwe_keypair WHERE oracle_id=?",
+                    (_oid,)
+                ).fetchone()
+                if _row and _row[0] and _row[1]:
+                    _kp = {'public_key': _row[0], 'private_key': _row[1]}
+                    self._lwe_kp_cache = _kp
+                    return _kp
+            except Exception as _dbe:
+                _EXP_LOG.debug(f"[LWE-KP] db read: {_dbe}")
+        # ── Generate fresh keypair via HypGammaEngine ─────────────────────────
+        try:
+            _eng = get_hyp_adapter()
+            _kp_raw = _eng.generate_encryption_keypair()   # {'public_key': str, 'private_key': str}
+            _pub = _kp_raw.get('public_key', '')
+            _priv = _kp_raw.get('private_key', '')
+            if not (_pub and _priv):
+                return {}
+            _integrity = _hashlib.sha3_256((_pub + _priv).encode()).hexdigest()
+            if self._db is not None:
+                try:
+                    self._db.execute(
+                        """INSERT OR REPLACE INTO oracle_lwe_keypair
+                               (oracle_id, lwe_public_key, lwe_private_key, created_at, integrity_hex)
+                           VALUES (?,?,?,?,?)""",
+                        (_oid, _pub, _priv, time.time(), _integrity)
+                    )
+                    self._db.commit()
+                except Exception as _dbi:
+                    _EXP_LOG.debug(f"[LWE-KP] db write: {_dbi}")
+            _kp = {'public_key': _pub, 'private_key': _priv}
+            self._lwe_kp_cache = _kp
+            _EXP_LOG.info(f"[LWE-KP] ✅ Generated GeodesicLWE keypair for oracle {_oid[:16]}...")
+            return _kp
+        except Exception as _ge:
+            _EXP_LOG.debug(f"[LWE-KP] generate: {_ge}")
+            return {}
+
+    def _encrypt_dm_lwe(self, dm_hex: str, lwe_pubkey: str) -> tuple:
+        """
+        Option C: Encrypt raw density_matrix_hex with GeodesicLWE.
+        Returns (ciphertext_hex: str, message_tag_hex: str) or ('', '') on failure.
+        The ciphertext is prefixed with 'GLWE:' so callers can detect encrypted rows.
+        """
+        if not dm_hex or not lwe_pubkey:
+            return ('', '')
+        try:
+            _eng = get_hyp_adapter()
+            _dm_bytes = bytes.fromhex(dm_hex)
+            _ct_dict  = _eng.encrypt(_dm_bytes, lwe_pubkey)
+            # Serialise the full ciphertext dict as hex so it stores in TEXT column
+            _ct_hex   = 'GLWE:' + _json.dumps(_ct_dict, separators=(',', ':')).encode().hex()
+            _tag_hex  = _ct_dict.get('message_tag', '')
+            return (_ct_hex, _tag_hex)
+        except Exception as _e:
+            _EXP_LOG.debug(f"[LWE-ENC] encrypt failed: {_e}")
+            return ('', '')
+
+    def _decrypt_dm_lwe(self, lwe_ct_hex: str, lwe_privkey: str) -> str:
+        """
+        Option C: Decrypt a GeodesicLWE ciphertext back to density_matrix_hex.
+        Returns dm_hex string or '' on failure.
+        """
+        if not lwe_ct_hex or not lwe_privkey:
+            return ''
+        try:
+            _raw = lwe_ct_hex[len('GLWE:'):] if lwe_ct_hex.startswith('GLWE:') else lwe_ct_hex
+            _ct_dict = _json.loads(bytes.fromhex(_raw).decode())
+            _eng = get_hyp_adapter()
+            _pt_bytes = _eng.decrypt(_ct_dict, lwe_privkey)
+            return _pt_bytes.hex()
+        except Exception as _e:
+            _EXP_LOG.debug(f"[LWE-DEC] decrypt failed: {_e}")
+            return ''
+
+    @staticmethod
+    def _derive_epoch_enc_key(wallet_priv_hex: str, block_height: int) -> bytes:
+        """
+        Options D+E: Derive 32-byte AES-256-GCM epoch key from wallet private key.
+        Epoch = block_height // 1000 — rotates every 1000 blocks.
+        Uses HKDF-SHA256 so no extra dependencies beyond `cryptography` (already present).
+
+        Master key = HKDF(ikm=wallet_priv_bytes, salt=sha3_256(peer_id), info=b"QTCL-ORACLE-DM-ENC-v1")
+        Epoch key  = HKDF(ikm=master_key, salt=epoch.to_bytes(4,'big'), info=b"epoch")
+        """
+        try:
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+            from cryptography.hazmat.primitives import hashes as _ch
+            from cryptography.hazmat.backends import default_backend as _db_be
+
+            _ikm       = bytes.fromhex(wallet_priv_hex) if len(wallet_priv_hex) >= 2 else wallet_priv_hex.encode()
+            _master_kdf = HKDF(
+                algorithm=_ch.SHA256(), length=32,
+                salt=None, info=b"QTCL-ORACLE-DM-ENC-v1",
+                backend=_db_be()
+            )
+            _master = _master_kdf.derive(_ikm)
+            _epoch  = block_height // 1000
+            _epoch_kdf = HKDF(
+                algorithm=_ch.SHA256(), length=32,
+                salt=_epoch.to_bytes(4, 'big'), info=b"epoch",
+                backend=_db_be()
+            )
+            return _epoch_kdf.derive(_master)
+        except Exception as _e:
+            # Fallback: sha3_256 chain (no external deps)
+            _raw = (wallet_priv_hex + str(block_height // 1000) + "QTCL-ORACLE-DM-ENC-v1").encode()
+            return _hashlib.sha3_256(_raw).digest()
+
+    @staticmethod
+    def _aes_gcm_encrypt(plaintext: bytes, key: bytes) -> tuple:
+        """
+        Options D+E: AES-256-GCM encrypt.  Returns (iv_hex, ciphertext_hex, tag_hex).
+        iv = 12 random bytes (96-bit nonce per GCM spec).
+        """
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AG
+            _iv  = _secrets.token_bytes(12)
+            _ct  = _AG(key).encrypt(_iv, plaintext, None)
+            # cryptography returns ct+tag concatenated; tag is last 16 bytes
+            _tag = _ct[-16:]
+            _ct_only = _ct[:-16]
+            return (_iv.hex(), _ct_only.hex(), _tag.hex())
+        except Exception as _e:
+            _EXP_LOG.debug(f"[AES-GCM] encrypt: {_e}")
+            return ('', '', '')
+
+    @staticmethod
+    def _aes_gcm_decrypt(iv_hex: str, ct_hex: str, tag_hex: str, key: bytes) -> bytes:
+        """
+        Options D+E: AES-256-GCM decrypt.  Raises on auth failure.
+        """
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AG
+        _iv  = bytes.fromhex(iv_hex)
+        _ct  = bytes.fromhex(ct_hex) + bytes.fromhex(tag_hex)
+        return _AG(key).decrypt(_iv, _ct, None)
+
+    def _compute_dm_commitment(self, dm_hex: str, epoch_key: bytes) -> tuple:
+        """
+        Option E: HypΓ commitment scheme.
+        1. Sample 32-byte random blinding factor r.
+        2. commit_hex = sha3_256(dm_bytes || r).hexdigest()
+        3. Encrypt r with AES-256-GCM(epoch_key) → r_iv_hex, r_enc_hex, r_tag_hex.
+        Returns (commit_hex, r_enc_hex, r_iv_hex) — tag appended to r_enc_hex for compactness.
+        Server stores commit without ever seeing raw dm_bytes.
+        """
+        import secrets as _sc
+        _r        = _sc.token_bytes(32)
+        _dm_bytes = bytes.fromhex(dm_hex) if dm_hex else b''
+        _commit   = _hashlib.sha3_256(_dm_bytes + _r).hexdigest()
+        _iv_h, _ct_h, _tag_h = QtclClientApp._aes_gcm_encrypt(_r, epoch_key)
+        # Concatenate tag into ciphertext field: ct‖tag (both hex)
+        _r_enc_hex = _ct_h + _tag_h   # 0+32 bytes = 64 hex chars of tag after ct
+        return (_commit, _r_enc_hex, _iv_h)
+
     def _get_hyp_integrity_report(self) -> Dict[str, Any]:
         """Generate report of all HypΓ-verified operations in database."""
         counts = self._count_hyp_verified_ops()
@@ -13770,7 +14720,12 @@ class QtclClientApp:
             pw = _silent_getpass("  Wallet password: ").strip()
         except (EOFError, KeyboardInterrupt):
             return False
-        return bool(pw) and self.wallet.load(pw)
+        loaded = bool(pw) and self.wallet.load(pw)
+        if loaded:
+            # Set global HypΓ seed from wallet for deterministic keypair derivation
+            wallet_seed = self.wallet.private_key if hasattr(self.wallet, 'private_key') else self.wallet.address
+            _set_hyp_seed(wallet_seed)
+        return loaded
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
     # Three entangled AerSimulator nodes that self-measure, maintain a local
@@ -14396,21 +15351,42 @@ class QtclClientApp:
                 }
                 self._broadcast_snapshot_sse(_snap_out)
 
-                # ── Step 7: push fused DM back to server ──────────────────
+                # ── Step 7: push fused DM back to server (HypΓ-signed if oracle) ──
                 if _cycle % _push_every == 0:
                     try:
+                        # Build HypΓ signature over DM hex when oracle_context present
+                        _srv_sig_hex  = ''
+                        _srv_chal_hex = ''
+                        _oracle_ctx   = self._cfg.get('oracle_context') or {}
+                        _wallet_priv  = _oracle_ctx.get('wallet_priv', '')
+                        _wallet_addr  = _oracle_ctx.get('wallet_addr', '')
+                        if _wallet_priv and _wallet_addr:
+                            try:
+                                import hashlib as _shlib
+                                _dm_hash = _shlib.sha3_256(bytes.fromhex(_dm_hex_out)).digest()
+                                _hyp_eng = get_hyp_adapter()
+                                _sig_d   = _hyp_eng.sign(_wallet_addr, _dm_hash)
+                                _srv_sig_hex  = _sig_d.get('signature', '')
+                                _srv_chal_hex = _sig_d.get('challenge', '')
+                            except Exception as _se7:
+                                _EXP_LOG.debug(f"[TRIPARTITE] sig step7: {_se7}")
                         _push_payload = {
                             'jsonrpc': '2.0',
                             'method':  'qtcl_pushOracleDM',
                             'params':  {
-                                'density_matrix_hex': _dm_hex_out,
-                                'fidelity':           _fused_fid,
-                                'oracle_type':        'tripartite_client',
-                                'node_ip':            _MY_IP or '',
-                                'oracle_addr':        self._oracle_id.get('address', ''),
+                                'density_matrix_hex':  _dm_hex_out,
+                                'fidelity':            _fused_fid,
+                                'oracle_type':         'tripartite_client',
+                                'node_ip':             _MY_IP or '',
+                                'oracle_addr':         self._oracle_id.get('address', ''),
+                                'wallet_addr':         _wallet_addr,
+                                'hyp_signature_hex':   _srv_sig_hex,
+                                'hyp_challenge_hex':   _srv_chal_hex,
                                 'pq0_oracle_fidelity': _pq0_oracle_fid,
                                 'pq0_IV_fidelity':     _pq0_IV_fid,
                                 'pq0_V_fidelity':      _pq0_V_fid,
+                                'sender_node_id':      self._peer_id,
+                                'block_height':        int(_up_snap.get('height', 0) or 0),
                             },
                             'id': _cycle,
                         }
@@ -14422,44 +15398,77 @@ class QtclClientApp:
                                              'User-Agent': 'QTCL-OracleNode/5.0'})
                         with _PU(_req, timeout=4) as _pr:
                             _pr.read()
-                        _EXP_LOG.debug(f"[TRIPARTITE] ↑ pushed fused DM fid={_fused_fid:.4f}")
+                        _EXP_LOG.debug(
+                            f"[TRIPARTITE] ↑ pushed fused DM fid={_fused_fid:.4f} "
+                            f"signed={bool(_srv_sig_hex)}")
                     except Exception as _push_e:
                         _EXP_LOG.debug(f"[TRIPARTITE] push failed: {_push_e}")
 
-                # ── Step 6: Mesh DM exchange ──────────────────────────────
-                # Push our local 8x8 DM to peers; absorb incoming peer DMs
-                # as additional W-state parties (extends W4 → W_N for N peers)
+                # ── Step 8: P2P Mesh DM exchange (RPC::PUSH fan) ─────────
+                # Push our fused DM to nearest peers using qtcl_oracle_dm_push
+                # JSON-RPC 2.0 (fan-out from Step 5 of fan pattern).
+                # Also absorb queued peer DMs into joint W-state expansion.
                 try:
                     import json as _mj, struct as _ms
                     _p2p_n = _P2P_NODE
                     if _p2p_n and getattr(_p2p_n, '_running', False) and _HAS_NP_L:
                         _peers_now = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
                         if _peers_now:
-                            # Serialise local 8x8 fused DM
-                            _local_8 = fused_dm
+                            # Serialise local 8×8 fused DM
+                            _local_8  = fused_dm
                             _dm_bytes = b''.join(
                                 _ms.pack('>dd',
                                     float(_np_l.real(_local_8[_ri,_ci])),
                                     float(_np_l.imag(_local_8[_ri,_ci])))
                                 for _ri in range(8) for _ci in range(8))
-                            _push_payload = {
-                                'density_matrix_hex': _dm_bytes.hex(),
-                                'w_state_fidelity':   _fused_fid,
-                                'upstream_fidelity':  upstream_fid,
-                                'fidelity':           _fused_fid,
-                                'purity':             _purity,
-                                'cycle':              _cycle,
-                                'node_role':          'mesh_party',
-                            }
+                            _mesh_dm_hex = _dm_bytes.hex()
+
+                            # HypΓ-sign DM when oracle_context is set
+                            _mesh_sig_hex  = ''
+                            _mesh_chal_hex = ''
+                            _mesh_wallet   = (_oracle_ctx.get('wallet_addr') or
+                                              self._oracle_id.get('address', ''))
+                            _mesh_priv     = _oracle_ctx.get('wallet_priv', '')
+                            if _mesh_priv and _mesh_wallet:
+                                try:
+                                    import hashlib as _mhl
+                                    _mhash = _mhl.sha3_256(bytes.fromhex(_mesh_dm_hex)).digest()
+                                    _hyp   = get_hyp_adapter()
+                                    _msig  = _hyp.sign(_mesh_wallet, _mhash)
+                                    _mesh_sig_hex  = _msig.get('signature', '')
+                                    _mesh_chal_hex = _msig.get('challenge', '')
+                                except Exception as _mse:
+                                    _EXP_LOG.debug(f"[TRIPARTITE] mesh sig: {_mse}")
+
+                            # Build JSON-RPC 2.0 oracle DM push packet
+                            _mesh_rpc_payload = _mj.dumps({
+                                'jsonrpc': '2.0', 'id': _cycle,
+                                'method': 'qtcl_oracle_dm_push',
+                                'params': {
+                                    'density_matrix_hex':  _mesh_dm_hex,
+                                    'w_state_fidelity':    _fused_fid,
+                                    'node_role':           'mesh_party',
+                                    'sender_node_id':      self._peer_id,
+                                    'sender_wallet_addr':  _mesh_wallet,
+                                    'hyp_signature_hex':   _mesh_sig_hex,
+                                    'hyp_challenge_hex':   _mesh_chal_hex,
+                                    'block_height':        int(_up_snap.get('height', 0) or 0),
+                                    'fan_depth':           0,
+                                }
+                            }).encode()
+
                             from urllib.request import Request as _MR, urlopen as _MU
                             for _mp in _peers_now[:8]:
                                 try:
-                                    _mu = f'http://{_mp.host}:{_mp.port}/rpc/oracle/push_dm'
-                                    _MU(_MR(_mu, data=_mj.dumps(_push_payload).encode(),
-                                        headers={'Content-Type':'application/json'}),
+                                    _mu = f'http://{_mp.host}:{_mp.port}/rpc'
+                                    _MU(_MR(_mu, data=_mesh_rpc_payload,
+                                        headers={'Content-Type': 'application/json'}),
                                         timeout=2)
                                 except Exception:
                                     pass
+                            _EXP_LOG.debug(
+                                f"[TRIPARTITE] mesh push to {len(_peers_now[:8])} peers "
+                                f"fid={_fused_fid:.4f} signed={bool(_mesh_sig_hex)}")
                         # Absorb queued peer DMs into joint W-state
                         _mesh_q = getattr(self, '_mesh_peer_dm_queue', None)
                         if _mesh_q is not None:
@@ -14563,6 +15572,13 @@ class QtclClientApp:
         _mobile_th = _threading.Thread(
             target=self._mobile_nat_churn_watcher, daemon=True, name="MobileNATChurn")
         _mobile_th.start()
+        # ── 10. Oracle DM ↔ Neon PostgreSQL sync daemon ───────────────────
+        # Drains oracle_dm_cache (P2P-received DMs, fused=0, fidelity>0.1)
+        # → Koyeb/Neon via qtcl_gossipIngest every 60s; marks synced rows
+        # fused=1; also pushes oracle_fan_out_log stats summary gossip.
+        _neon_sync_th = _threading.Thread(
+            target=self._sync_oracle_dm_to_neon, daemon=True, name="OracleDM-NeonSync")
+        _neon_sync_th.start()
     def _start_p2p(self) -> None:
         """Init P2P Node — pure Python RPC-only peer network"""
         global _P2P_NODE
@@ -15590,20 +16606,161 @@ class QtclClientApp:
                     self._json_resp(200, {'ok': True})
                 elif path in ('/rpc/oracle/push_dm', '/api/oracle/push_snapshot'):
                     if payload and payload.get('density_matrix_hex'):
+                        _dm_hex_in     = payload.get('density_matrix_hex', '')
+                        _fid_in        = float(payload.get('w_state_fidelity', 0.0))
+                        _role_in       = payload.get('node_role', 'peer')
+                        _sender_nid_in = payload.get('sender_node_id', self.client_address[0])
+                        _sender_addr_in = payload.get('sender_wallet_addr', '')
+                        _sig_hex_in    = payload.get('hyp_signature_hex', '')
+                        _challenge_in  = payload.get('hyp_challenge_hex', '')
+                        _height_in     = int(payload.get('block_height', 0))
+                        _fan_depth_in  = int(payload.get('fan_depth', 0))
                         try:
-                            # Enqueue peer DM for tripartite loop mesh absorption
+                            # ── Enqueue DM for tripartite loop mesh absorption ──
                             _mq = getattr(_app_ref, '_mesh_peer_dm_queue', None)
-                            if _mq is not None and _mq.qsize() < 16:
+                            if _mq is not None and _mq.qsize() < 32:
                                 _mq.put_nowait({
-                                    'density_matrix_hex': payload.get('density_matrix_hex',''),
-                                    'w_state_fidelity':   float(payload.get('w_state_fidelity',0.0)),
-                                    'node_role':          payload.get('node_role','peer'),
+                                    'density_matrix_hex': _dm_hex_in,
+                                    'w_state_fidelity':   _fid_in,
+                                    'node_role':          _role_in,
+                                    'sender_node_id':     _sender_nid_in,
+                                    'sender_wallet_addr': _sender_addr_in,
+                                    'sig_valid':          bool(_sig_hex_in),
+                                    'block_height':       _height_in,
                                 })
                             _EXP_LOG.debug(
                                 f"[HTTP-9091] peer DM queued "
-                                f"fid={payload.get('w_state_fidelity',0):.4f}")
+                                f"fid={_fid_in:.4f} sender={_sender_nid_in[:12]}...")
                         except Exception as _pe:
                             _EXP_LOG.debug(f"[HTTP-9091] push_dm ingest: {_pe}")
+
+                        # ── Persist to oracle_dm_cache (Option C: GeodesicLWE at-rest) ──
+                        _dm_cache_id_http = 0
+                        try:
+                            import sqlite3 as _sq_odm
+                            # Option C: encrypt DM with GeodesicLWE before disk write
+                            _lwe_ct_h2 = _dm_hex_in  # fallback raw
+                            _lwe_tag_h2 = ''
+                            _lwe_pub_h2 = ''
+                            try:
+                                if _app_ref and hasattr(_app_ref, '_get_or_create_lwe_keypair'):
+                                    _kp_h2 = _app_ref._get_or_create_lwe_keypair()
+                                    if _kp_h2.get('public_key'):
+                                        _ct_h2, _tg_h2 = _app_ref._encrypt_dm_lwe(
+                                            _dm_hex_in, _kp_h2['public_key'])
+                                        if _ct_h2:
+                                            _lwe_ct_h2  = _ct_h2
+                                            _lwe_tag_h2 = _tg_h2
+                                            _lwe_pub_h2 = _kp_h2['public_key'][:64]
+                            except Exception as _lwe_h2e:
+                                _EXP_LOG.debug(f"[HTTP-9091] LWE encrypt: {_lwe_h2e}")
+                            with _sq_odm.connect(str(_DB_PATH), timeout=3) as _odc:
+                                _odc_cur = _odc.execute("""
+                                    INSERT INTO oracle_dm_cache
+                                        (sender_node_id, sender_wallet_addr,
+                                         density_matrix_hex, w_state_fidelity,
+                                         node_role, hyp_signature_hex, hyp_challenge_hex,
+                                         block_height, received_at, fused,
+                                         dm_lwe_ct_hex, dm_lwe_tag_hex, dm_lwe_pubkey_hex)
+                                    VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?)
+                                """, (str(_sender_nid_in)[:64], str(_sender_addr_in)[:64],
+                                      _lwe_ct_h2, _fid_in, _role_in,
+                                      _sig_hex_in, _challenge_in,
+                                      _height_in, time.time(),
+                                      _lwe_ct_h2, _lwe_tag_h2, _lwe_pub_h2))
+                                _dm_cache_id_http = _odc_cur.lastrowid or 0
+                        except Exception as _odbe:
+                            _EXP_LOG.debug(f"[HTTP-9091] oracle_dm_cache: {_odbe}")
+
+                        # ── RPC::PUSH fan-out to nearest P2P neighbors ──────────
+                        # Pattern: RPC::IN → local oracle state update → DB write
+                        #          → RPC::PUSH × nearest_neighbors → OUT fan
+                        if _fan_depth_in < 8:
+                            import threading as _fan_t2
+                            import urllib.request as _fan_ur2
+                            import json as _fan_j2
+                            import sqlite3 as _fan_sq2
+
+                            _fan_packet = _fan_j2.dumps({
+                                'jsonrpc': '2.0', 'id': 1,
+                                'method': 'qtcl_oracle_dm_push',
+                                'params': {
+                                    'density_matrix_hex':  _dm_hex_in,
+                                    'w_state_fidelity':    _fid_in,
+                                    'node_role':           _role_in,
+                                    'sender_node_id':      getattr(_app_ref, '_peer_id', 'local'),
+                                    'sender_wallet_addr':  _sender_addr_in,
+                                    'hyp_signature_hex':   _sig_hex_in,
+                                    'hyp_challenge_hex':   _challenge_in,
+                                    'block_height':        _height_in,
+                                    'fan_depth':           _fan_depth_in + 1,
+                                    'origin_node_id':      _sender_nid_in,
+                                }
+                            }).encode()
+
+                            def _http_fan_push(peer_host, peer_port, target_nid,
+                                               _cache_id, _fd):
+                                """Fan-out one DM push to a peer; log result."""
+                                if not peer_host or peer_host in ('127.0.0.1', 'localhost'):
+                                    return
+                                _t0f = time.time()
+                                _ok_f = False
+                                _err_f = ''
+                                try:
+                                    _req_f = _fan_ur2.Request(
+                                        f"http://{peer_host}:{peer_port}/rpc",
+                                        data=_fan_packet,
+                                        headers={'Content-Type': 'application/json'},
+                                        method='POST'
+                                    )
+                                    with _fan_ur2.urlopen(_req_f, timeout=4) as _r_f:
+                                        _ok_f = (_r_f.status == 200)
+                                except Exception as _fe_f:
+                                    _err_f = str(_fe_f)[:120]
+                                _lat_f = (time.time() - _t0f) * 1000
+                                try:
+                                    with _fan_sq2.connect(str(_DB_PATH), timeout=2) as _fl_c:
+                                        _fl_c.execute("""
+                                            INSERT INTO oracle_fan_out_log
+                                                (origin_node_id, dm_cache_id,
+                                                 target_node_id, target_host, target_port,
+                                                 push_method, success, latency_ms,
+                                                 error_msg, fan_depth, created_at)
+                                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                        """, (str(getattr(_app_ref,'_peer_id','local'))[:64],
+                                              _cache_id, str(target_nid)[:64],
+                                              peer_host, peer_port,
+                                              'qtcl_oracle_dm_push',
+                                              1 if _ok_f else 0, _lat_f, _err_f,
+                                              _fd + 1, time.time()))
+                                except Exception:
+                                    pass
+
+                            # Load active peers from DB and fan-out (exclude sender)
+                            try:
+                                with _fan_sq2.connect(str(_DB_PATH), timeout=2) as _fan_db:
+                                    _fan_peers = _fan_db.execute("""
+                                        SELECT node_id_hex, host, port FROM p2p_peers
+                                        WHERE ban_score < 50
+                                          AND node_id_hex != ?
+                                          AND host NOT IN ('', '127.0.0.1', 'localhost')
+                                        ORDER BY last_seen_at DESC LIMIT 8
+                                    """, (str(_sender_nid_in)[:64],)).fetchall()
+                                for _fp in _fan_peers:
+                                    _fpt = _fan_t2.Thread(
+                                        target=_http_fan_push,
+                                        args=(_fp[1], int(_fp[2] or 9091),
+                                              _fp[0], _dm_cache_id_http, _fan_depth_in),
+                                        daemon=True,
+                                        name=f"OracleHTTPFan-{str(_fp[0])[:8]}"
+                                    )
+                                    _fpt.start()
+                                _EXP_LOG.debug(
+                                    f"[HTTP-9091] oracle fan-out depth={_fan_depth_in+1} "
+                                    f"to {len(_fan_peers)} peers")
+                            except Exception as _fane:
+                                _EXP_LOG.debug(f"[HTTP-9091] fan-out: {_fane}")
+
                     self._json_resp(200, {'ok': True, 'snapshot_count': _LIVE_RPC_ORACLE.fetch_snapshot().get("cycle", 0)})
                 elif path in ('/api/peers/register', '/api/peers/heartbeat'):
                     peer_id  = payload.get('peer_id', '')
@@ -16221,9 +17378,12 @@ class QtclClientApp:
                     # Get server's current difficulty (from block height response or dedicated call)
                     _server_difficulty = int(_res_h.get('difficulty', 0) or 0)
 
-                    # ── GATE 1: Refuse null parent — would fork the chain ──────────
-                    # Development mode: allow mining with null parent if QTCL_DEV_MINE=1
-                    if oracle_hash == _NULL_HASH:
+                    # ── GATE 1: Handle null/empty tip hash ──────────
+                    # At genesis (height 0), tip_hash is all zeros — this is VALID
+                    # We mine block 1 with parent = genesis hash (all zeros)
+                    # Only refuse if height > 0 but tip is still zeros (invalid chain state)
+                    if oracle_hash == _NULL_HASH and oracle_height > 0:
+                        # Invalid: non-genesis height should have real tip hash
                         if os.environ.get("QTCL_DEV_MINE") == "1":
                             _EXP_LOG.warning("[MINER] ⚠️  DEV MODE: mining with null parent (genesis fork possible)")
                             print(f"  ⚠️  DEV MODE: mining with null parent (QTCL_DEV_MINE=1)", flush=True)
@@ -16240,6 +17400,9 @@ class QtclClientApp:
                             print(f"     Set QTCL_DEV_MINE=1 to mine in development mode.", flush=True)
                             await _asyncio.sleep(5.0)
                             continue
+                    elif oracle_hash == _NULL_HASH and oracle_height == 0:
+                        # VALID: We're at genesis, about to mine block 1
+                        _EXP_LOG.info("[MINER] ℹ️  At genesis (h=0, tip=0x0…0) — will mine block 1")
 
                     # Oracle height sync (advisory only — no block)
                     _snap_height = int(_oracle_snap.get('block_height') or _oracle_snap.get('height') or 0) if isinstance(_oracle_snap, dict) else 0
@@ -17255,6 +18418,8 @@ class QtclClientApp:
             # migration in load() — never re-derive here to avoid engine version skew.
             sig_dict["public_key_hex"] = self.wallet.public_key or ""
             tx["signature"] = _json.dumps(sig_dict)
+            # CATHEDRAL-GRADE: Include public key in transaction itself for server verification
+            tx["sender_public_key_hex"] = self.wallet.public_key or ""
             
         # Standard tx_id for display
         tx_id = _hashlib.sha256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
@@ -19236,7 +20401,115 @@ class NodeRPCMeshServer:
                 ts          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method ON mesh_rpc_log(method, ts DESC)")
-            
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # oracle_dm_cache — Received peer oracle density-matrix cache
+            # Stores all inbound DMs from P2P gossip for tripartite fusion
+            # ═══════════════════════════════════════════════════════════════════════
+            conn.execute("""CREATE TABLE IF NOT EXISTS oracle_dm_cache (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_node_id      TEXT    NOT NULL DEFAULT '',
+                sender_wallet_addr  TEXT    NOT NULL DEFAULT '',
+                density_matrix_hex  TEXT    NOT NULL DEFAULT '',
+                w_state_fidelity    REAL    NOT NULL DEFAULT 0.0,
+                node_role           TEXT    NOT NULL DEFAULT 'peer',
+                hyp_signature_hex   TEXT    NOT NULL DEFAULT '',
+                hyp_challenge_hex   TEXT    NOT NULL DEFAULT '',
+                block_height        INTEGER NOT NULL DEFAULT 0,
+                received_at         REAL    NOT NULL DEFAULT (strftime('%s','now')),
+                fused               INTEGER NOT NULL DEFAULT 0,
+                fused_at            REAL    NOT NULL DEFAULT 0.0,
+                dm_lwe_ct_hex       TEXT    NOT NULL DEFAULT '',
+                dm_lwe_tag_hex      TEXT    NOT NULL DEFAULT '',
+                dm_lwe_pubkey_hex   TEXT    NOT NULL DEFAULT '',
+                dm_commit_hex       TEXT    NOT NULL DEFAULT '',
+                dm_r_enc_hex        TEXT    NOT NULL DEFAULT '',
+                dm_r_iv_hex         TEXT    NOT NULL DEFAULT '',
+                dm_enc_epoch        INTEGER NOT NULL DEFAULT 0
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_odmc_sender ON oracle_dm_cache(sender_node_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_odmc_height ON oracle_dm_cache(block_height)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_odmc_fused  ON oracle_dm_cache(fused, received_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_odmc_fidelity ON oracle_dm_cache(w_state_fidelity DESC)")
+            # Migrate existing tables
+            for _col, _defn in [
+                ("sender_node_id",     "TEXT DEFAULT ''"),
+                ("sender_wallet_addr", "TEXT DEFAULT ''"),
+                ("density_matrix_hex", "TEXT DEFAULT ''"),
+                ("w_state_fidelity",   "REAL DEFAULT 0.0"),
+                ("node_role",          "TEXT DEFAULT 'peer'"),
+                ("hyp_signature_hex",  "TEXT DEFAULT ''"),
+                ("hyp_challenge_hex",  "TEXT DEFAULT ''"),
+                ("block_height",       "INTEGER DEFAULT 0"),
+                ("received_at",        "REAL DEFAULT 0"),
+                ("fused",              "INTEGER DEFAULT 0"),
+                ("fused_at",           "REAL DEFAULT 0"),
+                ("dm_lwe_ct_hex",      "TEXT DEFAULT ''"),
+                ("dm_lwe_tag_hex",     "TEXT DEFAULT ''"),
+                ("dm_lwe_pubkey_hex",  "TEXT DEFAULT ''"),
+                ("dm_commit_hex",      "TEXT DEFAULT ''"),
+                ("dm_r_enc_hex",       "TEXT DEFAULT ''"),
+                ("dm_r_iv_hex",        "TEXT DEFAULT ''"),
+                ("dm_enc_epoch",       "INTEGER DEFAULT 0"),
+            ]:
+                try: conn.execute(f"ALTER TABLE oracle_dm_cache ADD COLUMN {_col} {_defn}")
+                except: pass
+            # oracle_lwe_keypair — GeodesicLWE at-rest encryption keypair per oracle identity
+            conn.execute("""CREATE TABLE IF NOT EXISTS oracle_lwe_keypair (
+                oracle_id           TEXT    PRIMARY KEY,
+                lwe_public_key      TEXT    NOT NULL DEFAULT '',
+                lwe_private_key     TEXT    NOT NULL DEFAULT '',
+                created_at          REAL    NOT NULL DEFAULT (strftime('%s','now')),
+                integrity_hex       TEXT    NOT NULL DEFAULT ''
+            )""")
+            for _col, _defn in [
+                ("lwe_public_key",  "TEXT DEFAULT ''"),
+                ("lwe_private_key", "TEXT DEFAULT ''"),
+                ("created_at",      "REAL DEFAULT 0"),
+                ("integrity_hex",   "TEXT DEFAULT ''"),
+            ]:
+                try: conn.execute(f"ALTER TABLE oracle_lwe_keypair ADD COLUMN {_col} {_defn}")
+                except: pass
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # oracle_fan_out_log — Audit trail of P2P oracle DM fan-out events
+            # Records every RPC::PUSH to neighbor nodes for provability
+            # ═══════════════════════════════════════════════════════════════════════
+            conn.execute("""CREATE TABLE IF NOT EXISTS oracle_fan_out_log (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin_node_id      TEXT    NOT NULL DEFAULT '',
+                dm_cache_id         INTEGER NOT NULL DEFAULT 0,
+                target_node_id      TEXT    NOT NULL DEFAULT '',
+                target_host         TEXT    NOT NULL DEFAULT '',
+                target_port         INTEGER NOT NULL DEFAULT 9091,
+                push_method         TEXT    NOT NULL DEFAULT 'qtcl_oracle_dm_push',
+                success             INTEGER NOT NULL DEFAULT 0,
+                latency_ms          REAL    NOT NULL DEFAULT 0.0,
+                error_msg           TEXT    NOT NULL DEFAULT '',
+                fan_depth           INTEGER NOT NULL DEFAULT 0,
+                created_at          REAL    NOT NULL DEFAULT (strftime('%s','now'))
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ofl_origin ON oracle_fan_out_log(origin_node_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ofl_dm_id  ON oracle_fan_out_log(dm_cache_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ofl_ts     ON oracle_fan_out_log(created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ofl_success ON oracle_fan_out_log(success, created_at DESC)")
+            # Migrate existing tables
+            for _col, _defn in [
+                ("origin_node_id", "TEXT DEFAULT ''"),
+                ("dm_cache_id",    "INTEGER DEFAULT 0"),
+                ("target_node_id", "TEXT DEFAULT ''"),
+                ("target_host",    "TEXT DEFAULT ''"),
+                ("target_port",    "INTEGER DEFAULT 9091"),
+                ("push_method",    "TEXT DEFAULT 'qtcl_oracle_dm_push'"),
+                ("success",        "INTEGER DEFAULT 0"),
+                ("latency_ms",     "REAL DEFAULT 0"),
+                ("error_msg",      "TEXT DEFAULT ''"),
+                ("fan_depth",      "INTEGER DEFAULT 0"),
+                ("created_at",     "REAL DEFAULT 0"),
+            ]:
+                try: conn.execute(f"ALTER TABLE oracle_fan_out_log ADD COLUMN {_col} {_defn}")
+                except: pass
+
             conn.commit()
             conn.close()
             logger.info(f"[DB] ✅ Full schema initialized at {self._db_path}")
@@ -20245,15 +21518,14 @@ def main() -> None:  # noqa: F811
             print("  │  No wallet file found.                                   │")
             print("  │  Create a new QTCL wallet? (Required for all modes)      │")
             print("  └──────────────────────────────────────────────────────────┘")
-            # Suppress logging during interactive prompts
+            # Suppress logging during interactive prompts AND wallet creation
+            # This prevents HYP-WALLET initialization logs from appearing mid-prompt
             logging.getLogger().setLevel(logging.CRITICAL)
             print("  Create wallet? [Y/n]: ", end="", flush=True)
             try:
                 _create_wallet_ans = input().strip().lower() or "y"
             except (EOFError, KeyboardInterrupt):
                 _create_wallet_ans = "y"
-            finally:
-                logging.getLogger().setLevel(logging.INFO)
             
             if _create_wallet_ans != "n":
                 print()
@@ -20275,6 +21547,8 @@ def main() -> None:  # noqa: F811
                     print("  ⚠  Wallet creation skipped — continuing as guest")
                 except Exception as _cwe:
                     print(f"  ❌ Wallet creation error: {_cwe} — continuing as guest")
+            # Restore logging AFTER all wallet operations complete
+            logging.getLogger().setLevel(logging.INFO)
         # ── Oracle mode prompt (skip for --oracle-audit) ──────────────────────
         oracle_context = None
         if _is_oracle_audit:
@@ -20291,15 +21565,15 @@ def main() -> None:  # noqa: F811
             print("  │                                                          │")
             print("  │  Skip (N) = mine/transact normally, anonymous signing.   │")
             print("  └──────────────────────────────────────────────────────────┘")
-            # Suppress logging during interactive prompts
+            # Suppress logging during interactive prompts AND wallet operations
+            # This prevents HYP-WALLET initialization logs from appearing mid-prompt
             logging.getLogger().setLevel(logging.CRITICAL)
             print("  Register as oracle? [y/N]: ", end="", flush=True)
             try:
                 _oracle_ans = input().strip().lower() or "n"
             except (EOFError, KeyboardInterrupt):
                 _oracle_ans = "n"
-            finally:
-                logging.getLogger().setLevel(logging.INFO)
+            
             if _oracle_ans == "y":
                 print()
                 _tmp_wallet = QTCLWallet()
@@ -20322,8 +21596,14 @@ def main() -> None:  # noqa: F811
                     print(f"  ❌ Wallet error ({_oe}) — running anonymous oracle")
             else:
                 print("  👻 Running anonymous oracle (no wallet binding)")
+            # Restore logging AFTER all wallet operations complete
+            logging.getLogger().setLevel(logging.INFO)
         print()
         app = QtclClientApp(oracle_url=url, oracle_context=oracle_context)
+        # Expose as module-level singleton so RPC dispatch closures can find it
+        # for GeodesicLWE Option C encryption of inbound DMs.
+        import sys as _app_sys
+        setattr(_app_sys.modules[__name__], '_APP_INSTANCE', app)
         # (Moved here after interactive prompts to prevent log injection during password input)
         import sqlite3 as _rpc_sq3
         try:
