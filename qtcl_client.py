@@ -31,6 +31,12 @@ import math
 import re
 import copy
 import random
+
+# Add hlwe directory to sys.path so hyp_engine can be imported directly
+_HLWE_PATH = str(Path(__file__).parent / 'hlwe')
+if _HLWE_PATH not in sys.path:
+    sys.path.insert(0, _HLWE_PATH)
+
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
         level=logging.INFO,
@@ -1246,8 +1252,17 @@ def _pq_get_coord_mpf(pq_id: int) -> Tuple[Any, Any]:
     return x, y
 
 # ── Background lattice warm-up (fires after LocalBlockchainDB.create_tables) ─
+_LATTICE_WARMUP_STARTED = False
+_LATTICE_WARMUP_LOCK = threading.Lock()
+
 def _start_lattice_warmup(db_path: Optional[Path] = None) -> threading.Thread:
-    """Non-blocking: builds/checks tessellation in background thread."""
+    """Non-blocking: builds/checks tessellation in background thread. Singleton - runs only once."""
+    global _LATTICE_WARMUP_STARTED
+    with _LATTICE_WARMUP_LOCK:
+        if _LATTICE_WARMUP_STARTED:
+            return None  # Already running, don't start again
+        _LATTICE_WARMUP_STARTED = True
+
     def _worker():
         try:
             _ensure_pq_cache(db_path)
@@ -1324,22 +1339,39 @@ class HypKeyPair:
 
 
 class HypGammaWallet:
-    """HypΓ-only wallet manager — post-quantum cryptography."""
-    
+    """HypΓ-only wallet manager — post-quantum cryptography. Singleton pattern."""
+
+    _instance: Optional['HypGammaWallet'] = None
+    _lock = threading.Lock()
+
+    def __new__(cls, seed_hex: Optional[str] = None):
+        """Singleton pattern - create only once per process."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._initialized = False
+                    cls._instance = instance
+        return cls._instance
+
     def __init__(self, seed_hex: Optional[str] = None):
-        """Initialize HypΓ wallet with optional seed."""
+        """Initialize HypΓ wallet with optional seed. Idempotent due to singleton."""
+        if self._initialized:
+            return  # Already initialized, skip
+        self._initialized = True
+
         try:
             from hyp_engine import HypGammaEngine
             self.engine = HypGammaEngine()
             self.keypair: Optional[HypKeyPair] = None
-            
+
             if seed_hex:
                 # Deterministic generation from seed
                 self.keypair = self._generate_from_seed(seed_hex)
             else:
                 # Random generation
                 self.keypair = self.engine.generate_keypair()
-                
+
             logger.info(f"[HYP-WALLET] ✅ Initialized — address: {self.keypair.address[:16]}...")
         except Exception as e:
             logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
@@ -1986,26 +2018,66 @@ class LiveRPCOracleSnapshot:
                     logger.debug(f"[RPC-ORACLE] {_url} failed: {_fe}")
                     continue
             
-            # Parse density matrix if present
+            # Parse density matrix if present (supports 8x8, 32³, 64³ formats)
             if snap and snap.get('density_matrix_hex'):
                 try:
                     dm_hex = snap['density_matrix_hex']
                     bdata = bytes.fromhex(dm_hex)
-                    dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                    
-                    if len(bdata) == 1024:
-                        for i in range(64):
+
+                    # Detect 3D matrix size (32³ or 64³)
+                    if len(bdata) == 32768 * 16:  # 32³ * 2 complex doubles
+                        dim = 32
+                        dm_flat = [0.0] * (dim ** 3)
+                        for i in range(dim ** 3):
                             re, im = struct.unpack_from('>dd', bdata, i*16)
-                            dm_re_new[i], dm_im_new[i] = re, im
-                    elif len(bdata) == 512:
-                        for i in range(64):
+                            dm_flat[i] = complex(re, im)
+                    elif len(bdata) == 262144 * 16:  # 64³ * 2 complex doubles
+                        dim = 64
+                        dm_flat = [0.0] * (dim ** 3)
+                        for i in range(dim ** 3):
+                            re, im = struct.unpack_from('>dd', bdata, i*16)
+                            dm_flat[i] = complex(re, im)
+                    elif len(bdata) == 32768 * 8:  # 32³ * 2 complex floats
+                        dim = 32
+                        dm_flat = [0.0] * (dim ** 3)
+                        for i in range(dim ** 3):
                             re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                    
-                    with self._dm_lock:
-                        self._dm_re = dm_re_new
-                        self._dm_im = dm_im_new
-                        self._last_fetch_ts = time.time()
+                            dm_flat[i] = complex(float(re), float(im))
+                    elif len(bdata) == 262144 * 8:  # 64³ * 2 complex floats
+                        dim = 64
+                        dm_flat = [0.0] * (dim ** 3)
+                        for i in range(dim ** 3):
+                            re, im = struct.unpack_from('>ff', bdata, i*8)
+                            dm_flat[i] = complex(float(re), float(im))
+                    else:
+                        # Fall back to 8x8 (64-element) format
+                        dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
+                        if len(bdata) == 1024:
+                            for i in range(64):
+                                re, im = struct.unpack_from('>dd', bdata, i*16)
+                                dm_re_new[i], dm_im_new[i] = re, im
+                        elif len(bdata) == 512:
+                            for i in range(64):
+                                re, im = struct.unpack_from('>ff', bdata, i*8)
+                                dm_re_new[i], dm_im_new[i] = float(re), float(im)
+                        with self._dm_lock:
+                            self._dm_re = dm_re_new
+                            self._dm_im = dm_im_new
+                            self._last_fetch_ts = time.time()
+
+                    # For 3D matrices, store separately or flatten appropriately
+                    if len(bdata) >= 32768 * 8:
+                        snap['_density_matrix_3d'] = {
+                            'dimension': dim,
+                            'elements': dm_flat,
+                            'timestamp': time.time()
+                        }
+                        # Store real/imag separately for backward compat
+                        with self._dm_lock:
+                            self._dm_re = [c.real for c in dm_flat[:64]] if dim >= 32 else []
+                            self._dm_im = [c.imag for c in dm_flat[:64]] if dim >= 32 else []
+                            self._last_fetch_ts = time.time()
+
                 except Exception as parse_e:
                     logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
             
@@ -3138,7 +3210,7 @@ class LocalBlockchainDB:
                 id                      INTEGER  PRIMARY KEY AUTOINCREMENT,
                 height                  INTEGER  UNIQUE NOT NULL,
                 hash                    TEXT     UNIQUE NOT NULL,
-                parent_hash             TEXT,
+                prev_hash               TEXT,
                 timestamp               INTEGER  DEFAULT 0,
                 nonce                   INTEGER  DEFAULT 0,
                 difficulty              REAL     DEFAULT 4.0,
@@ -3686,7 +3758,7 @@ class LocalBlockchainDB:
             "CREATE INDEX IF NOT EXISTS idx_tx_block_hash     ON transactions (block_hash)",
             "CREATE INDEX IF NOT EXISTS idx_tx_height         ON transactions (block_height DESC)",
             "CREATE INDEX IF NOT EXISTS idx_blocks_hash       ON blocks (hash)",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_parent     ON blocks (parent_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_blocks_prev_hash  ON blocks (prev_hash)",
             "CREATE INDEX IF NOT EXISTS idx_blocks_miner      ON blocks (miner_address)",
         ]
         for _eidx in _extended_indexes:
@@ -3779,7 +3851,7 @@ class LocalBlockchainDB:
         import json as _json_ib, time as _t_ib
         self.execute("""
             INSERT OR REPLACE INTO blocks
-            (height, hash, parent_hash, timestamp, nonce, difficulty, miner_address,
+            (height, hash, prev_hash, timestamp, nonce, difficulty, miner_address,
              pq_curr, pq_last, qubit_snapshot, w_state_fidelity,
              pq0,
              hyp_triangle_area, hyp_dist_0c, hyp_dist_cl, hyp_dist_0l,
@@ -3790,7 +3862,7 @@ class LocalBlockchainDB:
         """, (
             height,
             block_data.get('hash') or block_data.get('block_hash'),
-            block_data.get('parent_hash') or block_data.get('previous_hash'),
+            block_data.get('prev_hash') or block_data.get('parent_hash') or block_data.get('previous_hash'),
             block_data.get('timestamp') or block_data.get('timestamp_s'),
             block_data.get('nonce'),
             block_data.get('difficulty') or block_data.get('difficulty_bits'),
@@ -4175,7 +4247,7 @@ class LocalBlockchainDB:
         _ibd_required_cols: list = [
             # (column_name,  DDL fragment)
             ("hash",               "TEXT    UNIQUE NOT NULL DEFAULT ''"),
-            ("parent_hash",        "TEXT    DEFAULT ''"),
+            ("prev_hash",          "TEXT    DEFAULT ''"),
             ("timestamp",          "INTEGER DEFAULT 0"),
             ("nonce",              "INTEGER DEFAULT 0"),
             ("difficulty",         "REAL    DEFAULT 4.0"),
@@ -12538,7 +12610,50 @@ class QtclClientApp:
         if self._db is None:
             self._init_db()
         return self._db
-    
+
+    # ── Unified P2P status helper ──────────────────────────────────────────────
+    def get_p2p_status(self) -> dict:
+        """Get unified P2P node status. Returns dict with keys: running, external_addr, peers, latency_ms, fidelity."""
+        p2p_node = getattr(self, 'p2p_node', None)
+        status = {
+            'running': False,
+            'external_addr': 'unknown',
+            'peers': 0,
+            'latency_ms': 0.0,
+            'fidelity': 0.0
+        }
+        if not p2p_node or not getattr(p2p_node, '_running', False):
+            return status
+
+        status['running'] = True
+        status['external_addr'] = getattr(p2p_node, 'external_addr', 'unknown')
+
+        peer_mgr = getattr(p2p_node, 'peer_mgr', None)
+        if peer_mgr:
+            active_peers = peer_mgr.get_active_peers()
+            status['peers'] = len(active_peers)
+
+            if active_peers:
+                latencies = [p.latency_ms for p in active_peers if p.latency_ms > 0]
+                fidelities = [p.last_fidelity for p in active_peers if p.last_fidelity > 0]
+                if latencies:
+                    status['latency_ms'] = sum(latencies) / len(latencies)
+                if fidelities:
+                    status['fidelity'] = sum(fidelities) / len(fidelities)
+
+        return status
+
+    def format_p2p_status(self, detail: bool = False) -> str:
+        """Format P2P status for display. detail=True includes latency/fidelity stats."""
+        s = self.get_p2p_status()
+        if s['running']:
+            base = f"  🌐 P2P     : ✅ {s['external_addr']}  peers={s['peers']}"
+            if detail and s['peers'] > 0:
+                base += f"\n           : avg_lat={s['latency_ms']:.0f}ms  avg_fid={s['fidelity']:.4f}"
+            return base
+        else:
+            return f"  🌐 P2P     : ⚠️  starting..."
+
     # ── Oracle identity ────────────────────────────────────────────────────────
     def _init_oracle_identity(self, oracle_context: dict = None) -> dict:
         """
@@ -15360,7 +15475,14 @@ class QtclClientApp:
         if _boot_attempt > 0:
             print("", flush=True)  # newline after dots
         snap = _snap or {}
-        
+
+        # ── Sync koyeb_state with bootstrap snapshot ──────────────────────────
+        if snap:
+            try:
+                self.koyeb_state.sync(self.client_field, timeout=5)
+            except Exception as _sync_e:
+                _EXP_LOG.debug(f"[BOOTSTRAP] koyeb_state sync failed: {_sync_e}")
+
         # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
         # Priority: 1) snap block_height, 2) koyeb_state.block_height, 3) fetch from server
         bh = int(snap.get('block_height') or snap.get('height') or 0)
@@ -15551,13 +15673,7 @@ class QtclClientApp:
         _ent_status = "✅ entangled" if _dm_ready else "⚠️  degraded"
         print(f"  🔗 Quantum state          : {_ent_status}  |  Mining unlocked", flush=True)
         # ── P2P status in mining loop ──────────────────────────────────────────
-        _p2p_node = getattr(self, 'p2p_node', None)
-        if _p2p_node and getattr(_p2p_node, '_running', False):
-            _p2p_ext = getattr(_p2p_node, 'external_addr', 'unknown')
-            _p2p_peers = len(_p2p_node.peer_mgr.get_active_peers()) if _p2p_node.peer_mgr else 0
-            print(f"  🌐 P2P RPC               : ✅ {_p2p_ext}  peers={_p2p_peers}", flush=True)
-        else:
-            print(f"  🌐 P2P RPC               : ⚠️  starting...", flush=True)
+        print(self.format_p2p_status(), flush=True)
         print(flush=True)
         # ── Miner handle ───────────────────────────────────────────────────────
         def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
@@ -16546,21 +16662,7 @@ class QtclClientApp:
                   f"lat={ks2.channel_latency_ms:.0f}ms  "
                   f"{'✅' if ks2.connected else '❌'}")
             # ── P2P Status ─────────────────────────────────────────────────
-            _p2p_n = getattr(self, 'p2p_node', None)
-            if _p2p_n and getattr(_p2p_n, '_running', False):
-                _active_peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
-                _p2p_peers = len(_active_peers)
-                print(f"  🌐 P2P     : ✅ {_p2p_n.external_addr}  peers={_p2p_peers}")
-                if _active_peers:
-                    _lats = [p.latency_ms for p in _active_peers if p.latency_ms > 0]
-                    _fids = [p.last_fidelity for p in _active_peers if p.last_fidelity > 0]
-                    _avg_lat = sum(_lats) / len(_lats) if _lats else 0
-                    _avg_fid = sum(_fids) / len(_fids) if _fids else 0
-                    _peer_heights = [p.chain_height for p in _active_peers if p.chain_height > 0]
-                    _max_peer_h = max(_peer_heights) if _peer_heights else 0
-                    print(f"           : avg_lat={_avg_lat:.0f}ms  avg_fid={_avg_fid:.4f}  max_peer_h={_max_peer_h}")
-            else:
-                print(f"  🌐 P2P     : ⚠️  starting...")
+            print(self.format_p2p_status(detail=True))
             print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
             if tel['total_earned_qtcl'] > 0:
                 print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)")
@@ -19765,10 +19867,16 @@ def main() -> None:  # noqa: F811
             print("  │  No wallet file found.                                   │")
             print("  │  Create a new QTCL wallet? (Required for all modes)      │")
             print("  └──────────────────────────────────────────────────────────┘")
+            # Suppress logging during input to prevent prompt injection
+            import contextlib
+            _orig_level = logger.level
             try:
+                logger.setLevel(logging.CRITICAL)
                 _create_wallet_ans = input("  Create wallet? [Y/n]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 _create_wallet_ans = "y"
+            finally:
+                logger.setLevel(_orig_level)
             
             if _create_wallet_ans != "n":
                 print()
@@ -19806,10 +19914,16 @@ def main() -> None:  # noqa: F811
             print("  │                                                          │")
             print("  │  Skip (N) = mine/transact normally, anonymous signing.   │")
             print("  └──────────────────────────────────────────────────────────┘")
+            # Suppress logging during input to prevent prompt injection
+            import contextlib
+            _orig_level = logger.level
             try:
+                logger.setLevel(logging.CRITICAL)
                 _oracle_ans = input("  Register as oracle? [y/N]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 _oracle_ans = "n"
+            finally:
+                logger.setLevel(_orig_level)
             if _oracle_ans == "y":
                 print()
                 _tmp_wallet = QTCLWallet()
