@@ -232,8 +232,8 @@ class ClientOracleSSEHandler(BaseHTTPRequestHandler):
                     payload = json.dumps({
                         "result": {
                             "density_matrix_hex": dm_hex,
-                            "tensor_dim": 64,
-                            "tensor_shape": [64, 64, 64],
+                            "tensor_dim": 16,
+                            "tensor_shape": [16, 16, 16],
                             "timestamp": time.time(),
                         },
                         "id": 1
@@ -319,7 +319,7 @@ def fetch_peer_measurement(peer_host: str, peer_port: int = 9091, timeout_s: flo
     return None
 
 def average_density_matrices(measurements: List[str]) -> Optional[str]:
-    """Average multiple 64³ density matrices (hex encoded) into consensus state."""
+    """Average multiple 16³ density matrices (hex encoded) into consensus state."""
     try:
         import numpy as _np_avg
 
@@ -328,11 +328,11 @@ def average_density_matrices(measurements: List[str]) -> Optional[str]:
 
         matrices = []
         for dm_hex in measurements:
-            if not dm_hex or len(dm_hex) < 4194304 * 2:  # 64³ × 8 bytes = 2,097,152 bytes = 4,194,304 hex chars
+            if not dm_hex or len(dm_hex) < 65536 * 2:  # 16³ × 8 bytes = 32,768 bytes = 65,536 hex chars
                 continue
             try:
                 dm_bytes = bytes.fromhex(dm_hex)
-                dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((64, 64, 64))
+                dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((16, 16, 16))
                 matrices.append(dm_array)
             except Exception:
                 continue
@@ -341,7 +341,7 @@ def average_density_matrices(measurements: List[str]) -> Optional[str]:
             return None
 
         # Average: mean_dm = (1/N) * sum(dm_i)
-        avg_dm = _np_avg.zeros((64, 64, 64), dtype=_np_avg.complex64)
+        avg_dm = _np_avg.zeros((16, 16, 16), dtype=_np_avg.complex64)
         for dm in matrices:
             avg_dm += dm
         avg_dm = avg_dm / len(matrices)
@@ -2465,47 +2465,47 @@ class LiveRPCOracleSnapshot:
                         _body = _r.json()
                         snap = _body.get("result") or {}
                         if snap and snap.get('density_matrix_hex'):
-                            logger.debug(f"[RPC-ORACLE] ✅ RPC fallback succeeded with 64³ DM")
+                            logger.debug(f"[RPC-ORACLE] ✅ RPC fallback succeeded with 16³ DM (32 KB)")
                 except Exception as _rpc_e:
                     logger.debug(f"[RPC-ORACLE] RPC fallback failed: {_rpc_e}")
 
             if not snap:
                 return {}
 
-            # Process snapshot: parse 64³ density tensor (native 3D format)
+            # Process snapshot: parse 16³ density tensor (native 3D format) — 2000× smaller than 64³
             dm_hex = snap.get('density_matrix_hex')
             if dm_hex:
                 try:
 
-                    # Parse 64³ density tensor (native format)
+                    # Parse 16³ density tensor (native format) = 4,096 elements × 8 bytes = 32 KB
                     bdata = bytes.fromhex(dm_hex)
-                    expected_64_3_complex64 = 262144 * 8  # 64³ × complex64 (8 bytes)
+                    expected_16_3_complex64 = 4096 * 8  # 16³ × complex64 (8 bytes)
 
-                    if len(bdata) != expected_64_3_complex64:
-                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_64_3_complex64}")
-                        raise ValueError(f"Invalid 64³ tensor size: {len(bdata)}")
+                    if len(bdata) != expected_16_3_complex64:
+                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³ tensor)")
+                        raise ValueError(f"Invalid 16³ tensor size: {len(bdata)}")
 
-                    # Parse 262144 complex64 elements
+                    # Parse 4096 complex64 elements
                     dm_flat = []
-                    for i in range(262144):
+                    for i in range(4096):
                         re, im = struct.unpack_from('>ff', bdata, i*8)
                         dm_flat.append(complex(float(re), float(im)))
 
-                    # Store 64³ tensor metadata
+                    # Store 16³ tensor metadata
                     snap['_density_matrix_3d'] = {
-                        'dimension': 64,
-                        'shape': [64, 64, 64],
+                        'dimension': 16,
+                        'shape': [16, 16, 16],
                         'elements': dm_flat,
                         'timestamp': time.time()
                     }
 
-                    # Keep first 64 elements for legacy compatibility
+                    # Keep first 16 elements for legacy compatibility
                     with self._dm_lock:
-                        self._dm_re = [c.real for c in dm_flat[:64]]
-                        self._dm_im = [c.imag for c in dm_flat[:64]]
+                        self._dm_re = [c.real for c in dm_flat[:16]]
+                        self._dm_im = [c.imag for c in dm_flat[:16]]
                         self._last_fetch_ts = time.time()
 
-                    logger.debug(f"[RPC-ORACLE] ✅ Parsed 64³ density tensor ({len(dm_flat)} elements)")
+                    logger.debug(f"[RPC-ORACLE] ✅ Parsed 16³ density tensor ({len(dm_flat)} elements, 32 KB)")
 
                 except Exception as _parse_e:
                     logger.debug(f"[RPC-ORACLE] DM parse error: {_parse_e}")
@@ -16121,21 +16121,21 @@ class QtclClientApp:
                         _rng_seed = int.from_bytes(_seed_hash[:4], 'big')
                         _np_aer.random.seed(_rng_seed)
 
-                        # Create 64³ field: W-state with Gaussian envelope
-                        _field = _np_aer.zeros((64, 64, 64), dtype=_np_aer.complex64)
-                        _x = (pq_curr % 64)
-                        _y = (pq_last % 64)
-                        _z = (int(block_hash[:8], 16) % 64)
+                        # Create 16³ field: W-state with Gaussian envelope (reduced from 64³ = 2000× smaller)
+                        _field = _np_aer.zeros((16, 16, 16), dtype=_np_aer.complex64)
+                        _x = (pq_curr % 16)
+                        _y = (pq_last % 16)
+                        _z = (int(block_hash[:8], 16) % 16)
 
-                        for _i in range(64):
-                            for _y_idx in range(64):
-                                for _k in range(64):
+                        for _i in range(16):
+                            for _y_idx in range(16):
+                                for _k in range(16):
                                     _dx, _dy, _dz = (_i - _x), (_y_idx - _y), (_k - _z)
                                     _r_sq = _dx*_dx + _dy*_dy + _dz*_dz
-                                    _envelope = _np_aer.exp(-_r_sq / 256.0)
-                                    _phase = 2 * _np_aer.pi * (pq_curr + pq_last) / 256.0
+                                    _envelope = _np_aer.exp(-_r_sq / 64.0)  # Updated scaling for 16³
+                                    _phase = 2 * _np_aer.pi * (pq_curr + pq_last) / 16.0
                                     _phase += 2 * _np_aer.pi * int(block_hash[:4], 16) / 65536.0
-                                    _amp = _envelope / _np_aer.sqrt(262144.0)
+                                    _amp = _envelope / _np_aer.sqrt(4096.0)  # 16³ = 4096 normalization
                                     _field[_i, _y_idx, _k] = _amp * _np_aer.exp(1j * _phase)
 
                         # Normalize
