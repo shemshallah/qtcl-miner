@@ -172,8 +172,11 @@ def _resolve_database_url() -> Tuple[str, str]:
         logger.info(f"{CLR.OK}[CONN] PostgreSQL mode via DATABASE_URL env{CLR.E}")
         return url, "postgres"
 
-    # 2. SQLite fallback — local client mode
-    sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qtcl.db")
+    # 2. SQLite fallback — local client mode (uses canonical data/ directory)
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(repo_root, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    sqlite_path = os.path.join(data_dir, "qtcl.db")
     logger.info(f"{CLR.WARN}[CONN] No DATABASE_URL found → SQLite client mode: {sqlite_path}{CLR.E}")
     return sqlite_path, "sqlite"
 

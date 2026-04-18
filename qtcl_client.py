@@ -3142,6 +3142,63 @@ except ImportError:
     HAS_PSYCOPG = False
     psycopg = None  # type: ignore
     ConnectionPool = None  # type: ignore
+
+# ── SCHEMA VALIDATION: Use qtcl_db_builder.py as single source of truth ───────
+def _validate_and_init_schema(db_path: Path) -> bool:
+    """Validate database schema against qtcl_db_builder.py. Run builder if mismatch.
+
+    Returns True if schema valid/fixed, False if error.
+    """
+    import subprocess
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(str(db_path), timeout=10)
+        cursor = conn.cursor()
+
+        # Check if blocks table exists with required columns
+        cursor.execute("PRAGMA table_info(blocks)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        # Required columns (from qtcl_db_builder.py blocks table)
+        required_cols = {
+            'height', 'block_hash', 'parent_hash', 'merkle_root', 'timestamp',
+            'tx_count', 'coherence_snapshot', 'fidelity_snapshot', 'miner_address',
+            'difficulty', 'nonce', 'pq_curr', 'pq_last'
+        }
+
+        if required_cols.issubset(existing_cols):
+            logger.info("[DB-SCHEMA] ✅ Schema valid")
+            return True
+
+        # Schema missing columns - run builder
+        logger.info("[DB-SCHEMA] ⚠️  Schema mismatch, running qtcl_db_builder.py...")
+        builder_path = _REPO_ROOT / 'qtcl_db_builder.py'
+
+        if not builder_path.exists():
+            logger.error(f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}")
+            return False
+
+        # Run builder to fix schema
+        result = subprocess.run(
+            [sys.executable, str(builder_path)],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            timeout=120,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.error(f"[DB-SCHEMA] ❌ Builder failed:\n{result.stderr}")
+            return False
+
+        logger.info("[DB-SCHEMA] ✅ Schema fixed by qtcl_db_builder.py")
+        return True
+
+    except Exception as e:
+        logger.error(f"[DB-SCHEMA] ❌ Validation error: {e}")
+        return False
+
 class LocalBlockchainDB:
     """Local SQLite blockchain database - replaces psycopg version
     
@@ -3184,10 +3241,12 @@ class LocalBlockchainDB:
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self._pool = None
-        
+
         self._init_pool()
-        self.create_tables()
-        
+        # Validate schema against qtcl_db_builder.py (single source of truth)
+        if not _validate_and_init_schema(self.db_path):
+            raise RuntimeError(f"Database schema validation failed for {self.db_path}")
+
         logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
     def _init_pool(self):
         """Initialize connection pool (no-op for SQLite, kept for interface compatibility)"""
@@ -3202,604 +3261,10 @@ class LocalBlockchainDB:
         return self.conn
     
     def create_tables(self):
-        """Create all necessary tables"""
-        cursor = self.conn.cursor()
+        """DEPRECATED: Schema creation now handled by _validate_and_init_schema() which uses qtcl_db_builder.py.
+        This method is kept for backward compatibility but does nothing."""
+        pass
         
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS blocks (
-                id                      INTEGER  PRIMARY KEY AUTOINCREMENT,
-                height                  INTEGER  UNIQUE NOT NULL,
-                hash                    TEXT     UNIQUE NOT NULL,
-                prev_hash               TEXT,
-                timestamp               INTEGER  DEFAULT 0,
-                nonce                   INTEGER  DEFAULT 0,
-                difficulty              REAL     DEFAULT 4.0,
-                miner_address           TEXT     DEFAULT '',
-                pq_curr                 INTEGER  DEFAULT 0,
-                pq_last                 INTEGER  DEFAULT 0,
-                pq0                     INTEGER  DEFAULT 0,
-                qubit_snapshot          TEXT,
-                w_state_fidelity        REAL     DEFAULT 0.0,
-                merkle_root             TEXT     DEFAULT '',
-                tx_count                INTEGER  DEFAULT 0,
-                synced_from_server      INTEGER  DEFAULT 0,
-                data                    TEXT,
-                hyp_triangle_area       REAL     DEFAULT 0.0,
-                hyp_dist_0c             REAL     DEFAULT 0.0,
-                hyp_dist_cl             REAL     DEFAULT 0.0,
-                hyp_dist_0l             REAL     DEFAULT 0.0,
-                oracle_quorum_hash      TEXT,
-                peer_measurement_count  INTEGER  DEFAULT 1,
-                consensus_agreement     REAL     DEFAULT 0.0,
-                local_dm_hex            TEXT,
-                local_measurement_sig   TEXT,
-                entanglement_coeff_hex  TEXT     DEFAULT ''
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                txid TEXT UNIQUE NOT NULL,
-                block_height INTEGER,
-                from_addr TEXT,
-                to_addr TEXT,
-                amount REAL,
-                fee REAL DEFAULT 0.0,
-                timestamp INTEGER,
-                status TEXT DEFAULT 'pending'
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                address TEXT PRIMARY KEY,
-                balance REAL,
-                token_balance REAL,
-                updated_at INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS miners (
-                miner_address TEXT PRIMARY KEY,
-                blocks_mined INTEGER DEFAULT 0,
-                last_block_height INTEGER,
-                heartbeat INTEGER,
-                status TEXT DEFAULT 'active'
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chain_state (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height INTEGER,
-                snapshot_data TEXT,
-                created_at INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS qubit_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height INTEGER,
-                qubit_id INTEGER,
-                state_vector TEXT,
-                fidelity REAL,
-                created_at INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS oracle_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT,
-                event_data TEXT,
-                block_height INTEGER,
-                created_at INTEGER
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS entanglement_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                qubit_pair TEXT,
-                entanglement_strength REAL,
-                block_height INTEGER,
-                created_at INTEGER
-            )
-        """)
-        # ── P2P v2: Known TCP peers (mirrors QtclPeer C struct) ─────────────
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS p2p_peers (
-                node_id_hex         TEXT     PRIMARY KEY,
-                host                TEXT     NOT NULL,
-                port                INTEGER  NOT NULL,
-                services            INTEGER  NOT NULL DEFAULT 1,
-                protocol_version    INTEGER  NOT NULL DEFAULT 2,
-                chain_height        INTEGER  NOT NULL DEFAULT 0,
-                last_fidelity       REAL     NOT NULL DEFAULT 0.0,
-                latency_ms          REAL     NOT NULL DEFAULT 0.0,
-                ban_score           INTEGER  NOT NULL DEFAULT 0,
-                advertised_host     TEXT,
-                advertised_port     INTEGER,
-                source              TEXT     NOT NULL DEFAULT 'self_register',
-                first_seen_at       INTEGER  NOT NULL DEFAULT 0,
-                last_seen_at        INTEGER  NOT NULL DEFAULT 0,
-                last_heartbeat_at   INTEGER,
-                mac_address         TEXT     NOT NULL DEFAULT '',
-                device_id           TEXT     NOT NULL DEFAULT ''
-            )
-        """)
-        # ── P2P v2: Received W-state measurements (gossip archive) ───────────
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wstate_measurements (
-                id                  INTEGER  PRIMARY KEY AUTOINCREMENT,
-                node_id_hex         TEXT     NOT NULL,
-                chain_height        INTEGER  NOT NULL,
-                pq0                 INTEGER  NOT NULL DEFAULT 0,
-                pq_curr             INTEGER  NOT NULL DEFAULT 0,
-                pq_last             INTEGER  NOT NULL DEFAULT 0,
-                hyp_dist_0c         REAL     NOT NULL DEFAULT 0.0,
-                hyp_dist_cl         REAL     NOT NULL DEFAULT 0.0,
-                hyp_dist_0l         REAL     NOT NULL DEFAULT 0.0,
-                hyp_triangle_area   REAL     NOT NULL DEFAULT 0.0,
-                w_fidelity          REAL     NOT NULL DEFAULT 0.0,
-                coherence           REAL     NOT NULL DEFAULT 0.0,
-                purity              REAL     NOT NULL DEFAULT 0.0,
-                negativity          REAL     NOT NULL DEFAULT 0.0,
-                entropy_vn          REAL     NOT NULL DEFAULT 0.0,
-                discord             REAL     NOT NULL DEFAULT 0.0,
-                dm_sample_hex       TEXT,
-                auth_tag_hex        TEXT     NOT NULL,
-                timestamp_ns        INTEGER,
-                received_at         INTEGER  NOT NULL DEFAULT 0
-            )
-        """)
-        # ── P2P v2: Per-block BFT consensus snapshots ────────────────────────
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS wstate_consensus_log (
-                chain_height            INTEGER  PRIMARY KEY,
-                block_hash              TEXT     NOT NULL,
-                median_fidelity         REAL     NOT NULL DEFAULT 0.0,
-                median_coherence        REAL     NOT NULL DEFAULT 0.0,
-                median_purity           REAL     NOT NULL DEFAULT 0.0,
-                median_negativity       REAL     NOT NULL DEFAULT 0.0,
-                median_entropy          REAL     NOT NULL DEFAULT 0.0,
-                median_discord          REAL     NOT NULL DEFAULT 0.0,
-                hyp_area_median         REAL     NOT NULL DEFAULT 0.0,
-                quorum_hash             TEXT     NOT NULL,
-                peer_count              INTEGER  NOT NULL DEFAULT 1,
-                agreement_score         REAL     NOT NULL DEFAULT 0.0,
-                consensus_dm_hex        TEXT,
-                participant_node_ids    TEXT,
-                consensus_computed_at   INTEGER  NOT NULL DEFAULT 0
-            )
-        """)
-        # ── P2P v2: Peer exchange log ─────────────────────────────────────────
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS p2p_peer_exchange (
-                id                  INTEGER  PRIMARY KEY AUTOINCREMENT,
-                requesting_node     TEXT     NOT NULL,
-                requesting_host     TEXT,
-                requesting_port     INTEGER,
-                peers_returned      INTEGER  NOT NULL DEFAULT 0,
-                protocol_ver        INTEGER  NOT NULL DEFAULT 2,
-                exchanged_at        INTEGER  NOT NULL DEFAULT 0,
-                requesting_mac      TEXT,
-                requesting_device   TEXT
-            )
-        """)
-        _p2pv2_new_block_cols = [
-            "ALTER TABLE blocks ADD COLUMN pq0                   INTEGER DEFAULT 0",
-            "ALTER TABLE blocks ADD COLUMN hyp_triangle_area     REAL    DEFAULT 0.0",
-            "ALTER TABLE blocks ADD COLUMN hyp_dist_0c           REAL    DEFAULT 0.0",
-            "ALTER TABLE blocks ADD COLUMN hyp_dist_cl           REAL    DEFAULT 0.0",
-            "ALTER TABLE blocks ADD COLUMN hyp_dist_0l           REAL    DEFAULT 0.0",
-            "ALTER TABLE blocks ADD COLUMN oracle_quorum_hash    TEXT    DEFAULT NULL",
-            "ALTER TABLE blocks ADD COLUMN peer_measurement_count INTEGER DEFAULT 1",
-            "ALTER TABLE blocks ADD COLUMN consensus_agreement   REAL    DEFAULT 0.0",
-            "ALTER TABLE blocks ADD COLUMN local_dm_hex          TEXT    DEFAULT NULL",
-            "ALTER TABLE blocks ADD COLUMN local_measurement_sig TEXT    DEFAULT NULL",
-        ]
-        for _alter in _p2pv2_new_block_cols:
-            try:
-                cursor.execute(_alter)
-            except Exception:
-                pass   # column already exists — idempotent
-        # ── Indexes for new tables and block columns ───────────────────────────
-        _p2pv2_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_p2p_peers_host_port  ON p2p_peers (host, port)",
-            "CREATE INDEX IF NOT EXISTS idx_p2p_peers_last_seen  ON p2p_peers (last_seen_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_p2p_peers_height     ON p2p_peers (chain_height DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_wstate_height        ON wstate_measurements (chain_height DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_wstate_node_height   ON wstate_measurements (node_id_hex, chain_height DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_wstate_fidelity      ON wstate_measurements (w_fidelity DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_wscl_quorum          ON wstate_consensus_log (quorum_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_quorum_hash   ON blocks (oracle_quorum_hash) WHERE oracle_quorum_hash IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_pq_triangle   ON blocks (pq0, pq_curr, pq_last)",
-        ]
-        for _idx in _p2pv2_indexes:
-            try:
-                cursor.execute(_idx)
-            except Exception:
-                pass
-        # ── HypΓ / RPC / Oracle audit tables (required by QtclClientApp) ────────
-        _extended_tables = [
-            """CREATE TABLE IF NOT EXISTS hyp_signatures (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_hash    TEXT    NOT NULL DEFAULT '',
-                signature_hex   TEXT    NOT NULL DEFAULT '',
-                public_key      TEXT    NOT NULL DEFAULT '',
-                verified        INTEGER NOT NULL DEFAULT 0,
-                algorithm       TEXT    NOT NULL DEFAULT 'hyp_128',
-                created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS wallet_operations (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_addr     TEXT    NOT NULL DEFAULT '',
-                op_type         TEXT    NOT NULL DEFAULT '',
-                amount          INTEGER NOT NULL DEFAULT 0,
-                peer_addr       TEXT    NOT NULL DEFAULT '',
-                tx_hash         TEXT    NOT NULL DEFAULT '',
-                hyp_signed     INTEGER NOT NULL DEFAULT 0,
-                signature_hex   TEXT    NOT NULL DEFAULT '',
-                block_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS rpc_operations (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                method          TEXT    NOT NULL DEFAULT '',
-                params          TEXT    NOT NULL DEFAULT '',
-                result_hash     TEXT    NOT NULL DEFAULT '',
-                status          TEXT    NOT NULL DEFAULT 'pending',
-                error_msg       TEXT    NOT NULL DEFAULT '',
-                hyp_verified   INTEGER NOT NULL DEFAULT 0,
-                block_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS oracle_measurements (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                oracle_addr         TEXT    NOT NULL DEFAULT '',
-                measurement_hex     TEXT    NOT NULL DEFAULT '',
-                w_state_fidelity    REAL    NOT NULL DEFAULT 0.0,
-                bell_violation      INTEGER NOT NULL DEFAULT 0,
-                timestamp_ns        INTEGER NOT NULL DEFAULT 0,
-                block_height        INTEGER NOT NULL DEFAULT 0,
-                hyp_signature      TEXT    NOT NULL DEFAULT '',
-                attestation_count   INTEGER NOT NULL DEFAULT 1
-            )""",
-            """CREATE TABLE IF NOT EXISTS block_verification (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_hash      TEXT    NOT NULL DEFAULT '',
-                miner_addr      TEXT    NOT NULL DEFAULT '',
-                verified        INTEGER NOT NULL DEFAULT 0,
-                hyp_sig_valid  INTEGER NOT NULL DEFAULT 0,
-                chain_height    INTEGER NOT NULL DEFAULT 0,
-                ts              INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS oracle_registry (
-                oracle_addr         TEXT    PRIMARY KEY,
-                wallet_addr         TEXT    NOT NULL DEFAULT '',
-                oracle_pubkey       TEXT    NOT NULL DEFAULT '',
-                cert_json           TEXT    NOT NULL DEFAULT '{}',
-                mode                TEXT    NOT NULL DEFAULT 'anonymous',
-                cert_valid          INTEGER NOT NULL DEFAULT 0,
-                peer_id             TEXT    NOT NULL DEFAULT '',
-                ip_hint             TEXT    NOT NULL DEFAULT '',
-                first_seen_ns       INTEGER NOT NULL DEFAULT 0,
-                last_seen_ns        INTEGER NOT NULL DEFAULT 0,
-                attestation_count   INTEGER NOT NULL DEFAULT 0
-            )""",
-            """CREATE TABLE IF NOT EXISTS dm_pool (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                dm_hex          TEXT    NOT NULL DEFAULT '',
-                fidelity        REAL    NOT NULL DEFAULT 0.0,
-                purity          REAL    NOT NULL DEFAULT 0.0,
-                chain_height    INTEGER NOT NULL DEFAULT 0,
-                source_id_hex   TEXT    NOT NULL DEFAULT '',
-                flags           INTEGER NOT NULL DEFAULT 0,
-                timestamp_ns    INTEGER NOT NULL DEFAULT 0,
-                ingested_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS consensus_dm_log (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                chain_height    INTEGER NOT NULL DEFAULT 0,
-                consensus_dm_hex TEXT   NOT NULL DEFAULT '',
-                fidelity        REAL    NOT NULL DEFAULT 0.0,
-                pool_size       INTEGER NOT NULL DEFAULT 0,
-                computed_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS tensor_field_metrics (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                pq_curr_id          TEXT    NOT NULL DEFAULT '',
-                pq_last_id          TEXT    NOT NULL DEFAULT '',
-                fidelity_to_w3      REAL    NOT NULL DEFAULT 0.0,
-                entropy_vn          REAL    NOT NULL DEFAULT 0.0,
-                coherence_l1        REAL    NOT NULL DEFAULT 0.0,
-                quantum_discord     REAL    NOT NULL DEFAULT 0.0,
-                bell_chsh_AB        REAL    NOT NULL DEFAULT 0.0,
-                bell_chsh_BC        REAL    NOT NULL DEFAULT 0.0,
-                bell_violations     INTEGER NOT NULL DEFAULT 0,
-                bell_S1_AB REAL DEFAULT 0.0, bell_S2_AB REAL DEFAULT 0.0,
-                bell_S3_AB REAL DEFAULT 0.0, bell_S4_AB REAL DEFAULT 0.0,
-                bell_S1_BC REAL DEFAULT 0.0, bell_S2_BC REAL DEFAULT 0.0,
-                bell_S3_BC REAL DEFAULT 0.0, bell_S4_BC REAL DEFAULT 0.0,
-                purity              REAL    NOT NULL DEFAULT 0.0,
-                negativity_AB       REAL    NOT NULL DEFAULT 0.0,
-                negativity_BC       REAL    NOT NULL DEFAULT 0.0,
-                field_density       REAL    NOT NULL DEFAULT 0.0,
-                entanglement_entropy REAL   NOT NULL DEFAULT 0.0,
-                oracle_fidelity     REAL    NOT NULL DEFAULT 0.0,
-                oracle_coherence    REAL    NOT NULL DEFAULT 0.0,
-                bridge_fidelity     REAL    NOT NULL DEFAULT 0.0,
-                channel_latency_ms  REAL    NOT NULL DEFAULT 0.0,
-                block_height        INTEGER NOT NULL DEFAULT 0,
-                ts                  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS gossip_inventory (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type  TEXT    NOT NULL DEFAULT '',
-                channel     TEXT    NOT NULL DEFAULT '',
-                peer_id     TEXT    NOT NULL DEFAULT '',
-                payload     TEXT    NOT NULL DEFAULT '',
-                ts          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
-                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                epoch                   INTEGER NOT NULL DEFAULT 0,
-                block_height            INTEGER NOT NULL DEFAULT 0,
-                pq0                     INTEGER NOT NULL DEFAULT 0,
-                oracle_ids              TEXT    NOT NULL DEFAULT '',
-                entanglement_matrix_hex TEXT    NOT NULL DEFAULT '',
-                created_at              REAL    DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)""",
-            """CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)""",
-            """CREATE TABLE IF NOT EXISTS p2p_peers (
-                node_id_hex     TEXT    PRIMARY KEY,
-                host            TEXT    NOT NULL DEFAULT '',
-                port            INTEGER NOT NULL DEFAULT 9091,
-                chain_height    INTEGER NOT NULL DEFAULT 0,
-                last_seen_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                last_heartbeat_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                ban_score       INTEGER NOT NULL DEFAULT 0,
-                last_fidelity   REAL    NOT NULL DEFAULT 0.0,
-                latency_ms      REAL    NOT NULL DEFAULT 0.0,
-                services        INTEGER NOT NULL DEFAULT 1,
-                protocol_version INTEGER NOT NULL DEFAULT 2,
-                source          TEXT    NOT NULL DEFAULT 'unknown',
-                external_addr   TEXT    NOT NULL DEFAULT '',
-                capabilities    TEXT    NOT NULL DEFAULT '[]',
-                mac_address     TEXT    NOT NULL DEFAULT '',
-                device_id       TEXT    NOT NULL DEFAULT ''
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_peer_host ON p2p_peers(host)""",
-            """CREATE INDEX IF NOT EXISTS idx_peer_last_seen ON p2p_peers(last_seen_at DESC)""",
-            """CREATE INDEX IF NOT EXISTS idx_peer_chain_height ON p2p_peers(chain_height DESC)""",
-            """CREATE TABLE IF NOT EXISTS wstate_consensus_log (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height     INTEGER NOT NULL DEFAULT 0,
-                median_fidelity  REAL    NOT NULL DEFAULT 0.0,
-                agreement_score  REAL    NOT NULL DEFAULT 0.0,
-                peer_count       INTEGER NOT NULL DEFAULT 0,
-                quorum_hash_hex  TEXT    NOT NULL DEFAULT '',
-                pow_seed         TEXT    NOT NULL DEFAULT '',
-                created_at       REAL    DEFAULT (strftime('%s','now'))
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_wscl_height ON wstate_consensus_log(block_height)""",
-            """CREATE INDEX IF NOT EXISTS idx_wscl_fidelity ON wstate_consensus_log(median_fidelity)""",
-            """CREATE TABLE IF NOT EXISTS snapshots (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height    INTEGER,
-                oracle_pub      TEXT,
-                sig_hex         TEXT,
-                created_at      REAL
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_snap_height ON snapshots(block_height)""",
-            """CREATE INDEX IF NOT EXISTS idx_snap_oracle ON snapshots(oracle_pub)""",
-            """CREATE TABLE IF NOT EXISTS mempool (
-                tx_hash      TEXT PRIMARY KEY,
-                raw_hex      TEXT NOT NULL,
-                received_at  REAL DEFAULT (strftime('%s','now')),
-                expires_at   REAL DEFAULT 0.0
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_mempool_expires ON mempool(expires_at)""",
-        ]
-        for _tbl_sql in _extended_tables:
-            try:
-                cursor.execute(_tbl_sql)
-            except Exception:
-                pass
-        # ── ALTER TABLE migrations for existing databases ───────────────────────
-        # Migrate pq0_entanglement_log: add missing columns
-        # epoch NOT NULL DEFAULT 0 handles old DBs that have epoch NOT NULL without DEFAULT
-        try:
-            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(pq0_entanglement_log)").fetchall()}
-            for _col, _defn in [
-                ("epoch",                   "INTEGER NOT NULL DEFAULT 0"),
-                ("pq0",                     "INTEGER NOT NULL DEFAULT 0"),
-                ("block_height",            "INTEGER NOT NULL DEFAULT 0"),
-                ("oracle_ids",              "TEXT NOT NULL DEFAULT ''"),
-                ("entanglement_matrix_hex", "TEXT NOT NULL DEFAULT ''"),
-            ]:
-                if _col not in _cols:
-                    cursor.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
-        except Exception:
-            pass
-        # Migrate wstate_consensus_log: add missing columns
-        try:
-            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(wstate_consensus_log)").fetchall()}
-            for _col, _defn in [("median_fidelity","REAL DEFAULT 0"),("agreement_score","REAL DEFAULT 0"),
-                                ("peer_count","INTEGER DEFAULT 0"),("quorum_hash_hex","TEXT DEFAULT ''"),
-                                ("pow_seed","TEXT DEFAULT ''")]:
-                if _col not in _cols:
-                    cursor.execute(f"ALTER TABLE wstate_consensus_log ADD COLUMN {_col} {_defn}")
-        except Exception:
-            pass
-        # Migrate p2p_peers: add missing columns
-        try:
-            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(p2p_peers)").fetchall()}
-            for _col, _defn in [("chain_height","INTEGER DEFAULT 0"),("last_seen_at","INTEGER DEFAULT 0"),
-                                ("first_seen_at","INTEGER DEFAULT 0"),("last_heartbeat_at","INTEGER DEFAULT 0"),
-                                ("ban_score","INTEGER DEFAULT 0"),("last_fidelity","REAL DEFAULT 0.0"),
-                                ("latency_ms","REAL DEFAULT 0.0"),("services","INTEGER DEFAULT 1"),
-                                ("protocol_version","INTEGER DEFAULT 2"),("source","TEXT DEFAULT 'unknown'"),
-                                ("external_addr","TEXT DEFAULT ''"),("capabilities","TEXT DEFAULT '[]'"),
-                                ("mac_address","TEXT DEFAULT ''"),("device_id","TEXT DEFAULT ''")]:
-                if _col not in _cols:
-                    cursor.execute(f"ALTER TABLE p2p_peers ADD COLUMN {_col} {_defn}")
-        except Exception:
-            pass
-        # ── Server-mirrored tables (from SQL patches) ──────────────────────────
-        _server_mirror_tables = [
-            # wallet_addresses — mirrors server PostgreSQL wallet_addresses table
-            # Used for local balance cache, miner reward tracking, treasury visibility
-            """CREATE TABLE IF NOT EXISTS wallet_addresses (
-                address             TEXT    PRIMARY KEY,
-                wallet_fingerprint  TEXT    NOT NULL DEFAULT '',
-                public_key          TEXT    NOT NULL DEFAULT '',
-                balance             INTEGER NOT NULL DEFAULT 0,
-                transaction_count   INTEGER NOT NULL DEFAULT 0,
-                address_type        TEXT    NOT NULL DEFAULT 'receiving',
-                balance_at_height   INTEGER NOT NULL DEFAULT 0,
-                balance_updated_at  INTEGER NOT NULL DEFAULT 0,
-                last_used_at        INTEGER NOT NULL DEFAULT 0,
-                created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-            # quantum_metrics — mirrors server quantum_metrics for local dashboard
-            """CREATE TABLE IF NOT EXISTS quantum_metrics (
-                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp                   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                engine                      TEXT    DEFAULT 'QTCL-QE v8.0',
-                heartbeat_running           INTEGER DEFAULT 0,
-                heartbeat_pulse_count       INTEGER DEFAULT 0,
-                lattice_operations          INTEGER DEFAULT 0,
-                w_state_coherence_avg       REAL    DEFAULT 0.0,
-                w_state_fidelity_avg        REAL    DEFAULT 0.0,
-                w_state_entanglement        REAL    DEFAULT 0.0,
-                noise_kappa                 REAL    DEFAULT 0.08,
-                noise_fidelity_preservation REAL    DEFAULT 0.99,
-                bell_quantum_fraction       REAL    DEFAULT 0.0,
-                bell_s_chsh_mean            REAL    DEFAULT 0.0,
-                created_at                  INTEGER DEFAULT (strftime('%s','now'))
-            )""",
-            # schema_migrations — tracks applied schema versions for idempotent upgrades
-            """CREATE TABLE IF NOT EXISTS schema_migrations (
-                version     TEXT    PRIMARY KEY,
-                applied_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                description TEXT    DEFAULT ''
-            )""",
-            # sync_state — tracks chain sync progress (IBD bookmark)
-            """CREATE TABLE IF NOT EXISTS sync_state (
-                key         TEXT    PRIMARY KEY,
-                value       TEXT    NOT NULL DEFAULT '',
-                updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""",
-        ]
-        for _tbl_sql in _server_mirror_tables:
-            try:
-                cursor.execute(_tbl_sql)
-            except Exception:
-                pass
-        # ── Transaction table expansion (server-compatible columns) ───────────
-        _tx_new_cols = [
-            "ALTER TABLE transactions ADD COLUMN block_hash        TEXT    DEFAULT ''",
-            "ALTER TABLE transactions ADD COLUMN transaction_index INTEGER DEFAULT 0",
-            "ALTER TABLE transactions ADD COLUMN tx_type           TEXT    DEFAULT 'transfer'",
-            "ALTER TABLE transactions ADD COLUMN quantum_state_hash TEXT   DEFAULT ''",
-            "ALTER TABLE transactions ADD COLUMN commitment_hash   TEXT    DEFAULT ''",
-            "ALTER TABLE transactions ADD COLUMN metadata          TEXT    DEFAULT ''",
-            "ALTER TABLE transactions ADD COLUMN created_at        INTEGER DEFAULT 0",
-            "ALTER TABLE transactions ADD COLUMN updated_at        INTEGER DEFAULT 0",
-            "ALTER TABLE transactions ADD COLUMN finalized_at      INTEGER DEFAULT 0",
-            "ALTER TABLE transactions ADD COLUMN w_proof           TEXT    DEFAULT ''",
-        ]
-        for _alter in _tx_new_cols:
-            try:
-                cursor.execute(_alter)
-            except Exception:
-                pass  # column already exists
-        # ── Blocks table expansion (merkle_root, block_hash alias) ────────────
-        _block_new_cols = [
-            "ALTER TABLE blocks ADD COLUMN merkle_root        TEXT    DEFAULT ''",
-            "ALTER TABLE blocks ADD COLUMN block_hash_alias   TEXT    DEFAULT ''",
-            "ALTER TABLE blocks ADD COLUMN tx_count           INTEGER DEFAULT 0",
-            "ALTER TABLE blocks ADD COLUMN synced_from_server INTEGER DEFAULT 0",
-        ]
-        for _alter in _block_new_cols:
-            try:
-                cursor.execute(_alter)
-            except Exception:
-                pass
-        # Indexes for extended tables
-        _extended_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_wallet_ops_addr   ON wallet_operations (wallet_addr, ts DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_rpc_ops_method    ON rpc_operations (method, ts DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_oracle_meas_addr  ON oracle_measurements (oracle_addr, timestamp_ns DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_block_ver_hash    ON block_verification (block_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_hyp_sig_hash     ON hyp_signatures (content_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_dm_pool_height    ON dm_pool (chain_height DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_tfm_height        ON tensor_field_metrics (block_height DESC)",
-            # Server-mirror indexes
-            "CREATE INDEX IF NOT EXISTS idx_wallet_addr_type  ON wallet_addresses (address_type)",
-            "CREATE INDEX IF NOT EXISTS idx_wallet_addr_bal   ON wallet_addresses (balance DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_qmetrics_ts       ON quantum_metrics (timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_tx_type           ON transactions (tx_type)",
-            "CREATE INDEX IF NOT EXISTS idx_tx_block_hash     ON transactions (block_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_tx_height         ON transactions (block_height DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_hash       ON blocks (hash)",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_prev_hash  ON blocks (prev_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_blocks_miner      ON blocks (miner_address)",
-        ]
-        for _eidx in _extended_indexes:
-            try:
-                cursor.execute(_eidx)
-            except Exception:
-                pass
-        # Record schema version
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO schema_migrations (version, description)
-                VALUES ('v2.0_chain_sync', 'Added wallet_addresses, quantum_metrics, schema_migrations, sync_state, expanded tx/block columns')
-            """)
-            cursor.execute("""
-                INSERT OR IGNORE INTO schema_migrations (version, description)
-                VALUES ('v3.0_mac_registration', 'Added mac_address+device_id to p2p_peers, known_peers, mesh_peers, p2p_peer_exchange for NAT-group per-device identity')
-            """)
-        except Exception:
-            pass
-        # ── GeodesicLWE: hyperbolic lattice geometry tables ───────────────────
-        # Mirrors Supabase schema: hyperbolic_triangles, pseudoqubits,
-        # quantum_lattice_metadata — same column names, TEXT instead of NUMERIC(200,150)
-        # (SQLite stores arbitrary-precision TEXT; we parse back via float()/mpf(str()))
-        for _lsql in _LATTICE_TABLE_SQL:
-            try:
-                cursor.execute(_lsql)
-            except Exception:
-                pass
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO schema_migrations (version, description)
-                VALUES ('v4.0_geodesic_lwe',
-                        'Hyperbolic lattice geometry: hyperbolic_triangles, pseudoqubits, '
-                        'quantum_lattice_metadata (mpmath mp.dps=150, depth=5, db_builder parity)')
-            """)
-        except Exception:
-            pass
-        self.conn.commit()
-        # Warm up PQ coord cache in background — non-blocking, mining never waits
-        _start_lattice_warmup(self.db_path)
-
     # ========= Interface-compatible query methods =========
     
     def execute(self, query: str, params=None):
@@ -3851,7 +3316,7 @@ class LocalBlockchainDB:
         import json as _json_ib, time as _t_ib
         self.execute("""
             INSERT OR REPLACE INTO blocks
-            (height, hash, prev_hash, timestamp, nonce, difficulty, miner_address,
+            (height, hash, parent_hash, timestamp, nonce, difficulty, miner_address,
              pq_curr, pq_last, qubit_snapshot, w_state_fidelity,
              pq0,
              hyp_triangle_area, hyp_dist_0c, hyp_dist_cl, hyp_dist_0l,
@@ -3862,7 +3327,7 @@ class LocalBlockchainDB:
         """, (
             height,
             block_data.get('hash') or block_data.get('block_hash'),
-            block_data.get('prev_hash') or block_data.get('parent_hash') or block_data.get('previous_hash'),
+            block_data.get('parent_hash') or block_data.get('parent_hash') or block_data.get('previous_hash'),
             block_data.get('timestamp') or block_data.get('timestamp_s'),
             block_data.get('nonce'),
             block_data.get('difficulty') or block_data.get('difficulty_bits'),
@@ -4247,7 +3712,7 @@ class LocalBlockchainDB:
         _ibd_required_cols: list = [
             # (column_name,  DDL fragment)
             ("hash",               "TEXT    UNIQUE NOT NULL DEFAULT ''"),
-            ("prev_hash",          "TEXT    DEFAULT ''"),
+            ("parent_hash",          "TEXT    DEFAULT ''"),
             ("timestamp",          "INTEGER DEFAULT 0"),
             ("nonce",              "INTEGER DEFAULT 0"),
             ("difficulty",         "REAL    DEFAULT 4.0"),
@@ -4659,11 +4124,11 @@ def _forge_and_store_genesis_block(
     """
     After nuclear wipe: forge + insert genesis block (height=0).
     Deterministic hash → every node converges on the same genesis.
-    Mining loop gets a valid prev_hash immediately after reset.
+    Mining loop gets a valid parent_hash immediately after reset.
     """
     coinbase = _forge_genesis_coinbase(miner_address)
     genesis  = {
-        "height": 0, "prev_hash": "0" * 64,
+        "height": 0, "parent_hash": "0" * 64,
         "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
         "timestamp": 1_700_000_000, "difficulty": 4,
         "miner_id": NULL_COINBASE_ADDRESS, "tx_count": 1, "nonce": 0,
@@ -5102,8 +4567,8 @@ class SnapshotManager(ComponentBase):
             prev = self._db.get_block_by_height(height - 1)
             if not prev:
                 warnings.append(f"Previous block at height {height-1} not found in DB (may be syncing)")
-            elif prev.get("block_hash") != block.get("prev_hash"):
-                errors.append("prev_hash does not match stored previous block hash")
+            elif prev.get("block_hash") != block.get("parent_hash"):
+                errors.append("parent_hash does not match stored previous block hash")
         self._inc("blocks_verified")
         return VerificationResult(valid=not errors, errors=errors, warnings=warnings)
     def verify_transaction(self, tx: Dict[str, Any]) -> VerificationResult:
@@ -5136,10 +4601,10 @@ class SnapshotManager(ComponentBase):
         for i, block in enumerate(blocks):
             if i > 0:
                 prev = blocks[i - 1]
-                if block.get("prev_hash") != prev.get("block_hash"):
+                if block.get("parent_hash") != prev.get("block_hash"):
                     errors.append(
                         f"Chain break at height {block.get('height')}: "
-                        f"prev_hash mismatch"
+                        f"parent_hash mismatch"
                     )
                 if block.get("height") != prev.get("height", 0) + 1:
                     errors.append(f"Height gap at block index {i}")
@@ -5201,7 +4666,7 @@ class SnapshotManager(ComponentBase):
         return self._hash.verify_pow(block, difficulty)
     def _check_block_structure(self, block: Dict) -> List[str]:
         errors = []
-        required = ["height", "prev_hash", "merkle_root", "timestamp"]
+        required = ["height", "parent_hash", "merkle_root", "timestamp"]
         for field_name in required:
             if field_name not in block:
                 errors.append(f"Block missing required field: {field_name}")
@@ -5831,7 +5296,7 @@ class RotationOrchestrator(ComponentBase):
             if h:
                 nodes[h] = {
                     "height": block.get("height", 0),
-                    "prev": block.get("prev_hash", ""),
+                    "prev": block.get("parent_hash", ""),
                     "ts": block.get("timestamp", 0),
                     "nonce": block.get("nonce", 0),
                 }
@@ -18703,7 +18168,7 @@ class NodeRPCMeshServer:
             conn.execute("""CREATE TABLE IF NOT EXISTS blocks (
                 height              INTEGER PRIMARY KEY,
                 hash                TEXT    UNIQUE NOT NULL,
-                prev_hash           TEXT    NOT NULL,
+                parent_hash           TEXT    NOT NULL,
                 timestamp           INTEGER NOT NULL DEFAULT 0,
                 tx_count            INTEGER NOT NULL DEFAULT 0,
                 merkle_root         TEXT    NOT NULL DEFAULT '',
@@ -18716,10 +18181,10 @@ class NodeRPCMeshServer:
                 block_latency_ms    INTEGER NOT NULL DEFAULT 0
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_prev_hash ON blocks(prev_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_parent_hash ON blocks(parent_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp)")
             # Migrate existing tables
-            for col, defn in [("prev_hash","TEXT DEFAULT ''"),("synced_from_server","INTEGER DEFAULT 0"),
+            for col, defn in [("parent_hash","TEXT DEFAULT ''"),("synced_from_server","INTEGER DEFAULT 0"),
                               ("miner_reward","REAL DEFAULT 0"),("treasury_reward","REAL DEFAULT 0"),
                               ("version","INTEGER DEFAULT 1"),("w_state_fidelity","REAL DEFAULT 0"),
                               ("fidelity_measure","REAL DEFAULT 0"),("block_latency_ms","INTEGER DEFAULT 0")]:
@@ -19463,7 +18928,7 @@ class NodeRPCMeshServer:
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         h, bhash,
-                        str(block.get("parent_hash") or block.get("prev_hash","0"*64)),
+                        str(block.get("parent_hash") or block.get("parent_hash","0"*64)),
                         int(block.get("timestamp") or time.time()),
                         int(block.get("nonce") or 0),
                         float(block.get("difficulty") or 4.0),
