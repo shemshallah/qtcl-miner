@@ -1495,21 +1495,34 @@ class HypKeyPair:
 
 class HypGammaWallet:
     """HypΓ-only wallet manager — post-quantum cryptography."""
-    
+
     # Class-level tracking to prevent duplicate initialization logs
     _initialized_addresses: Set[str] = set()
-    
-    def __init__(self, seed_hex: Optional[str] = None, label: str = "wallet"):
+
+    def __init__(self, seed_hex: Optional[str] = None, label: str = "wallet", data_dir: Optional[str] = None):
         """Initialize HypΓ wallet with optional seed.
 
         Args:
             seed_hex: Optional seed for deterministic keypair generation
             label: Label for this wallet instance (e.g., 'wallet', 'adapter', 'oracle')
                    Used to prevent confusing duplicate log messages.
+            data_dir: Directory for wallet files (defaults to ~/.qtcl)
         """
+        from pathlib import Path
+
         self._label = label
         self.engine = None
         self.keypair: Optional[HypKeyPair] = None
+        self._mnemonic_phrase: Optional[str] = None
+
+        # Set up wallet file paths
+        if data_dir is None:
+            data_dir = str(Path.home() / ".qtcl")
+        data_path = Path(data_dir)
+        data_path.mkdir(parents=True, exist_ok=True)
+
+        self.wallet_file = str(data_path / "wallet.json")
+        self.mnemonic_file = str(data_path / "wallet_mnemonic.enc")
 
         try:
             # Import here to avoid circular imports
@@ -1522,6 +1535,8 @@ class HypGammaWallet:
             else:
                 # Random generation
                 self.keypair = self._generate_keypair_from_engine()
+                # Generate random BIP-39 mnemonic for new wallets
+                self._generate_bip39_mnemonic()
 
             # Only log initialization once per unique address to prevent confusion
             addr_short = self.keypair.address[:16]
@@ -1601,6 +1616,297 @@ class HypGammaWallet:
                 self.keypair.address is not None and
                 self.keypair.private_key is not None and
                 self.keypair.public_key is not None)
+
+    def load_from_file(self, wallet_path: str, password: str) -> bool:
+        """Load keypair from encrypted wallet.json file using HypΓ-XOF KDF.
+
+        Decrypts using SHA3-256 KDF + HMAC authentication.
+        Returns True on success, False on failure.
+        """
+        try:
+            from pathlib import Path
+            import json as _json_wallet
+            import hashlib
+            import hmac
+
+            wallet_file = Path(wallet_path)
+            if not wallet_file.exists():
+                logger.debug(f"[HYP-WALLET] Wallet file not found: {wallet_path}")
+                return False
+
+            # Read encrypted wallet JSON
+            with open(wallet_file, 'r') as f:
+                wallet_data = _json_wallet.load(f)
+
+            # Extract encryption components
+            salt_hex = wallet_data.get('salt', '')
+            auth_hex = wallet_data.get('auth', '')
+            cipher_hex = wallet_data.get('cipher', '')
+
+            if not all([salt_hex, auth_hex, cipher_hex]):
+                logger.debug("[HYP-WALLET] Wallet file missing encryption fields")
+                return False
+
+            # Decrypt using HypΓ-XOF KDF (SHA3-256 based)
+            salt = bytes.fromhex(salt_hex)
+
+            # Step 1: Derive key from password + salt
+            password_entropy = hashlib.sha3_256(password.encode('utf-8') + salt).digest()
+            kdf_input = password_entropy + b"HYPCL_KEY_ENCRYPTION"
+
+            # Step 2: Generate keystream (XOF-like mode using SHA3-256 counter)
+            cipher_bytes = bytes.fromhex(cipher_hex)
+            keystream = b''
+            blocks_needed = (len(cipher_bytes) + 31) // 32
+            for i in range(blocks_needed):
+                xof_block = hashlib.sha3_256(kdf_input + bytes([i])).digest()
+                keystream += xof_block
+
+            # Step 3: Decrypt (XOR with keystream)
+            plaintext = bytes(a ^ b for a, b in zip(cipher_bytes, keystream[:len(cipher_bytes)]))
+
+            # Step 4: Verify auth (HMAC-SHA3-256)
+            expected_auth = hmac.new(password_entropy, plaintext, hashlib.sha3_256).digest().hex()
+            if expected_auth != auth_hex:
+                logger.debug("[HYP-WALLET] ❌ Auth failed - wrong password")
+                return False
+
+            # Step 5: Parse and restore keypair
+            try:
+                keypair_data = _json_wallet.loads(plaintext.decode('utf-8'))
+                self.keypair = HypKeyPair(
+                    private_key=keypair_data.get('private_key', ''),
+                    public_key=keypair_data.get('public_key', ''),
+                    address=keypair_data.get('address', '')
+                )
+                logger.info(f"[HYP-WALLET] ✅ Decrypted: {self.keypair.address[:16]}...")
+                return True
+            except Exception as parse_e:
+                logger.debug(f"[HYP-WALLET] Parse error: {parse_e}")
+                return False
+
+        except Exception as e:
+            logger.debug(f"[HYP-WALLET] Load error: {e}")
+            return False
+
+    def save_to_file(self, wallet_path: str, password: str) -> bool:
+        """Save keypair to encrypted wallet.json file using HypΓ-XOF KDF.
+
+        Returns True on success, False on failure.
+        """
+        try:
+            from pathlib import Path
+            import json as _json_wallet
+            import hashlib
+            import hmac
+            import secrets
+
+            if not self.keypair:
+                logger.debug("[HYP-WALLET] No keypair to save")
+                return False
+
+            wallet_file = Path(wallet_path)
+            wallet_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Step 1: Generate random salt
+            salt = secrets.token_bytes(32)
+            salt_hex = salt.hex()
+
+            # Step 2: Serialize keypair to JSON
+            keypair_data = {
+                'private_key': self.keypair.private_key,
+                'public_key': self.keypair.public_key,
+                'address': self.keypair.address
+            }
+            plaintext = _json_wallet.dumps(keypair_data).encode('utf-8')
+
+            # Step 3: Derive key from password + salt
+            password_entropy = hashlib.sha3_256(password.encode('utf-8') + salt).digest()
+            kdf_input = password_entropy + b"HYPCL_KEY_ENCRYPTION"
+
+            # Step 4: Generate keystream (XOF-like mode)
+            keystream = b''
+            blocks_needed = (len(plaintext) + 31) // 32
+            for i in range(blocks_needed):
+                xof_block = hashlib.sha3_256(kdf_input + bytes([i])).digest()
+                keystream += xof_block
+
+            # Step 5: Encrypt (XOR with keystream)
+            cipher = bytes(a ^ b for a, b in zip(plaintext, keystream[:len(plaintext)]))
+            cipher_hex = cipher.hex()
+
+            # Step 6: Calculate auth (HMAC-SHA3-256)
+            auth_hex = hmac.new(password_entropy, plaintext, hashlib.sha3_256).digest().hex()
+
+            # Step 7: Write encrypted wallet file
+            wallet_data = {
+                'version': 4,
+                'salt': salt_hex,
+                'auth': auth_hex,
+                'cipher': cipher_hex,
+                'kdf': 'Hyp\u0393-XOF'
+            }
+
+            with open(wallet_file, 'w') as f:
+                _json_wallet.dump(wallet_data, f)
+
+            logger.info(f"[HYP-WALLET] ✅ Saved: {wallet_path}")
+            return True
+
+        except Exception as e:
+            logger.debug(f"[HYP-WALLET] Save error: {e}")
+            return False
+
+    def _generate_bip39_mnemonic(self) -> str:
+        """Generate random 12-word BIP-39 mnemonic phrase."""
+        import secrets
+        # Generate 128 bits of entropy (12 words × 11 bits)
+        entropy_bytes = secrets.token_bytes(16)
+        entropy_int = int.from_bytes(entropy_bytes, 'big')
+
+        # Select 12 words from BIP39_WORDLIST
+        words = []
+        for i in range(12):
+            index = (entropy_int >> (i * 11)) & 0x7FF  # Extract 11-bit index
+            words.append(BIP39_WORDLIST[index % len(BIP39_WORDLIST)])
+
+        self._mnemonic_phrase = " ".join(words)
+        return self._mnemonic_phrase
+
+    def _save_mnemonic(self, password: str) -> bool:
+        """Save mnemonic phrase encrypted to wallet_mnemonic.enc using HypΓ-XOF KDF."""
+        if not self._mnemonic_phrase:
+            logger.debug("[HYP-WALLET] No mnemonic to save")
+            return False
+
+        try:
+            from pathlib import Path
+            import json as _json_wallet
+            import hashlib
+            import hmac
+            import secrets
+
+            mnemonic_file = Path(self.mnemonic_file)
+            mnemonic_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Step 1: Generate random salt
+            salt = secrets.token_bytes(32)
+            salt_hex = salt.hex()
+
+            # Step 2: Serialize mnemonic
+            plaintext = self._mnemonic_phrase.encode('utf-8')
+
+            # Step 3: Derive key from password + salt
+            password_entropy = hashlib.sha3_256(password.encode('utf-8') + salt).digest()
+            kdf_input = password_entropy + b"HYPCL_MNEMONIC_ENCRYPTION"
+
+            # Step 4: Generate keystream (XOF-like mode)
+            keystream = b''
+            blocks_needed = (len(plaintext) + 31) // 32
+            for i in range(blocks_needed):
+                xof_block = hashlib.sha3_256(kdf_input + bytes([i])).digest()
+                keystream += xof_block
+
+            # Step 5: Encrypt (XOR with keystream)
+            cipher = bytes(a ^ b for a, b in zip(plaintext, keystream[:len(plaintext)]))
+            cipher_hex = cipher.hex()
+
+            # Step 6: Calculate auth (HMAC-SHA3-256)
+            auth_hex = hmac.new(password_entropy, plaintext, hashlib.sha3_256).digest().hex()
+
+            # Step 7: Write encrypted mnemonic file
+            mnemonic_data = {
+                'version': 1,
+                'salt': salt_hex,
+                'auth': auth_hex,
+                'cipher': cipher_hex,
+                'kdf': 'HypΓ-XOF'
+            }
+
+            with open(mnemonic_file, 'w') as f:
+                _json_wallet.dump(mnemonic_data, f)
+
+            logger.debug(f"[HYP-WALLET] ✅ Mnemonic saved: {self.mnemonic_file}")
+            return True
+
+        except Exception as e:
+            logger.debug(f"[HYP-WALLET] Mnemonic save error: {e}")
+            return False
+
+    def _load_mnemonic(self, password: str) -> Optional[str]:
+        """Load and decrypt mnemonic phrase using password."""
+        try:
+            from pathlib import Path
+            import json as _json_wallet
+            import hashlib
+            import hmac
+
+            mnemonic_file = Path(self.mnemonic_file)
+            if not mnemonic_file.exists():
+                logger.debug(f"[HYP-WALLET] Mnemonic file not found: {self.mnemonic_file}")
+                return None
+
+            # Read encrypted mnemonic JSON
+            with open(mnemonic_file, 'r') as f:
+                mnemonic_data = _json_wallet.load(f)
+
+            # Extract encryption components
+            salt_hex = mnemonic_data.get('salt', '')
+            auth_hex = mnemonic_data.get('auth', '')
+            cipher_hex = mnemonic_data.get('cipher', '')
+
+            if not all([salt_hex, auth_hex, cipher_hex]):
+                logger.debug("[HYP-WALLET] Mnemonic file missing encryption fields")
+                return None
+
+            # Decrypt using HypΓ-XOF KDF (SHA3-256 based)
+            salt = bytes.fromhex(salt_hex)
+
+            # Step 1: Derive key from password + salt
+            password_entropy = hashlib.sha3_256(password.encode('utf-8') + salt).digest()
+            kdf_input = password_entropy + b"HYPCL_MNEMONIC_ENCRYPTION"
+
+            # Step 2: Generate keystream (XOF-like mode using SHA3-256 counter)
+            cipher_bytes = bytes.fromhex(cipher_hex)
+            keystream = b''
+            blocks_needed = (len(cipher_bytes) + 31) // 32
+            for i in range(blocks_needed):
+                xof_block = hashlib.sha3_256(kdf_input + bytes([i])).digest()
+                keystream += xof_block
+
+            # Step 3: Decrypt (XOR with keystream)
+            plaintext = bytes(a ^ b for a, b in zip(cipher_bytes, keystream[:len(cipher_bytes)]))
+
+            # Step 4: Verify auth (HMAC-SHA3-256)
+            expected_auth = hmac.new(password_entropy, plaintext, hashlib.sha3_256).digest().hex()
+            if expected_auth != auth_hex:
+                logger.debug("[HYP-WALLET] ❌ Mnemonic auth failed - wrong password")
+                return None
+
+            # Step 5: Decode mnemonic phrase
+            phrase = plaintext.decode('utf-8')
+            self._mnemonic_phrase = phrase
+            logger.debug(f"[HYP-WALLET] ✅ Mnemonic decrypted")
+            return phrase
+
+        except Exception as e:
+            logger.debug(f"[HYP-WALLET] Mnemonic load error: {e}")
+            return None
+
+    @property
+    def address(self) -> str:
+        """Get wallet address."""
+        return self.keypair.address if self.keypair else ""
+
+    @property
+    def public_key(self) -> str:
+        """Get wallet public key."""
+        return self.keypair.public_key if self.keypair else ""
+
+    @property
+    def mnemonic_phrase(self) -> Optional[str]:
+        """Get mnemonic phrase (in memory, not persisted unless saved)."""
+        return self._mnemonic_phrase
 
     def get_address(self) -> str:
         """Get wallet address."""
@@ -2207,9 +2513,9 @@ class QtclOracleMeasurement:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LiveRPCOracleSnapshot:
-    """⚛️ Real-time synchronous RPC snapshot fetcher → DM + metrics on-demand (ZERO polling)."""
-    ORACLE_URL = ENTROPY_SERVER_URL  # unified — set from ENTROPY_SERVER or ORACLE_URL env
-    
+    """Real-time SSE stream listener for /rpc/oracle/snapshot (compact 4×4×4 tensor + W-state)."""
+    ORACLE_URL = ENTROPY_SERVER_URL
+
     def __init__(self):
         self._dm_re = [0.0]*64
         self._dm_im = [0.0]*64
@@ -2217,215 +2523,215 @@ class LiveRPCOracleSnapshot:
         self._dm_lock = threading.Lock()
         self._oracle_state = {}
         self._oracle_state_lock = threading.Lock()
-        self._session = None  # Lazy-init HTTP session
-    
-    def _get_session(self):
-        """Lazy-init HTTP session for connection pooling."""
-        if self._session is None:
-            try:
-                import requests
-                self._session = requests.Session()
-            except:
-                self._session = False  # Mark as failed
-        return self._session if self._session else None
-    
-    def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous JSON-RPC 2.0 call to /rpc → qtcl_getQuantumMetrics.
-        Falls back to /rpc/oracle/snapshot GET if RPC returns empty.
-        Returns empty dict on any error — fail-safe for RPC hangs. ❤️"""
-        _t0 = time.time()
-        _rpc_url  = f"{self.ORACLE_URL}/rpc"
-        _snap_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
-        _payload  = {"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1}
-        snap: dict = {}
+        self._sse_running = False
+        self._sse_thread = None
+        self._sse_stop_event = threading.Event()
+        self._snapshot_updates = 0
+        self._last_snapshot_ts = 0.0
+
+    def _parse_w_state_hex(self, w_hex: str) -> tuple:
+        """Parse W-state hex string (8 complex doubles = 256 hex chars, 128 bytes).
+
+        Returns: (w_re list[8], w_im list[8]) or (None, None) on error.
+        """
+        if not w_hex or len(w_hex) != 256:
+            return None, None
         try:
-            session = self._get_session()
-            for _url, _is_rpc in ((_rpc_url, True), (_snap_url, False)):
-                try:
-                    if session:
-                        _r = session.post(_url, json=_payload, timeout=timeout_s)
-                        if _r.status_code not in (200, 202):
-                            continue
-                        _body = _r.json()
-                    else:
-                        from urllib.request import Request as _Req, urlopen as _uo
-                        _req = _Req(_url, data=json.dumps(_payload).encode(),
-                                    headers={"Content-Type": "application/json"}, method="POST")
-                        with _uo(_req, timeout=timeout_s) as _resp:
-                            _body = json.loads(_resp.read())
-                    snap = _body.get("result") or {}
-                    if not isinstance(snap, dict): snap = {}
-                    if snap: break  # got data — no need for fallback
-                except Exception as _fe:
-                    logger.debug(f"[RPC-ORACLE] {_url} failed: {_fe}")
-                    continue
-            
-            # Parse compact W-state amplitudes (8 complex doubles = 128 bytes)
-            _w_hex = snap.get('w_state_hex') or ''
-            if snap and _w_hex:
-                try:
-                    bdata = bytes.fromhex(_w_hex)
-                    # 8 complex doubles for 8-qubit W-state
-                    w_re, w_im = [0.0]*8, [0.0]*8
-                    for i in range(8):
-                        re, im = struct.unpack_from('>dd', bdata, i*16)
-                        w_re[i], w_im[i] = re, im
-                    
-                    # Store as simplified DM representation (8x8 single-excitation subspace)
-                    with self._dm_lock:
-                        # Expand to 64x64 for compatibility (indices 0,1,2,4,8,16,32,64)
-                        self._dm_re = [0.0]*64
-                        self._dm_im = [0.0]*64
-                        w_indices = [1, 2, 4, 8, 16, 32, 64, 128]
-                        for i, idx in enumerate(w_indices):
-                            if idx < 64:
-                                self._dm_re[idx] = w_re[i]
-                                self._dm_im[idx] = w_im[i]
-                        self._last_fetch_ts = time.time()
-                    logger.debug(f"[RPC-ORACLE] ✅ W-state parsed: {len(_w_hex)//2} bytes")
-                except Exception as parse_e:
-                    logger.debug(f"[RPC-ORACLE] W-state parse error: {parse_e}")
-            else:
-                # Fallback: try full density tensor (legacy)
-                _dm_hex = snap.get('density_matrix_hex') or snap.get('density_tensor_hex') or ''
-                if snap and _dm_hex:
-                    try:
-                        bdata = bytes.fromhex(_dm_hex)
-                        dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                        
-                        if len(bdata) == 1024:
-                            for i in range(64):
-                                re, im = struct.unpack_from('>dd', bdata, i*16)
-                                dm_re_new[i], dm_im_new[i] = re, im
-                        elif len(bdata) == 512:
-                            for i in range(64):
-                                re, im = struct.unpack_from('>ff', bdata, i*8)
-                                dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                        
-                        with self._dm_lock:
-                            self._dm_re = dm_re_new
-                            self._dm_im = dm_im_new
-                            self._last_fetch_ts = time.time()
-                        logger.debug(f"[RPC-ORACLE] ✅ DM parsed from {len(_dm_hex)//2} bytes")
-                    except Exception as parse_e:
-                        logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
-            
-            # Update oracle state from compact snapshot
-            if snap:
-                with self._oracle_state_lock:
-                    w_state = snap.get('w_state') or {}
-                    _lattice = snap.get('lattice') or {}
-                    
-                    # Update fidelity from compact snapshot (already sent by server)
-                    if w_state.get('fidelity'):
-                        self._w_fidelity = float(w_state['fidelity'])
-                    elif _lattice.get('fidelity'):
-                        self._w_fidelity = float(_lattice['fidelity'])
-                    _fid_raw = (w_state.get('fidelity') or
-                                snap.get('w_state_fidelity') or
-                                _lattice.get('fidelity') or
-                                snap.get('fidelity') or
-                                snap.get('client_fused_fidelity') or 0.0)
-                    _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
-                    # Use explicit None-checks — 0.0 is a valid value, don't fall through
-                    _pur_raw = w_state.get('purity')
-                    if _pur_raw is None:
-                        _pur_raw = _lattice.get('purity')
-                    if _pur_raw is None:
-                        _pur_raw = 0.0
-                    # Clamp purity to valid [0,1] range — reject garbage values
-                    try:
-                        _pur_val = float(_pur_raw)
-                        if not (0.0 <= _pur_val <= 1.0):
-                            _pur_val = 0.0
-                    except (TypeError, ValueError):
-                        _pur_val = 0.0
-                    
-                    _vne_raw = w_state.get('entropy')
-                    if _vne_raw is None:
-                        _vne_raw = w_state.get('von_neumann_entropy')
-                    if _vne_raw is None:
-                        _vne_raw = _lattice.get('entropy')
-                    if _vne_raw is None:
-                        _vne_raw = 0.0
-                    try:
-                        _vne_val = float(_vne_raw)
-                        if not (0.0 <= _vne_val <= 10.0):
-                            _vne_val = 0.0
-                    except (TypeError, ValueError):
-                        _vne_val = 0.0
-                    
-                    _pq_curr_raw = snap.get('pq_curr')
-                    _pq_last_raw = snap.get('pq_last')
-                    if _pq_curr_raw is None:
-                        _pq_curr_raw = snap.get('pq_curr_id')
-                    if _pq_last_raw is None:
-                        _pq_last_raw = snap.get('pq_last_id')
-                    # pq_curr = forward boundary number of current block
-                    # pq_last = read boundary number (previous block's boundary)
-                    _pq_curr = int(_pq_curr_raw) if _pq_curr_raw is not None else (_bh_snap + 1)
-                    _pq_last = int(_pq_last_raw) if _pq_last_raw is not None else _bh_snap
-                    
-                    self._oracle_state = {
-                        'w_state_fidelity': float(_fid_raw),
-                        'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
-                        'von_neumann_entropy': _vne_val,
-                        'purity': _pur_val,
-                        'cycle': snap.get('cycle', 0),
-                        'consensus': snap.get('consensus', False),
-                        'mermin_test': snap.get('mermin_test', {}),
-                        'block_height': _bh_snap,
-                        'density_matrix_hex': snap.get('density_matrix_hex', ''),
-                        'pq_curr': _pq_curr,
-                        'pq_last': _pq_last,
-                        'latency_ms': round((time.time() - _t0) * 1000.0, 1),
-                        'pq0_oracle_fidelity': float(snap.get('pq0_oracle_fidelity') or
-                                                     (snap.get('aer_noise_state') or {}).get('pq0_oracle_fidelity') or 0.0),
-                        'pq0_IV_fidelity':     float(snap.get('pq0_IV_fidelity') or
-                                                     (snap.get('aer_noise_state') or {}).get('pq0_IV_fidelity') or 0.0),
-                        'pq0_V_fidelity':      float(snap.get('pq0_V_fidelity') or
-                                                     (snap.get('aer_noise_state') or {}).get('pq0_V_fidelity') or 0.0),
-                    }
-            
-            snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
-            return snap
+            bdata = bytes.fromhex(w_hex)
+            if len(bdata) != 128:
+                return None, None
+            w_re, w_im = [0.0]*8, [0.0]*8
+            for i in range(8):
+                re, im = struct.unpack_from('>dd', bdata, i*16)
+                w_re[i], w_im[i] = re, im
+            return w_re, w_im
         except Exception as e:
-            logger.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
-            return {}
-    
+            logger.error(f"[SSE-PARSER] W-state parse failed: {e}")
+            return None, None
+
+    def _parse_compact_tensor_hex(self, tensor_hex: str) -> list:
+        """Parse compact 4×4×4 tensor hex string (512 hex chars, 256 bytes float32).
+
+        Returns: flattened tensor list[64] or None on error.
+        """
+        if not tensor_hex or len(tensor_hex) != 512:
+            return None
+        try:
+            bdata = bytes.fromhex(tensor_hex)
+            if len(bdata) != 256:
+                return None
+            tensor_flat = list(struct.unpack('>64f', bdata))
+            return tensor_flat
+        except Exception as e:
+            logger.error(f"[SSE-PARSER] Tensor parse failed: {e}")
+            return None
+
+    def _process_snapshot(self, snap: dict) -> None:
+        """Process incoming SSE snapshot: parse W-state & tensor, update DM."""
+        if not snap or not isinstance(snap, dict):
+            return
+
+        _t0 = time.time()
+
+        w_hex = snap.get('w_state_hex', '')
+        tensor_hex = snap.get('density_tensor_hex', '')
+
+        if not w_hex and not tensor_hex:
+            logger.warning("[SSE-ORACLE] Snapshot missing w_state_hex and density_tensor_hex")
+            return
+
+        w_re, w_im = self._parse_w_state_hex(w_hex) if w_hex else (None, None)
+        tensor_flat = self._parse_compact_tensor_hex(tensor_hex) if tensor_hex else None
+
+        if w_re is None and tensor_flat is None:
+            logger.warning("[SSE-ORACLE] Could not parse W-state or tensor from snapshot")
+            return
+
+        with self._dm_lock:
+            if w_re is not None:
+                self._dm_re = [0.0]*64
+                self._dm_im = [0.0]*64
+                w_indices = [1, 2, 4, 8, 16, 32, 64, 128]
+                for i, idx in enumerate(w_indices):
+                    if idx < 64:
+                        self._dm_re[idx] = w_re[i]
+                        self._dm_im[idx] = w_im[i]
+                logger.debug(f"[SSE-ORACLE] ✅ W-state: {len(w_hex)//2} bytes parsed")
+
+            if tensor_flat is not None:
+                self._dm_re = tensor_flat[:]
+                logger.debug(f"[SSE-ORACLE] ✅ Compact tensor: {len(tensor_hex)//2} bytes parsed")
+
+            self._last_fetch_ts = time.time()
+
+        with self._oracle_state_lock:
+            self._oracle_state = {
+                'w_state_fidelity': float(snap.get('w_state_fidelity', 0.0)),
+                'purity': float(snap.get('purity', 0.0)),
+                'timestamp_ns': int(snap.get('timestamp_ns', 0)),
+                'ready': snap.get('ready', False),
+                'packet_type': snap.get('packet_type', 'tensor'),
+                'latency_ms': round((time.time() - _t0) * 1000.0, 1),
+            }
+
+        self._snapshot_updates += 1
+        self._last_snapshot_ts = time.time()
+
+    def _sse_listener_thread(self) -> None:
+        """Continuous SSE listener for /rpc/oracle/snapshot (50ms cadence)."""
+        import urllib.request
+        import urllib.error
+        from http.client import HTTPMessage
+        from io import BytesIO
+
+        sse_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
+        backoff_ms = 100
+        max_backoff_ms = 5000
+
+        while not self._sse_stop_event.is_set():
+            try:
+                logger.info(f"[SSE-ORACLE] Connecting to {sse_url}")
+                req = urllib.request.Request(sse_url, method='GET')
+                req.add_header('Cache-Control', 'no-cache')
+                req.add_header('Accept', 'text/event-stream')
+
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    backoff_ms = 100
+                    logger.info("[SSE-ORACLE] ✅ Connected, listening for updates...")
+
+                    while not self._sse_stop_event.is_set():
+                        line = resp.readline().decode('utf-8').rstrip('\r\n')
+
+                        if not line:
+                            continue
+
+                        if line.startswith(':'):
+                            continue
+
+                        if line.startswith('data: '):
+                            data_str = line[6:]
+                            try:
+                                msg = json.loads(data_str)
+                                snap = msg.get('result', {})
+                                self._process_snapshot(snap)
+                            except json.JSONDecodeError as je:
+                                logger.error(f"[SSE-ORACLE] JSON parse error: {je}")
+                            except Exception as e:
+                                logger.error(f"[SSE-ORACLE] Snapshot processing error: {e}")
+
+            except urllib.error.HTTPError as he:
+                logger.error(f"[SSE-ORACLE] HTTP {he.code}: {he.reason}")
+                self._sse_stop_event.wait(timeout=backoff_ms/1000.0)
+                backoff_ms = min(backoff_ms * 2, max_backoff_ms)
+            except urllib.error.URLError as ue:
+                logger.error(f"[SSE-ORACLE] Connection error: {ue.reason}")
+                self._sse_stop_event.wait(timeout=backoff_ms/1000.0)
+                backoff_ms = min(backoff_ms * 2, max_backoff_ms)
+            except Exception as e:
+                logger.error(f"[SSE-ORACLE] Unexpected error: {type(e).__name__}: {e}")
+                self._sse_stop_event.wait(timeout=backoff_ms/1000.0)
+                backoff_ms = min(backoff_ms * 2, max_backoff_ms)
+
+    def start_sse_listener(self) -> None:
+        """Start the SSE listener thread (must be called once)."""
+        if self._sse_running:
+            logger.warning("[SSE-ORACLE] Listener already running")
+            return
+
+        self._sse_running = True
+        self._sse_stop_event.clear()
+        self._sse_thread = threading.Thread(target=self._sse_listener_thread, daemon=True, name='OracleSSE')
+        self._sse_thread.start()
+        logger.info("[SSE-ORACLE] SSE listener thread started")
+
+    def stop_sse_listener(self) -> None:
+        """Stop the SSE listener thread."""
+        if not self._sse_running:
+            return
+        self._sse_stop_event.set()
+        if self._sse_thread:
+            self._sse_thread.join(timeout=5.0)
+        self._sse_running = False
+        logger.info("[SSE-ORACLE] SSE listener thread stopped")
+
     def get_oracle_dm(self) -> tuple:
         """Return (dm_re, dm_im, age_sec) thread-safe."""
         with self._dm_lock:
             age = max(0.0, time.time() - self._last_fetch_ts)
             return (self._dm_re[:], self._dm_im[:], age)
-    
+
     def get_oracle_state(self) -> dict:
         """Return current oracle state (thread-safe)."""
         with self._oracle_state_lock:
-            return dict(self._oracle_state)
+            state = dict(self._oracle_state)
+            state['updates_received'] = self._snapshot_updates
+            state['last_update_ts'] = self._last_snapshot_ts
+            return state
+
+    def fetch_snapshot(self, timeout_s=5.0) -> dict:
+        """Deprecated: fetch_snapshot() replaced by SSE streaming.
+
+        This method is retained for compatibility. It waits (up to timeout_s) for
+        the SSE stream to deliver at least one snapshot, then returns the current state.
+        """
+        import time as _t_compat
+        deadline = _t_compat.time() + timeout_s
+        while _t_compat.time() < deadline:
+            state = self.get_oracle_state()
+            if state and state.get('updates_received', 0) > 0:
+                return state
+            _t_compat.sleep(0.05)  # Poll SSE buffer every 50ms
+        return self.get_oracle_state() or {}
 _LIVE_RPC_ORACLE = LiveRPCOracleSnapshot()
 
-def _start_oracle_background_poll(interval_s: float = 15.0) -> None:
-    """Soft background poll — keeps _LIVE_RPC_ORACLE cache warm.
-    Uses a long interval (15s default) so it never competes with mining.
-    Non-blocking: skips if oracle is slow; mining never waits for this.
-    """
-    import threading as _obgt, time as _obgtime
-    def _poll():
-        while True:
-            try:
-                # Only refresh if cache is stale
-                _, _, _age = _LIVE_RPC_ORACLE.get_oracle_dm()
-                if _age > interval_s:
-                    _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)
-            except Exception:
-                pass
-            _obgtime.sleep(interval_s)
-    t = _obgt.Thread(target=_poll, daemon=True, name='OracleBackgroundPoll')
-    t.start()
-    return t
+def _start_oracle_sse_listener() -> None:
+    """Start the SSE listener for real-time oracle snapshots (50ms cadence from server)."""
+    try:
+        _LIVE_RPC_ORACLE.start_sse_listener()
+    except Exception as e:
+        logger.error(f"[INIT-ORACLE] Failed to start SSE listener: {e}")
 
-_ORACLE_BG_POLL = _start_oracle_background_poll()
+_start_oracle_sse_listener()
 
 class WStateConsensus:
     """BFT median consensus over peer W-state measurements.
@@ -8804,17 +9110,15 @@ class KoyebOracleState:
         """RPC-based metric refresh — always does a live fetch to measure real latency."""
         try:
             t0 = time.time()
-            live = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
-            if live:
+            state = _LIVE_RPC_ORACLE.get_oracle_state()
+            if state and state.get('updates_received', 0) > 0:
                 def _nv(v):
                     try:
                         f = float(v)
                         return f if (f == f and abs(f) < 1e15) else None
                     except Exception:
                         return None
-                fid = (_nv(live.get("w_state_fidelity")) or
-                       _nv((live.get("w_state") or {}).get("fidelity")) or
-                       _nv(live.get("fidelity")) or 0.0)
+                fid = _nv(state.get("w_state_fidelity")) or 0.0
                 self.pq0_fidelity       = float(fid)
                 self.w_state_fidelity   = float(fid)
                 self.channel_latency_ms = (time.time() - t0) * 1000.0
@@ -8831,11 +9135,11 @@ class KoyebOracleState:
             return False
     
     def sync(self, client_field: "ClientFieldState", timeout: int = 8) -> bool:
-        """RPC-only sync via _LIVE_RPC_ORACLE.fetch_snapshot()."""
+        """Sync via SSE stream — get_oracle_state() returns latest snapshot."""
         t0 = time.time()
         snap = {}
         try:
-            snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=min(timeout, 6)) or {}
+            snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}
             if snap:
                 self.channel_latency_ms = (time.time() - t0) * 1000.0
         except Exception:
@@ -14542,18 +14846,40 @@ class QtclClientApp:
             self._stop.wait(5.0)
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _load_wallet(self) -> bool:
+        """Load wallet with password protection.
+
+        Tries to load existing wallet.json first. If successful, returns True.
+        If wallet.json doesn't exist, uses the auto-generated HypGammaWallet.
+        """
+        from pathlib import Path
+
+        # Check if wallet file exists
+        wallet_file = Path(self.wallet.wallet_file)
+        if wallet_file.exists():
+            try:
+                pw = _silent_getpass("  Wallet password: ").strip()
+                if not pw:
+                    print("  ❌ Password required to load wallet")
+                    return False
+
+                # Try to load from file
+                if self.wallet.load_from_file(str(wallet_file), pw):
+                    _set_hyp_seed(self.wallet.private_key or self.wallet.address)
+                    return True
+                else:
+                    print("  ❌ Failed to load wallet (incorrect password or file corrupted)")
+                    return False
+            except (EOFError, KeyboardInterrupt):
+                print("  ⚠️  Wallet load cancelled")
+                return False
+
+        # No wallet file exists — use auto-generated wallet
         if self.wallet.is_loaded():
+            print("  ℹ️  Using auto-generated wallet (no persistent wallet.json found)")
+            _set_hyp_seed(self.wallet.private_key or self.wallet.address)
             return True
-        try:
-            pw = _silent_getpass("  Wallet password: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        loaded = bool(pw) and self.wallet.load(pw)
-        if loaded:
-            # Set global HypΓ seed from wallet for deterministic keypair derivation
-            wallet_seed = self.wallet.private_key if hasattr(self.wallet, 'private_key') else self.wallet.address
-            _set_hyp_seed(wallet_seed)
-        return loaded
+
+        return False
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
     # Three entangled AerSimulator nodes that self-measure, maintain a local
@@ -15034,8 +15360,8 @@ class QtclClientApp:
                 upstream_dm   = None
                 upstream_fid  = 0.0
                 try:
-                    _up_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
-                    _dm_hex  = _up_snap.get('density_matrix_hex', '')
+                    _up_snap = _LIVE_RPC_ORACLE.get_oracle_state()
+                    _dm_hex  = _up_snap.get('density_matrix_hex', '') if _up_snap else ''
                     if _dm_hex:
                         import struct as _us
                         _bdata = bytes.fromhex(_dm_hex)
@@ -16755,7 +17081,7 @@ class QtclClientApp:
         _boot_attempt  = 0
         while _t.time() < _boot_deadline:
             _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=8.0)
-            if _snap and _snap.get("density_matrix_hex"):
+            if _snap and (_snap.get("density_matrix_hex") or _snap.get("density_tensor_hex")):
                 break   # ✅ got DM
             _boot_attempt += 1
             if _boot_attempt == 1:
@@ -19280,8 +19606,28 @@ class QtclClientApp:
                 if not pw:
                     print("  ❌ Password required"); continue
                 try:
-                    print("  ℹ️  HypGammaWallet auto-generates on startup")
-                    print(f"  ✅ Created: {addr}")
+                    new_wallet = HypGammaWallet(label="new")
+                    self.wallet = new_wallet
+                    print(f"  ✅ Created: {new_wallet.address}")
+                    # Save wallet.json encrypted
+                    if new_wallet.save_to_file(new_wallet.wallet_file, pw):
+                        print(f"  ✅ Wallet saved (encrypted)")
+                    else:
+                        print(f"  ⚠️  Wallet kept in memory only")
+                    # Save mnemonic encrypted
+                    if new_wallet._save_mnemonic(pw):
+                        print(f"  ✅ Mnemonic saved (encrypted)")
+                    else:
+                        print(f"  ⚠️  Mnemonic kept in memory only")
+                    # Display the new mnemonic
+                    if new_wallet.mnemonic_phrase:
+                        words = new_wallet.mnemonic_phrase.split()
+                        print("\n" + "═" * 60)
+                        print("  🔐 YOUR RECOVERY PHRASE — store offline, never share")
+                        print("═" * 60)
+                        for i in range(0, 12, 3):
+                            print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
+                        print("═" * 60)
                 except Exception as e:
                     print(f"  ❌ {e}")
             elif ch == "4":
@@ -19299,11 +19645,16 @@ class QtclClientApp:
                 print(f"  BIP-39 wordlist   : Embedded in qtcl_client.py (2048-word standard list)")
                 print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
             elif ch == "5":
+                if not self.wallet.is_loaded() and not self._load_wallet():
+                    continue
                 try:
                     pw = getpass.getpass("  Wallet password: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     continue
-                    print("  ℹ️  HypGammaWallet stores keys in memory, not files")
+                phrase = self.wallet._load_mnemonic(pw)
+                if not phrase:
+                    # If mnemonic not encrypted on disk, try in-memory copy
+                    phrase = self.wallet.mnemonic_phrase
                 if phrase:
                     words = phrase.split()
                     print("\n" + "═" * 60)
@@ -19313,7 +19664,7 @@ class QtclClientApp:
                         print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
                     print("═" * 60)
                 else:
-                    print("  ❌ Not found or wrong password")
+                    print("  ℹ️  No mnemonic (in-memory wallet — store phrase elsewhere)")
             elif ch == "6":
                 break
     def _recover_mnemonic(self) -> None:
@@ -19332,15 +19683,22 @@ class QtclClientApp:
         if len(words) != 12:
             print(f"  ❌ Need 12 words, got {len(words)}"); return
         bad = []
+        for word in words:
+            try:
+                get_index_by_word(word)
+            except ValueError:
+                bad.append(word)
         if bad:
             print(f"  ❌ Invalid BIP-39 word(s): {', '.join(bad[:5])}"); return
         w = HypGammaWallet(label="recovery")
-        if print("  ℹ️  HypGammaWallet uses auto-generated keypair")
-            self.wallet = w
-            print(f"  ✅ Recovered: {w.address}")
-            w._print_mnemonic()
+        w._mnemonic_phrase = phrase
+        print(f"  ✅ Recovered: {w.address}")
+        # Save mnemonic encrypted with the password
+        if w._save_mnemonic(pw):
+            print(f"  ✅ Mnemonic saved (encrypted)")
         else:
-            print("  ❌ Recovery failed")
+            print(f"  ⚠️  Mnemonic kept in memory only")
+        self.wallet = w
     _T_GRN  = "\033[92m"
     _T_RED  = "\033[91m"
     _T_YLW  = "\033[93m"
