@@ -328,11 +328,20 @@ def average_density_matrices(measurements: List[str]) -> Optional[str]:
 
         matrices = []
         for dm_hex in measurements:
-            if not dm_hex or len(dm_hex) < 65536 * 2:  # 16³ × 8 bytes = 32,768 bytes = 65,536 hex chars
+            if not dm_hex:
+                continue
+            # Accept both 16³ (32,768 bytes = 65,536 hex) and 64³ (2,097,152 bytes = 4,194,304 hex)
+            hex_len = len(dm_hex)
+            if hex_len < 65536:  # Too small even for 16³
                 continue
             try:
                 dm_bytes = bytes.fromhex(dm_hex)
-                dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((16, 16, 16))
+                if len(dm_bytes) == 262144 * 8:  # 64³ format - downsample
+                    dm_flat = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64)
+                    dm_64 = dm_flat.reshape((64, 64, 64))
+                    dm_array = dm_64[::4, ::4, ::4]  # Downsample to 16³
+                else:  # Assume 16³ format
+                    dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((16, 16, 16))
                 matrices.append(dm_array)
             except Exception:
                 continue
@@ -2477,19 +2486,33 @@ class LiveRPCOracleSnapshot:
             if dm_hex:
                 try:
 
-                    # Parse 16³ density tensor (native format) = 4,096 elements × 8 bytes = 32 KB
                     bdata = bytes.fromhex(dm_hex)
-                    expected_16_3_complex64 = 4096 * 8  # 16³ × complex64 (8 bytes)
+                    expected_16_3_complex64 = 4096 * 8  # 16³ × complex64 (8 bytes) = 32,768 bytes
+                    expected_64_3_complex64 = 262144 * 8  # 64³ × complex64 (8 bytes) = 2,097,152 bytes
 
-                    if len(bdata) != expected_16_3_complex64:
-                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³ tensor)")
-                        raise ValueError(f"Invalid 16³ tensor size: {len(bdata)}")
+                    # Handle both 16³ (new) and 64³ (legacy server) formats
+                    if len(bdata) == expected_16_3_complex64:
+                        # Native 16³ format - parse directly
+                        dm_flat = []
+                        for i in range(4096):
+                            re, im = struct.unpack_from('>ff', bdata, i*8)
+                            dm_flat.append(complex(float(re), float(im)))
+                    elif len(bdata) == expected_64_3_complex64:
+                        # Legacy 64³ format - downsample to 16³ (take every 4th element in each dimension)
+                        logger.debug(f"[RPC-ORACLE] Downsampling 64³ tensor to 16³...")
+                        dm_64_flat = []
+                        for i in range(262144):
+                            re, im = struct.unpack_from('>ff', bdata, i*8)
+                            dm_64_flat.append(complex(float(re), float(im)))
 
-                    # Parse 4096 complex64 elements
-                    dm_flat = []
-                    for i in range(4096):
-                        re, im = struct.unpack_from('>ff', bdata, i*8)
-                        dm_flat.append(complex(float(re), float(im)))
+                        # Reshape to 64×64×64, sample every 4th element
+                        dm_64_3d = _np.array(dm_64_flat, dtype=_np.complex64).reshape((64, 64, 64))
+                        dm_16_3d = dm_64_3d[::4, ::4, ::4]  # Downsample: keep every 4th element
+                        dm_flat = dm_16_3d.flatten().tolist()
+                        logger.debug(f"[RPC-ORACLE] ✅ Downsampled 64³ ({len(dm_64_flat)} elements) to 16³ ({len(dm_flat)} elements)")
+                    else:
+                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³) or {expected_64_3_complex64} (64³)")
+                        raise ValueError(f"Invalid tensor size: {len(bdata)} bytes")
 
                     # Store 16³ tensor metadata
                     snap['_density_matrix_3d'] = {
