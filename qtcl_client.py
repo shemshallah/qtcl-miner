@@ -2000,7 +2000,8 @@ class HypGammaEngine:
         if hasattr(self, '_hyp_engine'):
             return  # Already initialized
         try:
-            from hyp_engine import HypGammaEngine as HypEngine
+            # ✅ FIXED: Import from hlwe package (not root-level hyp_engine)
+            from hlwe.hyp_engine import HypGammaEngine as HypEngine
             self._hyp_engine = HypEngine()
             logger.info("[HYP-ENGINE] ✅ HypΓ engine initialized — Schnorr-Γ + GeodesicLWE active")
         except ImportError as e:
@@ -2586,48 +2587,38 @@ class LiveRPCOracleSnapshot:
 
         w_hex = snap.get('w_state_hex', '')
         tensor_hex = snap.get('density_tensor_hex', '')
-        
-        # ✅ DEBUG: Log what we're receiving
-        if not hasattr(self, '_debug_log_count'):
-            self._debug_log_count = 0
-        if self._debug_log_count < 5:
-            logger.warning(f"[SSE-DEBUG] Received snap keys: {list(snap.keys())}")
-            logger.warning(f"[SSE-DEBUG] w_hex present: {bool(w_hex)} len={len(w_hex) if w_hex else 0}")
-            logger.warning(f"[SSE-DEBUG] tensor_hex present: {bool(tensor_hex)} len={len(tensor_hex) if tensor_hex else 0}")
-            self._debug_log_count += 1
 
         if not w_hex and not tensor_hex:
-            logger.warning("[SSE-ORACLE] Snapshot missing w_state_hex and density_tensor_hex")
-            return
+            return  # Silent skip - no data
 
         w_re, w_im = self._parse_w_state_hex(w_hex) if w_hex else (None, None)
         tensor_flat = self._parse_compact_tensor_hex(tensor_hex) if tensor_hex else None
-        
-        # ✅ DEBUG: Log parse results
-        if self._debug_log_count <= 5:
-            logger.warning(f"[SSE-DEBUG] w_re parsed: {w_re is not None}")
-            logger.warning(f"[SSE-DEBUG] tensor parsed: {tensor_flat is not None}")
 
         if w_re is None and tensor_flat is None:
-            logger.warning("[SSE-ORACLE] Could not parse W-state or tensor from snapshot")
-            return
+            return  # Silent skip - parse failed
 
         with self._dm_lock:
             if w_re is not None:
                 self._dm_re = [0.0]*64
                 self._dm_im = [0.0]*64
-                w_indices = [1, 2, 4, 8, 16, 32, 64, 128]
+                w_indices = [1, 2, 4, 8, 16, 32]  # Fixed: removed 64,128 which are out of bounds
                 for i, idx in enumerate(w_indices):
                     if idx < 64:
                         self._dm_re[idx] = w_re[i]
                         self._dm_im[idx] = w_im[i]
-                logger.debug(f"[SSE-ORACLE] ✅ W-state: {len(w_hex)//2} bytes parsed")
 
             if tensor_flat is not None:
                 self._dm_re = tensor_flat[:]
-                logger.debug(f"[SSE-ORACLE] ✅ Compact tensor: {len(tensor_hex)//2} bytes parsed")
+                self._dm_im = [0.0]*64  # Reset imaginary part when using tensor
 
             self._last_fetch_ts = time.time()
+            
+            # ✅ One-time status log when DM first becomes valid
+            if not hasattr(self, '_dm_ready_logged'):
+                self._dm_ready_logged = False
+            if not self._dm_ready_logged and any(v != 0.0 for v in self._dm_re):
+                logger.info(f"[SSE-ORACLE] ✅ DM NOW VALID — {sum(1 for v in self._dm_re if v != 0.0)}/64 non-zero values")
+                self._dm_ready_logged = True
 
         with self._oracle_state_lock:
             self._oracle_state = {
