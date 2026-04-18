@@ -2058,7 +2058,7 @@ class HypGammaEngine:
 HLWEKeyPair = HypKeyPair
 HLWEWalletManager = HypGammaWallet
 HLWEEngine = HypGammaEngine
-HLWEIntegrationAdapter = HypGammaWallet  # Alias for existing code
+HLWEIntegrationAdapter = HypGammaEngine  # FIXED: Was HypGammaWallet, but sign_block is in HypGammaEngine
 HLWEMessageAuth = HypGammaWallet  # Alias for existing code
 
 
@@ -14849,7 +14849,7 @@ class QtclClientApp:
         """Load wallet with password protection.
 
         Tries to load existing wallet.json first. If successful, returns True.
-        If wallet.json doesn't exist, uses the auto-generated HypGammaWallet.
+        If wallet.json doesn't exist, creates a new wallet and saves it securely.
         """
         from pathlib import Path
 
@@ -14865,6 +14865,7 @@ class QtclClientApp:
                 # Try to load from file
                 if self.wallet.load_from_file(str(wallet_file), pw):
                     _set_hyp_seed(self.wallet.private_key or self.wallet.address)
+                    logger.info(f"[HYP-WALLET] ✅ Loaded from {wallet_file}")
                     return True
                 else:
                     print("  ❌ Failed to load wallet (incorrect password or file corrupted)")
@@ -14873,13 +14874,63 @@ class QtclClientApp:
                 print("  ⚠️  Wallet load cancelled")
                 return False
 
-        # No wallet file exists — use auto-generated wallet
-        if self.wallet.is_loaded():
-            print("  ℹ️  Using auto-generated wallet (no persistent wallet.json found)")
+        # ═══════════════════════════════════════════════════════════════════════
+        # No wallet file exists — CREATE AND SAVE a new persistent wallet
+        # ═══════════════════════════════════════════════════════════════════════
+        print("  ⚠️  No wallet file found — creating new persistent wallet")
+        try:
+            # Prompt for password to encrypt the new wallet
+            pw = _silent_getpass("  Set wallet password: ").strip()
+            if not pw:
+                print("  ❌ Password required to create wallet")
+                return False
+            pw2 = _silent_getpass("  Confirm password: ").strip()
+            if pw != pw2:
+                print("  ❌ Passwords don't match")
+                return False
+            
+            # Create new wallet (the one from __init__ is auto-generated, create fresh)
+            new_wallet = HypGammaWallet(label="miner")
+            self.wallet = new_wallet
+            
+            # Save wallet.json encrypted
+            if new_wallet.save_to_file(str(wallet_file), pw):
+                print(f"  ✅ Wallet created and saved (encrypted)")
+                print(f"  📍 Location: {wallet_file}")
+                print(f"  🔑 Address: {new_wallet.address[:30]}...")
+            else:
+                print(f"  ⚠️  Failed to save wallet — mining will use in-memory keys only")
+                return False
+            
+            # Save mnemonic encrypted
+            if new_wallet._save_mnemonic(pw):
+                print(f"  ✅ Mnemonic saved (encrypted)")
+            else:
+                print(f"  ⚠️  Mnemonic not saved")
+            
+            # Display the new mnemonic for recovery
+            if new_wallet.mnemonic_phrase:
+                words = new_wallet.mnemonic_phrase.split()
+                print("\n" + "═" * 60)
+                print("  🔐 YOUR RECOVERY PHRASE — WRITE THIS DOWN AND STORE SAFELY")
+                print("═" * 60)
+                for i in range(0, 12, 3):
+                    print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
+                print("═" * 60)
+                print("  ⚠️  Without this phrase, your wallet CANNOT be recovered!")
+                print("═" * 60)
+            
             _set_hyp_seed(self.wallet.private_key or self.wallet.address)
+            logger.info(f"[HYP-WALLET] ✅ Created new wallet at {wallet_file}")
             return True
-
-        return False
+            
+        except (EOFError, KeyboardInterrupt):
+            print("  ⚠️  Wallet creation cancelled")
+            return False
+        except Exception as e:
+            logger.error(f"[HYP-WALLET] Failed to create wallet: {e}")
+            print(f"  ❌ Wallet creation failed: {e}")
+            return False
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
     # Three entangled AerSimulator nodes that self-measure, maintain a local
@@ -17267,7 +17318,8 @@ class QtclClientApp:
             )
             return (True, _meas, _pow_seed, _report)
         # ── Status display — use live snap already fetched above ───────────────
-        _dm_hex   = snap.get('density_matrix_hex', '')
+        # SSE stream sends density_tensor_hex, not density_matrix_hex
+        _dm_hex   = snap.get('density_matrix_hex') or snap.get('density_tensor_hex') or ''
         _w_fid    = float(
             (snap.get('w_state') or {}).get('fidelity') or
             snap.get('w_state_fidelity') or
