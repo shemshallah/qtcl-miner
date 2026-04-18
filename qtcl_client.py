@@ -1679,6 +1679,17 @@ class HypGammaWallet:
                     public_key=keypair_data.get('public_key', ''),
                     address=keypair_data.get('address', '')
                 )
+                
+                # ✅ CRITICAL: Ensure engine is initialized for signing
+                if self.engine is None:
+                    try:
+                        from hlwe.hyp_engine import HypGammaEngine as _HypEngine
+                        self.engine = _HypEngine()
+                        logger.debug(f"[HYP-WALLET] Engine initialized on load")
+                    except Exception as _engine_err:
+                        logger.warning(f"[HYP-WALLET] ⚠️  Engine init failed on load: {_engine_err}")
+                        # Continue - we'll fail later when trying to sign
+                
                 logger.info(f"[HYP-WALLET] ✅ Decrypted: {self.keypair.address[:16]}...")
                 return True
             except Exception as parse_e:
@@ -14864,6 +14875,10 @@ class QtclClientApp:
 
                 # Try to load from file
                 if self.wallet.load_from_file(str(wallet_file), pw):
+                    # ✅ CRITICAL: Verify wallet has valid keypair before allowing mining
+                    if not self.wallet.is_loaded():
+                        print("  ❌ Wallet loaded but keypair is invalid — check HypΓ engine")
+                        return False
                     _set_hyp_seed(self.wallet.private_key or self.wallet.address)
                     logger.info(f"[HYP-WALLET] ✅ Loaded from {wallet_file}")
                     return True
@@ -14893,13 +14908,19 @@ class QtclClientApp:
             new_wallet = HypGammaWallet(label="miner")
             self.wallet = new_wallet
             
+            # ✅ CRITICAL: Verify wallet has valid keypair before saving
+            if not self.wallet.is_loaded():
+                print("  ❌ Wallet creation failed — HypΓ engine unavailable (check mpmath)")
+                print("  ℹ️  Install: pip install mpmath")
+                return False
+            
             # Save wallet.json encrypted
             if new_wallet.save_to_file(str(wallet_file), pw):
                 print(f"  ✅ Wallet created and saved (encrypted)")
                 print(f"  📍 Location: {wallet_file}")
                 print(f"  🔑 Address: {new_wallet.address[:30]}...")
             else:
-                print(f"  ⚠️  Failed to save wallet — mining will use in-memory keys only")
+                print(f"  ⚠️  Failed to save wallet — cannot start mining without persistent keys")
                 return False
             
             # Save mnemonic encrypted
@@ -14921,7 +14942,7 @@ class QtclClientApp:
                 print("═" * 60)
             
             _set_hyp_seed(self.wallet.private_key or self.wallet.address)
-            logger.info(f"[HYP-WALLET] ✅ Created new wallet at {wallet_file}")
+            logger.info(f"[HYP-WALLET] ✅ Created new wallet at {wallet_file} | addr={self.wallet.address[:22]}...")
             return True
             
         except (EOFError, KeyboardInterrupt):
@@ -18094,6 +18115,8 @@ class QtclClientApp:
                     }
                     
                     # ── HypΓ-sign the block ──
+                    # ✅ CRITICAL: Block MUST be signed or server will reject
+                    _signing_success = False
                     try:
                         if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
                             _hyp_adapter = HLWEIntegrationAdapter()
@@ -18103,13 +18126,20 @@ class QtclClientApp:
                                 submit_payload["hyp_signature"] = _sig
                                 # Send the public key for verification (derived from private_key)
                                 submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
-                                _EXP_LOG.info(f"[MINER] HypΓ-signed block h={target_height}")
+                                _EXP_LOG.info(f"[MINER] ✅ HypΓ-signed block h={target_height} | challenge={str(_sig.get('c_full', '?'))[:16]}...")
+                                _signing_success = True
                             else:
-                                _EXP_LOG.warning(f"[MINER] HypΓ signing failed: {_sig}")
+                                _EXP_LOG.error(f"[MINER] ❌ HypΓ signing failed: {_sig}")
                         else:
-                            _EXP_LOG.warning("[MINER] No wallet loaded — block will be rejected (HypΓ required)")
+                            _wallet_status = "not loaded" if not self.wallet else ("no keypair" if not self.wallet.is_loaded() else "no private_key")
+                            _EXP_LOG.error(f"[MINER] ❌ Wallet {_wallet_status} — block CANNOT be submitted (HypΓ signature required)")
                     except Exception as _hyp_sign_err:
-                        _EXP_LOG.warning(f"[MINER] HypΓ signing error: {_hyp_sign_err}")
+                        _EXP_LOG.error(f"[MINER] ❌ HypΓ signing error: {_hyp_sign_err}")
+                    
+                    # If signing failed, we could continue (server will reject) or abort
+                    # For now, log clearly and let server reject - user will see the error
+                    if not _signing_success:
+                        _EXP_LOG.error(f"[MINER] ⚠️  Block h={target_height} lacks cryptographic signature — submission will likely fail")
                     
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
