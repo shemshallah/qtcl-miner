@@ -3199,6 +3199,7 @@ except ImportError:
 def _validate_and_init_schema(db_path: Path) -> bool:
     """Validate database schema against qtcl_db_builder.py. Run builder if mismatch.
 
+    Checks for ALL critical tables, not just blocks. If ANY are missing, rebuilds.
     Returns True if schema valid/fixed, False if error.
     """
     import subprocess
@@ -3207,25 +3208,42 @@ def _validate_and_init_schema(db_path: Path) -> bool:
         conn = _sqlite3.connect(str(db_path), timeout=10)
         cursor = conn.cursor()
 
-        # Check if blocks table exists with required columns
+        # Critical tables that MUST exist (from qtcl_db_builder.py)
+        critical_tables = {
+            'blocks', 'transactions', 'wallet_addresses', 'pq0_entanglement_log',
+            'wstate_consensus_log', 'hyperbolic_triangles', 'pseudoqubits'
+        }
+
+        # Check which tables exist
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = {row[0] for row in cursor.fetchall()}
+
+        # Check blocks table columns specifically
         cursor.execute("PRAGMA table_info(blocks)")
-        existing_cols = {row[1] for row in cursor.fetchall()}
+        blocks_cols = {row[1] for row in cursor.fetchall()}
         conn.close()
 
-        # Required columns (from qtcl_db_builder.py blocks table - PRIMARY: height, UNIQUE: block_hash)
-        required_cols = {
+        required_blocks_cols = {
             'height', 'block_hash', 'parent_hash', 'merkle_root', 'timestamp',
             'tx_count', 'miner_address', 'difficulty', 'nonce', 'pq_curr', 'pq_last'
         }
 
-        if required_cols.issubset(existing_cols):
-            logger.info("[DB-SCHEMA] ✅ Schema valid")
+        # Schema is valid if:
+        # 1. All critical tables exist
+        # 2. Blocks table has all required columns
+        if critical_tables.issubset(existing_tables) and required_blocks_cols.issubset(blocks_cols):
+            logger.info("[DB-SCHEMA] ✅ All critical tables present, schema valid")
             return True
 
-        # Schema missing columns - run builder
-        logger.info("[DB-SCHEMA] ⚠️  Schema mismatch, running qtcl_db_builder.py...")
-        builder_path = _REPO_ROOT / 'qtcl_db_builder.py'
+        # Schema incomplete - run builder
+        missing_tables = critical_tables - existing_tables
+        missing_cols = required_blocks_cols - blocks_cols
 
+        if missing_tables or missing_cols:
+            logger.warning(f"[DB-SCHEMA] ⚠️  Missing tables: {missing_tables}, missing cols: {missing_cols}")
+            logger.info("[DB-SCHEMA] Running qtcl_db_builder.py to repair schema...")
+
+        builder_path = _REPO_ROOT / 'qtcl_db_builder.py'
         if not builder_path.exists():
             logger.error(f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}")
             return False
@@ -3235,15 +3253,15 @@ def _validate_and_init_schema(db_path: Path) -> bool:
             [sys.executable, str(builder_path)],
             cwd=str(_REPO_ROOT),
             capture_output=True,
-            timeout=120,
+            timeout=180,
             text=True
         )
 
         if result.returncode != 0:
-            logger.error(f"[DB-SCHEMA] ❌ Builder failed:\n{result.stderr}")
+            logger.error(f"[DB-SCHEMA] ❌ Builder failed:\n{result.stderr[-500:]}")
             return False
 
-        logger.info("[DB-SCHEMA] ✅ Schema fixed by qtcl_db_builder.py")
+        logger.info("[DB-SCHEMA] ✅ Schema repaired by qtcl_db_builder.py")
         return True
 
     except Exception as e:
@@ -17816,239 +17834,12 @@ class NodeRPCMeshServer:
         self._oracle_lock  = threading.Lock()
         self._pq0_epoch    = 0
         self._entangle_log: list = []   # ring buffer, last 256 epochs
-        self._ensure_mesh_schema()
         logger.info(
             f"[MESH] ✅ NodeRPCMeshServer init  node={self._node_id[:16]}…  "
             f"port={self._port}  server={self._server_url}"
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Complete database schema initialization
-    # ─────────────────────────────────────────────────────────────────────────
-    def _ensure_mesh_schema(self) -> None:
-        """
-        Create/update ALL tables on startup.
-        Uses CREATE TABLE IF NOT EXISTS for new databases.
-        Uses ALTER TABLE ADD COLUMN for existing databases (idempotent migration).
-        """
-        import sqlite3
-        try:
-            conn = sqlite3.connect(str(self._db_path), timeout=10, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 1. blocks — Main chain ledger
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS blocks (
-                height              INTEGER PRIMARY KEY,
-                hash                TEXT    UNIQUE NOT NULL,
-                parent_hash           TEXT    NOT NULL,
-                timestamp           INTEGER NOT NULL DEFAULT 0,
-                tx_count            INTEGER NOT NULL DEFAULT 0,
-                merkle_root         TEXT    NOT NULL DEFAULT '',
-                synced_from_server  INTEGER NOT NULL DEFAULT 0,
-                miner_reward        REAL    NOT NULL DEFAULT 0.0,
-                treasury_reward     REAL    NOT NULL DEFAULT 0.0,
-                version             INTEGER NOT NULL DEFAULT 1,
-                w_state_fidelity    REAL    NOT NULL DEFAULT 0.0,
-                fidelity_measure    REAL    NOT NULL DEFAULT 0.0,
-                block_latency_ms    INTEGER NOT NULL DEFAULT 0
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_parent_hash ON blocks(parent_hash)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp)")
-            # Migrate existing tables
-            for col, defn in [("parent_hash","TEXT DEFAULT ''"),("synced_from_server","INTEGER DEFAULT 0"),
-                              ("miner_reward","REAL DEFAULT 0"),("treasury_reward","REAL DEFAULT 0"),
-                              ("version","INTEGER DEFAULT 1"),("w_state_fidelity","REAL DEFAULT 0"),
-                              ("fidelity_measure","REAL DEFAULT 0"),("block_latency_ms","INTEGER DEFAULT 0")]:
-                try: conn.execute(f"ALTER TABLE blocks ADD COLUMN {col} {defn}")
-                except: pass
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 2. transactions — On-chain transactions
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS transactions (
-                tx_hash         TEXT PRIMARY KEY,
-                block_height    INTEGER REFERENCES blocks(height),
-                sender          TEXT,
-                recipient       TEXT,
-                amount          REAL    DEFAULT 0.0,
-                fee             REAL    DEFAULT 0.0,
-                nonce           INTEGER,
-                timestamp       INTEGER,
-                oracle_pubkey   TEXT,
-                signature_hex   TEXT,
-                status          TEXT    DEFAULT 'pending'
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_height)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_sender ON transactions(sender)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_recip ON transactions(recipient)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status)")
-            # Migrate
-            for col, defn in [("sender","TEXT"),("recipient","TEXT"),("fee","REAL DEFAULT 0"),
-                              ("nonce","INTEGER"),("oracle_pubkey","TEXT"),("signature_hex","TEXT")]:
-                try: conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {defn}")
-                except: pass
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 3. chain_state — Key-value chain metadata
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS chain_state (
-                key     TEXT PRIMARY KEY,
-                value   TEXT
-            )""")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 4. sync_state — IBD progress tracker
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS sync_state (
-                key         TEXT PRIMARY KEY,
-                block_height INTEGER DEFAULT 0,
-                last_sync_at INTEGER DEFAULT 0,
-                status      TEXT DEFAULT 'idle'
-            )""")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 5. snapshots — Oracle W-state attestations
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height  INTEGER,
-                oracle_pub    TEXT,
-                sig_hex       TEXT,
-                created_at    REAL
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_height ON snapshots(block_height)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_oracle ON snapshots(oracle_pub)")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 6. p2p_peers — Discovered P2P network peers
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS p2p_peers (
-                node_id_hex     TEXT PRIMARY KEY,
-                host            TEXT,
-                port            INTEGER,
-                chain_height    INTEGER DEFAULT 0,
-                last_seen_at    INTEGER DEFAULT 0,
-                ban_score       INTEGER DEFAULT 0,
-                last_fidelity   REAL DEFAULT 0.0,
-                mac_address     TEXT DEFAULT '',
-                device_id       TEXT DEFAULT ''
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_peer_host ON p2p_peers(host)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_peer_last_seen ON p2p_peers(last_seen_at DESC)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_peer_chain_height ON p2p_peers(chain_height DESC)")
-            try:
-                _cols = {r[1] for r in conn.execute("PRAGMA table_info(p2p_peers)").fetchall()}
-                for _col, _defn in [("mac_address","TEXT DEFAULT ''"),("device_id","TEXT DEFAULT ''")]:
-                    if _col not in _cols:
-                        conn.execute(f"ALTER TABLE p2p_peers ADD COLUMN {_col} {_defn}")
-            except Exception:
-                pass
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 7. mesh_peers — Local mesh bridge registry
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS mesh_peers (
-                peer_id     TEXT PRIMARY KEY,
-                host        TEXT,
-                port        INTEGER,
-                last_seen   REAL DEFAULT 0.0,
-                status      TEXT DEFAULT 'unknown',
-                mac_address TEXT DEFAULT '',
-                device_id   TEXT DEFAULT ''
-            )""")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 8. mempool — Unconfirmed transactions
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS mempool (
-                tx_hash      TEXT PRIMARY KEY,
-                raw_hex      TEXT NOT NULL,
-                received_at  REAL DEFAULT (strftime('%s','now')),
-                expires_at   REAL DEFAULT 0.0
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_expires ON mempool(expires_at)")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 9. pq0_entanglement_log — Tripartite pq0 entanglement chain
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
-                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                epoch                   INTEGER NOT NULL DEFAULT 0,
-                block_height            INTEGER NOT NULL DEFAULT 0,
-                pq0                     INTEGER NOT NULL DEFAULT 0,
-                oracle_ids              TEXT NOT NULL DEFAULT '',
-                entanglement_matrix_hex TEXT NOT NULL DEFAULT '',
-                created_at              REAL DEFAULT (strftime('%s','now'))
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0)")
-            # Migrate: add missing columns for existing databases (handles epoch NOT NULL from old schema)
-            _cursor = conn.execute("PRAGMA table_info(pq0_entanglement_log)")
-            _existing_cols = {row[1] for row in _cursor.fetchall()}
-            logger.info(f"[DB] pq0_entanglement_log columns: {_existing_cols}")
-            for _col, _defn in [
-                ("epoch",                   "INTEGER NOT NULL DEFAULT 0"),
-                ("pq0",                     "INTEGER NOT NULL DEFAULT 0"),
-                ("block_height",            "INTEGER NOT NULL DEFAULT 0"),
-                ("oracle_ids",              "TEXT NOT NULL DEFAULT ''"),
-                ("entanglement_matrix_hex", "TEXT NOT NULL DEFAULT ''"),
-            ]:
-                if _col not in _existing_cols:
-                    try:
-                        conn.execute(f"ALTER TABLE pq0_entanglement_log ADD COLUMN {_col} {_defn}")
-                        logger.info(f"[DB] ✅ Added column pq0_entanglement_log.{_col}")
-                    except Exception as _e:
-                        logger.warning(f"[DB] ALTER failed for {_col}: {_e}")
-                else:
-                    logger.debug(f"[DB] Column pq0_entanglement_log.{_col} already exists")
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # 10. wstate_consensus_log — W-state BFT consensus log
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS wstate_consensus_log (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_height     INTEGER NOT NULL,
-                median_fidelity  REAL NOT NULL,
-                agreement_score  REAL NOT NULL,
-                peer_count       INTEGER NOT NULL,
-                quorum_hash_hex  TEXT,
-                pow_seed         TEXT,
-                created_at       REAL DEFAULT (strftime('%s','now'))
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_wscl_height ON wstate_consensus_log(block_height)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_wscl_fidelity ON wstate_consensus_log(median_fidelity)")
-            # Migrate
-            for col, defn in [("median_fidelity","REAL DEFAULT 0"),("agreement_score","REAL DEFAULT 0"),
-                              ("peer_count","INTEGER DEFAULT 0"),("quorum_hash_hex","TEXT DEFAULT ''"),
-                              ("pow_seed","TEXT DEFAULT ''")]:
-                try: conn.execute(f"ALTER TABLE wstate_consensus_log ADD COLUMN {col} {defn}")
-                except: pass
-            
-            # ═══════════════════════════════════════════════════════════════════════
-            # mesh_rpc_log — Audit trail
-            # ═══════════════════════════════════════════════════════════════════════
-            conn.execute("""CREATE TABLE IF NOT EXISTS mesh_rpc_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                method      TEXT NOT NULL DEFAULT '',
-                params_hash TEXT NOT NULL DEFAULT '',
-                result_ok   INTEGER NOT NULL DEFAULT 1,
-                latency_ms  REAL NOT NULL DEFAULT 0.0,
-                peer_addr   TEXT NOT NULL DEFAULT '',
-                ts          INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_mesh_rpc_method ON mesh_rpc_log(method, ts DESC)")
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"[DB] ✅ Full schema initialized at {self._db_path}")
-        except Exception as e:
-            logger.error(f"[DB] Schema init failed: {e}")
-
     # ─────────────────────────────────────────────────────────────────────────
     # pq0 Entanglement Engine
     # ─────────────────────────────────────────────────────────────────────────
