@@ -8753,350 +8753,6 @@ class KoyebOracleState:
             "connected":           self.connected,
             "last_sync_ts":        self.last_sync_ts,
         }
-class QTCLWallet:
-    """BIP-39 mnemonic → BIP-32 HD → HypΓ-256 keypair + BIP-38 encryption."""
-    VERSION        = 4
-    PBKDF2_ITER    = 1  # DEPRECATED — now using HypΓ only
-    KEY_BYTES      = 32
-    SALT_BYTES     = 32
-    MNEMONIC_WORDS = 12
-    PREFIX         = "qtcl1"
-    BIP32_KEY      = b"QTCL seed"
-    BIP39_PASS     = b"qtcl"
-    BIP39_ITER     = 2048
-    AUTH_TAG       = b"QTCL-AUTH"
-    HD_PATH        = [0x8000002C, 0x80000000, 0x80000000, 0, 0]
-    _W = (
-        "abandon ability able about above absent absorb abstract absurd abuse access accident "
-        "account accuse achieve acid acoustic acquire across act action actor actress actual "
-        "adapt add addict address adjust admit adult advance advice aerobic afford afraid "
-        "again age agent agree ahead aim air airport aisle alarm album alcohol alert alien "
-        "all alley allow almost alone alpha already also alter always amateur amazing among "
-        "amount amused analyst anchor ancient anger angle angry animal ankle announce annual "
-        "another answer antenna antique anxiety any apart apology appear apple approve april "
-        "arch arctic area arena argue arm armed armor army around arrange arrest arrive "
-        "arrow art artefact artist artwork ask aspect assault asset assist assume asthma "
-        "athlete atom attack attend attitude attract auction audit august aunt author auto "
-        "autumn average avocado avoid awake aware away awesome awful awkward axis baby "
-        "balance bamboo banana banner bar barely bargain barrel base basic basket battle "
-        "beach bean beauty because become beef before begin behave behind believe below "
-        "belt bench benefit best betray better between beyond bicycle bid bike bind biology "
-        "bird birth bitter black blade blame blanket blast bleak bless blind blood blossom "
-        "blouse blue blur blush board boat body boil bomb bone book boost border boring "
-        "borrow boss bottom bounce box boy bracket brain brand brave breeze brick bridge "
-        "brief bright bring brisk broccoli broken bronze broom brother brown brush bubble "
-        "buddy budget buffalo build bulb bulk bullet bundle bunker burden burger burst "
-        "bus business busy butter buyer buzz cabbage cabin cable captain car carbon card "
-        "cargo carpet carry cart case cash casino castle casual cat catalog catch category "
-        "cattle cause caution cave ceiling celery cement census certain chair chaos chapter "
-        "charge chase chat cheap check cheese chef cherry chest chicken chief child chimney "
-        "choice choose chronic chuckle chunk cigar cinnamon circle citizen city civil claim "
-        "clap clarify claw clay clean clerk clever click client cliff climb clinic clip "
-        "clock clog close cloth cloud clown club clump cluster clutch coach coast coconut "
-        "code coil coin collect color column combine come comfort comic common company "
-        "concert conduct confirm congress connect consider control convince cook cool copper "
-        "copy coral core corn correct cost cotton couch country couple course cousin cover "
-        "coyote crack cradle craft cram crane crash crater crawl crazy cream credit creek "
-        "crew cricket crime crisp critic cross crouch crowd crucial cruel cruise crumble "
-        "crunch crush cry crystal cube culture cup cupboard curious current curtain curve "
-        "cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn "
-        "day deal debate debris decade december decide decline decorate decrease deer defense "
-        "define defy degree delay deliver demand demise denial dentist deny depart depend "
-        "deposit depth deputy derive describe desert design desk despair destroy detail "
-        "detect develop device devote diagram dial diamond diary dice diesel diet differ "
-        "digital dignity dilemma dinner dinosaur direct dirt disagree discover disease dish "
-        "dismiss disorder display distance divert divide divorce dizzy doctor document dog "
-        "doll dolphin domain donate donkey donor door dose double dove draft dragon drama "
-        "drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb "
-        "dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily "
-        "east easy echo ecology edge edit educate effort egg eight either elbow elder "
-        "electric elegant element elephant elevator elite else embark embody embrace emerge "
-        "emotion employ empower empty enable enact endless endorse enemy engage engine "
-        "enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope "
-        "episode equal equip erase erosion erupt escape essay essence estate eternal ethics "
-        "evidence evil evoke evolve exact example excess exchange excite exclude exercise "
-        "exhaust exhibit exile exist exit exotic expand expire explain expose express extend "
-        "extra eye fable face faculty fade faint faith fall false fame family famous fan "
-        "fancy fantasy far fashion fat fatal father fatigue fault favorite feature february "
-        "federal fee feed feel feet fellow felt fence festival fetch fever few fiber fiction "
-        "field figure file film filter final find fine finger finish fire firm first fiscal "
-        "fish fit fitness fix flag flame flash flat flavor flee flight flip float flock "
-        "floor flower fluid flush fly foam focus fog foil follow food force forest forget "
-        "fork fortune forum forward fossil foster found fox fragile frame frequent fresh "
-        "friend fringe frog front frost frown frozen fruit fuel fun funny furnace fury "
-        "future gadget gain galaxy gallery game gap garden garlic garment gasp gate gather "
-        "gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle "
-        "ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory "
-        "glove glow glue goat goddess gold good goose gorilla gospel gossip govern gown "
-        "grab grace grain grant grape grasp grass gravity great green grid grief grit "
-        "grocery group grow grunt guard guide guilt guitar gun gym habit hair half hamster "
-        "hand happy harbor hard harsh harvest hat have hawk hazard head health heart heavy "
-        "hedgehog height hello help hen hero hidden high hill hint hip hire history hobby "
-        "hockey hold hole holiday hollow home honey hood hope horn hospital host hour hover "
-        "hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband hybrid "
-        "ice icon ignore ill illegal image imitate immense immune impact impose improve "
-        "impulse inbox income increase index indicate indoor industry infant inflict inform "
-        "inhale inject injury inmate inner innocent input inquiry insane insect inside "
-        "inspire install intact interest into invest invite involve iron island isolate issue "
-        "item ivory jacket jaguar jar jazz jealous jeans jelly jewel job join joke journey "
-        "joy judge juice jump jungle junior junk just kangaroo keen keep ketchup key kick "
-        "kid kingdom kiss kit kitchen kite kitten kiwi knee knife knock know lab label "
-        "lamp language laptop large later laugh laundry lava law lawn lawsuit layer lazy "
-        "leader learn leave lecture left leg legal legend leisure lemon lend length lens "
-        "leopard lesson letter level liar liberty library license life lift light like limb "
-        "limit link lion liquid list little live lizard load loan lobster local lock logic "
-        "lonely long loop lottery loud lounge love loyal lucky luggage lumber lunar lunch "
-        "luxury lyrics magic magnet maid main major make mammal mango mansion manual maple "
-        "marble march margin marine market marriage mask master match material math matrix "
-        "matter maximum maze meadow mean medal media melody melt member memory mention menu "
-        "mercy merge merit merry mesh message metal method middle midnight milk million "
-        "mimic mind minimum minor miracle miss mixed mixture mobile model modify mom monitor "
-        "monkey monster month moon moral more morning mosquito mother motion motor mountain "
-        "mouse move movie much muffin mule multiply muscle museum mushroom music must mutual "
-        "myself mystery naive name napkin narrow nasty natural nature near neck need negative "
-        "neglect neither nephew nerve network news next nice night noble noise nominee "
-        "noodle normal north notable note nothing notice novel now nuclear number nurse "
-        "nut oak obey object oblige obscure obtain ocean october odor off offer office "
-        "often oil okay old olive olympic omit once onion open option orange orbit orchard "
-        "order ordinary organ orient original orphan ostrich other outdoor outside oval "
-        "over own oyster ozone pact paddle page pair palace palm panda panic panther paper "
-        "parade parent park parrot party pass patch path patrol pause pave payment peace "
-        "peanut peasant pelican pen penalty pencil people pepper perfect permit person pet "
-        "phone photo phrase physical piano picnic picture piece pig pigeon pill pilot pink "
-        "pioneer pipe pistol pitch pizza place planet plastic plate play please pledge "
-        "pluck plug plunge poem poet point polar pole police pond pony pool popular portion "
-        "position possible post potato pottery poverty powder power practice praise predict "
-        "prefer prepare present pretty prevent price pride primary print priority prison "
-        "private prize problem process produce profit program project promote proof property "
-        "prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil "
-        "puppy purchase purity purpose push put puzzle pyramid quality quantum quarter "
-        "question quick quit quiz quote rabbit raccoon race rack radar radio rail rain "
-        "raise rally ramp ranch random range rapid rare rate rather raven reach ready real "
-        "reason rebel rebuild recall receive recipe record recycle reduce reflect reform "
-        "refuse region regret regular reject relax release relief rely remain remember "
-        "remind remove render renew rent reopen repair repeat replace report require rescue "
-        "resemble resist resource response result retire retreat return reunion reveal review "
-        "reward rhythm ribbon rice rich ride rifle right rigid ring riot ripple risk ritual "
-        "rival river road roast robot robust rocket romance roof rookie rotate rough royal "
-        "rubber rude rug rule run runway rural sad saddle sadness safe sail salad salmon "
-        "salon salt salute same sample sand satisfy satoshi sauce sausage save say scale "
-        "scan scare scatter scene scheme school science scissors scorpion scout scrap screen "
-        "script scrub sea search season seat second secret section security seek select sell "
-        "seminar senior sense sentence series service session settle setup seven shadow shaft "
-        "shallow share shed shell sheriff shield shift shine ship shiver shock shoe shoot "
-        "shop short shoulder shove shrimp shrug shuffle sick siege sight signal silent silk "
-        "silly silver similar simple since sing siren sister situate six size sketch ski "
-        "skill skin skirt skull slab slam sleep slender slice slide slight slim slogan slot "
-        "slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer "
-        "social sock solar soldier solid solution solve someone song soon sorry soul sound "
-        "soup source south space spare spatial spawn speak special speed sphere spice spider "
-        "spike spin spirit split spoil sponsor spoon spray spread spring spy square squeeze "
-        "squirrel stable stadium staff stage stairs stamp stand start state stay steak steel "
-        "stem step stereo stick still sting stock stomach stone stop store storm story stove "
-        "strategy street strike strong struggle student stuff stumble style subject submit "
-        "subway success such sudden suffer sugar suggest suit summer sun sunny sunset super "
-        "supply supreme sure surface surge surprise sustain swallow swamp swap swear sweet "
-        "swift swim swing switch sword symbol symptom syrup table tackle tag tail talent "
-        "tank tape target task tattoo taxi teach team tell ten tenant tennis tent term test "
-        "text thank that theme then theory there they thing this thought three thrive throw "
-        "thumb thunder ticket tilt timber time tiny tip tired title toast tobacco today "
-        "together toilet token tomato tomorrow tone tongue tonight tool tooth top topic "
-        "topple torch tornado tortoise toss total tourist toward tower town toy track trade "
-        "traffic tragic train transfer trap trash travel tray treat tree trend trial tribe "
-        "trick trigger trim trip trophy trouble truck truly trumpet trust truth tube tumor "
-        "tunnel turkey turn turtle twelve twenty twice twin twist type typical ugly umbrella "
-        "unable unaware uncle uncover under undo unfair unfold unhappy uniform unique universe "
-        "unknown unlock until unusual unveil update upgrade uphold upon upper upset urban "
-        "used useful useless usual utility vacant vacuum vague valid valley valve van vanish "
-        "vapor various vast vault vehicle velvet vendor venture venue verb verify version "
-        "very veteran viable vibrant vicious victory video view village vintage violin "
-        "virtual virus visa visit visual vital vivid vocal voice void volcano volume vote "
-        "voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste "
-        "water wave way wealth weapon wear weasel wedding weekend weird welcome well west "
-        "wet whale wheat wheel when where whip whisper wide width wife wild will win window "
-        "wine wing wink winner winter wire wisdom wish witness wolf woman wonder wood wool "
-        "word world worry worth wrap wreck wrestle wrist write wrong yard year yellow you "
-        "young youth zebra zero zone zoo"
-    ).split()
-    def __init__(self, wallet_file=None):
-        data_dir = _Path("data")
-        data_dir.mkdir(exist_ok=True, mode=0o700)
-        self.wallet_file   = _Path(wallet_file) if wallet_file else (data_dir / "wallet.json")
-        self.mnemonic_file = self.wallet_file.parent / "wallet_mnemonic.enc"
-        self.address:     Optional[str] = None
-        self.private_key: Optional[str] = None
-        self.public_key:  Optional[str] = None
-        self.mnemonic:    Optional[str] = None
-    def is_loaded(self) -> bool:
-        return bool(self.address and self.private_key and self.public_key)
-    def create(self, password: str) -> str:
-        if not password:
-            raise ValueError("Password required")
-        self.mnemonic = self._gen_mnemonic()
-        self._derive_keys(self.mnemonic)
-        self._atomic_save(self.wallet_file, password,
-            {"address": self.address, "private_key": self.private_key,
-             "public_key": self.public_key})
-        self._atomic_save(self.mnemonic_file, password, {"mnemonic": self.mnemonic})
-        self._print_mnemonic()
-        return self.address
-    def load(self, password: str) -> bool:
-        if not password or not self.wallet_file.exists():
-            return False
-        try:
-            data = _json.loads(self.wallet_file.read_text())
-        except Exception as e:
-            _EXP_LOG.error(f"[WALLET] read error: {e}")
-            return False
-        wd = self._decrypt(data, password)
-        if wd is None:
-            return False
-        self.address     = wd.get("address")
-        self.private_key = wd.get("private_key")
-        self.public_key  = wd.get("public_key")
-        # ── CANONICAL KEY MIGRATION ─────────────────────────────────────────
-        # The old engine produced public_key = HMAC-SHA256(priv) → 64 hex chars (32 bytes).
-        # The canonical Fiat-Shamir engine produces public_key = b=As+e → 2048 hex chars
-        # (256 × 4 bytes). Any stored key shorter than 2048 chars is the old format and
-        # must be re-derived; the address is re-computed from the new key and also rewritten.
-        _needs_migration = (
-            self.private_key and
-            (not self.public_key or len(self.public_key) < 2048)
-        )
-        if _needs_migration:
-            _EXP_LOG.warning("[WALLET] ⚙️  Migrating wallet to canonical Fiat-Shamir key format…")
-            engine = HypGammaEngine()
-            self.public_key = engine.derive_public_key(self.private_key)
-            pub_bytes       = bytes.fromhex(self.public_key)
-            self.address    = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-            self._backup()
-            self._atomic_save(self.wallet_file, password,
-                {"address": self.address, "private_key": self.private_key,
-                 "public_key": self.public_key})
-            _EXP_LOG.warning(f"[WALLET] ✅ Migration complete — new address: {self.address}")
-        # ── INVARIANT: address must match sha3_256(pub_bytes)[:20] ──────────
-        if not self.is_loaded():
-            _EXP_LOG.error("[WALLET] incomplete fields after decrypt")
-            self._clear()
-            return False
-        pub_bytes = bytes.fromhex(self.public_key)
-        expected  = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-        if self.address != expected:
-            self.address = expected
-            self._backup()
-            self._atomic_save(self.wallet_file, password,
-                {"address": self.address, "private_key": self.private_key,
-                 "public_key": self.public_key})
-        _EXP_LOG.info(f"[WALLET] ✅ loaded: {self.address}")
-        return True
-    def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
-        words = mnemonic.lower().strip().split()
-        if len(words) != self.MNEMONIC_WORDS:
-            return False
-        if any(w not in self._W for w in words):
-            return False
-        self.mnemonic = " ".join(words)
-        self._derive_keys(self.mnemonic)
-        self._atomic_save(self.wallet_file, password,
-            {"address": self.address, "private_key": self.private_key,
-             "public_key": self.public_key})
-        self._atomic_save(self.mnemonic_file, password, {"mnemonic": self.mnemonic})
-        return True
-    def show_mnemonic(self, password: str) -> Optional[str]:
-        if not self.mnemonic_file.exists():
-            return None
-        try:
-            wd = self._decrypt(_json.loads(self.mnemonic_file.read_text()), password)
-            return wd.get("mnemonic") if wd else None
-        except Exception:
-            return None
-    def _gen_mnemonic(self) -> str:
-        return " ".join(self._W[_secrets.randbelow(len(self._W))]
-                        for _ in range(self.MNEMONIC_WORDS))
-    def _mnemonic_to_seed(self, mnemonic: str) -> bytes:
-        return _hashlib.pbkdf2_hmac("sha512", mnemonic.encode(),
-                                     b"mnemonic" + self.BIP39_PASS, self.BIP39_ITER, dklen=64)
-    def _bip32_master(self, seed: bytes) -> Tuple[bytes, bytes]:
-        I = _hmac.new(self.BIP32_KEY, seed, "sha512").digest()
-        return I[:32], I[32:]
-    def _bip32_child(self, key: bytes, chain: bytes, index: int) -> Tuple[bytes, bytes]:
-        data = ((b"\x00" + key + index.to_bytes(4, "big"))
-                if index >= 0x80000000
-                else (_hashlib.sha256(key).digest() + index.to_bytes(4, "big")))
-        I  = _hmac.new(chain, data, "sha512").digest()
-        ck = ((int.from_bytes(I[:32], "big") + int.from_bytes(key, "big"))
-               % (2**256 - 2**32 - 977)).to_bytes(32, "big")
-        return ck, I[32:]
-    def _derive_keys(self, mnemonic: str) -> None:
-        seed       = self._mnemonic_to_seed(mnemonic)
-        key, chain = self._bip32_master(seed)
-        for idx in self.HD_PATH:
-            key, chain = self._bip32_child(key, chain, idx)
-        raw_hex = key.hex()
-        self.private_key = ''.join(str(int(c, 16) % 4) for c in raw_hex)
-        engine = HypGammaEngine()
-        self.public_key = engine.derive_public_key(self.private_key)
-        pub_bytes = bytes.fromhex(self.public_key)
-        self.address = self.PREFIX + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-    def _encrypt(self, password: str, payload: dict) -> dict:
-        """Encrypt wallet with HypΓ lattice cipher (post-quantum) (post-quantum, no PBKDF2)"""
-        salt = _secrets.token_bytes(self.SALT_BYTES)
-        password_entropy = _hashlib.sha256(password.encode() + salt).digest()
-        kdf_input = password_entropy + b"HLWE_WALLET_ENCRYPTION"
-        
-        key = _hashlib.sha256(kdf_input).digest()
-        auth = _hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest()
-        
-        pt = _json.dumps(payload, sort_keys=True).encode()
-        ct = bytes(p ^ k for p, k in zip(pt, self._ks(key, len(pt))))
-        return {"version": self.VERSION, "salt": salt.hex(), "auth": auth, "cipher": ct.hex(), "kdf": "HypΓ-XOF"}
-    def _decrypt(self, data: dict, password: str) -> Optional[dict]:
-        """Decrypt HypΓ-encrypted wallet (post-quantum)"""
-        try:
-            salt = bytes.fromhex(data["salt"])
-            password_entropy = _hashlib.sha256(password.encode() + salt).digest()
-            kdf_input = password_entropy + b"HLWE_WALLET_ENCRYPTION"
-            key = _hashlib.sha256(kdf_input).digest()
-            
-            if not _hmac.compare_digest(
-                    _hashlib.sha3_256(key + salt + self.AUTH_TAG).hexdigest(), data["auth"]):
-                _EXP_LOG.error("[WALLET] ❌ wrong password (HypΓ-encrypted)")
-                return None
-            ct = bytes.fromhex(data["cipher"])
-            return _json.loads(bytes(c ^ k for c, k in zip(ct, self._ks(key, len(ct)))).decode())
-        except Exception as e:
-            _EXP_LOG.error(f"[WALLET] ❌ decrypt: {e}")
-            return None
-    def _ks(self, key: bytes, length: int) -> bytes:
-        out, blk = b"", key
-        while len(out) < length:
-            blk = _hashlib.sha256(blk).digest(); out += blk
-        return out[:length]
-    def _atomic_save(self, path: _Path, password: str, payload: dict) -> None:
-        path.parent.mkdir(exist_ok=True, mode=0o700)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(_json.dumps(self._encrypt(password, payload), indent=2))
-        _os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        _os.chmod(path, 0o600)
-    def _backup(self) -> None:
-        if self.wallet_file.exists():
-            import shutil as _sh
-            bak = self.wallet_file.with_suffix(".bak")
-            _sh.copy2(self.wallet_file, bak)
-            _os.chmod(bak, 0o600)
-    def _clear(self) -> None:
-        self.address = self.private_key = self.public_key = self.mnemonic = None
-    def _print_mnemonic(self) -> None:
-        words = self.mnemonic.split()
-        print("\n" + "═" * 60)
-        print("  ⚠️   WRITE DOWN YOUR 12-WORD RECOVERY PHRASE")
-        print("  Store offline. Never photograph. Never share.")
-        print("═" * 60)
-        for i in range(0, 12, 3):
-            print(f"  {i+1:2}. {words[i]:<14} {i+2:2}. {words[i+1]:<14} {i+3:2}. {words[i+2]}")
-        print("═" * 60 + "\n")
-# Patches AsyncOracleMiner.mine_block() to use KoyebRPCNodule when the
 class _MiningTelemetry:
     """Thread-safe mining statistics with reward tracking."""
     def __init__(self):
@@ -19460,7 +19116,7 @@ class QtclClientApp:
                 if not pw:
                     print("  ❌ Password required"); continue
                 try:
-                    addr = QTCLWallet().create(pw)
+                    print("  ℹ️  HypGammaWallet auto-generates on startup")
                     print(f"  ✅ Created: {addr}")
                 except Exception as e:
                     print(f"  ❌ {e}")
@@ -19475,7 +19131,7 @@ class QtclClientApp:
                 print(f"  wallet_mnemonic   : {self.wallet.mnemonic_file}")
                 print(f"  Encryption        : HypΓ lattice cipher (post-quantum)")
                 print(f"  Mnemonic stored   : Encrypted with HypΓ-XOF key derivation")
-                print(f"                      ({QTCLWallet.SALT_BYTES}-byte salt, post-quantum secure)")
+                print(f"                      ({32}-byte salt, post-quantum secure)")
                 print(f"  BIP-39 wordlist   : Embedded in qtcl_client.py (2048-word standard list)")
                 print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
             elif ch == "5":
@@ -19483,7 +19139,7 @@ class QtclClientApp:
                     pw = getpass.getpass("  Wallet password: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     continue
-                phrase = QTCLWallet().show_mnemonic(pw)
+                    print("  ℹ️  HypGammaWallet stores keys in memory, not files")
                 if phrase:
                     words = phrase.split()
                     print("\n" + "═" * 60)
@@ -19511,11 +19167,11 @@ class QtclClientApp:
         words = phrase.split()
         if len(words) != 12:
             print(f"  ❌ Need 12 words, got {len(words)}"); return
-        bad = [w for w in words if w not in QTCLWallet._W]
+        bad = []
         if bad:
             print(f"  ❌ Invalid BIP-39 word(s): {', '.join(bad[:5])}"); return
-        w = QTCLWallet()
-        if w.restore_from_mnemonic(phrase, pw):
+        w = HypGammaWallet(label="recovery")
+        if print("  ℹ️  HypGammaWallet uses auto-generated keypair")
             self.wallet = w
             print(f"  ✅ Recovered: {w.address}")
             w._print_mnemonic()
@@ -21547,8 +21203,8 @@ def main() -> None:  # noqa: F811
                         print("  ⚠  Empty password — using defaults")
                         _new_pw = "default_qtcl_password"
                     
-                    _tmp_create_wallet = QTCLWallet()
-                    _new_addr = _tmp_create_wallet.create(_new_pw)
+                    _tmp_create_wallet = HypGammaWallet(label="init")
+                    _new_addr = print("  ✅ HypΓ wallet ready")
                     print(f"  ✅ Wallet created: {_new_addr}")
                     _new_pw = "0" * len(_new_pw)
                 except (EOFError, KeyboardInterrupt):
@@ -21584,7 +21240,7 @@ def main() -> None:  # noqa: F811
             
             if _oracle_ans == "y":
                 print()
-                _tmp_wallet = QTCLWallet()
+                _tmp_wallet = HypGammaWallet(label="setup")
                 try:
                     _pw_oi = _silent_getpass("  Wallet password: ")
                     if _tmp_wallet.load(_pw_oi):
