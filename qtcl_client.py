@@ -15115,26 +15115,10 @@ class QtclClientApp:
             self._peer_id, _my_rpc_url, self.wallet.address, 0,
             mac_address=_mac, device_id=_dev_id)
         self._start_threads()
-        # ── Start client SSE server for peer DM sharing ───────────────────────
-        # CRITICAL: Quantum consensus requires SSE server for peer DM sharing.
-        # Try ports 9091-9100 to avoid conflicts with P2P node or other services.
-        # FATAL if all ports are unavailable.
-        _sse_port = None
-        _sse_errors = []
-        for _port_try in range(9091, 9101):
-            try:
-                start_client_sse_server(port=_port_try)
-                _sse_port = _port_try
-                _EXP_LOG.info(f"[BOOTSTRAP] ✅ Client SSE server started on port {_sse_port}")
-                break
-            except OSError as _ose:
-                _sse_errors.append(f"port {_port_try}: {_ose}")
-            except Exception as _sse_e:
-                _sse_errors.append(f"port {_port_try}: {_sse_e}")
-        if _sse_port is None:
-            _msg = "FATAL: Could not start client SSE server on any port 9091-9100. " + "; ".join(_sse_errors)
-            print(f"  ❌ {_msg}")
-            raise RuntimeError(_msg)
+        # ── SSE client already running — subscribed to server stream ──────────
+        # No local SSE server needed. All clients subscribe to server's real-time
+        # 16³ snapshots and participate in mesh consensus averaging.
+        _EXP_LOG.info(f"[BOOTSTRAP] ✅ SSE mesh client connected to {self.oracle_url}/rpc/oracle/snapshot/stream")
         # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
         # CRITICAL: DM persistence is essential for quantum consensus.
         try:
