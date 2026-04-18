@@ -2040,35 +2040,60 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Synchronous JSON-RPC 2.0 call to /rpc → qtcl_getQuantumMetrics.
-        Falls back to /rpc/oracle/snapshot GET if RPC returns empty.
-        Returns empty dict on any error — fail-safe for RPC hangs. ❤️"""
-        _t0 = time.time()
-        _rpc_url  = f"{self.ORACLE_URL}/rpc"
+        """Read single event from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
+
+        /rpc/oracle/snapshot is Server-Sent Events stream (text/event-stream).
+        Reads one event from the stream, extracts JSON data, returns it.
+        Falls back to RPC JSON endpoint if SSE fails.
+        """
         _snap_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
+        _rpc_url  = f"{self.ORACLE_URL}/rpc"
         _payload  = {"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1}
-        snap: dict = {}
+
         try:
             session = self._get_session()
-            for _url, _is_rpc in ((_rpc_url, True), (_snap_url, False)):
-                try:
-                    if session:
-                        _r = session.post(_url, json=_payload, timeout=timeout_s)
-                        if _r.status_code not in (200, 202):
-                            continue
+
+            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot
+            try:
+                if session:
+                    _r = session.get(_snap_url, timeout=timeout_s, stream=True,
+                                     headers={"Accept": "text/event-stream"})
+                    if _r.status_code in (200, 202):
+                        # Read lines from SSE stream until we get a data: line
+                        for _line in _r.iter_lines(decode_unicode=True):
+                            if _line.startswith("data: "):
+                                try:
+                                    _json_str = _line[6:]  # Strip "data: " prefix
+                                    snap = json.loads(_json_str)
+                                    logger.debug(f"[RPC-ORACLE] ✅ SSE /rpc/oracle/snapshot got event")
+                                    return snap
+                                except json.JSONDecodeError:
+                                    continue
+                            elif _line.startswith(":"):
+                                # Skip comments
+                                continue
+                except Exception as _sse_e:
+                    logger.debug(f"[RPC-ORACLE] SSE /rpc/oracle/snapshot failed: {_sse_e} (trying RPC)")
+
+                # FALLBACK: POST /rpc with qtcl_getQuantumMetrics (regular JSON)
+                if session:
+                    _r = session.post(_rpc_url, json=_payload, timeout=timeout_s)
+                    if _r.status_code in (200, 202):
                         _body = _r.json()
-                    else:
-                        from urllib.request import Request as _Req, urlopen as _uo
-                        _req = _Req(_url, data=json.dumps(_payload).encode(),
-                                    headers={"Content-Type": "application/json"}, method="POST")
-                        with _uo(_req, timeout=timeout_s) as _resp:
-                            _body = json.loads(_resp.read())
-                    snap = _body.get("result") or {}
-                    if not isinstance(snap, dict): snap = {}
-                    if snap: break  # got data — no need for fallback
-                except Exception as _fe:
-                    logger.debug(f"[RPC-ORACLE] {_url} failed: {_fe}")
-                    continue
+                        snap = _body.get("result") or {}
+                        if isinstance(snap, dict) and snap:
+                            logger.debug(f"[RPC-ORACLE] ✅ RPC fallback succeeded")
+                            return snap
+
+                return {}
+
+            except Exception as _rpc_e:
+                logger.debug(f"[RPC-ORACLE] RPC fallback also failed: {_rpc_e}")
+                return {}
+
+        except Exception as _e:
+            logger.debug(f"[RPC-ORACLE] fetch_snapshot error: {_e}")
+            return {}
             
             # Parse density matrix OR W-state and convert (supports both server formats)
             dm_hex = snap.get('density_matrix_hex') or snap.get('w_state_hex')
