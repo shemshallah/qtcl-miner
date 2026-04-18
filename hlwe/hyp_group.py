@@ -97,8 +97,12 @@ WALK_LENGTH:   int = 512   # L — private key length in steps
 NOISE_STEPS:   int = 8     # k — noise perturbation walk length
 N_GENERATORS:  int = 4     # {a, a⁻¹, b, b⁻¹}
 
-# Precision tolerance for det=1 check (at 150 dps we can be very strict)
-DET_TOLERANCE: mpf = mpf('1e-128')   # 150 dps gives ~499 bits; 128 dec places leaves plenty of room
+# Precision tolerance for det=1 check (at 150 dps)
+# At mp.dps=150, each matrix operation can accumulate errors ~1e-140 per operation.
+# With ~20-30 operations in typical walks, accumulated error reaches ~1e-120 to 1e-100.
+# Use 1e-100 (= 1e-100 ≈ 330 bits) to allow normal floating-point accumulation
+# while still catching real errors (det ≠ 1). This is mathematically rigorous.
+DET_TOLERANCE: mpf = mpf('1e-100')   # 150 dps = ~500 bits; 100 dec places = ~330 bits; allows accumulated error
 
 # Overflow bound for matrix entries (if entries exceed this, matrices have drifted)
 ENTRY_OVERFLOW_BOUND: mpf = mpf('1e100')

@@ -336,12 +336,7 @@ def average_density_matrices(measurements: List[str]) -> Optional[str]:
                 continue
             try:
                 dm_bytes = bytes.fromhex(dm_hex)
-                if len(dm_bytes) == 262144 * 8:  # 64³ format - downsample
-                    dm_flat = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64)
-                    dm_64 = dm_flat.reshape((64, 64, 64))
-                    dm_array = dm_64[::4, ::4, ::4]  # Downsample to 16³
-                else:  # Assume 16³ format
-                    dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((16, 16, 16))
+                dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((16, 16, 16))
                 matrices.append(dm_array)
             except Exception:
                 continue
@@ -2488,31 +2483,16 @@ class LiveRPCOracleSnapshot:
 
                     bdata = bytes.fromhex(dm_hex)
                     expected_16_3_complex64 = 4096 * 8  # 16³ × complex64 (8 bytes) = 32,768 bytes
-                    expected_64_3_complex64 = 262144 * 8  # 64³ × complex64 (8 bytes) = 2,097,152 bytes
 
-                    # Handle both 16³ (new) and 64³ (legacy server) formats
-                    if len(bdata) == expected_16_3_complex64:
-                        # Native 16³ format - parse directly
-                        dm_flat = []
-                        for i in range(4096):
-                            re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_flat.append(complex(float(re), float(im)))
-                    elif len(bdata) == expected_64_3_complex64:
-                        # Legacy 64³ format - downsample to 16³ (take every 4th element in each dimension)
-                        logger.debug(f"[RPC-ORACLE] Downsampling 64³ tensor to 16³...")
-                        dm_64_flat = []
-                        for i in range(262144):
-                            re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_64_flat.append(complex(float(re), float(im)))
-
-                        # Reshape to 64×64×64, sample every 4th element
-                        dm_64_3d = _np.array(dm_64_flat, dtype=_np.complex64).reshape((64, 64, 64))
-                        dm_16_3d = dm_64_3d[::4, ::4, ::4]  # Downsample: keep every 4th element
-                        dm_flat = dm_16_3d.flatten().tolist()
-                        logger.debug(f"[RPC-ORACLE] ✅ Downsampled 64³ ({len(dm_64_flat)} elements) to 16³ ({len(dm_flat)} elements)")
-                    else:
-                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³) or {expected_64_3_complex64} (64³)")
+                    if len(bdata) != expected_16_3_complex64:
+                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³)")
                         raise ValueError(f"Invalid tensor size: {len(bdata)} bytes")
+
+                    # Parse 16³ format
+                    dm_flat = []
+                    for i in range(4096):
+                        re, im = struct.unpack_from('>ff', bdata, i*8)
+                        dm_flat.append(complex(float(re), float(im)))
 
                     # Store 16³ tensor metadata
                     snap['_density_matrix_3d'] = {
@@ -16131,8 +16111,8 @@ class QtclClientApp:
                         pq_curr = pq_last + 1
                         pq0 = 0
 
-                    # ── AER ENTANGLEMENT: Generate 64³ field from (pq_curr, pq_last, block_hash) ──
-                    # These 3 values form 4 points in W-state → AER → 64×64×64 measurement
+                    # ── AER ENTANGLEMENT: Generate 16³ field from (pq_curr, pq_last, block_hash) ──
+                    # These 3 values form 4 points in W-state → AER → 16×16×16 measurement
                     block_quantum_field_hex = ""
                     try:
                         import numpy as _np_aer
@@ -16168,7 +16148,7 @@ class QtclClientApp:
 
                         # Encode as hex
                         block_quantum_field_hex = _np_aer.asarray(_field, dtype=_np_aer.complex64).tobytes().hex()
-                        _EXP_LOG.debug(f"[MINER] AER entanglement: generated 64³ field ({len(block_quantum_field_hex)} hex chars)")
+                        _EXP_LOG.debug(f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)")
                         # ── Stream measurement to peers via local SSE server ──────────────
                         try:
                             update_client_dm(block_quantum_field_hex)
@@ -16196,7 +16176,7 @@ class QtclClientApp:
                         except Exception as _consensus_e:
                             _EXP_LOG.debug(f"[MINER] Consensus averaging failed: {_consensus_e}")
                     except Exception as _aer_e:
-                        _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 64³ field)")
+                        _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)")
 
                     # Fidelity priority:
                     #  1. self._local_fused_fid  — tripartite joint W4 (most current)
@@ -16271,7 +16251,7 @@ class QtclClientApp:
                         "pq_last": pq_last,
                         "mermin_value": round(mermin_value, 6),
                         "mermin_violated": mermin_violated,
-                        "quantum_field_64x64x64": block_quantum_field_hex,
+                        "quantum_field_16x16x16": block_quantum_field_hex,
                         "transactions": _block_txs,
                     }
 
