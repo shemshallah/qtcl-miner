@@ -15118,26 +15118,55 @@ class QtclClientApp:
         # ── Bootstrap RPC snapshot — MUST succeed or FATAL ──────────────────────
         # NO degraded mode fallback. If RPC is down, mining cannot proceed.
         import time as _t
+        import requests as _requests
         _snap = {}
-        _boot_deadline = _t.time() + 30.0
-        _boot_attempt  = 0
         print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
+
+        # FAST-FAIL: Check if RPC endpoint is reachable (first attempt only)
+        try:
+            _rpc_check = _requests.post(
+                f"{self.oracle_url}/rpc",
+                json={"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1},
+                timeout=3.0
+            )
+            if _rpc_check.status_code not in (200, 202):
+                print("\n  ❌ FATAL: RPC endpoint responded but with error code", flush=True)
+                print(f"  Status: {_rpc_check.status_code}")
+                raise RuntimeError(f"RPC endpoint error: HTTP {_rpc_check.status_code}")
+        except _requests.exceptions.Timeout:
+            print("\n  ❌ FATAL: RPC endpoint timeout (server not responding)", flush=True)
+            raise RuntimeError("RPC bootstrap failed: server timeout")
+        except _requests.exceptions.ConnectionError:
+            print("\n  ❌ FATAL: Cannot connect to RPC endpoint", flush=True)
+            print(f"  Check: Is server running at {self.oracle_url}?")
+            raise RuntimeError("RPC bootstrap failed: connection refused")
+        except Exception as _rpc_err:
+            print(f"\n  ❌ FATAL: RPC connection error: {_rpc_err}", flush=True)
+            raise RuntimeError(f"RPC bootstrap failed: {_rpc_err}")
+
+        # Now fetch snapshot (should work now that we know RPC is up)
+        _boot_deadline = _t.time() + 10.0  # Reduced from 30s to 10s since RPC is responsive
+        _boot_attempt = 0
         while _t.time() < _boot_deadline:
-            _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=8.0)
+            _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
             # Accept either density_matrix_hex (native) or w_state_hex (converted to DM)
             has_dm = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
             if has_dm:
                 print(" ✅", flush=True)
                 break   # ✅ got DM or W-state
             _boot_attempt += 1
+            if _boot_attempt > 2:
+                print("\n  ❌ FATAL: RPC returned empty quantum data after 3 attempts", flush=True)
+                print(f"  Last response: {_snap}")
+                raise RuntimeError("RPC bootstrap failed: no quantum data in response")
             print(".", end="", flush=True)
             _sleep_time = _boot_deadline - _t.time()
             if _sleep_time > 0:
-                _t.sleep(min(2.0, _sleep_time))
+                _t.sleep(min(1.0, _sleep_time))
             else:
                 break
 
-        # FATAL if no DM or W-state received
+        # Final check
         has_quantum_data = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
         if not has_quantum_data:
             print("\n  ❌ FATAL: RPC oracle unreachable or no quantum data")
