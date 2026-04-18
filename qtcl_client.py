@@ -2070,10 +2070,41 @@ class LiveRPCOracleSnapshot:
                     logger.debug(f"[RPC-ORACLE] {_url} failed: {_fe}")
                     continue
             
-            # Parse density matrix if present (supports 8x8, 32³, 64³ formats)
-            if snap and snap.get('density_matrix_hex'):
+            # Parse density matrix OR W-state and convert (supports both server formats)
+            dm_hex = snap.get('density_matrix_hex') or snap.get('w_state_hex')
+            if snap and dm_hex:
                 try:
-                    dm_hex = snap['density_matrix_hex']
+                    # If we got w_state_hex, convert to density matrix: ρ = |ψ⟩⟨ψ|
+                    if snap.get('w_state_hex') and not snap.get('density_matrix_hex'):
+                        try:
+                            # Parse W-state (8-element complex state)
+                            ws_hex = snap['w_state_hex']
+                            ws_bytes = bytes.fromhex(ws_hex)
+
+                            # W-state is 8 elements, each 8 bytes (complex64: 4+4 bytes real+imag)
+                            if len(ws_bytes) >= 64:  # 8 elements * 8 bytes
+                                w_state = []
+                                for i in range(8):
+                                    re, im = struct.unpack_from('>ff', ws_bytes, i*8)
+                                    w_state.append(complex(re, im))
+
+                                # Compute density matrix: ρ = |ψ⟩⟨ψ†|
+                                if HAS_NUMPY:
+                                    import numpy as _np_wstate
+                                    psi = _np_wstate.array(w_state, dtype=complex)
+                                    rho = _np_wstate.outer(psi, _np_wstate.conj(psi))  # 8x8 DM
+
+                                    # Encode as density_matrix_hex for downstream compatibility
+                                    dm_bytes = b''
+                                    for i in range(8):
+                                        for j in range(8):
+                                            val = rho[i,j]
+                                            dm_bytes += struct.pack('>ff', float(val.real), float(val.imag))
+                                    dm_hex = dm_bytes.hex()
+                                    snap['density_matrix_hex'] = dm_hex
+                                    logger.info(f"[RPC-ORACLE] ✅ Converted W-state to 8×8 density matrix")
+                        except Exception as _ws_e:
+                            logger.debug(f"[RPC-ORACLE] W-state conversion failed: {_ws_e}")
                     bdata = bytes.fromhex(dm_hex)
 
                     # Detect 3D matrix size (32³ or 64³)
@@ -14653,9 +14684,11 @@ class QtclClientApp:
         print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
         while _t.time() < _boot_deadline:
             _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=8.0)
-            if _snap and _snap.get("density_matrix_hex"):
+            # Accept either density_matrix_hex (native) or w_state_hex (converted to DM)
+            has_dm = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
+            if has_dm:
                 print(" ✅", flush=True)
-                break   # ✅ got DM
+                break   # ✅ got DM or W-state
             _boot_attempt += 1
             print(".", end="", flush=True)
             _sleep_time = _boot_deadline - _t.time()
@@ -14664,11 +14697,13 @@ class QtclClientApp:
             else:
                 break
 
-        # FATAL if no DM received
-        if not _snap or not _snap.get("density_matrix_hex"):
-            print("\n  ❌ FATAL: RPC oracle unreachable or no density matrix")
-            print("  Check: Is server running? Is /rpc/oracle/snapshot returning data?")
-            raise RuntimeError("RPC bootstrap failed: no oracle snapshot with density matrix")
+        # FATAL if no DM or W-state received
+        has_quantum_data = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
+        if not has_quantum_data:
+            print("\n  ❌ FATAL: RPC oracle unreachable or no quantum data")
+            print("  Check: Is server running? Is /rpc endpoint returning density_matrix_hex or w_state_hex?")
+            print(f"  Got: {_snap}")
+            raise RuntimeError("RPC bootstrap failed: no quantum data (density_matrix_hex or w_state_hex)")
 
         snap = _snap
 
