@@ -1148,6 +1148,33 @@ CREATE TABLE oracle_w_state_snapshots (
     UNIQUE(block_height, block_hash)
 );
 
+-- TABLE: pq0_entanglement_log — Tripartite pq0 entanglement chain log
+CREATE TABLE pq0_entanglement_log (
+    id                      BIGSERIAL PRIMARY KEY,
+    epoch                   BIGINT NOT NULL DEFAULT 0,
+    block_height            BIGINT NOT NULL DEFAULT 0,
+    pq0                     BIGINT NOT NULL DEFAULT 0,
+    oracle_ids              TEXT NOT NULL DEFAULT '',
+    entanglement_matrix_hex TEXT NOT NULL DEFAULT '',
+    created_at              TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pq0_height ON pq0_entanglement_log(block_height);
+CREATE INDEX IF NOT EXISTS idx_pq0_pq0 ON pq0_entanglement_log(pq0);
+
+-- TABLE: wstate_consensus_log — W-state BFT consensus log
+CREATE TABLE wstate_consensus_log (
+    id               BIGSERIAL PRIMARY KEY,
+    block_height     BIGINT NOT NULL,
+    median_fidelity  NUMERIC(5,4) NOT NULL,
+    agreement_score  NUMERIC(5,4) NOT NULL,
+    peer_count       INT NOT NULL,
+    quorum_hash_hex  TEXT,
+    pow_seed         TEXT,
+    created_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_wscl_height ON wstate_consensus_log(block_height);
+CREATE INDEX IF NOT EXISTS idx_wscl_fidelity ON wstate_consensus_log(median_fidelity);
+
 -- TABLE: orphan_blocks
 CREATE TABLE orphan_blocks (
     block_hash VARCHAR(255) PRIMARY KEY,
