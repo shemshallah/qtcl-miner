@@ -12177,8 +12177,10 @@ class QtclClientApp:
         """
         self.oracle_url    = oracle_url or _ORACLE_BASE_URL
         self.api           = KoyebRPCNodule(self.oracle_url)
-        
-        # ── RPC snapshot consumer now on-demand via _LIVE_RPC_ORACLE ────────
+
+        # ── 16³ SSE stream client: subscribe to server for real-time snapshots ──
+        self._sse_client = init_sse_client(self.oracle_url)
+        _EXP_LOG.info(f"[INIT] ✅ SSE stream client initialized for {self.oracle_url}")
 
         self.wallet        = HypGammaWallet()
         self.client_field  = ClientFieldState()
@@ -12195,14 +12197,14 @@ class QtclClientApp:
         ).hexdigest()  # always 64 lowercase hex — passes server validation
         self._peer_id_final = False  # True once wallet-bound node_id replaces this
         self._oracle_id: dict = self._init_oracle_identity(oracle_context)
-        
+
         # ── Client configuration (used by RPC daemon threads) ─────────────────
         self._cfg = {
             "server_url": self.oracle_url,
             "oracle_context": oracle_context or {},
             "peer_id": self._peer_id,
         }
-        
+
         # ── P2P Node (initialized in _start_p2p thread) ─────────────────────
         self.p2p_node: Optional[Any] = None
 
@@ -12215,9 +12217,45 @@ class QtclClientApp:
         self._local_fused_fid: float = 0.0
         self._upstream_fid: float    = 0.0
 
+        # ── Mesh network: consensus averaging with peer SSE snapshots ──
+        self._peer_snapshots: dict = {}  # {peer_id: latest_16³_hex}
+        self._mesh_consensus_dm: Optional[Any] = None  # averaged consensus
+        self._mesh_lock = _threading.Lock()
+
         # ── SSE broadcast infrastructure (peers subscribe to our oracle stream) ──
         self._sse_snapshot_queues: list = []     # list of queue.Queue — one per SSE subscriber
         self._sse_lock = _threading.Lock()
+    def sample_server_16_cubed(self) -> Optional[str]:
+        """Sample latest 16³ from server SSE stream - called by AER to feed mining."""
+        if not self._sse_client:
+            return None
+        snap = self._sse_client.get_latest_snapshot()
+        if snap and snap.get('density_tensor_hex'):
+            return snap['density_tensor_hex']
+        return None
+
+    def merge_with_peer_consensus(self, local_16_cubed_hex: str) -> str:
+        """
+        Merge local 16³ with peer measurements from SSE mesh network.
+        Returns consensus 16³ hex for mining.
+        """
+        measurements = [local_16_cubed_hex]
+
+        # Add server snapshot if available
+        server_snap = self.sample_server_16_cubed()
+        if server_snap:
+            measurements.append(server_snap)
+
+        # Add peer snapshots from mesh
+        with self._mesh_lock:
+            measurements.extend(self._peer_snapshots.values())
+
+        if len(measurements) < 2:
+            return local_16_cubed_hex  # fallback to local only
+
+        # Average all measurements
+        return average_density_matrices(measurements) or local_16_cubed_hex
+
     # ── Lazy DB property (for mining loop compatibility) ─────────────────────
     @property
     def db(self):
@@ -16134,12 +16172,7 @@ class QtclClientApp:
                         # Encode as hex
                         block_quantum_field_hex = _np_aer.asarray(_field, dtype=_np_aer.complex64).tobytes().hex()
                         _EXP_LOG.debug(f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)")
-                        # ── Stream measurement to peers via local SSE server ──────────────
-                        try:
-                            update_client_dm(block_quantum_field_hex)
-                            _EXP_LOG.debug(f"[MINER] Updated peer SSE stream with local measurement")
-                        except Exception as _sse_update_e:
-                            _EXP_LOG.debug(f"[MINER] SSE update failed: {_sse_update_e}")
+
                         # ── Store local measurement in database ──────────────────────────
                         try:
                             self.db.store_dm_measurement(pq_curr, 'local', block_quantum_field_hex,
@@ -16148,18 +16181,16 @@ class QtclClientApp:
                         except Exception as _store_local_e:
                             _EXP_LOG.debug(f"[MINER] Store local measurement failed: {_store_local_e}")
 
-                        # ── Compute quantum consensus: average server + local + peer measurements ──
-                        _consensus_dm = None
+                        # ── Compute quantum consensus: merge with server + peer SSE snapshots ──
                         try:
-                            _server_dm = _LIVE_RPC_ORACLE.get_oracle_state().get('density_matrix_hex', '')
-                            _consensus_dm = discover_and_average_peer_measurements(
-                                self.db, pq_curr, _server_dm, block_quantum_field_hex, timeout_per_peer=1.0
-                            )
-                            if _consensus_dm:
-                                update_client_dm(_consensus_dm)
-                                _EXP_LOG.info(f"[MINER] ✅ Quantum consensus DM computed and streamed to peers")
+                            _consensus_dm = self.merge_with_peer_consensus(block_quantum_field_hex)
+                            if _consensus_dm and _consensus_dm != block_quantum_field_hex:
+                                _EXP_LOG.info(f"[MINER] ✅ Quantum mesh consensus: merged local + server + peers")
+                                block_quantum_field_hex = _consensus_dm
+                            else:
+                                _EXP_LOG.debug(f"[MINER] Using local 16³ measurement (no consensus available)")
                         except Exception as _consensus_e:
-                            _EXP_LOG.debug(f"[MINER] Consensus averaging failed: {_consensus_e}")
+                            _EXP_LOG.debug(f"[MINER] Mesh consensus failed: {_consensus_e}, using local")
                     except Exception as _aer_e:
                         _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)")
 
