@@ -16186,6 +16186,13 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
                     # ──────────────────────────────────────────────────────────────
+
+                    # Validate required fields before submission
+                    if "hyp_signature" not in submit_payload or "miner_public_key_hex" not in submit_payload:
+                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_public_key_hex={submit_payload.get('miner_public_key_hex') is not None}")
+                        _MINE_TELEM.mark_idle()
+                        continue
+
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
                     _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": timestamp, "fidelity": w_state_fidelity, "parent_hash": parent_hash, "difficulty": difficulty_bits})
                     _MINE_TELEM.mark_submitting()
