@@ -18049,9 +18049,8 @@ class QtclClientApp:
                             _sig = _hyp_adapter.sign_block(_block_dict_for_sig, self.wallet.private_key)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hyp_signature"] = _sig
-                                # HypΓ verification derives signing_key from the key bytes,
-                                # so we send the private_key as the "public key" for verification
-                                submit_payload["miner_public_key_hex"] = self.wallet.private_key or ""
+                                # Send the public key for verification (derived from private_key)
+                                submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
                                 _EXP_LOG.info(f"[MINER] HypΓ-signed block h={target_height}")
                             else:
                                 _EXP_LOG.warning(f"[MINER] HypΓ signing failed: {_sig}")
