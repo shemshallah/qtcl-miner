@@ -16153,51 +16153,52 @@ class QtclClientApp:
                     except Exception as _mermin_err:
                         _EXP_LOG.debug(f"[MINER] Mermin computation: {_mermin_err}")
                     
+                    # ── Standardized block submission payload (flat structure for server compatibility) ──
                     submit_payload = {
-                        "header": {
-                            "height": target_height,
-                            "block_hash": block_hash,
-                            "parent_hash": parent_hash,
-                            "merkle_root": merkle_root,
-                            "timestamp_s": timestamp,
-                            "nonce": nonce,
-                            "miner_address": miner_addr,
-                            "difficulty_bits": difficulty_bits,
-                            "w_entropy_hash": _w_entropy_seed.hex(),
-                            "w_state_fidelity": round(w_state_fidelity, 4),
-                            "pq0": pq0,
-                            "pq_curr": pq_curr,
-                            "pq_last": pq_last,
-                            "mermin_value": round(mermin_value, 6),
-                            "mermin_violated": mermin_violated,
-                            "quantum_field_64x64x64": block_quantum_field_hex,  # ← 64³ AER measurement
-                        },
+                        "height": target_height,
+                        "block_hash": block_hash,
+                        "parent_hash": parent_hash,
+                        "merkle_root": merkle_root,
+                        "timestamp": timestamp,
+                        "nonce": nonce,
+                        "miner_address": miner_addr,
+                        "difficulty_bits": difficulty_bits,
+                        "w_entropy_hash": _w_entropy_seed.hex(),
+                        "w_state_fidelity": round(w_state_fidelity, 4),
+                        "pq0": pq0,
+                        "pq_curr": pq_curr,
+                        "pq_last": pq_last,
+                        "mermin_value": round(mermin_value, 6),
+                        "mermin_violated": mermin_violated,
+                        "quantum_field_64x64x64": block_quantum_field_hex,
                         "transactions": _block_txs,
                     }
-                    
-                    # ── HypΓ-sign the block ──
+
+                    # ── HypΓ-sign the block (must be before submission) ──
+                    _sig = None
                     try:
                         if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
-                            _block_dict_for_sig = submit_payload["header"].copy()
-                            _sig = self.wallet.sign_block(_block_dict_for_sig, self.wallet.private_key)
+                            # Sign the block payload (excluding signature field)
+                            _block_for_sig = {k: v for k, v in submit_payload.items() if k not in ('hyp_signature', 'hyp_sig', 'miner_pubkey')}
+                            _sig = self.wallet.sign_block(_block_for_sig, self.wallet.private_key)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hyp_signature"] = _sig
-                                submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
-                                _EXP_LOG.info(f"[MINER] HypΓ-signed block h={target_height}")
+                                submit_payload["miner_pubkey"] = self.wallet.public_key or ""
+                                _EXP_LOG.info(f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…")
                             else:
-                                _EXP_LOG.warning(f"[MINER] HypΓ signing failed: {_sig}")
+                                _EXP_LOG.error(f"[MINER] ❌ HypΓ signing failed: {_sig}")
                         else:
-                            _EXP_LOG.warning("[MINER] No wallet loaded — block will be rejected (HypΓ required)")
+                            _EXP_LOG.error(f"[MINER] ❌ Wallet not loaded — cannot sign block (is_loaded={self.wallet.is_loaded() if self.wallet else False}, has_private_key={bool(self.wallet.private_key if self.wallet else None)})")
                     except Exception as _hyp_sign_err:
-                        _EXP_LOG.warning(f"[MINER] HypΓ signing error: {_hyp_sign_err}")
+                        _EXP_LOG.error(f"[MINER] ❌ HypΓ signing exception: {_hyp_sign_err}")
                     
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
                     # ──────────────────────────────────────────────────────────────
 
                     # Validate required fields before submission
-                    if "hyp_signature" not in submit_payload or "miner_public_key_hex" not in submit_payload:
-                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_public_key_hex={submit_payload.get('miner_public_key_hex') is not None}")
+                    if "hyp_signature" not in submit_payload or "miner_pubkey" not in submit_payload:
+                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_pubkey={submit_payload.get('miner_pubkey') is not None}")
                         _MINE_TELEM.mark_idle()
                         continue
 
