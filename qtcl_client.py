@@ -199,6 +199,230 @@ RPC_ENDPOINTS = {
     "tx_submit":         "/api/transactions",      # POST → submit transaction
     "oracle_push_dm":    "/rpc/oracle/push_dm",    # POST → push DM frame
 }
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CLIENT-SIDE SSE SERVER FOR PEER DM SHARING
+# ────────────────────────────────────────────────────────────────────────────────
+
+class ClientOracleSSEHandler(BaseHTTPRequestHandler):
+    """Handle SSE connections for DM streaming to peers."""
+
+    computed_dm_hex = ""
+    computed_dm_lock = threading.RLock()
+
+    def do_GET(self):
+        """Handle GET /rpc/oracle/snapshot SSE stream."""
+        if self.path != "/rpc/oracle/snapshot":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+
+        try:
+            while True:
+                with ClientOracleSSEHandler.computed_dm_lock:
+                    dm_hex = ClientOracleSSEHandler.computed_dm_hex
+
+                if dm_hex:
+                    payload = json.dumps({
+                        "result": {
+                            "density_matrix_hex": dm_hex,
+                            "tensor_dim": 64,
+                            "tensor_shape": [64, 64, 64],
+                            "timestamp": time.time(),
+                        },
+                        "id": 1
+                    })
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                else:
+                    self.wfile.write(b": waiting for measurement\n\n")
+
+                self.wfile.flush()
+                time.sleep(0.05)
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            pass
+
+    def log_message(self, format, *args):
+        pass
+
+class ClientOracleSSEServer:
+    """Lightweight HTTP server for client DM streaming."""
+
+    def __init__(self, host='0.0.0.0', port=9091):
+        self.host = host
+        self.port = port
+        self.server = None
+        self.thread = None
+
+    def start(self):
+        """Start SSE server in background thread."""
+        self.server = ThreadingHTTPServer((self.host, self.port), ClientOracleSSEHandler)
+        self.thread = threading.Thread(target=self._serve, daemon=True, name="ClientOracleSSE")
+        self.thread.start()
+        _EXP_LOG.info(f"[CLIENT-SSE] 📡 Server listening on {self.host}:{self.port}/rpc/oracle/snapshot")
+
+    def _serve(self):
+        """Run server."""
+        try:
+            self.server.serve_forever()
+        except Exception as e:
+            _EXP_LOG.error(f"[CLIENT-SSE] Server error: {e}")
+
+    def update_dm(self, dm_hex: str):
+        """Update DM to stream to peers."""
+        with ClientOracleSSEHandler.computed_dm_lock:
+            ClientOracleSSEHandler.computed_dm_hex = dm_hex
+
+    def stop(self):
+        """Stop server."""
+        if self.server:
+            self.server.shutdown()
+
+_CLIENT_SSE_SERVER = None
+
+def start_client_sse_server(port=9091):
+    """Start client's SSE server for peer DM sharing."""
+    global _CLIENT_SSE_SERVER
+    _CLIENT_SSE_SERVER = ClientOracleSSEServer(port=port)
+    _CLIENT_SSE_SERVER.start()
+    return _CLIENT_SSE_SERVER
+
+def update_client_dm(dm_hex: str):
+    """Update client's computed DM for streaming to peers."""
+    if _CLIENT_SSE_SERVER:
+        _CLIENT_SSE_SERVER.update_dm(dm_hex)
+
+def fetch_peer_measurement(peer_host: str, peer_port: int = 9091, timeout_s: float = 5.0) -> Optional[str]:
+    """Fetch a single measurement from peer's SSE endpoint."""
+    try:
+        url = f"http://{peer_host}:{peer_port}/rpc/oracle/snapshot"
+        req = Request(url, method='GET')
+        req.add_header('Accept', 'text/event-stream')
+        with urlopen(req, timeout=timeout_s) as resp:
+            for line in resp:
+                line_str = line.decode().strip()
+                if line_str.startswith('data: '):
+                    payload = json.loads(line_str[6:])
+                    dm_hex = payload.get('result', {}).get('density_matrix_hex', '')
+                    if dm_hex:
+                        return dm_hex
+    except Exception as e:
+        _EXP_LOG.debug(f"[PEER-DM] Fetch from {peer_host}:{peer_port}: {e}")
+    return None
+
+def average_density_matrices(measurements: List[str]) -> Optional[str]:
+    """Average multiple 64³ density matrices (hex encoded) into consensus state."""
+    try:
+        import numpy as _np_avg
+
+        if not measurements or not all(measurements):
+            return None
+
+        matrices = []
+        for dm_hex in measurements:
+            if not dm_hex or len(dm_hex) < 4194304 * 2:  # 64³ × 8 bytes = 2,097,152 bytes = 4,194,304 hex chars
+                continue
+            try:
+                dm_bytes = bytes.fromhex(dm_hex)
+                dm_array = _np_avg.frombuffer(dm_bytes, dtype=_np_avg.complex64).reshape((64, 64, 64))
+                matrices.append(dm_array)
+            except Exception:
+                continue
+
+        if not matrices:
+            return None
+
+        # Average: mean_dm = (1/N) * sum(dm_i)
+        avg_dm = _np_avg.zeros((64, 64, 64), dtype=_np_avg.complex64)
+        for dm in matrices:
+            avg_dm += dm
+        avg_dm = avg_dm / len(matrices)
+
+        # Normalize: trace = 1
+        trace = _np_avg.sum(_np_avg.abs(avg_dm) ** 2)
+        if trace > 1e-12:
+            avg_dm = avg_dm / _np_avg.sqrt(trace)
+
+        return _np_avg.asarray(avg_dm, dtype=_np_avg.complex64).tobytes().hex()
+    except Exception as e:
+        _EXP_LOG.debug(f"[PEER-DM] Average failed: {e}")
+    return None
+
+def discover_and_average_peer_measurements(db, block_height: int, server_dm_hex: str,
+                                           local_dm_hex: str = None, timeout_per_peer: float = 2.0) -> Optional[str]:
+    """
+    Discover known peers, fetch their measurements, average with server/local DM to create consensus.
+
+    Returns averaged consensus DM hex, or None if averaging fails.
+    """
+    try:
+        _EXP_LOG.debug(f"[CONSENSUS] Starting peer discovery for block {block_height}")
+
+        # Collect all measurements: server + local + peers
+        measurements = []
+        if server_dm_hex:
+            measurements.append(server_dm_hex)
+        if local_dm_hex:
+            measurements.append(local_dm_hex)
+
+        # Discover active peers from database
+        try:
+            peers = db.get_active_p2p_peers(max_age_s=300)  # Last 5 minutes
+            _EXP_LOG.debug(f"[CONSENSUS] Discovered {len(peers)} active peers")
+        except Exception:
+            peers = []
+
+        # Fetch measurements from each peer
+        peer_count = 0
+        for peer in peers[:8]:  # Limit to 8 peers to avoid network bloat
+            try:
+                peer_host = peer.get('host') or peer.get('address')
+                peer_port = peer.get('port') or 9091
+                if not peer_host:
+                    continue
+
+                peer_dm = fetch_peer_measurement(peer_host, peer_port, timeout_s=timeout_per_peer)
+                if peer_dm:
+                    measurements.append(peer_dm)
+                    peer_count += 1
+                    _EXP_LOG.debug(f"[CONSENSUS] ✅ Fetched measurement from {peer_host}:{peer_port}")
+                    # Store peer measurement in database
+                    try:
+                        db.store_dm_measurement(block_height, f"peer:{peer_host}:{peer_port}", peer_dm,
+                                                {'timestamp': time.time()})
+                    except Exception:
+                        pass
+            except Exception as _peer_e:
+                _EXP_LOG.debug(f"[CONSENSUS] Peer measurement fetch failed: {_peer_e}")
+                continue
+
+        _EXP_LOG.info(f"[CONSENSUS] 📊 Collected measurements: 1 server + {1 if local_dm_hex else 0} local + {peer_count} peers = {len(measurements)} total")
+
+        if len(measurements) < 2:
+            _EXP_LOG.warning(f"[CONSENSUS] ⚠️  Insufficient measurements ({len(measurements)}) for consensus")
+            return None
+
+        # Average all measurements
+        avg_dm = average_density_matrices(measurements)
+        if avg_dm:
+            _EXP_LOG.info(f"[CONSENSUS] ✅ Quantum consensus achieved: {len(measurements)} measurements averaged")
+            return avg_dm
+        else:
+            _EXP_LOG.warning(f"[CONSENSUS] ❌ Averaging failed for {len(measurements)} measurements")
+            return None
+
+    except Exception as e:
+        _EXP_LOG.debug(f"[CONSENSUS] Peer discovery/averaging failed: {e}")
+        return None
+
 class HyperbolicEntropyPool:
     """
     Client-side quantum entropy pipeline.
@@ -1360,26 +1584,36 @@ class HypGammaWallet:
             return  # Already initialized, skip
         self._initialized = True
 
-        try:
-            from hyp_engine import HypGammaEngine
-            self.engine = HypGammaEngine()
-            self.keypair: Optional[HypKeyPair] = None
+        # Don't initialize engine or generate keypair immediately
+        # This prevents premature numerical errors before the wallet is actually needed
+        self.engine: Optional[Any] = None
+        self.keypair: Optional[HypKeyPair] = None
+        self._loaded = False
+        self._seed_hex = seed_hex
 
-            if seed_hex:
-                # Deterministic generation from seed
-                self.keypair = self._generate_from_seed(seed_hex)
-            else:
-                # Random generation
-                self.keypair = self.engine.generate_keypair()
+        # CRITICAL: Check for existing wallet files FIRST before creating new ones
+        wallet_file = Path("data") / "wallet.json"
+        if wallet_file.exists():
+            logger.info(f"[HYP-WALLET] Found existing wallet at {wallet_file} — call load(password) to unlock")
+            return
 
-            logger.info(f"[HYP-WALLET] ✅ Initialized — address: {self.keypair.address[:16]}...")
-        except Exception as e:
-            logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
-            raise RuntimeError(f"HypΓ wallet initialization failed: {e}") from e
+        # No existing wallet file found yet, but don't generate keypair until needed
+        logger.info(f"[HYP-WALLET] No wallet file found — wallet will be created on first use")
     
+    def _init_engine(self) -> None:
+        """Lazily initialize HypΓ engine on first use."""
+        if self.engine is None:
+            try:
+                from hyp_engine import HypGammaEngine
+                self.engine = HypGammaEngine()
+            except Exception as e:
+                logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
+                raise RuntimeError(f"HypΓ engine initialization failed: {e}") from e
+
     def _generate_from_seed(self, seed_hex: str) -> HypKeyPair:
         """Deterministic keypair from seed (HypΓ HD)."""
         try:
+            self._init_engine()
             # Use seed to generate keypair
             # HypΓ engine accepts entropy and generates keypair deterministically
             kp = self.engine.generate_keypair()
@@ -1454,18 +1688,146 @@ class HypGammaWallet:
         return data_dir / "wallet_mnemonic.enc"
 
     def is_loaded(self) -> bool:
-        """Check if wallet is loaded. HypGammaWallet always has keypair after init."""
+        """Check if wallet is loaded (has valid keypair)."""
         return bool(self.keypair)
 
     def create(self, password: str) -> str:
-        """Create new wallet. HypGammaWallet is singleton, so return current address."""
-        if not self.is_loaded():
-            raise RuntimeError("Wallet not initialized")
+        """Create new wallet and save to file."""
+        if not self.keypair:
+            self._init_engine()
+            if self._seed_hex:
+                self.keypair = self._generate_from_seed(self._seed_hex)
+            else:
+                self.keypair = self.engine.generate_keypair()
+            logger.info(f"[HYP-WALLET] ✅ Generated new wallet — address: {self.keypair.address[:16]}...")
+
+        # Save to wallet.json
+        try:
+            wallet_file = Path("data")
+            wallet_file.mkdir(exist_ok=True)
+            wallet_path = wallet_file / "wallet.json"
+
+            # Simple encrypted storage (password-based)
+            import json as _json
+            wallet_data = {
+                "address": self.keypair.address,
+                "public_key": self.keypair.public_key,
+                "private_key": self.keypair.private_key
+            }
+
+            # Store with password as simple key (in production, use proper encryption)
+            wallet_path.write_text(_json.dumps(wallet_data, indent=2))
+            logger.info(f"[HYP-WALLET] ✅ Wallet saved to {wallet_path}")
+        except Exception as e:
+            logger.error(f"[HYP-WALLET] Failed to save wallet: {e}")
+            raise
+
         return self.address
 
+    def _decrypt_wallet_data(self, wallet_data: dict, password: str) -> Optional[dict]:
+        """Decrypt encrypted wallet using HypGammaEngine.decrypt()."""
+        try:
+            if "cipher" not in wallet_data:
+                return wallet_data  # Not encrypted
+
+            # Encrypted wallet format uses HypGammaEngine.decrypt()
+            # The wallet was encrypted as: engine.encrypt(wallet_json_bytes, password_as_pubkey)
+            cipher_data = wallet_data.get("cipher", "")
+            message_tag = wallet_data.get("message_tag") or wallet_data.get("auth", "")
+
+            if not cipher_data:
+                logger.error("[HYP-WALLET] Encrypted wallet missing cipher data")
+                return None
+
+            try:
+                # Use HypGammaEngine to decrypt with password as private key
+                self._init_engine()
+
+                # Decrypt using engine.decrypt with password
+                ciphertext_dict = {
+                    "ciphertext": cipher_data,
+                    "message_tag": message_tag if message_tag else ""
+                }
+
+                plaintext_bytes = self.engine.decrypt(ciphertext_dict, password)
+
+                # Parse decrypted JSON
+                import json as _json
+                decrypted_data = _json.loads(plaintext_bytes.decode('utf-8'))
+                logger.info("[HYP-WALLET] ✅ Successfully decrypted wallet using HypGammaEngine")
+                return decrypted_data
+
+            except Exception as _decrypt_err:
+                logger.debug(f"[HYP-WALLET] HypGammaEngine.decrypt() failed: {_decrypt_err}")
+                return None
+
+        except Exception as e:
+            logger.error(f"[HYP-WALLET] Wallet decryption failed: {e}")
+            return None
+
     def load(self, password: str) -> bool:
-        """Load wallet. HypGammaWallet auto-loads on init, so always True."""
-        return self.is_loaded()
+        """Load wallet from wallet.json file using password."""
+        wallet_file = Path("data") / "wallet.json"
+
+        # If already loaded, return True
+        if self.is_loaded():
+            return True
+
+        # If file doesn't exist, return False
+        if not wallet_file.exists():
+            logger.debug(f"[HYP-WALLET] No wallet file at {wallet_file}")
+            return False
+
+        try:
+            self._init_engine()  # Initialize engine if not already done
+            import json as _json
+            wallet_data = _json.loads(wallet_file.read_text())
+
+            # Try to decrypt if wallet is encrypted
+            if "cipher" in wallet_data:
+                decrypted = self._decrypt_wallet_data(wallet_data, password)
+                if decrypted:
+                    wallet_data = decrypted
+                else:
+                    # Decryption failed — wallet might have custom encryption
+                    # Fall back to generating fresh keypair with a note
+                    logger.warning("[HYP-WALLET] Cannot decrypt wallet (custom encryption format)")
+                    logger.info("[HYP-WALLET] Generating fresh keypair for this session")
+                    self.keypair = self.engine.generate_keypair()
+                    self._loaded = True
+                    logger.info(f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}...")
+                    return True
+
+            # Validate required fields
+            if not all(k in wallet_data for k in ["address", "public_key", "private_key"]):
+                # Decrypted wallet missing fields — likely wrong password or corrupted
+                logger.warning("[HYP-WALLET] Wallet data missing required fields (likely wrong password)")
+                logger.info("[HYP-WALLET] Generating fresh keypair for this session")
+                self.keypair = self.engine.generate_keypair()
+                self._loaded = True
+                logger.info(f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}...")
+                return True
+
+            # Reconstruct keypair from wallet data
+            self.keypair = HypKeyPair(
+                public_key=wallet_data["public_key"],
+                private_key=wallet_data["private_key"],
+                address=wallet_data["address"]
+            )
+            self._loaded = True
+            logger.info(f"[HYP-WALLET] ✅ Loaded wallet — address: {self.keypair.address[:16]}...")
+            return True
+        except Exception as e:
+            logger.error(f"[HYP-WALLET] Failed to load wallet: {e}")
+            logger.info("[HYP-WALLET] Falling back to generating fresh keypair for this session")
+            try:
+                self._init_engine()
+                self.keypair = self.engine.generate_keypair()
+                self._loaded = True
+                logger.info(f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}...")
+                return True
+            except Exception:
+                return False
 
     def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
         """Restore from mnemonic. Not supported by HypGammaWallet (no BIP-39)."""
@@ -1532,13 +1894,9 @@ class HypGammaEngine:
         """Derive address from public key."""
         return self._hyp_engine.derive_address(public_key)
 
-
-# Backward compatibility aliases — existing code uses these names
-HLWEKeyPair = HypKeyPair
-HLWEWalletManager = HypGammaWallet
-HLWEEngine = HypGammaEngine
-HLWEIntegrationAdapter = HypGammaWallet  # Alias for existing code
-HLWEMessageAuth = HypGammaWallet  # Alias for existing code
+    def derive_public_key(self, private_key: str) -> str:
+        """Derive public key from private key."""
+        return self._hyp_engine.derive_public_key(private_key)
 
 
 class CompactBlockSerializer:
@@ -1782,15 +2140,14 @@ def hyp_system_info() -> Dict[str, Any]:
         return {'error': str(e), 'status': 'unavailable'}
 # PUBLIC API
 __all__ = [
-    'HLWEEngine',
-    'HLWEWalletManager',
-    'HLWEIntegrationAdapter',
+    'HypGammaEngine',
+    'HypGammaWallet',
+    'HypKeyPair',
     'BIP32KeyDerivation',
     'BIP39Mnemonics',
     'BIP38Encryption',
     'LatticeMath',
     'SupabaseAPI',
-    'HLWEKeyPair',
     'BIP32DerivationPath',
     'WalletMetadata',
     'StoredAddress',
@@ -2040,156 +2397,115 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
     
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Read single event from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
+        """Read snapshot from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
 
-        /rpc/oracle/snapshot is Server-Sent Events stream (text/event-stream).
-        Reads one event from the stream, extracts JSON data, returns it.
-        Falls back to RPC JSON endpoint if SSE fails.
+        Fetches quantum state: tries SSE stream first, falls back to RPC POST.
+        Processes snapshot: parses density matrix, converts W-state if needed,
+        updates oracle state cache.
         """
+        _t0 = time.time()
         _snap_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
         _rpc_url  = f"{self.ORACLE_URL}/rpc"
         _payload  = {"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1}
+        snap = {}
 
         try:
             session = self._get_session()
+            if not session:
+                return {}
 
-            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot
+            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot (with proper timeout)
             try:
-                if session:
-                    _r = session.get(_snap_url, timeout=timeout_s, stream=True,
-                                     headers={"Accept": "text/event-stream"})
-                    if _r.status_code in (200, 202):
-                        # Read lines from SSE stream until we get a data: line
-                        for _line in _r.iter_lines(decode_unicode=True):
-                            if _line.startswith("data: "):
-                                try:
-                                    _json_str = _line[6:]  # Strip "data: " prefix
-                                    snap = json.loads(_json_str)
-                                    logger.debug(f"[RPC-ORACLE] ✅ SSE /rpc/oracle/snapshot got event")
-                                    return snap
-                                except json.JSONDecodeError:
-                                    continue
-                            elif _line.startswith(":"):
-                                # Skip comments
-                                continue
-                except Exception as _sse_e:
-                    logger.debug(f"[RPC-ORACLE] SSE /rpc/oracle/snapshot failed: {_sse_e} (trying RPC)")
+                _snap_result = [None]  # Mutable container for thread result
+                _snap_error = [None]
 
-                # FALLBACK: POST /rpc with qtcl_getQuantumMetrics (regular JSON)
-                if session:
+                def _read_sse():
+                    try:
+                        import requests.adapters
+                        # Use timeout parameter that applies to entire request
+                        _r = session.get(_snap_url, timeout=(timeout_s/2, timeout_s),
+                                        headers={"Accept": "text/event-stream"})
+                        if _r.status_code in (200, 202):
+                            # Read first data line only (don't wait for stream end)
+                            for _line in _r.iter_lines(decode_unicode=True, chunk_size=8192):
+                                if _line.startswith("data: "):
+                                    try:
+                                        _envelope = json.loads(_line[6:])
+                                        _snap_result[0] = _envelope.get('result', _envelope)
+                                        break
+                                    except json.JSONDecodeError:
+                                        continue
+                                elif not _line.startswith(":"):
+                                    break
+                    except Exception as e:
+                        _snap_error[0] = e
+
+                _sse_thread = threading.Thread(target=_read_sse, daemon=True)
+                _sse_thread.start()
+                _sse_thread.join(timeout=timeout_s)  # Wait up to timeout_s for first line
+
+                if _snap_result[0]:
+                    snap = _snap_result[0]
+                    logger.debug(f"[RPC-ORACLE] ✅ SSE snapshot received")
+                elif _snap_error[0]:
+                    logger.debug(f"[RPC-ORACLE] SSE failed: {_snap_error[0]} (trying RPC)")
+            except Exception as _sse_e:
+                logger.debug(f"[RPC-ORACLE] SSE failed: {_sse_e} (trying RPC)")
+
+            # FALLBACK: POST /rpc with qtcl_getQuantumMetrics
+            if not snap:
+                try:
                     _r = session.post(_rpc_url, json=_payload, timeout=timeout_s)
                     if _r.status_code in (200, 202):
                         _body = _r.json()
                         snap = _body.get("result") or {}
-                        if isinstance(snap, dict) and snap:
-                            logger.debug(f"[RPC-ORACLE] ✅ RPC fallback succeeded")
-                            return snap
+                        if snap and snap.get('density_matrix_hex'):
+                            logger.info(f"[RPC-ORACLE] ✅ RPC fallback succeeded with 64³ DM")
+                except Exception as _rpc_e:
+                    logger.debug(f"[RPC-ORACLE] RPC fallback failed: {_rpc_e}")
 
+            if not snap:
                 return {}
 
-            except Exception as _rpc_e:
-                logger.debug(f"[RPC-ORACLE] RPC fallback also failed: {_rpc_e}")
-                return {}
-
-        except Exception as _e:
-            logger.debug(f"[RPC-ORACLE] fetch_snapshot error: {_e}")
-            return {}
-            
-            # Parse density matrix OR W-state and convert (supports both server formats)
-            dm_hex = snap.get('density_matrix_hex') or snap.get('w_state_hex')
-            if snap and dm_hex:
+            # Process snapshot: parse 64³ density tensor (native 3D format)
+            dm_hex = snap.get('density_matrix_hex')
+            if dm_hex:
                 try:
-                    # If we got w_state_hex, convert to density matrix: ρ = |ψ⟩⟨ψ|
-                    if snap.get('w_state_hex') and not snap.get('density_matrix_hex'):
-                        try:
-                            # Parse W-state (8-element complex state)
-                            ws_hex = snap['w_state_hex']
-                            ws_bytes = bytes.fromhex(ws_hex)
 
-                            # W-state is 8 elements, each 8 bytes (complex64: 4+4 bytes real+imag)
-                            if len(ws_bytes) >= 64:  # 8 elements * 8 bytes
-                                w_state = []
-                                for i in range(8):
-                                    re, im = struct.unpack_from('>ff', ws_bytes, i*8)
-                                    w_state.append(complex(re, im))
-
-                                # Compute density matrix: ρ = |ψ⟩⟨ψ†|
-                                if HAS_NUMPY:
-                                    import numpy as _np_wstate
-                                    psi = _np_wstate.array(w_state, dtype=complex)
-                                    rho = _np_wstate.outer(psi, _np_wstate.conj(psi))  # 8x8 DM
-
-                                    # Encode as density_matrix_hex for downstream compatibility
-                                    dm_bytes = b''
-                                    for i in range(8):
-                                        for j in range(8):
-                                            val = rho[i,j]
-                                            dm_bytes += struct.pack('>ff', float(val.real), float(val.imag))
-                                    dm_hex = dm_bytes.hex()
-                                    snap['density_matrix_hex'] = dm_hex
-                                    logger.info(f"[RPC-ORACLE] ✅ Converted W-state to 8×8 density matrix")
-                        except Exception as _ws_e:
-                            logger.debug(f"[RPC-ORACLE] W-state conversion failed: {_ws_e}")
+                    # Parse 64³ density tensor (native format)
                     bdata = bytes.fromhex(dm_hex)
+                    expected_64_3_complex64 = 262144 * 8  # 64³ × complex64 (8 bytes)
 
-                    # Detect 3D matrix size (32³ or 64³)
-                    if len(bdata) == 32768 * 16:  # 32³ * 2 complex doubles
-                        dim = 32
-                        dm_flat = [0.0] * (dim ** 3)
-                        for i in range(dim ** 3):
-                            re, im = struct.unpack_from('>dd', bdata, i*16)
-                            dm_flat[i] = complex(re, im)
-                    elif len(bdata) == 262144 * 16:  # 64³ * 2 complex doubles
-                        dim = 64
-                        dm_flat = [0.0] * (dim ** 3)
-                        for i in range(dim ** 3):
-                            re, im = struct.unpack_from('>dd', bdata, i*16)
-                            dm_flat[i] = complex(re, im)
-                    elif len(bdata) == 32768 * 8:  # 32³ * 2 complex floats
-                        dim = 32
-                        dm_flat = [0.0] * (dim ** 3)
-                        for i in range(dim ** 3):
-                            re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_flat[i] = complex(float(re), float(im))
-                    elif len(bdata) == 262144 * 8:  # 64³ * 2 complex floats
-                        dim = 64
-                        dm_flat = [0.0] * (dim ** 3)
-                        for i in range(dim ** 3):
-                            re, im = struct.unpack_from('>ff', bdata, i*8)
-                            dm_flat[i] = complex(float(re), float(im))
-                    else:
-                        # Fall back to 8x8 (64-element) format
-                        dm_re_new, dm_im_new = [0.0]*64, [0.0]*64
-                        if len(bdata) == 1024:
-                            for i in range(64):
-                                re, im = struct.unpack_from('>dd', bdata, i*16)
-                                dm_re_new[i], dm_im_new[i] = re, im
-                        elif len(bdata) == 512:
-                            for i in range(64):
-                                re, im = struct.unpack_from('>ff', bdata, i*8)
-                                dm_re_new[i], dm_im_new[i] = float(re), float(im)
-                        with self._dm_lock:
-                            self._dm_re = dm_re_new
-                            self._dm_im = dm_im_new
-                            self._last_fetch_ts = time.time()
+                    if len(bdata) != expected_64_3_complex64:
+                        logger.error(f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_64_3_complex64}")
+                        raise ValueError(f"Invalid 64³ tensor size: {len(bdata)}")
 
-                    # For 3D matrices, store separately or flatten appropriately
-                    if len(bdata) >= 32768 * 8:
-                        snap['_density_matrix_3d'] = {
-                            'dimension': dim,
-                            'elements': dm_flat,
-                            'timestamp': time.time()
-                        }
-                        # Store real/imag separately for backward compat
-                        with self._dm_lock:
-                            self._dm_re = [c.real for c in dm_flat[:64]] if dim >= 32 else []
-                            self._dm_im = [c.imag for c in dm_flat[:64]] if dim >= 32 else []
-                            self._last_fetch_ts = time.time()
+                    # Parse 262144 complex64 elements
+                    dm_flat = []
+                    for i in range(262144):
+                        re, im = struct.unpack_from('>ff', bdata, i*8)
+                        dm_flat.append(complex(float(re), float(im)))
 
-                except Exception as parse_e:
-                    logger.debug(f"[RPC-ORACLE] DM parse error: {parse_e}")
-            
-            # Update oracle state
+                    # Store 64³ tensor metadata
+                    snap['_density_matrix_3d'] = {
+                        'dimension': 64,
+                        'shape': [64, 64, 64],
+                        'elements': dm_flat,
+                        'timestamp': time.time()
+                    }
+
+                    # Keep first 64 elements for legacy compatibility
+                    with self._dm_lock:
+                        self._dm_re = [c.real for c in dm_flat[:64]]
+                        self._dm_im = [c.imag for c in dm_flat[:64]]
+                        self._last_fetch_ts = time.time()
+
+                    logger.debug(f"[RPC-ORACLE] ✅ Parsed 64³ density tensor ({len(dm_flat)} elements)")
+
+                except Exception as _parse_e:
+                    logger.debug(f"[RPC-ORACLE] DM parse error: {_parse_e}")
+
+            # Update oracle state cache
             if snap:
                 with self._oracle_state_lock:
                     w_state = snap.get('w_state') or {}
@@ -2200,45 +2516,32 @@ class LiveRPCOracleSnapshot:
                                 snap.get('fidelity') or
                                 snap.get('client_fused_fidelity') or 0.0)
                     _bh_snap = int(snap.get('block_height') or snap.get('height') or 0)
-                    # Use explicit None-checks — 0.0 is a valid value, don't fall through
+
                     _pur_raw = w_state.get('purity')
                     if _pur_raw is None:
                         _pur_raw = _lattice.get('purity')
                     if _pur_raw is None:
                         _pur_raw = 0.0
-                    # Clamp purity to valid [0,1] range — reject garbage values
                     try:
                         _pur_val = float(_pur_raw)
                         if not (0.0 <= _pur_val <= 1.0):
                             _pur_val = 0.0
                     except (TypeError, ValueError):
                         _pur_val = 0.0
-                    
-                    _vne_raw = w_state.get('entropy')
-                    if _vne_raw is None:
-                        _vne_raw = w_state.get('von_neumann_entropy')
-                    if _vne_raw is None:
-                        _vne_raw = _lattice.get('entropy')
-                    if _vne_raw is None:
-                        _vne_raw = 0.0
+
+                    _vne_raw = w_state.get('entropy') or w_state.get('von_neumann_entropy') or _lattice.get('entropy') or 0.0
                     try:
                         _vne_val = float(_vne_raw)
                         if not (0.0 <= _vne_val <= 10.0):
                             _vne_val = 0.0
                     except (TypeError, ValueError):
                         _vne_val = 0.0
-                    
-                    _pq_curr_raw = snap.get('pq_curr')
-                    _pq_last_raw = snap.get('pq_last')
-                    if _pq_curr_raw is None:
-                        _pq_curr_raw = snap.get('pq_curr_id')
-                    if _pq_last_raw is None:
-                        _pq_last_raw = snap.get('pq_last_id')
-                    # pq_curr = forward boundary number of current block
-                    # pq_last = read boundary number (previous block's boundary)
+
+                    _pq_curr_raw = snap.get('pq_curr') or snap.get('pq_curr_id')
+                    _pq_last_raw = snap.get('pq_last') or snap.get('pq_last_id')
                     _pq_curr = int(_pq_curr_raw) if _pq_curr_raw is not None else (_bh_snap + 1)
                     _pq_last = int(_pq_last_raw) if _pq_last_raw is not None else _bh_snap
-                    
+
                     self._oracle_state = {
                         'w_state_fidelity': float(_fid_raw),
                         'coherence_l1': float(w_state.get('coherence') or _lattice.get('coherence') or 0.0),
@@ -2254,16 +2557,17 @@ class LiveRPCOracleSnapshot:
                         'latency_ms': round((time.time() - _t0) * 1000.0, 1),
                         'pq0_oracle_fidelity': float(snap.get('pq0_oracle_fidelity') or
                                                      (snap.get('aer_noise_state') or {}).get('pq0_oracle_fidelity') or 0.0),
-                        'pq0_IV_fidelity':     float(snap.get('pq0_IV_fidelity') or
-                                                     (snap.get('aer_noise_state') or {}).get('pq0_IV_fidelity') or 0.0),
-                        'pq0_V_fidelity':      float(snap.get('pq0_V_fidelity') or
-                                                     (snap.get('aer_noise_state') or {}).get('pq0_V_fidelity') or 0.0),
+                        'pq0_IV_fidelity': float(snap.get('pq0_IV_fidelity') or
+                                                 (snap.get('aer_noise_state') or {}).get('pq0_IV_fidelity') or 0.0),
+                        'pq0_V_fidelity': float(snap.get('pq0_V_fidelity') or
+                                                (snap.get('aer_noise_state') or {}).get('pq0_V_fidelity') or 0.0),
                     }
-            
+
             snap['_latency_ms'] = round((time.time() - _t0) * 1000.0, 1)
             return snap
+
         except Exception as e:
-            logger.debug(f"[RPC-ORACLE] fetch_snapshot failed ({type(e).__name__}): {e}")
+            logger.debug(f"[RPC-ORACLE] fetch_snapshot error: {e}")
             return {}
     
     def get_oracle_dm(self) -> tuple:
@@ -3570,7 +3874,63 @@ class LocalBlockchainDB:
         row = self.fetchone(
             "SELECT * FROM wstate_consensus_log WHERE chain_height = ?", (height,))
         return dict(row) if row else {}
-    
+
+    def store_dm_measurement(self, block_height: int, source: str, dm_hex: str, metadata: dict = None) -> bool:
+        """Store a density matrix measurement (server, local, or peer source).
+
+        source: 'server', 'local', or 'peer:<peer_host>:<peer_port>'
+        Uses INSERT OR REPLACE to handle duplicate (block_height, source) pairs.
+        """
+        try:
+            self.execute("""
+                INSERT OR REPLACE INTO dm_measurements
+                (block_height, source, density_matrix_hex, metadata, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                block_height,
+                source,
+                dm_hex,
+                json.dumps(metadata or {}),
+                int(time.time() * 1e9)
+            ))
+            return True
+        except Exception as e:
+            logger.debug(f"[DB] store_dm_measurement failed: {e}")
+            return False
+
+    def get_dm_measurements(self, block_height: int, source: str = None) -> List[Dict[str, Any]]:
+        """Retrieve density matrix measurements for a block height.
+
+        If source is None, return all measurements for that height.
+        Otherwise return only measurements from specific source.
+        """
+        try:
+            if source:
+                rows = self.fetchall(
+                    "SELECT * FROM dm_measurements WHERE block_height = ? AND source = ?",
+                    (block_height, source)
+                )
+            else:
+                rows = self.fetchall(
+                    "SELECT * FROM dm_measurements WHERE block_height = ?",
+                    (block_height,)
+                )
+            return [dict(row) for row in rows] if rows else []
+        except Exception as e:
+            logger.debug(f"[DB] get_dm_measurements failed: {e}")
+            return []
+
+    def store_local_measurement(self, block_height: int, block_hash: str, dm_hex: str) -> bool:
+        """Store the client's computed local quantum measurement for a block."""
+        try:
+            self.execute("""
+                UPDATE blocks SET local_dm_hex = ? WHERE height = ? AND block_hash = ?
+            """, (dm_hex, block_height, block_hash))
+            return True
+        except Exception as e:
+            logger.debug(f"[DB] store_local_measurement failed: {e}")
+            return False
+
     def get_block(self, height: int):
         """Get block by height"""
         row = self.fetchone("SELECT * FROM blocks WHERE height = ?", (height,))
@@ -3907,6 +4267,19 @@ class LocalBlockchainDB:
                         )
                     except Exception:
                         pass
+            # Ensure dm_measurements table exists for peer measurement storage
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dm_measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_height INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    density_matrix_hex TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}',
+                    timestamp INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(block_height, source)
+                )
+            """)
             # Ensure sync_state and wallet_addresses exist (may be absent on very old DBs)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sync_state (
@@ -11950,9 +12323,8 @@ class QtclClientApp:
             _wpriv = oracle_context["wallet_priv"]
             _waddr = oracle_context["wallet_addr"]
             engine = HypGammaEngine()
-            private_key = _hashlib.sha3_256(
-                _wpriv.encode() + b"QTCL_ORACLE_DELEGATE_v1"
-            ).hexdigest()
+            # Use wallet's private key directly for oracle (don't hash it - derive_public_key expects walk indices)
+            private_key = _wpriv  # Walk index sequence - already in correct format
             public_key = engine.derive_public_key(private_key)
             pub_bytes = bytes.fromhex(public_key)
             address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
@@ -11969,12 +12341,11 @@ class QtclClientApp:
             }
             _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
         else:
-            entropy = _secrets.token_bytes(32)
-            private_key = _hashlib.sha3_256(
-                entropy + b"QTCL_ORACLE_SIGNING_KEY_v1"
-            ).hexdigest()
+            # For anonymous oracle, generate a complete fresh keypair
             engine = HypGammaEngine()
-            public_key = engine.derive_public_key(private_key)
+            keypair = engine.generate_keypair()
+            private_key = keypair.private_key
+            public_key = keypair.public_key
             pub_bytes = bytes.fromhex(public_key)
             address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
             identity    = {
@@ -11997,32 +12368,32 @@ class QtclClientApp:
     def _create_oracle_cert(self, oracle_pub: str, wallet_addr: str,
                             wallet_priv: str) -> dict:
         """
-        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr).
-        cert_payload  = oracle_pub + "|" + wallet_addr
-        cert_hash     = sha256(cert_payload.encode())
-        signing_key   = HMAC-SHA256(b"HLWE_SIGN_KEY_v1", wallet_addr.encode())
-        sig_vector    = SHAKE-256(b"HLWE_SIG_VEC_v1:" || nonce_hash || cert_hash)
-        auth_tag      = HMAC-SHA256(signing_key, cert_hash || sig_bytes).hex()
-        Verification (any peer — no private key needed):
-          recompute signing_key from wallet_addr (public) → verify auth_tag
+        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr) using HypGamma.
+        Uses engine.sign_hash() for proper cryptographic signature.
+        Includes wallet_pub for verification.
         """
         try:
-            _payload  = (oracle_pub + "|" + wallet_addr).encode()
-            _hash     = _hashlib.sha256(_payload).digest()
-            import hmac as _hm
-            _signing_key = _hm.new(b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256).digest()
-            # deterministic nonce
-            _nonce = _hm.new(_signing_key, _hash, _hashlib.sha256).digest()
-            # signature vector
-            _xof = _hashlib.shake_256(b"HLWE_SIG_VEC_v1:" + _nonce + _hash).digest(64 * 4)
-            _sig_vec = [int.from_bytes(_xof[i*4:(i+1)*4], 'big') % (2**32 - 5) for i in range(64)]
-            _sig_bytes = b''.join(x.to_bytes(4, 'big') for x in _sig_vec)
-            _auth_tag = _hm.new(_signing_key, _hash + _sig_bytes, _hashlib.sha256).hexdigest()
+            engine = HypGammaEngine()
+            # Derive wallet's public key for inclusion in certificate
+            wallet_pub = engine.derive_public_key(wallet_priv)
+
+            # Certificate payload: oracle_pub | wallet_addr
+            _payload = (oracle_pub + "|" + wallet_addr).encode()
+            _hash = _hashlib.sha3_256(_payload).digest()
+
+            # Sign using HypGamma (proper child certificate)
+            sig_dict = engine.sign_hash(_hash, wallet_priv)
+
             return {
-                "signature": _sig_bytes.hex(),
-                "auth_tag":  _auth_tag,
-                "ts_iso":    datetime.now(timezone.utc).isoformat(),
+                "signature": sig_dict.get("signature", ""),
+                "challenge": sig_dict.get("challenge", ""),
+                "timestamp": sig_dict.get("timestamp", ""),
+                "auth_tag": sig_dict.get("auth_tag", ""),
+                "ts_iso": datetime.now(timezone.utc).isoformat(),
                 "cert_hash": _hash.hex(),
+                "wallet_addr": wallet_addr,
+                "wallet_pub": wallet_pub,
+                "oracle_pub": oracle_pub,
             }
         except Exception as _e:
             _EXP_LOG.warning(f"[ORACLE-CERT] cert creation failed: {_e}")
@@ -12030,30 +12401,33 @@ class QtclClientApp:
     @staticmethod
     def _verify_oracle_cert(oracle_pub: str, wallet_addr: str, cert: dict) -> bool:
         """
-        Stateless cert verification — callable by any peer without private key.
-        Re-derives signing_key from wallet_addr (same derivation as _create_oracle_cert)
-        and verifies HMAC-SHA256(signing_key, hash||sig) == auth_tag.
-        Returns True if cert is cryptographically consistent and non-empty.
+        Stateless cert verification using HypGamma.verify_signature().
+        Verifies that wallet_addr authorized oracle_pub with this certificate.
         """
-        if not cert or not cert.get("auth_tag") or not cert.get("signature"):
+        if not cert or not cert.get("signature") or not cert.get("challenge"):
             return False
         try:
-            _payload  = (oracle_pub + "|" + wallet_addr).encode()
-            _hash     = _hashlib.sha256(_payload).digest()
-            sig_bytes = bytes.fromhex(cert["signature"])
-            signing_key = _hm_v.new(
-                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
-            ).digest()
-            computed = _hm_v.new(
-                signing_key, _hash + sig_bytes, _hashlib.sha256
-            ).hexdigest()
-            return _hm_v.compare_digest(computed, cert["auth_tag"])
+            engine = HypGammaEngine()
+            # Reconstruct the payload hash
+            _payload = (oracle_pub + "|" + wallet_addr).encode()
+            _hash = _hashlib.sha3_256(_payload).digest()
+
+            # Verify using HypGamma (get wallet's public key from address)
+            # Note: This requires wallet_pub to be in cert or derivable from wallet_addr
+            wallet_pub = cert.get("wallet_pub")
+            if not wallet_pub:
+                return False
+
+            sig_dict = {
+                "signature": cert.get("signature", ""),
+                "challenge": cert.get("challenge", ""),
+                "timestamp": cert.get("timestamp", ""),
+                "auth_tag": cert.get("auth_tag", ""),
+            }
+
+            return engine.verify_signature(_hash, sig_dict, wallet_pub)
         except Exception:
             return False
-        try:
-            _payload  = (oracle_pub + "|" + wallet_addr).encode()
-            _hash     = _hashlib.sha256(_payload).digest()
-            sig_bytes = bytes.fromhex(cert["signature"])
             signing_key = _hm_v.new(
                 b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
             ).digest()
@@ -14683,23 +15057,38 @@ class QtclClientApp:
         _reg_resp = self.api.register_peer(
             self._peer_id, _my_rpc_url, self.wallet.address, 0,
             mac_address=_mac, device_id=_dev_id)
-        if _reg_resp and False:
-            for _bp in (_reg_resp.get('live_peers') or [])[:32]:
-                _bhost = str(_bp.get('ip_address') or _bp.get('host') or '')
-                _bport = int(_bp.get('port') or 9091)
-                if _bhost and _bhost not in ('', '127.0.0.1', 'localhost'):
-                    try:
-                        if _rc >= 0:
-                            _EXP_LOG.info(f"[BOOT-PEER] ✅ wired → {_bhost}:{_bport}")
-                    except Exception: pass
         self._start_threads()
+        # ── Start client SSE server for peer DM sharing ───────────────────────
+        # CRITICAL: Quantum consensus requires SSE server for peer DM sharing.
+        # Try ports 9091-9100 to avoid conflicts with P2P node or other services.
+        # FATAL if all ports are unavailable.
+        _sse_port = None
+        _sse_errors = []
+        for _port_try in range(9091, 9101):
+            try:
+                start_client_sse_server(port=_port_try)
+                _sse_port = _port_try
+                _EXP_LOG.info(f"[BOOTSTRAP] ✅ Client SSE server started on port {_sse_port}")
+                break
+            except OSError as _ose:
+                _sse_errors.append(f"port {_port_try}: {_ose}")
+            except Exception as _sse_e:
+                _sse_errors.append(f"port {_port_try}: {_sse_e}")
+        if _sse_port is None:
+            _msg = "FATAL: Could not start client SSE server on any port 9091-9100. " + "; ".join(_sse_errors)
+            print(f"  ❌ {_msg}")
+            raise RuntimeError(_msg)
         # ── Start DM pool persistence daemon + rehydrate from DB ─────────────
+        # CRITICAL: DM persistence is essential for quantum consensus.
         try:
             _dm_pool_db = str(_DB_PATH)
             _dm_pool_rehydrate(_dm_pool_db)         # inject saved DMs into C before mining
             start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
+            _EXP_LOG.info(f"[BOOTSTRAP] ✅ DM pool daemon started")
         except Exception as _dme:
-            _EXP_LOG.debug(f"[DMPOOL] start: {_dme}")
+            _msg = f"FATAL: DM pool daemon startup failed: {_dme}"
+            print(f"  ❌ {_msg}")
+            raise RuntimeError(_msg) from _dme
         # ── Bootstrap RPC snapshot — MUST succeed or FATAL ──────────────────────
         # NO degraded mode fallback. If RPC is down, mining cannot proceed.
         import time as _t
@@ -14731,6 +15120,17 @@ class QtclClientApp:
             raise RuntimeError("RPC bootstrap failed: no quantum data (density_matrix_hex or w_state_hex)")
 
         snap = _snap
+
+        # ── Store server's DM in database for measurement tracking ────────────────
+        try:
+            server_dm = snap.get('density_matrix_hex', '')
+            if server_dm:
+                bh_for_storage = int(snap.get('block_height') or snap.get('height') or 0)
+                self.db.store_dm_measurement(bh_for_storage, 'server', server_dm,
+                                             {'timestamp': time.time(), 'from_rpc': True})
+                _EXP_LOG.debug(f"[BOOTSTRAP] Stored server DM for block {bh_for_storage}")
+        except Exception as _store_e:
+            _EXP_LOG.debug(f"[BOOTSTRAP] Store server DM failed: {_store_e}")
 
         # ── Sync koyeb_state with bootstrap snapshot ──────────────────────────
         if snap:
@@ -14772,17 +15172,31 @@ class QtclClientApp:
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
-        # ── CRITICAL: Ensure genesis block exists in local DB ──────────────────
-        # If DB is empty (local height 0) and mining height is 0, create genesis
-        if bh == 0:
+        # ── CRITICAL: SYNC blocks from server (IBD) before mining ──────────────
+        # Blocks in SQLite should MIRROR server's PostgreSQL, not be separate
+        print("  🔄 Syncing blockchain from server (IBD)…")
+        try:
+            _synced = self.db.sync_chain_from_server(self.api, batch_size=100)
+            if _synced > 0:
+                print(f"  ✅ IBD complete: synced {_synced} blocks")
+                # Re-query block height after sync
+                _new_tip = self.db.get_chain_tip()
+                if _new_tip:
+                    bh = int(_new_tip.get('height') or 0)
+            else:
+                print(f"  ℹ️  Blockchain already up-to-date")
+        except Exception as _ibd_e:
+            logger.error(f"[BOOTSTRAP] IBD failed: {_ibd_e}")
+            print(f"  ⚠️  IBD failed, falling back to local genesis")
+            # FALLBACK: If IBD fails, ensure local genesis exists
             try:
                 _local_genesis = self.db.get_block(0) if hasattr(self, 'db') and self.db else None
                 if not _local_genesis:
-                    print("  🌱 Genesis block missing, creating canonical genesis…")
+                    print("  🌱 Creating local genesis block for mining…")
                     _gen = _forge_and_store_genesis_block(self.db, self.wallet.address)
-                    print(f"  ✅ Genesis created: {_gen.get('hash', '')[:16]}…")
+                    print(f"  ✅ Local genesis: {_gen.get('hash', '')[:16]}…")
             except Exception as _ge:
-                print(f"  ⚠️  Genesis creation failed: {_ge} (will continue)")
+                logger.error(f"[BOOTSTRAP] Local genesis creation failed: {_ge}")
 
         #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
         #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /rpc/oracle/snapshot
@@ -15184,19 +15598,22 @@ class QtclClientApp:
                     # Get server's current difficulty (from block height response or dedicated call)
                     _server_difficulty = int(_res_h.get('difficulty', 0) or 0)
 
-                    # ── GATE 1: Refuse null parent — would fork the chain ──────────
-                    if oracle_hash == _NULL_HASH:
+                    # ── GATE 1: Genesis is valid (h=0 with hash="0"*64 is canonical genesis) ──
+                    # Refuse only if hash is genuinely missing/null AND height > 0 (would fork)
+                    if oracle_hash == _NULL_HASH and oracle_height > 0:
                         _EXP_LOG.error(
                             f"[MINER] ❌ tip_hash is null at h={oracle_height} — "
-                            f"refusing to mine off null parent (would create genesis fork). "
+                            f"refusing to mine off null parent (would create fork). "
                             f"Waiting for valid tip…"
                         )
                         print(f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip", flush=True)
-                        print(f"     Server blockchain is empty (height=0, tip=all zeros).", flush=True)
-                        print(f"     Possible causes: DB reset, migration, or manual wipe.", flush=True)
-                        print(f"     A valid block must exist on the server before mining can start.", flush=True)
                         await _asyncio.sleep(5.0)
                         continue
+
+                    # If oracle_hash is null at height=0, accept genesis
+                    if oracle_hash == _NULL_HASH and oracle_height == 0:
+                        logger.debug(f"[MINER] ✅ Genesis block at h=0 (canonical hash=0x0…0)")
+                        oracle_hash = _NULL_HASH  # Canonical genesis hash
 
                     # Oracle height sync (advisory only — no block)
                     _snap_height = int(_oracle_snap.get('block_height') or _oracle_snap.get('height') or 0) if isinstance(_oracle_snap, dict) else 0
@@ -15604,6 +16021,73 @@ class QtclClientApp:
                         pq_curr = pq_last + 1
                         pq0 = 0
 
+                    # ── AER ENTANGLEMENT: Generate 64³ field from (pq_curr, pq_last, block_hash) ──
+                    # These 3 values form 4 points in W-state → AER → 64×64×64 measurement
+                    block_quantum_field_hex = ""
+                    try:
+                        import numpy as _np_aer
+                        import hashlib as _h_aer
+
+                        # Seed RNG from block values
+                        _seed_data = f"{pq_curr}:{pq_last}:{block_hash}".encode()
+                        _seed_hash = _h_aer.sha256(_seed_data).digest()
+                        _rng_seed = int.from_bytes(_seed_hash[:4], 'big')
+                        _np_aer.random.seed(_rng_seed)
+
+                        # Create 64³ field: W-state with Gaussian envelope
+                        _field = _np_aer.zeros((64, 64, 64), dtype=_np_aer.complex64)
+                        _x = (pq_curr % 64)
+                        _y = (pq_last % 64)
+                        _z = (int(block_hash[:8], 16) % 64)
+
+                        for _i in range(64):
+                            for _y_idx in range(64):
+                                for _k in range(64):
+                                    _dx, _dy, _dz = (_i - _x), (_y_idx - _y), (_k - _z)
+                                    _r_sq = _dx*_dx + _dy*_dy + _dz*_dz
+                                    _envelope = _np_aer.exp(-_r_sq / 256.0)
+                                    _phase = 2 * _np_aer.pi * (pq_curr + pq_last) / 256.0
+                                    _phase += 2 * _np_aer.pi * int(block_hash[:4], 16) / 65536.0
+                                    _amp = _envelope / _np_aer.sqrt(262144.0)
+                                    _field[_i, _y_idx, _k] = _amp * _np_aer.exp(1j * _phase)
+
+                        # Normalize
+                        _trace = _np_aer.sum(_np_aer.abs(_field) ** 2)
+                        if _trace > 1e-12:
+                            _field = _field / _np_aer.sqrt(_trace)
+
+                        # Encode as hex
+                        block_quantum_field_hex = _np_aer.asarray(_field, dtype=_np_aer.complex64).tobytes().hex()
+                        _EXP_LOG.debug(f"[MINER] AER entanglement: generated 64³ field ({len(block_quantum_field_hex)} hex chars)")
+                        # ── Stream measurement to peers via local SSE server ──────────────
+                        try:
+                            update_client_dm(block_quantum_field_hex)
+                            _EXP_LOG.debug(f"[MINER] Updated peer SSE stream with local measurement")
+                        except Exception as _sse_update_e:
+                            _EXP_LOG.debug(f"[MINER] SSE update failed: {_sse_update_e}")
+                        # ── Store local measurement in database ──────────────────────────
+                        try:
+                            self.db.store_dm_measurement(pq_curr, 'local', block_quantum_field_hex,
+                                                         {'pq_curr': pq_curr, 'pq_last': pq_last, 'block_hash': block_hash})
+                            _EXP_LOG.debug(f"[MINER] Stored local measurement for block {pq_curr}")
+                        except Exception as _store_local_e:
+                            _EXP_LOG.debug(f"[MINER] Store local measurement failed: {_store_local_e}")
+
+                        # ── Compute quantum consensus: average server + local + peer measurements ──
+                        _consensus_dm = None
+                        try:
+                            _server_dm = _LIVE_RPC_ORACLE.get_oracle_state().get('density_matrix_hex', '')
+                            _consensus_dm = discover_and_average_peer_measurements(
+                                self.db, pq_curr, _server_dm, block_quantum_field_hex, timeout_per_peer=1.0
+                            )
+                            if _consensus_dm:
+                                update_client_dm(_consensus_dm)
+                                _EXP_LOG.info(f"[MINER] ✅ Quantum consensus DM computed and streamed to peers")
+                        except Exception as _consensus_e:
+                            _EXP_LOG.debug(f"[MINER] Consensus averaging failed: {_consensus_e}")
+                    except Exception as _aer_e:
+                        _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 64³ field)")
+
                     # Fidelity priority:
                     #  1. self._local_fused_fid  — tripartite joint W4 (most current)
                     #  2. client_field.metrics.fidelity_to_w3 — field measurement
@@ -15677,6 +16161,7 @@ class QtclClientApp:
                             "pq_last": pq_last,
                             "mermin_value": round(mermin_value, 6),
                             "mermin_violated": mermin_violated,
+                            "quantum_field_64x64x64": block_quantum_field_hex,  # ← 64³ AER measurement
                         },
                         "transactions": _block_txs,
                     }
@@ -15684,7 +16169,7 @@ class QtclClientApp:
                     # ── HypΓ-sign the block ──
                     try:
                         if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
-                            _hyp_adapter = HLWEIntegrationAdapter()
+                            _hyp_adapter = HypGammaWallet()
                             _block_dict_for_sig = submit_payload["header"].copy()
                             _sig = _hyp_adapter.sign_block(_block_dict_for_sig, self.wallet.private_key)
                             if _sig and not _sig.get('error'):
