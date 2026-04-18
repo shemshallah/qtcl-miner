@@ -15154,7 +15154,7 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[BOOTSTRAP] Could not fetch height from server: {_e}")
         
-        pq_curr_id = str(bh) if bh > 0 else str(snap.get('pq_curr') or snap.get('pq_curr_id') or '0')
+        pq_curr_id = str(bh) if bh > 0 else str(snap.get('pq_curr') or snap.get('pq_curr_id') or '1')
         pq_last_id = str(bh - 1) if bh > 0 else str(snap.get('pq_last') or snap.get('pq_last_id') or '0')
         # Fetch actual pq_curr/pq_last from server block record — they are sealed
         # by the block sealer and may differ from a local modulo estimate.
@@ -15347,6 +15347,15 @@ class QtclClientApp:
         )
         _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
         _lat_ms   = float(snap.get('_latency_ms') or snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
+
+        # ── Load wallet before mining (required for block signatures) ──────────────
+        if not self.wallet.is_loaded():
+            print("  🔑 Wallet password required for mining", flush=True)
+            if not self._load_wallet():
+                print("  ❌ Failed to load wallet — mining cannot proceed", flush=True)
+                raise RuntimeError("Wallet required for mining but failed to load")
+        print(f"  ✅ Wallet loaded: {self.wallet.address}", flush=True)
+
         if _dm_ready:
             print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
             print(f"  ⛏️  Mining at height {bh}  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
