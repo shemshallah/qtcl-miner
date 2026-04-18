@@ -14629,30 +14629,33 @@ class QtclClientApp:
             start_dm_pool_daemon(_dm_pool_db)       # passive drain/snap/reinforce loop
         except Exception as _dme:
             _EXP_LOG.debug(f"[DMPOOL] start: {_dme}")
-        # ── RPC poll thread — no SSE ──────────────────────
-        # ── Fetch live RPC snapshot on-demand ────────────────────────
-        # ── Bootstrap oracle fetch: retry up to 30s — handles Koyeb cold-start ──
+        # ── Bootstrap RPC snapshot — MUST succeed or FATAL ──────────────────────
+        # NO degraded mode fallback. If RPC is down, mining cannot proceed.
         import time as _t
         _snap = {}
         _boot_deadline = _t.time() + 30.0
         _boot_attempt  = 0
+        print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
         while _t.time() < _boot_deadline:
             _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=8.0)
             if _snap and _snap.get("density_matrix_hex"):
+                print(" ✅", flush=True)
                 break   # ✅ got DM
             _boot_attempt += 1
-            if _boot_attempt == 1:
-                print("  🔗 Connecting to oracle…", end="", flush=True)
-            else:
-                print(".", end="", flush=True)
+            print(".", end="", flush=True)
             _sleep_time = _boot_deadline - _t.time()
             if _sleep_time > 0:
                 _t.sleep(min(2.0, _sleep_time))
             else:
-                break  # deadline already passed
-        if _boot_attempt > 0:
-            print("", flush=True)  # newline after dots
-        snap = _snap or {}
+                break
+
+        # FATAL if no DM received
+        if not _snap or not _snap.get("density_matrix_hex"):
+            print("\n  ❌ FATAL: RPC oracle unreachable or no density matrix")
+            print("  Check: Is server running? Is /rpc/oracle/snapshot returning data?")
+            raise RuntimeError("RPC bootstrap failed: no oracle snapshot with density matrix")
+
+        snap = _snap
 
         # ── Sync koyeb_state with bootstrap snapshot ──────────────────────────
         if snap:
@@ -14693,6 +14696,19 @@ class QtclClientApp:
             pass  # keep local modulo fallback
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
+
+        # ── CRITICAL: Ensure genesis block exists in local DB ──────────────────
+        # If DB is empty (local height 0) and mining height is 0, create genesis
+        if bh == 0:
+            try:
+                _local_genesis = self.db.get_block(0) if hasattr(self, 'db') and self.db else None
+                if not _local_genesis:
+                    print("  🌱 Genesis block missing, creating canonical genesis…")
+                    _gen = _forge_and_store_genesis_block(self.db, self.wallet.address)
+                    print(f"  ✅ Genesis created: {_gen.get('hash', '')[:16]}…")
+            except Exception as _ge:
+                print(f"  ⚠️  Genesis creation failed: {_ge} (will continue)")
+
         #  1. RPC DM already flowing via _LIVE_RPC_ORACLE (started at import)
         #     RPC path: _LIVE_RPC_ORACLE.fetch_snapshot() → /rpc/oracle/snapshot
 
