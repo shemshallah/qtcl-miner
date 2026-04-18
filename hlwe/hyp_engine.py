@@ -454,6 +454,15 @@ class HypGammaEngine:
 
     _instance: ClassVar[Optional[HypGammaEngine]] = None
     _instance_lock: ClassVar[threading.Lock] = threading.Lock()
+    _initialized: ClassVar[bool] = False
+
+    def __new__(cls) -> HypGammaEngine:
+        """Singleton pattern: return existing instance if available."""
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self):
         """
@@ -471,6 +480,11 @@ class HypGammaEngine:
         Raises:
             HypEngineError: If any critical module is missing or initialization fails.
         """
+        # Skip re-initialization if already initialized (singleton pattern)
+        if HypGammaEngine._initialized:
+            return
+
+        logger.info("HypGammaEngine initializing...")
 
         # Check all modules are available
         missing = [k for k, v in _MODULES_AVAILABLE.items() if not v]
@@ -495,8 +509,6 @@ class HypGammaEngine:
         self._schnorr: Optional[SchnorrGamma] = None
         self._lwe: Optional[GeodesicLWE] = None
 
-        logger.info("HypGammaEngine initializing...")
-
         try:
             # Load tessellation (may query Supabase)
             logger.debug("Loading HypTessellation...")
@@ -519,6 +531,7 @@ class HypGammaEngine:
             logger.debug("✓ GeodesicLWE ready")
 
             logger.info("HypGammaEngine initialized successfully")
+            HypGammaEngine._initialized = True
 
         except Exception as e:
             logger.error(f"Failed to initialize HypGammaEngine: {e}")
@@ -576,7 +589,8 @@ class HypGammaEngine:
 
             # Sample private key (512 random walk indices)
             walk_indices = [secrets.randbelow(N_GENERATORS) for _ in range(WALK_LENGTH)]
-            private_key_hex = ''.join(f'{idx:x}' for idx in walk_indices)
+            # Encode as single hex digits (0,1,2,3) for compact storage
+            private_key_hex = ''.join(str(idx) for idx in walk_indices)
 
             # Evaluate walk to PSL(2,ℝ) matrix (uses module-level generators internally)
             public_matrix = evaluate_walk(walk_indices)
@@ -709,9 +723,20 @@ class HypGammaEngine:
                 # Deserialize public key
                 public_matrix = self._deserialize_psl_matrix(public_key)
 
+                # Decode the inner signature dict from the wire-format sig.
+                # sign_hash() stores the full signature_to_dict() blob as
+                # hex-encoded JSON in sig['signature'].  Decode it back.
+                _sig_field = sig.get('signature', '')
+                try:
+                    import json as _json_v
+                    _inner_sig_dict = _json_v.loads(bytes.fromhex(_sig_field).decode())
+                except Exception:
+                    # Fallback: maybe sig IS already the inner dict (old format)
+                    _inner_sig_dict = sig
+
                 # Verify
                 valid = self._schnorr.verify_signature(
-                    message_hash, sig, public_matrix
+                    message_hash, _inner_sig_dict, public_matrix
                 )
 
             logger.debug(f"✓ Signature {'valid' if valid else 'invalid'}")
@@ -967,24 +992,13 @@ class HypGammaEngine:
     def _deserialize_psl_matrix(hex_str: str) -> PSLMatrix:
         """
         Deserialize hex string back to PSL(2,ℝ) matrix.
-        Inverse of _serialize_psl_matrix().
+        Inverse of _serialize_psl_matrix() which calls serialize_matrix() →
+        PSLMatrix.to_hex() → serialize_canonical().hex() (null-separated ASCII).
         """
-        # Parse hex string as 4 segments of 300 characters each
-        # Each segment is a 150-dps decimal float
-        if len(hex_str) < 1200:
-            raise ValueError(f"Invalid serialized matrix length: {len(hex_str)}")
-
-        from mpmath import mpf
-        entries = []
-        for i in range(4):
-            segment = hex_str[i*300:(i+1)*300]
-            try:
-                val = mpf(segment)
-                entries.append(val)
-            except:
-                raise ValueError(f"Could not parse matrix entry {i}")
-
-        return PSLMatrix(entries[0], entries[1], entries[2], entries[3])
+        if not hex_str:
+            raise ValueError("Empty hex string for PSLMatrix")
+        # PSLMatrix.from_hex() is the canonical inverse of PSLMatrix.to_hex()
+        return PSLMatrix.from_hex(hex_str)
 
     @staticmethod
     def _deserialize_walk_indices(hex_str: str) -> List[int]:
