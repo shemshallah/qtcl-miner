@@ -1731,7 +1731,11 @@ class SchnorrGamma:
     def sign(self, message: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
         """Sign a message with a private walk."""
         return sign(message, private_walk, public_key)
-    
+
+    def sign_hash(self, message_hash: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
+        """Sign a message hash (alias for sign, for hyp_engine compatibility)."""
+        return sign(message_hash, private_walk, public_key)
+
     def verify(self, sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> VerifyResult:
         """Verify a Schnorr-Γ signature."""
         return verify(sig, message, public_key)
