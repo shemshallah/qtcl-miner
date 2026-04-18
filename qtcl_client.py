@@ -2421,22 +2421,27 @@ class LiveRPCOracleSnapshot:
 
                 def _read_sse():
                     try:
-                        import requests.adapters
-                        # Use timeout parameter that applies to entire request
+                        # Stream=True: read response as stream, don't load entire body
                         _r = session.get(_snap_url, timeout=(timeout_s/2, timeout_s),
-                                        headers={"Accept": "text/event-stream"})
+                                        headers={"Accept": "text/event-stream"},
+                                        stream=True)
                         if _r.status_code in (200, 202):
-                            # Read first data line only (don't wait for stream end)
-                            for _line in _r.iter_lines(decode_unicode=True, chunk_size=8192):
-                                if _line.startswith("data: "):
-                                    try:
-                                        _envelope = json.loads(_line[6:])
-                                        _snap_result[0] = _envelope.get('result', _envelope)
-                                        break
-                                    except json.JSONDecodeError:
-                                        continue
-                                elif not _line.startswith(":"):
-                                    break
+                            try:
+                                # Read line by line from stream without loading entire response
+                                for _line in _r.iter_lines(decode_unicode=True, chunk_size=1024):
+                                    if _line.startswith("data: "):
+                                        try:
+                                            _envelope = json.loads(_line[6:])
+                                            _snap_result[0] = _envelope.get('result', _envelope)
+                                            _r.close()  # Close immediately after getting first message
+                                            return
+                                        except json.JSONDecodeError:
+                                            continue
+                                    elif _line and not _line.startswith(":"):
+                                        _r.close()
+                                        return
+                            finally:
+                                _r.close()
                     except Exception as e:
                         _snap_error[0] = e
 
@@ -15122,13 +15127,16 @@ class QtclClientApp:
         _snap = {}
         print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
 
-        # FAST-FAIL: Check if RPC endpoint is reachable (first attempt only)
+        # FAST-FAIL: Check if oracle snapshot endpoint is reachable (first attempt only)
         try:
-            _rpc_check = _requests.post(
-                f"{self.oracle_url}/rpc",
-                json={"jsonrpc": "2.0", "method": "qtcl_getQuantumMetrics", "params": [], "id": 1},
-                timeout=3.0
+            _rpc_check = _requests.get(
+                f"{self.oracle_url}/rpc/oracle/snapshot",
+                headers={"Accept": "text/event-stream"},
+                timeout=3.0,
+                stream=True
             )
+            # Close immediately - we just need to know if it responds
+            _rpc_check.close()
             if _rpc_check.status_code not in (200, 202):
                 print("\n  ❌ FATAL: RPC endpoint responded but with error code", flush=True)
                 print(f"  Status: {_rpc_check.status_code}")
