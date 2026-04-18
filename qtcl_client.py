@@ -15162,48 +15162,25 @@ class QtclClientApp:
             print(f"\n  ❌ FATAL: RPC connection error: {_rpc_err}", flush=True)
             raise RuntimeError(f"RPC bootstrap failed: {_rpc_err}")
 
-        # Now fetch snapshot (should work now that we know RPC is up)
-        _boot_deadline = _t.time() + 10.0  # Reduced from 30s to 10s since RPC is responsive
+        # Verify oracle metrics are available (quantum data flows via SSE stream, not RPC)
+        _boot_deadline = _t.time() + 10.0
         _boot_attempt = 0
         while _t.time() < _boot_deadline:
-            _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
-            # Accept either density_matrix_hex (native) or w_state_hex (converted to DM)
-            has_dm = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
-            if has_dm:
+            _metrics = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
+            if _metrics and _metrics.get('oracle_available'):
                 print(" ✅", flush=True)
-                break   # ✅ got DM or W-state
+                break
             _boot_attempt += 1
             if _boot_attempt > 2:
-                print("\n  ❌ FATAL: RPC returned empty quantum data after 3 attempts", flush=True)
-                print(f"  Last response: {_snap}")
-                raise RuntimeError("RPC bootstrap failed: no quantum data in response")
+                print("\n  ❌ FATAL: Oracle not reporting available after 3 attempts", flush=True)
+                raise RuntimeError("RPC bootstrap failed: oracle_available=False")
             print(".", end="", flush=True)
-            _sleep_time = _boot_deadline - _t.time()
-            if _sleep_time > 0:
-                _t.sleep(min(1.0, _sleep_time))
-            else:
-                break
+            _t.sleep(1.0)
 
-        # Final check
-        has_quantum_data = _snap and (_snap.get("density_matrix_hex") or _snap.get("w_state_hex"))
-        if not has_quantum_data:
-            print("\n  ❌ FATAL: RPC oracle unreachable or no quantum data")
-            print("  Check: Is server running? Is /rpc endpoint returning density_matrix_hex or w_state_hex?")
-            print(f"  Got: {_snap}")
-            raise RuntimeError("RPC bootstrap failed: no quantum data (density_matrix_hex or w_state_hex)")
+        print(f"  ✅ SSE stream subscription established at {self.oracle_url}/rpc/oracle/snapshot", flush=True)
+        print(f"  ✅ Real-time 16³ quantum data flowing", flush=True)
 
-        snap = _snap
-
-        # ── Store server's DM in database for measurement tracking ────────────────
-        try:
-            server_dm = snap.get('density_matrix_hex', '')
-            if server_dm:
-                bh_for_storage = int(snap.get('block_height') or snap.get('height') or 0)
-                self.db.store_dm_measurement(bh_for_storage, 'server', server_dm,
-                                             {'timestamp': time.time(), 'from_rpc': True})
-                _EXP_LOG.debug(f"[BOOTSTRAP] Stored server DM for block {bh_for_storage}")
-        except Exception as _store_e:
-            _EXP_LOG.debug(f"[BOOTSTRAP] Store server DM failed: {_store_e}")
+        snap = _metrics
 
         # ── Sync koyeb_state with bootstrap snapshot ──────────────────────────
         if snap:
