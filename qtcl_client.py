@@ -11542,16 +11542,18 @@ class KoyebRPCNodule:
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
         """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
+        import urllib.parse as _up
         t = timeout or self.timeout
-        url = f"{self.base_url}/rpc"
         last_error = None
 
-        payload = {"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1}
+        params_json = _json.dumps(params or [])
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.base_url}/rpc?{query}"
 
         for attempt in range(retries):
             try:
                 if _HAS_REQUESTS:
-                    r = self._get_session().post(url, json=payload, timeout=t)
+                    r = self._get_session().get(full_url, timeout=t)
                     if r.status_code == 200:
                         result = r.json()
                         if "result" in result:
@@ -29017,6 +29019,8 @@ class NodeRPCMeshServer:
                 self.end_headers()
 
             def do_GET(self):
+                from urllib.parse import parse_qs
+
                 path = self.path.split("?")[0]
                 peer = self.client_address[0]
                 if path in ("/health", "/"):
@@ -29027,6 +29031,20 @@ class NodeRPCMeshServer:
                             "version": mesh.MESH_VERSION,
                         }
                     )
+                elif path == "/rpc":
+                    # GET /rpc?method=<method>&params=<json-encoded-params>
+                    try:
+                        query_params = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                        method = query_params.get("method", [""])[0]
+                        params_str = query_params.get("params", ["[]"])[0]
+                        params = json.loads(params_str) if params_str else []
+                        # Build JSON-RPC 2.0 request body from query params
+                        body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+                        result, status = mesh._dispatch(body, peer)
+                        self._send_json(result, status)
+                    except Exception as e:
+                        logger.debug(f"[MESH] GET /rpc parse error: {e}")
+                        self._send_json({"error": f"Invalid GET /rpc request: {e}"}, 400)
                 elif path == "/rpc/chain/status":
                     self._send_json(mesh._rpc_getChainStatus([]))
                 elif path == "/rpc/oracle/pq0":
