@@ -1,0 +1,159 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                     QTCL RPC PROTOCOL QUICK REFERENCE                       ║
+║                              2026-04-19                                      ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLIENT SENDS → SERVER RECEIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POST {BASE_URL}/rpc
+Content-Type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "method": "qtcl_getHealth",
+    "params": [],
+    "id": 1
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVER SENDS → CLIENT RECEIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+HTTP 200 OK
+Content-Type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "result": {
+        "status": "healthy",
+        "uptime_seconds": 86400
+    },
+    "id": 1
+}
+
+OR (on error):
+
+HTTP 200 OK
+Content-Type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "error": {
+        "code": -32601,
+        "message": "Method not found"
+    },
+    "id": 1
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL RULES (DO NOT BREAK THESE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ ALWAYS return HTTP 200 (never 503, 404, 500, etc)
+✓ MUST include "jsonrpc": "2.0" in response
+✓ MUST include "id" that matches the request
+✓ MUST have EITHER "result" OR "error", never both
+✓ Set Content-Type: application/json header
+✓ Invalid method = JSON error response, not HTTP error
+✓ Server crash = JSON error response, not HTTP error
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ERROR CODES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+-32700  Parse error           Invalid JSON
+-32600  Invalid Request       Wrong format
+-32601  Method not found      Unknown method
+-32602  Invalid params        Wrong param count/type
+-32603  Internal error        Server crash
+-32000  Application error     Custom error
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REQUIRED METHODS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+qtcl_getHealth
+  params: []
+  returns: {status, uptime_seconds, peer_count, synced}
+
+qtcl_getBlockHeight
+  params: []
+  returns: {height, hash, difficulty}
+
+qtcl_getBlock
+  params: [height]
+  returns: {height, hash, timestamp, transactions, miner, nonce}
+
+qtcl_getPeers
+  params: [{limit: 50}]
+  returns: {peers: [{id, address, version, last_seen}]}
+
+qtcl_getLatestDMSnapshot
+  params: []
+  returns: {snapshot_id, timestamp, oracle_data: {w_state, pq0, ...}}
+
+qtcl_getMyAddr
+  params: []
+  returns: {address, wallet}
+
+qtcl_getMempool
+  params: [limit]
+  returns: {pending_transactions: [...]}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TESTING WITH CURL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Test basic health
+curl -X POST http://localhost:8000/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"qtcl_getHealth","params":[],"id":1}'
+
+# Test invalid method (should return JSON error with -32601)
+curl -X POST http://localhost:8000/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"invalid_method","params":[],"id":1}'
+
+# Should see:
+# HTTP 200 (not 503)
+# JSON response with error code -32601
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALIDATION TOOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+python3 /home/shemshallah/qtcl-miner/verify_rpc_spec.py \
+  --server http://your-server:8000
+
+This will test all compliance requirements.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMON MISTAKES TO AVOID
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ Returning HTTP 503 instead of JSON-RPC error
+❌ Missing "jsonrpc": "2.0" field
+❌ Missing "id" field in response
+❌ Having both "result" and "error" in response
+❌ Not setting Content-Type: application/json header
+❌ Returning HTML error pages instead of JSON
+❌ Using GET instead of POST
+❌ Wrong endpoint path (/api/rpc instead of /rpc)
+❌ Putting method in URL instead of JSON body
+❌ Not validating JSON-RPC format before processing
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOCUMENTATION LOCATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full Specification:  /home/shemshallah/qtcl-miner/RPC_SPECIFICATION.md
+Implementation Guide: /home/shemshallah/qtcl-miner/RPC_CHECKLIST.md
+Validator Script:     /home/shemshallah/qtcl-miner/verify_rpc_spec.py
+This Quick Reference: /home/shemshallah/qtcl-miner/RPC_QUICK_REFERENCE.txt
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ The key rule: ALWAYS return HTTP 200 with proper JSON-RPC format.         ║
+║ There is no HTTP 503 in JSON-RPC. Errors come as JSON error responses.    ║
+╚════════════════════════════════════════════════════════════════════════════╝
