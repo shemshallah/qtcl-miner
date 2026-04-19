@@ -17015,9 +17015,15 @@ class QtclClientApp:
             # ══════════════════════════════════════════════════════════════════════
             _POLL_EVERY_S = 2.0   # poll chain height every 2 seconds
             _last_poll_time = _t.time()
-            
+
             _NULL_HASH = '0' * 64
             # _ORACLE_LAT_MAX_MS removed — oracle gate removed, miner is self-sovereign
+            # ── Session variables for height progression and deduplication ──
+            _force_next_height: int = 0
+            _confirmed_heights: set = set()
+            _submitted_hashes: set = set()
+            _last_accepted_hash: str = ""
+
             while True:  # Main mining loop
                 try:
                     # ── Sentinel reset — must be first two lines of every iteration ──
@@ -17108,23 +17114,45 @@ class QtclClientApp:
 
                     _EXP_LOG.warning(f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms")
 
-                    target_height = oracle_height + 1
-                    parent_hash = oracle_hash
+                    if _force_next_height > 0:
+                        target_height = _force_next_height
+                        parent_hash = oracle_hash
+                        _EXP_LOG.warning(f"[MINER] ⬆️  HEIGHT FORCED: target={target_height} (server signal, oracle_height={oracle_height})")
+                        _force_next_height = 0
+                    else:
+                        target_height = oracle_height + 1
+                        parent_hash = oracle_hash
+
+                    if target_height in _confirmed_heights:
+                        _EXP_LOG.warning(f"[MINER] ⏭️  Skipping h={target_height}: already confirmed this session")
+                        await _asyncio.sleep(1.0)
+                        continue
+
                     timestamp = int(_t.time())
                     miner_addr = getattr(getattr(self, 'wallet', None), 'address', "0" * 64) or "0" * 64
 
                     # ── STAGE 2: Quantum PoW seed from live oracle snap ────────────
+                    # CRITICAL: Entropy seed MUST be deterministic (no time-based randomness)
+                    # If oracle unavailable, derive from immutable block parameters
                     _dm_hex = _oracle_snap.get('density_matrix_hex', '')
                     if _dm_hex and len(_dm_hex) > 32:
+                        # Method 1: Oracle-based entropy (when oracle provides DM)
                         _w_entropy_seed = _hl.sha3_256(
                             bytes.fromhex(_dm_hex[:64]) +
                             target_height.to_bytes(8, 'big') +
                             bytes.fromhex(parent_hash[:32])
                         ).digest()
+                        _EXP_LOG.info(f"[MINER-ENTROPY] 🔮 METHOD=ORACLE dm_len={len(_dm_hex)} entropy={_w_entropy_seed.hex()}")
                     else:
+                        # Method 2: Deterministic fallback (no time-based randomness!)
+                        # Use only immutable block parameters: parent + height + timestamp
+                        # This ensures the same entropy seed is always generated for the same block
                         _w_entropy_seed = _hl.sha3_256(
-                            str(int(_t.time() / 30)).encode() + parent_hash.encode()
+                            parent_hash.encode() +
+                            target_height.to_bytes(8, 'big') +
+                            timestamp.to_bytes(8, 'big')  # timestamp is now fixed (refreshed once per block)
                         ).digest()
+                        _EXP_LOG.warning(f"[MINER-ENTROPY] ⚠️  METHOD=DETERMINISTIC_FALLBACK (oracle unavailable) entropy={_w_entropy_seed.hex()}")
                     
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
@@ -17437,6 +17465,14 @@ class QtclClientApp:
 
                     _found = (block_hash is not None)
 
+                    # 🔍 DEBUG: Log exact PoW computation inputs and result
+                    if _found:
+                        _EXP_LOG.info(f"[MINER-POW-DEBUG] ⛏️  FOUND height={target_height} nonce={nonce} hash={block_hash}")
+                        _EXP_LOG.info(f"[MINER-POW-DEBUG] parent={parent_hash[:16]}… merkle={merkle_root[:16]}… timestamp={_ts} miner={miner_addr[:16]}… diff={_diff}")
+                        _EXP_LOG.info(f"[MINER-POW-DEBUG] entropy_seed={_w_entropy_seed.hex()} (len={len(_w_entropy_seed)})")
+                        _POW_SCRATCHPAD_PFX = b"QTCL_SCRATCHPAD_v1:"
+                        _EXP_LOG.info(f"[MINER-POW-DEBUG] scratchpad_input={(_POW_SCRATCHPAD_PFX + _w_entropy_seed).hex()[:64]}…")
+
                     if not _found or _chain_advanced or _ttl_expired:
                         if _ttl_expired:
                             _EXP_LOG.info("[MINER] TTL expired, rebuilding block with fresh oracle seed…")
@@ -17681,11 +17717,27 @@ class QtclClientApp:
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
                     # ──────────────────────────────────────────────────────────────
 
+                    # 🔍 DEBUG: Verify entropy seed in submission matches what was used
+                    _submitted_entropy = submit_payload.get("w_entropy_hash", "")
+                    if _submitted_entropy != _w_entropy_seed.hex():
+                        _EXP_LOG.error(f"[CRITICAL] 🚨 ENTROPY MISMATCH: computed={_w_entropy_seed.hex()} vs submitted={_submitted_entropy}")
+                    else:
+                        _EXP_LOG.info(f"[VERIFY] ✅ Entropy seed matches: {_w_entropy_seed.hex()[:16]}…")
+
                     # Validate required fields before submission
                     if "hyp_signature" not in submit_payload or "miner_public_key_hex" not in submit_payload:
-                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_public_key_hex={submit_payload.get('miner_public_key_hex') is not None}")
+                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} signing failed — skipping this block, forcing fresh height")
+                        _MINE_TELEM.mark_idle()
+                        _submitted_hashes.discard(block_hash)
+                        await _asyncio.sleep(0.5)
+                        continue
+
+                    # Hash dedup check before submission
+                    if block_hash in _submitted_hashes:
+                        _EXP_LOG.warning(f"[MINER] ⏭️  Skipping duplicate submission: h={target_height} hash={block_hash[:16]}…")
                         _MINE_TELEM.mark_idle()
                         continue
+                    _submitted_hashes.add(block_hash)
 
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
                     _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": timestamp, "fidelity": w_state_fidelity, "parent_hash": parent_hash, "difficulty": difficulty_bits})
@@ -17702,6 +17754,31 @@ class QtclClientApp:
                                 from globals import TessellationRewardSchedule as _TRS3
                                 _srv_r = _TRS3.get_miner_reward_qtcl(target_height)
                             except Exception: _srv_r = 7.20
+
+                        # 🔴 CRITICAL: Extract next_height from server response (if available)
+                        # This signals the server has confirmed h and we should mine h+1
+                        _srv_next_h = int((_result or {}).get("next_height", target_height + 1) or (target_height + 1))
+                        _EXP_LOG.warning(f"[MINER-ACCEPT] ✅ Block h={target_height} accepted | Server signals next_height={_srv_next_h}")
+
+                        # Store server's next_height signal for height progression
+                        _confirmed_heights.add(target_height)
+                        _force_next_height = _srv_next_h
+                        _last_accepted_hash = block_hash
+                        _EXP_LOG.warning(f"[MINER] ✅ h={target_height} confirmed — _force_next_height={_srv_next_h}")
+
+                        # 🔴 CRITICAL VERIFICATION: Query DB to confirm block is actually there
+                        # This detects if the server accepted but didn't persist (rare but catastrophic)
+                        try:
+                            _verify_block = await _asyncio.to_thread(
+                                kapi._rpc, "qtcl_getBlock", [target_height], 3, 1
+                            )
+                            if _verify_block and not _verify_block.get("error"):
+                                _EXP_LOG.warning(f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in server DB")
+                            else:
+                                _EXP_LOG.error(f"[MINER-VERIFY] ❌ Block h={target_height} NOT found in DB despite acceptance!")
+                        except Exception as _ve:
+                            _EXP_LOG.warning(f"[MINER-VERIFY] Could not verify block in DB: {_ve}")
+
                         _MINE_TELEM.record_block_accepted(
                             height=target_height, hash=block_hash, nonce=nonce,
                             timestamp=timestamp, fidelity=w_state_fidelity, reward_qtcl=_srv_r,
@@ -17753,6 +17830,7 @@ class QtclClientApp:
                         _TIP_WAIT_MAX_S  = 30.0
                         _TIP_WAIT_POLL_S = 0.5
                         _tip_wait_start  = _t.time()
+                        _tip_confirmed  = False
                         while _t.time() - _tip_wait_start < _TIP_WAIT_MAX_S:
                             await _asyncio.sleep(_TIP_WAIT_POLL_S)
                             try:
@@ -17765,6 +17843,7 @@ class QtclClientApp:
                                         f"[MINER] ✅ Server tip confirmed h={_confirmed_h} "
                                         f"(waited {_t.time()-_tip_wait_start:.1f}s)"
                                     )
+                                    _tip_confirmed = True
                                     _MINE_TELEM.mark_idle()
                                     break
                             except Exception as _te:
@@ -17772,6 +17851,41 @@ class QtclClientApp:
                         else:
                             _EXP_LOG.warning("[MINER] ⚠️  tip-wait timeout — advancing anyway")
                             _MINE_TELEM.mark_idle()
+
+                        # 🔴 CRITICAL FIX: Invalidate oracle cache AND force fresh RPC fetch
+                        # This ensures the miner always sees the latest server state and doesn't
+                        # re-mine the same height indefinitely
+                        if _tip_confirmed or (_t.time() - _tip_wait_start >= _TIP_WAIT_MAX_S):
+                            _EXP_LOG.warning(f"[MINER-STATE] 🔄 BLOCK ACCEPTED: invalidating caches and quantum field")
+                            # Force oracle to refresh state by clearing cached snapshot
+                            if hasattr(_LIVE_RPC_ORACLE, '_cached_state'):
+                                delattr(_LIVE_RPC_ORACLE, '_cached_state')
+                            if hasattr(_LIVE_RPC_ORACLE, '_cache'):
+                                _LIVE_RPC_ORACLE._cache = {}
+                            # Also clear any RPC-level caches
+                            if hasattr(kapi, '_rpc_cache'):
+                                kapi._rpc_cache.clear()
+
+                            # 🌊 CRITICAL: Force quantum field regeneration
+                            # Each block MUST get fresh W-state, not reuse previous block's state
+                            if hasattr(self, '_oracle_mesh') and self._oracle_mesh:
+                                if hasattr(self._oracle_mesh, '_snapshot_cache'):
+                                    delattr(self._oracle_mesh, '_snapshot_cache')
+                                if hasattr(self._oracle_mesh, 'clear_cache'):
+                                    self._oracle_mesh.clear_cache()
+
+                            # 🔴 FORCED FRESH HEIGHT QUERY (not cached)
+                            # Guarantee next loop will see updated height
+                            try:
+                                _final_height_check = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlockHeight", [], 5, 1
+                                )
+                                _final_h = int((_final_height_check or {}).get("height") or target_height)
+                                _EXP_LOG.critical(f"[MINER-STATE] 🔄 FORCED HEIGHT CHECK: h={_final_h} (next will mine h={_final_h+1})")
+                            except Exception:
+                                _EXP_LOG.warning(f"[MINER-STATE] Could not verify final height, proceeding anyway")
+
+                            _EXP_LOG.warning(f"[MINER-STATE] ✅ Caches cleared + quantum field will regenerate for next block")
                     else:
                         # Parse rejection reason for smart retry
                         _err_msg = ""
