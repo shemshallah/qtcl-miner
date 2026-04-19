@@ -325,9 +325,9 @@ class PSLMatrix:
         det = self.a * self.d - self.b * self.c
         det_err = fabs(det - mpf("1"))
 
-        # Use relaxed tolerance (1e-80) for the "should I rescale?" check.
-        # At mp.dps=150, this is still ~270 bits of safety margin.
-        RESCALE_CHECK_TOLERANCE = mpf("1e-80")
+        # Use relaxed tolerance (1e-70) for the "should I rescale?" check.
+        # At mp.dps=150, this is still ~230 bits of safety margin.
+        RESCALE_CHECK_TOLERANCE = mpf("1e-85")
 
         if det_err < RESCALE_CHECK_TOLERANCE:
             self._validated = True

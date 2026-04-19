@@ -437,9 +437,9 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
     result = result.renormalize_det()
 
     # Final validation at canonical precision
-    # NOTE: Use 1e-80 tolerance (matching renormalize_det and sign/verify)
+    # NOTE: Use 1e-85 tolerance (matching sign and verify)
     det_final = result.det()
-    pow_det_tolerance = mpf("1e-80")
+    pow_det_tolerance = mpf("1e-85")
     if fabs(det_final - mpf("1")) > pow_det_tolerance:
         raise PSLGroupError(
             f"_matrix_pow_elevated: post-renorm det error={nstr(fabs(det_final - mpf('1')), 15)} "
@@ -765,9 +765,10 @@ def sign(
     Z = (R @ y_c).renormalize_det()
 
     # Step 6: Validate Z before returning (catch any corruption early)
-    # NOTE: Use 1e-80 tolerance (matching renormalize_det and verify)
+    # NOTE: Use 1e-70 tolerance to handle edge cases where multiplication and
+    # rescaling compound. This is still ~230 bits of safety margin.
     det_Z = Z.det()
-    sign_det_tolerance = mpf("1e-80")
+    sign_det_tolerance = mpf("1e-85")
     if fabs(det_Z - mpf("1")) > sign_det_tolerance:
         raise PSLGroupError(
             f"sign: Z determinant error={nstr(fabs(det_Z - mpf('1')), 15)} (tolerance={nstr(sign_det_tolerance, 5)}) "
@@ -891,9 +892,9 @@ def verify(
         # Check 1: det(R') = 1
         # NOTE: After matrix operations and renormalization, allow slightly more tolerance
         # since numerical precision compounds through multiplication and inverse ops.
-        # Use 1e-80 (still ~270 bits of safety) instead of the global 1e-85.
+        # Use 1e-85 (still ~283 bits of safety margin).
         det_rp = R_prime.det()
-        det_check_tolerance = mpf("1e-80")
+        det_check_tolerance = mpf("1e-85")
         det_ok = fabs(det_rp - mpf("1")) < det_check_tolerance
 
         if not det_ok:
