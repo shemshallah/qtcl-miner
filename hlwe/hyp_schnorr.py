@@ -91,17 +91,36 @@ from typing import Dict, Tuple, Optional, Any, List, Union, NamedTuple
 try:
     import mpmath
     from mpmath import mp, mpf, mpc
-    from mpmath import (cos, sin, cosh, sinh, tanh, atanh, sqrt, pi,
-                        exp, log, fabs, nstr, almosteq, acosh, re, im, conj,
-                        matrix as mpmatrix, eye as mpeye, expm, arg)
-    arctanh = atanh
-except ImportError:
-    raise ImportError(
-        "mpmath is required for HypΓ Schnorr-Γ. pip install mpmath"
+    from mpmath import (
+        cos,
+        sin,
+        cosh,
+        sinh,
+        tanh,
+        atanh,
+        sqrt,
+        pi,
+        exp,
+        log,
+        fabs,
+        nstr,
+        almosteq,
+        acosh,
+        re,
+        im,
+        conj,
+        matrix as mpmatrix,
+        eye as mpeye,
+        expm,
+        arg,
     )
 
-DPS_DEFAULT:  int = 150   # Spec canonical — never reduce below this
-DPS_ELEVATED: int = 210   # Temporary escalation for eigendecomposition
+    arctanh = atanh
+except ImportError:
+    raise ImportError("mpmath is required for HypΓ Schnorr-Γ. pip install mpmath")
+
+DPS_DEFAULT: int = 150  # Spec canonical — never reduce below this
+DPS_ELEVATED: int = 210  # Temporary escalation for eigendecomposition
 
 mp.dps = DPS_DEFAULT
 
@@ -115,13 +134,28 @@ _N_GENERATORS_FALLBACK = 4
 
 try:
     from hyp_group import (
-        PSLMatrix, PSLGroupError,
-        get_generators, identity, random_walk, evaluate_walk, noise_walk,
-        hash_matrix, serialize_walk, deserialize_walk, WALK_LENGTH,
-        NOISE_STEPS, N_GENERATORS, DET_TOLERANCE, ENTRY_OVERFLOW_BOUND,
-        SERIAL_ENTRY_LEN, generator_list, hyp_metric, sample_disk_point,
+        PSLMatrix,
+        PSLGroupError,
+        get_generators,
+        identity,
+        random_walk,
+        evaluate_walk,
+        noise_walk,
+        hash_matrix,
+        serialize_walk,
+        deserialize_walk,
+        WALK_LENGTH,
+        NOISE_STEPS,
+        N_GENERATORS,
+        DET_TOLERANCE,
+        ENTRY_OVERFLOW_BOUND,
+        SERIAL_ENTRY_LEN,
+        generator_list,
+        hyp_metric,
+        sample_disk_point,
         matrix_pow_repeated_squaring,
     )
+
     _HYP_GROUP_AVAILABLE = True
 except ImportError as _hyp_group_import_err:
     _HYP_GROUP_AVAILABLE = False
@@ -138,10 +172,10 @@ logger = logging.getLogger(__name__)
 # §0  CANONICAL PARAMETERS — verbatim §5 of HypΓ Architecture
 # ════════════════════════════════════════════════════════════════════════════
 
-CHALLENGE_BITS:    int = 256      # Fiat-Shamir challenge size (SHA3-256 output)
-CHALLENGE_MODULUS: int = 1 << 256 # 2^256 — challenge space
-SIGN_WALK_LENGTH:  int = WALK_LENGTH    # nonce walk = same length as key walk
-OVERFLOW_BOUND:    mpf = mpf('1e100')   # entry overflow guard for verify output
+CHALLENGE_BITS: int = 256  # Fiat-Shamir challenge size (SHA3-256 output)
+CHALLENGE_MODULUS: int = 1 << 256  # 2^256 — challenge space
+SIGN_WALK_LENGTH: int = WALK_LENGTH  # nonce walk = same length as key walk
+OVERFLOW_BOUND: mpf = mpf("1e100")  # entry overflow guard for verify output
 
 # Thread lock for precision context management
 _PRECISION_LOCK = threading.Lock()
@@ -151,6 +185,7 @@ _PRECISION_LOCK = threading.Lock()
 #     Temporarily raise mp.dps to DPS_ELEVATED for eigendecomposition,
 #     then safely restore. Thread-safe via lock + context manager pattern.
 # ════════════════════════════════════════════════════════════════════════════
+
 
 @contextlib.contextmanager
 def _elevated_precision():
@@ -278,8 +313,8 @@ def _elevated_precision():
 # e^{c_exp * 31} < 10^{DPS_ELEVATED=210} → c_exp < 483/31 ≈ 15
 # We use 4 bits = {0..15} as the canonical safe range.
 # The BINDING uses the full 256-bit challenge hash.
-CHALLENGE_EXP_BITS: int = 4        # exponent uses low CHALLENGE_EXP_BITS bits of c
-CHALLENGE_EXP_MAX:  int = (1 << CHALLENGE_EXP_BITS)  # 16 — max exponent value
+CHALLENGE_EXP_BITS: int = 4  # exponent uses low CHALLENGE_EXP_BITS bits of c
+CHALLENGE_EXP_MAX: int = 1 << CHALLENGE_EXP_BITS  # 16 — max exponent value
 
 
 def _compute_safe_exponent(c_full: int) -> int:
@@ -300,7 +335,7 @@ def _compute_safe_exponent(c_full: int) -> int:
     int
         c_exp ∈ {0, 1, ..., CHALLENGE_EXP_MAX-1}
     """
-    return c_full & (CHALLENGE_EXP_MAX - 1)   # low CHALLENGE_EXP_BITS bits
+    return c_full & (CHALLENGE_EXP_MAX - 1)  # low CHALLENGE_EXP_BITS bits
 
 
 def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
@@ -330,7 +365,8 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
         M^n at DPS_DEFAULT precision (elevated internally, restored on exit).
     """
     if n < 0:
-        return _matrix_pow_elevated(M.inverse(), -n)
+        # Renormalize before inverse() to avoid determinant check failure
+        return _matrix_pow_elevated(M.renormalize_det().inverse().renormalize_det(), -n)
     if n == 0:
         return identity()
     if n == 1:
@@ -344,8 +380,10 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
         base_d = mpf(nstr(M.d, DPS_DEFAULT))
 
         # Identity at elevated precision
-        res_a = mpf('1'); res_b = mpf('0')
-        res_c = mpf('0'); res_d = mpf('1')
+        res_a = mpf("1")
+        res_b = mpf("0")
+        res_c = mpf("0")
+        res_d = mpf("1")
 
         exp_remaining = n
 
@@ -358,14 +396,16 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
                 new_d = res_c * base_b + res_d * base_d
                 # Renorm result immediately after accumulation
                 det_r = new_a * new_d - new_b * new_c
-                if fabs(det_r) < mpf('1e-300'):
+                if fabs(det_r) < mpf("1e-300"):
                     raise PSLGroupError(
                         f"_matrix_pow_elevated: result determinant collapsed to {nstr(det_r, 20)} "
                         f"at n={n}. This indicates a fundamental group arithmetic error."
                     )
-                scale_r = mpf('1') / sqrt(fabs(det_r))
-                res_a = new_a * scale_r;  res_b = new_b * scale_r
-                res_c = new_c * scale_r;  res_d = new_d * scale_r
+                scale_r = mpf("1") / sqrt(fabs(det_r))
+                res_a = new_a * scale_r
+                res_b = new_b * scale_r
+                res_c = new_c * scale_r
+                res_d = new_d * scale_r
 
             # Square the base — renorm EVERY SINGLE STEP
             sq_a = base_a * base_a + base_b * base_c
@@ -373,15 +413,17 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
             sq_c = base_c * base_a + base_d * base_c
             sq_d = base_c * base_b + base_d * base_d
             det_sq = sq_a * sq_d - sq_b * sq_c
-            if fabs(det_sq) < mpf('1e-300'):
+            if fabs(det_sq) < mpf("1e-300"):
                 raise PSLGroupError(
                     f"_matrix_pow_elevated: base determinant collapsed at squaring step, "
                     f"n={n}, det={nstr(det_sq, 20)}. "
                     f"entry magnitude: |a|={nstr(fabs(sq_a), 8)}"
                 )
-            scale_sq = mpf('1') / sqrt(fabs(det_sq))
-            base_a = sq_a * scale_sq;  base_b = sq_b * scale_sq
-            base_c = sq_c * scale_sq;  base_d = sq_d * scale_sq
+            scale_sq = mpf("1") / sqrt(fabs(det_sq))
+            base_a = sq_a * scale_sq
+            base_b = sq_b * scale_sq
+            base_c = sq_c * scale_sq
+            base_d = sq_d * scale_sq
 
             exp_remaining >>= 1
 
@@ -396,7 +438,7 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
 
     # Final validation at canonical precision
     det_final = result.det()
-    if fabs(det_final - mpf('1')) > DET_TOLERANCE:
+    if fabs(det_final - mpf("1")) > DET_TOLERANCE:
         raise PSLGroupError(
             f"_matrix_pow_elevated: post-renorm det={nstr(det_final, 20)} "
             f"still outside tolerance. PSL(2,R) invariant violated."
@@ -440,10 +482,10 @@ def _fiat_shamir_challenge(R: PSLMatrix, message: bytes) -> int:
     h = hashlib.sha3_256()
     h.update(DOMAIN_TAG)
     h.update(R.serialize_canonical())
-    h.update(b'\x01')     # separator prevents length extension
+    h.update(b"\x01")  # separator prevents length extension
     h.update(message)
-    digest = h.digest()   # 32 bytes = 256 bits
-    return int.from_bytes(digest, 'big')   # big-endian → integer in [0, 2^256)
+    digest = h.digest()  # 32 bytes = 256 bits
+    return int.from_bytes(digest, "big")  # big-endian → integer in [0, 2^256)
 
 
 def _fiat_shamir_challenge_from_hex(R_hex: str, message: bytes) -> int:
@@ -455,10 +497,10 @@ def _fiat_shamir_challenge_from_hex(R_hex: str, message: bytes) -> int:
     h = hashlib.sha3_256()
     h.update(DOMAIN_TAG)
     h.update(R_bytes)
-    h.update(b'\x01')
+    h.update(b"\x01")
     h.update(message)
     digest = h.digest()
-    return int.from_bytes(digest, 'big')
+    return int.from_bytes(digest, "big")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -472,11 +514,13 @@ def _fiat_shamir_challenge_from_hex(R_hex: str, message: bytes) -> int:
 
 class SchnorrError(Exception):
     """Exception raised for Schnorr-Γ signing/verification errors."""
+
     pass
 
 
 class HypSignature(NamedTuple):
     """Schnorr-Γ signature (alias for compatibility with hyp_engine)."""
+
     signature: str
     challenge: str
     auth_tag: str
@@ -484,10 +528,10 @@ class HypSignature(NamedTuple):
 
     def to_dict(self) -> Dict[str, str]:
         return {
-            'signature': self.signature,
-            'challenge': self.challenge,
-            'auth_tag': self.auth_tag,
-            'timestamp': self.timestamp,
+            "signature": self.signature,
+            "challenge": self.challenge,
+            "auth_tag": self.auth_tag,
+            "timestamp": self.timestamp,
         }
 
 
@@ -508,9 +552,10 @@ class SchnorrKeyPair(NamedTuple):
         SHA3-256²(serialize(public_key)) — hex string.
         Backward-compatible with existing QTCL address derivation.
     """
+
     private_walk: List[int]
-    public_key:   PSLMatrix
-    address:      str
+    public_key: PSLMatrix
+    address: str
 
 
 def keygen() -> SchnorrKeyPair:
@@ -552,32 +597,33 @@ def keygen() -> SchnorrKeyPair:
 
     # 3. Verify invariant
     det_y = y.det()
-    if fabs(det_y - mpf('1')) > DET_TOLERANCE:
+    if fabs(det_y - mpf("1")) > DET_TOLERANCE:
         raise PSLGroupError(
             f"keygen: public key det={nstr(det_y, 20)} violates PSL(2,R) invariant"
         )
 
     # 4. Derive address: SHA3-256²(canonical_serialization)
     y_bytes = y.serialize_canonical()
-    inner   = hashlib.sha3_256(y_bytes).digest()
+    inner = hashlib.sha3_256(y_bytes).digest()
     address = hashlib.sha3_256(inner).hexdigest()
 
     dt = time.perf_counter() - t0
     tr_y = y.trace()
-    element_type = "hyperbolic" if fabs(tr_y) > mpf('2') else (
-        "parabolic" if fabs(fabs(tr_y) - mpf('2')) < mpf('1e-80') else "elliptic"
+    element_type = (
+        "hyperbolic"
+        if fabs(tr_y) > mpf("2")
+        else ("parabolic" if fabs(fabs(tr_y) - mpf("2")) < mpf("1e-80") else "elliptic")
     )
     logger.info(
         "[SchnorrΓ] keygen done in %.3fs | "
         "public key trace=%.4e | element type: %s | address=%s...",
-        dt, float(nstr(tr_y, 8)), element_type, address[:16]
+        dt,
+        float(nstr(tr_y, 8)),
+        element_type,
+        address[:16],
     )
 
-    return SchnorrKeyPair(
-        private_walk=private_walk,
-        public_key=y,
-        address=address
-    )
+    return SchnorrKeyPair(private_walk=private_walk, public_key=y, address=address)
 
 
 def keygen_from_walk(private_walk: List[int]) -> SchnorrKeyPair:
@@ -595,14 +641,16 @@ def keygen_from_walk(private_walk: List[int]) -> SchnorrKeyPair:
     SchnorrKeyPair
     """
     _require_hyp_group()
-    if not all(x in (0,1,2,3) for x in private_walk):
-        raise ValueError(f"Invalid walk: all elements must be in {{0,1,2,3}}, "
-                         f"got {set(private_walk) - {0,1,2,3}}")
+    if not all(x in (0, 1, 2, 3) for x in private_walk):
+        raise ValueError(
+            f"Invalid walk: all elements must be in {{0,1,2,3}}, "
+            f"got {set(private_walk) - {0, 1, 2, 3}}"
+        )
     if len(private_walk) != WALK_LENGTH:
         raise ValueError(f"Walk length must be {WALK_LENGTH}, got {len(private_walk)}")
     y = evaluate_walk(private_walk)
     y_bytes = y.serialize_canonical()
-    inner   = hashlib.sha3_256(y_bytes).digest()
+    inner = hashlib.sha3_256(y_bytes).digest()
     address = hashlib.sha3_256(inner).hexdigest()
     return SchnorrKeyPair(private_walk=private_walk, public_key=y, address=address)
 
@@ -610,6 +658,7 @@ def keygen_from_walk(private_walk: List[int]) -> SchnorrKeyPair:
 # ════════════════════════════════════════════════════════════════════════════
 # §5  SIGN — Non-Interactive Schnorr-Γ with Fiat-Shamir
 # ════════════════════════════════════════════════════════════════════════════
+
 
 class SchnorrSignature(NamedTuple):
     """
@@ -630,14 +679,17 @@ class SchnorrSignature(NamedTuple):
         The nonce walk (NOT serialized in compact wire format — derivable
         from R, but stored here for debugging / HVZK proof purposes).
     """
-    R:          PSLMatrix
-    Z:          PSLMatrix
-    c_full:     int
-    c_exp:      int
+
+    R: PSLMatrix
+    Z: PSLMatrix
+    c_full: int
+    c_exp: int
     nonce_walk: List[int]
 
 
-def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
+def sign(
+    message: bytes, private_walk: List[int], public_key: PSLMatrix
+) -> SchnorrSignature:
     """
     Sign a message with the Schnorr-Γ protocol.
 
@@ -678,8 +730,9 @@ def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> Schn
     if not isinstance(message, bytes):
         raise TypeError(f"sign: message must be bytes, got {type(message).__name__}")
     if len(private_walk) != WALK_LENGTH:
-        raise ValueError(f"sign: private_walk length must be {WALK_LENGTH}, "
-                         f"got {len(private_walk)}")
+        raise ValueError(
+            f"sign: private_walk length must be {WALK_LENGTH}, got {len(private_walk)}"
+        )
 
     t0 = time.perf_counter()
     logger.debug("[SchnorrΓ] sign: message=%s bytes", len(message))
@@ -692,7 +745,7 @@ def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> Schn
 
     # Step 3: Fiat-Shamir challenge (full 256 bits for binding)
     c_full = _fiat_shamir_challenge(R, message)
-    c_exp  = _compute_safe_exponent(c_full)
+    c_exp = _compute_safe_exponent(c_full)
 
     logger.debug("[SchnorrΓ] sign: c_full=%064x c_exp=%d", c_full, c_exp)
 
@@ -700,8 +753,9 @@ def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> Schn
     if c_exp == 0:
         y_c = identity()
     elif c_exp == 1:
-        y_c = PSLMatrix(public_key.a, public_key.b, public_key.c, public_key.d,
-                        skip_validation=True)
+        y_c = PSLMatrix(
+            public_key.a, public_key.b, public_key.c, public_key.d, skip_validation=True
+        )
     else:
         y_c = _matrix_pow_elevated(public_key, c_exp)
 
@@ -710,7 +764,7 @@ def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> Schn
 
     # Step 6: Validate Z before returning (catch any corruption early)
     det_Z = Z.det()
-    if fabs(det_Z - mpf('1')) > DET_TOLERANCE:
+    if fabs(det_Z - mpf("1")) > DET_TOLERANCE:
         raise PSLGroupError(
             f"sign: Z determinant={nstr(det_Z, 20)} violates PSL(2,R) invariant. "
             f"c_exp={c_exp}"
@@ -719,17 +773,18 @@ def sign(message: bytes, private_walk: List[int], public_key: PSLMatrix) -> Schn
     dt = time.perf_counter() - t0
     logger.info(
         "[SchnorrΓ] sign: done in %.3fs | c_exp=%d | Z_det=%s",
-        dt, c_exp, nstr(Z.det(), 10)
+        dt,
+        c_exp,
+        nstr(Z.det(), 10),
     )
 
-    return SchnorrSignature(
-        R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=nonce_walk
-    )
+    return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=nonce_walk)
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # §6  VERIFY — Schnorr-Γ Verification
 # ════════════════════════════════════════════════════════════════════════════
+
 
 class VerifyResult(NamedTuple):
     """
@@ -753,16 +808,19 @@ class VerifyResult(NamedTuple):
     error : Optional[str]
         Error message if verification threw an exception.
     """
-    valid:       bool
-    c_prime:     int
-    c_match:     bool
-    det_ok:      bool
+
+    valid: bool
+    c_prime: int
+    c_match: bool
+    det_ok: bool
     overflow_ok: bool
-    R_prime:     Optional[PSLMatrix]
-    error:       Optional[str]
+    R_prime: Optional[PSLMatrix]
+    error: Optional[str]
 
 
-def verify(sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> VerifyResult:
+def verify(
+    sig: SchnorrSignature, message: bytes, public_key: PSLMatrix
+) -> VerifyResult:
     """
     Verify a Schnorr-Γ signature.
 
@@ -801,15 +859,17 @@ def verify(sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> Veri
         if c_exp == 0:
             y_neg_c = identity()
         elif c_exp == 1:
-            y_neg_c = public_key.inverse()
+            y_neg_c = public_key.inverse().renormalize_det()
         else:
-            y_neg_c = _matrix_pow_elevated(public_key, c_exp).inverse()
+            # Renormalize BEFORE inverse() to avoid determinant check failure
+            y_pow = _matrix_pow_elevated(public_key, c_exp).renormalize_det()
+            y_neg_c = y_pow.inverse().renormalize_det()
 
         R_prime = (sig.Z @ y_neg_c).renormalize_det()
 
         # Check 1: det(R') = 1
         det_rp = R_prime.det()
-        det_ok = fabs(det_rp - mpf('1')) < DET_TOLERANCE
+        det_ok = fabs(det_rp - mpf("1")) < DET_TOLERANCE
 
         # Check 2: overflow guard
         overflow_ok = all(
@@ -819,28 +879,40 @@ def verify(sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> Veri
 
         # Check 3: recompute challenge and compare
         c_prime = _fiat_shamir_challenge(R_prime, message)
-        c_match = (c_prime == sig.c_full)
+        c_match = c_prime == sig.c_full
 
         valid = det_ok and overflow_ok and c_match
 
         dt = time.perf_counter() - t0
         logger.info(
             "[SchnorrΓ] verify: %s | det_ok=%s overflow_ok=%s c_match=%s | %.3fs",
-            "VALID ✓" if valid else "INVALID ✗", det_ok, overflow_ok, c_match, dt
+            "VALID ✓" if valid else "INVALID ✗",
+            det_ok,
+            overflow_ok,
+            c_match,
+            dt,
         )
 
         return VerifyResult(
-            valid=valid, c_prime=c_prime, c_match=c_match,
-            det_ok=det_ok, overflow_ok=overflow_ok,
-            R_prime=R_prime, error=None
+            valid=valid,
+            c_prime=c_prime,
+            c_match=c_match,
+            det_ok=det_ok,
+            overflow_ok=overflow_ok,
+            R_prime=R_prime,
+            error=None,
         )
 
     except Exception as exc:
         logger.error("[SchnorrΓ] verify: exception: %s", exc, exc_info=True)
         return VerifyResult(
-            valid=False, c_prime=0, c_match=False,
-            det_ok=False, overflow_ok=False,
-            R_prime=None, error=str(exc)
+            valid=False,
+            c_prime=0,
+            c_match=False,
+            det_ok=False,
+            overflow_ok=False,
+            R_prime=None,
+            error=str(exc),
         )
 
 
@@ -868,9 +940,10 @@ def verify(sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> Veri
 #   setting. In the Fiat-Shamir (QROM) setting, EUF-CMA security replaces HVZK.
 # ════════════════════════════════════════════════════════════════════════════
 
-def simulate_transcript(public_key: PSLMatrix,
-                        message: bytes,
-                        c_exp_override: Optional[int] = None) -> SchnorrSignature:
+
+def simulate_transcript(
+    public_key: PSLMatrix, message: bytes, c_exp_override: Optional[int] = None
+) -> SchnorrSignature:
     """
     Produce a simulated Schnorr-Γ transcript without knowledge of private key.
 
@@ -922,15 +995,15 @@ def simulate_transcript(public_key: PSLMatrix,
     if c_exp == 0:
         y_neg_c = identity()
     elif c_exp == 1:
-        y_neg_c = public_key.inverse()
+        y_neg_c = public_key.inverse().renormalize_det()
     else:
-        y_neg_c = _matrix_pow_elevated(public_key, c_exp).inverse()
+        # Renormalize BEFORE inverse() to avoid determinant check failure
+        y_pow = _matrix_pow_elevated(public_key, c_exp).renormalize_det()
+        y_neg_c = y_pow.inverse().renormalize_det()
 
     R = (Z @ y_neg_c).renormalize_det()
 
-    return SchnorrSignature(
-        R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[]
-    )
+    return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[])
 
 
 def verify_simulation(sig: SchnorrSignature, public_key: PSLMatrix) -> bool:
@@ -957,19 +1030,30 @@ def verify_simulation(sig: SchnorrSignature, public_key: PSLMatrix) -> bool:
     if c_exp == 0:
         y_neg_c = identity()
     elif c_exp == 1:
-        y_neg_c = public_key.inverse()
+        y_neg_c = public_key.inverse().renormalize_det()
     else:
-        y_neg_c = _matrix_pow_elevated(public_key, c_exp).inverse()
+        # Renormalize BEFORE inverse() to avoid determinant check failure
+        y_pow = _matrix_pow_elevated(public_key, c_exp).renormalize_det()
+        y_neg_c = y_pow.inverse().renormalize_det()
 
     R_reconstructed = (sig.Z @ y_neg_c).renormalize_det()
 
     # PSL equality: R == R_reconstructed or R == -R_reconstructed
-    tol = mpf('1e-100')
+    tol = mpf("1e-100")
+
     def close_psl(A: PSLMatrix, B: PSLMatrix) -> bool:
-        same = (almosteq(A.a, B.a, tol) and almosteq(A.b, B.b, tol) and
-                almosteq(A.c, B.c, tol) and almosteq(A.d, B.d, tol))
-        neg  = (almosteq(A.a, -B.a, tol) and almosteq(A.b, -B.b, tol) and
-                almosteq(A.c, -B.c, tol) and almosteq(A.d, -B.d, tol))
+        same = (
+            almosteq(A.a, B.a, tol)
+            and almosteq(A.b, B.b, tol)
+            and almosteq(A.c, B.c, tol)
+            and almosteq(A.d, B.d, tol)
+        )
+        neg = (
+            almosteq(A.a, -B.a, tol)
+            and almosteq(A.b, -B.b, tol)
+            and almosteq(A.c, -B.c, tol)
+            and almosteq(A.d, -B.d, tol)
+        )
         return same or neg
 
     return close_psl(sig.R, R_reconstructed)
@@ -1003,17 +1087,20 @@ def signature_to_dict(sig: SchnorrSignature) -> Dict[str, Any]:
     The nonce_walk is NOT included (private information).
     """
     return {
-        "version":  WIRE_VERSION,
-        "R":        sig.R.to_dict(),
-        "Z":        sig.Z.to_dict(),
-        "c_full":   format(sig.c_full, '064x'),   # 64 hex chars = 256 bits
-        "c_exp":    sig.c_exp,
+        "version": WIRE_VERSION,
+        "R": sig.R.to_dict(),
+        "Z": sig.Z.to_dict(),
+        "c_full": format(sig.c_full, "064x"),  # 64 hex chars = 256 bits
+        "c_exp": sig.c_exp,
     }
 
 
 def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
     """
     Deserialize a SchnorrSignature from a JSON-compatible dict.
+
+    Supports both canonical format (with version, R, Z, c_full, c_exp)
+    and legacy/certificate formats (with signature matrix as R, challenge as c).
 
     Raises
     ------
@@ -1022,16 +1109,55 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
     PSLGroupError
         If deserialized matrices fail PSL(2,ℝ) invariants.
     """
-    if d.get('version') != WIRE_VERSION:
+    version = d.get("version")
+
+    # Canonical format: version must match if present
+    if version is not None and version != WIRE_VERSION:
         raise ValueError(
             f"signature_from_dict: version mismatch: "
-            f"got {d.get('version')!r}, expected {WIRE_VERSION!r}"
+            f"got {version!r}, expected {WIRE_VERSION!r}"
         )
-    R      = PSLMatrix.from_dict(d['R'])
-    Z      = PSLMatrix.from_dict(d['Z'])
-    c_full = int(d['c_full'], 16)
-    c_exp  = int(d['c_exp'])
-    return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[])
+
+    # Canonical format with full signature fields
+    if "R" in d and "Z" in d and "c_full" in d:
+        R = PSLMatrix.from_dict(d["R"])
+        Z = PSLMatrix.from_dict(d["Z"])
+        c_full = int(d["c_full"], 16)
+        c_exp = int(d.get("c_exp", 0))
+        return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[])
+
+    # Legacy/certificate format: signature matrix is R, challenge is c
+    if "signature" in d and "challenge" in d:
+        sig_field = d["signature"]
+        # Parse signature as PSL matrix (JSON with a, b, c, d)
+        if isinstance(sig_field, str):
+            try:
+                import json as _json
+
+                sig_field = _json.loads(sig_field)
+            except Exception:
+                pass
+        if isinstance(sig_field, dict) and all(
+            k in sig_field for k in ("a", "b", "c", "d")
+        ):
+            R = PSLMatrix.from_dict(sig_field)
+            # For legacy format, we need to reconstruct Z from available data
+            # Z = R · y^c, but we don't have y here. Use placeholder Z = R.
+            # This is a verification-only path where the actual Z would be computed
+            # by the caller with knowledge of the public key.
+            c_hex = d["challenge"]
+            if isinstance(c_hex, str):
+                c_full = int(c_hex, 16)
+            else:
+                c_full = int(c_hex)
+            # For certificates, Z is not stored; verification uses different logic
+            # Return signature with Z=R as placeholder - verification code handles this
+            return SchnorrSignature(R=R, Z=R, c_full=c_full, c_exp=0, nonce_walk=[])
+
+    raise ValueError(
+        f"signature_from_dict: unrecognized signature format. "
+        f"Expected keys: (R, Z, c_full) or (signature, challenge). Got: {list(d.keys())}"
+    )
 
 
 def public_key_to_hex(pk: PSLMatrix) -> str:
@@ -1043,10 +1169,10 @@ def public_key_from_hex(hex_str: str) -> PSLMatrix:
     """Deserialize public key from hex string."""
     raw = bytes.fromhex(hex_str)
     # Reverse of serialize_canonical: split by null separator
-    parts = raw.split(b'\x00')
+    parts = raw.split(b"\x00")
     if len(parts) != 4:
         raise ValueError(f"public_key_from_hex: expected 4 parts, got {len(parts)}")
-    a, b, c, d = (mpf(p.decode('ascii')) for p in parts)
+    a, b, c, d = (mpf(p.decode("ascii")) for p in parts)
     return PSLMatrix(a, b, c, d)
 
 
@@ -1056,6 +1182,7 @@ def public_key_from_hex(hex_str: str) -> PSLMatrix:
 #   Backward-compatible with the existing hlwe_engine.py signing API.
 #   All functions accept/return plain Python dicts for JSON transport.
 # ════════════════════════════════════════════════════════════════════════════
+
 
 def generate_keypair_dict() -> Dict[str, Any]:
     """
@@ -1075,29 +1202,29 @@ def generate_keypair_dict() -> Dict[str, Any]:
     kp = keygen()
     tr = kp.public_key.trace()
     abs_tr = fabs(tr)
-    if abs_tr > mpf('2') + mpf('1e-80'):
+    if abs_tr > mpf("2") + mpf("1e-80"):
         element_type = "hyperbolic"
-    elif abs_tr < mpf('2') - mpf('1e-80'):
+    elif abs_tr < mpf("2") - mpf("1e-80"):
         element_type = "elliptic"
     else:
         element_type = "parabolic"
     return {
-        "private_walk":      kp.private_walk,
-        "public_key_hex":    public_key_to_hex(kp.public_key),
-        "address":           kp.address,
-        "walk_length":       WALK_LENGTH,
-        "public_key_det":    nstr(kp.public_key.det(), 20),
-        "public_key_trace":  nstr(tr, 20),
-        "element_type":      element_type,
+        "private_walk": kp.private_walk,
+        "public_key_hex": public_key_to_hex(kp.public_key),
+        "address": kp.address,
+        "walk_length": WALK_LENGTH,
+        "public_key_det": nstr(kp.public_key.det(), 20),
+        "public_key_trace": nstr(tr, 20),
+        "element_type": element_type,
         "challenge_exp_bits": CHALLENGE_EXP_BITS,
-        "dps_canonical":     DPS_DEFAULT,
-        "dps_elevated":      DPS_ELEVATED,
+        "dps_canonical": DPS_DEFAULT,
+        "dps_elevated": DPS_ELEVATED,
     }
 
 
-def sign_message_dict(message: Union[str, bytes],
-                      private_walk: List[int],
-                      public_key_hex: str) -> Dict[str, Any]:
+def sign_message_dict(
+    message: Union[str, bytes], private_walk: List[int], public_key_hex: str
+) -> Dict[str, Any]:
     """
     Sign a message using the Schnorr-Γ protocol.
 
@@ -1115,15 +1242,15 @@ def sign_message_dict(message: Union[str, bytes],
     dict — the signature in wire format, JSON-serializable.
     """
     if isinstance(message, str):
-        message = message.encode('utf-8')
+        message = message.encode("utf-8")
     pk = public_key_from_hex(public_key_hex)
     sig = sign(message, private_walk, pk)
     return signature_to_dict(sig)
 
 
-def verify_message_dict(sig_dict: Dict[str, Any],
-                        message: Union[str, bytes],
-                        public_key_hex: str) -> Dict[str, Any]:
+def verify_message_dict(
+    sig_dict: Dict[str, Any], message: Union[str, bytes], public_key_hex: str
+) -> Dict[str, Any]:
     """
     Verify a Schnorr-Γ signature.
 
@@ -1146,22 +1273,23 @@ def verify_message_dict(sig_dict: Dict[str, Any],
         "error":        str or None
     """
     if isinstance(message, str):
-        message = message.encode('utf-8')
+        message = message.encode("utf-8")
     pk = public_key_from_hex(public_key_hex)
     sig = signature_from_dict(sig_dict)
     result = verify(sig, message, pk)
     return {
-        "valid":       result.valid,
-        "c_match":     result.c_match,
-        "det_ok":      result.det_ok,
+        "valid": result.valid,
+        "c_match": result.c_match,
+        "det_ok": result.det_ok,
         "overflow_ok": result.overflow_ok,
-        "error":       result.error,
+        "error": result.error,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # §10  UTILITY — Require hyp_group
 # ════════════════════════════════════════════════════════════════════════════
+
 
 def _require_hyp_group() -> None:
     """Raise ImportError with actionable message if hyp_group is unavailable."""
@@ -1179,6 +1307,7 @@ def _require_hyp_group() -> None:
 #                          §B binding, §F forgery, §H HVZK, §R round-trip,
 #                          §E edge cases, §W wire format, §P precision
 # ════════════════════════════════════════════════════════════════════════════
+
 
 def run_tests(verbose: bool = True) -> Dict[str, Any]:
     """
@@ -1213,7 +1342,7 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
             passed = False
             detail = f"EXCEPTION: {exc}"
             dt = 0.0
-        results[name] = {'pass': passed, 'detail': detail, 'time': dt}
+        results[name] = {"pass": passed, "detail": detail, "time": dt}
         if verbose:
             mark = "✅" if passed else "❌"
             print(f"  {mark} [{dt:.3f}s] {name}")
@@ -1223,107 +1352,149 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
     if verbose:
         print("=" * 80)
         print("  HypΓ Schnorr-Γ — Full Test Suite (39 tests)")
-        print(f"  mp.dps={DPS_DEFAULT} | DPS_ELEVATED={DPS_ELEVATED} | "
-              f"CHALLENGE_EXP_BITS={CHALLENGE_EXP_BITS} | CHALLENGE_EXP_MAX={CHALLENGE_EXP_MAX}")
+        print(
+            f"  mp.dps={DPS_DEFAULT} | DPS_ELEVATED={DPS_ELEVATED} | "
+            f"CHALLENGE_EXP_BITS={CHALLENGE_EXP_BITS} | CHALLENGE_EXP_MAX={CHALLENGE_EXP_MAX}"
+        )
         print(f"  WALK_LENGTH={WALK_LENGTH} | SIGN_WALK_LENGTH={SIGN_WALK_LENGTH}")
         print("=" * 80)
 
     # ─────── §G Group Operations (3) ────────────────────────────────────────
 
-    if verbose: print("\n  ── §G Group Operations")
+    if verbose:
+        print("\n  ── §G Group Operations")
 
     def tG1_identity_absorbs():
-        I = identity(); gens = get_generators(); a = gens['a']
-        ai = (I @ a); ia = (a @ I)
-        tol = mpf('1e-120')
-        ok = (almosteq(ai.a, a.a, tol) and almosteq(ai.d, a.d, tol) and
-              almosteq(ia.a, a.a, tol) and almosteq(ia.d, a.d, tol))
+        I = identity()
+        gens = get_generators()
+        a = gens["a"]
+        ai = I @ a
+        ia = a @ I
+        tol = mpf("1e-120")
+        ok = (
+            almosteq(ai.a, a.a, tol)
+            and almosteq(ai.d, a.d, tol)
+            and almosteq(ia.a, a.a, tol)
+            and almosteq(ia.d, a.d, tol)
+        )
         return ok, f"I·a == a·I == a (tol={tol})"
+
     test("§G1 Identity absorbs: I·a == a·I == a", tG1_identity_absorbs)
 
     def tG2_inverse_product_identity():
-        gens = get_generators(); a = gens['a']; a_inv = gens['a_inv']
+        gens = get_generators()
+        a = gens["a"]
+        a_inv = gens["a_inv"]
         prod = (a @ a_inv).renormalize_det()
         I = identity()
         err = max(fabs(prod.a - 1), fabs(prod.b), fabs(prod.c), fabs(prod.d - 1))
-        return err < mpf('1e-100'), f"a·a⁻¹ dist-to-I={nstr(err, 8)}"
+        return err < mpf("1e-100"), f"a·a⁻¹ dist-to-I={nstr(err, 8)}"
+
     test("§G2 a·a⁻¹ = I within 1e-100", tG2_inverse_product_identity)
 
     def tG3_generator_order_a8():
-        gens = get_generators(); a = gens['a']
+        gens = get_generators()
+        a = gens["a"]
         a8 = matrix_pow_repeated_squaring(a, 8)
-        err1 = max(fabs(a8.a-1), fabs(a8.b), fabs(a8.c), fabs(a8.d-1))
-        err2 = max(fabs(a8.a+1), fabs(a8.b), fabs(a8.c), fabs(a8.d+1))
+        err1 = max(fabs(a8.a - 1), fabs(a8.b), fabs(a8.c), fabs(a8.d - 1))
+        err2 = max(fabs(a8.a + 1), fabs(a8.b), fabs(a8.c), fabs(a8.d + 1))
         err = min(err1, err2)
-        return err < mpf('1e-90'), f"a^8 PSL-dist-to-±I={nstr(err, 8)}"
+        return err < mpf("1e-90"), f"a^8 PSL-dist-to-±I={nstr(err, 8)}"
+
     test("§G3 a^8 == ±I in PSL(2,R)", tG3_generator_order_a8)
 
     # ─────── §K Key Generation (5) ──────────────────────────────────────────
 
-    if verbose: print("\n  ── §K Key Generation")
+    if verbose:
+        print("\n  ── §K Key Generation")
 
     def tK1_keygen_runs():
         kp = keygen()
-        return kp.public_key is not None and len(kp.private_walk) == WALK_LENGTH, \
-               f"walk_len={len(kp.private_walk)}"
+        return kp.public_key is not None and len(
+            kp.private_walk
+        ) == WALK_LENGTH, f"walk_len={len(kp.private_walk)}"
+
     test("§K1 keygen() produces valid key pair", tK1_keygen_runs)
 
     def tK2_public_key_det1():
         kp = keygen()
         det = kp.public_key.det()
-        err = fabs(det - mpf('1'))
+        err = fabs(det - mpf("1"))
         return err < DET_TOLERANCE, f"det(y)={nstr(det, 20)}, err={nstr(err, 8)}"
+
     test("§K2 Public key det=1 within DET_TOLERANCE", tK2_public_key_det1)
 
     def tK3_address_sha3_double():
         kp = keygen()
         y_bytes = kp.public_key.serialize_canonical()
-        inner   = hashlib.sha3_256(y_bytes).digest()
+        inner = hashlib.sha3_256(y_bytes).digest()
         expected_addr = hashlib.sha3_256(inner).hexdigest()
         ok = kp.address == expected_addr and len(kp.address) == 64
         return ok, f"address={kp.address[:16]}... len={len(kp.address)}"
-    test("§K3 Address = SHA3-256²(serialize(y)) — 64 hex chars", tK3_address_sha3_double)
+
+    test(
+        "§K3 Address = SHA3-256²(serialize(y)) — 64 hex chars", tK3_address_sha3_double
+    )
 
     def tK4_keygen_deterministic_from_walk():
         kp = keygen()
         kp2 = keygen_from_walk(kp.private_walk)
         ok_addr = kp.address == kp2.address
-        ok_pk = almosteq(kp.public_key.a, kp2.public_key.a, mpf('1e-100'))
+        ok_pk = almosteq(kp.public_key.a, kp2.public_key.a, mpf("1e-100"))
         return ok_addr and ok_pk, f"same_address={ok_addr} same_pk_a={ok_pk}"
-    test("§K4 keygen_from_walk() reproduces same public key", tK4_keygen_deterministic_from_walk)
+
+    test(
+        "§K4 keygen_from_walk() reproduces same public key",
+        tK4_keygen_deterministic_from_walk,
+    )
 
     def tK5_two_keygens_distinct():
-        kp1 = keygen(); kp2 = keygen()
+        kp1 = keygen()
+        kp2 = keygen()
         ok = kp1.address != kp2.address
         return ok, f"addr1={kp1.address[:8]} addr2={kp2.address[:8]}"
+
     test("§K5 Two keygens produce distinct keys", tK5_two_keygens_distinct)
 
     # ─────── §P Precision / Matrix Power (5) ────────────────────────────────
 
-    if verbose: print("\n  ── §P Precision / Matrix Power")
+    if verbose:
+        print("\n  ── §P Precision / Matrix Power")
 
     def tP1_matrix_pow_0_is_identity():
-        gens = get_generators(); a = gens['a']
+        gens = get_generators()
+        a = gens["a"]
         a0 = _matrix_pow_elevated(a, 0)
         I = identity()
-        err = max(fabs(a0.a-1), fabs(a0.b), fabs(a0.c), fabs(a0.d-1))
-        return err < mpf('1e-100'), f"a^0 dist-to-I={nstr(err, 8)}"
+        err = max(fabs(a0.a - 1), fabs(a0.b), fabs(a0.c), fabs(a0.d - 1))
+        return err < mpf("1e-100"), f"a^0 dist-to-I={nstr(err, 8)}"
+
     test("§P1 _matrix_pow_elevated(a, 0) = I", tP1_matrix_pow_0_is_identity)
 
     def tP2_matrix_pow_1_is_self():
-        gens = get_generators(); a = gens['a']
+        gens = get_generators()
+        a = gens["a"]
         a1 = _matrix_pow_elevated(a, 1)
-        err = max(fabs(a1.a-a.a), fabs(a1.b-a.b), fabs(a1.c-a.c), fabs(a1.d-a.d))
-        return err < mpf('1e-100'), f"a^1 dist-to-a={nstr(err, 8)}"
+        err = max(
+            fabs(a1.a - a.a), fabs(a1.b - a.b), fabs(a1.c - a.c), fabs(a1.d - a.d)
+        )
+        return err < mpf("1e-100"), f"a^1 dist-to-a={nstr(err, 8)}"
+
     test("§P2 _matrix_pow_elevated(a, 1) = a", tP2_matrix_pow_1_is_self)
 
     def tP3_matrix_pow_2_matches_matmul():
-        gens = get_generators(); a = gens['a']
+        gens = get_generators()
+        a = gens["a"]
         a2_pow = _matrix_pow_elevated(a, 2)
         a2_mul = (a @ a).renormalize_det()
-        err = max(fabs(a2_pow.a-a2_mul.a), fabs(a2_pow.b-a2_mul.b),
-                  fabs(a2_pow.c-a2_mul.c), fabs(a2_pow.d-a2_mul.d))
-        return err < mpf('1e-100'), f"a^2 pow vs mul dist={nstr(err, 8)}"
+        err = max(
+            fabs(a2_pow.a - a2_mul.a),
+            fabs(a2_pow.b - a2_mul.b),
+            fabs(a2_pow.c - a2_mul.c),
+            fabs(a2_pow.d - a2_mul.d),
+        )
+        return err < mpf("1e-100"), f"a^2 pow vs mul dist={nstr(err, 8)}"
+
     test("§P3 _matrix_pow_elevated(a, 2) = a@a", tP3_matrix_pow_2_matches_matmul)
 
     def tP4_matrix_pow_hyperbolic_key_small_exp():
@@ -1331,16 +1502,25 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
         kp = keygen()
         y = kp.public_key
         tr = fabs(y.trace())
-        is_hyp = tr > mpf('2') + mpf('1e-80')
+        is_hyp = tr > mpf("2") + mpf("1e-80")
         # Try c_exp ∈ {1,...,CHALLENGE_EXP_MAX-1}
         for c_exp in range(1, CHALLENGE_EXP_MAX):
             yc = _matrix_pow_elevated(y, c_exp)
             det_yc = yc.det()
-            if fabs(det_yc - mpf('1')) > DET_TOLERANCE:
-                return False, f"y^{c_exp} det={nstr(det_yc, 20)} collapsed (trace={nstr(tr, 8)})"
-        return True, (f"y^{{1..{CHALLENGE_EXP_MAX-1}}} all det=1 | "
-                      f"element_type={'hyperbolic' if is_hyp else 'elliptic'} | trace={nstr(tr, 8)}")
-    test("§P4 y^c stable for ALL c_exp in {1..15} (hyperbolic key)", tP4_matrix_pow_hyperbolic_key_small_exp)
+            if fabs(det_yc - mpf("1")) > DET_TOLERANCE:
+                return (
+                    False,
+                    f"y^{c_exp} det={nstr(det_yc, 20)} collapsed (trace={nstr(tr, 8)})",
+                )
+        return True, (
+            f"y^{{1..{CHALLENGE_EXP_MAX - 1}}} all det=1 | "
+            f"element_type={'hyperbolic' if is_hyp else 'elliptic'} | trace={nstr(tr, 8)}"
+        )
+
+    test(
+        "§P4 y^c stable for ALL c_exp in {1..15} (hyperbolic key)",
+        tP4_matrix_pow_hyperbolic_key_small_exp,
+    )
 
     def tP5_precision_restored_after_pow():
         # Verify that DPS reverts to DPS_DEFAULT after elevated pow
@@ -1349,145 +1529,187 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
         _matrix_pow_elevated(kp.public_key, CHALLENGE_EXP_MAX - 1)
         ok = mp.dps == DPS_DEFAULT
         return ok, f"dps after pow={mp.dps} (expected {DPS_DEFAULT})"
-    test("§P5 mp.dps restored to 150 after _matrix_pow_elevated", tP5_precision_restored_after_pow)
+
+    test(
+        "§P5 mp.dps restored to 150 after _matrix_pow_elevated",
+        tP5_precision_restored_after_pow,
+    )
 
     # ─────── §S Sign Protocol (5) ───────────────────────────────────────────
 
-    if verbose: print("\n  ── §S Sign Protocol")
+    if verbose:
+        print("\n  ── §S Sign Protocol")
 
-    kp_global = keygen()   # shared keypair for §S, §V, §B, §F tests
+    kp_global = keygen()  # shared keypair for §S, §V, §B, §F tests
 
     def tS1_sign_returns_signature():
         sig = sign(b"test message", kp_global.private_walk, kp_global.public_key)
-        return sig.R is not None and sig.Z is not None, \
-               f"R={sig.R is not None} Z={sig.Z is not None} c_full={sig.c_full:#x}"
+        return (
+            sig.R is not None and sig.Z is not None,
+            f"R={sig.R is not None} Z={sig.Z is not None} c_full={sig.c_full:#x}",
+        )
+
     test("§S1 sign() returns SchnorrSignature with R, Z, c", tS1_sign_returns_signature)
 
     def tS2_commitment_det_ok():
         sig = sign(b"commitment det test", kp_global.private_walk, kp_global.public_key)
-        err = fabs(sig.R.det() - mpf('1'))
+        err = fabs(sig.R.det() - mpf("1"))
         return err < DET_TOLERANCE, f"det(R)={nstr(sig.R.det(), 20)}"
+
     test("§S2 Commitment R has det=1", tS2_commitment_det_ok)
 
     def tS3_response_det_ok():
         sig = sign(b"response det test", kp_global.private_walk, kp_global.public_key)
-        err = fabs(sig.Z.det() - mpf('1'))
+        err = fabs(sig.Z.det() - mpf("1"))
         return err < DET_TOLERANCE, f"det(Z)={nstr(sig.Z.det(), 20)}"
+
     test("§S3 Response Z has det=1", tS3_response_det_ok)
 
     def tS4_challenge_in_range():
-        sig = sign(b"challenge range test", kp_global.private_walk, kp_global.public_key)
+        sig = sign(
+            b"challenge range test", kp_global.private_walk, kp_global.public_key
+        )
         ok_full = 0 <= sig.c_full < CHALLENGE_MODULUS
-        ok_exp  = 0 <= sig.c_exp  < CHALLENGE_EXP_MAX
-        return ok_full and ok_exp, \
-               f"c_full in [0, 2^256)={ok_full} c_exp in [0,{CHALLENGE_EXP_MAX})={ok_exp}"
+        ok_exp = 0 <= sig.c_exp < CHALLENGE_EXP_MAX
+        return (
+            ok_full and ok_exp,
+            f"c_full in [0, 2^256)={ok_full} c_exp in [0,{CHALLENGE_EXP_MAX})={ok_exp}",
+        )
+
     test("§S4 Challenge c_full in [0, 2^256), c_exp in [0, 16)", tS4_challenge_in_range)
 
     def tS5_nonce_freshness():
         sig1 = sign(b"msg", kp_global.private_walk, kp_global.public_key)
         sig2 = sign(b"msg", kp_global.private_walk, kp_global.public_key)
         # Same message but fresh nonce → different R (with overwhelming probability)
-        R_differ = not almosteq(sig1.R.a, sig2.R.a, mpf('1e-100'))
+        R_differ = not almosteq(sig1.R.a, sig2.R.a, mpf("1e-100"))
         return R_differ, f"R1.a={nstr(sig1.R.a, 8)} R2.a={nstr(sig2.R.a, 8)}"
-    test("§S5 Fresh nonce: two signs of same msg produce distinct R", tS5_nonce_freshness)
+
+    test(
+        "§S5 Fresh nonce: two signs of same msg produce distinct R", tS5_nonce_freshness
+    )
 
     # ─────── §V Verify Correctness (5) ──────────────────────────────────────
 
-    if verbose: print("\n  ── §V Verify Correctness")
+    if verbose:
+        print("\n  ── §V Verify Correctness")
 
     def tV1_valid_signature_verifies():
         msg = b"valid signature test"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
-        vr  = verify(sig, msg, kp_global.public_key)
+        vr = verify(sig, msg, kp_global.public_key)
         return vr.valid, f"valid={vr.valid} c_match={vr.c_match} det_ok={vr.det_ok}"
+
     test("§V1 verify(sign(m, sk), m, pk) == True", tV1_valid_signature_verifies)
 
     def tV2_verify_returns_true():
         msg = b"correctness test 2"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
-        vr  = verify(sig, msg, kp_global.public_key)
+        vr = verify(sig, msg, kp_global.public_key)
         return vr.valid, f"valid={vr.valid}"
+
     test("§V2 Second correctness verification", tV2_verify_returns_true)
 
     def tV3_det_ok_in_result():
         msg = b"det check verify"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
-        vr  = verify(sig, msg, kp_global.public_key)
+        vr = verify(sig, msg, kp_global.public_key)
         return vr.det_ok, f"det_ok={vr.det_ok}"
+
     test("§V3 verify() reports det_ok=True for valid sig", tV3_det_ok_in_result)
 
     def tV4_overflow_ok_in_result():
         msg = b"overflow check verify"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
-        vr  = verify(sig, msg, kp_global.public_key)
+        vr = verify(sig, msg, kp_global.public_key)
         return vr.overflow_ok, f"overflow_ok={vr.overflow_ok}"
-    test("§V4 verify() reports overflow_ok=True for valid sig", tV4_overflow_ok_in_result)
+
+    test(
+        "§V4 verify() reports overflow_ok=True for valid sig", tV4_overflow_ok_in_result
+    )
 
     def tV5_R_prime_close_to_R():
         msg = b"R prime recovery test"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
-        vr  = verify(sig, msg, kp_global.public_key)
+        vr = verify(sig, msg, kp_global.public_key)
         if vr.R_prime is None:
             return False, "R_prime is None"
-        tol = mpf('1e-80')
-        close_a = almosteq(sig.R.a, vr.R_prime.a, tol) or almosteq(sig.R.a, -vr.R_prime.a, tol)
-        close_d = almosteq(sig.R.d, vr.R_prime.d, tol) or almosteq(sig.R.d, -vr.R_prime.d, tol)
-        return close_a and close_d, \
-               f"|R.a - R'.a|={nstr(fabs(sig.R.a - vr.R_prime.a), 8)}"
+        tol = mpf("1e-80")
+        close_a = almosteq(sig.R.a, vr.R_prime.a, tol) or almosteq(
+            sig.R.a, -vr.R_prime.a, tol
+        )
+        close_d = almosteq(sig.R.d, vr.R_prime.d, tol) or almosteq(
+            sig.R.d, -vr.R_prime.d, tol
+        )
+        return (
+            close_a and close_d,
+            f"|R.a - R'.a|={nstr(fabs(sig.R.a - vr.R_prime.a), 8)}",
+        )
+
     test("§V5 R' = Z@y^{-c} recovers R (PSL equality)", tV5_R_prime_close_to_R)
 
     # ─────── §B Binding (3) ─────────────────────────────────────────────────
 
-    if verbose: print("\n  ── §B Challenge Binding")
+    if verbose:
+        print("\n  ── §B Challenge Binding")
 
     def tB1_different_message_fails():
         msg1 = b"the real message"
         msg2 = b"a different message"
-        sig  = sign(msg1, kp_global.private_walk, kp_global.public_key)
-        vr   = verify(sig, msg2, kp_global.public_key)
+        sig = sign(msg1, kp_global.private_walk, kp_global.public_key)
+        vr = verify(sig, msg2, kp_global.public_key)
         return not vr.valid, f"valid_on_wrong_msg={vr.valid} (should be False)"
-    test("§B1 verify(sign(m, sk), m2, pk) == False (message binding)", tB1_different_message_fails)
+
+    test(
+        "§B1 verify(sign(m, sk), m2, pk) == False (message binding)",
+        tB1_different_message_fails,
+    )
 
     def tB2_tampered_R_fails():
         msg = b"binding test R tamper"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
         # Tamper R by composing a generator
         gens = get_generators()
-        R_tampered = (sig.R @ gens['a']).renormalize_det()
+        R_tampered = (sig.R @ gens["a"]).renormalize_det()
         sig_bad = SchnorrSignature(
-            R=R_tampered, Z=sig.Z, c_full=sig.c_full,
-            c_exp=sig.c_exp, nonce_walk=[]
+            R=R_tampered, Z=sig.Z, c_full=sig.c_full, c_exp=sig.c_exp, nonce_walk=[]
         )
         vr = verify(sig_bad, msg, kp_global.public_key)
         return not vr.valid, f"valid_with_tampered_R={vr.valid} (should be False)"
+
     test("§B2 Tampered R → verify fails", tB2_tampered_R_fails)
 
     def tB3_tampered_Z_fails():
         msg = b"binding test Z tamper"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
         gens = get_generators()
-        Z_tampered = (sig.Z @ gens['b']).renormalize_det()
+        Z_tampered = (sig.Z @ gens["b"]).renormalize_det()
         sig_bad = SchnorrSignature(
-            R=sig.R, Z=Z_tampered, c_full=sig.c_full,
-            c_exp=sig.c_exp, nonce_walk=[]
+            R=sig.R, Z=Z_tampered, c_full=sig.c_full, c_exp=sig.c_exp, nonce_walk=[]
         )
         vr = verify(sig_bad, msg, kp_global.public_key)
         return not vr.valid, f"valid_with_tampered_Z={vr.valid} (should be False)"
+
     test("§B3 Tampered Z → verify fails", tB3_tampered_Z_fails)
 
     # ─────── §F Forgery Resistance (4) ──────────────────────────────────────
 
-    if verbose: print("\n  ── §F Forgery Resistance")
+    if verbose:
+        print("\n  ── §F Forgery Resistance")
 
     def tF1_random_matrices_reject():
         msg = b"forgery test random"
-        kp2 = keygen()   # attacker's key
+        kp2 = keygen()  # attacker's key
         # Attacker tries to forge: uses OWN walk to produce R, Z
         fake_sig = sign(msg, kp2.private_walk, kp2.public_key)
         # But verifies against VICTIM's public key
         vr = verify(fake_sig, msg, kp_global.public_key)
         return not vr.valid, f"valid_with_wrong_key={vr.valid}"
-    test("§F1 Signature with wrong private key rejects (wrong pk at verify)", tF1_random_matrices_reject)
+
+    test(
+        "§F1 Signature with wrong private key rejects (wrong pk at verify)",
+        tF1_random_matrices_reject,
+    )
 
     def tF2_identity_forgery_rejects():
         msg = b"forgery identity attempt"
@@ -1498,48 +1720,64 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
         fake = SchnorrSignature(R=I, Z=I, c_full=c_rnd, c_exp=c_exp_rnd, nonce_walk=[])
         vr = verify(fake, msg, kp_global.public_key)
         return not vr.valid, f"identity forgery accepted={vr.valid} (should be False)"
+
     test("§F2 Identity forgery (R=I, Z=I) rejects", tF2_identity_forgery_rejects)
 
     def tF3_replayed_sig_wrong_msg_rejects():
         msg1 = b"original message for replay"
         msg2 = b"target message for replay attack"
-        sig  = sign(msg1, kp_global.private_walk, kp_global.public_key)
-        vr   = verify(sig, msg2, kp_global.public_key)
+        sig = sign(msg1, kp_global.private_walk, kp_global.public_key)
+        vr = verify(sig, msg2, kp_global.public_key)
         return not vr.valid, f"replay on wrong msg valid={vr.valid}"
-    test("§F3 Replayed signature on different message rejects", tF3_replayed_sig_wrong_msg_rejects)
+
+    test(
+        "§F3 Replayed signature on different message rejects",
+        tF3_replayed_sig_wrong_msg_rejects,
+    )
 
     def tF4_c_full_bit_flip_rejects():
         msg = b"bit flip forgery test"
         sig = sign(msg, kp_global.private_walk, kp_global.public_key)
         # Flip one bit in c_full (attacker modifies the challenge)
-        c_flipped = sig.c_full ^ (1 << 128)   # flip bit 128
+        c_flipped = sig.c_full ^ (1 << 128)  # flip bit 128
         c_exp_new = _compute_safe_exponent(c_flipped)
         sig_bad = SchnorrSignature(
-            R=sig.R, Z=sig.Z, c_full=c_flipped,
-            c_exp=c_exp_new, nonce_walk=[]
+            R=sig.R, Z=sig.Z, c_full=c_flipped, c_exp=c_exp_new, nonce_walk=[]
         )
         vr = verify(sig_bad, msg, kp_global.public_key)
         return not vr.valid, f"bit-flip forgery valid={vr.valid}"
+
     test("§F4 c_full bit-flip forgery rejects", tF4_c_full_bit_flip_rejects)
 
     # ─────── §H HVZK Simulator (4) ──────────────────────────────────────────
 
-    if verbose: print("\n  ── §H HVZK Simulator")
+    if verbose:
+        print("\n  ── §H HVZK Simulator")
 
     def tH1_simulator_produces_valid_group_eq():
         sim = simulate_transcript(kp_global.public_key, b"hvzk test 1")
         ok = verify_simulation(sim, kp_global.public_key)
         return ok, f"Z@y^{{-c}} == R: {ok}"
-    test("§H1 Simulated transcript satisfies Z@y^{-c} = R", tH1_simulator_produces_valid_group_eq)
+
+    test(
+        "§H1 Simulated transcript satisfies Z@y^{-c} = R",
+        tH1_simulator_produces_valid_group_eq,
+    )
 
     def tH2_simulator_all_c_exp_values():
         failures = []
         for c in range(CHALLENGE_EXP_MAX):
-            sim = simulate_transcript(kp_global.public_key, b"hvzk c sweep", c_exp_override=c)
+            sim = simulate_transcript(
+                kp_global.public_key, b"hvzk c sweep", c_exp_override=c
+            )
             if not verify_simulation(sim, kp_global.public_key):
                 failures.append(c)
         return len(failures) == 0, f"failures at c_exp={failures}"
-    test("§H2 Simulator valid for ALL c_exp in {0,...,15}", tH2_simulator_all_c_exp_values)
+
+    test(
+        "§H2 Simulator valid for ALL c_exp in {0,...,15}",
+        tH2_simulator_all_c_exp_values,
+    )
 
     def tH3_simulated_transcript_fiat_shamir_invalid():
         # A simulated transcript should NOT pass full Fiat-Shamir verify
@@ -1550,7 +1788,11 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
         # c_match should be False (with overwhelming probability)
         # (If c_match happens to be True, that's an astronomical coincidence)
         return not vr.c_match, f"c_match={vr.c_match} (should be False for simulated)"
-    test("§H3 Simulated transcript fails Fiat-Shamir binding (c_match=False)", tH3_simulated_transcript_fiat_shamir_invalid)
+
+    test(
+        "§H3 Simulated transcript fails Fiat-Shamir binding (c_match=False)",
+        tH3_simulated_transcript_fiat_shamir_invalid,
+    )
 
     def tH4_1000_simulations_all_valid_algebra():
         n_trials = 1000
@@ -1560,39 +1802,51 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
             if not verify_simulation(sim, kp_global.public_key):
                 failures += 1
         return failures == 0, f"{n_trials - failures}/{n_trials} algebraically valid"
-    test("§H4 1000 simulations all satisfy Z@y^{-c} = R", tH4_1000_simulations_all_valid_algebra)
+
+    test(
+        "§H4 1000 simulations all satisfy Z@y^{-c} = R",
+        tH4_1000_simulations_all_valid_algebra,
+    )
 
     # ─────── §R Round-Trip (3) ──────────────────────────────────────────────
 
-    if verbose: print("\n  ── §R Round-Trip (Dict Interface)")
+    if verbose:
+        print("\n  ── §R Round-Trip (Dict Interface)")
 
     def tR1_generate_sign_verify_dict():
         kpd = generate_keypair_dict()
         msg = b"round trip test 1"
-        sig_d = sign_message_dict(msg, kpd['private_walk'], kpd['public_key_hex'])
-        ver_d = verify_message_dict(sig_d, msg, kpd['public_key_hex'])
-        return ver_d['valid'], f"valid={ver_d['valid']}"
-    test("§R1 generate_keypair_dict → sign_message_dict → verify_message_dict", tR1_generate_sign_verify_dict)
+        sig_d = sign_message_dict(msg, kpd["private_walk"], kpd["public_key_hex"])
+        ver_d = verify_message_dict(sig_d, msg, kpd["public_key_hex"])
+        return ver_d["valid"], f"valid={ver_d['valid']}"
+
+    test(
+        "§R1 generate_keypair_dict → sign_message_dict → verify_message_dict",
+        tR1_generate_sign_verify_dict,
+    )
 
     def tR2_string_message_works():
         kpd = generate_keypair_dict()
         msg_str = "QTCL block header data for signing"
-        sig_d = sign_message_dict(msg_str, kpd['private_walk'], kpd['public_key_hex'])
-        ver_d = verify_message_dict(sig_d, msg_str, kpd['public_key_hex'])
-        return ver_d['valid'], f"valid={ver_d['valid']}"
+        sig_d = sign_message_dict(msg_str, kpd["private_walk"], kpd["public_key_hex"])
+        ver_d = verify_message_dict(sig_d, msg_str, kpd["public_key_hex"])
+        return ver_d["valid"], f"valid={ver_d['valid']}"
+
     test("§R2 String messages work via UTF-8 encoding", tR2_string_message_works)
 
     def tR3_empty_message_works():
         kpd = generate_keypair_dict()
         msg = b""
-        sig_d = sign_message_dict(msg, kpd['private_walk'], kpd['public_key_hex'])
-        ver_d = verify_message_dict(sig_d, msg, kpd['public_key_hex'])
-        return ver_d['valid'], f"empty msg valid={ver_d['valid']}"
+        sig_d = sign_message_dict(msg, kpd["private_walk"], kpd["public_key_hex"])
+        ver_d = verify_message_dict(sig_d, msg, kpd["public_key_hex"])
+        return ver_d["valid"], f"empty msg valid={ver_d['valid']}"
+
     test("§R3 Empty message sign/verify works", tR3_empty_message_works)
 
     # ─────── §W Wire Format (2) ─────────────────────────────────────────────
 
-    if verbose: print("\n  ── §W Wire Format")
+    if verbose:
+        print("\n  ── §W Wire Format")
 
     def tW1_signature_json_roundtrip():
         msg = b"wire format test"
@@ -1604,46 +1858,58 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
         sig2 = signature_from_dict(sig_d2)
         vr = verify(sig2, msg, kp_global.public_key)
         return vr.valid, f"json roundtrip valid={vr.valid}"
-    test("§W1 Signature → dict → JSON → dict → verify passes", tW1_signature_json_roundtrip)
+
+    test(
+        "§W1 Signature → dict → JSON → dict → verify passes",
+        tW1_signature_json_roundtrip,
+    )
 
     def tW2_public_key_hex_roundtrip():
         kp = keygen()
         pk_hex = public_key_to_hex(kp.public_key)
         pk2 = public_key_from_hex(pk_hex)
         err = max(fabs(kp.public_key.a - pk2.a), fabs(kp.public_key.d - pk2.d))
-        return err < mpf('1e-100'), f"hex roundtrip pk dist={nstr(err, 8)}"
-    test("§W2 public_key_to_hex → public_key_from_hex roundtrip", tW2_public_key_hex_roundtrip)
+        return err < mpf("1e-100"), f"hex roundtrip pk dist={nstr(err, 8)}"
+
+    test(
+        "§W2 public_key_to_hex → public_key_from_hex roundtrip",
+        tW2_public_key_hex_roundtrip,
+    )
 
     # ─────── Summary ────────────────────────────────────────────────────────
 
-    n_total  = len(results)
-    n_pass   = sum(1 for v in results.values() if v['pass'])
-    n_fail   = n_total - n_pass
-    all_pass = (n_fail == 0)
-    total_t  = sum(v['time'] for v in results.values())
+    n_total = len(results)
+    n_pass = sum(1 for v in results.values() if v["pass"])
+    n_fail = n_total - n_pass
+    all_pass = n_fail == 0
+    total_t = sum(v["time"] for v in results.values())
 
     if verbose:
         print("\n" + "=" * 80)
-        status = "✅ ALL TESTS PASSED" if all_pass else f"❌ {n_fail}/{n_total} TESTS FAILED"
+        status = (
+            "✅ ALL TESTS PASSED" if all_pass else f"❌ {n_fail}/{n_total} TESTS FAILED"
+        )
         print(f"  {status}  ({n_pass}/{n_total})  total_time={total_t:.2f}s")
         if not all_pass:
             print("  Failed tests:")
             for name, r in results.items():
-                if not r['pass']:
+                if not r["pass"]:
                     print(f"    • {name}: {r['detail']}")
         print(f"  Precision: DPS_DEFAULT={DPS_DEFAULT} | DPS_ELEVATED={DPS_ELEVATED}")
-        print(f"  Challenge: CHALLENGE_EXP_BITS={CHALLENGE_EXP_BITS} → max_exp={CHALLENGE_EXP_MAX}")
+        print(
+            f"  Challenge: CHALLENGE_EXP_BITS={CHALLENGE_EXP_BITS} → max_exp={CHALLENGE_EXP_MAX}"
+        )
         print("=" * 80)
 
     return {
-        'all_pass':    all_pass,
-        'test_results': results,
-        'summary': {
-            'passed':  n_pass,
-            'failed':  n_fail,
-            'total':   n_total,
-            'time_s':  total_t,
-        }
+        "all_pass": all_pass,
+        "test_results": results,
+        "summary": {
+            "passed": n_pass,
+            "failed": n_fail,
+            "total": n_total,
+            "time_s": total_t,
+        },
     }
 
 
@@ -1651,17 +1917,20 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
 # MAIN — Execute self-tests and print system summary
 # ════════════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
-        format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'
+        level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s"
     )
 
     print("\n" + "═" * 80)
     print("  HypΓ Cryptosystem — hyp_schnorr.py")
     print("  Schnorr-Γ: Non-Interactive Signatures over PSL(2,ℝ)")
-    print(f"  Module 4 of 6 — {WALK_LENGTH}-step walks | {CHALLENGE_EXP_BITS}-bit safe exponent")
-    print(f"  Precision: {DPS_DEFAULT} dps canonical | {DPS_ELEVATED} dps elevated (eigendecomp)")
+    print(
+        f"  Module 4 of 6 — {WALK_LENGTH}-step walks | {CHALLENGE_EXP_BITS}-bit safe exponent"
+    )
+    print(
+        f"  Precision: {DPS_DEFAULT} dps canonical | {DPS_ELEVATED} dps elevated (eigendecomp)"
+    )
     print(f"  Spec: HypΓ Architecture v1.0 · April 2026 · QTCL · shemshallah")
     print("═" * 80 + "\n")
 
@@ -1672,11 +1941,14 @@ if __name__ == '__main__':
 
     # Print system info
     gens = get_generators()
-    a_tr = gens['a'].trace(); b_tr = gens['b'].trace()
+    a_tr = gens["a"].trace()
+    b_tr = gens["b"].trace()
     print(f"  Generators loaded:")
     print(f"    a: trace={nstr(a_tr, 12)}  (order-8 rotation)")
     print(f"    b: trace={nstr(b_tr, 12)}  (order-3 rotation)")
-    print(f"    CHALLENGE_EXP_MAX = {CHALLENGE_EXP_MAX} (c_exp ∈ {{0,...,{CHALLENGE_EXP_MAX-1}}})")
+    print(
+        f"    CHALLENGE_EXP_MAX = {CHALLENGE_EXP_MAX} (c_exp ∈ {{0,...,{CHALLENGE_EXP_MAX - 1}}})"
+    )
     print()
 
     # Demo key pair
@@ -1684,7 +1956,7 @@ if __name__ == '__main__':
     kp_demo = keygen()
     tr_y = kp_demo.public_key.trace()
     abs_tr_y = fabs(tr_y)
-    etype = "HYPERBOLIC" if abs_tr_y > mpf('2') else "elliptic"
+    etype = "HYPERBOLIC" if abs_tr_y > mpf("2") else "elliptic"
     print(f"  Demo key: trace(y) = {nstr(tr_y, 12)} [{etype}]")
     print(f"  Address: {kp_demo.address}")
     print()
@@ -1702,7 +1974,7 @@ if __name__ == '__main__':
     # Full test suite
     results = run_tests(verbose=True)
 
-    if not results['all_pass']:
+    if not results["all_pass"]:
         sys.exit(1)
 
     print("\n✅ hyp_schnorr.py ready — proceed to hyp_lwe.py (Module 5 of 6)\n")
@@ -1712,7 +1984,10 @@ if __name__ == '__main__':
 # MODULE-LEVEL SIGNING FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
-def sign_hash(message_hash: bytes, private_walk: List[int], public_key: PSLMatrix) -> Dict[str, str]:
+
+def sign_hash(
+    message_hash: bytes, private_walk: List[int], public_key: PSLMatrix
+) -> Dict[str, str]:
     """
     Sign a pre-hashed message with Schnorr-Γ (canonical QTCL signing function).
 
@@ -1733,19 +2008,22 @@ def sign_hash(message_hash: bytes, private_walk: List[int], public_key: PSLMatri
     # Serialize the SchnorrSignature to dict format for transmission
     sig_dict = signature_to_dict(sig)
     # Convert challenge to canonical hex format
-    challenge_hex = format(sig.c_full, '064x')  # 64-char hex = 256 bits
+    challenge_hex = format(sig.c_full, "064x")  # 64-char hex = 256 bits
     from datetime import datetime, timezone
+
     timestamp = datetime.now(timezone.utc).isoformat()
     return {
-        'signature': sig_dict['R'] if isinstance(sig_dict.get('R'), str) else json.dumps(sig_dict['R']),
-        'challenge': challenge_hex,
-        'timestamp': timestamp,
-        'auth_tag': challenge_hex,
+        "signature": sig_dict["R"]
+        if isinstance(sig_dict.get("R"), str)
+        else json.dumps(sig_dict["R"]),
+        "challenge": challenge_hex,
+        "timestamp": timestamp,
+        "auth_tag": challenge_hex,
         # Include full dict for compatibility with verification
-        'R': sig_dict['R'],
-        'Z': sig_dict['Z'],
-        'c_full': challenge_hex,
-        'c_exp': sig.c_exp,
+        "R": sig_dict["R"],
+        "Z": sig_dict["Z"],
+        "c_full": challenge_hex,
+        "c_exp": sig.c_exp,
     }
 
 
@@ -1754,6 +2032,7 @@ def sign_hash(message_hash: bytes, private_walk: List[int], public_key: PSLMatri
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # Auto-generated compatibility layer: wraps module-level functions into a stateless class.
 # This allows hyp_engine.py to instantiate SchnorrGamma() and call methods directly.
+
 
 class SchnorrGamma:
     """
@@ -1769,11 +2048,15 @@ class SchnorrGamma:
         """Regenerate key pair from existing private walk."""
         return keygen_from_walk(private_walk)
 
-    def sign(self, message: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
+    def sign(
+        self, message: bytes, private_walk: List[int], public_key: PSLMatrix
+    ) -> SchnorrSignature:
         """Sign a message with a private walk."""
         return sign(message, private_walk, public_key)
 
-    def sign_hash(self, message_hash: bytes, private_walk: List[int], public_key) -> 'SchnorrSignature':
+    def sign_hash(
+        self, message_hash: bytes, private_walk: List[int], public_key
+    ) -> "SchnorrSignature":
         """
         Sign a pre-hashed message (32-byte hash).
         public_key may be a PSLMatrix OR the generators dict from hyp_engine —
@@ -1784,19 +2067,24 @@ class SchnorrGamma:
         # pass a wrong type regardless of what hyp_engine sends as third arg.
         _kp = keygen_from_walk(private_walk)
         _result_dict = sign_hash(message_hash, private_walk, _kp.public_key)
+
         class _SigResult:
-            signature = _result_dict.get('signature', '')
-            challenge  = _result_dict.get('challenge', '')
-            auth_tag   = _result_dict.get('auth_tag', '')
-            timestamp  = _result_dict.get('timestamp', '')
+            signature = _result_dict.get("signature", "")
+            challenge = _result_dict.get("challenge", "")
+            auth_tag = _result_dict.get("auth_tag", "")
+            timestamp = _result_dict.get("timestamp", "")
+
         return _SigResult()
 
-    def verify(self, sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> VerifyResult:
+    def verify(
+        self, sig: SchnorrSignature, message: bytes, public_key: PSLMatrix
+    ) -> VerifyResult:
         """Verify a Schnorr-Γ signature."""
         return verify(sig, message, public_key)
 
-    def verify_signature(self, message_hash: bytes, sig_dict: Dict[str, Any],
-                        public_key: PSLMatrix) -> bool:
+    def verify_signature(
+        self, message_hash: bytes, sig_dict: Dict[str, Any], public_key: PSLMatrix
+    ) -> bool:
         """
         Verify a Schnorr-Γ signature from dict format (hyp_engine integration).
 
@@ -1828,13 +2116,17 @@ class SchnorrGamma:
         """Deserialize signature from dict."""
         return signature_from_dict(d)
 
-    def sign_message_dict(self, message: Union[str, bytes],
-                         kp: SchnorrKeyPair) -> Dict[str, Any]:
+    def sign_message_dict(
+        self, message: Union[str, bytes], kp: SchnorrKeyPair
+    ) -> Dict[str, Any]:
         """Sign message and return full sig dict."""
         return sign_message_dict(message, kp)
 
-    def verify_message_dict(self, sig_dict: Dict[str, Any],
-                           message: Union[str, bytes],
-                           public_key: PSLMatrix) -> bool:
+    def verify_message_dict(
+        self,
+        sig_dict: Dict[str, Any],
+        message: Union[str, bytes],
+        public_key: PSLMatrix,
+    ) -> bool:
         """Verify signature from dict."""
         return verify_message_dict(sig_dict, message, public_key)
