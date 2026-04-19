@@ -23092,27 +23092,18 @@ class QtclClientApp:
 
         for _retry in range(_max_retries):
             try:
-                # Use HEAD first for lightweight connectivity check
-                _rpc_check = _requests.head(
-                    f"{self.oracle_url}/rpc/oracle/snapshot", timeout=_base_timeout
-                )
-                if _rpc_check.status_code in (
-                    200,
-                    202,
-                    405,
-                ):  # 405 = HEAD not allowed, that's OK
-                    break
-                # If HEAD returns other codes, try GET with SSE headers
+                # Go straight to GET with SSE headers. SSE endpoints don't respond to HEAD.
                 _rpc_check = _requests.get(
                     f"{self.oracle_url}/rpc/oracle/snapshot",
                     headers={"Accept": "text/event-stream"},
                     timeout=_base_timeout,
                     stream=True,
                 )
-                # Read just the first few bytes to confirm it's a valid SSE stream
-                _ = _rpc_check.raw.read(128)
-                _rpc_check.close()
+                # Verify we got a successful response
                 if _rpc_check.status_code in (200, 202):
+                    # Read just the first few bytes to confirm it's a valid SSE stream
+                    _ = _rpc_check.raw.read(128)
+                    _rpc_check.close()
                     break
                 # Treat 5xx errors as retryable (server temporarily unavailable)
                 if 500 <= _rpc_check.status_code < 600:
