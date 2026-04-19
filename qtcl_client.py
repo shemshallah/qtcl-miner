@@ -5385,6 +5385,43 @@ class LiveRPCOracleSnapshot:
             logger.debug(f"[RPC-ORACLE] fetch_snapshot error: {e}")
             return {}
 
+    def _rpc(
+        self, method: str, params: list = None, timeout: int = 5, retries: int = 2
+    ):
+        """Generic JSON-RPC 2.0 call to server /rpc endpoint.
+
+        Used for health checks and metrics during bootstrap.
+        Returns result dict or None on failure.
+        """
+        import urllib.parse as _up
+
+        params_json = json.dumps(params or [])
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.ORACLE_URL}/rpc?{query}"
+
+        for attempt in range(retries):
+            try:
+                session = self._get_session()
+                if not session:
+                    return None
+
+                r = session.get(full_url, timeout=timeout)
+                if r.status_code == 200:
+                    result = r.json()
+                    if "result" in result:
+                        return result.get("result")
+                    elif "error" in result:
+                        return result
+                else:
+                    logger.debug(f"[RPC-ORACLE] {method} → HTTP {r.status_code}")
+            except Exception as e:
+                logger.debug(
+                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries} failed: {e}"
+                )
+                if attempt < retries - 1:
+                    time.sleep(2**attempt)
+        return None
+
     def get_oracle_dm(self) -> tuple:
         """Return (dm_re, dm_im, age_sec) thread-safe."""
         with self._dm_lock:
