@@ -8174,6 +8174,31 @@ class GenesisResetListener:
     def update_peers(self, peers: list) -> None:
         self._peers = list(peers)
 
+    def _rpc(self, method: str, params: list = None) -> dict:
+        """Make JSON-RPC 2.0 call to server."""
+        import json
+        import urllib.request as ur
+
+        if params is None:
+            params = []
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }
+
+        try:
+            url = f"{self._server_url}/rpc"
+            data = json.dumps(payload).encode('utf-8')
+            req = ur.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            with ur.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            logger.debug(f"[GRL] RPC call failed: {method}: {e}")
+            return {"error": str(e)}
+
     def _listen_loop(self) -> None:
         """RPC-only polling for chain_reset events. No SSE."""
         import urllib.request as _ur, urllib.error as _ue
