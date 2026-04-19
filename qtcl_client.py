@@ -29,6 +29,14 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from urllib.parse import quote, urlencode
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+# Optional: requests for SSE streaming (falls back to urllib if not available)
+try:
+    import requests
+
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 from collections import deque, defaultdict
 from pathlib import Path
 import base64
@@ -81,10 +89,15 @@ def _bootstrap_client_env() -> None:
     _tout = 6  # tight timeout — this is startup-path code
 
     def _rpc_call(method: str, params: dict = None) -> dict:
-        body = json.dumps(
-            {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}
-        ).encode()
-        req = _BR(_rpc, data=body, headers={"Content-Type": "application/json"})
+        # GET-based RPC with query parameters
+        query_params = {
+            "method": method,
+            "params": json.dumps(params or {}),
+            "id": 1,
+        }
+        query_string = urlencode(query_params)
+        url = f"{_rpc}?{query_string}"
+        req = _BR(url, method="GET")
         with _BU(req, timeout=_tout) as r:
             return json.loads(r.read().decode()).get("result") or {}
 
@@ -345,6 +358,175 @@ def fetch_peer_measurement(
     return None
 
 
+# ════════════════════════════════════════════════════════════════════════════════════════
+# SSE STREAM RECEIVERS: Density (16³ tensor) and Block streams
+# ════════════════════════════════════════════════════════════════════════════════════════
+
+
+def connect_density_stream(
+    server_url: str, callback: Callable[[dict], None]
+) -> threading.Thread:
+    """
+    Connect to /rpc/oracle/snapshot SSE stream.
+    Parse 16³ density tensor data and call callback with each event.
+
+    Args:
+        server_url: Base URL of the server (e.g., "https://qtcl-blockchain.koyeb.app")
+        callback: Function to call with parsed JSON data for each SSE event
+
+    Returns:
+        Daemon thread handle (already started)
+    """
+    url = f"{server_url.rstrip('/')}/rpc/oracle/snapshot"
+    headers = {"Accept": "text/event-stream"}
+
+    def _sse_reader():
+        consecutive_errors = 0
+        max_errors = 10
+        base_delay = 1.0
+
+        while True:
+            try:
+                if _HAS_REQUESTS:
+                    # Use requests with stream=True
+                    with requests.get(
+                        url, headers=headers, stream=True, timeout=30
+                    ) as resp:
+                        resp.raise_for_status()
+                        consecutive_errors = 0
+
+                        for line in resp.iter_lines(decode_unicode=True):
+                            if line is None:
+                                continue
+                            line_str = (
+                                line.strip()
+                                if isinstance(line, str)
+                                else line.decode().strip()
+                            )
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError as e:
+                                    _EXP_LOG.debug(
+                                        f"[SSE-DENSITY] JSON parse error: {e}"
+                                    )
+                else:
+                    # Fallback to urllib
+                    req = Request(url, headers=headers, method="GET")
+                    with urlopen(req, timeout=30) as resp:
+                        consecutive_errors = 0
+                        for line in resp:
+                            line_str = line.decode().strip()
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError as e:
+                                    _EXP_LOG.debug(
+                                        f"[SSE-DENSITY] JSON parse error: {e}"
+                                    )
+
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    _EXP_LOG.warning(f"[SSE-DENSITY] Connection failed: {e}")
+                if consecutive_errors > max_errors:
+                    _EXP_LOG.error(
+                        f"[SSE-DENSITY] Giving up after {max_errors} consecutive errors"
+                    )
+                    break
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
+                time.sleep(delay)
+
+    thread = threading.Thread(
+        target=_sse_reader, daemon=True, name="SSE-Density-Reader"
+    )
+    thread.start()
+    _EXP_LOG.info(f"[SSE-DENSITY] Connected to {url}")
+    return thread
+
+
+def connect_block_stream(
+    server_url: str, callback: Callable[[dict], None]
+) -> threading.Thread:
+    """
+    Connect to /rpc/blocks/stream SSE stream.
+    Parse block info and call callback with each block.
+
+    Args:
+        server_url: Base URL of the server (e.g., "https://qtcl-blockchain.koyeb.app")
+        callback: Function to call with parsed JSON block data for each SSE event
+
+    Returns:
+        Daemon thread handle (already started)
+    """
+    url = f"{server_url.rstrip('/')}/rpc/blocks/stream"
+    headers = {"Accept": "text/event-stream"}
+
+    def _sse_reader():
+        consecutive_errors = 0
+        max_errors = 10
+        base_delay = 1.0
+
+        while True:
+            try:
+                if _HAS_REQUESTS:
+                    # Use requests with stream=True
+                    with requests.get(
+                        url, headers=headers, stream=True, timeout=30
+                    ) as resp:
+                        resp.raise_for_status()
+                        consecutive_errors = 0
+
+                        for line in resp.iter_lines(decode_unicode=True):
+                            if line is None:
+                                continue
+                            line_str = (
+                                line.strip()
+                                if isinstance(line, str)
+                                else line.decode().strip()
+                            )
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError as e:
+                                    _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
+                else:
+                    # Fallback to urllib
+                    req = Request(url, headers=headers, method="GET")
+                    with urlopen(req, timeout=30) as resp:
+                        consecutive_errors = 0
+                        for line in resp:
+                            line_str = line.decode().strip()
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError as e:
+                                    _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
+
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    _EXP_LOG.warning(f"[SSE-BLOCK] Connection failed: {e}")
+                if consecutive_errors > max_errors:
+                    _EXP_LOG.error(
+                        f"[SSE-BLOCK] Giving up after {max_errors} consecutive errors"
+                    )
+                    break
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
+                time.sleep(delay)
+
+    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Block-Reader")
+    thread.start()
+    _EXP_LOG.info(f"[SSE-BLOCK] Connected to {url}")
+    return thread
+
+
 def average_density_matrices(measurements: List[str]) -> Optional[str]:
     """Average multiple 16³ density matrices (hex encoded) into consensus state."""
     try:
@@ -565,8 +747,11 @@ class HyperbolicEntropyPool:
         """Fetch entropy from server via RPC (not streaming)."""
         try:
             from urllib.parse import urlencode
+
             params_json = json.dumps([])
-            query = urlencode({"method": "qtcl_getEntropy", "params": params_json, "id": 1})
+            query = urlencode(
+                {"method": "qtcl_getEntropy", "params": params_json, "id": 1}
+            )
             full_url = f"{ENTROPY_SERVER_URL}/rpc?{query}"
             req = Request(full_url)
             req.add_header("User-Agent", "QTCL-Client/3.0")
@@ -4988,7 +5173,9 @@ class LiveRPCOracleSnapshot:
                         # Handle 429 Too Many Requests — server at capacity
                         if _r.status_code == 429:
                             _retry_after = int(_r.headers.get("Retry-After", "5"))
-                            _snap_error[0] = f"HTTP 429 (at capacity, retry after {_retry_after}s)"
+                            _snap_error[0] = (
+                                f"HTTP 429 (at capacity, retry after {_retry_after}s)"
+                            )
                             return
                         # Handle other non-2xx responses
                         if _r.status_code not in (200, 202):
@@ -5038,8 +5225,15 @@ class LiveRPCOracleSnapshot:
             if not snap:
                 try:
                     import urllib.parse as _up
+
                     params_json = json.dumps(_payload.get("params", []))
-                    query = _up.urlencode({"method": _payload.get("method"), "params": params_json, "id": 1})
+                    query = _up.urlencode(
+                        {
+                            "method": _payload.get("method"),
+                            "params": params_json,
+                            "id": 1,
+                        }
+                    )
                     _rpc_get_url = f"{_rpc_url}?{query}"
                     _r = session.get(_rpc_get_url, timeout=timeout_s)
                     if _r.status_code in (200, 202):
@@ -8062,11 +8256,12 @@ def _broadcast_reset_to_peers(
             if not host:
                 continue
             try:
+                # GET-based gossip broadcast with encoded payload
+                query_params = {"payload": json.dumps(_payload)}
+                query_string = urlencode(query_params)
                 _req = Request(
-                    f"http://{host}:{port}/gossip",
-                    data=json.dumps(_payload).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
+                    f"http://{host}:{port}/gossip?{query_string}",
+                    method="GET",
                 )
                 with urlopen(_req, timeout=4) as _r:
                     _r.read()
@@ -8190,7 +8385,7 @@ class GenesisResetListener:
             full_url = f"{url}?{query}"
             req = ur.Request(full_url)
             with ur.urlopen(req, timeout=5) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+                return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             logger.debug(f"[GRL] RPC call failed: {method}: {e}")
             return {"error": str(e)}
@@ -9972,8 +10167,13 @@ class QtclServer(QtclNode):
                 resp = req_handler.handle_GET(path, params)
                 self._send_response(resp)
 
-            def do_POST(self):
-                path, params, body = self._parse_request()
+            def do_GET(self):
+                from urllib.parse import parse_qs, urlparse
+
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                path = parsed.path
+                body = params.get("body", [params.get("data", ["{}"])[0]])[0]
                 resp = req_handler.handle_POST(path, body)
                 self._send_response(resp)
 
@@ -11539,6 +11739,7 @@ class KoyebRPCNodule:
     ) -> Optional[dict]:
         """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
         import urllib.parse as _up
+
         t = timeout or self.timeout
         last_error = None
 
@@ -11613,6 +11814,7 @@ class KoyebRPCNodule:
         """Like _rpc but returns the full JSON-RPC envelope including error objects.
         Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline)."""
         import urllib.parse as _up
+
         t = timeout or self.timeout
         params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
@@ -14105,6 +14307,7 @@ class ServerRPCClient:
         # ── STEP 1: Try Koyeb HTTP RPC (primary) ──────────────────────────────
         try:
             from urllib.parse import urlencode
+
             params_json = json.dumps(req_body.get("params", []))
             query = urlencode({"method": method, "params": params_json, "id": req_id})
             full_url = f"{self.server_url}?{query}"
@@ -15782,13 +15985,16 @@ class BlockPropagator:
             return {"accepted": False, "error": str(e)}
 
     def _send_rpc(self, peer: P2PPeer, method: str, params: dict) -> dict:
-        """Send RPC to peer"""
+        """Send RPC to peer via GET with query parameters"""
         try:
-            url = f"http://{peer.host}:{peer.port}/rpc"
-            data = json.dumps(
-                {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-            ).encode()
-            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            query_params = {
+                "method": method,
+                "params": json.dumps(params),
+                "id": 1,
+            }
+            query_string = urlencode(query_params)
+            url = f"http://{peer.host}:{peer.port}/rpc?{query_string}"
+            req = Request(url, method="GET")
             with urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read())
         except:
@@ -16669,18 +16875,18 @@ class P2PRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def do_POST(self):
-        if self.path != "/rpc":
+    def do_GET(self):
+        from urllib.parse import parse_qs, urlparse
+
+        if self.path.split("?")[0] != "/rpc":
             self.send_error(404)
             return
         client_ip = self.client_address[0]
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > 1_000_000:
-                self.send_error(413)
-                return
-            body = self.rfile.read(content_length)
-            request = json.loads(body)
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            request_data = params.get("data", [params.get("body", ["{}"])[0]])[0]
+            request = json.loads(request_data)
         except json.JSONDecodeError:
             self.send_error(400)
             return
@@ -22368,6 +22574,7 @@ class QtclClientApp:
             try:
                 # RPC call: get latest block via JSON-RPC 2.0
                 import urllib.parse as _kup
+
                 rpc_payload = {
                     "jsonrpc": "2.0",
                     "method": "qtcl_getBlockHeight",
@@ -22375,7 +22582,13 @@ class QtclClientApp:
                     "id": 1,
                 }
                 params_json = _kj.dumps(rpc_payload.get("params", []))
-                query = _kup.urlencode({"method": rpc_payload.get("method"), "params": params_json, "id": 1})
+                query = _kup.urlencode(
+                    {
+                        "method": rpc_payload.get("method"),
+                        "params": params_json,
+                        "id": 1,
+                    }
+                )
                 full_url = f"{_oracle_url}/rpc?{query}"
                 req = _KR(full_url)
                 req.add_header("User-Agent", "QTCL-RPC/5.0")
@@ -22834,14 +23047,18 @@ class QtclClientApp:
                     ):
                         pass
 
-            def do_POST(self):
-                clen = int(self.headers.get("Content-Length", 0))
-                body_bytes = self.rfile.read(clen)
+            def do_GET(self):
+                from urllib.parse import parse_qs, urlparse
+
                 path = self.path.split("?")[0].rstrip("/")
                 try:
-                    payload = _hj.loads(body_bytes.decode("utf-8", errors="replace"))
+                    parsed = urlparse(self.path)
+                    params = parse_qs(parsed.query)
+                    data_str = params.get("data", [params.get("body", ["{}"])[0]])[0]
+                    payload = _hj.loads(data_str)
                 except Exception:
                     payload = {}
+                body_bytes = data_str.encode("utf-8") if data_str else b"{}"
 
                 # ── ENTERPRISE P2P RPC DISPATCHER ──
                 if path in ("/rpc", "/api/rpc"):
@@ -22860,7 +23077,7 @@ class QtclClientApp:
                     ev = payload.get("event", "")
                     if ev == "chain_reset" and int(payload.get("new_height", -1)) == 0:
                         _RESET_PERFORMED.set()
-                        _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip POST")
+                        _EXP_LOG.warning("[HTTP-9091] ⚡ chain_reset via /gossip GET")
                     self._json_resp(200, {"ok": True})
                 elif path in ("/rpc/oracle/push_dm", "/api/oracle/push_snapshot"):
                     if payload and payload.get("density_matrix_hex"):
@@ -23130,7 +23347,9 @@ class QtclClientApp:
 
         for _retry in range(_boot_retries):
             try:
-                _boot_health = _LIVE_RPC_ORACLE._rpc("qtcl_getHealth", [], timeout=3, retries=1)
+                _boot_health = _LIVE_RPC_ORACLE._rpc(
+                    "qtcl_getHealth", [], timeout=3, retries=1
+                )
                 if _boot_health is not None:
                     break
                 _last_boot_error = "No response from health check"
@@ -23143,7 +23362,9 @@ class QtclClientApp:
                 if _retry == _boot_retries - 1:
                     print("\n  ❌ FATAL: Cannot connect to RPC endpoint", flush=True)
                     print(f"  Check: Is server running at {self.oracle_url}?")
-                    raise RuntimeError("RPC bootstrap failed: server unreachable (ConnectionRefused)")
+                    raise RuntimeError(
+                        "RPC bootstrap failed: server unreachable (ConnectionRefused)"
+                    )
                 if _retry < _boot_retries - 1:
                     print(f".", end="", flush=True)
                     _t.sleep(2 ** min(_retry, 4))
@@ -23158,7 +23379,9 @@ class QtclClientApp:
 
         if _boot_health is None:
             # Server is either down or saturated. Log warning and degrade.
-            print(f"\n  ⚠️  RPC endpoint slow/unavailable: {_last_boot_error}", flush=True)
+            print(
+                f"\n  ⚠️  RPC endpoint slow/unavailable: {_last_boot_error}", flush=True
+            )
             print("  Mining in degraded mode (local entropy fallback)", flush=True)
             _metrics = {}
         else:
@@ -23170,16 +23393,24 @@ class QtclClientApp:
         _metrics = {}
         print("  🌌 Checking quantum oracle…", end="", flush=True)
         try:
-            _m = _LIVE_RPC_ORACLE._rpc("qtcl_getQuantumMetrics", [], timeout=10, retries=2)
+            _m = _LIVE_RPC_ORACLE._rpc(
+                "qtcl_getQuantumMetrics", [], timeout=10, retries=2
+            )
             if isinstance(_m, dict) and _m.get("oracle_available"):
                 _metrics = _m
                 print(" ✅", flush=True)
             else:
                 print(" ⚠️", flush=True)
-                print("     Oracle initializing, will use local entropy fallback", flush=True)
+                print(
+                    "     Oracle initializing, will use local entropy fallback",
+                    flush=True,
+                )
         except Exception as _oracle_err:
             print(" ⚠️", flush=True)
-            print(f"     Oracle unavailable ({_oracle_err}), will use local entropy fallback", flush=True)
+            print(
+                f"     Oracle unavailable ({_oracle_err}), will use local entropy fallback",
+                flush=True,
+            )
 
         # ── Start quantum oracle mesh if SSE available (background snapshot polling) ────
         # If bootstrap didn't establish SSE due to server saturation, mining still proceeds
@@ -28310,6 +28541,7 @@ class NodeRPCMeshServer:
         """Execute a JSON-RPC 2.0 call against the main server."""
         try:
             from urllib.parse import urlencode
+
             params_json = json.dumps(params)
             query = urlencode({"method": method, "params": params_json, "id": 1})
             full_url = f"{self._server_url}/rpc?{query}"
@@ -29029,17 +29261,28 @@ class NodeRPCMeshServer:
                 elif path == "/rpc":
                     # GET /rpc?method=<method>&params=<json-encoded-params>
                     try:
-                        query_params = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+                        query_params = parse_qs(
+                            self.path.split("?", 1)[1] if "?" in self.path else ""
+                        )
                         method = query_params.get("method", [""])[0]
                         params_str = query_params.get("params", ["[]"])[0]
                         params = json.loads(params_str) if params_str else []
                         # Build JSON-RPC 2.0 request body from query params
-                        body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+                        body = json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": method,
+                                "params": params,
+                                "id": 1,
+                            }
+                        ).encode()
                         result, status = mesh._dispatch(body, peer)
                         self._send_json(result, status)
                     except Exception as e:
                         logger.debug(f"[MESH] GET /rpc parse error: {e}")
-                        self._send_json({"error": f"Invalid GET /rpc request: {e}"}, 400)
+                        self._send_json(
+                            {"error": f"Invalid GET /rpc request: {e}"}, 400
+                        )
                 elif path == "/rpc/chain/status":
                     self._send_json(mesh._rpc_getChainStatus([]))
                 elif path == "/rpc/oracle/pq0":
@@ -29060,14 +29303,18 @@ class NodeRPCMeshServer:
                 else:
                     self._send_json({"error": "not found"}, 404)
 
-            def do_POST(self):
+            def do_GET(self):
+                from urllib.parse import parse_qs, urlparse
+
                 path = self.path.split("?")[0]
                 peer = self.client_address[0]
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > 4_000_000:
-                    self._send_json({"error": "payload too large"}, 413)
-                    return
-                body = self.rfile.read(length) if length else b"{}"
+                try:
+                    parsed = urlparse(self.path)
+                    params = parse_qs(parsed.query)
+                    data_str = params.get("data", [params.get("body", ["{}"])[0]])[0]
+                    body = data_str.encode("utf-8") if data_str else b"{}"
+                except Exception:
+                    body = b"{}"
                 if path == "/rpc":
                     result, status = mesh._dispatch(body, peer)
                     self._send_json(result, status)
@@ -29471,6 +29718,66 @@ def main() -> None:  # noqa: F811
             logger.info(
                 "[ORACLE-AUDIT] Skipping mesh node (port 9091 reserved for P2P)"
             )
+
+        # ── SSE Stream Receivers ─────────────────────────────────────────────
+        # Start background threads to receive real-time density and block streams
+        _sse_density_handlers: List[Callable[[dict], None]] = []
+        _sse_block_handlers: List[Callable[[dict], None]] = []
+
+        def _default_density_handler(data: dict) -> None:
+            """Default handler for density stream - stores to global for reference."""
+            dm_hex = data.get("density_tensor_hex", "") or data.get(
+                "density_matrix_hex", ""
+            )
+            ts = data.get("timestamp_ns", 0) or data.get("timestamp", 0)
+            if dm_hex:
+                logger.debug(f"[SSE-RECV] Density snapshot received (ts={ts})")
+            # Store in global for other components to access
+            globals()["_LATEST_DENSITY_SNAPSHOT"] = data
+
+        def _default_block_handler(data: dict) -> None:
+            """Default handler for block stream - logs new blocks."""
+            height = data.get("height", 0) or data.get("block_height", 0)
+            block_hash = data.get("hash", "") or data.get("block_hash", "")
+            if height:
+                logger.info(
+                    f"[SSE-RECV] New block received: height={height}, hash={block_hash[:16]}..."
+                )
+            # Store in global for other components to access
+            globals()["_LATEST_BLOCK_EVENT"] = data
+
+        # Register default handlers
+        _sse_density_handlers.append(_default_density_handler)
+        _sse_block_handlers.append(_default_block_handler)
+
+        # Start SSE streams (only in non-audit modes to avoid cluttering logs)
+        if not _is_oracle_audit:
+            try:
+                _density_thread = connect_density_stream(url, _default_density_handler)
+                globals()["_SSE_DENSITY_THREAD"] = _density_thread
+            except Exception as _sse_err:
+                logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
+
+            try:
+                _block_thread = connect_block_stream(url, _default_block_handler)
+                globals()["_SSE_BLOCK_THREAD"] = _block_thread
+            except Exception as _sse_err:
+                logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
+
+        # Make handler registration available globally
+        globals()["_SSE_DENSITY_HANDLERS"] = _sse_density_handlers
+        globals()["_SSE_BLOCK_HANDLERS"] = _sse_block_handlers
+
+        def register_density_handler(handler: Callable[[dict], None]) -> None:
+            """Register an additional handler for density stream events."""
+            _sse_density_handlers.append(handler)
+
+        def register_block_handler(handler: Callable[[dict], None]) -> None:
+            """Register an additional handler for block stream events."""
+            _sse_block_handlers.append(handler)
+
+        globals()["register_density_handler"] = register_density_handler
+        globals()["register_block_handler"] = register_block_handler
 
         print("✅ Ready for input", flush=True)
     except Exception as e:
