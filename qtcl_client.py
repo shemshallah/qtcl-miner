@@ -4986,27 +4986,36 @@ class LiveRPCOracleSnapshot:
                             headers={"Accept": "text/event-stream"},
                             stream=True,
                         )
-                        if _r.status_code in (200, 202):
-                            try:
-                                # Read line by line from stream without loading entire response
-                                for _line in _r.iter_lines(
-                                    decode_unicode=True, chunk_size=1024
-                                ):
-                                    if _line.startswith("data: "):
-                                        try:
-                                            _envelope = json.loads(_line[6:])
-                                            _snap_result[0] = _envelope.get(
-                                                "result", _envelope
-                                            )
-                                            _r.close()  # Close immediately after getting first message
-                                            return
-                                        except json.JSONDecodeError:
-                                            continue
-                                    elif _line and not _line.startswith(":"):
-                                        _r.close()
+                        # Handle 429 Too Many Requests — server at capacity
+                        if _r.status_code == 429:
+                            _retry_after = int(_r.headers.get("Retry-After", "5"))
+                            _snap_error[0] = f"HTTP 429 (at capacity, retry after {_retry_after}s)"
+                            return
+                        # Handle other non-2xx responses
+                        if _r.status_code not in (200, 202):
+                            _snap_error[0] = f"HTTP {_r.status_code}"
+                            return
+                        # Read SSE stream successfully
+                        try:
+                            # Read line by line from stream without loading entire response
+                            for _line in _r.iter_lines(
+                                decode_unicode=True, chunk_size=1024
+                            ):
+                                if _line.startswith("data: "):
+                                    try:
+                                        _envelope = json.loads(_line[6:])
+                                        _snap_result[0] = _envelope.get(
+                                            "result", _envelope
+                                        )
+                                        _r.close()  # Close immediately after getting first message
                                         return
-                            finally:
-                                _r.close()
+                                    except json.JSONDecodeError:
+                                        continue
+                                elif _line and not _line.startswith(":"):
+                                    _r.close()
+                                    return
+                        finally:
+                            _r.close()
                     except Exception as e:
                         _snap_error[0] = e
 
@@ -23083,100 +23092,80 @@ class QtclClientApp:
         _snap = {}
         print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
 
-        # FAST-FAIL: Check if oracle snapshot endpoint is reachable with retries
-        # SSE streams need longer timeouts - initial handshake may take 5-10s
-        _max_retries = 3
-        _base_timeout = 10.0  # Increased from 3.0 for SSE stream handshake
-        _rpc_check = None
-        _last_error = None
+        # ── PHASE 1: Lightweight RPC reachability (via qtcl_getHealth) ──────────────────────
+        # Use JSON-RPC POST /rpc (not SSE) for reachability check. SSE connections are
+        # expensive on gunicorn. We only hard-fail on ConnectionRefused. Any 5xx from
+        # Koyeb's proxy (HTML 503 during worker saturation) is transient — retry with backoff.
+        print("  🔗 Checking RPC endpoint…", end="", flush=True)
+        _boot_retries = 5
+        _boot_health = None
+        _last_boot_error = None
 
-        for _retry in range(_max_retries):
+        for _retry in range(_boot_retries):
             try:
-                # Go straight to GET with SSE headers. SSE endpoints don't respond to HEAD.
-                _rpc_check = _requests.get(
-                    f"{self.oracle_url}/rpc/oracle/snapshot",
-                    headers={"Accept": "text/event-stream"},
-                    timeout=_base_timeout,
-                    stream=True,
-                )
-                # Verify we got a successful response
-                if _rpc_check.status_code in (200, 202):
-                    # Read just the first few bytes to confirm it's a valid SSE stream
-                    _ = _rpc_check.raw.read(128)
-                    _rpc_check.close()
+                _boot_health = _LIVE_RPC_ORACLE._rpc("qtcl_getHealth", [], timeout=3, retries=1)
+                if _boot_health is not None:
                     break
-                # Treat 5xx errors as retryable (server temporarily unavailable)
-                if 500 <= _rpc_check.status_code < 600:
-                    _last_error = f"HTTP {_rpc_check.status_code} (server error)"
-                    if _retry < _max_retries - 1:
-                        print(f".", end="", flush=True)
-                        _t.sleep(2**_retry + 1.0)  # Extra wait for server recovery
-                        continue
-                # 4xx errors are client errors and not retryable
-                raise RuntimeError(f"RPC endpoint error: HTTP {_rpc_check.status_code}")
-            except _requests.exceptions.Timeout as _te:
-                _last_error = f"timeout (attempt {_retry + 1}/{_max_retries})"
-                if _retry < _max_retries - 1:
+                _last_boot_error = "No response from health check"
+                if _retry < _boot_retries - 1:
                     print(f".", end="", flush=True)
-                    _t.sleep(2**_retry)  # Exponential backoff: 1s, 2s
+                    _t.sleep(2 ** min(_retry, 4))  # 1, 2, 4, 8, 16s, cap at 16s
                     continue
-                print(
-                    "\n  ❌ FATAL: RPC endpoint timeout (server not responding)",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    f"RPC bootstrap failed: server timeout after {_max_retries} attempts"
-                )
             except _requests.exceptions.ConnectionError as _ce:
-                _last_error = (
-                    f"connection refused (attempt {_retry + 1}/{_max_retries})"
-                )
-                if _retry < _max_retries - 1:
+                _last_boot_error = f"connection refused"
+                if _retry == _boot_retries - 1:
+                    print("\n  ❌ FATAL: Cannot connect to RPC endpoint", flush=True)
+                    print(f"  Check: Is server running at {self.oracle_url}?")
+                    raise RuntimeError("RPC bootstrap failed: server unreachable (ConnectionRefused)")
+                if _retry < _boot_retries - 1:
                     print(f".", end="", flush=True)
-                    _t.sleep(2**_retry)
+                    _t.sleep(2 ** min(_retry, 4))
                     continue
-                print("\n  ❌ FATAL: Cannot connect to RPC endpoint", flush=True)
-                print(f"  Check: Is server running at {self.oracle_url}?")
-                raise RuntimeError("RPC bootstrap failed: connection refused")
-            except Exception as _rpc_err:
-                _last_error = str(_rpc_err)
-                if _retry < _max_retries - 1:
+            except Exception as _boot_err:
+                # Could be timeout, 503, or other transient error
+                _last_boot_error = str(_boot_err)
+                if _retry < _boot_retries - 1:
                     print(f".", end="", flush=True)
-                    _t.sleep(2**_retry)
+                    _t.sleep(2 ** min(_retry, 4))
                     continue
-                print(f"\n  ❌ FATAL: RPC connection error: {_rpc_err}", flush=True)
-                raise RuntimeError(f"RPC bootstrap failed: {_rpc_err}")
 
-        # Verify oracle metrics are available (quantum data flows via SSE stream, not RPC)
-        _boot_deadline = _t.time() + 10.0
-        _boot_attempt = 0
-        while _t.time() < _boot_deadline:
-            _metrics = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=5.0)
-            if _metrics and _metrics.get("oracle_available"):
+        if _boot_health is None:
+            # Server is either down or saturated. Log warning and degrade.
+            print(f"\n  ⚠️  RPC endpoint slow/unavailable: {_last_boot_error}", flush=True)
+            print("  Mining in degraded mode (local entropy fallback)", flush=True)
+            _metrics = {}
+        else:
+            print(" ✓", flush=True)
+
+        # ── PHASE 2: Oracle metrics fetch (optional, non-blocking) ────────────────────────
+        # Attempt to get quantum metrics via RPC. If unavailable, mining continues anyway.
+        # The oracle snapshot is nice-to-have for entropy, not required.
+        _metrics = {}
+        print("  🌌 Checking quantum oracle…", end="", flush=True)
+        try:
+            _m = _LIVE_RPC_ORACLE._rpc("qtcl_getQuantumMetrics", [], timeout=10, retries=2)
+            if isinstance(_m, dict) and _m.get("oracle_available"):
+                _metrics = _m
                 print(" ✅", flush=True)
-                break
-            _boot_attempt += 1
-            if _boot_attempt > 2:
-                print(
-                    "\n  ❌ FATAL: Oracle not reporting available after 3 attempts",
-                    flush=True,
-                )
-                raise RuntimeError("RPC bootstrap failed: oracle_available=False")
-            print(".", end="", flush=True)
-            _t.sleep(1.0)
+            else:
+                print(" ⚠️", flush=True)
+                print("     Oracle initializing, will use local entropy fallback", flush=True)
+        except Exception as _oracle_err:
+            print(" ⚠️", flush=True)
+            print(f"     Oracle unavailable ({_oracle_err}), will use local entropy fallback", flush=True)
 
-        print(
-            f"  ✅ SSE stream subscription established at {self.oracle_url}/rpc/oracle/snapshot",
-            flush=True,
-        )
-        print(f"  ✅ Real-time 16³ quantum data flowing", flush=True)
-
-        # ── Start quantum oracle mesh (background 30s snapshot cycle) ───────────────
+        # ── Start quantum oracle mesh if SSE available (background snapshot polling) ────
+        # If bootstrap didn't establish SSE due to server saturation, mining still proceeds
+        # in degraded mode. The oracle mesh can attempt SSE in the background.
         if self._sse_client:
             try:
                 self._oracle_mesh = ClientOracleMesh(self._sse_client, self)
                 self._oracle_mesh.start()
                 _EXP_LOG.info("[App] Quantum oracle mesh started")
+                print(
+                    f"  ✅ Background oracle mesh polling {self.oracle_url}/rpc/oracle/snapshot",
+                    flush=True,
+                )
             except Exception as e:
                 _EXP_LOG.warning(f"[App] Failed to start oracle mesh: {e}")
                 self._oracle_mesh = None
