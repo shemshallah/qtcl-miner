@@ -5394,6 +5394,8 @@ class LiveRPCOracleSnapshot:
         Returns result dict or None on failure.
         """
         import urllib.parse as _up
+        import urllib.request as _ur
+        import socket
 
         params_json = json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
@@ -5401,25 +5403,24 @@ class LiveRPCOracleSnapshot:
 
         for attempt in range(retries):
             try:
-                session = self._get_session()
-                if not session:
-                    return None
-
-                r = session.get(full_url, timeout=timeout)
-                if r.status_code == 200:
-                    result = r.json()
+                # Use urllib with explicit socket timeout (more reliable than requests)
+                req = _ur.Request(full_url, headers={"Accept": "application/json"})
+                # Set socket timeout before urlopen
+                socket.setdefaulttimeout(timeout)
+                with _ur.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
                     if "result" in result:
                         return result.get("result")
                     elif "error" in result:
                         return result
-                else:
-                    logger.debug(f"[RPC-ORACLE] {method} → HTTP {r.status_code}")
             except Exception as e:
                 logger.debug(
                     f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries} failed: {e}"
                 )
                 if attempt < retries - 1:
-                    time.sleep(2**attempt)
+                    time.sleep(min(2**attempt, 5))  # Cap backoff at 5s
+            finally:
+                socket.setdefaulttimeout(None)  # Reset to default
         return None
 
     def get_oracle_dm(self) -> tuple:
