@@ -1855,11 +1855,12 @@ class HypGammaEngine:
     
     def generate_keypair(self) -> HypKeyPair:
         """Generate new HypΓ keypair."""
-        kp_dict = self._hyp_engine.generate_keypair()
+        kp = self._hyp_engine.generate_keypair()
+        # kp is a NamedTuple from hyp_engine; convert to client's HypKeyPair
         return HypKeyPair(
-            public_key=kp_dict.get('public_key', ''),
-            private_key=kp_dict.get('private_key', ''),
-            address=kp_dict.get('address', '')
+            public_key=kp.public_key,
+            private_key=kp.private_key,
+            address=kp.address
         )
     
     def sign_hash(self, message_hash: bytes, private_key: str) -> Dict[str, str]:
