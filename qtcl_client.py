@@ -564,15 +564,11 @@ class HyperbolicEntropyPool:
     def _fetch_server(self, height: int = 0, pq_curr: str = "") -> Optional[bytes]:
         """Fetch entropy from server via RPC (not streaming)."""
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "qtcl_getEntropy",
-                "params": [],
-                "id": 1,
-            }
-            body = json.dumps(payload).encode()
-            req = Request(f"{ENTROPY_SERVER_URL}/rpc", data=body, method="POST")
-            req.add_header("Content-Type", "application/json")
+            from urllib.parse import urlencode
+            params_json = json.dumps([])
+            query = urlencode({"method": "qtcl_getEntropy", "params": params_json, "id": 1})
+            full_url = f"{ENTROPY_SERVER_URL}/rpc?{query}"
+            req = Request(full_url)
             req.add_header("User-Agent", "QTCL-Client/3.0")
             if ENTROPY_API_KEY:
                 req.add_header("X-Entropy-Key", ENTROPY_API_KEY)
@@ -8182,21 +8178,17 @@ class GenesisResetListener:
         """Make JSON-RPC 2.0 call to server."""
         import json
         import urllib.request as ur
+        import urllib.parse as up
 
         if params is None:
             params = []
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": 1,
-        }
-
         try:
             url = f"{self._server_url}/rpc"
-            data = json.dumps(payload).encode('utf-8')
-            req = ur.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            params_json = json.dumps(params)
+            query = up.urlencode({"method": method, "params": params_json, "id": 1})
+            full_url = f"{url}?{query}"
+            req = ur.Request(full_url)
             with ur.urlopen(req, timeout=5) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except Exception as e:
@@ -11620,21 +11612,21 @@ class KoyebRPCNodule:
     ) -> Optional[dict]:
         """Like _rpc but returns the full JSON-RPC envelope including error objects.
         Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline)."""
+        import urllib.parse as _up
         t = timeout or self.timeout
-        url = f"{self.base_url}/rpc"
-        payload = {"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1}
+        params_json = _json.dumps(params or [])
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.base_url}/rpc?{query}"
         for attempt in range(retries):
             try:
                 if _HAS_REQUESTS:
-                    r = self._get_session().post(url, json=payload, timeout=t)
+                    r = self._get_session().get(full_url, timeout=t)
                     if r.status_code == 200:
                         return r.json()
                 else:
                     import urllib.request as _ur
 
-                    body = _json.dumps(payload).encode()
-                    req = _ur.Request(url, data=body, method="POST")
-                    req.add_header("Content-Type", "application/json")
+                    req = _ur.Request(full_url)
                     with _ur.urlopen(req, timeout=t) as resp:
                         return _json.loads(resp.read().decode("utf-8"))
             except Exception as e:
@@ -14112,14 +14104,15 @@ class ServerRPCClient:
 
         # ── STEP 1: Try Koyeb HTTP RPC (primary) ──────────────────────────────
         try:
+            from urllib.parse import urlencode
+            params_json = json.dumps(req_body.get("params", []))
+            query = urlencode({"method": method, "params": params_json, "id": req_id})
+            full_url = f"{self.server_url}?{query}"
             req = Request(
-                self.server_url,
-                data=json.dumps(req_body).encode("utf-8"),
+                full_url,
                 headers={
-                    "Content-Type": "application/json",
                     "User-Agent": "QTCL-RPC/2.0",
                 },
-                method="POST",
             )
             with urlopen(req, timeout=5) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
@@ -22374,15 +22367,17 @@ class QtclClientApp:
         while not self._stop.is_set():
             try:
                 # RPC call: get latest block via JSON-RPC 2.0
+                import urllib.parse as _kup
                 rpc_payload = {
                     "jsonrpc": "2.0",
                     "method": "qtcl_getBlockHeight",
                     "params": [],
                     "id": 1,
                 }
-                body = _kj.dumps(rpc_payload).encode()
-                req = _KR(f"{_oracle_url}/rpc", data=body, method="POST")
-                req.add_header("Content-Type", "application/json")
+                params_json = _kj.dumps(rpc_payload.get("params", []))
+                query = _kup.urlencode({"method": rpc_payload.get("method"), "params": params_json, "id": 1})
+                full_url = f"{_oracle_url}/rpc?{query}"
+                req = _KR(full_url)
                 req.add_header("User-Agent", "QTCL-RPC/5.0")
 
                 ssl_ctx = _kssl.create_default_context()
@@ -28313,14 +28308,12 @@ class NodeRPCMeshServer:
     # ─────────────────────────────────────────────────────────────────────────
     def _fetch_server_rpc(self, method: str, params: list, timeout: float = 8.0) -> Any:
         """Execute a JSON-RPC 2.0 call against the main server."""
-        payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
         try:
-            req = Request(
-                f"{self._server_url}/rpc",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+            from urllib.parse import urlencode
+            params_json = json.dumps(params)
+            query = urlencode({"method": method, "params": params_json, "id": 1})
+            full_url = f"{self._server_url}/rpc?{query}"
+            req = Request(full_url)
             with urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read())
             result = body.get("result")
