@@ -5038,10 +5038,14 @@ class LiveRPCOracleSnapshot:
             except Exception as _sse_e:
                 logger.debug(f"[RPC-ORACLE] SSE failed: {_sse_e} (trying RPC)")
 
-            # FALLBACK: POST /rpc with qtcl_getQuantumMetrics
+            # FALLBACK: GET /rpc with qtcl_getQuantumMetrics
             if not snap:
                 try:
-                    _r = session.post(_rpc_url, json=_payload, timeout=timeout_s)
+                    import urllib.parse as _up
+                    params_json = json.dumps(_payload.get("params", []))
+                    query = _up.urlencode({"method": _payload.get("method"), "params": params_json, "id": 1})
+                    _rpc_get_url = f"{_rpc_url}?{query}"
+                    _r = session.get(_rpc_get_url, timeout=timeout_s)
                     if _r.status_code in (200, 202):
                         _body = _r.json()
                         snap = _body.get("result") or {}
@@ -11575,9 +11579,7 @@ class KoyebRPCNodule:
                 else:
                     import urllib.request as _ur
 
-                    body = _json.dumps(payload).encode()
-                    req = _ur.Request(url, data=body, method="POST")
-                    req.add_header("Content-Type", "application/json")
+                    req = _ur.Request(full_url)
                     with _ur.urlopen(req, timeout=t) as resp:
                         result = _json.loads(resp.read().decode("utf-8"))
                         if "result" in result:
