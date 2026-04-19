@@ -16137,7 +16137,7 @@ class SyncManager:
         return 0
 
     def _request_blocks(self, peer: P2PPeer, from_height: int, limit: int) -> dict:
-        """Request blocks from peer"""
+        """Request blocks from peer via GET"""
         try:
             url = f"http://{peer.host}:{peer.port}/rpc"
             params = {
@@ -16145,15 +16145,10 @@ class SyncManager:
                 "to_height": from_height + limit,
                 "limit": limit,
             }
-            data = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_p2p_getBlocks",
-                    "params": params,
-                    "id": 1,
-                }
-            ).encode()
-            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            query = urlencode(
+                {"method": "qtcl_p2p_getBlocks", "params": json.dumps(params), "id": 1}
+            )
+            req = Request(f"{url}?{query}", method="GET")
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read()).get("result", {})
         except:
@@ -18756,10 +18751,8 @@ class EnhancedBlockPropagator:
     def _send_rpc(self, peer: Any, method: str, params: dict) -> dict:
         try:
             url = f"http://{peer.host}:{peer.port}/rpc"
-            data = json.dumps(
-                {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-            ).encode()
-            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            query = urlencode({"method": method, "params": json.dumps(params), "id": 1})
+            req = Request(f"{url}?{query}", method="GET")
             with urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read())
         except:
@@ -18889,15 +18882,10 @@ class EnhancedSyncManager:
         try:
             url = f"http://{peer.host}:{peer.port}/rpc"
             params = {"from_height": from_height, "count": count}
-            data = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_p2p_getHeaders",
-                    "params": params,
-                    "id": 1,
-                }
-            ).encode()
-            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            query = urlencode(
+                {"method": "qtcl_p2p_getHeaders", "params": json.dumps(params), "id": 1}
+            )
+            req = Request(f"{url}?{query}", method="GET")
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read()).get("result", {})
         except:
@@ -18911,15 +18899,10 @@ class EnhancedSyncManager:
                 "to_height": from_height + limit,
                 "limit": limit,
             }
-            data = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "qtcl_p2p_getBlocks",
-                    "params": params,
-                    "id": 1,
-                }
-            ).encode()
-            req = Request(url, data=data, headers={"Content-Type": "application/json"})
+            query = urlencode(
+                {"method": "qtcl_p2p_getBlocks", "params": json.dumps(params), "id": 1}
+            )
+            req = Request(f"{url}?{query}", method="GET")
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read()).get("result", {})
         except:
