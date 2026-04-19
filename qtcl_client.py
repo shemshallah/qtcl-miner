@@ -195,7 +195,6 @@ RPC_ENDPOINTS = {
     "dht_hello":         "/api/dht/hello",         # GET  → DHT bootstrap
     
     # Mining RPC
-    "blocks_submit":     "/api/blocks/submit",     # POST → submit mined block
     "tx_submit":         "/api/transactions",      # POST → submit transaction
     "oracle_push_dm":    "/rpc/oracle/push_dm",    # POST → push DM frame
 }
@@ -9862,13 +9861,6 @@ class _MiningTelemetry:
     def mark_submitting(self) -> None:
         with self._lock:
             self.state = "SUBMITTING"
-    def record_submission(self, block_height: int, reward_qtcl: float) -> None:
-        """Record successful block submission with reward."""
-        with self._lock:
-            self.blocks_accepted += 1
-            self.total_earned_qtcl += reward_qtcl
-            self.last_reward_qtcl = reward_qtcl
-            self.state = "IDLE"
     def record_block_accepted(self, height: int, hash: str, nonce: int, timestamp: float, fidelity: float, reward_qtcl: float = 7.20) -> None:
         """❤️  I love you — accept: increments blocks_accepted, credits actual reward."""
         with self._lock:
@@ -16788,6 +16780,11 @@ class QtclClientApp:
         else:
             print(f"  ✅ Wallet already loaded: {self.wallet.address}", flush=True)
 
+        # SSE stream counts as a valid DM source — check it before printing degraded
+        _sse_snap = self._sse_client.get_latest_snapshot() if self._sse_client else None
+        if not _dm_ready and _sse_snap:
+            _dm_ready = True  # SSE stream is delivering DMs, not degraded
+
         if _dm_ready:
             print(f"  ✅ Oracle state: ACTIVE  fidelity={_w_fid:.4f}", flush=True)
             print(f"  ⛏️  Mining at height {bh}  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
@@ -16876,25 +16873,43 @@ class QtclClientApp:
             
             class _SubmissionPipeline:
                 """⚛️ Enterprise RPC submission with atomic quantum state locking."""
-                RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]  # 61s window
-                
+                MAX_RETRIES = 6                                      # max submission attempts per block
+                RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]  # exponential backoff: 61s window
+                MAX_TIMEOUT_S = 120.0                                # abandon block if >120s elapsed
+
                 def __init__(self):
                     self.submit_count = 0
                     self.accept_count = 0
                     self.reject_count = 0
-                
+
                 async def submit(self, payload: dict, block_height: int, block_hash: str) -> tuple:
-                    """RPC submission with exponential backoff retry. Single logical path."""
+                    """RPC submission with exponential backoff retry and timeout enforcement.
+
+                    Returns (True, result) on success or chain advancement.
+                    Returns (False, result) on permanent rejection or timeout.
+                    """
                     self.submit_count += 1
                     last_error = None
-                    
+                    _submit_start = _t.time()
+
                     for attempt, backoff in enumerate(self.RETRY_BACKOFFS):
+                        # Check total timeout — abandon if exceeded
+                        _elapsed = _t.time() - _submit_start
+                        if _elapsed > self.MAX_TIMEOUT_S:
+                            _EXP_LOG.error(
+                                f"[SUBMIT] ⏱️  TIMEOUT h={block_height} "
+                                f"after {_elapsed:.0f}s (>{self.MAX_TIMEOUT_S:.0f}s limit) "
+                                f"— giving up"
+                            )
+                            self.reject_count += 1
+                            return (False, {'error': f'Submission timeout after {_elapsed:.0f}s'})
+
                         try:
                             _EXP_LOG.info(
-                                f"[SUBMIT] Attempt {attempt+1}/6: h={block_height} "
-                                f"hash={block_hash[:16]}…"
+                                f"[SUBMIT] Attempt {attempt+1}/{self.MAX_RETRIES}: h={block_height} "
+                                f"hash={block_hash[:16]}… ({_elapsed:.0f}s elapsed)"
                             )
-                            
+
                             # RPC call with timeout (no internal retry — we handle retry loop)
                             # Use _rpc_envelope to get full response including error details
                             # needed for smart rejection handling (entropy_expired, Invalid height)
@@ -16906,16 +16921,20 @@ class QtclClientApp:
                             )
                             result = _envelope.get('result') if isinstance(_envelope, dict) and 'result' in _envelope else \
                                      (_envelope if isinstance(_envelope, dict) and 'error' in _envelope else None)
-                            
+
+                            _EXP_LOG.info(f"[SUBMIT] Server response: {str(_envelope)[:300]}")
+                            print(f"  📨 Submit response: {str(_envelope)[:200]}", flush=True)
+
                             # ✅ SUCCESS: Block accepted
                             if isinstance(result, dict) and result.get("status") == "accepted":
                                 _EXP_LOG.warning(
                                     f"[SUBMIT] ✅ ACCEPTED h={block_height} "
-                                    f"hash={block_hash[:16]}… attempts={attempt+1}"
+                                    f"hash={block_hash[:16]}… attempts={attempt+1} "
+                                    f"time={_t.time()-_submit_start:.1f}s"
                                 )
                                 self.accept_count += 1
                                 return (True, result)
-                            
+
                             # ⚠️ DUPLICATE: Chain advanced, block already accepted
                             elif isinstance(result, dict) and result.get("status") == "duplicate":
                                 _EXP_LOG.info(
@@ -16924,7 +16943,7 @@ class QtclClientApp:
                                 )
                                 self.accept_count += 1
                                 return (True, result)
-                            
+
                             # ❌ ERROR: Check if chain advanced or real validation error
                             elif isinstance(result, dict) and "error" in result:
                                 _err_raw = result.get("error", {})
@@ -16945,35 +16964,37 @@ class QtclClientApp:
                                 )
                                 self.reject_count += 1
                                 return (False, result)
-                            
+
                             # RPC returned None (network error) — retry
                             elif result is None:
                                 last_error = "RPC returned None"
                                 _EXP_LOG.warning(
                                     f"[SUBMIT] Attempt {attempt+1}: {last_error}"
                                 )
-                            
+
                             else:
                                 # Unexpected response format
                                 last_error = f"Unexpected response: {type(result)}"
                                 _EXP_LOG.warning(
                                     f"[SUBMIT] Attempt {attempt+1}: {last_error}"
                                 )
-                        
+
                         except Exception as e:
                             last_error = str(e)
                             _EXP_LOG.warning(
                                 f"[SUBMIT] Attempt {attempt+1} exception: {last_error}"
                             )
-                        
+
                         # Backoff before next attempt
                         if attempt < len(self.RETRY_BACKOFFS) - 1:
                             _EXP_LOG.info(f"[SUBMIT] Retry in {backoff:.1f}s…")
                             await _asyncio.sleep(backoff)
-                    
+
                     # All retries exhausted
+                    _total_time = _t.time() - _submit_start
                     _EXP_LOG.error(
-                        f"[SUBMIT] ❌ FAILED after 6 attempts (61s window): {last_error}"
+                        f"[SUBMIT] ❌ FAILED h={block_height} after {self.MAX_RETRIES} attempts "
+                        f"({_total_time:.1f}s): {last_error}"
                     )
                     self.reject_count += 1
                     return (False, None)
@@ -17748,7 +17769,7 @@ class QtclClientApp:
                         if isinstance(_result, dict):
                             _err_obj = _result.get("error") or _result
                             _err_msg = str(_err_obj.get("message", "") if isinstance(_err_obj, dict) else _err_obj)
-                        
+
                         if "entropy_expired" in _err_msg:
                             # Seed is stale — rebuild block with fresh seed, same height
                             _EXP_LOG.warning(
@@ -17762,16 +17783,24 @@ class QtclClientApp:
                             _MINE_TELEM.mark_mining()
                             await _asyncio.sleep(0.1)
                             # Don't go IDLE — loop continues immediately
+                            continue
                         elif "Invalid height" in _err_msg or "chain advanced" in _err_msg.lower():
                             # Chain moved, need fresh tip
                             _EXP_LOG.info(f"[MINER] height mismatch on submit — restarting from tip")
                             _MINE_TELEM.mark_mining()
                             await _asyncio.sleep(0.1)
+                            continue
                         else:
-                            # Unknown rejection (DB error, etc.) — brief pause then retry
-                            _EXP_LOG.warning(f"[MINER] ⚠️  submit rejected: {_err_msg[:120]} — retrying")
-                            _MINE_TELEM.mark_mining()
+                            # Submission failed after max retries — give up on this block and move on
+                            _EXP_LOG.error(
+                                f"[SUBMIT] ❌ Block h={target_height} failed after 6 attempts "
+                                f"({_submission.RETRY_BACKOFFS[-1] + sum(_submission.RETRY_BACKOFFS[:-1]):.0f}s timeout) — moving on"
+                            )
+                            _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} failed: {_err_msg or 'no response'}")
+                            print(f"\n  ❌ Block h={target_height} rejected: {_err_msg or 'server returned no response'}", flush=True)
+                            _MINE_TELEM.mark_idle()
                             await _asyncio.sleep(1.0)
+                            continue
                 
                 except Exception as e:
                     _EXP_LOG.error(

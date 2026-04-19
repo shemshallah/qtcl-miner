@@ -1709,6 +1709,47 @@ if __name__ == '__main__':
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
+# MODULE-LEVEL SIGNING FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+def sign_hash(message_hash: bytes, private_walk: List[int], public_key: PSLMatrix) -> Dict[str, str]:
+    """
+    Sign a pre-hashed message with Schnorr-Γ (canonical QTCL signing function).
+
+    Parameters:
+        message_hash (bytes): SHA3-256 hash of message (32 bytes)
+        private_walk (List[int]): Private key as walk index sequence
+        public_key (PSLMatrix): Public key (Y element in PSL(2,ℝ))
+
+    Returns:
+        dict: {
+            'signature': hex(R‖Z),
+            'challenge': hex(c),
+            'timestamp': ISO 8601,
+            'auth_tag': hex(c),  # backward compat field
+        }
+    """
+    sig = sign(message_hash, private_walk, public_key)
+    # Serialize the SchnorrSignature to dict format for transmission
+    sig_dict = signature_to_dict(sig)
+    # Convert challenge to canonical hex format
+    challenge_hex = format(sig.c_full, '064x')  # 64-char hex = 256 bits
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).isoformat()
+    return {
+        'signature': sig_dict['R'] if isinstance(sig_dict.get('R'), str) else json.dumps(sig_dict['R']),
+        'challenge': challenge_hex,
+        'timestamp': timestamp,
+        'auth_tag': challenge_hex,
+        # Include full dict for compatibility with verification
+        'R': sig_dict['R'],
+        'Z': sig_dict['Z'],
+        'c_full': challenge_hex,
+        'c_exp': sig.c_exp,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
 # SCHNORRGAMMA CLASS — Unified API Facade
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # Auto-generated compatibility layer: wraps module-level functions into a stateless class.
@@ -1719,37 +1760,51 @@ class SchnorrGamma:
     HypΓ Schnorr-Γ Cryptosystem — Unified API Facade.
     Stateless wrapper around module functions.
     """
-    
+
     def keygen(self) -> SchnorrKeyPair:
         """Generate a random Schnorr-Γ key pair."""
         return keygen()
-    
+
     def keygen_from_walk(self, private_walk: List[int]) -> SchnorrKeyPair:
         """Regenerate key pair from existing private walk."""
         return keygen_from_walk(private_walk)
-    
+
     def sign(self, message: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
         """Sign a message with a private walk."""
         return sign(message, private_walk, public_key)
 
-    def sign_hash(self, message_hash: bytes, private_walk: List[int], public_key: PSLMatrix) -> SchnorrSignature:
-        """Sign a message hash (alias for sign, for hyp_engine compatibility)."""
-        return sign(message_hash, private_walk, public_key)
+    def sign_hash(self, message_hash: bytes, private_walk: List[int], public_key) -> 'SchnorrSignature':
+        """
+        Sign a pre-hashed message (32-byte hash).
+        public_key may be a PSLMatrix OR the generators dict from hyp_engine —
+        we always derive the canonical PSLMatrix from the private_walk to be safe.
+        Returns an object with .signature and .challenge string attributes.
+        """
+        # Derive the PSLMatrix public key from the private walk so we never
+        # pass a wrong type regardless of what hyp_engine sends as third arg.
+        _kp = keygen_from_walk(private_walk)
+        _result_dict = sign_hash(message_hash, private_walk, _kp.public_key)
+        class _SigResult:
+            signature = _result_dict.get('signature', '')
+            challenge  = _result_dict.get('challenge', '')
+            auth_tag   = _result_dict.get('auth_tag', '')
+            timestamp  = _result_dict.get('timestamp', '')
+        return _SigResult()
 
     def verify(self, sig: SchnorrSignature, message: bytes, public_key: PSLMatrix) -> VerifyResult:
         """Verify a Schnorr-Γ signature."""
         return verify(sig, message, public_key)
-    
-    def verify_signature(self, message_hash: bytes, sig_dict: Dict[str, Any], 
+
+    def verify_signature(self, message_hash: bytes, sig_dict: Dict[str, Any],
                         public_key: PSLMatrix) -> bool:
         """
         Verify a Schnorr-Γ signature from dict format (hyp_engine integration).
-        
+
         Parameters:
             message_hash (bytes): 32-byte hash of message
             sig_dict (dict): Signature dict with keys: 'signature', 'challenge'
             public_key (PSLMatrix): Signer's public key matrix
-        
+
         Returns:
             bool: True if signature is valid, False otherwise.
         """
@@ -1760,26 +1815,26 @@ class SchnorrGamma:
         except Exception as e:
             logger.error(f"[SchnorrΓ] verify_signature failed: {e}", exc_info=True)
             return False
-    
+
     def verify_simulation(self, sig: SchnorrSignature, public_key: PSLMatrix) -> bool:
         """Run HVZK simulator check on signature."""
         return verify_simulation(sig, public_key)
-    
+
     def signature_to_dict(self, sig: SchnorrSignature) -> Dict[str, Any]:
         """Serialize signature to JSON-compatible dict."""
         return signature_to_dict(sig)
-    
+
     def signature_from_dict(self, d: Dict[str, Any]) -> SchnorrSignature:
         """Deserialize signature from dict."""
         return signature_from_dict(d)
-    
-    def sign_message_dict(self, message: Union[str, bytes], 
+
+    def sign_message_dict(self, message: Union[str, bytes],
                          kp: SchnorrKeyPair) -> Dict[str, Any]:
         """Sign message and return full sig dict."""
         return sign_message_dict(message, kp)
-    
-    def verify_message_dict(self, sig_dict: Dict[str, Any], 
-                           message: Union[str, bytes], 
+
+    def verify_message_dict(self, sig_dict: Dict[str, Any],
+                           message: Union[str, bytes],
                            public_key: PSLMatrix) -> bool:
         """Verify signature from dict."""
         return verify_message_dict(sig_dict, message, public_key)
