@@ -8346,6 +8346,917 @@ class TensorFieldMetrics:
         except Exception as e:
             _EXP_LOG.debug(f"[TENSOR] compute: {e}")
         return m
+
+class ClientQuantumMetrics:
+    """
+    Pure static methods class providing all quantum metric calculations on density matrices.
+    All methods operate on 8×8 complex128 density matrices in Fock space.
+    W3 state: (|001⟩ + |010⟩ + |100⟩) / √3, with indices {1, 2, 4} in 8-dim Hilbert space.
+    """
+
+    @staticmethod
+    def w3_fidelity(rho: "Any") -> float:
+        """
+        Compute W3 state fidelity: F = Tr(ρ |W3⟩⟨W3|).
+        W3 = (|001⟩ + |010⟩ + |100⟩) / √3
+        In 8-dim Fock space, only indices {1,2,4} contribute.
+        F = (1/3) × Σ_{i,j ∈ {1,2,4}} ρ[i,j]
+
+        Args:
+            rho: 8×8 complex128 density matrix
+
+        Returns:
+            Fidelity value in [0, 1]
+        """
+        if not _HAS_NP or rho is None:
+            return 0.0
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+            if rho.shape != (8, 8):
+                return 0.0
+            # W3 indices: {1, 2, 4}
+            indices = [1, 2, 4]
+            fid = 0.0
+            for i in indices:
+                for j in indices:
+                    fid += _np.real(rho[i, j])
+            fid_normalized = fid / 3.0
+            # Clamp to [0,1] range and warn if clamping occurred
+            if fid_normalized > 1.0:
+                import warnings
+                warnings.warn(f"W3 fidelity exceeded 1.0: {fid_normalized}, clamping to 1.0", stacklevel=2)
+            return float(max(0.0, min(1.0, fid_normalized)))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def purity(rho: "Any") -> float:
+        """
+        Compute purity: P = Tr(ρ²).
+        For pure state: P = 1.0
+        For maximally mixed 8-dim: P ≈ 0.125
+
+        Args:
+            rho: 8×8 complex128 density matrix
+
+        Returns:
+            Purity in [0, 1]
+        """
+        if not _HAS_NP or rho is None:
+            return 0.0
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+            if rho.shape != (8, 8):
+                return 0.0
+            rho_sq = rho @ rho
+            p = float(_np.real(_np.trace(rho_sq)))
+            return float(max(0.0, min(1.0, p)))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def von_neumann_entropy(rho: "Any") -> float:
+        """
+        Compute von Neumann entropy: S = -Tr(ρ log₂ ρ).
+        Uses eigendecomposition; eigenvalues < 1e-14 treated as 0.
+        For pure state: S = 0.0
+        For maximally mixed 8-dim: S ≈ 3.0
+
+        Args:
+            rho: 8×8 complex128 density matrix
+
+        Returns:
+            Non-negative entropy value
+        """
+        if not _HAS_NP or rho is None:
+            return 0.0
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+            if rho.shape != (8, 8):
+                return 0.0
+            evals = _np.linalg.eigvalsh(rho)
+            evals = _np.real(evals)
+            # Explicit minimum clamp to prevent log(-inf) from small negative values
+            evals = _np.maximum(evals, 1e-15)
+            # Zero out eigenvalues below threshold to avoid noise
+            evals = evals[evals > 1e-14]
+            if len(evals) == 0:
+                return 0.0
+            entropy = -_np.sum(evals * _np.log2(evals))
+            return float(max(0.0, _np.real(entropy)))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def coherence_l1(rho: "Any") -> float:
+        """
+        Compute L1 coherence: C_l1 = Σ_{i≠j} |ρ_{ij}|.
+        Off-diagonal element sum; measure of quantum coherence.
+
+        Args:
+            rho: 8×8 complex128 density matrix
+
+        Returns:
+            Non-negative coherence measure
+        """
+        if not _HAS_NP or rho is None:
+            return 0.0
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+            if rho.shape != (8, 8):
+                return 0.0
+            # Vectorized: sum all absolute values minus diagonal
+            coherence = _np.sum(_np.abs(rho)) - _np.sum(_np.abs(_np.diag(rho)))
+            return float(max(0.0, coherence))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def mermin_value(rho8: "Any", angles: "Any") -> float:
+        """
+        Compute Mermin inequality: M = -E(A1B1C1) + E(A1B2C2) + E(A2B1C2) + E(A2B2C1).
+        Tripartite Bell test for W-state.
+
+        Args:
+            rho8: 8×8 density matrix
+            angles: 12-element array [θ_A1, φ_A1, θ_A2, φ_A2, θ_B1, φ_B1, θ_B2, φ_B2, θ_C1, φ_C1, θ_C2, φ_C2]
+                   Each measurement: A(θ,φ) = cos(θ)σ_z + sin(θ)(cos(φ)σ_x + sin(φ)σ_y)
+
+        Returns:
+            Mermin value (float, can be positive or negative)
+            Classical bound: |M| ≤ 2.0
+            W-state bound: |M| ≤ 3.046
+        """
+        if not _HAS_NP or rho8 is None or angles is None:
+            return 0.0
+        try:
+            rho8 = _np.asarray(rho8, dtype=_np.complex128)
+            angles = _np.asarray(angles, dtype=_np.float64)
+
+            if rho8.shape != (8, 8) or angles.shape != (12,):
+                return 0.0
+
+            # Extract angles for each party and measurement setting
+            theta_A1, phi_A1, theta_A2, phi_A2 = angles[0:4]
+            theta_B1, phi_B1, theta_B2, phi_B2 = angles[4:8]
+            theta_C1, phi_C1, theta_C2, phi_C2 = angles[8:12]
+
+            def build_observable(theta, phi):
+                """Build single-qubit measurement operator A(θ,φ)."""
+                sx = _np.array([[0, 1], [1, 0]], dtype=_np.complex128)
+                sy = _np.array([[0, -1j], [1j, 0]], dtype=_np.complex128)
+                sz = _np.array([[1, 0], [0, -1]], dtype=_np.complex128)
+                return (_np.cos(theta) * sz +
+                        _np.sin(theta) * (_np.cos(phi) * sx + _np.sin(phi) * sy))
+
+            def expectation_3qubit(rho, obs_a, obs_b, obs_c):
+                """Compute ⟨A ⊗ B ⊗ C⟩ on 3-qubit system."""
+                try:
+                    obs = _np.kron(_np.kron(obs_a, obs_b), obs_c)
+                    return float(_np.real(_np.trace(rho @ obs)))
+                except Exception:
+                    return 0.0
+
+            # Build all 8 observables
+            A1 = build_observable(theta_A1, phi_A1)
+            A2 = build_observable(theta_A2, phi_A2)
+            B1 = build_observable(theta_B1, phi_B1)
+            B2 = build_observable(theta_B2, phi_B2)
+            C1 = build_observable(theta_C1, phi_C1)
+            C2 = build_observable(theta_C2, phi_C2)
+
+            # Compute 8 expectation values
+            E_111 = expectation_3qubit(rho8, A1, B1, C1)
+            E_122 = expectation_3qubit(rho8, A1, B2, C2)
+            E_212 = expectation_3qubit(rho8, A2, B1, C2)
+            E_221 = expectation_3qubit(rho8, A2, B2, C1)
+
+            # Mermin inequality: M = -E(A1B1C1) + E(A1B2C2) + E(A2B1C2) + E(A2B2C1)
+            M = -E_111 + E_122 + E_212 + E_221
+            return float(M)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def optimize_mermin(rho8: "Any", warm_start: "Any" = None, n_restarts: int = 6) -> "Tuple[float, Any, int]":
+        """
+        Optimize Mermin inequality to find maximum violation.
+        Uses scipy.optimize.minimize with Nelder-Mead.
+
+        Args:
+            rho8: 8×8 density matrix
+            warm_start: Optional 12-element initial angle array
+            n_restarts: Number of random restarts for optimization
+
+        Returns:
+            Tuple of (M_max, optimal_angles, total_iterations)
+        """
+        if not _HAS_NP or rho8 is None:
+            return (0.0, _np.zeros(12), 0)
+
+        try:
+            from scipy.optimize import minimize
+        except ImportError:
+            return (0.0, _np.zeros(12), 0)
+
+        try:
+            rho8 = _np.asarray(rho8, dtype=_np.complex128)
+            if rho8.shape != (8, 8):
+                return (0.0, _np.zeros(12), 0)
+
+            def objective(angles):
+                """Objective: minimize -|M| to maximize |M|. With validation."""
+                try:
+                    m = ClientQuantumMetrics.mermin_value(rho8, angles)
+                    if _np.isnan(m) or _np.isinf(m):
+                        # Objective failed; return high penalty
+                        return 1e10
+                    return -_np.abs(m)
+                except Exception:
+                    # Silent failure in mermin_value; return penalty
+                    return 1e10
+
+            best_M = 0.0
+            best_angles = _np.zeros(12)
+            total_iters = 0
+
+            # If warm_start provided, use it directly
+            if warm_start is not None:
+                try:
+                    warm_start = _np.asarray(warm_start, dtype=_np.float64)
+                    if warm_start.shape == (12,):
+                        result = minimize(objective, warm_start, method='Nelder-Mead',
+                                         options={'maxiter': 2000, 'xatol': 1e-6, 'fatol': 1e-6})
+                        if result.success or result.nit > 0:
+                            m_val = ClientQuantumMetrics.mermin_value(rho8, result.x)
+                            if _np.abs(m_val) > _np.abs(best_M):
+                                best_M = m_val
+                                best_angles = result.x.copy()
+                            total_iters += result.nit
+                except Exception:
+                    pass
+
+            # Random restarts
+            for _ in range(n_restarts):
+                init_angles = _np.random.uniform(-_np.pi, _np.pi, 12)
+                result = minimize(objective, init_angles, method='Nelder-Mead',
+                                 options={'maxiter': 2000, 'xatol': 1e-6, 'fatol': 1e-6})
+                if result.success or result.nit > 0:
+                    m_val = ClientQuantumMetrics.mermin_value(rho8, result.x)
+                    if _np.abs(m_val) > _np.abs(best_M):
+                        best_M = m_val
+                        best_angles = result.x.copy()
+                    total_iters += result.nit
+
+            return (float(best_M), best_angles, total_iters)
+        except Exception:
+            return (0.0, _np.zeros(12), 0)
+
+    @staticmethod
+    def concurrence(rho: "Any") -> float:
+        """
+        Wootters concurrence for 2-qubit entanglement.
+
+        1. Compute partial trace over qubit 2 → 4×4 DM (ρ_A in |q0,q2⟩ space)
+        2. Compute eigenvalues of ρ_A ⊗ σ_y ⊗ ρ_A^* ⊗ σ_y
+        3. Sort as λ1 ≥ λ2 ≥ λ3 ≥ λ4
+        4. C = max(0, λ1 - λ2 - λ3 - λ4)
+
+        Args:
+            rho: 8×8 complex128 density matrix
+
+        Returns:
+            Concurrence in [0, 1]
+        """
+        if not _HAS_NP or rho is None:
+            return 0.0
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+            if rho.shape != (8, 8):
+                return 0.0
+
+            # Partial trace over qubit 1 (middle qubit)
+            # Reshape: (8,8) → (2,4,2,4) → trace over dims 1,3 → (2,2,2,2) → (4,4)
+            rho_reshaped = rho.reshape((2, 4, 2, 4))
+            rho_pt = _np.trace(rho_reshaped, axis1=1, axis2=3)  # Trace over qubit 1
+            rho_A = rho_pt.reshape((4, 4))
+
+            # σ_y for single qubit
+            sy = _np.array([[0, -1j], [1j, 0]], dtype=_np.complex128)
+            sy_kron = _np.kron(sy, sy)
+
+            # Construct ρ_A ⊗ σ_y ⊗ ρ_A^* ⊗ σ_y
+            rho_A_conj = _np.conj(rho_A)
+            M = _np.kron(rho_A, sy_kron) @ _np.kron(rho_A_conj, sy_kron)
+
+            # Eigenvalues with explicit scrubbing to ensure non-negative
+            evals = _np.linalg.eigvalsh(M)
+            evals = _np.real(evals)
+            # Zero out negative eigenvalues due to numerical precision
+            evals = _np.maximum(evals, 0.0)
+            evals = _np.sort(evals)[::-1]  # Sort descending
+
+            if len(evals) >= 4:
+                c = max(0.0, evals[0] - evals[1] - evals[2] - evals[3])
+            else:
+                c = max(0.0, evals[0]) if len(evals) > 0 else 0.0
+
+            return float(max(0.0, min(1.0, _np.sqrt(c))))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def partial_trace_to_2q(rho8: "Any") -> "Any":
+        """
+        Compute partial trace over qubit 1 (the middle qubit).
+        Input: 8×8 DM in Hilbert space |q0, q1, q2⟩
+        Output: 4×4 DM in |q0, q2⟩ space
+
+        Trace formula: ρ_A = Σ_i (I ⊗ |i⟩⟨i| ⊗ I) ρ (I ⊗ |i⟩⟨i| ⊗ I)†
+        Rearrange indices: (8,8) → (2,4,2,4) → (2×2, 4×4) → (4,4)
+
+        Args:
+            rho8: 8×8 complex128 density matrix
+
+        Returns:
+            4×4 complex128 density matrix
+        """
+        if not _HAS_NP or rho8 is None:
+            return _np.eye(4, dtype=_np.complex128) / 4.0
+
+        try:
+            rho8 = _np.asarray(rho8, dtype=_np.complex128)
+            if rho8.shape != (8, 8):
+                return _np.eye(4, dtype=_np.complex128) / 4.0
+
+            # Reshape to (2,4,2,4) then trace over middle qubit (dims 1,3)
+            rho_reshaped = rho8.reshape((2, 4, 2, 4))
+            rho_2q = _np.trace(rho_reshaped, axis1=1, axis2=3)
+            rho_2q = rho_2q.reshape((4, 4))
+
+            return rho_2q
+        except Exception:
+            return _np.eye(4, dtype=_np.complex128) / 4.0
+
+    @staticmethod
+    def enforce_valid_dm(rho: "Any") -> "Any":
+        """
+        Enforce valid density matrix properties.
+        1. Hermitianize: ρ = 0.5 × (ρ + ρ†)
+        2. Eigenvalue decomposition, zero negative eigenvalues
+        3. Normalize to trace = 1
+
+        Args:
+            rho: Density matrix (any dimension or None)
+
+        Returns:
+            8×8 complex128 valid density matrix, or identity/8 on error
+        """
+        if not _HAS_NP or rho is None:
+            return _np.eye(8, dtype=_np.complex128) / 8.0
+
+        try:
+            rho = _np.asarray(rho, dtype=_np.complex128)
+
+            # Handle invalid shapes
+            if rho.size == 0:
+                return _np.eye(8, dtype=_np.complex128) / 8.0
+
+            # Reshape to square if needed
+            if len(rho.shape) != 2:
+                rho = rho.reshape(8, 8)
+
+            if rho.shape != (8, 8):
+                # Pad or truncate to 8×8
+                result = _np.eye(8, dtype=_np.complex128) / 8.0
+                min_dim = min(rho.shape[0], 8)
+                result[:min_dim, :min_dim] = rho[:min_dim, :min_dim]
+                rho = result
+
+            # Hermitianize
+            rho = 0.5 * (rho + _np.conj(rho.T))
+
+            # Eigendecomposition
+            evals, evecs = _np.linalg.eigh(rho)
+            evals = _np.real(evals)
+
+            # Zero negative eigenvalues
+            evals = _np.maximum(evals, 0.0)
+
+            # Reconstruct
+            rho = evecs @ _np.diag(evals) @ _np.conj(evecs.T)
+
+            # Normalize trace with safe division
+            trace_val = _np.trace(rho)
+            safe_trace = _np.maximum(_np.abs(trace_val), 1e-14)
+            rho = rho / safe_trace
+
+            return _np.asarray(rho, dtype=_np.complex128)
+        except Exception:
+            return _np.eye(8, dtype=_np.complex128) / 8.0
+
+    @staticmethod
+    def w_entropy_hash(dm: "Any") -> str:
+        """
+        Compute SHA256 hash of density matrix for snapshot fingerprinting.
+
+        Args:
+            dm: Density matrix (any type)
+
+        Returns:
+            64-character hex string (first 16 bytes of sha256)
+        """
+        if not _HAS_NP or dm is None:
+            return "0" * 64
+
+        try:
+            dm = _np.asarray(dm, dtype=_np.complex128)
+            dm_bytes = dm.tobytes()
+            hash_obj = hashlib.sha256(dm_bytes)
+            hash_hex = hash_obj.hexdigest()
+            return hash_hex[:64]  # Return 64-char hex string
+        except Exception:
+            return "0" * 64
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ClientQuantumSnapshot + ClientOracleMesh: Distributed oracle consensus via mesh
+# ─────────────────────────────────────────────────────────────────────────────
+
+@_dc(frozen=True)
+class ClientQuantumSnapshot:
+    """Immutable snapshot of consensus quantum oracle state at a moment in time."""
+
+    # Timing and IDs
+    timestamp_s: float                  # Unix timestamp when snapshot was captured
+    cycle: int                          # Snapshot generation counter (incremented each cycle)
+
+    # Density matrix (8×8 complex128)
+    density_matrix_hex: str             # 2048 hex chars (8×8 complex128 = 64 els × 16 bytes = 1024 bytes = 2048 hex)
+    density_matrix: Any                 # 8×8 complex128, actual array (not hex)
+
+    # Quantum metrics (computed by ClientQuantumMetrics)
+    w_state_fidelity: float             # [0, 1]
+    purity: float                       # [0, 1]
+    von_neumann_entropy: float          # [0, 3] for 3-qubit
+    coherence_l1: float                 # ≥ 0
+    mermin_value: float                 # can be positive or negative
+    mermin_violated: bool               # True if mermin_value > 2.0
+    mermin_angles: List[float]          # 12 angles for optimal Mermin
+    concurrence: float                  # [0, 1]
+    measurement_counts: Dict[str, int]  # {'001': n, '010': n, ...} from shots
+    w_entropy_hash: str                 # 64-char hex hash for DM fingerprinting
+
+    # Block field tensor (8×8×8 complex64)
+    block_field_tensor_hex: str         # 8192 hex chars (8×8×8 complex64 = 512 els × 8 bytes = 4096 bytes = 8192 hex)
+    block_field_hash: str               # 64-char hex hash of tensor
+
+    # Stream info
+    stream_count: int                   # How many streams contributed to consensus (1 = genesis, ≥2 = mesh)
+    genesis_mode: bool                  # True if 0 peers, running on Koyeb stream only
+
+
+class ClientOracleMesh:
+    """Background quantum oracle mesh computation via 30s cycle."""
+
+    # Configuration constants
+    SNAPSHOT_CYCLE_S = 30.0             # Background loop cycle time
+    CACHE_FRESH_S = 45.0                # Max age before warning
+    CACHE_STALE_S = 90.0                # Max age before re-measure required
+    MAX_PEER_STREAMS = 8                # Max concurrent peer streams
+
+    def __init__(self, koyeb_sse_client: "SSEStreamClient", app_ref) -> None:
+        """Initialize mesh without starting background thread.
+
+        Args:
+            koyeb_sse_client: Existing SSEStreamClient subscribed to Koyeb server
+            app_ref: Reference to parent QtclClientApp for logging/context
+        """
+        self.koyeb_sse_client = koyeb_sse_client
+        self.app_ref = app_ref
+
+        # Peer SSE streams management
+        self._peer_sse_streams: Dict[str, Dict[str, Any]] = {}  # {peer_id: {'host': str, 'port': int, 'stream': _PeerSSEStream}}
+        self._stream_lock = threading.Lock()  # protects _peer_sse_streams access
+
+        # Snapshot caching
+        self._latest_snapshot: Optional[ClientQuantumSnapshot] = None
+        self._snapshot_lock = threading.RLock()  # allows re-entrant access
+
+        # Background thread management
+        self._background_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+        # AER engine for evolution/measurement
+        self._aer_engine = ClientAEREngine()
+
+        # Mermin warm-start cache
+        self._mermin_warm_angles: Optional[Any] = None  # warm-start cache for Mermin
+
+        # Cycle counter
+        self._cycle_count = 0
+
+    def get_snapshot(self) -> Optional[ClientQuantumSnapshot]:
+        """Get latest snapshot (None if never computed). Non-blocking O(1)."""
+        with self._snapshot_lock:
+            return self._latest_snapshot
+
+    def get_snapshot_or_empty(self) -> Dict:
+        """Get latest snapshot as dict or empty dict if unavailable. Never blocks."""
+        snap = self.get_snapshot()
+        if snap is None:
+            return {}
+
+        # Convert snapshot to dict
+        return {
+            'timestamp_s': snap.timestamp_s,
+            'cycle': snap.cycle,
+            'density_matrix_hex': snap.density_matrix_hex,
+            'w_state_fidelity': snap.w_state_fidelity,
+            'purity': snap.purity,
+            'von_neumann_entropy': snap.von_neumann_entropy,
+            'coherence_l1': snap.coherence_l1,
+            'mermin_value': snap.mermin_value,
+            'mermin_violated': snap.mermin_violated,
+            'mermin_angles': snap.mermin_angles,
+            'concurrence': snap.concurrence,
+            'measurement_counts': snap.measurement_counts,
+            'w_entropy_hash': snap.w_entropy_hash,
+            'block_field_tensor_hex': snap.block_field_tensor_hex,
+            'block_field_hash': snap.block_field_hash,
+            'stream_count': snap.stream_count,
+            'genesis_mode': snap.genesis_mode,
+        }
+
+    def start(self) -> None:
+        """Launch background thread. Safe to call multiple times."""
+        with self._snapshot_lock:
+            if self._background_thread is None:
+                self._stop_event.clear()
+                self._background_thread = threading.Thread(
+                    target=self._background_loop,
+                    daemon=True,
+                    name="ClientOracleMesh-bg"
+                )
+                self._background_thread.start()
+
+    def stop(self) -> None:
+        """Stop background thread gracefully. Waits up to 5 seconds."""
+        with self._snapshot_lock:
+            if self._background_thread is not None:
+                self._stop_event.set()
+                self._background_thread.join(timeout=5.0)
+                self._background_thread = None
+
+    def register_peer_sse(self, peer_id: str, host: str, port: int) -> None:
+        """Register new peer stream. Called from peer registration handler."""
+        with self._stream_lock:
+            if len(self._peer_sse_streams) >= self.MAX_PEER_STREAMS:
+                _EXP_LOG.warning(f"[ClientOracleMesh] Max peers ({self.MAX_PEER_STREAMS}) reached, dropping {peer_id}")
+                return
+
+            # Create _PeerSSEStream and store
+            peer_stream = _PeerSSEStream(host, port, peer_id)
+            self._peer_sse_streams[peer_id] = {'host': host, 'port': port, 'stream': peer_stream}
+            _EXP_LOG.info(f"[ClientOracleMesh] Registered peer {peer_id} at {host}:{port}")
+
+    def unregister_peer_sse(self, peer_id: str) -> None:
+        """Unregister peer stream."""
+        with self._stream_lock:
+            if peer_id in self._peer_sse_streams:
+                self._peer_sse_streams[peer_id]['stream'].stop()
+                del self._peer_sse_streams[peer_id]
+                _EXP_LOG.info(f"[ClientOracleMesh] Unregistered peer {peer_id}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Background computation (internal methods)
+    # ─────────────────────────────────────────────────────────────
+
+    def _background_loop(self) -> None:
+        """Run 30s cycle indefinitely until stop() is called."""
+        while not self._stop_event.is_set():
+            try:
+                snap = self._compute_snapshot()
+                if snap is not None:
+                    with self._snapshot_lock:
+                        self._latest_snapshot = snap
+            except Exception as e:
+                _EXP_LOG.debug(f"[ClientOracleMesh] _compute_snapshot error: {e}")
+
+            # Sleep for SNAPSHOT_CYCLE_S, but check stop event frequently
+            for _ in range(int(self.SNAPSHOT_CYCLE_S * 10)):  # 10 checks per cycle
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+    def _compute_snapshot(self) -> Optional[ClientQuantumSnapshot]:
+        """
+        Compute one snapshot:
+        1. Build consensus DM from Koyeb + peer streams
+        2. Run AER evolution
+        3. Run shot measurements
+        4. Compute all metrics (ClientQuantumMetrics)
+        5. Mermin optimization with warm-start
+        6. Block field tensor generation
+        7. Pack into ClientQuantumSnapshot
+        """
+        # Step 1: Build consensus DM
+        consensus_dm = self._build_consensus_dm()
+        if consensus_dm is None:
+            return None
+
+        # Step 2: Run AER evolution
+        evolved_dm = self._aer_engine.run_evolution_circuit(consensus_dm)
+        if evolved_dm is None:
+            return None
+
+        # Step 3: Run shot measurements
+        measurement_counts = self._aer_engine.run_shot_circuit(evolved_dm, shots=1024)
+        if measurement_counts is None:
+            measurement_counts = {}
+
+        # Step 4: Compute metrics using ClientQuantumMetrics
+        w_fidelity = ClientQuantumMetrics.w3_fidelity(evolved_dm)
+        purity_val = ClientQuantumMetrics.purity(evolved_dm)
+        entropy_val = ClientQuantumMetrics.von_neumann_entropy(evolved_dm)
+        coherence_val = ClientQuantumMetrics.coherence_l1(evolved_dm)
+        concurrence_val = ClientQuantumMetrics.concurrence(evolved_dm)
+
+        # Step 5: Mermin optimization with warm-start
+        mermin_val, mermin_angles, _ = ClientQuantumMetrics.optimize_mermin(
+            evolved_dm,
+            warm_start=self._mermin_warm_angles,
+            n_restarts=4  # Fewer restarts in background (cheaper than 6)
+        )
+        self._mermin_warm_angles = mermin_angles  # Cache for next cycle
+
+        mermin_violated = mermin_val > 2.0
+
+        # Hashes
+        dm_hash = ClientQuantumMetrics.w_entropy_hash(consensus_dm)
+
+        # Step 6: Block field tensor generation
+        block_tensor = self._aer_engine.build_block_field_tensor(
+            evolved_dm,
+            pq_curr=0,  # Placeholder, will be set by miner
+            pq_last=0,
+            block_hash_seed="mesh_snapshot"
+        )
+
+        # Compute tensor hash
+        if block_tensor is not None:
+            tensor_hex = block_tensor.astype(_np.complex64).tobytes().hex()
+            tensor_hash = hashlib.sha256(tensor_hex.encode()).hexdigest()[:64]
+        else:
+            tensor_hex = ""
+            tensor_hash = ""
+
+        # Compute DM hex
+        dm_hex = consensus_dm.tobytes().hex()
+
+        # Stream count
+        with self._stream_lock:
+            stream_count = 1 + len([p for p in self._peer_sse_streams.values() if p['stream'].is_active()])
+        genesis_mode = (stream_count == 1)
+
+        # Step 7: Pack into snapshot
+        with self._snapshot_lock:
+            snap = ClientQuantumSnapshot(
+                timestamp_s=time.time(),
+                cycle=self._cycle_count,
+                density_matrix_hex=dm_hex,
+                density_matrix=consensus_dm,
+                w_state_fidelity=float(w_fidelity),
+                purity=float(purity_val),
+                von_neumann_entropy=float(entropy_val),
+                coherence_l1=float(coherence_val),
+                mermin_value=float(mermin_val),
+                mermin_violated=bool(mermin_violated),
+                mermin_angles=list(mermin_angles) if mermin_angles is not None else [],
+                concurrence=float(concurrence_val),
+                measurement_counts=dict(measurement_counts),
+                w_entropy_hash=dm_hash,
+                block_field_tensor_hex=tensor_hex,
+                block_field_hash=tensor_hash,
+                stream_count=stream_count,
+                genesis_mode=genesis_mode,
+            )
+            self._cycle_count += 1
+
+        return snap
+
+    def _build_consensus_dm(self) -> Optional[Any]:
+        """Collect DMs from all sources, compute Byzantine-weighted average."""
+        dms_weighted = self._collect_stream_dms()
+        if not dms_weighted:
+            return None
+
+        return self._byzantine_weighted_average(dms_weighted)
+
+    def _collect_stream_dms(self) -> List[Tuple[Any, float, str]]:
+        """
+        Collect (dm, weight, label) tuples from:
+        - Koyeb SSE stream
+        - All active peer streams
+
+        Returns: [(dm, weight, label), ...]
+        """
+        dms = []
+
+        # Koyeb stream (weight = 1.0)
+        koyeb_snap = self.koyeb_sse_client.get_latest_snapshot()
+        if koyeb_snap is not None:
+            dm_hex = koyeb_snap.get('density_tensor_hex', '') or koyeb_snap.get('density_matrix_hex', '')
+            if dm_hex:
+                try:
+                    dm_bytes = bytes.fromhex(dm_hex)
+                    # Handle both 16³ (4096 bytes) and 8³ (1024 bytes) formats
+                    if len(dm_bytes) == 4096:
+                        # 16³ format - use first 8×8
+                        dm = _np.frombuffer(dm_bytes[:1024], dtype=_np.complex128).reshape((8, 8))
+                    else:
+                        dm = _np.frombuffer(dm_bytes, dtype=_np.complex128).reshape((8, 8))
+
+                    dm = ClientQuantumMetrics.enforce_valid_dm(dm)
+                    if self._validate_dm(dm, "Koyeb"):
+                        dms.append((dm, 1.0, "Koyeb"))
+                except Exception as e:
+                    _EXP_LOG.debug(f"[ClientOracleMesh] Koyeb DM parse error: {e}")
+
+        # Peer streams (weight = w3_fidelity)
+        with self._stream_lock:
+            for peer_id, peer_info in self._peer_sse_streams.items():
+                peer_dm = peer_info['stream'].get_latest_dm()
+                if peer_dm is not None:
+                    peer_dm = ClientQuantumMetrics.enforce_valid_dm(peer_dm)
+                    if self._validate_dm(peer_dm, f"Peer:{peer_id}"):
+                        fidelity = ClientQuantumMetrics.w3_fidelity(peer_dm)
+                        weight = max(0.1, fidelity)  # Minimum 0.1 weight for low-fidelity DMs
+                        dms.append((peer_dm, weight, f"Peer:{peer_id}"))
+
+        return dms
+
+    def _byzantine_weighted_average(self, dms_weighted: List) -> Optional[Any]:
+        """
+        Compute Byzantine-weighted average of consensus DMs.
+
+        For N < 4: simple weighted average
+        For N >= 4: drop 1-2 lowest weight peers, then weighted average
+
+        Returns: 8×8 complex128 DM, trace-1, enforced valid
+        """
+        if not dms_weighted:
+            return None
+
+        dms, weights, labels = zip(*dms_weighted)
+        weights = _np.array(weights, dtype=float)
+
+        # Outlier rejection for N >= 4
+        if len(dms) >= 4:
+            sorted_indices = _np.argsort(weights)
+            drop_count = min(len(dms) - 2, len(dms) // 3)  # Drop at most 1/3
+            keep_indices = sorted_indices[drop_count:]
+            dms = tuple(_np.array(dms, dtype=object)[keep_indices])
+            weights = weights[keep_indices]
+
+        # Normalize weights
+        weights /= _np.sum(weights)
+
+        # Weighted average
+        avg_dm = _np.zeros((8, 8), dtype=_np.complex128)
+        for dm, w in zip(dms, weights):
+            avg_dm += w * dm
+
+        # Enforce valid
+        avg_dm = ClientQuantumMetrics.enforce_valid_dm(avg_dm)
+        return avg_dm
+
+    def _validate_dm(self, dm: Any, label: str) -> bool:
+        """Check shape, dtype, trace, eigenvalues. Return True if valid."""
+        try:
+            if dm is None or (hasattr(dm, 'shape') and dm.shape != (8, 8)):
+                return False
+
+            tr = float(_np.real(_np.trace(dm)))
+            if not (0.9 < tr < 1.1):  # Allow 10% tolerance
+                _EXP_LOG.debug(f"[ClientOracleMesh] {label} trace out of range: {tr}")
+                return False
+
+            eigs = _np.linalg.eigvalsh(dm)
+            if _np.min(eigs) < -1e-6:
+                _EXP_LOG.debug(f"[ClientOracleMesh] {label} has negative eigenvalues: min={_np.min(eigs)}")
+                return False
+
+            return True
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientOracleMesh] _validate_dm({label}): {e}")
+            return False
+
+
+class _PeerSSEStream:
+    """Inner class: manage HTTP polling to peer's /rpc/stream/snapshot endpoint."""
+
+    def __init__(self, host: str, port: int, peer_id: str) -> None:
+        """Initialize and start peer stream reader."""
+        self.host = host
+        self.port = port
+        self.peer_id = peer_id
+        self._latest_dm: Optional[Any] = None
+        self._dm_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._error_count = 0
+        self._active = False
+        self._state_lock = threading.Lock()
+        self.start()
+
+    def start(self) -> None:
+        """Launch background polling thread."""
+        if self._thread is None:
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._poll_loop,
+                daemon=True,
+                name=f"PeerSSE-{self.peer_id}"
+            )
+            self._thread.start()
+            with self._state_lock:
+                self._active = True
+
+    def stop(self) -> None:
+        """Stop polling thread."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        with self._state_lock:
+            self._active = False
+
+    def get_latest_dm(self) -> Optional[Any]:
+        """Get latest DM (None if never received). Non-blocking."""
+        with self._dm_lock:
+            return self._latest_dm
+
+    def is_active(self) -> bool:
+        """Check if stream is actively polling."""
+        with self._state_lock:
+            return self._active and self._error_count < 10
+
+    def _poll_loop(self) -> None:
+        """Poll /rpc/stream/snapshot every 5s with exponential backoff on error."""
+        backoff = 5.0
+        while not self._stop_event.is_set():
+            try:
+                url = f"http://{self.host}:{self.port}/rpc/stream/snapshot"
+                if _HAS_REQUESTS:
+                    resp = _requests.get(url, timeout=5.0)
+                    resp.raise_for_status()
+                    data = resp.json()
+                else:
+                    # Fallback to urllib
+                    import urllib.request as _ur
+                    req = _ur.Request(url)
+                    with _ur.urlopen(req, timeout=5.0) as r:
+                        data = json.loads(r.read().decode())
+
+                snap_dict = data.get('snapshot', {}) or data.get('result', {})
+                dm_hex = snap_dict.get('density_matrix_hex', '') or snap_dict.get('density_tensor_hex', '')
+
+                if dm_hex:
+                    dm_bytes = bytes.fromhex(dm_hex)
+                    # Handle both 16³ and 8³ formats
+                    if len(dm_bytes) == 4096:
+                        # 16³ format - use first 8×8
+                        dm = _np.frombuffer(dm_bytes[:1024], dtype=_np.complex128).reshape((8, 8))
+                    else:
+                        dm = _np.frombuffer(dm_bytes, dtype=_np.complex128).reshape((8, 8))
+
+                    with self._dm_lock:
+                        self._latest_dm = dm
+                    with self._state_lock:
+                        self._error_count = 0
+                    backoff = 5.0
+
+            except Exception as e:
+                with self._state_lock:
+                    self._error_count += 1
+                    error_count = self._error_count
+                _EXP_LOG.debug(f"[PeerSSEStream] {self.peer_id}: poll error #{error_count}: {e}")
+
+                if error_count >= 10:
+                    _EXP_LOG.warning(f"[PeerSSEStream] {self.peer_id}: max errors reached, stopping")
+                    with self._state_lock:
+                        self._active = False
+                    break
+
+            # Exponential backoff sleep (capped at 30s)
+            sleep_time = min(30.0, backoff)
+            for _ in range(int(sleep_time * 10)):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+            backoff *= 1.5
+
 @_dc
 class ClientFieldState:
     """
@@ -8534,6 +9445,357 @@ class KoyebOracleState:
             "connected":           self.connected,
             "last_sync_ts":        self.last_sync_ts,
         }
+class ClientAEREngine:
+    """
+    Phase 1b + 2: Client-side AER engine for quantum circuit simulation.
+    Provides density-matrix evolution with realistic noise via Qiskit AER.
+
+    GKSL noise model:
+      - 1-qubit: amplitude_damping(gamma1) ∘ phase_damping(gammaphi*2/3)
+      - 2-qubit: depolarizing_error(gammadep, 2) on CX/CZ
+
+    Methods support W-state preparation, evolution, and shot measurement.
+    Falls back to numpy-only mode if Qiskit unavailable (e.g., Termux).
+    """
+    # Server noise profile calibrated for W-state revivals (node_id=2 / middle values)
+    SERVER_K_EFF: float = 0.0044      # k_eff = 0.004 + 0.0002*2
+    SERVER_A_EFF: float = 0.0012      # a_eff = 0.001 + 0.0001*2
+    SERVER_P_EFF: float = 0.0005      # p_eff (phase damping)
+
+    def __init__(self) -> None:
+        """Initialize AER engine: build noise model, create simulator."""
+        self.noise_model: Optional[Any] = None
+        self.aer_simulator: Optional[Any] = None
+        self.fallback_mode: bool = False
+
+        self._build_engine()
+
+    def _build_engine(self) -> None:
+        """Build noise model and AER simulator in __init__."""
+        try:
+            self.noise_model = self.build_noise_model()
+            if self.noise_model is None:
+                self.fallback_mode = True
+                return
+
+            from qiskit_aer import AerSimulator
+            self.aer_simulator = AerSimulator(
+                method='density_matrix',
+                noise_model=self.noise_model
+            )
+        except ImportError:
+            self.fallback_mode = True
+            _EXP_LOG.debug("[ClientAEREngine] qiskit_aer unavailable — fallback mode")
+        except Exception as e:
+            self.fallback_mode = True
+            _EXP_LOG.debug(f"[ClientAEREngine] init failed: {e}")
+
+    def build_noise_model(self) -> Optional[Any]:
+        """
+        Build GKSL-canonical NoiseModel for client-side circuits.
+        Uses server's noise profile calibrated for W-state revivals.
+
+        1-qubit errors on [id, u1, u2, u3, measure]:
+          - amplitude_damping(a_eff)      [SERVER_A_EFF = 0.0012]
+          - composed with phase_damping(p_eff) [SERVER_P_EFF = 0.0005]
+
+        2-qubit errors on [cx, cz]:
+          - depolarizing_error(k_eff, 2) [SERVER_K_EFF = 0.0044]
+
+        Returns NoiseModel on success, None on ImportError/failure.
+        """
+        try:
+            from qiskit_aer.noise import (
+                NoiseModel,
+                amplitude_damping_error,
+                phase_damping_error,
+                depolarizing_error
+            )
+
+            nm = NoiseModel()
+
+            # 1-qubit: amplitude_damping ∘ phase_damping
+            # Using server's calibrated noise parameters
+            a_eff = float(min(0.999, max(0.0, self.SERVER_A_EFF)))
+            p_eff = float(min(0.999, max(0.0, self.SERVER_P_EFF)))
+
+            err_1q = amplitude_damping_error(a_eff).compose(
+                phase_damping_error(p_eff)
+            )
+            nm.add_all_qubit_quantum_error(
+                err_1q,
+                ['id', 'u1', 'u2', 'u3', 'measure']
+            )
+
+            # 2-qubit: depolarizing
+            k_eff = float(min(0.75, max(0.0, self.SERVER_K_EFF)))
+            nm.add_all_qubit_quantum_error(
+                depolarizing_error(k_eff, 2),
+                ['cx', 'cz']
+            )
+
+            return nm
+        except ImportError:
+            return None
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] build_noise_model: {e}")
+            return None
+
+    def enforce_valid_dm(self, dm: _np.ndarray) -> _np.ndarray:
+        """
+        Enforce valid density matrix properties.
+        - Hermitianize: dm = 0.5 * (dm + dm†)
+        - Zero negative eigenvalues (drop below numerical noise floor)
+        - Normalize to trace = 1
+        """
+        if not _HAS_NP or dm is None:
+            if _HAS_NP:
+                return _np.eye(8, dtype=_np.complex128) / 8.0
+            return dm
+
+        try:
+            dm = _np.array(dm, dtype=_np.complex128)
+            if dm.shape != (8, 8):
+                return _np.eye(8, dtype=_np.complex128) / 8.0
+
+            # Hermitianize
+            dm = 0.5 * (dm + dm.conj().T)
+
+            # Eigenvalue decomposition
+            eigs, evecs = _np.linalg.eigh(dm)
+            eigs = _np.maximum(eigs, 0.0)  # zero negative eigenvalues
+            dm = evecs @ _np.diag(eigs.astype(_np.complex128)) @ evecs.conj().T
+
+            # Normalize
+            tr = float(_np.real(_np.trace(dm)))
+            if not _np.isfinite(tr) or tr < 1e-12:
+                return _np.eye(8, dtype=_np.complex128) / 8.0
+
+            dm /= tr
+            return dm
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] enforce_valid_dm: {e}")
+            return _np.eye(8, dtype=_np.complex128) / 8.0 if _HAS_NP else dm
+
+    def build_block_field_tensor(
+        self,
+        evolved_dm: _np.ndarray,
+        pq_curr: int,
+        pq_last: int,
+        block_hash_seed: str
+    ) -> Optional[_np.ndarray]:
+        """
+        Build 8×8×8 complex64 block field tensor from 8×8 evolved DM.
+
+        Steps:
+        a) Use evolved_dm directly (no upsampling)
+        b) Normalize by trace
+        c) Broadcast to 8³: field[i,j,k] = evolved_dm[i,j] * phase_kernel[k]
+           where phase_kernel uses pq_curr + pq_last + seed_hash
+        d) Apply Gaussian envelope with center (4,4,4) and width σ=4
+        e) Normalize Frobenius norm
+        f) Return as complex64
+        """
+        if not _HAS_NP or evolved_dm is None:
+            return None
+
+        # Validate input parameter types
+        if not isinstance(pq_curr, int):
+            _EXP_LOG.warning(f"[ClientAEREngine] build_block_field_tensor: pq_curr is {type(pq_curr)}, expected int")
+            return None
+        if not isinstance(pq_last, int):
+            _EXP_LOG.warning(f"[ClientAEREngine] build_block_field_tensor: pq_last is {type(pq_last)}, expected int")
+            return None
+
+        try:
+            dm = _np.array(evolved_dm, dtype=_np.complex128)
+            if dm.shape != (8, 8):
+                return None
+
+            # a-b) Use DM directly and normalize by trace
+            dm = dm.copy()
+            tr = float(_np.real(_np.trace(dm)))
+            if tr > 1e-12:
+                dm /= tr
+
+            # c) Broadcast with phase kernel
+            # Compute seed hash contribution
+            try:
+                seed_hash = int(hashlib.sha256(block_hash_seed.encode()).hexdigest()[:8], 16)
+            except Exception as e:
+                _EXP_LOG.warning(f"[ClientAEREngine] build_block_field_tensor: seed hash calc failed: {e}, using seed_hash=0")
+                seed_hash = 0
+
+            phase_base = float(pq_curr + pq_last + seed_hash)
+
+            # Validate phase_base is finite
+            if not _np.isfinite(phase_base):
+                _EXP_LOG.warning(f"[ClientAEREngine] build_block_field_tensor: phase_base is not finite ({phase_base})")
+                return None
+
+            field = _np.zeros((8, 8, 8), dtype=_np.complex128)
+            for i in range(8):
+                for j in range(8):
+                    for k in range(8):
+                        phase = 2.0 * _np.pi * k / 8.0
+                        phase_kernel = _np.exp(1j * phase) * phase_base / max(1.0, abs(phase_base))
+                        field[i, j, k] = dm[i, j] * phase_kernel
+
+            # d) Gaussian envelope: exp(-r²/16) where r² = (i-4)² + (j-4)² + (k-4)²
+            for i in range(8):
+                for j in range(8):
+                    for k in range(8):
+                        r_sq = float((i - 4) ** 2 + (j - 4) ** 2 + (k - 4) ** 2)
+                        envelope = _np.exp(-r_sq / 16.0)
+                        field[i, j, k] *= envelope
+
+            # e) Normalize Frobenius norm (use standard norm for any-dimensional arrays)
+            frob_norm = _np.linalg.norm(field)
+            if frob_norm > 1e-12:
+                field /= frob_norm
+
+            # f) Convert to complex64
+            return field.astype(_np.complex64)
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] build_block_field_tensor: {e}")
+            return None
+
+    def prepare_w_state_circuit(
+        self,
+        seed_dm: Optional[_np.ndarray] = None
+    ) -> Optional[Any]:
+        """
+        Prepare 3-qubit W-state circuit for AER execution.
+
+        1. Create 3-qubit QuantumCircuit
+        2. If seed_dm provided: set initial density matrix state
+        3. Apply id gates to all qubits (injects noise)
+        4. Save density matrix state
+        5. Return circuit
+
+        Returns QuantumCircuit on success, None on failure.
+        """
+        if self.fallback_mode:
+            return None
+
+        try:
+            from qiskit import QuantumCircuit
+            from qiskit.quantum_info import DensityMatrix
+
+            qc = QuantumCircuit(3, name='W3_circuit')
+
+            # Set initial density matrix if provided
+            if seed_dm is not None:
+                try:
+                    seed_dm_valid = self.enforce_valid_dm(_np.array(seed_dm, dtype=_np.complex128))
+                    if seed_dm_valid is not None and _HAS_NP:
+                        dm_init = DensityMatrix(seed_dm_valid)
+                        qc.set_density_matrix(dm_init)
+                except Exception as e:
+                    _EXP_LOG.debug(f"[ClientAEREngine] set seed_dm failed: {e}")
+
+            # Apply id gates (injects noise)
+            for q in range(3):
+                qc.id(q)
+
+            # Save density matrix
+            qc.save_density_matrix()
+
+            return qc
+        except ImportError:
+            self.fallback_mode = True
+            return None
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] prepare_w_state_circuit: {e}")
+            return None
+
+    def run_evolution_circuit(
+        self,
+        consensus_dm: _np.ndarray
+    ) -> Optional[_np.ndarray]:
+        """
+        Run W-state evolution circuit on consensus DM.
+
+        1. Build circuit with consensus_dm as seed
+        2. Run on AER simulator
+        3. Extract density matrix from result
+        4. Enforce valid DM
+        5. Return evolved DM
+
+        On error: log warning, return input consensus_dm.
+        Note: timeout is not enforced by qiskit AER at the method level.
+        """
+        if self.fallback_mode or self.aer_simulator is None:
+            return consensus_dm
+
+        try:
+            qc = self.prepare_w_state_circuit(consensus_dm)
+            if qc is None:
+                return consensus_dm
+
+            # Run AER simulator
+            result = self.aer_simulator.run(qc).result()
+
+            # Extract density matrix
+            dm_result_obj = result.data(0).get('density_matrix')
+            if dm_result_obj is None:
+                return consensus_dm
+
+            dm_result = _np.array(dm_result_obj.data, dtype=_np.complex128)
+            return self.enforce_valid_dm(dm_result)
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] run_evolution_circuit: {e}")
+            return consensus_dm
+
+    def run_shot_circuit(
+        self,
+        evolved_dm: _np.ndarray,
+        shots: int = 1024
+    ) -> Optional[Dict[str, int]]:
+        """
+        Run shot measurement circuit on evolved DM.
+
+        1. Build circuit with evolved_dm as seed
+        2. Add measurement to all qubits
+        3. Run with specified shots
+        4. Extract counts dict
+        5. Return {bitstring: count, ...} with string keys and int counts
+
+        Returns counts dict on success, {} on failure.
+        """
+        if self.fallback_mode or self.aer_simulator is None:
+            return {}
+
+        try:
+            qc = self.prepare_w_state_circuit(evolved_dm)
+            if qc is None:
+                return {}
+
+            # Add measurement to all qubits
+            qc.measure_all()
+
+            # Run with shots
+            result = self.aer_simulator.run(qc, shots=shots).result()
+
+            # Extract counts
+            counts = result.get_counts(qc)
+            if counts is None:
+                return {}
+
+            # Ensure all keys are strings and values are ints
+            counts_clean = {}
+            for key, val in counts.items():
+                try:
+                    k_str = str(key)
+                    v_int = int(val)
+                    counts_clean[k_str] = v_int
+                except Exception as e:
+                    _EXP_LOG.warning(f"[ClientAEREngine] run_shot_circuit: Failed to convert count {key}:{val} - {e}")
+
+            return counts_clean
+        except Exception as e:
+            _EXP_LOG.debug(f"[ClientAEREngine] run_shot_circuit: {e}")
+            return {}
 # Patches AsyncOracleMiner.mine_block() to use KoyebRPCNodule when the
 class _MiningTelemetry:
     """Thread-safe mining statistics with reward tracking."""
@@ -12225,6 +13487,10 @@ class QtclClientApp:
         # ── SSE broadcast infrastructure (peers subscribe to our oracle stream) ──
         self._sse_snapshot_queues: list = []     # list of queue.Queue — one per SSE subscriber
         self._sse_lock = _threading.Lock()
+
+        # ── Quantum oracle mesh: background 30s snapshot cycle for block submission ──
+        self._oracle_mesh: Optional[ClientOracleMesh] = None
+        self._oracle_mesh_lock = _threading.RLock()
     def sample_server_16_cubed(self) -> Optional[str]:
         """Sample latest 16³ from server SSE stream - called by AER to feed mining."""
         if not self._sse_client:
@@ -14712,6 +15978,8 @@ class QtclClientApp:
           GET  /rpc/oracle/w-state   → latest oracle W-state snapshot (JSON)
           GET  /rpc/oracle/pq0-bloch → pq0 bloch sphere angles + DM metrics
           GET  /rpc/oracle/pq0       → alias for pq0-bloch
+          GET  /rpc/stream/snapshot  → REST one-shot snapshot from ClientOracleMesh
+          GET  /rpc/stream           → SSE stream of ClientOracleMesh snapshots
           GET  /api/peers/list       → known peers from local DB
           GET  /api/p2p/peers        → P2P connected peers
           GET  /api/p2p/consensus_dm → current consensus DM
@@ -14937,6 +16205,81 @@ class QtclClientApp:
                                                for p in peers[:16]],
                         'timestamp':          _ht.time(),
                     })
+                # ── /rpc/stream/snapshot — REST one-shot snapshot endpoint ─────
+                elif path == '/rpc/stream/snapshot':
+                    _oracle_mesh = getattr(_app_ref, '_oracle_mesh', None)
+                    if _oracle_mesh is not None:
+                        _snap = _oracle_mesh.get_snapshot_or_empty()
+                    else:
+                        _snap = {}
+                    self._json_resp(200, {
+                        'status': 'ok',
+                        'timestamp_s': _ht.time(),
+                        'snapshot': _snap if _snap else None,
+                    })
+                # ── /rpc/stream — SSE streaming endpoint for peers ────────────
+                elif path == '/rpc/stream':
+                    _oracle_mesh = getattr(_app_ref, '_oracle_mesh', None)
+                    if _oracle_mesh is None:
+                        self._json_resp(503, {'error': 'oracle mesh not initialized'})
+                        return
+                    try:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/event-stream; charset=UTF-8')
+                        self.send_header('Cache-Control', 'no-cache')
+                        self.send_header('Connection', 'keep-alive')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        try:
+                            self.end_headers()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                        # Stream snapshots every ~5 seconds until client disconnects
+                        _last_cycle = -1
+                        _stream_wait_s = 0.1  # Poll interval
+                        _stream_timeout_s = 300.0  # 5 minute timeout
+                        _stream_start = _ht.time()
+                        while True:
+                            try:
+                                _snap = _oracle_mesh.get_snapshot()
+                                if _snap is not None and _snap.cycle != _last_cycle:
+                                    # New snapshot available — send it
+                                    _last_cycle = _snap.cycle
+                                    _snap_dict = {
+                                        'timestamp_s': _snap.timestamp_s,
+                                        'cycle': _snap.cycle,
+                                        'density_matrix_hex': _snap.density_matrix_hex,
+                                        'w_state_fidelity': _snap.w_state_fidelity,
+                                        'purity': _snap.purity,
+                                        'von_neumann_entropy': _snap.von_neumann_entropy,
+                                        'coherence_l1': _snap.coherence_l1,
+                                        'mermin_value': _snap.mermin_value,
+                                        'mermin_violated': _snap.mermin_violated,
+                                        'mermin_angles': _snap.mermin_angles,
+                                        'concurrence': _snap.concurrence,
+                                        'measurement_counts': _snap.measurement_counts,
+                                        'w_entropy_hash': _snap.w_entropy_hash,
+                                        'block_field_tensor_hex': _snap.block_field_tensor_hex,
+                                        'block_field_hash': _snap.block_field_hash,
+                                        'stream_count': _snap.stream_count,
+                                        'genesis_mode': _snap.genesis_mode,
+                                    }
+                                    _payload = ('data: ' + _hj.dumps(_snap_dict, separators=(',',':'), default=str) + '\n\n').encode()
+                                    self.wfile.write(_payload)
+                                    self.wfile.flush()
+                                elif _snap is None or _snap.cycle == _last_cycle:
+                                    # No new snapshot — check timeout
+                                    if _ht.time() - _stream_start > _stream_timeout_s:
+                                        break
+                                    # Brief sleep before retrying
+                                    _ht.sleep(_stream_wait_s)
+                            except (BrokenPipeError, ConnectionResetError,
+                                    ConnectionAbortedError):
+                                break
+                            except Exception as _e:
+                                _EXP_LOG.debug(f"[HTTP-9091] /rpc/stream error: {_e}")
+                                break
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[HTTP-9091] /rpc/stream setup error: {_e}")
                 else:
                     self.send_response(404)
                     self.send_header('Content-Length', '9')
@@ -15008,6 +16351,12 @@ class QtclClientApp:
                                       peer_ip, peer_port))
                         except Exception:
                             pass
+                        # Register peer with quantum oracle mesh for real-time consensus
+                        if self._oracle_mesh:
+                            try:
+                                self._oracle_mesh.register_peer_sse(peer_id, peer_ip, peer_port)
+                            except Exception as _mesh_reg_e:
+                                _EXP_LOG.debug(f"[HTTP] Failed to register peer with mesh: {_mesh_reg_e}")
                     snap = self._oracle_snapshot()
                     import sqlite3 as _plr
                     import pathlib as _plrpath
@@ -15179,6 +16528,16 @@ class QtclClientApp:
 
         print(f"  ✅ SSE stream subscription established at {self.oracle_url}/rpc/oracle/snapshot", flush=True)
         print(f"  ✅ Real-time 16³ quantum data flowing", flush=True)
+
+        # ── Start quantum oracle mesh (background 30s snapshot cycle) ───────────────
+        if self._sse_client:
+            try:
+                self._oracle_mesh = ClientOracleMesh(self._sse_client, self)
+                self._oracle_mesh.start()
+                _EXP_LOG.info("[App] Quantum oracle mesh started")
+            except Exception as e:
+                _EXP_LOG.warning(f"[App] Failed to start oracle mesh: {e}")
+                self._oracle_mesh = None
 
         snap = _metrics
 
@@ -15388,15 +16747,23 @@ class QtclClientApp:
                 f"pq_curr={_pqc}  pq_last={_pql}"
             )
             return (True, _meas, _pow_seed, _report)
-        # ── Status display — use live snap already fetched above ───────────────
-        _dm_hex   = snap.get('density_matrix_hex', '')
+        # ── Status display — check BOTH bootstrap snap AND ClientOracleMesh ──────
+        # ClientOracleMesh may have a fresher snapshot than the bootstrap snap
+        _display_snap = snap  # Start with bootstrap snap
+        if self._oracle_mesh:
+            _mesh_snap = self._oracle_mesh.get_snapshot()
+            if _mesh_snap and getattr(_mesh_snap, 'density_matrix_hex', None):
+                # Convert ClientQuantumSnapshot to dict for consistent access
+                _display_snap = self._oracle_mesh.get_snapshot_or_empty()
+
+        _dm_hex   = _display_snap.get('density_matrix_hex', '')
         _w_fid    = float(
-            (snap.get('w_state') or {}).get('fidelity') or
-            snap.get('w_state_fidelity') or
-            (snap.get('lattice') or {}).get('fidelity') or 0.0
+            (_display_snap.get('w_state') or {}).get('fidelity') or
+            _display_snap.get('w_state_fidelity') or
+            (_display_snap.get('lattice') or {}).get('fidelity') or 0.0
         )
         _dm_ready = bool(_dm_hex and len(_dm_hex) > 32)
-        _lat_ms   = float(snap.get('_latency_ms') or snap.get('latency_ms') or snap.get('oracle_latency_ms') or 0.0)
+        _lat_ms   = float(_display_snap.get('_latency_ms') or _display_snap.get('latency_ms') or _display_snap.get('oracle_latency_ms') or 0.0)
 
         # ── Load wallet before mining (required for block signatures) ──────────────
         if not self.wallet.is_loaded():
@@ -15422,10 +16789,10 @@ class QtclClientApp:
             print(f"  ✅ Wallet already loaded: {self.wallet.address}", flush=True)
 
         if _dm_ready:
-            print(f"  ✅ Oracle DM acquired  fidelity={_w_fid:.4f}", flush=True)
+            print(f"  ✅ Oracle state: ACTIVE  fidelity={_w_fid:.4f}", flush=True)
             print(f"  ⛏️  Mining at height {bh}  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
         else:
-            print(f"  ⚠️  Oracle DM unavailable (degraded mode)", flush=True)
+            print(f"  ⚠️  Oracle state: DEGRADED (SSE stream active)", flush=True)
             print(f"  ⛏️  Mining at height {bh} with os.urandom seed", flush=True)
             print(f"  pq_curr={pq_curr_id}  pq_last={pq_last_id}", flush=True)
         print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
@@ -16095,65 +17462,95 @@ class QtclClientApp:
                         pq_curr = pq_last + 1
                         pq0 = 0
 
-                    # ── AER ENTANGLEMENT: Generate 16³ field from (pq_curr, pq_last, block_hash) ──
-                    # These 3 values form 4 points in W-state → AER → 16×16×16 measurement
-                    block_quantum_field_hex = ""
-                    try:
-                        import numpy as _np_aer
-                        import hashlib as _h_aer
+                    # ── QUANTUM ORACLE MESH: Fetch pre-computed snapshot for block field ───────────────
+                    # Snapshot captured BEFORE block solve loop (race prevention)
+                    _mesh_snap = None
+                    if self._oracle_mesh:
+                        _mesh_snap = self._oracle_mesh.get_snapshot()
 
-                        # Seed RNG from block values
-                        _seed_data = f"{pq_curr}:{pq_last}:{block_hash}".encode()
-                        _seed_hash = _h_aer.sha256(_seed_data).digest()
-                        _rng_seed = int.from_bytes(_seed_hash[:4], 'big')
-                        _np_aer.random.seed(_rng_seed)
-
-                        # Create 16³ field: W-state with Gaussian envelope (reduced from 64³ = 2000× smaller)
-                        _field = _np_aer.zeros((16, 16, 16), dtype=_np_aer.complex64)
-                        _x = (pq_curr % 16)
-                        _y = (pq_last % 16)
-                        _z = (int(block_hash[:8], 16) % 16)
-
-                        for _i in range(16):
-                            for _y_idx in range(16):
-                                for _k in range(16):
-                                    _dx, _dy, _dz = (_i - _x), (_y_idx - _y), (_k - _z)
-                                    _r_sq = _dx*_dx + _dy*_dy + _dz*_dz
-                                    _envelope = _np_aer.exp(-_r_sq / 64.0)  # Updated scaling for 16³
-                                    _phase = 2 * _np_aer.pi * (pq_curr + pq_last) / 16.0
-                                    _phase += 2 * _np_aer.pi * int(block_hash[:4], 16) / 65536.0
-                                    _amp = _envelope / _np_aer.sqrt(4096.0)  # 16³ = 4096 normalization
-                                    _field[_i, _y_idx, _k] = _amp * _np_aer.exp(1j * _phase)
-
-                        # Normalize
-                        _trace = _np_aer.sum(_np_aer.abs(_field) ** 2)
-                        if _trace > 1e-12:
-                            _field = _field / _np_aer.sqrt(_trace)
-
-                        # Encode as hex
-                        block_quantum_field_hex = _np_aer.asarray(_field, dtype=_np_aer.complex64).tobytes().hex()
-                        _EXP_LOG.debug(f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)")
-
-                        # ── Store local measurement in database ──────────────────────────
+                    if _mesh_snap is not None and isinstance(_mesh_snap, ClientQuantumSnapshot):
+                        # ── Use quantum snapshot fields from mesh ────────────────────────
+                        block_quantum_field_hex = _mesh_snap.block_field_tensor_hex
+                        quantum_w_state_fidelity = _mesh_snap.w_state_fidelity
+                        quantum_mermin_value = _mesh_snap.mermin_value
+                        quantum_mermin_violated = _mesh_snap.mermin_violated
+                        quantum_purity = _mesh_snap.purity
+                        quantum_entropy = _mesh_snap.von_neumann_entropy
+                        quantum_coherence = _mesh_snap.coherence_l1
+                        quantum_concurrence = _mesh_snap.concurrence
+                        quantum_genesis_mode = _mesh_snap.genesis_mode
+                        quantum_stream_count = _mesh_snap.stream_count
+                        quantum_measurement_counts = _mesh_snap.measurement_counts
+                        _EXP_LOG.info(f"[MINER] ✅ Using quantum mesh snapshot (fidelity={quantum_w_state_fidelity:.4f})")
+                    else:
+                        # ── FALLBACK: Gaussian generation (existing code) ──────────────────────────
+                        block_quantum_field_hex = ""
+                        quantum_w_state_fidelity = 0.0
+                        quantum_mermin_value = 0.0
+                        quantum_mermin_violated = False
+                        quantum_purity = 0.0
+                        quantum_entropy = 0.0
+                        quantum_coherence = 0.0
+                        quantum_concurrence = 0.0
+                        quantum_genesis_mode = True
+                        quantum_stream_count = 0
+                        quantum_measurement_counts = {}
                         try:
-                            self.db.store_dm_measurement(pq_curr, 'local', block_quantum_field_hex,
-                                                         {'pq_curr': pq_curr, 'pq_last': pq_last, 'block_hash': block_hash})
-                            _EXP_LOG.debug(f"[MINER] Stored local measurement for block {pq_curr}")
-                        except Exception as _store_local_e:
-                            _EXP_LOG.debug(f"[MINER] Store local measurement failed: {_store_local_e}")
+                            import numpy as _np_aer
+                            import hashlib as _h_aer
 
-                        # ── Compute quantum consensus: merge with server + peer SSE snapshots ──
-                        try:
-                            _consensus_dm = self.merge_with_peer_consensus(block_quantum_field_hex)
-                            if _consensus_dm and _consensus_dm != block_quantum_field_hex:
-                                _EXP_LOG.info(f"[MINER] ✅ Quantum mesh consensus: merged local + server + peers")
-                                block_quantum_field_hex = _consensus_dm
-                            else:
-                                _EXP_LOG.debug(f"[MINER] Using local 16³ measurement (no consensus available)")
-                        except Exception as _consensus_e:
-                            _EXP_LOG.debug(f"[MINER] Mesh consensus failed: {_consensus_e}, using local")
-                    except Exception as _aer_e:
-                        _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)")
+                            # Seed RNG from block values
+                            _seed_data = f"{pq_curr}:{pq_last}:{block_hash}".encode()
+                            _seed_hash = _h_aer.sha256(_seed_data).digest()
+                            _rng_seed = int.from_bytes(_seed_hash[:4], 'big')
+                            _np_aer.random.seed(_rng_seed)
+
+                            # Create 16³ field: W-state with Gaussian envelope (reduced from 64³ = 2000× smaller)
+                            _field = _np_aer.zeros((16, 16, 16), dtype=_np_aer.complex64)
+                            _x = (pq_curr % 16)
+                            _y = (pq_last % 16)
+                            _z = (int(block_hash[:8], 16) % 16)
+
+                            for _i in range(16):
+                                for _y_idx in range(16):
+                                    for _k in range(16):
+                                        _dx, _dy, _dz = (_i - _x), (_y_idx - _y), (_k - _z)
+                                        _r_sq = _dx*_dx + _dy*_dy + _dz*_dz
+                                        _envelope = _np_aer.exp(-_r_sq / 64.0)  # Updated scaling for 16³
+                                        _phase = 2 * _np_aer.pi * (pq_curr + pq_last) / 16.0
+                                        _phase += 2 * _np_aer.pi * int(block_hash[:4], 16) / 65536.0
+                                        _amp = _envelope / _np_aer.sqrt(4096.0)  # 16³ = 4096 normalization
+                                        _field[_i, _y_idx, _k] = _amp * _np_aer.exp(1j * _phase)
+
+                            # Normalize
+                            _trace = _np_aer.sum(_np_aer.abs(_field) ** 2)
+                            if _trace > 1e-12:
+                                _field = _field / _np_aer.sqrt(_trace)
+
+                            # Encode as hex
+                            block_quantum_field_hex = _np_aer.asarray(_field, dtype=_np_aer.complex64).tobytes().hex()
+                            _EXP_LOG.debug(f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)")
+
+                            # ── Store local measurement in database ──────────────────────────
+                            try:
+                                self.db.store_dm_measurement(pq_curr, 'local', block_quantum_field_hex,
+                                                             {'pq_curr': pq_curr, 'pq_last': pq_last, 'block_hash': block_hash})
+                                _EXP_LOG.debug(f"[MINER] Stored local measurement for block {pq_curr}")
+                            except Exception as _store_local_e:
+                                _EXP_LOG.debug(f"[MINER] Store local measurement failed: {_store_local_e}")
+
+                            # ── Compute quantum consensus: merge with server + peer SSE snapshots ──
+                            try:
+                                _consensus_dm = self.merge_with_peer_consensus(block_quantum_field_hex)
+                                if _consensus_dm and _consensus_dm != block_quantum_field_hex:
+                                    _EXP_LOG.info(f"[MINER] ✅ Quantum mesh consensus: merged local + server + peers")
+                                    block_quantum_field_hex = _consensus_dm
+                                else:
+                                    _EXP_LOG.debug(f"[MINER] Using local 16³ measurement (no consensus available)")
+                            except Exception as _consensus_e:
+                                _EXP_LOG.debug(f"[MINER] Mesh consensus failed: {_consensus_e}, using local")
+                        except Exception as _aer_e:
+                            _EXP_LOG.warning(f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)")
 
                     # Fidelity priority:
                     #  1. self._local_fused_fid  — tripartite joint W4 (most current)
@@ -16241,7 +17638,7 @@ class QtclClientApp:
                             _sig = self.wallet.sign_transaction(_block_for_sig)
                             if _sig and not _sig.get('error'):
                                 submit_payload["hyp_signature"] = _sig
-                                submit_payload["miner_pubkey"] = self.wallet.public_key or ""
+                                submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
                                 _EXP_LOG.info(f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…")
                             else:
                                 _EXP_LOG.error(f"[MINER] ❌ HypΓ signing failed: {_sig}")
@@ -16255,8 +17652,8 @@ class QtclClientApp:
                     # ──────────────────────────────────────────────────────────────
 
                     # Validate required fields before submission
-                    if "hyp_signature" not in submit_payload or "miner_pubkey" not in submit_payload:
-                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_pubkey={submit_payload.get('miner_pubkey') is not None}")
+                    if "hyp_signature" not in submit_payload or "miner_public_key_hex" not in submit_payload:
+                        _EXP_LOG.error(f"[SUBMIT] ❌ Block h={target_height} missing required fields: hyp_signature={submit_payload.get('hyp_signature') is not None}, miner_public_key_hex={submit_payload.get('miner_public_key_hex') is not None}")
                         _MINE_TELEM.mark_idle()
                         continue
 
@@ -16427,11 +17824,79 @@ class QtclClientApp:
             return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         def _print_dashboard(force_full: bool = False) -> None:
             self.koyeb_state.refresh_metrics(self.client_field)
-            
+
             ks2  = self.koyeb_state
             m2   = self.client_field.metrics
             tel  = _MINE_TELEM.snapshot()
             now  = time.time()
+
+            # ── Refresh quantum metrics from latest stream data ──────────────────
+            # Priority: oracle_mesh snapshot > SSE stream snapshot > fallback to m2
+            _refreshed_metrics = None
+            try:
+                # Try oracle mesh snapshot first (highest priority)
+                if self._oracle_mesh:
+                    _mesh_snap = self._oracle_mesh.get_snapshot()
+                    if _mesh_snap:
+                        _refreshed_metrics = {
+                            'fidelity_to_w3': _mesh_snap.get('w_state_fidelity', 0.0),
+                            'entropy_vn': _mesh_snap.get('von_neumann_entropy', 0.0),
+                            'purity': _mesh_snap.get('purity', 0.0),
+                            'field_density': _mesh_snap.get('coherence_l1', 0.0),
+                        }
+
+                # Fallback to server SSE stream data
+                if not _refreshed_metrics and self._sse_client:
+                    _server_snap = self._sse_client.get_latest_snapshot()
+                    if _server_snap and ('density_tensor_hex' in _server_snap or 'density_matrix_hex' in _server_snap):
+                        # Parse DM from hex if available
+                        _dm_hex = _server_snap.get('density_tensor_hex', '') or _server_snap.get('density_matrix_hex', '')
+                        if _dm_hex:
+                            try:
+                                import struct as _st_m
+                                _bdata = bytes.fromhex(_dm_hex)
+                                # For 8x8 DM: 64 complex doubles = 64 * 16 bytes = 1024 bytes
+                                if len(_bdata) == 1024 and _HAS_NP:
+                                    _re = []; _im = []
+                                    for _i in range(64):
+                                        _r, _im_v = _st_m.unpack_from('>dd', _bdata, _i*16)
+                                        _re.append(_r); _im.append(_im_v)
+                                    _dm_arr = (_np.array(_re, dtype=_np.complex128) +
+                                             1j * _np.array(_im, dtype=_np.complex128)).reshape(8, 8)
+                                    # Compute metrics from DM
+                                    _w_fid = ClientQuantumMetrics.w3_fidelity(_dm_arr)
+                                    _vn_ent = ClientQuantumMetrics.von_neumann_entropy(_dm_arr)
+                                    _purity = ClientQuantumMetrics.purity(_dm_arr)
+                                    _coherence = ClientQuantumMetrics.coherence_l1(_dm_arr)
+                                    _refreshed_metrics = {
+                                        'fidelity_to_w3': max(0.0, min(1.0, float(_w_fid))),
+                                        'entropy_vn': max(0.0, min(3.0, float(_vn_ent))),
+                                        'purity': max(0.0, min(1.0, float(_purity))),
+                                        'field_density': float(_coherence),
+                                    }
+                            except Exception:
+                                pass
+                        # Fallback: use direct metrics from snapshot
+                        if not _refreshed_metrics:
+                            _refreshed_metrics = {
+                                'fidelity_to_w3': float(_server_snap.get('w_state_fidelity', _server_snap.get('fidelity', 0.0))),
+                                'entropy_vn': float(_server_snap.get('von_neumann_entropy', _server_snap.get('entropy', 0.0))),
+                                'purity': float(_server_snap.get('purity', 0.0)),
+                                'field_density': float(_server_snap.get('coherence_l1', _server_snap.get('coherence', 0.0))),
+                            }
+            except Exception:
+                pass
+
+            # Use refreshed metrics if available, otherwise fall back to m2
+            if _refreshed_metrics:
+                # Create a minimal object to hold refreshed metrics for display
+                class _RefreshedMetrics:
+                    def __init__(self, d):
+                        self.fidelity_to_w3 = d['fidelity_to_w3']
+                        self.entropy_vn = d['entropy_vn']
+                        self.purity = d['purity']
+                        self.field_density = d['field_density']
+                m2 = _RefreshedMetrics(_refreshed_metrics)
             sep  = "─" * 72
             # ── state badge ───────────────────────────────────────────────
             state_badge = {
