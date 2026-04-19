@@ -16910,15 +16910,23 @@ class QtclClientApp:
                                 f"hash={block_hash[:16]}… ({_elapsed:.0f}s elapsed)"
                             )
 
-                            # RPC call with timeout (no internal retry — we handle retry loop)
+                            # RPC call with hard timeout + asyncio cancellation safety
                             # Use _rpc_envelope to get full response including error details
                             # needed for smart rejection handling (entropy_expired, Invalid height)
-                            _envelope = kapi._rpc_envelope(
-                                "qtcl_submitBlock",
-                                [payload],
-                                timeout=15,
-                                retries=1
-                            )
+                            try:
+                                _envelope = await _asyncio.wait_for(
+                                    _asyncio.to_thread(
+                                        kapi._rpc_envelope,
+                                        "qtcl_submitBlock",
+                                        [payload],
+                                        15,
+                                        1
+                                    ),
+                                    timeout=20
+                                )
+                            except _asyncio.TimeoutError:
+                                _EXP_LOG.warning(f"[SUBMIT] Attempt {attempt+1}: RPC timeout after 20s")
+                                _envelope = None
                             result = _envelope.get('result') if isinstance(_envelope, dict) and 'result' in _envelope else \
                                      (_envelope if isinstance(_envelope, dict) and 'error' in _envelope else None)
 
