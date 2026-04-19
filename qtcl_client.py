@@ -161,6 +161,9 @@ ENTROPY_SERVER_URL = os.getenv(
 # Mirror back so any code using either env var sees the same value
 os.environ.setdefault("ENTROPY_SERVER", ENTROPY_SERVER_URL)
 os.environ.setdefault("ORACLE_URL", ENTROPY_SERVER_URL)
+
+# SSE service URL for streaming endpoints (defaults to main oracle if not set)
+SSE_SERVICE_URL = os.getenv("SSE_SERVICE_URL", ENTROPY_SERVER_URL)
 P2P_BOOTSTRAP_PEERS = [
     ("qtcl-blockchain.koyeb.app", 9091),
 ]
@@ -4881,7 +4884,7 @@ class LiveRPCOracleSnapshot:
             from sse_listener import EventSourceListener
 
             self.sse_listener = EventSourceListener(
-                url=f"{self.ORACLE_URL}/rpc/oracle/snapshot",
+                url=f"{SSE_SERVICE_URL}/rpc/oracle/snapshot",
                 on_snapshot=self._handle_sse_snapshot,
                 timeout=5.0,
                 max_reconnect_attempts=5,
@@ -4957,7 +4960,7 @@ class LiveRPCOracleSnapshot:
         updates oracle state cache.
         """
         _t0 = time.time()
-        _snap_url = f"{self.ORACLE_URL}/rpc/oracle/snapshot"
+        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot"
         _rpc_url = f"{self.ORACLE_URL}/rpc"
         _payload = {
             "jsonrpc": "2.0",
@@ -22188,7 +22191,7 @@ class QtclClientApp:
         from urllib.request import Request as _SR, urlopen as _SO
         from urllib.error import URLError as _SE, HTTPError as _HE
 
-        _oracle_url = ENTROPY_SERVER_URL
+        _oracle_url = SSE_SERVICE_URL
         url = f"{_oracle_url}/rpc/oracle/snapshot"
         _last_snap_hash = None
         _fail_count = 0
