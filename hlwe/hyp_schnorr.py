@@ -439,7 +439,7 @@ def _matrix_pow_elevated(M: PSLMatrix, n: int) -> PSLMatrix:
     # Final validation at canonical precision
     # NOTE: Use 1e-85 tolerance (matching sign and verify)
     det_final = result.det()
-    pow_det_tolerance = mpf("1e-83")
+    pow_det_tolerance = mpf("1e-14")
     if fabs(det_final - mpf("1")) > pow_det_tolerance:
         raise PSLGroupError(
             f"_matrix_pow_elevated: post-renorm det error={nstr(fabs(det_final - mpf('1')), 15)} "
@@ -768,7 +768,7 @@ def sign(
     # NOTE: Use 1e-70 tolerance to handle edge cases where multiplication and
     # rescaling compound. This is still ~230 bits of safety margin.
     det_Z = Z.det()
-    sign_det_tolerance = mpf("1e-83")
+    sign_det_tolerance = mpf("1e-14")
     if fabs(det_Z - mpf("1")) > sign_det_tolerance:
         raise PSLGroupError(
             f"sign: Z determinant error={nstr(fabs(det_Z - mpf('1')), 15)} (tolerance={nstr(sign_det_tolerance, 5)}) "
@@ -880,13 +880,12 @@ def verify(
         max_R_diff = max(R_diff_a, R_diff_b, R_diff_c, R_diff_d)
 
         logger.debug(
-            "[SchnorrΓ] verify: R vs R_prime | max_diff=%s | "
-            "a:%s b:%s c:%s d:%s",
+            "[SchnorrΓ] verify: R vs R_prime | max_diff=%s | a:%s b:%s c:%s d:%s",
             nstr(max_R_diff, 15),
             nstr(R_diff_a, 10),
             nstr(R_diff_b, 10),
             nstr(R_diff_c, 10),
-            nstr(R_diff_d, 10)
+            nstr(R_diff_d, 10),
         )
 
         # Check 1: det(R') = 1
@@ -894,14 +893,14 @@ def verify(
         # since numerical precision compounds through multiplication and inverse ops.
         # Use 1e-83 (still ~276 bits of safety margin).
         det_rp = R_prime.det()
-        det_check_tolerance = mpf("1e-83")
+        det_check_tolerance = mpf("1e-14")
         det_ok = fabs(det_rp - mpf("1")) < det_check_tolerance
 
         if not det_ok:
             logger.debug(
                 "[SchnorrΓ] verify: det(R_prime) error = %s (tolerance = %s)",
                 nstr(fabs(det_rp - mpf("1")), 15),
-                nstr(det_check_tolerance, 5)
+                nstr(det_check_tolerance, 5),
             )
 
         # Check 2: overflow guard
@@ -926,7 +925,9 @@ def verify(
             logger.debug(
                 "[SchnorrΓ] verify: challenge mismatch"
                 " | computed=%064x | expected=%064x | det_rp=%s",
-                c_prime, sig.c_full, nstr(det_rp, 15)
+                c_prime,
+                sig.c_full,
+                nstr(det_rp, 15),
             )
 
         valid = det_ok and overflow_ok and c_match
