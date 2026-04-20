@@ -4037,20 +4037,11 @@ class HypGammaWallet:
                 if decrypted:
                     wallet_data = decrypted
                 else:
-                    # Decryption failed — wallet might have custom encryption
-                    # Fall back to generating fresh keypair with a note
-                    logger.warning(
-                        "[HYP-WALLET] Cannot decrypt wallet (custom encryption format)"
+                    # Decryption failed — password is wrong
+                    logger.error(
+                        "[HYP-WALLET] ❌ Failed to decrypt wallet — password is incorrect"
                     )
-                    logger.info(
-                        "[HYP-WALLET] Generating fresh keypair for this session"
-                    )
-                    self.keypair = self.engine.generate_keypair()
-                    self._loaded = True
-                    logger.info(
-                        f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}..."
-                    )
-                    return True
+                    return False
 
             # Validate required fields
             if not all(
@@ -11911,11 +11902,15 @@ class KoyebRPCNodule:
             }
 
             # Try main URL, then fallback to port 9091 on timeout
+            # Extract hostname from base_url for fallback
+            import urllib.parse as _urlparse_fix
+            parsed = _urlparse_fix.urlparse(self.base_url)
+            fallback_host = parsed.netloc or self.base_url
+            fallback_scheme = parsed.scheme or "https"
+            fallback_url = f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc"
             urls_to_try = [
                 f"{self.base_url}/rpc",  # Primary (Koyeb-managed)
-                f"{self.base_url.split(':')[0]}:9091/rpc"  # Fallback P2P port
-                if "://" in self.base_url
-                else f"http://{self.base_url}:9091/rpc",
+                fallback_url,  # Fallback P2P port
             ]
 
             for url_idx, post_url in enumerate(urls_to_try):
@@ -11957,11 +11952,14 @@ class KoyebRPCNodule:
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
 
         # Try main URL, then fallback to port 9091 on timeout
+        # Reuse fallback URL construction from submitBlock
+        parsed = _up.urlparse(self.base_url)
+        fallback_host = parsed.netloc or self.base_url
+        fallback_scheme = parsed.scheme or "https"
+        fallback_url = f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc?{query}"
         urls_to_try = [
             f"{self.base_url}/rpc?{query}",  # Primary (Koyeb-managed)
-            f"{self.base_url.split(':')[0]}:9091/rpc?{query}"  # Fallback P2P port
-            if "://" in self.base_url
-            else f"http://{self.base_url}:9091/rpc?{query}",
+            fallback_url,  # Fallback P2P port
         ]
 
         for url_idx, full_url in enumerate(urls_to_try):
@@ -20745,8 +20743,8 @@ class QtclClientApp:
         try:
             pw = _silent_getpass("  Wallet password: ").strip()
         except (EOFError, KeyboardInterrupt):
-            return False
-        return bool(pw) and self.wallet.load(pw)
+            pw = ""
+        return self.wallet.load(pw)
 
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
