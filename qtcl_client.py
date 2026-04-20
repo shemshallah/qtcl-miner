@@ -4844,11 +4844,10 @@ def _update_chain_state_atomic(
     # Update total blocks accepted count
     cursor.execute("""
         INSERT INTO chain_state (key, value, updated_at)
-        VALUES ('total_blocks_accepted', '0', CURRENT_TIMESTAMP)
-        ON CONFLICT(key) DO UPDATE SET 
-            value = CAST(CAST(chain_state.value AS INTEGER) + 1 AS TEXT),
+        VALUES ('total_blocks_accepted', '1', CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = CAST(CAST(EXCLUDED.value AS INTEGER) + 1 AS TEXT),
             updated_at = CURRENT_TIMESTAMP
-        WHERE chain_state.key = 'total_blocks_accepted'
     """)
 
     logger.debug(
@@ -25336,6 +25335,7 @@ class QtclClientApp:
                     _submitted_hashes.add(block_hash)
 
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
+                    _sig_str = _sig.get("signature", "")[:32] + "…" if _sig and _sig.get("signature") else "unsigned"
                     _MINE_TELEM.record_block(
                         {
                             "height": target_height,
@@ -25345,11 +25345,14 @@ class QtclClientApp:
                             "fidelity": w_state_fidelity,
                             "parent_hash": parent_hash,
                             "difficulty": difficulty_bits,
+                            "signature": _sig_str,
+                            "miner_public_key": submit_payload.get("miner_public_key_hex", "")[:32] + "…",
                         }
                     )
                     _MINE_TELEM.mark_submitting()
                     _EXP_LOG.info(
-                        f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} — submitting…"
+                        f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} "
+                        f"sig={_sig_str}  miner={miner_addr[:12]}…  — submitting…"
                     )
                     _success, _result = await _submission.submit(
                         submit_payload, target_height, block_hash
@@ -25876,6 +25879,10 @@ class QtclClientApp:
                     f"ts: {time.strftime('%H:%M:%S', time.localtime(lb.get('timestamp', now)))}"
                 )
                 print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
+                if lb.get('signature'):
+                    print(f"     sig     : {str(lb.get('signature', '?'))[:48]}…")
+                if lb.get('miner_public_key'):
+                    print(f"     pubkey  : {str(lb.get('miner_public_key', '?'))[:48]}…")
                 print(
                     f"  ── Quantum Attestation ──────────────────────────────────────"
                 )
