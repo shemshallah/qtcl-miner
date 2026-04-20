@@ -25239,39 +25239,58 @@ class QtclClientApp:
 
                     # ── HypΓ-sign the block (must be before submission) ──
                     _sig = None
-                    try:
-                        if (
-                            self.wallet
-                            and self.wallet.is_loaded()
-                            and self.wallet.private_key
-                        ):
-                            # Sign the block payload (excluding signature field) using wallet's sign_transaction
-                            _block_for_sig = {
-                                k: v
-                                for k, v in submit_payload.items()
-                                if k not in ("hyp_signature", "hyp_sig", "miner_pubkey")
-                            }
-                            _sig = self.wallet.sign_transaction(_block_for_sig)
-                            if _sig and not _sig.get("error"):
-                                submit_payload["hyp_signature"] = _sig
-                                submit_payload["miner_public_key_hex"] = (
-                                    self.wallet.public_key or ""
-                                )
-                                _EXP_LOG.info(
-                                    f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…"
-                                )
+                    _sign_retries = 3
+                    for _sign_attempt in range(_sign_retries):
+                        try:
+                            if (
+                                self.wallet
+                                and self.wallet.is_loaded()
+                                and self.wallet.private_key
+                            ):
+                                # Sign the block payload (excluding signature field)
+                                _block_for_sig = {
+                                    k: v
+                                    for k, v in submit_payload.items()
+                                    if k
+                                    not in ("hyp_signature", "hyp_sig", "miner_pubkey")
+                                }
+                                _sig = self.wallet.sign_transaction(_block_for_sig)
+                                if _sig and not _sig.get("error"):
+                                    submit_payload["hyp_signature"] = _sig
+                                    submit_payload["miner_public_key_hex"] = (
+                                        self.wallet.public_key or ""
+                                    )
+                                    _EXP_LOG.info(
+                                        f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…"
+                                    )
+                                    break
+                                elif _sign_attempt < _sign_retries - 1:
+                                    _EXP_LOG.warning(
+                                        f"[MINER] ⚠️ HypΓ sign retry {_sign_attempt + 1}/{_sign_retries}: {_sig}"
+                                    )
+                                    await _asyncio.sleep(0.1)
                             else:
                                 _EXP_LOG.error(
-                                    f"[MINER] ❌ HypΓ signing failed: {_sig}"
+                                    f"[MINER] ❌ Wallet not loaded — cannot sign block"
                                 )
-                        else:
-                            _EXP_LOG.error(
-                                f"[MINER] ❌ Wallet not loaded — cannot sign block (is_loaded={self.wallet.is_loaded() if self.wallet else False}, has_private_key={bool(self.wallet.private_key if self.wallet else None)})"
-                            )
-                    except Exception as _hyp_sign_err:
+                                break
+                        except Exception as _hyp_sign_err:
+                            if _sign_attempt < _sign_retries - 1:
+                                _EXP_LOG.warning(
+                                    f"[MINER] ⚠️ HypΓ sign exception retry: {_hyp_sign_err}"
+                                )
+                                await _asyncio.sleep(0.1)
+                            else:
+                                raise
+
+                    if not _sig or _sig.get("error"):
                         _EXP_LOG.error(
-                            f"[MINER] ❌ HypΓ signing exception: {_hyp_sign_err}"
+                            f"[MINER] ❌ HypΓ signing failed after {_sign_retries} attempts — cannot submit unsigned block"
                         )
+                        _MINE_TELEM.mark_idle()
+                        _submitted_hashes.discard(block_hash)
+                        await _asyncio.sleep(0.5)
+                        continue
 
                     # ──────────────────────────────────────────────────────────────
                     # STAGE 6: Submit via RPC (single path, exponential backoff)
@@ -25294,7 +25313,7 @@ class QtclClientApp:
                         or "miner_public_key_hex" not in submit_payload
                     ):
                         _EXP_LOG.error(
-                            f"[SUBMIT] ❌ Block h={target_height} signing failed — skipping this block, forcing fresh height"
+                            f"[SUBMIT] ❌ Block h={target_height} signing failed — skipping this block"
                         )
                         _MINE_TELEM.mark_idle()
                         _submitted_hashes.discard(block_hash)
