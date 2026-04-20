@@ -4771,9 +4771,10 @@ def _apply_utxo_updates_atomic(
                 if amount > 0 and owner:
                     utxo_id = f"{tx_hash}:{idx}"
                     cursor.execute(
-                        """INSERT OR IGNORE INTO utxo_set 
+                        """INSERT INTO utxo_set
                            (utxo_id, owner_address, amount, created_height)
-                           VALUES (?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT(utxo_id) DO NOTHING""",
                         (utxo_id, owner, int(amount), block_height),
                     )
 
@@ -4808,35 +4809,39 @@ def _update_chain_state_atomic(
         )
     """)
 
-    # Update chain tip
+    # Update chain tip (SQLite 3.24+ and PostgreSQL compatible ON CONFLICT syntax)
     cursor.execute(
         """
-        INSERT OR REPLACE INTO chain_state (key, value, updated_at)
+        INSERT INTO chain_state (key, value, updated_at)
         VALUES ('chain_tip_height', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
     """,
         (str(block_height),),
     )
 
     cursor.execute(
         """
-        INSERT OR REPLACE INTO chain_state (key, value, updated_at)
+        INSERT INTO chain_state (key, value, updated_at)
         VALUES ('chain_tip_hash', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
     """,
         (block_hash,),
     )
 
     cursor.execute(
         """
-        INSERT OR REPLACE INTO chain_state (key, value, updated_at)
+        INSERT INTO chain_state (key, value, updated_at)
         VALUES ('chain_tip_timestamp', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
     """,
         (str(block_timestamp),),
     )
 
     cursor.execute(
         """
-        INSERT OR REPLACE INTO chain_state (key, value, updated_at)
+        INSERT INTO chain_state (key, value, updated_at)
         VALUES ('chain_tip_miner', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
     """,
         (miner_address,),
     )
@@ -11889,67 +11894,93 @@ class KoyebRPCNodule:
     ) -> Optional[dict]:
         """Like _rpc but returns the full JSON-RPC envelope including error objects.
         Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline).
-        IMPORTANT: Use POST for submitBlock to avoid GET 204 empty response issues."""
+        IMPORTANT: Use POST for submitBlock to avoid GET 204 empty response issues.
+
+        Port fallback: Try standard HTTPS first, then fall back to port 9091 on timeout."""
         import urllib.parse as _up
         import urllib.request as _ur
 
         t = timeout or self.timeout
 
         if method == "qtcl_submitBlock":
-            post_url = f"{self.base_url}/rpc"
             payload = {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or [],
                 "id": 1,
             }
-            logger.warning(f"[RPC-ENVELOPE] POST to {post_url}")
-            for attempt in range(retries):
-                try:
-                    if _HAS_REQUESTS:
-                        r = self._get_session().post(post_url, json=payload, timeout=t)
-                        logger.warning(f"[RPC-ENVELOPE] status={r.status_code}")
-                        if r.status_code == 200:
-                            response_text = r.text
-                            logger.warning(
-                                f"[RPC-ENVELOPE] response={response_text[:500]}"
+
+            # Try main URL, then fallback to port 9091 on timeout
+            urls_to_try = [
+                f"{self.base_url}/rpc",  # Primary (Koyeb-managed)
+                f"{self.base_url.split(':')[0]}:9091/rpc"  # Fallback P2P port
+                if "://" in self.base_url
+                else f"http://{self.base_url}:9091/rpc",
+            ]
+
+            for url_idx, post_url in enumerate(urls_to_try):
+                logger.warning(f"[RPC-ENVELOPE] POST to {post_url}")
+                for attempt in range(retries):
+                    try:
+                        if _HAS_REQUESTS:
+                            r = self._get_session().post(post_url, json=payload, timeout=t)
+                            logger.warning(f"[RPC-ENVELOPE] status={r.status_code}")
+                            if r.status_code == 200:
+                                response_text = r.text
+                                logger.warning(
+                                    f"[RPC-ENVELOPE] response={response_text[:500]}"
+                                )
+                                return r.json()
+                        else:
+                            data = _json.dumps(payload).encode("utf-8")
+                            req = _ur.Request(
+                                post_url,
+                                data=data,
+                                headers={"Content-Type": "application/json"},
                             )
-                            return r.json()
-                    else:
-                        data = _json.dumps(payload).encode("utf-8")
-                        req = _ur.Request(
-                            post_url,
-                            data=data,
-                            headers={"Content-Type": "application/json"},
-                        )
-                        with _ur.urlopen(req, timeout=t) as resp:
-                            response_text = resp.read().decode("utf-8")
-                            logger.warning(
-                                f"[RPC-ENVELOPE] fallback response={response_text[:500]}"
-                            )
-                            return _json.loads(response_text)
-                except Exception as e:
-                    logger.warning(f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}")
-                    if attempt < retries - 1:
-                        time.sleep(2**attempt)
+                            with _ur.urlopen(req, timeout=t) as resp:
+                                response_text = resp.read().decode("utf-8")
+                                logger.warning(
+                                    f"[RPC-ENVELOPE] fallback response={response_text[:500]}"
+                                )
+                                return _json.loads(response_text)
+                    except Exception as e:
+                        logger.warning(f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}")
+                        if attempt < retries - 1:
+                            time.sleep(2**attempt)
+                        elif url_idx < len(urls_to_try) - 1:
+                            logger.warning(f"[RPC-ENVELOPE] Trying fallback port 9091...")
+                            break  # Try next URL
             return None
 
         params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-        full_url = f"{self.base_url}/rpc?{query}"
-        for attempt in range(retries):
-            try:
-                if _HAS_REQUESTS:
-                    r = self._get_session().get(full_url, timeout=t)
-                    if r.status_code == 200:
-                        return r.json()
-                else:
-                    req = _ur.Request(full_url)
-                    with _ur.urlopen(req, timeout=t) as resp:
-                        return _json.loads(resp.read().decode("utf-8"))
-            except Exception as e:
-                if attempt < retries - 1:
-                    time.sleep(2**attempt)
+
+        # Try main URL, then fallback to port 9091 on timeout
+        urls_to_try = [
+            f"{self.base_url}/rpc?{query}",  # Primary (Koyeb-managed)
+            f"{self.base_url.split(':')[0]}:9091/rpc?{query}"  # Fallback P2P port
+            if "://" in self.base_url
+            else f"http://{self.base_url}:9091/rpc?{query}",
+        ]
+
+        for url_idx, full_url in enumerate(urls_to_try):
+            for attempt in range(retries):
+                try:
+                    if _HAS_REQUESTS:
+                        r = self._get_session().get(full_url, timeout=t)
+                        if r.status_code == 200:
+                            return r.json()
+                    else:
+                        req = _ur.Request(full_url)
+                        with _ur.urlopen(req, timeout=t) as resp:
+                            return _json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    if attempt < retries - 1:
+                        time.sleep(2**attempt)
+                    elif url_idx < len(urls_to_try) - 1:
+                        logger.warning(f"[RPC-ENVELOPE] Trying fallback port 9091 for {method}...")
+                        break  # Try next URL
         return None
 
     def get_chain_tip(self) -> Optional[dict]:
@@ -25261,7 +25292,9 @@ class QtclClientApp:
                                 }
                                 _sig = self.wallet.sign_transaction(_block_for_sig)
                                 if _sig and not _sig.get("error"):
-                                    submit_payload["hyp_signature"] = _sig
+                                    # Keep _sig as dict for telemetry, but serialize for submission
+                                    # (signature dict contains complex nested objects like R, Z that aren't JSON-serializable)
+                                    submit_payload["hyp_signature"] = json.dumps(_sig, default=str)
                                     submit_payload["miner_public_key_hex"] = (
                                         self.wallet.public_key or ""
                                     )
@@ -25334,8 +25367,16 @@ class QtclClientApp:
                         continue
                     _submitted_hashes.add(block_hash)
 
+                    # ── DEBUG: Trace payload structure before submission ──
+                    _sig_type = type(submit_payload.get("hyp_signature")).__name__
+                    _sig_len = len(str(submit_payload.get("hyp_signature", "")))
+                    _EXP_LOG.warning(
+                        f"[MINER-DEBUG] submit_payload hyp_signature: type={_sig_type} len={_sig_len}"
+                    )
+
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
-                    _sig_str = _sig.get("signature", "")[:32] + "…" if _sig and _sig.get("signature") else "unsigned"
+                    _sig_full = _sig.get("signature", "") if _sig and _sig.get("signature") else "unsigned"
+                    _pubkey_full = submit_payload.get("miner_public_key_hex", "") or ""
                     _MINE_TELEM.record_block(
                         {
                             "height": target_height,
@@ -25345,14 +25386,15 @@ class QtclClientApp:
                             "fidelity": w_state_fidelity,
                             "parent_hash": parent_hash,
                             "difficulty": difficulty_bits,
-                            "signature": _sig_str,
-                            "miner_public_key": submit_payload.get("miner_public_key_hex", "")[:32] + "…",
+                            "signature": _sig_full,
+                            "miner_public_key": _pubkey_full,
                         }
                     )
                     _MINE_TELEM.mark_submitting()
+                    _sig_preview = _sig_full[:48] + "…" if len(_sig_full) > 48 else _sig_full
                     _EXP_LOG.info(
                         f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} "
-                        f"sig={_sig_str}  miner={miner_addr[:12]}…  — submitting…"
+                        f"sig={_sig_preview}  miner={miner_addr[:12]}…  — submitting…"
                     )
                     _success, _result = await _submission.submit(
                         submit_payload, target_height, block_hash
@@ -25880,9 +25922,17 @@ class QtclClientApp:
                 )
                 print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
                 if lb.get('signature'):
-                    print(f"     sig     : {str(lb.get('signature', '?'))[:48]}…")
+                    _sig_display = str(lb.get('signature', '?'))
+                    if len(_sig_display) > 120:
+                        print(f"     sig     : {_sig_display[:120]}…")
+                    else:
+                        print(f"     sig     : {_sig_display}")
                 if lb.get('miner_public_key'):
-                    print(f"     pubkey  : {str(lb.get('miner_public_key', '?'))[:48]}…")
+                    _pubkey_display = str(lb.get('miner_public_key', '?'))
+                    if len(_pubkey_display) > 120:
+                        print(f"     pubkey  : {_pubkey_display[:120]}…")
+                    else:
+                        print(f"     pubkey  : {_pubkey_display}")
                 print(
                     f"  ── Quantum Attestation ──────────────────────────────────────"
                 )
@@ -29128,14 +29178,15 @@ class NodeRPCMeshServer:
             )
             conn.execute("BEGIN IMMEDIATE")
 
-            # Insert block
+            # Insert block (PostgreSQL-compatible ON CONFLICT syntax)
             conn.execute(
                 """
-                INSERT OR IGNORE INTO blocks
+                INSERT INTO blocks
                 (height, hash, parent_hash, timestamp, nonce,
                  difficulty, miner_address, pq_curr, pq_last,
                  merkle_root, tx_count, data)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(height) DO NOTHING
             """,
                 (
                     h,
