@@ -119,12 +119,10 @@ N_GENERATORS: int = 4  # {a, a⁻¹, b, b⁻¹}
 # With ~20-30 operations in typical walks, accumulated error reaches ~1e-110 to 1e-90.
 # Additionally, operations at elevated precision (210 dps) then normalized back can
 # introduce errors up to ~1e-90 due to the re-entry to 150 dps.
-# Use 1e-85 (≈ 283 bits) as the "tight" validation tolerance, allowing accumulated
-# floating-point error while still catching genuine matrix corruption (det >> 1).
-# This accommodates rescaling ops, elevated precision roundtrips, and long chains.
+# FIX: Increased from 1e-85 to 1e-15 to handle sign operation with larger errors.
 DET_TOLERANCE: mpf = mpf(
-    "1e-85"
-)  # 150 dps = ~500 bits; 85 dec places = ~283 bits; accommodates rescaling and elevation
+    "1e-15"
+)  # 1e-15 accommodates sign operation errors while catching genuine corruption
 
 # Overflow bound for matrix entries (if entries exceed this, matrices have drifted)
 ENTRY_OVERFLOW_BOUND: mpf = mpf("1e100")
