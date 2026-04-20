@@ -5392,11 +5392,50 @@ class LiveRPCOracleSnapshot:
 
         Used for health checks and metrics during bootstrap.
         Returns result dict or None on failure.
+        IMPORTANT: Use POST for submitBlock to avoid GET 204 empty response issues.
         """
         import urllib.parse as _up
         import urllib.request as _ur
         import socket
 
+        # Use POST for block submission to avoid GET 204 empty response
+        if method == "qtcl_submitBlock":
+            post_url = f"{self.ORACLE_URL}/rpc"
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or [],
+                "id": 1,
+            }
+            for attempt in range(retries):
+                try:
+                    socket.setdefaulttimeout(timeout)
+                    data = json.dumps(payload).encode("utf-8")
+                    req = _ur.Request(
+                        post_url,
+                        data=data,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                        },
+                    )
+                    with _ur.urlopen(req, timeout=timeout) as resp:
+                        result = json.loads(resp.read().decode("utf-8"))
+                        if "result" in result:
+                            return result.get("result")
+                        elif "error" in result:
+                            return result
+                except Exception as e:
+                    logger.debug(
+                        f"[RPC-ORACLE] {method} POST attempt {attempt + 1}/{retries} failed: {e}"
+                    )
+                    if attempt < retries - 1:
+                        time.sleep(min(2**attempt, 5))
+                finally:
+                    socket.setdefaulttimeout(None)
+            return None
+
+        # Use GET for other methods
         params_json = json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.ORACLE_URL}/rpc?{query}"
@@ -11850,10 +11889,46 @@ class KoyebRPCNodule:
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
         """Like _rpc but returns the full JSON-RPC envelope including error objects.
-        Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline)."""
+        Use this when the caller needs to inspect rejection reasons (e.g. submit pipeline).
+        IMPORTANT: Use POST for submitBlock to avoid GET 204 empty response issues."""
         import urllib.parse as _up
+        import urllib.request as _ur
 
         t = timeout or self.timeout
+
+        # Use POST for block submission to avoid GET 204 empty response
+        if method == "qtcl_submitBlock":
+            post_url = f"{self.base_url}/rpc"
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or [],
+                "id": 1,
+            }
+            for attempt in range(retries):
+                try:
+                    if _HAS_REQUESTS:
+                        r = self._get_session().post(post_url, json=payload, timeout=t)
+                        if r.status_code == 200:
+                            return r.json()
+                    else:
+                        data = _json.dumps(payload).encode("utf-8")
+                        req = _ur.Request(
+                            post_url,
+                            data=data,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Accept": "application/json",
+                            },
+                        )
+                        with _ur.urlopen(req, timeout=t) as resp:
+                            return _json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    if attempt < retries - 1:
+                        time.sleep(2**attempt)
+            return None
+
+        # Use GET for other methods
         params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
@@ -11864,8 +11939,6 @@ class KoyebRPCNodule:
                     if r.status_code == 200:
                         return r.json()
                 else:
-                    import urllib.request as _ur
-
                     req = _ur.Request(full_url)
                     with _ur.urlopen(req, timeout=t) as resp:
                         return _json.loads(resp.read().decode("utf-8"))
