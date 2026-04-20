@@ -11896,7 +11896,6 @@ class KoyebRPCNodule:
 
         t = timeout or self.timeout
 
-        # Use POST for block submission to avoid GET 204 empty response
         if method == "qtcl_submitBlock":
             post_url = f"{self.base_url}/rpc"
             payload = {
@@ -11905,30 +11904,37 @@ class KoyebRPCNodule:
                 "params": params or [],
                 "id": 1,
             }
+            logger.warning(f"[RPC-ENVELOPE] POST to {post_url}")
             for attempt in range(retries):
                 try:
                     if _HAS_REQUESTS:
                         r = self._get_session().post(post_url, json=payload, timeout=t)
+                        logger.warning(f"[RPC-ENVELOPE] status={r.status_code}")
                         if r.status_code == 200:
+                            response_text = r.text
+                            logger.warning(
+                                f"[RPC-ENVELOPE] response={response_text[:500]}"
+                            )
                             return r.json()
                     else:
                         data = _json.dumps(payload).encode("utf-8")
                         req = _ur.Request(
                             post_url,
                             data=data,
-                            headers={
-                                "Content-Type": "application/json",
-                                "Accept": "application/json",
-                            },
+                            headers={"Content-Type": "application/json"},
                         )
                         with _ur.urlopen(req, timeout=t) as resp:
-                            return _json.loads(resp.read().decode("utf-8"))
+                            response_text = resp.read().decode("utf-8")
+                            logger.warning(
+                                f"[RPC-ENVELOPE] fallback response={response_text[:500]}"
+                            )
+                            return _json.loads(response_text)
                 except Exception as e:
+                    logger.warning(f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}")
                     if attempt < retries - 1:
                         time.sleep(2**attempt)
             return None
 
-        # Use GET for other methods
         params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
