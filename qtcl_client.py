@@ -29226,7 +29226,13 @@ class NodeRPCMeshServer:
             )
             conn.execute("BEGIN IMMEDIATE")
 
-            # Insert block (PostgreSQL-compatible ON CONFLICT syntax)
+            # Idempotency: check if this height was already settled before insert
+            _existing = conn.execute(
+                "SELECT hash FROM blocks WHERE height=?", (h,)
+            ).fetchone()
+            _block_is_new = _existing is None
+
+            # Insert block — DO NOTHING on duplicate height
             conn.execute(
                 """
                 INSERT INTO blocks
@@ -29259,61 +29265,54 @@ class NodeRPCMeshServer:
             _update_chain_state_atomic(conn, h, bhash, miner_address, block_time)
 
             # ═════════════════════════════════════════════════════════════════════════
-            # SETTLEMENT: Update miner and treasury wallets (HARDCODED SINGLE LOGIC PATH)
+            # SETTLEMENT: Update miner and treasury wallets — new blocks only
             # Miner: 7.20 QTCL (720 base units)
             # Treasury: 0.80 QTCL (80 base units)
+            # Uses INSERT OR IGNORE + UPDATE to avoid changes() race.
+            # balance column is INTEGER — no CAST to TEXT.
+            # Gated on _block_is_new: resubmit of known height is a no-op.
             # ═════════════════════════════════════════════════════════════════════════
-            _miner_reward_base = 720  # 7.20 QTCL
+            _miner_reward_base = 720   # 7.20 QTCL
             _treasury_reward_base = 80  # 0.80 QTCL
             _treasury_addr = 'qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1'
 
-            # MINER REWARD — UPDATE balance (TEXT field, sum as integers)
-            conn.execute(
-                """
-                UPDATE wallet_addresses SET
-                    balance = CAST(CAST(COALESCE(balance, 0) AS INTEGER) + ? AS TEXT),
-                    address_type = 'miner',
-                    balance_updated_at = datetime('now'),
-                    transaction_count = COALESCE(transaction_count, 0) + 1
-                WHERE address = ?
-                """,
-                (_miner_reward_base, miner_address),
-            )
-            # If no rows updated, insert new wallet entry
-            if conn.total_changes == 0 or conn.execute("SELECT changes()").fetchone()[0] == 0:
+            def _settle_wallet(addr: str, reward: int, atype: str) -> None:
+                """Upsert wallet balance atomically. No changes() race."""
+                # Ensure row exists first (no-op if already present)
                 conn.execute(
                     """
-                    INSERT INTO wallet_addresses
-                    (address, public_key, wallet_fingerprint, balance, address_type, balance_updated_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'miner', datetime('now'), datetime('now'), datetime('now'))
+                    INSERT OR IGNORE INTO wallet_addresses
+                    (address, public_key, wallet_fingerprint, balance,
+                     address_type, balance_updated_at, balance_at_height,
+                     created_at, updated_at, transaction_count)
+                    VALUES (?, ?, ?, 0, ?, strftime('%s','now'), ?,
+                            strftime('%s','now'), strftime('%s','now'), 0)
                     """,
-                    (miner_address, miner_address[:64], miner_address[:64], str(_miner_reward_base)),
+                    (addr, addr[:64], addr[:64], atype, h),
                 )
-            logger.critical(f"[SETTLEMENT] ✅ Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL")
+                # Always-succeeds UPDATE (row guaranteed above)
+                conn.execute(
+                    """
+                    UPDATE wallet_addresses SET
+                        balance            = balance + ?,
+                        address_type       = ?,
+                        balance_updated_at = strftime('%s','now'),
+                        balance_at_height  = ?,
+                        transaction_count  = transaction_count + 1,
+                        updated_at         = strftime('%s','now')
+                    WHERE address = ?
+                    """,
+                    (reward, atype, h, addr),
+                )
 
-            # TREASURY REWARD — UPDATE balance (TEXT field)
-            conn.execute(
-                """
-                UPDATE wallet_addresses SET
-                    balance = CAST(CAST(COALESCE(balance, 0) AS INTEGER) + ? AS TEXT),
-                    address_type = 'treasury',
-                    balance_updated_at = datetime('now'),
-                    transaction_count = COALESCE(transaction_count, 0) + 1
-                WHERE address = ?
-                """,
-                (_treasury_reward_base, _treasury_addr),
+            _settle_wallet(miner_address, _miner_reward_base, 'miner')
+            logger.critical(
+                f"[SETTLEMENT] ✅ Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL"
             )
-            # If no rows updated, insert new wallet entry
-            if conn.execute("SELECT changes()").fetchone()[0] == 0:
-                conn.execute(
-                    """
-                    INSERT INTO wallet_addresses
-                    (address, public_key, wallet_fingerprint, balance, address_type, balance_updated_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'treasury', datetime('now'), datetime('now'), datetime('now'))
-                    """,
-                    (_treasury_addr, _treasury_addr[:64], _treasury_addr[:64], str(_treasury_reward_base)),
-                )
-            logger.critical(f"[SETTLEMENT] ✅ Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL")
+            _settle_wallet(_treasury_addr, _treasury_reward_base, 'treasury')
+            logger.critical(
+                f"[SETTLEMENT] ✅ Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL"
+            )
 
             conn.commit()
             logger.info(
