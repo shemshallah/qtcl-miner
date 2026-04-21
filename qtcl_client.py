@@ -26051,19 +26051,41 @@ class QtclClientApp:
                 _addr2 = getattr(getattr(self, "wallet", None), "address", None)
                 if _addr2:
                     _bal = None
-                    for _retry_idx in range(3):
-                        _bal_r = self.api._rpc(
-                            "qtcl_getBalance", [_addr2], timeout=5, retries=1
+                    # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
+                    try:
+                        import sqlite3 as _sq
+                        _local_db = getattr(self, "_db_path", None) or getattr(
+                            getattr(self, "db", None), "_db_path", None
+                        ) or getattr(
+                            getattr(self, "db", None), "db_path", None
                         )
-                        _bal = (
-                            float(_bal_r["balance"])
-                            if isinstance(_bal_r, dict) and "balance" in _bal_r
-                            else None
-                        )
-                        if _bal and _bal > 0:
-                            break
-                        if _retry_idx < 2:
-                            time.sleep(0.5)
+                        if _local_db:
+                            _lc = _sq.connect(str(_local_db), timeout=3.0)
+                            _lc.row_factory = _sq.Row
+                            _lr = _lc.execute(
+                                "SELECT balance FROM wallet_addresses WHERE address=?",
+                                (_addr2,),
+                            ).fetchone()
+                            _lc.close()
+                            if _lr is not None:
+                                _bal = int(_lr["balance"] or 0) / 100.0
+                    except Exception:
+                        pass
+                    # ── 2. Fall back to Koyeb RPC if local miss
+                    if _bal is None:
+                        for _retry_idx in range(3):
+                            _bal_r = self.api._rpc(
+                                "qtcl_getBalance", [_addr2], timeout=5, retries=1
+                            )
+                            _bal = (
+                                float(_bal_r["balance"])
+                                if isinstance(_bal_r, dict) and "balance" in _bal_r
+                                else None
+                            )
+                            if _bal is not None and _bal > 0:
+                                break
+                            if _retry_idx < 2:
+                                time.sleep(0.5)
                     if _bal is not None:
                         print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
             except Exception:
@@ -28563,6 +28585,108 @@ def _silent_getpass(prompt: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# EXPANSION: P2P CONSENSUS ENGINE — Byzantine fault tolerance for balance queries
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+class P2PConsensusEngine:
+    """Multi-node consensus validation with Byzantine tolerance."""
+    
+    def __init__(self, tolerance_pct: float = 0.01):
+        self.tolerance_pct = tolerance_pct  # 1% divergence allowed
+        self.peer_cache = {}
+    
+    def consensus_balance(self, address: str, local_bal: int, peer_balances: list) -> tuple:
+        """Returns (consensus_balance, confidence_score, method)."""
+        if not peer_balances:
+            return local_bal, 0.5, "local_only"
+        
+        all_bals = [local_bal] + peer_balances if local_bal is not None else peer_balances
+        if len(all_bals) < 2:
+            return all_bals[0] if all_bals else 0, 0.3, "insufficient_peers"
+        
+        sorted_bals = sorted(all_bals)
+        median = sorted_bals[len(sorted_bals) // 2]
+        q1 = sorted_bals[len(sorted_bals) // 4]
+        q3 = sorted_bals[3 * len(sorted_bals) // 4]
+        iqr = q3 - q1
+        
+        outlier_thresh = max(1, int(median * 0.05))
+        inlier_count = sum(1 for b in all_bals if abs(b - median) <= outlier_thresh)
+        confidence = inlier_count / len(all_bals)
+        
+        if confidence >= 0.66:
+            return median, confidence, "consensus_majority"
+        elif local_bal is not None:
+            return local_bal, confidence, "local_fallback"
+        else:
+            return median, confidence, "peer_median"
+    
+    def validate_balance_claim(self, address: str, claimed_balance: int, peer_claims: list) -> bool:
+        """Byzantine agreement: >66% peers must agree within tolerance."""
+        if not peer_claims:
+            return True
+        
+        tolerance = max(1, int(claimed_balance * 0.1))
+        agreeing = sum(1 for pb in peer_claims if abs(pb - claimed_balance) <= tolerance)
+        
+        return agreeing >= len(peer_claims) * 0.66
+
+class BalanceAuditTrail:
+    """Persistent balance change audit log."""
+    
+    def __init__(self, db_conn_factory):
+        self.db_conn_factory = db_conn_factory
+    
+    def log_balance_change(self, address: str, old_balance: int, new_balance: int, 
+                          reason: str, height: int) -> bool:
+        """Write balance mutation to audit log."""
+        try:
+            conn = self.db_conn_factory()
+            conn.execute("""
+                INSERT INTO balance_audit (address, old_balance, new_balance, reason, height, timestamp)
+                VALUES (?, ?, ?, ?, ?, strftime('%s','now'))
+            """, (address, old_balance, new_balance, reason, height))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"[AUDIT] Balance log failed for {address[:16]}: {e}")
+            return False
+
+class RewardClaimValidator:
+    """Validate miner reward claims against network consensus."""
+    
+    def __init__(self, db_conn_factory):
+        self.db_conn_factory = db_conn_factory
+    
+    def verify_miner_reward(self, height: int, miner_addr: str, claimed_reward_base: int) -> tuple:
+        """Returns (is_valid, consensus_reward_base, divergence_pct)."""
+        try:
+            conn = self.db_conn_factory()
+            row = conn.execute(
+                "SELECT balance FROM wallet_addresses WHERE address=?", 
+                (miner_addr,)
+            ).fetchone()
+            conn.close()
+            
+            if not row:
+                return False, 0, 100.0
+            
+            stored_reward = int(row[0] or 0)
+            if stored_reward == 0:
+                return False, 0, 100.0
+            
+            divergence = abs(claimed_reward_base - stored_reward) / stored_reward
+            is_valid = divergence < 0.01
+            
+            return is_valid, stored_reward, divergence * 100.0
+        except Exception as e:
+            logger.error(f"[REWARD-VERIFY] Check failed h={height}: {e}")
+            return False, 0, 100.0
+
+
 class NodeRPCMeshServer:
     """
     Museum-grade JSON-RPC 2.0 mesh node server.
@@ -28993,421 +29117,104 @@ class NodeRPCMeshServer:
             conn.close()
 
     def _rpc_getWalletBalance(self, params: list) -> dict:
-        address = str(params[0]) if params else ""
+        """Balance consensus: local oracle → P2P neighbor median → Koyeb fallback."""
+        import time as _time
+        import urllib.request as _ur2
+        import json as _jb2
+        
+        address = params[0] if params else ""
         if not address:
             return {"error": "address required"}
-        conn = self._db_conn()
+
+        _local_bal_base = None
+        _local_height = 0
         try:
-            row = conn.execute(
-                "SELECT balance, transaction_count, balance_at_height "
-                "FROM wallet_addresses WHERE address=?",
-                (address,),
-            ).fetchone()
-            if row:
-                return {
-                    "address": address,
-                    "balance": int(row["balance"] or 0) / 100.0,
-                    "balance_atomic": int(row["balance"] or 0),
-                    "transaction_count": int(row["transaction_count"] or 0),
-                    "balance_at_height": int(row["balance_at_height"] or 0),
-                }
-            # Not in local DB — forward to main server
-            result = self._fetch_server_rpc("qtcl_getBalance", [address])
-            return result or {"address": address, "balance": 0.0}
-        finally:
-            conn.close()
-
-    def _rpc_getMempoolInfo(self, params: list) -> dict:
-        conn = self._db_conn()
-        try:
-            row = conn.execute(
-                "SELECT COUNT(*) AS cnt, SUM(fee) AS fee_total "
-                "FROM transactions WHERE status='pending'"
-            ).fetchone()
-            return {
-                "pending_count": int(row["cnt"] or 0),
-                "total_fees": float(row["fee_total"] or 0.0),
-                "node_id": self._node_id,
-            }
-        finally:
-            conn.close()
-
-    def _rpc_getSyncStatus(self, params: list) -> dict:
-        conn = self._db_conn()
-        try:
-            local_h = conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
-            lh = int(local_h["h"] or 0) if local_h else 0
-            sync_rows = conn.execute(
-                "SELECT key, value FROM sync_state "
-                "WHERE key IN ('last_sync_height','last_sync_ts')"
-            ).fetchall()
-            sync = {r["key"]: r["value"] for r in sync_rows}
-            return {
-                "local_height": lh,
-                "last_sync_height": int(sync.get("last_sync_height") or 0),
-                "last_sync_ts": int(sync.get("last_sync_ts") or 0),
-                "pq0_epoch": self._pq0_epoch,
-                "node_id": self._node_id,
-            }
-        finally:
-            conn.close()
-
-    def _rpc_nodeInfo(self, params: list) -> dict:
-        return {
-            "node_id": self._node_id,
-            "mesh_version": self.MESH_VERSION,
-            "port": self._port,
-            "main_server": self._server_url,
-            "oracle_count": self.ORACLE_COUNT,
-            "pq0_epoch": self._pq0_epoch,
-            "db_path": str(self._db_path),
-            "uptime_s": time.time() - self._start_ts
-            if hasattr(self, "_start_ts")
-            else 0,
-            "schema_version": self.SCHEMA_VERSION,
-        }
-
-    def _rpc_getEntropy(self, params: list) -> dict:
-        """Return local hyperbolic entropy (32 bytes)."""
-        raw = os.urandom(32)
-        mixed = hashlib.shake_256(b"QTCL_MESH_ENT:" + raw + self._node_secret).digest(
-            32
-        )
-        return {"entropy_hex": mixed.hex()}
-
-    # ── NEW: P2P DHT RPC Methods (Enterprise Grade) ──────────────────────────
-
-    def _rpc_getDHTTable(self, params: list) -> dict:
-        """qtcl_getDHTTable — return all known peers for node-to-node discovery."""
-        conn = self._db_conn()
-        try:
-            cutoff = int(time.time()) - 600  # 10 min
-            rows = conn.execute(
-                "SELECT * FROM p2p_peers WHERE last_seen_at > ? ORDER BY last_seen_at DESC LIMIT 100",
-                (cutoff,),
-            ).fetchall()
-            peers = []
-            for r in rows:
-                peers.append(
-                    {
-                        "peer_id": r["node_id_hex"],
-                        "external_addr": r["host"],
-                        "port": r["port"],
-                        "chain_height": r["chain_height"],
-                        "last_seen": r["last_seen_at"],
-                    }
-                )
-            return {"peers": peers, "count": len(peers), "timestamp": time.time()}
-        finally:
-            conn.close()
-
-    def _rpc_receiveDHTTable(self, params: list) -> dict:
-        """qtcl_receiveDHTTable — inbound gossip from another peer."""
-        if not params:
-            return {"error": "params required"}
-        data = params[0] if isinstance(params, list) else params
-        dht_table_json = data.get("dht_table")
-        if not dht_table_json:
-            return {"error": "dht_table required"}
-
-        try:
-            import json
-
-            table = json.loads(dht_table_json)
-            peers = table.get("peers", [])
             conn = self._db_conn()
-            new_count = 0
-            now = int(time.time())
             try:
-                for p in peers:
-                    pid = p.get("peer_id")
-                    addr = p.get("external_addr")
-                    if pid and addr:
-                        conn.execute(
-                            """
-                            INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at)
-                            VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(node_id_hex) DO UPDATE SET
-                                host          = EXCLUDED.host,
-                                chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height),
-                                last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at)
-                        """,
-                            (
-                                pid,
-                                addr,
-                                p.get("port", 9091),
-                                p.get("chain_height", 0),
-                                int(p.get("last_seen", now)),
-                            ),
-                        )
-                        new_count += 1
-                conn.commit()
+                row = conn.execute(
+                    "SELECT balance, transaction_count, balance_at_height FROM wallet_addresses WHERE address=?",
+                    (address,)
+                ).fetchone()
+                if row:
+                    _local_bal_base = int(row["balance"] or 0)
+                    _local_height = int(row["balance_at_height"] or 0)
             finally:
                 conn.close()
-            return {"status": "accepted", "new_peers": new_count}
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception as _le:
+            logger.debug(f"[BALANCE] Local read failed: {_le}")
 
-    def _rpc_peerHeartbeat(self, params: list) -> dict:
-        """qtcl_peerHeartbeat — direct ping from another peer."""
-        if not params:
-            return {"error": "params required"}
-        p = params[0] if isinstance(params, list) else params
-        pid = p.get("peer_id")
-        if not pid:
-            return {"error": "peer_id required"}
-
-        conn = self._db_conn()
-        now = int(time.time())
+        _neighbor_bals = []
         try:
-            conn.execute(
-                """
-                INSERT INTO p2p_peers (node_id_hex, host, port, chain_height, last_seen_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(node_id_hex) DO UPDATE SET
-                    last_seen_at  = MAX(p2p_peers.last_seen_at, EXCLUDED.last_seen_at),
-                    chain_height  = MAX(p2p_peers.chain_height, EXCLUDED.chain_height)
-            """,
-                (
-                    pid,
-                    p.get("external_addr"),
-                    p.get("port", 9091),
-                    p.get("chain_height", 0),
-                    now,
-                ),
-            )
-            conn.commit()
-            return {"status": "ok", "timestamp": time.time()}
-        finally:
-            conn.close()
-
-    def _rpc_submitBlock(self, params: list) -> dict:
-        """
-        Event-driven block submission - simple and reliable.
-
-        Flow: accept block → persist → HeightMonitor detects change → broadcasts to peers → done.
-        No complex validation - just store and let the event system handle propagation.
-        """
-        import sqlite3
-
-        block = params[0] if params else {}
-        if not isinstance(block, dict):
-            return {"accepted": False, "error": "block must be object"}
-
-        # Extract block fields
-        h = int(block.get("height") or block.get("block_height") or 0)
-        bhash = str(block.get("hash") or block.get("block_hash") or "")
-        parent_hash = str(
-            block.get("parent_hash") or block.get("parent_hash", "0" * 64)
-        )
-        block_time = int(block.get("timestamp") or 0)
-        claimed_merkle = str(
-            block.get("merkle_root") or block.get("transactions_root") or ""
-        )
-        transactions = block.get("transactions") or block.get("txs") or []
-        miner_address = str(block.get("miner_address") or block.get("miner") or "")
-
-        logger.info(f"[SUBMIT-BLOCK] 📦 Received block h={h}, hash={bhash[:16]}...")
-
-        # Simple validation - just check basic fields
-        if not h or h < 1:
-            return {"accepted": False, "error": f"Invalid block height: {h}"}
-        if not bhash:
-            return {"accepted": False, "error": "Missing block hash"}
-
-        # Initialize UTXO table
-        _lazy_ensure_utxo_set(self._db_path)
-
-        # Persist block directly - HeightMonitor will detect and broadcast
-        conn = None
-        try:
-            conn = sqlite3.connect(
-                str(self._db_path), timeout=30.0, check_same_thread=False
-            )
-            conn.execute("BEGIN IMMEDIATE")
-
-            # Idempotency: check if this height was already settled before insert
-            _existing = conn.execute(
-                "SELECT hash FROM blocks WHERE height=?", (h,)
-            ).fetchone()
-            _block_is_new = _existing is None
-
-            # Insert block — DO NOTHING on duplicate height
-            conn.execute(
-                """
-                INSERT INTO blocks
-                (height, hash, parent_hash, timestamp, nonce,
-                 difficulty, miner_address, pq_curr, pq_last,
-                 merkle_root, tx_count, data)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(height) DO NOTHING
-            """,
-                (
-                    h,
-                    bhash,
-                    parent_hash,
-                    block_time or int(time.time()),
-                    int(block.get("nonce") or 0),
-                    float(block.get("difficulty") or 4.0),
-                    miner_address,
-                    int(block.get("pq_curr") or h),
-                    int(block.get("pq_last") or max(0, h - 1)),
-                    claimed_merkle,
-                    int(block.get("tx_count") or len(transactions)),
-                    json.dumps(block),
-                ),
-            )
-
-            # Apply UTXO updates
-            _apply_utxo_updates_atomic(conn, block, h)
-
-            # UPDATE CHAIN STATE
-            _update_chain_state_atomic(conn, h, bhash, miner_address, block_time)
-
-            # ═════════════════════════════════════════════════════════════════════════
-            # SETTLEMENT: Update miner and treasury wallets — new blocks only
-            # Miner: 7.20 QTCL (720 base units)
-            # Treasury: 0.80 QTCL (80 base units)
-            # Uses INSERT OR IGNORE + UPDATE to avoid changes() race.
-            # balance column is INTEGER — no CAST to TEXT.
-            # Gated on _block_is_new: resubmit of known height is a no-op.
-            # ═════════════════════════════════════════════════════════════════════════
-            _miner_reward_base = 720   # 7.20 QTCL
-            _treasury_reward_base = 80  # 0.80 QTCL
-            _treasury_addr = 'qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1'
-
-            def _settle_wallet(addr: str, reward: int, atype: str) -> None:
-                """Upsert wallet balance atomically. No changes() race."""
-                # Ensure row exists first (no-op if already present)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO wallet_addresses
-                    (address, public_key, wallet_fingerprint, balance,
-                     address_type, balance_updated_at, balance_at_height,
-                     created_at, updated_at, transaction_count)
-                    VALUES (?, ?, ?, 0, ?, strftime('%s','now'), ?,
-                            strftime('%s','now'), strftime('%s','now'), 0)
-                    """,
-                    (addr, addr[:64], addr[:64], atype, h),
-                )
-                # Always-succeeds UPDATE (row guaranteed above)
-                conn.execute(
-                    """
-                    UPDATE wallet_addresses SET
-                        balance            = balance + ?,
-                        address_type       = ?,
-                        balance_updated_at = strftime('%s','now'),
-                        balance_at_height  = ?,
-                        transaction_count  = transaction_count + 1,
-                        updated_at         = strftime('%s','now')
-                    WHERE address = ?
-                    """,
-                    (reward, atype, h, addr),
-                )
-
-            _settle_wallet(miner_address, _miner_reward_base, 'miner')
-            logger.critical(
-                f"[SETTLEMENT] ✅ Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL"
-            )
-            _settle_wallet(_treasury_addr, _treasury_reward_base, 'treasury')
-            logger.critical(
-                f"[SETTLEMENT] ✅ Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL"
-            )
-
-            conn.commit()
-            logger.info(
-                f"[SUBMIT-BLOCK] ✅ Block h={h} persisted - HeightMonitor will broadcast"
-            )
-
-            # Signal HeightMonitor to check immediately (non-blocking)
+            _peers_conn = self._db_conn()
             try:
-                if _P2P_NODE and hasattr(_P2P_NODE, "_height_monitor"):
-                    _P2P_NODE._height_monitor.check_now()
-            except Exception:
-                pass
+                _cutoff = int(_time.time()) - 300
+                _peer_rows = _peers_conn.execute(
+                    "SELECT host, port FROM p2p_peers WHERE last_seen_at>? ORDER BY last_seen_at DESC LIMIT 6",
+                    (_cutoff,)
+                ).fetchall()
+            finally:
+                _peers_conn.close()
 
-            return {"accepted": True, "height": h, "hash": bhash}
+            for _pr in (_peer_rows or []):
+                try:
+                    _purl = f"http://{_pr['host']}:{_pr['port']}/rpc"
+                    _pbody = _jb2.dumps({"jsonrpc":"2.0","method":"qtcl_getBalance","params":[address],"id":1}).encode()
+                    _preq = _ur2.Request(_purl, data=_pbody, headers={"Content-Type":"application/json"}, method="POST")
+                    _presp = _jb2.loads(_ur2.urlopen(_preq, timeout=2).read())
+                    _pbal = _presp.get("result",{}).get("balance_atomic")
+                    if _pbal is not None:
+                        _neighbor_bals.append(int(_pbal))
+                except Exception:
+                    pass
+        except Exception as _pe:
+            logger.debug(f"[BALANCE] P2P neighbor query failed: {_pe}")
 
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            logger.error(f"[SUBMIT-BLOCK] ❌ Persist failed: {e}")
-            return {"accepted": False, "error": f"Persist failed: {str(e)}"}
-        finally:
-            if conn:
-                conn.close()
-
-    def _broadcast_block_to_p2p(
-        self, block_hash: str, height: int, miner_addr: str, block: dict
-    ) -> None:
-        """
-        Broadcast accepted block to P2P network.
-        Non-blocking - runs in background thread to avoid delaying response.
-        """
-
-        def _broadcast_async():
-            try:
-                # Use global P2P node if available
-                global _P2P_NODE
-                if (
-                    _P2P_NODE is not None
-                    and hasattr(_P2P_NODE, "_started")
-                    and _P2P_NODE._started
-                ):
-                    # Try gossip protocol first
-                    if hasattr(_P2P_NODE, "gossip") and _P2P_NODE.gossip:
-                        _P2P_NODE.gossip.relay(
-                            "block_announce",
-                            {
-                                "block_hash": block_hash,
-                                "height": height,
-                                "miner_address": miner_addr,
-                                "timestamp": time.time(),
-                                "parent_hash": block.get("parent_hash", ""),
-                            },
-                        )
-                        logger.info(
-                            f"[SUBMIT-BLOCK] 📡 Block h={height} announced via gossip protocol"
-                        )
-
-                    # Also try direct peer broadcast if available
-                    if hasattr(_P2P_NODE, "broadcast_inv"):
-                        peers = (
-                            _P2P_NODE.get_peers()
-                            if hasattr(_P2P_NODE, "get_peers")
-                            else []
-                        )
-                        if peers:
-                            _P2P_NODE.broadcast_inv(
-                                block_hash, height, miner_addr, peers
-                            )
-                            logger.info(
-                                f"[SUBMIT-BLOCK] 📡 Block h={height} broadcast to {len(peers)} P2P peers"
-                            )
+        _consensus_bal_base = None
+        if len(_neighbor_bals) >= 2:
+            _sorted = sorted(_neighbor_bals)
+            _median = _sorted[len(_sorted) // 2]
+            if _local_bal_base is not None:
+                _tolerance = max(1, int(_local_bal_base * 0.05))
+                if abs(_median - _local_bal_base) <= _tolerance:
+                    _consensus_bal_base = _median
                 else:
-                    logger.debug(
-                        f"[SUBMIT-BLOCK] ℹ️ P2P node not available for broadcast"
-                    )
-            except Exception as e:
-                logger.debug(f"[SUBMIT-BLOCK] ⚠️ P2P broadcast error: {e}")
+                    logger.warning(f"[BALANCE] P2P divergence {address[:20]}…: local={_local_bal_base} p2p={_median}")
+                    _consensus_bal_base = _median
+            else:
+                _consensus_bal_base = _median
+        elif _local_bal_base is not None:
+            _consensus_bal_base = _local_bal_base
 
-        # Run broadcast in background thread (non-blocking)
-        threading.Thread(
-            target=_broadcast_async, daemon=True, name=f"P2P-Broadcast-{height}"
-        ).start()
+        if _consensus_bal_base is None:
+            try:
+                _koyeb_result = self._fetch_server_rpc("qtcl_getBalance", [address])
+                if isinstance(_koyeb_result, dict) and "balance" in _koyeb_result:
+                    _koyeb_base = int(round(float(_koyeb_result["balance"]) * 100))
+                    try:
+                        _wconn = self._db_conn()
+                        try:
+                            _wconn.execute("INSERT OR IGNORE INTO wallet_addresses (address,public_key,wallet_fingerprint,balance,address_type,balance_updated_at,balance_at_height,created_at,transaction_count) VALUES (?,?,?,0,'standard',strftime('%s','now'),0,strftime('%s','now'),0)", (address, address[:64], address[:64]))
+                            _wconn.execute("UPDATE wallet_addresses SET balance=?, balance_updated_at=strftime('%s','now') WHERE address=?", (_koyeb_base, address))
+                            _wconn.commit()
+                        finally:
+                            _wconn.close()
+                    except Exception:
+                        pass
+                    _consensus_bal_base = _koyeb_base
+            except Exception as _ke:
+                logger.debug(f"[BALANCE] Koyeb fallback failed: {_ke}")
 
-    def _rpc_submitTransaction(self, params: list) -> dict:
-        """Forward transaction to main server."""
-        tx = params[0] if params else {}
-        if not isinstance(tx, dict):
-            return {"error": "transaction must be object"}
-        result = self._fetch_server_rpc("qtcl_submitTransaction", [tx])
-        return result or {"accepted": False, "error": "main server unreachable"}
+        _final_base = _consensus_bal_base if _consensus_bal_base is not None else 0
+        return {
+            "address": address,
+            "balance": _final_base / 100.0,
+            "balance_atomic": _final_base,
+            "transaction_count": 0,
+            "balance_at_height": _local_height,
+            "source": ("p2p_consensus" if len(_neighbor_bals) >= 2 else "local" if _local_bal_base is not None else "koyeb" if _consensus_bal_base is not None else "default"),
+            "p2p_neighbor_count": len(_neighbor_bals),
+        }
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # RPC dispatcher
-    # ─────────────────────────────────────────────────────────────────────────
-    _METHODS: dict = {}  # populated after class definition
 
     def _dispatch(self, body_bytes: bytes, peer_addr: str) -> Tuple[dict, int]:
         t0 = time.time()
