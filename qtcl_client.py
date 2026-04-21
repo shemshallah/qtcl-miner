@@ -28913,6 +28913,60 @@ class NodeRPCMeshServer:
             logger.warning(f"[MESH] DB file not found: {db_path}, creating...")
         conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row  # Enable dict-like access: row["column"]
+        # Ensure tables the mesh RPC methods depend on exist
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS p2p_peers ("
+                " node_id TEXT,"
+                " host TEXT NOT NULL,"
+                " port INTEGER NOT NULL DEFAULT 9091,"
+                " chain_height INTEGER DEFAULT 0,"
+                " last_seen_at INTEGER DEFAULT 0,"
+                " external_addr TEXT,"
+                " capabilities TEXT,"
+                " mac_address TEXT,"
+                " device_id TEXT,"
+                " ban_score INTEGER DEFAULT 0,"
+                " PRIMARY KEY (host, port)"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mesh_rpc_log ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " method TEXT,"
+                " params_hash TEXT,"
+                " result_ok INTEGER,"
+                " latency_ms REAL,"
+                " peer_addr TEXT,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS gossip_inventory ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " event_type TEXT,"
+                " channel TEXT,"
+                " peer_id TEXT,"
+                " payload TEXT,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pending_rewards ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " height INTEGER NOT NULL,"
+                " reward_type TEXT NOT NULL,"
+                " recipient TEXT NOT NULL,"
+                " amount INTEGER NOT NULL,"
+                " confirmed_at_height INTEGER DEFAULT NULL,"
+                " status TEXT DEFAULT 'pending',"
+                " created_at INTEGER DEFAULT (strftime('%s','now')),"
+                " UNIQUE(height, reward_type, recipient)"
+                ")"
+            )
+            conn.commit()
+        except Exception:
+            pass
         return conn
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -29215,6 +29269,660 @@ class NodeRPCMeshServer:
             "p2p_neighbor_count": len(_neighbor_bals),
         }
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # MEMPOOL / SYNC / NODE-INFO / ENTROPY / DHT / HEARTBEAT
+    # ─────────────────────────────────────────────────────────────────────────
+    def _rpc_getMempoolInfo(self, params: list) -> dict:
+        """Return pending mempool transaction count + volume.
+        Mirrors Koyeb server truth with local pending-tx buffer."""
+        local_pending = 0
+        local_volume = 0
+        try:
+            conn = self._db_conn()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS v "
+                    "FROM transactions WHERE status='pending' OR status='mempool'"
+                ).fetchone()
+                if row:
+                    local_pending = int(row["n"] or 0)
+                    local_volume = int(row["v"] or 0)
+            finally:
+                conn.close()
+        except Exception as _le:
+            logger.debug(f"[MEMPOOL] local read failed: {_le}")
+
+        server_snap = None
+        try:
+            server_snap = self._fetch_server_rpc("qtcl_getMempoolInfo", [])
+        except Exception:
+            server_snap = None
+
+        merged_pending = local_pending
+        merged_volume = local_volume
+        if isinstance(server_snap, dict):
+            merged_pending = max(local_pending, int(server_snap.get("pending", 0) or 0))
+            merged_volume = max(local_volume, int(server_snap.get("volume_base", 0) or 0))
+
+        return {
+            "pending": merged_pending,
+            "volume_base": merged_volume,
+            "volume_qtcl": merged_volume / 100.0,
+            "local_pending": local_pending,
+            "koyeb_pending": (server_snap or {}).get("pending", 0) if isinstance(server_snap, dict) else 0,
+            "source": "dual_truth" if server_snap else "local_only",
+        }
+
+    def _rpc_getSyncStatus(self, params: list) -> dict:
+        """Report local vs Koyeb chain-tip delta for sync health."""
+        local_h = 0
+        local_hash = ""
+        try:
+            conn = self._db_conn()
+            try:
+                r = conn.execute(
+                    "SELECT MAX(height) AS h FROM blocks"
+                ).fetchone()
+                if r and r["h"] is not None:
+                    local_h = int(r["h"])
+                r2 = conn.execute(
+                    "SELECT block_hash FROM blocks WHERE height=? LIMIT 1",
+                    (local_h,)
+                ).fetchone()
+                if r2:
+                    local_hash = r2["block_hash"] or ""
+            finally:
+                conn.close()
+        except Exception as _e:
+            logger.debug(f"[SYNC] local read: {_e}")
+
+        koyeb_h = 0
+        koyeb_hash = ""
+        try:
+            r = self._fetch_server_rpc("qtcl_getChainStatus", [])
+            if isinstance(r, dict):
+                koyeb_h = int(r.get("height", r.get("chain_height", 0)) or 0)
+                koyeb_hash = str(r.get("best_block_hash", r.get("head_block_hash", "")) or "")
+        except Exception:
+            pass
+
+        delta = koyeb_h - local_h
+        in_sync = (delta <= 1) and (local_hash == koyeb_hash or koyeb_hash == "")
+
+        return {
+            "local_height": local_h,
+            "local_hash": local_hash,
+            "koyeb_height": koyeb_h,
+            "koyeb_hash": koyeb_hash,
+            "delta": delta,
+            "in_sync": in_sync,
+            "sync_percent": round((local_h / koyeb_h * 100.0), 2) if koyeb_h > 0 else 0.0,
+        }
+
+    def _rpc_nodeInfo(self, params: list) -> dict:
+        """Self-describe: node identity, version, uptime, endpoints."""
+        uptime = 0.0
+        try:
+            uptime = time.time() - getattr(self, "_start_ts", time.time())
+        except Exception:
+            pass
+        external_wan = os.getenv("EXTERNAL_WAN", os.getenv("WAN_IP", ""))
+        external_port = self._port
+        return {
+            "node_id": self._node_id,
+            "mesh_version": self.MESH_VERSION,
+            "schema_version": self.SCHEMA_VERSION,
+            "uptime_sec": round(uptime, 2),
+            "port": external_port,
+            "external_addr": f"{external_wan}:{external_port}" if external_wan else f"0.0.0.0:{external_port}",
+            "server_url": self._server_url,
+            "oracle_count": self.ORACLE_COUNT,
+            "pq0_epoch": self._pq0_epoch,
+            "methods": sorted(list(self._METHODS.keys())) if hasattr(self, "_METHODS") else [],
+        }
+
+    def _rpc_getEntropy(self, params: list) -> dict:
+        """Return a fresh 32-byte entropy nugget derived from local QRNG pool + server pq0."""
+        try:
+            n_bytes = int(params[0]) if params else 32
+        except Exception:
+            n_bytes = 32
+        n_bytes = max(8, min(n_bytes, 1024))
+
+        local_seed = os.urandom(n_bytes)
+        server_nugget = None
+        try:
+            r = self._fetch_server_rpc("qtcl_getEntropy", [n_bytes])
+            if isinstance(r, dict) and "entropy_hex" in r:
+                server_nugget = bytes.fromhex(r["entropy_hex"])[:n_bytes]
+        except Exception:
+            pass
+
+        if server_nugget and len(server_nugget) == n_bytes:
+            merged = bytes(a ^ b for a, b in zip(local_seed, server_nugget))
+            source = "xor_local_koyeb"
+        else:
+            merged = local_seed
+            source = "local_only"
+
+        return {
+            "entropy_hex": merged.hex(),
+            "bytes": len(merged),
+            "source": source,
+        }
+
+    def _rpc_getDHTTable(self, params: list) -> dict:
+        """Return this node's Kademlia-style peer table snapshot."""
+        peers = []
+        try:
+            conn = self._db_conn()
+            try:
+                cutoff = int(time.time()) - 600
+                rows = conn.execute(
+                    "SELECT host, port, last_seen_at, chain_height, node_id "
+                    "FROM p2p_peers WHERE last_seen_at>? "
+                    "ORDER BY last_seen_at DESC LIMIT 128",
+                    (cutoff,)
+                ).fetchall()
+                for row in rows:
+                    peers.append({
+                        "host": row["host"],
+                        "port": int(row["port"] or 9091),
+                        "node_id": row["node_id"] or "",
+                        "last_seen_at": int(row["last_seen_at"] or 0),
+                        "chain_height": int(row["chain_height"] or 0),
+                    })
+            finally:
+                conn.close()
+        except Exception as _e:
+            logger.debug(f"[DHT] read error: {_e}")
+
+        return {
+            "node_id": self._node_id,
+            "peer_count": len(peers),
+            "peers": peers,
+            "timestamp": int(time.time()),
+        }
+
+    def _rpc_receiveDHTTable(self, params: list) -> dict:
+        """Accept another peer's DHT table and merge into p2p_peers."""
+        if not params or not isinstance(params[0], dict):
+            return {"accepted": 0, "error": "params[0] must be dict"}
+        payload = params[0]
+        incoming = payload.get("peers", []) or []
+        origin = str(payload.get("node_id", ""))[:64]
+        now = int(time.time())
+        accepted = 0
+        try:
+            conn = self._db_conn()
+            try:
+                for p in incoming[:256]:
+                    try:
+                        host = str(p.get("host", ""))[:64]
+                        port = int(p.get("port", 9091))
+                        node_id = str(p.get("node_id", ""))[:64]
+                        ch = int(p.get("chain_height", 0))
+                        if not host or not port:
+                            continue
+                        conn.execute(
+                            "INSERT OR REPLACE INTO p2p_peers "
+                            "(host, port, node_id, chain_height, last_seen_at) "
+                            "VALUES (?,?,?,?,?)",
+                            (host, port, node_id, ch, now)
+                        )
+                        accepted += 1
+                    except Exception:
+                        continue
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as _e:
+            logger.debug(f"[DHT] receive error: {_e}")
+        return {"accepted": accepted, "origin": origin, "total_sent": len(incoming)}
+
+    def _rpc_peerHeartbeat(self, params: list) -> dict:
+        """Peer liveness ping — updates last_seen and returns our tip."""
+        if params and isinstance(params[0], dict):
+            p = params[0]
+            host = str(p.get("host", ""))[:64]
+            port = int(p.get("port", 9091))
+            node_id = str(p.get("node_id", ""))[:64]
+            ch = int(p.get("chain_height", 0))
+            if host:
+                try:
+                    conn = self._db_conn()
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO p2p_peers "
+                            "(host, port, node_id, chain_height, last_seen_at) "
+                            "VALUES (?,?,?,?,?)",
+                            (host, port, node_id, ch, int(time.time()))
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+
+        local_h = 0
+        local_hash = ""
+        try:
+            conn = self._db_conn()
+            try:
+                r = conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
+                if r and r["h"] is not None:
+                    local_h = int(r["h"])
+                    r2 = conn.execute(
+                        "SELECT block_hash FROM blocks WHERE height=? LIMIT 1",
+                        (local_h,)
+                    ).fetchone()
+                    if r2:
+                        local_hash = r2["block_hash"] or ""
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        return {
+            "pong": True,
+            "node_id": self._node_id,
+            "chain_height": local_h,
+            "best_hash": local_hash,
+            "timestamp": int(time.time()),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BLOCK + TRANSACTION SUBMISSION (dual-truth: Koyeb primary + local SQLite)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _rpc_submitBlock(self, params: list) -> dict:
+        """Submit a block: dispatch to Koyeb (primary truth) then mirror into local SQLite.
+        Cryptographic linkage: coinbase(miner, 7.2 QTCL) embedded IN this block.
+        Treasury 0.8 QTCL is queued as pending_reward, requiring NEXT-block confirmation."""
+        if not params or not isinstance(params[0], dict):
+            return {"accepted": False, "error": "params[0] must be dict"}
+        block = params[0]
+        hdr = block.get("header", block)
+        height = int(hdr.get("height", 0))
+        block_hash = str(hdr.get("block_hash", hdr.get("hash", "")))
+        parent_hash = str(hdr.get("parent_hash", "0" * 64))
+        merkle_root = str(hdr.get("merkle_root", hdr.get("transactions_root", "0" * 64)))
+        timestamp_s = int(hdr.get("timestamp", int(time.time())))
+        nonce = int(hdr.get("nonce", 0))
+        miner_address = str(hdr.get("miner_address", hdr.get("miner", "")))
+        difficulty = int(hdr.get("difficulty", 6))
+        w_entropy_hex = str(hdr.get("w_entropy_hash", hdr.get("oracle_w_state_hash", "")))
+        txs = block.get("transactions", block.get("txs", [])) or []
+
+        if not height or not block_hash or not miner_address:
+            return {"accepted": False, "error": "height/block_hash/miner_address required"}
+
+        # Verify cryptographic miner coinbase presence (7.2 QTCL self-embedded)
+        _miner_coinbase_found = False
+        _treasury_coinbase_found = False
+        for tx in txs:
+            if str(tx.get("tx_type", "")).lower() == "coinbase":
+                _to = tx.get("to_addr", tx.get("to_address", ""))
+                _amt = float(tx.get("amount", 0))
+                if _to == miner_address and abs(_amt - 7.2) < 0.01:
+                    _miner_coinbase_found = True
+                elif "treasury" in _to.lower() and abs(_amt - 0.8) < 0.01:
+                    _treasury_coinbase_found = True
+
+        if not _miner_coinbase_found:
+            logger.warning(
+                f"[SUBMIT-BLOCK] h={height} missing 7.2 QTCL miner coinbase to {miner_address[:20]}..."
+            )
+            return {"accepted": False, "error": "Block missing miner coinbase (7.2 QTCL)"}
+
+        # === 1. Primary truth: push to Koyeb ===
+        koyeb_result = None
+        try:
+            koyeb_result = self._fetch_server_rpc("qtcl_submitBlock", [block], timeout=20.0)
+        except Exception as _ke:
+            logger.warning(f"[SUBMIT-BLOCK] Koyeb push failed: {_ke}")
+
+        koyeb_accepted = isinstance(koyeb_result, dict) and (
+            koyeb_result.get("status") == "accepted"
+            or koyeb_result.get("accepted") is True
+        )
+
+        # === 2. Mirror into local SQLite (secondary truth) ===
+        local_persisted = False
+        try:
+            conn = self._db_conn()
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO blocks "
+                    "(height, block_hash, parent_hash, merkle_root, timestamp, "
+                    " miner_address, difficulty, nonce, oracle_w_state_hash, "
+                    " transaction_count, data) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        height, block_hash, parent_hash, merkle_root, timestamp_s,
+                        miner_address, difficulty, nonce,
+                        w_entropy_hex[:64] if w_entropy_hex else "0" * 64,
+                        len(txs), json.dumps(block, default=str)[:65536]
+                    )
+                )
+                # Persist all transactions
+                for tx in txs:
+                    tx_id = str(tx.get("tx_id") or tx.get("tx_hash", ""))
+                    if not tx_id:
+                        continue
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO transactions "
+                            "(tx_hash, from_address, to_address, amount, tx_type, "
+                            " status, height, block_hash, created_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (
+                                tx_id,
+                                str(tx.get("from_addr", tx.get("from_address", "0" * 64))),
+                                str(tx.get("to_addr", tx.get("to_address", ""))),
+                                int(round(float(tx.get("amount", 0)) * 100)),
+                                str(tx.get("tx_type", "transfer")),
+                                "confirmed",
+                                height,
+                                block_hash,
+                                timestamp_s,
+                            )
+                        )
+                    except Exception as _txe:
+                        logger.debug(f"[SUBMIT-BLOCK] local tx insert {tx_id[:16]}: {_txe}")
+
+                # Credit miner 7.2 QTCL NOW (embedded in this block)
+                miner_reward_base = 720
+                conn.execute(
+                    "INSERT INTO wallet_addresses "
+                    "(address, public_key, wallet_fingerprint, balance, "
+                    " address_type, balance_at_height, balance_updated_at, "
+                    " created_at, transaction_count) "
+                    "VALUES (?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),1) "
+                    "ON CONFLICT(address) DO UPDATE SET "
+                    " balance = balance + ?, "
+                    " transaction_count = transaction_count + 1, "
+                    " balance_at_height = ?, "
+                    " balance_updated_at = strftime('%s','now')",
+                    (
+                        miner_address, miner_address[:64], miner_address[:64],
+                        miner_reward_base, "miner", height,
+                        miner_reward_base, height,
+                    )
+                )
+
+                # Treasury 0.8 QTCL → pending_rewards (requires NEXT block confirmation)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS pending_rewards ("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " height INTEGER NOT NULL,"
+                    " reward_type TEXT NOT NULL,"
+                    " recipient TEXT NOT NULL,"
+                    " amount INTEGER NOT NULL,"
+                    " confirmed_at_height INTEGER DEFAULT NULL,"
+                    " status TEXT DEFAULT 'pending',"
+                    " created_at INTEGER DEFAULT (strftime('%s','now')),"
+                    " UNIQUE(height, reward_type, recipient)"
+                    ")"
+                )
+                treasury_address = "qtcl1treasury0reward0dist0address00000000000000000000001"
+                treasury_reward_base = 80
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO pending_rewards "
+                        "(height, reward_type, recipient, amount, status) "
+                        "VALUES (?, 'treasury', ?, ?, 'pending')",
+                        (height, treasury_address, treasury_reward_base)
+                    )
+                except Exception:
+                    pass
+
+                # ← Confirm PRIOR block's pending treasury reward (height-1)
+                try:
+                    prev = conn.execute(
+                        "SELECT id, recipient, amount FROM pending_rewards "
+                        "WHERE height=? AND status='pending'",
+                        (height - 1,)
+                    ).fetchall()
+                    for pr in prev:
+                        conn.execute(
+                            "INSERT INTO wallet_addresses "
+                            "(address, public_key, wallet_fingerprint, balance, "
+                            " address_type, balance_at_height, balance_updated_at, "
+                            " created_at, transaction_count) "
+                            "VALUES (?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),1) "
+                            "ON CONFLICT(address) DO UPDATE SET "
+                            " balance = balance + ?, "
+                            " transaction_count = transaction_count + 1, "
+                            " balance_at_height = ?, "
+                            " balance_updated_at = strftime('%s','now')",
+                            (
+                                pr["recipient"], pr["recipient"][:64], pr["recipient"][:64],
+                                pr["amount"], "treasury", height,
+                                pr["amount"], height,
+                            )
+                        )
+                        conn.execute(
+                            "UPDATE pending_rewards SET status='confirmed', "
+                            "confirmed_at_height=? WHERE id=?",
+                            (height, pr["id"])
+                        )
+                        logger.info(
+                            f"[SUBMIT-BLOCK] 💰 Treasury reward confirmed: h={height-1} "
+                            f"→ {pr['recipient'][:20]}... +{pr['amount']/100:.2f} QTCL"
+                        )
+                except Exception as _pre:
+                    logger.debug(f"[SUBMIT-BLOCK] prev-treasury confirm: {_pre}")
+
+                # Settle non-coinbase transactions locally
+                for tx in txs:
+                    if str(tx.get("tx_type", "")).lower() == "coinbase":
+                        continue
+                    _from = str(tx.get("from_addr", tx.get("from_address", "")))
+                    _to = str(tx.get("to_addr", tx.get("to_address", "")))
+                    _amt = int(round(float(tx.get("amount", 0)) * 100))
+                    _fee = int(round(float(tx.get("fee", 0)) * 100))
+                    if _from and _to and _amt > 0:
+                        conn.execute(
+                            "UPDATE wallet_addresses SET "
+                            " balance = balance - ?, "
+                            " transaction_count = transaction_count + 1, "
+                            " balance_at_height = ? "
+                            "WHERE address=? AND balance >= ?",
+                            (_amt + _fee, height, _from, _amt + _fee)
+                        )
+                        conn.execute(
+                            "INSERT INTO wallet_addresses "
+                            "(address, public_key, wallet_fingerprint, balance, "
+                            " address_type, balance_at_height, balance_updated_at, "
+                            " created_at, transaction_count) "
+                            "VALUES (?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),1) "
+                            "ON CONFLICT(address) DO UPDATE SET "
+                            " balance = balance + ?, "
+                            " transaction_count = transaction_count + 1, "
+                            " balance_at_height = ?, "
+                            " balance_updated_at = strftime('%s','now')",
+                            (_to, _to[:64], _to[:64], _amt, "standard", height, _amt, height)
+                        )
+
+                conn.commit()
+                local_persisted = True
+                logger.info(
+                    f"[SUBMIT-BLOCK] ✅ h={height} local mirror: miner +7.20 QTCL, "
+                    f"treasury 0.80 QTCL queued (confirms at h={height+1})"
+                )
+            finally:
+                conn.close()
+        except Exception as _le:
+            logger.warning(f"[SUBMIT-BLOCK] local mirror failed: {_le}")
+
+        # === 3. P2P gossip to peers ===
+        self._gossip_to_peers("qtcl_submitBlock", [block])
+
+        return {
+            "accepted": koyeb_accepted or local_persisted,
+            "koyeb_accepted": koyeb_accepted,
+            "local_persisted": local_persisted,
+            "height": height,
+            "block_hash": block_hash,
+            "miner_reward_qtcl": 7.2,
+            "treasury_reward_qtcl_pending": 0.8,
+            "treasury_confirms_at_height": height + 1,
+            "koyeb_result": koyeb_result,
+        }
+
+    def _rpc_submitTransaction(self, params: list) -> dict:
+        """Submit a signed transaction to both Koyeb (primary truth) and local mempool."""
+        if not params or not isinstance(params[0], dict):
+            return {"accepted": False, "error": "params[0] must be dict"}
+        tx = params[0]
+        tx_id = str(tx.get("tx_id") or tx.get("tx_hash", ""))
+        _from = str(tx.get("from_addr", tx.get("from_address", "")))
+        _to = str(tx.get("to_addr", tx.get("to_address", "")))
+        _amt = float(tx.get("amount", 0))
+
+        if not tx_id or not _from or not _to or _amt <= 0:
+            return {"accepted": False, "error": "tx_id/from/to/amount required"}
+
+        # Push to Koyeb first
+        koyeb_result = None
+        try:
+            koyeb_result = self._fetch_server_rpc("qtcl_submitTransaction", [tx], timeout=10.0)
+        except Exception as _ke:
+            logger.debug(f"[SUBMIT-TX] Koyeb push: {_ke}")
+        koyeb_accepted = isinstance(koyeb_result, dict) and (
+            koyeb_result.get("status") in ("accepted", "pending")
+            or koyeb_result.get("accepted") is True
+        )
+
+        # Local mempool mirror
+        local_persisted = False
+        try:
+            conn = self._db_conn()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO transactions "
+                    "(tx_hash, from_address, to_address, amount, tx_type, "
+                    " status, created_at) "
+                    "VALUES (?,?,?,?,?,?,strftime('%s','now'))",
+                    (
+                        tx_id, _from, _to,
+                        int(round(_amt * 100)),
+                        str(tx.get("tx_type", "transfer")),
+                        "pending"
+                    )
+                )
+                conn.commit()
+                local_persisted = True
+            finally:
+                conn.close()
+        except Exception as _le:
+            logger.debug(f"[SUBMIT-TX] local mirror: {_le}")
+
+        # Gossip
+        self._gossip_to_peers("qtcl_submitTransaction", [tx])
+
+        return {
+            "accepted": koyeb_accepted or local_persisted,
+            "koyeb_accepted": koyeb_accepted,
+            "local_persisted": local_persisted,
+            "tx_hash": tx_id,
+            "koyeb_result": koyeb_result,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P2P gossip primitive (fire-and-forget to all known peers)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _gossip_to_peers(self, method: str, params: list, max_peers: int = 6) -> None:
+        """Fire-and-forget gossip to up to `max_peers` recent peers."""
+        def _do():
+            import urllib.request as _ur
+            try:
+                conn = self._db_conn()
+                try:
+                    cutoff = int(time.time()) - 300
+                    rows = conn.execute(
+                        "SELECT host, port FROM p2p_peers "
+                        "WHERE last_seen_at>? "
+                        "ORDER BY last_seen_at DESC LIMIT ?",
+                        (cutoff, max_peers)
+                    ).fetchall()
+                finally:
+                    conn.close()
+                body = json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": params,
+                    "id": 1
+                }).encode()
+                for r in rows:
+                    try:
+                        url = f"http://{r['host']}:{r['port']}/rpc"
+                        req = _ur.Request(
+                            url, data=body,
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        _ur.urlopen(req, timeout=2).read()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True, name="Gossip").start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BALANCE RECONCILIATION DAEMON (Koyeb ↔ Local ↔ P2P)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _reconcile_balances_loop(self) -> None:
+        """Background daemon: reconcile local wallet balances with Koyeb every 60s.
+        Logs discrepancies and tags divergent wallets."""
+        while not self._stop.is_set():
+            try:
+                conn = self._db_conn()
+                try:
+                    rows = conn.execute(
+                        "SELECT address, balance FROM wallet_addresses "
+                        "ORDER BY balance_updated_at DESC LIMIT 32"
+                    ).fetchall()
+                finally:
+                    conn.close()
+                divergences = 0
+                for row in rows:
+                    addr = row["address"]
+                    local_bal = int(row["balance"] or 0)
+                    try:
+                        koyeb = self._fetch_server_rpc("qtcl_getBalance", [addr], timeout=5.0)
+                        if isinstance(koyeb, dict) and "balance" in koyeb:
+                            kbal = int(round(float(koyeb["balance"]) * 100))
+                            if abs(kbal - local_bal) > 1:
+                                divergences += 1
+                                logger.warning(
+                                    f"[RECONCILE] {addr[:20]}... local={local_bal/100:.2f} "
+                                    f"koyeb={kbal/100:.2f} Δ={abs(kbal-local_bal)/100:.2f} QTCL"
+                                )
+                                # Koyeb is primary truth → correct local
+                                try:
+                                    c2 = self._db_conn()
+                                    try:
+                                        c2.execute(
+                                            "UPDATE wallet_addresses SET "
+                                            " balance=?, "
+                                            " balance_updated_at=strftime('%s','now') "
+                                            "WHERE address=?",
+                                            (kbal, addr)
+                                        )
+                                        c2.commit()
+                                    finally:
+                                        c2.close()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                if divergences > 0:
+                    logger.info(f"[RECONCILE] corrected {divergences} divergent wallets from Koyeb")
+            except Exception as _e:
+                logger.debug(f"[RECONCILE] loop error: {_e}")
+            self._stop.wait(60.0)
+
 
     def _dispatch(self, body_bytes: bytes, peer_addr: str) -> Tuple[dict, int]:
         t0 = time.time()
@@ -29465,6 +30173,12 @@ class NodeRPCMeshServer:
             target=self._poll_oracle_and_entangle,
             daemon=True,
             name="Mesh-PQ0-Entangle",
+        ).start()
+        # Balance reconciliation daemon (Koyeb ↔ Local ↔ P2P)
+        threading.Thread(
+            target=self._reconcile_balances_loop,
+            daemon=True,
+            name="Mesh-Reconcile",
         ).start()
         # HTTP server
         handler = self._make_handler()
