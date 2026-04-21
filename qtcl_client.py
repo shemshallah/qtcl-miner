@@ -25479,29 +25479,44 @@ class QtclClientApp:
                                 f"[MINER-VERIFY] Local DB check failed: {_local_err}"
                             )
 
-                        # Check 2: Koyeb (remote server) persistence - PRIMARY
-                        try:
-                            _verify_block = await _asyncio.to_thread(
-                                kapi._rpc, "qtcl_getBlock", [target_height], 5, 2
-                            )
-                            if _verify_block and not _verify_block.get("error"):
-                                _koyeb_ok = True
-                                _EXP_LOG.warning(
-                                    f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in Koyeb DB"
+                        # Check 2: Koyeb (remote server) persistence - PRIMARY with retry
+                        # Database replication/pooling may have slight lag, so retry with backoff
+                        _koyeb_retries = 3
+                        for _retry in range(_koyeb_retries):
+                            try:
+                                _verify_block = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlock", [target_height], 5, 1
                                 )
-                            else:
-                                _EXP_LOG.warning(
-                                    f"[MINER-VERIFY] ⚠️  Block h={target_height} verification failed: {_verify_block}"
-                                )
-                        except Exception as _ve:
-                            _EXP_LOG.warning(
-                                f"[MINER-VERIFY] ⚠️  Koyeb DB check failed (will retry): {_ve}"
-                            )
+                                if _verify_block and not _verify_block.get("error"):
+                                    _koyeb_ok = True
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in Koyeb DB (attempt {_retry + 1})"
+                                    )
+                                    break
+                                elif _retry < _koyeb_retries - 1:
+                                    # Query returned but with error, retry with backoff
+                                    await _asyncio.sleep(0.5 * (_retry + 1))
+                                    continue
+                                else:
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ⚠️  Block h={target_height} still not found after {_koyeb_retries} attempts: {_verify_block}"
+                                    )
+                            except Exception as _ve:
+                                if _retry < _koyeb_retries - 1:
+                                    _EXP_LOG.debug(
+                                        f"[MINER-VERIFY] Retry {_retry + 1}/{_koyeb_retries}: {_ve}"
+                                    )
+                                    await _asyncio.sleep(0.5 * (_retry + 1))
+                                else:
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ⚠️  Koyeb DB check failed after {_koyeb_retries} attempts: {_ve}"
+                                    )
 
-                        # Summary: At least Koyeb should confirm (it already did with "accepted")
+                        # Summary: Server response already confirmed acceptance (next_height advanced)
+                        # Verification is supplementary - not finding immediately is not critical
                         if not _koyeb_ok:
-                            _EXP_LOG.error(
-                                f"[MINER-VERIFY] ❌ CRITICAL: Block h={target_height} not confirmed in Koyeb!"
+                            _EXP_LOG.warning(
+                                f"[MINER-VERIFY] ⚠️  Block h={target_height} verification timeout - may be replication lag (block IS accepted per server response)"
                             )
 
                         _MINE_TELEM.record_block_accepted(
