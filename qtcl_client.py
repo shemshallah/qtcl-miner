@@ -25457,22 +25457,51 @@ class QtclClientApp:
                                 f"[MINER] ⚠️  Failed to persist block locally: {_persist_err}"
                             )
 
-                        # 🔴 CRITICAL VERIFICATION: Query server DB to confirm block is actually there
+                        # 🔍 PERSISTENCE VERIFICATION: Check both local and remote (Koyeb primary)
+                        _local_ok = False
+                        _koyeb_ok = False
+
+                        # Check 1: Local SQLite persistence
                         try:
-                            _verify_block = await _asyncio.to_thread(
-                                kapi._rpc, "qtcl_getBlock", [target_height], 3, 1
-                            )
-                            if _verify_block and not _verify_block.get("error"):
-                                _EXP_LOG.warning(
-                                    f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in server DB"
+                            _local_verify_db = LocalBlockchainDB(name="qtcl")
+                            _local_blk = _local_verify_db.get_block(target_height)
+                            if _local_blk:
+                                _local_ok = True
+                                _EXP_LOG.debug(
+                                    f"[MINER-VERIFY] ✅ Block h={target_height} persisted in local DB"
                                 )
                             else:
-                                _EXP_LOG.error(
-                                    f"[MINER-VERIFY] ❌ Block h={target_height} NOT found in DB despite acceptance!"
+                                _EXP_LOG.warning(
+                                    f"[MINER-VERIFY] ⚠️  Block h={target_height} not found in local DB (may be delayed)"
+                                )
+                        except Exception as _local_err:
+                            _EXP_LOG.debug(
+                                f"[MINER-VERIFY] Local DB check failed: {_local_err}"
+                            )
+
+                        # Check 2: Koyeb (remote server) persistence - PRIMARY
+                        try:
+                            _verify_block = await _asyncio.to_thread(
+                                kapi._rpc, "qtcl_getBlock", [target_height], 5, 2
+                            )
+                            if _verify_block and not _verify_block.get("error"):
+                                _koyeb_ok = True
+                                _EXP_LOG.warning(
+                                    f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in Koyeb DB"
+                                )
+                            else:
+                                _EXP_LOG.warning(
+                                    f"[MINER-VERIFY] ⚠️  Block h={target_height} verification failed: {_verify_block}"
                                 )
                         except Exception as _ve:
                             _EXP_LOG.warning(
-                                f"[MINER-VERIFY] Could not verify block in DB: {_ve}"
+                                f"[MINER-VERIFY] ⚠️  Koyeb DB check failed (will retry): {_ve}"
+                            )
+
+                        # Summary: At least Koyeb should confirm (it already did with "accepted")
+                        if not _koyeb_ok:
+                            _EXP_LOG.error(
+                                f"[MINER-VERIFY] ❌ CRITICAL: Block h={target_height} not confirmed in Koyeb!"
                             )
 
                         _MINE_TELEM.record_block_accepted(
