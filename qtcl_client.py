@@ -26050,14 +26050,20 @@ class QtclClientApp:
             try:
                 _addr2 = getattr(getattr(self, "wallet", None), "address", None)
                 if _addr2:
-                    _bal_r = self.api._rpc(
-                        "qtcl_getBalance", [_addr2], timeout=5, retries=1
-                    )
-                    _bal = (
-                        float(_bal_r["balance"])
-                        if isinstance(_bal_r, dict) and "balance" in _bal_r
-                        else None
-                    )
+                    _bal = None
+                    for _retry_idx in range(3):
+                        _bal_r = self.api._rpc(
+                            "qtcl_getBalance", [_addr2], timeout=5, retries=1
+                        )
+                        _bal = (
+                            float(_bal_r["balance"])
+                            if isinstance(_bal_r, dict) and "balance" in _bal_r
+                            else None
+                        )
+                        if _bal and _bal > 0:
+                            break
+                        if _retry_idx < 2:
+                            time.sleep(0.5)
                     if _bal is not None:
                         print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
             except Exception:
