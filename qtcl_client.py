@@ -29267,35 +29267,53 @@ class NodeRPCMeshServer:
             _treasury_reward_base = 80  # 0.80 QTCL
             _treasury_addr = 'qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1'
 
-            # MINER REWARD
+            # MINER REWARD — UPDATE balance (TEXT field, sum as integers)
             conn.execute(
                 """
-                INSERT INTO wallet_addresses
-                (address, balance, address_type, last_updated, created_at)
-                VALUES (?, ?, 'miner', datetime('now'), datetime('now'))
-                ON CONFLICT(address) DO UPDATE SET
-                    balance = balance + ?,
+                UPDATE wallet_addresses SET
+                    balance = CAST(CAST(COALESCE(balance, 0) AS INTEGER) + ? AS TEXT),
                     address_type = 'miner',
-                    last_updated = datetime('now')
+                    balance_updated_at = datetime('now'),
+                    transaction_count = COALESCE(transaction_count, 0) + 1
+                WHERE address = ?
                 """,
-                (miner_address, _miner_reward_base, _miner_reward_base),
+                (_miner_reward_base, miner_address),
             )
-            logger.info(f"[SETTLEMENT] Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL")
+            # If no rows updated, insert new wallet entry
+            if conn.total_changes == 0 or conn.execute("SELECT changes()").fetchone()[0] == 0:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_addresses
+                    (address, public_key, wallet_fingerprint, balance, address_type, balance_updated_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'miner', datetime('now'), datetime('now'), datetime('now'))
+                    """,
+                    (miner_address, miner_address[:64], miner_address[:64], str(_miner_reward_base)),
+                )
+            logger.critical(f"[SETTLEMENT] ✅ Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL")
 
-            # TREASURY REWARD
+            # TREASURY REWARD — UPDATE balance (TEXT field)
             conn.execute(
                 """
-                INSERT INTO wallet_addresses
-                (address, balance, address_type, last_updated, created_at)
-                VALUES (?, ?, 'treasury', datetime('now'), datetime('now'))
-                ON CONFLICT(address) DO UPDATE SET
-                    balance = balance + ?,
+                UPDATE wallet_addresses SET
+                    balance = CAST(CAST(COALESCE(balance, 0) AS INTEGER) + ? AS TEXT),
                     address_type = 'treasury',
-                    last_updated = datetime('now')
+                    balance_updated_at = datetime('now'),
+                    transaction_count = COALESCE(transaction_count, 0) + 1
+                WHERE address = ?
                 """,
-                (_treasury_addr, _treasury_reward_base, _treasury_reward_base),
+                (_treasury_reward_base, _treasury_addr),
             )
-            logger.info(f"[SETTLEMENT] Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL")
+            # If no rows updated, insert new wallet entry
+            if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_addresses
+                    (address, public_key, wallet_fingerprint, balance, address_type, balance_updated_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'treasury', datetime('now'), datetime('now'), datetime('now'))
+                    """,
+                    (_treasury_addr, _treasury_addr[:64], _treasury_addr[:64], str(_treasury_reward_base)),
+                )
+            logger.critical(f"[SETTLEMENT] ✅ Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL")
 
             conn.commit()
             logger.info(
