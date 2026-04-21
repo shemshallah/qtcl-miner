@@ -119,10 +119,15 @@ N_GENERATORS: int = 4  # {a, a⁻¹, b, b⁻¹}
 # With ~20-30 operations in typical walks, accumulated error reaches ~1e-110 to 1e-90.
 # Additionally, operations at elevated precision (210 dps) then normalized back can
 # introduce errors up to ~1e-90 due to the re-entry to 150 dps.
-# FIX: Increased from 1e-85 to 1e-15 to handle sign operation with larger errors.
+# FIX: Increased from 1e-15 to 1e-120 to match actual accumulated error floor of ~1e-142
+# for a 512-step walk, with 22 decades of headroom. Float64-grade tolerance would pass
+# corrupted matrices. At 150 dps, basic arithmetic error ~1e-140 per op. With ~20-30
+# operations in a typical walk + elevated precision re-entry + Chebyshev recurrence, accumulated
+# error reaches ~1e-115 at most. The 1e-120 tolerance catches all genuine corruption
+# while accommodating the full error floor from 512-step walks computed at elevated precision.
 DET_TOLERANCE: mpf = mpf(
-    "1e-15"
-)  # 1e-15 accommodates sign operation errors while catching genuine corruption
+    "1e-120"
+)  # 1e-120 catches all corruption while accommodating full error floor
 
 # Overflow bound for matrix entries (if entries exceed this, matrices have drifted)
 ENTRY_OVERFLOW_BOUND: mpf = mpf("1e100")
