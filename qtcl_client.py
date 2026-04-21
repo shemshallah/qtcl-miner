@@ -7082,7 +7082,93 @@ class LocalBlockchainDB:
         if not _validate_and_init_schema(self.db_path):
             raise RuntimeError(f"Database schema validation failed for {self.db_path}")
 
+        # Apply idempotent schema migrations (add missing columns to existing tables)
+        self._migrate_schema()
+
         logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
+
+    def _migrate_schema(self):
+        """Idempotent schema migrations — add missing columns to pre-existing tables.
+        Runs on every startup; no-op if columns already exist."""
+        _p2p_cols = {
+            "node_id": "TEXT",
+            "node_id_hex": "TEXT",
+            "services": "INTEGER DEFAULT 0",
+            "protocol_version": "INTEGER DEFAULT 2",
+            "chain_height": "INTEGER DEFAULT 0",
+            "last_fidelity": "REAL DEFAULT 0.0",
+            "latency_ms": "REAL DEFAULT 0.0",
+            "source": "TEXT DEFAULT 'dht'",
+            "first_seen_at": "INTEGER DEFAULT 0",
+            "last_seen_at": "INTEGER DEFAULT 0",
+            "last_heartbeat_at": "INTEGER DEFAULT 0",
+            "external_addr": "TEXT",
+            "capabilities": "TEXT",
+            "mac_address": "TEXT",
+            "device_id": "TEXT",
+            "ban_score": "INTEGER DEFAULT 0",
+        }
+        try:
+            # Create table if missing (covers fresh-install case)
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS p2p_peers ("
+                " host TEXT NOT NULL,"
+                " port INTEGER NOT NULL DEFAULT 9091,"
+                " PRIMARY KEY (host, port)"
+                ")"
+            )
+            existing = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(p2p_peers)").fetchall()
+            }
+            for col, ddl in _p2p_cols.items():
+                if col not in existing:
+                    try:
+                        self.conn.execute(f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}")
+                    except Exception as _ae:
+                        logging.debug(f"[SCHEMA] add col {col}: {_ae}")
+
+            # pending_rewards
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS pending_rewards ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " height INTEGER NOT NULL,"
+                " reward_type TEXT NOT NULL,"
+                " recipient TEXT NOT NULL,"
+                " amount INTEGER NOT NULL,"
+                " confirmed_at_height INTEGER DEFAULT NULL,"
+                " status TEXT DEFAULT 'pending',"
+                " created_at INTEGER DEFAULT (strftime('%s','now')),"
+                " UNIQUE(height, reward_type, recipient)"
+                ")"
+            )
+
+            # mesh_rpc_log + gossip_inventory
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS mesh_rpc_log ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " method TEXT,"
+                " params_hash TEXT,"
+                " result_ok INTEGER,"
+                " latency_ms REAL,"
+                " peer_addr TEXT,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                ")"
+            )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS gossip_inventory ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " event_type TEXT,"
+                " channel TEXT,"
+                " peer_id TEXT,"
+                " payload TEXT,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                ")"
+            )
+            self.conn.commit()
+            logging.info("[SCHEMA] ✅ migrations applied")
+        except Exception as _me:
+            logging.warning(f"[SCHEMA] migration error: {_me}")
 
     def _init_pool(self):
         """Initialize connection pool (no-op for SQLite, kept for interface compatibility)"""
@@ -24559,41 +24645,44 @@ class QtclClientApp:
                     # STAGE 3: Build block (coinbase + treasury + user TXs)
                     # ──────────────────────────────────────────────────────────────
 
-                    # Get reward schedule
+                    # Get reward schedule — server validation expects QTCL float, not base units
                     try:
                         from globals import TessellationRewardSchedule as _TRS
 
-                        # ❤️  BASE UNITS
-                        _miner_reward = _TRS.get_miner_reward_base(target_height)
-                        base_treasury_reward = _TRS.get_treasury_reward_base(
+                        # ❤️ QTCL float (server multiplies *100 internally)
+                        _miner_reward = _TRS.get_miner_reward_qtcl(target_height)
+                        base_treasury_reward = _TRS.get_treasury_reward_qtcl(
                             target_height
                         )
-                        # Prefer treasury address pulled from server
                         _treasury_addr = (
                             self.koyeb_state.treasury_address or _TRS.TREASURY_ADDRESS
                         )
                     except Exception:
-                        _miner_reward = 720
-                        base_treasury_reward = 80
+                        _miner_reward = 7.2
+                        base_treasury_reward = 0.8
                         _treasury_addr = (
                             self.koyeb_state.treasury_address
                             or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
                         )
 
-                    # Sum all transaction donations (formerly fees) for the treasury
-                    total_donations = 0
+                    # Sum all transaction donations (in QTCL float)
+                    total_donations = 0.0
                     for tx in _pending_user_txs:
-                        # fee is in float QTCL in mempool records usually, or 'fee' field
                         f = tx.get("fee", 0)
                         if isinstance(f, (float, str)):
                             try:
-                                total_donations += int(round(float(f) * 100))
+                                total_donations += float(f)
                             except:
                                 pass
                         else:
-                            total_donations += int(f)
+                            try:
+                                total_donations += float(f)
+                            except:
+                                pass
 
-                    _treasury_reward = base_treasury_reward + total_donations
+                    # Miner receives 7.2 + 50% of total fees (float QTCL)
+                    _miner_reward = _miner_reward + (total_donations / 2.0)
+                    _treasury_reward = base_treasury_reward + (total_donations - total_donations / 2.0)
 
                     # Create miner coinbase transaction
                     _miner_cb_id = _hl.sha3_256(
@@ -28899,10 +28988,18 @@ class NodeRPCMeshServer:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS p2p_peers ("
                 " node_id TEXT,"
+                " node_id_hex TEXT,"
                 " host TEXT NOT NULL,"
                 " port INTEGER NOT NULL DEFAULT 9091,"
+                " services INTEGER DEFAULT 0,"
+                " protocol_version INTEGER DEFAULT 2,"
                 " chain_height INTEGER DEFAULT 0,"
+                " last_fidelity REAL DEFAULT 0.0,"
+                " latency_ms REAL DEFAULT 0.0,"
+                " source TEXT DEFAULT 'dht',"
+                " first_seen_at INTEGER DEFAULT 0,"
                 " last_seen_at INTEGER DEFAULT 0,"
+                " last_heartbeat_at INTEGER DEFAULT 0,"
                 " external_addr TEXT,"
                 " capabilities TEXT,"
                 " mac_address TEXT,"
@@ -28911,6 +29008,35 @@ class NodeRPCMeshServer:
                 " PRIMARY KEY (host, port)"
                 ")"
             )
+            # ALTER existing tables to add missing columns (idempotent)
+            _required_cols = {
+                "node_id": "TEXT",
+                "node_id_hex": "TEXT",
+                "services": "INTEGER DEFAULT 0",
+                "protocol_version": "INTEGER DEFAULT 2",
+                "chain_height": "INTEGER DEFAULT 0",
+                "last_fidelity": "REAL DEFAULT 0.0",
+                "latency_ms": "REAL DEFAULT 0.0",
+                "source": "TEXT DEFAULT 'dht'",
+                "first_seen_at": "INTEGER DEFAULT 0",
+                "last_seen_at": "INTEGER DEFAULT 0",
+                "last_heartbeat_at": "INTEGER DEFAULT 0",
+                "external_addr": "TEXT",
+                "capabilities": "TEXT",
+                "mac_address": "TEXT",
+                "device_id": "TEXT",
+                "ban_score": "INTEGER DEFAULT 0",
+            }
+            try:
+                existing = {row[1] for row in conn.execute("PRAGMA table_info(p2p_peers)").fetchall()}
+                for col, ddl in _required_cols.items():
+                    if col not in existing:
+                        try:
+                            conn.execute(f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS mesh_rpc_log ("
                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
