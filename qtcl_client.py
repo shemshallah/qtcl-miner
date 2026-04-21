@@ -24618,30 +24618,11 @@ class QtclClientApp:
                         "version": 1,
                     }
 
-                    # Create treasury coinbase transaction
-                    _treasury_cb_id = _hl.sha3_256(
-                        _j.dumps(
-                            {
-                                "height": target_height,
-                                "treasury": _treasury_addr,
-                                "amount": _treasury_reward,
-                                "seed": _w_entropy_seed.hex(),
-                            },
-                            sort_keys=True,
-                        ).encode()
-                    ).hexdigest()
-                    _treasury_cb = {
-                        "tx_id": _treasury_cb_id,
-                        "from_addr": "0" * 64,
-                        "to_addr": _treasury_addr,
-                        "amount": _treasury_reward,
-                        "block_height": target_height,
-                        "w_proof": _w_entropy_seed.hex(),
-                        "tx_type": "coinbase",
-                        "version": 1,
-                    }
+                    # Treasury reward (0.8 QTCL) is NOT a coinbase anymore.
+                    # It is queued in pending_rewards server-side and confirmed at height+1.
+                    # Only the miner coinbase (7.2 QTCL) lives inside the block.
 
-                    _block_txs = [_miner_cb, _treasury_cb] + _pending_user_txs
+                    _block_txs = [_miner_cb] + _pending_user_txs
 
                     # Compute merkle root (SHA3-256 binary tree)
                     def _compute_merkle(tx_list: list) -> str:
@@ -26040,10 +26021,10 @@ class QtclClientApp:
                     == _TRS_disp.TREASURY_ADDRESS
                 ):
                     print(
-                        f"  Split   : miner={_m_disp:.2f} QTCL/blk + treasury={_t_disp:.2f} QTCL/blk → total={_m_disp + _t_disp:.2f} QTCL/blk"
+                        f"  Split   : miner={_m_disp:.2f} QTCL/blk (now) + treasury={_t_disp:.2f} QTCL/blk (confirms at h+1) → total={_m_disp + _t_disp:.2f} QTCL/blk"
                     )
                     print(
-                        f"  Note    : Mining as treasury address — both coinbases credit same wallet"
+                        f"  Note    : Mining as treasury address — miner credited immediately, treasury pending until next block"
                     )
             except Exception:
                 pass
