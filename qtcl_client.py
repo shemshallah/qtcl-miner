@@ -29255,8 +29255,47 @@ class NodeRPCMeshServer:
             # Apply UTXO updates
             _apply_utxo_updates_atomic(conn, block, h)
 
-            # Update chain state
+            # UPDATE CHAIN STATE
             _update_chain_state_atomic(conn, h, bhash, miner_address, block_time)
+
+            # ═════════════════════════════════════════════════════════════════════════
+            # SETTLEMENT: Update miner and treasury wallets (HARDCODED SINGLE LOGIC PATH)
+            # Miner: 7.20 QTCL (720 base units)
+            # Treasury: 0.80 QTCL (80 base units)
+            # ═════════════════════════════════════════════════════════════════════════
+            _miner_reward_base = 720  # 7.20 QTCL
+            _treasury_reward_base = 80  # 0.80 QTCL
+            _treasury_addr = 'qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1'
+
+            # MINER REWARD
+            conn.execute(
+                """
+                INSERT INTO wallet_addresses
+                (address, balance, address_type, last_updated, created_at)
+                VALUES (?, ?, 'miner', datetime('now'), datetime('now'))
+                ON CONFLICT(address) DO UPDATE SET
+                    balance = balance + ?,
+                    address_type = 'miner',
+                    last_updated = datetime('now')
+                """,
+                (miner_address, _miner_reward_base, _miner_reward_base),
+            )
+            logger.info(f"[SETTLEMENT] Miner {miner_address[:16]}… += {_miner_reward_base/100:.2f} QTCL")
+
+            # TREASURY REWARD
+            conn.execute(
+                """
+                INSERT INTO wallet_addresses
+                (address, balance, address_type, last_updated, created_at)
+                VALUES (?, ?, 'treasury', datetime('now'), datetime('now'))
+                ON CONFLICT(address) DO UPDATE SET
+                    balance = balance + ?,
+                    address_type = 'treasury',
+                    last_updated = datetime('now')
+                """,
+                (_treasury_addr, _treasury_reward_base, _treasury_reward_base),
+            )
+            logger.info(f"[SETTLEMENT] Treasury {_treasury_addr[:16]}… += {_treasury_reward_base/100:.2f} QTCL")
 
             conn.commit()
             logger.info(
