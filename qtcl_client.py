@@ -24687,29 +24687,25 @@ class QtclClientApp:
                         )
 
                     # ──────────────────────────────────────────────────────────────
-                    # STAGE 3: Build block (coinbase + treasury + user TXs)
+                    # STAGE 3: Build block (miner coinbase + previous treasury settlement + user TXs)
                     # ──────────────────────────────────────────────────────────────
 
-                    # Get reward schedule — server validation expects QTCL float, not base units
+                    # Get rewards from RPC (authoritative, server-side only)
+                    _miner_reward = 7.2
+                    _treasury_reward = 0.8
+                    _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                    
                     try:
-                        from globals import TessellationRewardSchedule as _TRS
-
-                        # ❤️ QTCL float (server multiplies *100 internally)
-                        _miner_reward = _TRS.get_miner_reward_qtcl(target_height)
-                        base_treasury_reward = _TRS.get_treasury_reward_qtcl(
-                            target_height
-                        )
-                        _treasury_addr = (
-                            self.koyeb_state.treasury_address or _TRS.TREASURY_ADDRESS
-                        )
-                    except Exception:
-                        _miner_reward = 7.2
-                        base_treasury_reward = 0.8
-                        _treasury_addr = (
-                            self.koyeb_state.treasury_address
-                            or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
-                        )
-
+                        _rewards_res = kapi._rpc_http(
+                            "/rpc/config/rewards", method="GET", timeout=5
+                        ) if hasattr(kapi, "_rpc_http") else None
+                        if _rewards_res and isinstance(_rewards_res, dict):
+                            _result = _rewards_res.get("result", {})
+                            _miner_reward = float(_result.get("miner_reward", 7.2))
+                            _treasury_reward = float(_result.get("treasury_reward", 0.8))
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/rewards, using defaults: {_e}")
+                    
                     # Sum all transaction donations (in QTCL float)
                     total_donations = 0.0
                     for tx in _pending_user_txs:
@@ -24725,19 +24721,16 @@ class QtclClientApp:
                             except:
                                 pass
 
-                    # Miner receives 7.2 + 50% of total fees (float QTCL)
-                    _miner_reward = _miner_reward + (total_donations / 2.0)
-                    _treasury_reward = base_treasury_reward + (
-                        total_donations - total_donations / 2.0
-                    )
+                    # Miner receives base reward + 50% of total fees
+                    _miner_reward_total = _miner_reward + (total_donations / 2.0)
 
-                    # Create miner coinbase transaction
+                    # Create miner coinbase transaction (authoritative amount from RPC)
                     _miner_cb_id = _hl.sha3_256(
                         _j.dumps(
                             {
                                 "height": target_height,
                                 "miner": miner_addr,
-                                "amount": _miner_reward,
+                                "amount": _miner_reward_total,
                                 "seed": _w_entropy_seed.hex(),
                             },
                             sort_keys=True,
@@ -24747,18 +24740,55 @@ class QtclClientApp:
                         "tx_id": _miner_cb_id,
                         "from_addr": "0" * 64,
                         "to_addr": miner_addr,
-                        "amount": _miner_reward,
+                        "amount": _miner_reward_total,
                         "block_height": target_height,
                         "w_proof": _w_entropy_seed.hex(),
                         "tx_type": "coinbase",
                         "version": 1,
                     }
 
-                    # Treasury reward (0.8 QTCL) is NOT a coinbase anymore.
-                    # It is queued in pending_rewards server-side and confirmed at height+1.
-                    # Only the miner coinbase (7.2 QTCL) lives inside the block.
+                    # Miner coinbase (7.2 QTCL) — immediate reward in current block
+                    # Treasury reward (0.8 QTCL) from PREVIOUS block — settled in current block (1-block delay)
 
-                    _block_txs = [_miner_cb] + _pending_user_txs
+                    _block_txs = [_miner_cb]
+                    
+                    # If not genesis, add previous block's treasury settlement
+                    if target_height > 1:
+                        try:
+                            from globals import TessellationRewardSchedule as _TRS_prev
+                            _prev_height = target_height - 1
+                            _prev_treasury_reward = _TRS_prev.get_treasury_reward_qtcl(_prev_height)
+                            _prev_treasury_addr = (
+                                self.koyeb_state.treasury_address or _TRS_prev.TREASURY_ADDRESS
+                            )
+                            
+                            # Settlement TX for previous block's treasury
+                            _prev_treasury_id = _hl.sha3_256(
+                                _j.dumps(
+                                    {
+                                        "height": _prev_height,
+                                        "settlement_at": target_height,
+                                        "treasury": _prev_treasury_addr,
+                                        "amount": _prev_treasury_reward,
+                                    },
+                                    sort_keys=True,
+                                ).encode()
+                            ).hexdigest()
+                            _prev_treasury_tx = {
+                                "tx_id": _prev_treasury_id,
+                                "from_addr": "0" * 64,
+                                "to_addr": _prev_treasury_addr,
+                                "amount": _prev_treasury_reward,
+                                "block_height": target_height,
+                                "settled_from": _prev_height,
+                                "tx_type": "coinbase",
+                                "version": 1,
+                            }
+                            _block_txs.append(_prev_treasury_tx)
+                        except Exception as _e:
+                            _EXP_LOG.debug(f"[MINER] Could not add treasury settlement: {_e}")
+                    
+                    _block_txs.extend(_pending_user_txs)
 
                     # Compute merkle root (SHA3-256 binary tree)
                     def _compute_merkle(tx_list: list) -> str:
