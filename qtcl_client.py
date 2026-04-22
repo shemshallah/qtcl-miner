@@ -24581,7 +24581,7 @@ class QtclClientApp:
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
-                    _pending_user_txs = _res_m.get("result", []) if isinstance(_res_m, dict) else (_res_m if isinstance(_res_m, list) else [])
+                    _pending_user_txs = _res_m if isinstance(_res_m, list) else []
 
                     _EXP_LOG.warning(
                         f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms"
@@ -24641,58 +24641,68 @@ class QtclClientApp:
                         )
 
                     # ──────────────────────────────────────────────────────────────
-                    # STAGE 3: Build block (miner coinbase + previous treasury settlement + user TXs)
+                    # STAGE 3: Build block — coinbases from server template + user TXs
+                    # ──────────────────────────────────────────────────────────────
+                    # COHERENT PIPELINE:
+                    #   1. Fetch coinbase template from server (authoritative rewards + pending treasury)
+                    #   2. Build coinbase txs with DETERMINISTIC IDs matching what server expects
+                    #   3. Compute merkle root over FULL tx list [miner_cb, treasury_cb, ...user_txs]
+                    #   4. Do PoW (merkle baked into header hash)
+                    #   5. Submit block with FULL tx list — server validates & persists AS-IS
                     # ──────────────────────────────────────────────────────────────
 
-                    # Get rewards from RPC (authoritative, server-side only)
                     _miner_reward = 7.2
                     _treasury_reward = 0.8
                     _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
-                    
+                    _miner_cb_id = f"cb_miner_{target_height}_{miner_addr[:16]}"
+                    _prior_pending_treasury = []
+
                     try:
-                        _rewards_res = kapi._rpc_http(
-                            "/rpc/config/rewards", method="GET", timeout=5
-                        ) if hasattr(kapi, "_rpc_http") else None
-                        if _rewards_res and isinstance(_rewards_res, dict):
-                            _result = _rewards_res.get("result", {})
-                            _miner_reward = float(_result.get("miner_reward", 7.2))
-                            _treasury_reward = float(_result.get("treasury_reward", 0.8))
+                        _tmpl_res = kapi._rpc_envelope(
+                            "qtcl_getCoinbaseTemplate", [target_height, miner_addr], 5, 1
+                        ) if hasattr(kapi, "_rpc_envelope") else None
+                        if _tmpl_res and isinstance(_tmpl_res, dict):
+                            _result = _tmpl_res.get("result", {})
+                            _miner_reward = float(_result.get("miner_reward_qtcl", 7.2))
+                            _treasury_reward = float(_result.get("treasury_reward_qtcl", 0.8))
+                            _treasury_addr = _result.get("treasury_address", _treasury_addr)
+                            _miner_cb_id = _result.get("miner_coinbase_id", _miner_cb_id)
+                            _prior_pending_treasury = _result.get("prior_pending_treasury", [])
+                            _EXP_LOG.info(
+                                f"[MINER] coinbase template h={target_height}: "
+                                f"miner={_miner_reward} treasury={_treasury_reward} "
+                                f"pending_from_prior={len(_prior_pending_treasury)}"
+                            )
                     except Exception as _e:
-                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/rewards, using defaults: {_e}")
-                    
-                    # Sum all transaction donations (in QTCL float)
+                        _EXP_LOG.debug(f"[MINER] Could not fetch getCoinbaseTemplate: {_e}")
+                        # Fallback: try old /rpc/config/rewards endpoint
+                        try:
+                            _rewards_res = kapi._rpc_http(
+                                "/rpc/config/rewards", method="GET", timeout=5
+                            ) if hasattr(kapi, "_rpc_http") else None
+                            if _rewards_res and isinstance(_rewards_res, dict):
+                                _result = _rewards_res.get("result", {})
+                                _miner_reward = float(_result.get("miner_reward", 7.2))
+                                _treasury_reward = float(_result.get("treasury_reward", 0.8))
+                        except Exception as _e2:
+                            _EXP_LOG.debug(f"[MINER] config/rewards fallback also failed: {_e2}")
+
+                    # Sum all transaction fees (in QTCL float)
                     total_donations = 0.0
                     for tx in _pending_user_txs:
                         f = tx.get("fee", 0)
-                        if isinstance(f, (float, str)):
-                            try:
-                                total_donations += float(f)
-                            except:
-                                pass
-                        else:
-                            try:
-                                total_donations += float(f)
-                            except:
-                                pass
+                        try:
+                            total_donations += float(f)
+                        except (ValueError, TypeError):
+                            pass
 
-                    # Miner receives base reward + 50% of total fees
+                    # Miner total = base reward + 50% of fees
                     _miner_reward_total = _miner_reward + (total_donations / 2.0)
 
-                    # Create miner coinbase transaction (authoritative amount from RPC)
-                    _miner_cb_id = _hl.sha3_256(
-                        _j.dumps(
-                            {
-                                "height": target_height,
-                                "miner": miner_addr,
-                                "amount": _miner_reward_total,
-                                "seed": _w_entropy_seed.hex(),
-                            },
-                            sort_keys=True,
-                        ).encode()
-                    ).hexdigest()
+                    # ── Build miner coinbase TX (deterministic ID) ─────────────
                     _miner_cb = {
                         "tx_id": _miner_cb_id,
-                        "from_addr": "0" * 64,
+                        "from_addr": "COINBASE",
                         "to_addr": miner_addr,
                         "amount": _miner_reward_total,
                         "block_height": target_height,
@@ -24701,47 +24711,37 @@ class QtclClientApp:
                         "version": 1,
                     }
 
-                    # Miner coinbase (7.2 QTCL) — immediate reward in current block
-                    # Treasury reward (0.8 QTCL) from PREVIOUS block — settled in current block (1-block delay)
-
                     _block_txs = [_miner_cb]
-                    
-                    # If not genesis, add previous block's treasury settlement
-                    if target_height > 1:
-                        try:
-                            from globals import TessellationRewardSchedule as _TRS_prev
-                            _prev_height = target_height - 1
-                            _prev_treasury_reward = _TRS_prev.get_treasury_reward_qtcl(_prev_height)
-                            _prev_treasury_addr = (
-                                self.koyeb_state.treasury_address or _TRS_prev.TREASURY_ADDRESS
-                            )
-                            
-                            # Settlement TX for previous block's treasury
-                            _prev_treasury_id = _hl.sha3_256(
-                                _j.dumps(
-                                    {
-                                        "height": _prev_height,
-                                        "settlement_at": target_height,
-                                        "treasury": _prev_treasury_addr,
-                                        "amount": _prev_treasury_reward,
-                                    },
-                                    sort_keys=True,
-                                ).encode()
-                            ).hexdigest()
-                            _prev_treasury_tx = {
-                                "tx_id": _prev_treasury_id,
-                                "from_addr": "0" * 64,
-                                "to_addr": _prev_treasury_addr,
-                                "amount": _prev_treasury_reward,
-                                "block_height": target_height,
-                                "settled_from": _prev_height,
-                                "tx_type": "coinbase",
-                                "version": 1,
-                            }
-                            _block_txs.append(_prev_treasury_tx)
-                        except Exception as _e:
-                            _EXP_LOG.debug(f"[MINER] Could not add treasury settlement: {_e}")
-                    
+
+                    # ── Build treasury coinbase TXs (from template's prior pending) ──
+                    for _pp in _prior_pending_treasury:
+                        _pp_tx_id = _pp.get("tx_id", f"cb_treasury_{target_height}_{target_height-1}_{_pp.get('recipient','')[:16]}")
+                        _pp_tx = {
+                            "tx_id": _pp_tx_id,
+                            "from_addr": "TREASURY",
+                            "to_addr": _pp.get("recipient", _treasury_addr),
+                            "amount": _pp.get("amount_qtcl", _treasury_reward),
+                            "block_height": target_height,
+                            "settled_from": _pp.get("settled_from_height", target_height - 1),
+                            "tx_type": "coinbase",
+                            "version": 1,
+                        }
+                        _block_txs.append(_pp_tx)
+
+                    # If no template pending (genesis, or template fetch failed), add default treasury
+                    if not _prior_pending_treasury and target_height > 1:
+                        _default_treasury_id = f"cb_treasury_{target_height}_{target_height-1}_{_treasury_addr[:16]}"
+                        _block_txs.append({
+                            "tx_id": _default_treasury_id,
+                            "from_addr": "TREASURY",
+                            "to_addr": _treasury_addr,
+                            "amount": _treasury_reward,
+                            "block_height": target_height,
+                            "settled_from": target_height - 1,
+                            "tx_type": "coinbase",
+                            "version": 1,
+                        })
+
                     _block_txs.extend(_pending_user_txs)
 
                     # Compute merkle root (SHA3-256 binary tree)
