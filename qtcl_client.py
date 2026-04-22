@@ -24755,18 +24755,15 @@ class QtclClientApp:
                     # If not genesis, add previous block's treasury settlement
                     if target_height > 1:
                         try:
-                            from globals import TessellationRewardSchedule as _TRS_prev
-                            _prev_height = target_height - 1
-                            _prev_treasury_reward = _TRS_prev.get_treasury_reward_qtcl(_prev_height)
-                            _prev_treasury_addr = (
-                                self.koyeb_state.treasury_address or _TRS_prev.TREASURY_ADDRESS
-                            )
+                            # Use treasury reward from RPC config (already fetched above)
+                            _prev_treasury_reward = _treasury_reward
+                            _prev_treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
                             
                             # Settlement TX for previous block's treasury
                             _prev_treasury_id = _hl.sha3_256(
                                 _j.dumps(
                                     {
-                                        "height": _prev_height,
+                                        "height": target_height - 1,
                                         "settlement_at": target_height,
                                         "treasury": _prev_treasury_addr,
                                         "amount": _prev_treasury_reward,
@@ -24780,7 +24777,7 @@ class QtclClientApp:
                                 "to_addr": _prev_treasury_addr,
                                 "amount": _prev_treasury_reward,
                                 "block_height": target_height,
-                                "settled_from": _prev_height,
+                                "settled_from": target_height - 1,
                                 "tx_type": "coinbase",
                                 "version": 1,
                             }
