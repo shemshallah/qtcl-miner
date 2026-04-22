@@ -11989,95 +11989,49 @@ class KoyebRPCNodule:
                 "id": 1,
             }
 
-            # Try main URL, then fallback to port 9091 on timeout
-            # Extract hostname from base_url for fallback
-            import urllib.parse as _urlparse_fix
-
-            parsed = _urlparse_fix.urlparse(self.base_url)
-            fallback_host = parsed.netloc or self.base_url
-            fallback_scheme = parsed.scheme or "https"
-            fallback_url = f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc"
-            urls_to_try = [
-                f"{self.base_url}/rpc",  # Primary (Koyeb-managed)
-                fallback_url,  # Fallback P2P port
-            ]
-
-            for url_idx, post_url in enumerate(urls_to_try):
-                logger.warning(f"[RPC-ENVELOPE] POST to {post_url}")
-                for attempt in range(retries):
-                    try:
-                        if _HAS_REQUESTS:
-                            r = self._get_session().post(
-                                post_url, json=payload, timeout=t
-                            )
-                            logger.warning(f"[RPC-ENVELOPE] status={r.status_code}")
-                            if r.status_code == 200:
-                                response_text = r.text
-                                logger.warning(
-                                    f"[RPC-ENVELOPE] response={response_text[:500]}"
-                                )
-                                return r.json()
-                        else:
-                            data = _json.dumps(payload).encode("utf-8")
-                            req = _ur.Request(
-                                post_url,
-                                data=data,
-                                headers={"Content-Type": "application/json"},
-                            )
-                            with _ur.urlopen(req, timeout=t) as resp:
-                                response_text = resp.read().decode("utf-8")
-                                logger.warning(
-                                    f"[RPC-ENVELOPE] fallback response={response_text[:500]}"
-                                )
-                                return _json.loads(response_text)
-                    except Exception as e:
-                        logger.warning(
-                            f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}"
-                        )
-                        if attempt < retries - 1:
-                            time.sleep(2**attempt)
-                        elif url_idx < len(urls_to_try) - 1:
-                            logger.warning(
-                                f"[RPC-ENVELOPE] Trying fallback port 9091..."
-                            )
-                            break  # Try next URL
-            return None
-
-        params_json = _json.dumps(params or [])
-        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-
-        # Try main URL, then fallback to port 9091 on timeout
-        # Reuse fallback URL construction from submitBlock
-        parsed = _up.urlparse(self.base_url)
-        fallback_host = parsed.netloc or self.base_url
-        fallback_scheme = parsed.scheme or "https"
-        fallback_url = (
-            f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc?{query}"
-        )
-        urls_to_try = [
-            f"{self.base_url}/rpc?{query}",  # Primary (Koyeb-managed)
-            fallback_url,  # Fallback P2P port
-        ]
-
-        for url_idx, full_url in enumerate(urls_to_try):
+            # POST /rpc directly to Koyeb-managed reverse proxy (no fallback port)
+            post_url = f"{self.base_url}/rpc"
             for attempt in range(retries):
                 try:
                     if _HAS_REQUESTS:
-                        r = self._get_session().get(full_url, timeout=t)
+                        r = self._get_session().post(
+                            post_url, json=payload, timeout=t
+                        )
                         if r.status_code == 200:
                             return r.json()
                     else:
-                        req = _ur.Request(full_url)
+                        data = _json.dumps(payload).encode("utf-8")
+                        req = _ur.Request(
+                            post_url,
+                            data=data,
+                            headers={"Content-Type": "application/json"},
+                        )
                         with _ur.urlopen(req, timeout=t) as resp:
                             return _json.loads(resp.read().decode("utf-8"))
                 except Exception as e:
+                    logger.debug(f"[RPC] POST attempt {attempt + 1} failed: {e}")
                     if attempt < retries - 1:
                         time.sleep(2**attempt)
-                    elif url_idx < len(urls_to_try) - 1:
-                        logger.warning(
-                            f"[RPC-ENVELOPE] Trying fallback port 9091 for {method}..."
-                        )
-                        break  # Try next URL
+            return None
+
+        # GET /rpc directly to Koyeb-managed reverse proxy (no fallback port)
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.base_url}/rpc?{query}"
+
+        for attempt in range(retries):
+            try:
+                if _HAS_REQUESTS:
+                    r = self._get_session().get(full_url, timeout=t)
+                    if r.status_code == 200:
+                        return r.json()
+                else:
+                    req = _ur.Request(full_url)
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        return _json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                logger.debug(f"[RPC] GET {method} attempt {attempt + 1} failed: {e}")
+                if attempt < retries - 1:
+                    time.sleep(2**attempt)
         return None
 
     def get_chain_tip(self) -> Optional[dict]:
@@ -24627,7 +24581,7 @@ class QtclClientApp:
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
-                    _pending_user_txs = _res_m if isinstance(_res_m, list) else []
+                    _pending_user_txs = _res_m.get("result", []) if isinstance(_res_m, dict) else (_res_m if isinstance(_res_m, list) else [])
 
                     _EXP_LOG.warning(
                         f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms"
@@ -24755,15 +24709,18 @@ class QtclClientApp:
                     # If not genesis, add previous block's treasury settlement
                     if target_height > 1:
                         try:
-                            # Use treasury reward from RPC config (already fetched above)
-                            _prev_treasury_reward = _treasury_reward
-                            _prev_treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                            from globals import TessellationRewardSchedule as _TRS_prev
+                            _prev_height = target_height - 1
+                            _prev_treasury_reward = _TRS_prev.get_treasury_reward_qtcl(_prev_height)
+                            _prev_treasury_addr = (
+                                self.koyeb_state.treasury_address or _TRS_prev.TREASURY_ADDRESS
+                            )
                             
                             # Settlement TX for previous block's treasury
                             _prev_treasury_id = _hl.sha3_256(
                                 _j.dumps(
                                     {
-                                        "height": target_height - 1,
+                                        "height": _prev_height,
                                         "settlement_at": target_height,
                                         "treasury": _prev_treasury_addr,
                                         "amount": _prev_treasury_reward,
@@ -24777,7 +24734,7 @@ class QtclClientApp:
                                 "to_addr": _prev_treasury_addr,
                                 "amount": _prev_treasury_reward,
                                 "block_height": target_height,
-                                "settled_from": target_height - 1,
+                                "settled_from": _prev_height,
                                 "tx_type": "coinbase",
                                 "version": 1,
                             }
