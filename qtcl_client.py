@@ -19118,6 +19118,41 @@ class EnhancedSyncManager:
         return self.last_sync_height
 
 
+@dataclass
+class TxReward:
+    tx_type: str
+    from_addr: str
+    to_addr: str
+    amount: float
+    block_height: int
+    timestamp: float
+    tx_hash: str
+    tx_index: int = 0
+    fee: float = 0.0
+    def to_dict(self):
+        return asdict(self)
+
+class BlockTxBuilder:
+    @staticmethod
+    def fetch_rewards(sse_url="http://localhost:8001"):
+        try:
+            r=requests.get(f"{sse_url}/rpc/config/rewards",timeout=2)
+            d=r.json()
+            res=d.get("result",{})
+            return float(res.get("miner_reward",7.2)),float(res.get("treasury_reward",0.8))
+        except:return 7.2,0.8
+    @staticmethod
+    def build_with_txs(h,prev_hash,miner_addr,treasury_addr,miner_r,treasury_r,ts,nonce,qe=""):
+        import hashlib,time as tm
+        if ts is None:ts=tm.time()
+        txs=[]
+        mtx_h=hashlib.sha256(f"miner_reward:{h}:{miner_addr}:{miner_r}".encode()).hexdigest()
+        txs.append(TxReward(tx_type="miner_reward",from_addr="BLOCK_REWARD",to_addr=miner_addr,amount=miner_r,block_height=h,timestamp=ts,tx_hash=mtx_h,tx_index=0))
+        ttx_h=hashlib.sha256(f"treasury_reward:{h}:{treasury_addr}:{treasury_r}".encode()).hexdigest()
+        txs.append(TxReward(tx_type="treasury_reward",from_addr="TREASURY",to_addr=treasury_addr,amount=treasury_r,block_height=h,timestamp=ts,tx_hash=ttx_h,tx_index=1))
+        return {"height":h,"previous_hash":prev_hash,"timestamp":ts,"nonce":nonce,"transactions":[t.to_dict() for t in txs],"tx_count":2,"quantum_entropy":qe,"hash":""}
+
+
 class QtclClientApp:
     """
     QTCL Client interactive entrypoint.
@@ -23462,40 +23497,6 @@ class QtclClientApp:
                 )
         except Exception as _he:
             _EXP_LOG.warning(f"[HTTP] HTTP server error: {_he}")
-
-@dataclass
-class TxReward:
-    tx_type: str
-    from_addr: str
-    to_addr: str
-    amount: float
-    block_height: int
-    timestamp: float
-    tx_hash: str
-    tx_index: int = 0
-    fee: float = 0.0
-    def to_dict(self):
-        return asdict(self)
-
-class BlockTxBuilder:
-    @staticmethod
-    def fetch_rewards(sse_url="http://localhost:8001"):
-        try:
-            r=requests.get(f"{sse_url}/rpc/config/rewards",timeout=2)
-            d=r.json()
-            res=d.get("result",{})
-            return float(res.get("miner_reward",7.2)),float(res.get("treasury_reward",0.8))
-        except:return 7.2,0.8
-    @staticmethod
-    def build_with_txs(h,prev_hash,miner_addr,treasury_addr,miner_r,treasury_r,ts,nonce,qe=""):
-        import hashlib,time as tm
-        if ts is None:ts=tm.time()
-        txs=[]
-        mtx_h=hashlib.sha256(f"miner_reward:{h}:{miner_addr}:{miner_r}".encode()).hexdigest()
-        txs.append(TxReward(tx_type="miner_reward",from_addr="BLOCK_REWARD",to_addr=miner_addr,amount=miner_r,block_height=h,timestamp=ts,tx_hash=mtx_h,tx_index=0))
-        ttx_h=hashlib.sha256(f"treasury_reward:{h}:{treasury_addr}:{treasury_r}".encode()).hexdigest()
-        txs.append(TxReward(tx_type="treasury_reward",from_addr="TREASURY",to_addr=treasury_addr,amount=treasury_r,block_height=h,timestamp=ts,tx_hash=ttx_h,tx_index=1))
-        return {"height":h,"previous_hash":prev_hash,"timestamp":ts,"nonce":nonce,"transactions":[t.to_dict() for t in txs],"tx_count":2,"quantum_entropy":qe,"hash":""}
 
     # ── Mine mode ─────────────────────────────────────────────────────────────
     def run_mine_mode(self) -> None:
