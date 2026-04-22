@@ -347,34 +347,16 @@ def _compute_period_and_exponent(c_full: int, public_key: PSLMatrix) -> Tuple[in
     The full 256-bit c_full is used for binding in the signature;
     c_exp (0 ≤ c_exp < N_PERIOD) is used for the actual matrix power.
 
-    Mathematical derivation of N_PERIOD formula:
-
-    For a hyperbolic matrix M ∈ PSL(2,ℝ) with eigenvalues λ, 1/λ where
-    λ = e^t, the characteristic polynomial of M is:
-        p(λ) = λ² - tr(M)λ + 1 = 0
-
-    By Cayley-Hamilton for SL(2,ℝ):
-        M² - tr(M)·M + I = 0    (since det(M) = 1)
-        M² = tr(M)·M - I
-
-    The iterated Chebyshev recurrence:
-        M^n = tr(M)·M^{n-1} - M^{n-2}    for n ≥ 2
-
-    The trace of M^n is given by the Chebyshev U-polynomial:
-        tr(M^n) = 2×cosh(n×t)  (hyperbolic case)
-
-    For stability, we require entries of M^n to stay < 10^{DPS_ELEVATED}:
-        |entry| ≈ |sinh(n×t)| / |sinh(t)| × |entry of M|
-                 ≤ e^{(n-1)×t} / 2  (for large n×t)
-        ⇒ (n-1)×t < (DPS_ELEVATED - SAFETY_DIGITS) × ln(10)
-        ⇒ n < ((DPS_ELEVATED - SAFETY_DIGITS) × ln(10) / t) + 1
-        ⇒ N_PERIOD ≈ (DPS_ELEVATED - SAFETY_DIGITS) × ln(10) / t
-
-    For the worst case at n = N_PERIOD/2:
-        The det product ra·rd involves two ~10^((N_PERIOD/2-1)×t) terms cancelling to 1.
-        This requires (N_PERIOD/2-1)×t digits of cancellation margin.
-        With SAFETY_DIGITS = 120, we have 120 decades of headroom.
-        For t = 10.86: (N_PERIOD/2-1) × t ≈ (4.5-1) × 10.86 ≈ 38 < 120 ✓
+    DEGENERATE CASE (t=0):
+    If |tr| ≤ 2 (parabolic or elliptic element):
+        acosh(|tr|/2) ≤ acosh(1) = 0
+    This would cause division by zero in N_PERIOD formula.
+    
+    CLAY INSTITUTE FIX:
+    When t ≤ 1e-100 (numerically zero after elevated precision):
+      - Matrix is parabolic/elliptic (finite-order or cusped element)
+      - No exponential growth, so all powers are bounded
+      - Set N_PERIOD = 1 (no reduction in exponent needed)
 
     Parameters
     ----------
@@ -398,12 +380,19 @@ def _compute_period_and_exponent(c_full: int, public_key: PSLMatrix) -> Tuple[in
     else:
         t = acosh(tr_abs / mpf("2"))
 
-    ln10 = mpf("2.3025850929940456840179914546843642")
+    # DEGENERATE CASE: if t is effectively zero (parabolic/elliptic element),
+    # don't divide by t; instead use N_PERIOD = 1 (no growth, no reduction needed)
+    T_NUMERICALLY_ZERO = mpf("1e-100")
+    if fabs(t) < T_NUMERICALLY_ZERO:
+        N_PERIOD = 1
+        c_exp = 0  # c_full % 1 = 0 for any integer c_full
+    else:
+        ln10 = mpf("2.3025850929940456840179914546843642")
 
-    np_float = float((DPS_ELEVATED - SAFETY_DIGITS) * ln10 / (mpf("2") * t))
-    N_PERIOD = max(1, int(np_float))
+        np_float = float((DPS_ELEVATED - SAFETY_DIGITS) * ln10 / (mpf("2") * t))
+        N_PERIOD = max(1, int(np_float))
 
-    c_exp = c_full % N_PERIOD
+        c_exp = c_full % N_PERIOD
 
     return N_PERIOD, c_exp
 
