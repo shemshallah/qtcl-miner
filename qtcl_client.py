@@ -7124,7 +7124,9 @@ class LocalBlockchainDB:
             for col, ddl in _p2p_cols.items():
                 if col not in existing:
                     try:
-                        self.conn.execute(f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}")
+                        self.conn.execute(
+                            f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}"
+                        )
                     except Exception as _ae:
                         logging.debug(f"[SCHEMA] add col {col}: {_ae}")
 
@@ -10485,7 +10487,7 @@ class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
 
     GENESIS_HASH: str = "0" * 64
-    DEFAULT_DIFFICULTY: int = 4
+    DEFAULT_DIFFICULTY: int = 4  # Miner queries /rpc/config/difficulty on startup; this is fallback only
     BLOCK_REWARD: int = 800  # 8.0 QTCL total per block (miner+treasury) — depth-agnostic display constant only
     MAX_TX_PER_BLOCK: int = 500
     DEFAULT_N_QUBITS: int = 8
@@ -11990,6 +11992,7 @@ class KoyebRPCNodule:
             # Try main URL, then fallback to port 9091 on timeout
             # Extract hostname from base_url for fallback
             import urllib.parse as _urlparse_fix
+
             parsed = _urlparse_fix.urlparse(self.base_url)
             fallback_host = parsed.netloc or self.base_url
             fallback_scheme = parsed.scheme or "https"
@@ -12004,7 +12007,9 @@ class KoyebRPCNodule:
                 for attempt in range(retries):
                     try:
                         if _HAS_REQUESTS:
-                            r = self._get_session().post(post_url, json=payload, timeout=t)
+                            r = self._get_session().post(
+                                post_url, json=payload, timeout=t
+                            )
                             logger.warning(f"[RPC-ENVELOPE] status={r.status_code}")
                             if r.status_code == 200:
                                 response_text = r.text
@@ -12026,11 +12031,15 @@ class KoyebRPCNodule:
                                 )
                                 return _json.loads(response_text)
                     except Exception as e:
-                        logger.warning(f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}")
+                        logger.warning(
+                            f"[RPC-ENVELOPE] attempt {attempt + 1} failed: {e}"
+                        )
                         if attempt < retries - 1:
                             time.sleep(2**attempt)
                         elif url_idx < len(urls_to_try) - 1:
-                            logger.warning(f"[RPC-ENVELOPE] Trying fallback port 9091...")
+                            logger.warning(
+                                f"[RPC-ENVELOPE] Trying fallback port 9091..."
+                            )
                             break  # Try next URL
             return None
 
@@ -12042,7 +12051,9 @@ class KoyebRPCNodule:
         parsed = _up.urlparse(self.base_url)
         fallback_host = parsed.netloc or self.base_url
         fallback_scheme = parsed.scheme or "https"
-        fallback_url = f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc?{query}"
+        fallback_url = (
+            f"{fallback_scheme}://{fallback_host.split(':')[0]}:9091/rpc?{query}"
+        )
         urls_to_try = [
             f"{self.base_url}/rpc?{query}",  # Primary (Koyeb-managed)
             fallback_url,  # Fallback P2P port
@@ -12063,7 +12074,9 @@ class KoyebRPCNodule:
                     if attempt < retries - 1:
                         time.sleep(2**attempt)
                     elif url_idx < len(urls_to_try) - 1:
-                        logger.warning(f"[RPC-ENVELOPE] Trying fallback port 9091 for {method}...")
+                        logger.warning(
+                            f"[RPC-ENVELOPE] Trying fallback port 9091 for {method}..."
+                        )
                         break  # Try next URL
         return None
 
@@ -20832,6 +20845,25 @@ class QtclClientApp:
             pw = ""
         return self.wallet.load(pw)
 
+    def _verify_password(self, password: str) -> bool:
+        """Verify wallet password by attempting to decrypt."""
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            wallet_file = _Path("data") / "wallet.json"
+            if not wallet_file.exists():
+                return False
+
+            wallet_data = _json.loads(wallet_file.read_text())
+
+            if "cipher" in wallet_data:
+                decrypted = self.wallet._decrypt_wallet_data(wallet_data, password)
+                return decrypted is not None
+            return True
+        except Exception:
+            return False
+
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
     # Three entangled AerSimulator nodes that self-measure, maintain a local
@@ -24562,7 +24594,18 @@ class QtclClientApp:
                             f"— proceeding with chain tip (oracle is advisory)"
                         )
 
-                    # STAGE 2: Fetch difficulty — prefer server's current difficulty over stored block
+                    # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
+                    _difficulty_bits = 4  # fallback default
+                    try:
+                        _config_res = kapi._rpc_http(
+                            "/rpc/config/difficulty", method="GET", timeout=5
+                        ) if hasattr(kapi, "_rpc_http") else None
+                        if _config_res and isinstance(_config_res, dict):
+                            _difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/difficulty: {_e}")
+                    
+                    # Fallback: query block difficulty if RPC config fails
                     _res_b_raw = kapi._rpc(
                         "qtcl_getBlock", [oracle_height], timeout=8, retries=2
                     )
@@ -24574,8 +24617,10 @@ class QtclClientApp:
                     _block_diff = int(
                         _res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0
                     )
-                    # Use the higher of server's current difficulty vs block's stored difficulty
-                    if _server_difficulty > 0:
+                    # Use authoritative config difficulty, fallback to block difficulty
+                    if _difficulty_bits > 0:
+                        difficulty_bits = _difficulty_bits
+                    elif _server_difficulty > 0:
                         difficulty_bits = max(_server_difficulty, _block_diff)
                     else:
                         difficulty_bits = _block_diff if _block_diff > 0 else 4
@@ -24682,7 +24727,9 @@ class QtclClientApp:
 
                     # Miner receives 7.2 + 50% of total fees (float QTCL)
                     _miner_reward = _miner_reward + (total_donations / 2.0)
-                    _treasury_reward = base_treasury_reward + (total_donations - total_donations / 2.0)
+                    _treasury_reward = base_treasury_reward + (
+                        total_donations - total_donations / 2.0
+                    )
 
                     # Create miner coinbase transaction
                     _miner_cb_id = _hl.sha3_256(
@@ -25362,7 +25409,9 @@ class QtclClientApp:
                                 if _sig and not _sig.get("error"):
                                     # Keep _sig as dict for telemetry, but serialize for submission
                                     # (signature dict contains complex nested objects like R, Z that aren't JSON-serializable)
-                                    submit_payload["hyp_signature"] = json.dumps(_sig, default=str)
+                                    submit_payload["hyp_signature"] = json.dumps(
+                                        _sig, default=str
+                                    )
                                     submit_payload["miner_public_key_hex"] = (
                                         self.wallet.public_key or ""
                                     )
@@ -25443,7 +25492,11 @@ class QtclClientApp:
                     )
 
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
-                    _sig_full = _sig.get("signature", "") if _sig and _sig.get("signature") else "unsigned"
+                    _sig_full = (
+                        _sig.get("signature", "")
+                        if _sig and _sig.get("signature")
+                        else "unsigned"
+                    )
                     _pubkey_full = submit_payload.get("miner_public_key_hex", "") or ""
                     _MINE_TELEM.record_block(
                         {
@@ -25459,7 +25512,9 @@ class QtclClientApp:
                         }
                     )
                     _MINE_TELEM.mark_submitting()
-                    _sig_preview = _sig_full[:48] + "…" if len(_sig_full) > 48 else _sig_full
+                    _sig_preview = (
+                        _sig_full[:48] + "…" if len(_sig_full) > 48 else _sig_full
+                    )
                     _EXP_LOG.info(
                         f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} "
                         f"sig={_sig_preview}  miner={miner_addr[:12]}…  — submitting…"
@@ -26033,14 +26088,14 @@ class QtclClientApp:
                     f"ts: {time.strftime('%H:%M:%S', time.localtime(lb.get('timestamp', now)))}"
                 )
                 print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
-                if lb.get('signature'):
-                    _sig_display = str(lb.get('signature', '?'))
+                if lb.get("signature"):
+                    _sig_display = str(lb.get("signature", "?"))
                     if len(_sig_display) > 120:
                         print(f"     sig     : {_sig_display[:120]}…")
                     else:
                         print(f"     sig     : {_sig_display}")
-                if lb.get('miner_public_key'):
-                    _pubkey_display = str(lb.get('miner_public_key', '?'))
+                if lb.get("miner_public_key"):
+                    _pubkey_display = str(lb.get("miner_public_key", "?"))
                     if len(_pubkey_display) > 120:
                         print(f"     pubkey  : {_pubkey_display[:120]}…")
                     else:
@@ -26124,10 +26179,11 @@ class QtclClientApp:
                     # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
                     try:
                         import sqlite3 as _sq
-                        _local_db = getattr(self, "_db_path", None) or getattr(
-                            getattr(self, "db", None), "_db_path", None
-                        ) or getattr(
-                            getattr(self, "db", None), "db_path", None
+
+                        _local_db = (
+                            getattr(self, "_db_path", None)
+                            or getattr(getattr(self, "db", None), "_db_path", None)
+                            or getattr(getattr(self, "db", None), "db_path", None)
                         )
                         if _local_db:
                             _lc = _sq.connect(str(_local_db), timeout=3.0)
@@ -27799,9 +27855,10 @@ class QtclClientApp:
             print("  3.) ➕  Create new wallet")
             print("  4.) 🔍  Show address / public key")
             print("  5.) 📜  Show mnemonic phrase")
-            print("  6.) 🔙  Back")
+            print("  6.) 🔑  Show private key")
+            print("  7.) 🔙  Back")
             try:
-                ch = input("  Choice [1-6]: ").strip()
+                ch = input("  Choice [1-7]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if ch == "1":
@@ -27875,6 +27932,26 @@ class QtclClientApp:
                 else:
                     print("  ❌ Not found or wrong password")
             elif ch == "6":
+                if not self.wallet.is_loaded() and not self._load_wallet():
+                    continue
+                try:
+                    pw = getpass.getpass("  Wallet password: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if self._verify_password(pw):
+                    pk = self.wallet.private_key
+                    if pk:
+                        print("\n" + "═" * 60)
+                        print("  ⚠️   YOUR PRIVATE KEY — never share")
+                        print("═" * 60)
+                        print(f"  {pk}")
+                        print("═" * 60)
+                        print("  ⚠️  Warning: Anyone with this key controls your funds!")
+                    else:
+                        print("  ❌ Private key not available")
+                else:
+                    print("  ❌ Incorrect password")
+            elif ch == "7":
                 break
 
     def _recover_mnemonic(self) -> None:
@@ -28655,69 +28732,82 @@ def _silent_getpass(prompt: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════════════════
 # EXPANSION: P2P CONSENSUS ENGINE — Byzantine fault tolerance for balance queries
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
+
 class P2PConsensusEngine:
     """Multi-node consensus validation with Byzantine tolerance."""
-    
+
     def __init__(self, tolerance_pct: float = 0.01):
         self.tolerance_pct = tolerance_pct  # 1% divergence allowed
         self.peer_cache = {}
-    
-    def consensus_balance(self, address: str, local_bal: int, peer_balances: list) -> tuple:
+
+    def consensus_balance(
+        self, address: str, local_bal: int, peer_balances: list
+    ) -> tuple:
         """Returns (consensus_balance, confidence_score, method)."""
         if not peer_balances:
             return local_bal, 0.5, "local_only"
-        
-        all_bals = [local_bal] + peer_balances if local_bal is not None else peer_balances
+
+        all_bals = (
+            [local_bal] + peer_balances if local_bal is not None else peer_balances
+        )
         if len(all_bals) < 2:
             return all_bals[0] if all_bals else 0, 0.3, "insufficient_peers"
-        
+
         sorted_bals = sorted(all_bals)
         median = sorted_bals[len(sorted_bals) // 2]
         q1 = sorted_bals[len(sorted_bals) // 4]
         q3 = sorted_bals[3 * len(sorted_bals) // 4]
         iqr = q3 - q1
-        
+
         outlier_thresh = max(1, int(median * 0.05))
         inlier_count = sum(1 for b in all_bals if abs(b - median) <= outlier_thresh)
         confidence = inlier_count / len(all_bals)
-        
+
         if confidence >= 0.66:
             return median, confidence, "consensus_majority"
         elif local_bal is not None:
             return local_bal, confidence, "local_fallback"
         else:
             return median, confidence, "peer_median"
-    
-    def validate_balance_claim(self, address: str, claimed_balance: int, peer_claims: list) -> bool:
+
+    def validate_balance_claim(
+        self, address: str, claimed_balance: int, peer_claims: list
+    ) -> bool:
         """Byzantine agreement: >66% peers must agree within tolerance."""
         if not peer_claims:
             return True
-        
+
         tolerance = max(1, int(claimed_balance * 0.1))
-        agreeing = sum(1 for pb in peer_claims if abs(pb - claimed_balance) <= tolerance)
-        
+        agreeing = sum(
+            1 for pb in peer_claims if abs(pb - claimed_balance) <= tolerance
+        )
+
         return agreeing >= len(peer_claims) * 0.66
+
 
 class BalanceAuditTrail:
     """Persistent balance change audit log."""
-    
+
     def __init__(self, db_conn_factory):
         self.db_conn_factory = db_conn_factory
-    
-    def log_balance_change(self, address: str, old_balance: int, new_balance: int, 
-                          reason: str, height: int) -> bool:
+
+    def log_balance_change(
+        self, address: str, old_balance: int, new_balance: int, reason: str, height: int
+    ) -> bool:
         """Write balance mutation to audit log."""
         try:
             conn = self.db_conn_factory()
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO balance_audit (address, old_balance, new_balance, reason, height, timestamp)
                 VALUES (?, ?, ?, ?, ?, strftime('%s','now'))
-            """, (address, old_balance, new_balance, reason, height))
+            """,
+                (address, old_balance, new_balance, reason, height),
+            )
             conn.commit()
             conn.close()
             return True
@@ -28725,32 +28815,34 @@ class BalanceAuditTrail:
             logger.error(f"[AUDIT] Balance log failed for {address[:16]}: {e}")
             return False
 
+
 class RewardClaimValidator:
     """Validate miner reward claims against network consensus."""
-    
+
     def __init__(self, db_conn_factory):
         self.db_conn_factory = db_conn_factory
-    
-    def verify_miner_reward(self, height: int, miner_addr: str, claimed_reward_base: int) -> tuple:
+
+    def verify_miner_reward(
+        self, height: int, miner_addr: str, claimed_reward_base: int
+    ) -> tuple:
         """Returns (is_valid, consensus_reward_base, divergence_pct)."""
         try:
             conn = self.db_conn_factory()
             row = conn.execute(
-                "SELECT balance FROM wallet_addresses WHERE address=?", 
-                (miner_addr,)
+                "SELECT balance FROM wallet_addresses WHERE address=?", (miner_addr,)
             ).fetchone()
             conn.close()
-            
+
             if not row:
                 return False, 0, 100.0
-            
+
             stored_reward = int(row[0] or 0)
             if stored_reward == 0:
                 return False, 0, 100.0
-            
+
             divergence = abs(claimed_reward_base - stored_reward) / stored_reward
             is_valid = divergence < 0.01
-            
+
             return is_valid, stored_reward, divergence * 100.0
         except Exception as e:
             logger.error(f"[REWARD-VERIFY] Check failed h={height}: {e}")
@@ -29028,11 +29120,16 @@ class NodeRPCMeshServer:
                 "ban_score": "INTEGER DEFAULT 0",
             }
             try:
-                existing = {row[1] for row in conn.execute("PRAGMA table_info(p2p_peers)").fetchall()}
+                existing = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(p2p_peers)").fetchall()
+                }
                 for col, ddl in _required_cols.items():
                     if col not in existing:
                         try:
-                            conn.execute(f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}")
+                            conn.execute(
+                                f"ALTER TABLE p2p_peers ADD COLUMN {col} {ddl}"
+                            )
                         except Exception:
                             pass
             except Exception:
@@ -29282,7 +29379,7 @@ class NodeRPCMeshServer:
         import time as _time
         import urllib.request as _ur2
         import json as _jb2
-        
+
         address = params[0] if params else ""
         if not address:
             return {"error": "address required"}
@@ -29294,7 +29391,7 @@ class NodeRPCMeshServer:
             try:
                 row = conn.execute(
                     "SELECT balance, transaction_count, balance_at_height FROM wallet_addresses WHERE address=?",
-                    (address,)
+                    (address,),
                 ).fetchone()
                 if row:
                     _local_bal_base = int(row["balance"] or 0)
@@ -29311,18 +29408,30 @@ class NodeRPCMeshServer:
                 _cutoff = int(_time.time()) - 300
                 _peer_rows = _peers_conn.execute(
                     "SELECT host, port FROM p2p_peers WHERE last_seen_at>? ORDER BY last_seen_at DESC LIMIT 6",
-                    (_cutoff,)
+                    (_cutoff,),
                 ).fetchall()
             finally:
                 _peers_conn.close()
 
-            for _pr in (_peer_rows or []):
+            for _pr in _peer_rows or []:
                 try:
                     _purl = f"http://{_pr['host']}:{_pr['port']}/rpc"
-                    _pbody = _jb2.dumps({"jsonrpc":"2.0","method":"qtcl_getBalance","params":[address],"id":1}).encode()
-                    _preq = _ur2.Request(_purl, data=_pbody, headers={"Content-Type":"application/json"}, method="POST")
+                    _pbody = _jb2.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "qtcl_getBalance",
+                            "params": [address],
+                            "id": 1,
+                        }
+                    ).encode()
+                    _preq = _ur2.Request(
+                        _purl,
+                        data=_pbody,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
                     _presp = _jb2.loads(_ur2.urlopen(_preq, timeout=2).read())
-                    _pbal = _presp.get("result",{}).get("balance_atomic")
+                    _pbal = _presp.get("result", {}).get("balance_atomic")
                     if _pbal is not None:
                         _neighbor_bals.append(int(_pbal))
                 except Exception:
@@ -29339,7 +29448,9 @@ class NodeRPCMeshServer:
                 if abs(_median - _local_bal_base) <= _tolerance:
                     _consensus_bal_base = _median
                 else:
-                    logger.warning(f"[BALANCE] P2P divergence {address[:20]}…: local={_local_bal_base} p2p={_median}")
+                    logger.warning(
+                        f"[BALANCE] P2P divergence {address[:20]}…: local={_local_bal_base} p2p={_median}"
+                    )
                     _consensus_bal_base = _median
             else:
                 _consensus_bal_base = _median
@@ -29354,8 +29465,14 @@ class NodeRPCMeshServer:
                     try:
                         _wconn = self._db_conn()
                         try:
-                            _wconn.execute("INSERT OR IGNORE INTO wallet_addresses (address,public_key,wallet_fingerprint,balance,address_type,balance_updated_at,balance_at_height,created_at,transaction_count) VALUES (?,?,?,0,'standard',strftime('%s','now'),0,strftime('%s','now'),0)", (address, address[:64], address[:64]))
-                            _wconn.execute("UPDATE wallet_addresses SET balance=?, balance_updated_at=strftime('%s','now') WHERE address=?", (_koyeb_base, address))
+                            _wconn.execute(
+                                "INSERT OR IGNORE INTO wallet_addresses (address,public_key,wallet_fingerprint,balance,address_type,balance_updated_at,balance_at_height,created_at,transaction_count) VALUES (?,?,?,0,'standard',strftime('%s','now'),0,strftime('%s','now'),0)",
+                                (address, address[:64], address[:64]),
+                            )
+                            _wconn.execute(
+                                "UPDATE wallet_addresses SET balance=?, balance_updated_at=strftime('%s','now') WHERE address=?",
+                                (_koyeb_base, address),
+                            )
                             _wconn.commit()
                         finally:
                             _wconn.close()
@@ -29372,7 +29489,15 @@ class NodeRPCMeshServer:
             "balance_atomic": _final_base,
             "transaction_count": 0,
             "balance_at_height": _local_height,
-            "source": ("p2p_consensus" if len(_neighbor_bals) >= 2 else "local" if _local_bal_base is not None else "koyeb" if _consensus_bal_base is not None else "default"),
+            "source": (
+                "p2p_consensus"
+                if len(_neighbor_bals) >= 2
+                else "local"
+                if _local_bal_base is not None
+                else "koyeb"
+                if _consensus_bal_base is not None
+                else "default"
+            ),
             "p2p_neighbor_count": len(_neighbor_bals),
         }
 
@@ -29409,14 +29534,18 @@ class NodeRPCMeshServer:
         merged_volume = local_volume
         if isinstance(server_snap, dict):
             merged_pending = max(local_pending, int(server_snap.get("pending", 0) or 0))
-            merged_volume = max(local_volume, int(server_snap.get("volume_base", 0) or 0))
+            merged_volume = max(
+                local_volume, int(server_snap.get("volume_base", 0) or 0)
+            )
 
         return {
             "pending": merged_pending,
             "volume_base": merged_volume,
             "volume_qtcl": merged_volume / 100.0,
             "local_pending": local_pending,
-            "koyeb_pending": (server_snap or {}).get("pending", 0) if isinstance(server_snap, dict) else 0,
+            "koyeb_pending": (server_snap or {}).get("pending", 0)
+            if isinstance(server_snap, dict)
+            else 0,
             "source": "dual_truth" if server_snap else "local_only",
         }
 
@@ -29427,14 +29556,11 @@ class NodeRPCMeshServer:
         try:
             conn = self._db_conn()
             try:
-                r = conn.execute(
-                    "SELECT MAX(height) AS h FROM blocks"
-                ).fetchone()
+                r = conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
                 if r and r["h"] is not None:
                     local_h = int(r["h"])
                 r2 = conn.execute(
-                    "SELECT block_hash FROM blocks WHERE height=? LIMIT 1",
-                    (local_h,)
+                    "SELECT block_hash FROM blocks WHERE height=? LIMIT 1", (local_h,)
                 ).fetchone()
                 if r2:
                     local_hash = r2["block_hash"] or ""
@@ -29449,7 +29575,9 @@ class NodeRPCMeshServer:
             r = self._fetch_server_rpc("qtcl_getChainStatus", [])
             if isinstance(r, dict):
                 koyeb_h = int(r.get("height", r.get("chain_height", 0)) or 0)
-                koyeb_hash = str(r.get("best_block_hash", r.get("head_block_hash", "")) or "")
+                koyeb_hash = str(
+                    r.get("best_block_hash", r.get("head_block_hash", "")) or ""
+                )
         except Exception:
             pass
 
@@ -29463,7 +29591,9 @@ class NodeRPCMeshServer:
             "koyeb_hash": koyeb_hash,
             "delta": delta,
             "in_sync": in_sync,
-            "sync_percent": round((local_h / koyeb_h * 100.0), 2) if koyeb_h > 0 else 0.0,
+            "sync_percent": round((local_h / koyeb_h * 100.0), 2)
+            if koyeb_h > 0
+            else 0.0,
         }
 
     def _rpc_nodeInfo(self, params: list) -> dict:
@@ -29481,11 +29611,15 @@ class NodeRPCMeshServer:
             "schema_version": self.SCHEMA_VERSION,
             "uptime_sec": round(uptime, 2),
             "port": external_port,
-            "external_addr": f"{external_wan}:{external_port}" if external_wan else f"0.0.0.0:{external_port}",
+            "external_addr": f"{external_wan}:{external_port}"
+            if external_wan
+            else f"0.0.0.0:{external_port}",
             "server_url": self._server_url,
             "oracle_count": self.ORACLE_COUNT,
             "pq0_epoch": self._pq0_epoch,
-            "methods": sorted(list(self._METHODS.keys())) if hasattr(self, "_METHODS") else [],
+            "methods": sorted(list(self._METHODS.keys()))
+            if hasattr(self, "_METHODS")
+            else [],
         }
 
     def _rpc_getEntropy(self, params: list) -> dict:
@@ -29529,16 +29663,18 @@ class NodeRPCMeshServer:
                     "SELECT host, port, last_seen_at, chain_height, node_id "
                     "FROM p2p_peers WHERE last_seen_at>? "
                     "ORDER BY last_seen_at DESC LIMIT 128",
-                    (cutoff,)
+                    (cutoff,),
                 ).fetchall()
                 for row in rows:
-                    peers.append({
-                        "host": row["host"],
-                        "port": int(row["port"] or 9091),
-                        "node_id": row["node_id"] or "",
-                        "last_seen_at": int(row["last_seen_at"] or 0),
-                        "chain_height": int(row["chain_height"] or 0),
-                    })
+                    peers.append(
+                        {
+                            "host": row["host"],
+                            "port": int(row["port"] or 9091),
+                            "node_id": row["node_id"] or "",
+                            "last_seen_at": int(row["last_seen_at"] or 0),
+                            "chain_height": int(row["chain_height"] or 0),
+                        }
+                    )
             finally:
                 conn.close()
         except Exception as _e:
@@ -29575,7 +29711,7 @@ class NodeRPCMeshServer:
                             "INSERT OR REPLACE INTO p2p_peers "
                             "(host, port, node_id, chain_height, last_seen_at) "
                             "VALUES (?,?,?,?,?)",
-                            (host, port, node_id, ch, now)
+                            (host, port, node_id, ch, now),
                         )
                         accepted += 1
                     except Exception:
@@ -29603,7 +29739,7 @@ class NodeRPCMeshServer:
                             "INSERT OR REPLACE INTO p2p_peers "
                             "(host, port, node_id, chain_height, last_seen_at) "
                             "VALUES (?,?,?,?,?)",
-                            (host, port, node_id, ch, int(time.time()))
+                            (host, port, node_id, ch, int(time.time())),
                         )
                         conn.commit()
                     finally:
@@ -29621,7 +29757,7 @@ class NodeRPCMeshServer:
                     local_h = int(r["h"])
                     r2 = conn.execute(
                         "SELECT block_hash FROM blocks WHERE height=? LIMIT 1",
-                        (local_h,)
+                        (local_h,),
                     ).fetchone()
                     if r2:
                         local_hash = r2["block_hash"] or ""
@@ -29652,16 +29788,23 @@ class NodeRPCMeshServer:
         height = int(hdr.get("height", 0))
         block_hash = str(hdr.get("block_hash", hdr.get("hash", "")))
         parent_hash = str(hdr.get("parent_hash", "0" * 64))
-        merkle_root = str(hdr.get("merkle_root", hdr.get("transactions_root", "0" * 64)))
+        merkle_root = str(
+            hdr.get("merkle_root", hdr.get("transactions_root", "0" * 64))
+        )
         timestamp_s = int(hdr.get("timestamp", int(time.time())))
         nonce = int(hdr.get("nonce", 0))
         miner_address = str(hdr.get("miner_address", hdr.get("miner", "")))
         difficulty = int(hdr.get("difficulty", 6))
-        w_entropy_hex = str(hdr.get("w_entropy_hash", hdr.get("oracle_w_state_hash", "")))
+        w_entropy_hex = str(
+            hdr.get("w_entropy_hash", hdr.get("oracle_w_state_hash", ""))
+        )
         txs = block.get("transactions", block.get("txs", [])) or []
 
         if not height or not block_hash or not miner_address:
-            return {"accepted": False, "error": "height/block_hash/miner_address required"}
+            return {
+                "accepted": False,
+                "error": "height/block_hash/miner_address required",
+            }
 
         # Verify cryptographic miner coinbase presence (7.2 QTCL self-embedded)
         _miner_coinbase_found = False
@@ -29679,12 +29822,17 @@ class NodeRPCMeshServer:
             logger.warning(
                 f"[SUBMIT-BLOCK] h={height} missing 7.2 QTCL miner coinbase to {miner_address[:20]}..."
             )
-            return {"accepted": False, "error": "Block missing miner coinbase (7.2 QTCL)"}
+            return {
+                "accepted": False,
+                "error": "Block missing miner coinbase (7.2 QTCL)",
+            }
 
         # === 1. Primary truth: push to Koyeb ===
         koyeb_result = None
         try:
-            koyeb_result = self._fetch_server_rpc("qtcl_submitBlock", [block], timeout=20.0)
+            koyeb_result = self._fetch_server_rpc(
+                "qtcl_submitBlock", [block], timeout=20.0
+            )
         except Exception as _ke:
             logger.warning(f"[SUBMIT-BLOCK] Koyeb push failed: {_ke}")
 
@@ -29705,11 +29853,18 @@ class NodeRPCMeshServer:
                     " transaction_count, data) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        height, block_hash, parent_hash, merkle_root, timestamp_s,
-                        miner_address, difficulty, nonce,
+                        height,
+                        block_hash,
+                        parent_hash,
+                        merkle_root,
+                        timestamp_s,
+                        miner_address,
+                        difficulty,
+                        nonce,
                         w_entropy_hex[:64] if w_entropy_hex else "0" * 64,
-                        len(txs), json.dumps(block, default=str)[:65536]
-                    )
+                        len(txs),
+                        json.dumps(block, default=str)[:65536],
+                    ),
                 )
                 # Persist all transactions
                 for tx in txs:
@@ -29724,7 +29879,11 @@ class NodeRPCMeshServer:
                             "VALUES (?,?,?,?,?,?,?,?,?)",
                             (
                                 tx_id,
-                                str(tx.get("from_addr", tx.get("from_address", "0" * 64))),
+                                str(
+                                    tx.get(
+                                        "from_addr", tx.get("from_address", "0" * 64)
+                                    )
+                                ),
                                 str(tx.get("to_addr", tx.get("to_address", ""))),
                                 int(round(float(tx.get("amount", 0)) * 100)),
                                 str(tx.get("tx_type", "transfer")),
@@ -29732,10 +29891,12 @@ class NodeRPCMeshServer:
                                 height,
                                 block_hash,
                                 timestamp_s,
-                            )
+                            ),
                         )
                     except Exception as _txe:
-                        logger.debug(f"[SUBMIT-BLOCK] local tx insert {tx_id[:16]}: {_txe}")
+                        logger.debug(
+                            f"[SUBMIT-BLOCK] local tx insert {tx_id[:16]}: {_txe}"
+                        )
 
                 # Credit miner 7.2 QTCL NOW (embedded in this block)
                 miner_reward_base = 720
@@ -29751,10 +29912,15 @@ class NodeRPCMeshServer:
                     " balance_at_height = ?, "
                     " balance_updated_at = strftime('%s','now')",
                     (
-                        miner_address, miner_address[:64], miner_address[:64],
-                        miner_reward_base, "miner", height,
-                        miner_reward_base, height,
-                    )
+                        miner_address,
+                        miner_address[:64],
+                        miner_address[:64],
+                        miner_reward_base,
+                        "miner",
+                        height,
+                        miner_reward_base,
+                        height,
+                    ),
                 )
 
                 # Treasury 0.8 QTCL → pending_rewards (requires NEXT block confirmation)
@@ -29771,14 +29937,16 @@ class NodeRPCMeshServer:
                     " UNIQUE(height, reward_type, recipient)"
                     ")"
                 )
-                treasury_address = "qtcl1treasury0reward0dist0address00000000000000000000001"
+                treasury_address = (
+                    "qtcl1treasury0reward0dist0address00000000000000000000001"
+                )
                 treasury_reward_base = 80
                 try:
                     conn.execute(
                         "INSERT OR IGNORE INTO pending_rewards "
                         "(height, reward_type, recipient, amount, status) "
                         "VALUES (?, 'treasury', ?, ?, 'pending')",
-                        (height, treasury_address, treasury_reward_base)
+                        (height, treasury_address, treasury_reward_base),
                     )
                 except Exception:
                     pass
@@ -29788,7 +29956,7 @@ class NodeRPCMeshServer:
                     prev = conn.execute(
                         "SELECT id, recipient, amount FROM pending_rewards "
                         "WHERE height=? AND status='pending'",
-                        (height - 1,)
+                        (height - 1,),
                     ).fetchall()
                     for pr in prev:
                         conn.execute(
@@ -29803,19 +29971,24 @@ class NodeRPCMeshServer:
                             " balance_at_height = ?, "
                             " balance_updated_at = strftime('%s','now')",
                             (
-                                pr["recipient"], pr["recipient"][:64], pr["recipient"][:64],
-                                pr["amount"], "treasury", height,
-                                pr["amount"], height,
-                            )
+                                pr["recipient"],
+                                pr["recipient"][:64],
+                                pr["recipient"][:64],
+                                pr["amount"],
+                                "treasury",
+                                height,
+                                pr["amount"],
+                                height,
+                            ),
                         )
                         conn.execute(
                             "UPDATE pending_rewards SET status='confirmed', "
                             "confirmed_at_height=? WHERE id=?",
-                            (height, pr["id"])
+                            (height, pr["id"]),
                         )
                         logger.info(
-                            f"[SUBMIT-BLOCK] 💰 Treasury reward confirmed: h={height-1} "
-                            f"→ {pr['recipient'][:20]}... +{pr['amount']/100:.2f} QTCL"
+                            f"[SUBMIT-BLOCK] 💰 Treasury reward confirmed: h={height - 1} "
+                            f"→ {pr['recipient'][:20]}... +{pr['amount'] / 100:.2f} QTCL"
                         )
                 except Exception as _pre:
                     logger.debug(f"[SUBMIT-BLOCK] prev-treasury confirm: {_pre}")
@@ -29835,7 +30008,7 @@ class NodeRPCMeshServer:
                             " transaction_count = transaction_count + 1, "
                             " balance_at_height = ? "
                             "WHERE address=? AND balance >= ?",
-                            (_amt + _fee, height, _from, _amt + _fee)
+                            (_amt + _fee, height, _from, _amt + _fee),
                         )
                         conn.execute(
                             "INSERT INTO wallet_addresses "
@@ -29848,14 +30021,23 @@ class NodeRPCMeshServer:
                             " transaction_count = transaction_count + 1, "
                             " balance_at_height = ?, "
                             " balance_updated_at = strftime('%s','now')",
-                            (_to, _to[:64], _to[:64], _amt, "standard", height, _amt, height)
+                            (
+                                _to,
+                                _to[:64],
+                                _to[:64],
+                                _amt,
+                                "standard",
+                                height,
+                                _amt,
+                                height,
+                            ),
                         )
 
                 conn.commit()
                 local_persisted = True
                 logger.info(
                     f"[SUBMIT-BLOCK] ✅ h={height} local mirror: miner +7.20 QTCL, "
-                    f"treasury 0.80 QTCL queued (confirms at h={height+1})"
+                    f"treasury 0.80 QTCL queued (confirms at h={height + 1})"
                 )
             finally:
                 conn.close()
@@ -29893,7 +30075,9 @@ class NodeRPCMeshServer:
         # Push to Koyeb first
         koyeb_result = None
         try:
-            koyeb_result = self._fetch_server_rpc("qtcl_submitTransaction", [tx], timeout=10.0)
+            koyeb_result = self._fetch_server_rpc(
+                "qtcl_submitTransaction", [tx], timeout=10.0
+            )
         except Exception as _ke:
             logger.debug(f"[SUBMIT-TX] Koyeb push: {_ke}")
         koyeb_accepted = isinstance(koyeb_result, dict) and (
@@ -29912,11 +30096,13 @@ class NodeRPCMeshServer:
                     " status, created_at) "
                     "VALUES (?,?,?,?,?,?,strftime('%s','now'))",
                     (
-                        tx_id, _from, _to,
+                        tx_id,
+                        _from,
+                        _to,
                         int(round(_amt * 100)),
                         str(tx.get("tx_type", "transfer")),
-                        "pending"
-                    )
+                        "pending",
+                    ),
                 )
                 conn.commit()
                 local_persisted = True
@@ -29941,8 +30127,10 @@ class NodeRPCMeshServer:
     # ─────────────────────────────────────────────────────────────────────────
     def _gossip_to_peers(self, method: str, params: list, max_peers: int = 6) -> None:
         """Fire-and-forget gossip to up to `max_peers` recent peers."""
+
         def _do():
             import urllib.request as _ur
+
             try:
                 conn = self._db_conn()
                 try:
@@ -29951,29 +30139,28 @@ class NodeRPCMeshServer:
                         "SELECT host, port FROM p2p_peers "
                         "WHERE last_seen_at>? "
                         "ORDER BY last_seen_at DESC LIMIT ?",
-                        (cutoff, max_peers)
+                        (cutoff, max_peers),
                     ).fetchall()
                 finally:
                     conn.close()
-                body = json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": method,
-                    "params": params,
-                    "id": 1
-                }).encode()
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+                ).encode()
                 for r in rows:
                     try:
                         url = f"http://{r['host']}:{r['port']}/rpc"
                         req = _ur.Request(
-                            url, data=body,
+                            url,
+                            data=body,
                             headers={"Content-Type": "application/json"},
-                            method="POST"
+                            method="POST",
                         )
                         _ur.urlopen(req, timeout=2).read()
                     except Exception:
                         pass
             except Exception:
                 pass
+
         threading.Thread(target=_do, daemon=True, name="Gossip").start()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -29997,14 +30184,16 @@ class NodeRPCMeshServer:
                     addr = row["address"]
                     local_bal = int(row["balance"] or 0)
                     try:
-                        koyeb = self._fetch_server_rpc("qtcl_getBalance", [addr], timeout=5.0)
+                        koyeb = self._fetch_server_rpc(
+                            "qtcl_getBalance", [addr], timeout=5.0
+                        )
                         if isinstance(koyeb, dict) and "balance" in koyeb:
                             kbal = int(round(float(koyeb["balance"]) * 100))
                             if abs(kbal - local_bal) > 1:
                                 divergences += 1
                                 logger.warning(
-                                    f"[RECONCILE] {addr[:20]}... local={local_bal/100:.2f} "
-                                    f"koyeb={kbal/100:.2f} Δ={abs(kbal-local_bal)/100:.2f} QTCL"
+                                    f"[RECONCILE] {addr[:20]}... local={local_bal / 100:.2f} "
+                                    f"koyeb={kbal / 100:.2f} Δ={abs(kbal - local_bal) / 100:.2f} QTCL"
                                 )
                                 # Koyeb is primary truth → correct local
                                 try:
@@ -30015,7 +30204,7 @@ class NodeRPCMeshServer:
                                             " balance=?, "
                                             " balance_updated_at=strftime('%s','now') "
                                             "WHERE address=?",
-                                            (kbal, addr)
+                                            (kbal, addr),
                                         )
                                         c2.commit()
                                     finally:
@@ -30025,11 +30214,12 @@ class NodeRPCMeshServer:
                     except Exception:
                         pass
                 if divergences > 0:
-                    logger.info(f"[RECONCILE] corrected {divergences} divergent wallets from Koyeb")
+                    logger.info(
+                        f"[RECONCILE] corrected {divergences} divergent wallets from Koyeb"
+                    )
             except Exception as _e:
                 logger.debug(f"[RECONCILE] loop error: {_e}")
             self._stop.wait(60.0)
-
 
     def _dispatch(self, body_bytes: bytes, peer_addr: str) -> Tuple[dict, int]:
         t0 = time.time()
