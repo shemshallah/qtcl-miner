@@ -24743,6 +24743,8 @@ class QtclClientApp:
                     _miner_reward_total = _miner_reward + (total_donations / 2.0)
 
                     # ── Build miner coinbase TX (deterministic ID) ─────────────
+                    # tx_type MUST be "miner_reward" — server validator checks this
+                    # exact string; "coinbase" causes immediate block rejection.  ❤️
                     _miner_cb = {
                         "tx_id": _miner_cb_id,
                         "from_addr": "COINBASE",
@@ -24750,7 +24752,7 @@ class QtclClientApp:
                         "amount": _miner_reward_total,
                         "block_height": target_height,
                         "w_proof": _w_entropy_seed.hex(),
-                        "tx_type": "coinbase",
+                        "tx_type": "miner_reward",
                         "version": 1,
                     }
 
@@ -24766,7 +24768,7 @@ class QtclClientApp:
                             "amount": _pp.get("amount_qtcl", _treasury_reward),
                             "block_height": target_height,
                             "settled_from": _pp.get("settled_from_height", target_height - 1),
-                            "tx_type": "coinbase",
+                            "tx_type": "treasury_reward",
                             "version": 1,
                         }
                         _block_txs.append(_pp_tx)
@@ -24781,7 +24783,7 @@ class QtclClientApp:
                             "amount": _treasury_reward,
                             "block_height": target_height,
                             "settled_from": target_height - 1,
-                            "tx_type": "coinbase",
+                            "tx_type": "treasury_reward",
                             "version": 1,
                         })
 
@@ -24796,7 +24798,38 @@ class QtclClientApp:
                         def _tx_hash(tx: dict) -> str:
                             """Hash transaction exactly as server expects."""
                             tx_type = tx.get("tx_type", "transfer")
-                            if tx_type == "coinbase":
+                            if tx_type == "miner_reward":
+                                # Server canonical: miner_reward uses w_proof field
+                                canonical = _j.dumps(
+                                    {
+                                        "tx_id": tx.get("tx_id", ""),
+                                        "from_addr": tx.get("from_addr", ""),
+                                        "to_addr": tx.get("to_addr", ""),
+                                        "amount": tx.get("amount", 0),
+                                        "block_height": tx.get("block_height", 0),
+                                        "w_proof": tx.get("w_proof", ""),
+                                        "tx_type": "miner_reward",
+                                        "version": tx.get("version", 1),
+                                    },
+                                    sort_keys=True,
+                                )
+                            elif tx_type == "treasury_reward":
+                                # Server canonical: treasury_reward uses settled_from field
+                                canonical = _j.dumps(
+                                    {
+                                        "tx_id": tx.get("tx_id", ""),
+                                        "from_addr": tx.get("from_addr", ""),
+                                        "to_addr": tx.get("to_addr", ""),
+                                        "amount": tx.get("amount", 0),
+                                        "block_height": tx.get("block_height", 0),
+                                        "settled_from": tx.get("settled_from", 0),
+                                        "tx_type": "treasury_reward",
+                                        "version": tx.get("version", 1),
+                                    },
+                                    sort_keys=True,
+                                )
+                            elif tx_type == "coinbase":
+                                # Legacy coinbase branch — kept for backward compat
                                 canonical = _j.dumps(
                                     {
                                         "tx_id": tx.get("tx_id", ""),
