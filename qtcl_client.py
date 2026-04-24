@@ -3803,13 +3803,22 @@ class HypKeyPair:
 
 
 class HypGammaWallet:
-    """HypΓ-only wallet manager — post-quantum cryptography. Singleton pattern."""
+    """
+    HypΓ wallet manager — Cathedral-Grade security. Singleton.
+
+    SECURITY INVARIANTS:
+      1. Private key NEVER written to disk as plaintext
+      2. Wrong password → hard ValueError (no fallback, no fresh keypair)
+      3. Wallet file requires vault_version — invalid files rejected
+      4. Shamir (k,n) secret sharing for peer-based decentralized recovery
+      5. Password verified via HMAC-SHA3 tag BEFORE attempting decryption
+      6. No silent key generation on ANY error path
+    """
 
     _instance: Optional["HypGammaWallet"] = None
     _lock = threading.Lock()
 
     def __new__(cls, seed_hex: Optional[str] = None):
-        """Singleton pattern - create only once per process."""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -3819,295 +3828,174 @@ class HypGammaWallet:
         return cls._instance
 
     def __init__(self, seed_hex: Optional[str] = None):
-        """Initialize HypΓ wallet with optional seed. Idempotent due to singleton."""
         if self._initialized:
-            return  # Already initialized, skip
+            return
         self._initialized = True
-
-        # Don't initialize engine or generate keypair immediately
-        # This prevents premature numerical errors before the wallet is actually needed
         self.engine: Optional[Any] = None
         self.keypair: Optional[HypKeyPair] = None
         self._loaded = False
         self._seed_hex = seed_hex
+        self._password_verified = False
+        self._shamir_shares: Optional[list] = None
 
-        # CRITICAL: Check for existing wallet files FIRST before creating new ones
         wallet_file = Path("data") / "wallet.json"
         if wallet_file.exists():
-            logger.info(
-                f"[HYP-WALLET] Found existing wallet at {wallet_file} — call load(password) to unlock"
-            )
-            return
-
-        # No existing wallet file found yet, but don't generate keypair until needed
-        logger.info(
-            f"[HYP-WALLET] No wallet file found — wallet will be created on first use"
-        )
+            try:
+                import json as _j
+                raw = _j.loads(wallet_file.read_text())
+                if "vault_version" in raw:
+                    logger.info(f"[HYP-WALLET] Found vault v{raw['vault_version']} wallet — call load(password) to unlock")
+                else:
+                    logger.warning("[HYP-WALLET] ⚠️  Unrecognized wallet format — create a new wallet")
+            except Exception:
+                logger.warning("[HYP-WALLET] Found wallet but couldn't read it")
+        else:
+            logger.info("[HYP-WALLET] No wallet file — will be created on first use")
 
     def _init_engine(self) -> None:
-        """Lazily initialize HypΓ engine on first use."""
         if self.engine is None:
             try:
                 from hyp_engine import HypGammaEngine
-
                 self.engine = HypGammaEngine()
             except Exception as e:
                 logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
-                raise RuntimeError(f"HypΓ engine initialization failed: {e}") from e
+                raise RuntimeError(f"HypΓ engine init failed: {e}") from e
 
-    def _generate_from_seed(self, seed_hex: str) -> HypKeyPair:
-        """Deterministic keypair from seed (HypΓ HD)."""
+    def create(self, password: str, enable_shamir: bool = False,
+               shamir_threshold: int = 3, shamir_total: int = 5) -> str:
+        """Create new wallet — private key ENCRYPTED from birth. No plaintext on disk."""
+        if not password:
+            raise ValueError("[HYP-WALLET] Password REQUIRED")
+        self._init_engine()
+        kp = self.engine.generate_keypair()
+        self.keypair = HypKeyPair(public_key=kp.public_key, private_key=kp.private_key, address=kp.address)
+        logger.info(f"[HYP-WALLET] ✅ Generated keypair — address: {self.keypair.address[:16]}...")
+        data_dir = Path("data"); data_dir.mkdir(exist_ok=True)
+        wallet_path = data_dir / "wallet.json"
+        from hyp_lwe import create_wallet_file
+        sh_k = shamir_threshold if enable_shamir else 0
+        sh_n = shamir_total if enable_shamir else 0
+        wallet_dict, shamir_shares = create_wallet_file(
+            self.keypair.address, self.keypair.public_key, self.keypair.private_key,
+            password, sh_k, sh_n)
+        import json as _j
+        wallet_path.write_text(_j.dumps(wallet_dict, indent=2))
+        logger.info(f"[HYP-WALLET] ✅ Encrypted wallet saved to {wallet_path}")
+        self._loaded = True; self._password_verified = True
+        if shamir_shares:
+            self._shamir_shares = shamir_shares
+            logger.info(f"[HYP-WALLET] ✅ Shamir ({shamir_threshold},{shamir_total}) shares generated")
+        return self.keypair.address
+
+    def load(self, password: str) -> bool:
+        """Load wallet from encrypted file. RAISES ValueError on wrong password. NO fallback."""
+        if self.is_loaded(): return True
+        wallet_path = self.wallet_file
+        if not wallet_path.exists():
+            logger.debug(f"[HYP-WALLET] No wallet at {wallet_path}")
+            return False
+        import json as _j
+        raw = _j.loads(wallet_path.read_text())
+        if "vault_version" not in raw:
+            raise ValueError("[HYP-WALLET] Invalid wallet file — create a new wallet")
+        self._init_engine()
+        from hyp_lwe import load_wallet_file
+        data = load_wallet_file(wallet_path, password)
+        self.keypair = HypKeyPair(public_key=data["public_key"],
+                                   private_key=data["private_key"], address=data["address"])
+        self._loaded = True; self._password_verified = True
+        logger.info(f"[HYP-WALLET] ✅ Wallet unlocked — address: {self.keypair.address[:16]}...")
+        return True
+
+    def load_from_shares(self, shares) -> bool:
+        """Reconstruct from Shamir shares (peer recovery, no password)."""
+        if self.is_loaded(): return True
+        self._init_engine()
+        from hyp_lwe import load_wallet_from_shares
+        data = load_wallet_from_shares(self.wallet_file, shares)
+        self.keypair = HypKeyPair(public_key=data["public_key"],
+                                   private_key=data["private_key"], address=data["address"])
+        self._loaded = True; self._password_verified = True
+        logger.info(f"[HYP-WALLET] ✅ Recovered via Shamir — address: {self.keypair.address[:16]}...")
+        return True
+
+    def verify_password(self, password: str) -> bool:
+        """Verify password via HMAC tag — constant-time, no decrypt."""
         try:
-            self._init_engine()
-            # Use seed to generate keypair
-            # HypΓ engine accepts entropy and generates keypair deterministically
-            kp = self.engine.generate_keypair()
-            return kp
-        except Exception as e:
-            logger.error(f"[HYP-WALLET] Seed-based generation failed: {e}")
-            raise
+            import json as _j
+            from hyp_lwe import verify_wallet_password
+            wallet_path = self.wallet_file
+            if not wallet_path.exists(): return False
+            raw = _j.loads(wallet_path.read_text())
+            enc_pk = raw.get("encrypted_private_key")
+            if not enc_pk: return False
+            return verify_wallet_password(enc_pk, password)
+        except Exception:
+            return False
+
+    def change_password(self, old_password: str, new_password: str) -> bool:
+        """Change wallet encryption password."""
+        from hyp_lwe import change_wallet_password
+        return change_wallet_password(self.wallet_file, old_password, new_password)
+
+    def get_shamir_shares(self): return self._shamir_shares
+    def clear_shamir_shares(self): self._shamir_shares = None
 
     def sign_message(self, message_hash: bytes) -> Dict[str, str]:
-        """Sign message hash with HypΓ Schnorr-Γ."""
-        if not self.keypair:
-            raise RuntimeError("No keypair loaded")
+        if not self.keypair: raise RuntimeError("No keypair loaded")
         return self.engine.sign_hash(message_hash, self.keypair.private_key)
 
     def sign_transaction(self, tx_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Sign transaction with HypΓ."""
-        if not self.keypair:
-            raise RuntimeError("No keypair loaded")
-
-        # Canonical JSON hash
+        if not self.keypair: raise RuntimeError("No keypair loaded")
         tx_json = json.dumps(tx_dict, sort_keys=True, separators=(",", ":"))
         tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
-
         sig = self.engine.sign_hash(tx_hash, self.keypair.private_key)
         sig["signer_address"] = self.keypair.address
         return sig
 
     def verify_signature(self, message_hash: bytes, signature: Dict[str, str]) -> bool:
-        """Verify HypΓ signature."""
-        if not self.keypair:
-            raise RuntimeError("No keypair loaded")
+        if not self.keypair: raise RuntimeError("No keypair loaded")
         try:
-            return self.engine.verify_signature(
-                message_hash, signature, self.keypair.public_key
-            )
+            return self.engine.verify_signature(message_hash, signature, self.keypair.public_key)
         except Exception as e:
-            logger.warning(f"[HYP-WALLET] Signature verification failed: {e}")
+            logger.warning(f"[HYP-WALLET] Sig verify failed: {e}")
             return False
 
-    def get_address(self) -> str:
-        """Get wallet address."""
-        return self.keypair.address if self.keypair else ""
-
+    def get_address(self) -> str: return self.keypair.address if self.keypair else ""
     def export_keypair(self) -> Dict[str, str]:
-        """Export keypair as dict."""
+        if not self._password_verified: raise RuntimeError("Must unlock first")
         return self.keypair.to_dict() if self.keypair else {}
 
-    # ── Compatibility properties for wallet menu ──────────────────────────
     @property
-    def address(self) -> Optional[str]:
-        """Wallet address (compatible with QTCLWallet interface)."""
-        return self.keypair.address if self.keypair else None
-
+    def address(self) -> Optional[str]: return self.keypair.address if self.keypair else None
     @property
-    def public_key(self) -> Optional[str]:
-        """Public key (compatible with QTCLWallet interface)."""
-        return self.keypair.public_key if self.keypair else None
-
+    def public_key(self) -> Optional[str]: return self.keypair.public_key if self.keypair else None
     @property
     def private_key(self) -> Optional[str]:
-        """Private key (compatible with QTCLWallet interface)."""
+        if not self._password_verified: return None
         return self.keypair.private_key if self.keypair else None
-
     @property
-    def wallet_file(self) -> Path:
-        """Return path to wallet file (for compatibility, not used)."""
-        data_dir = Path("data")
-        return data_dir / "wallet.json"
-
+    def wallet_file(self) -> Path: return Path("data") / "wallet.json"
     @property
-    def mnemonic_file(self) -> Path:
-        """Return path to mnemonic file (for compatibility, not used)."""
-        data_dir = Path("data")
-        return data_dir / "wallet_mnemonic.enc"
-
-    def is_loaded(self) -> bool:
-        """Check if wallet is loaded (has valid keypair)."""
-        return bool(self.keypair)
-
-    def create(self, password: str) -> str:
-        """Create new wallet and save to file."""
-        if not self.keypair:
-            self._init_engine()
-            if self._seed_hex:
-                self.keypair = self._generate_from_seed(self._seed_hex)
-            else:
-                self.keypair = self.engine.generate_keypair()
-            logger.info(
-                f"[HYP-WALLET] ✅ Generated new wallet — address: {self.keypair.address[:16]}..."
-            )
-
-        # Save to wallet.json
-        try:
-            wallet_file = Path("data")
-            wallet_file.mkdir(exist_ok=True)
-            wallet_path = wallet_file / "wallet.json"
-
-            # Simple encrypted storage (password-based)
-            import json as _json
-
-            wallet_data = {
-                "address": self.keypair.address,
-                "public_key": self.keypair.public_key,
-                "private_key": self.keypair.private_key,
-            }
-
-            # Store with password as simple key (in production, use proper encryption)
-            wallet_path.write_text(_json.dumps(wallet_data, indent=2))
-            logger.info(f"[HYP-WALLET] ✅ Wallet saved to {wallet_path}")
-        except Exception as e:
-            logger.error(f"[HYP-WALLET] Failed to save wallet: {e}")
-            raise
-
-        return self.address
-
-    def _decrypt_wallet_data(self, wallet_data: dict, password: str) -> Optional[dict]:
-        """Decrypt encrypted wallet using HypGammaEngine.decrypt()."""
-        try:
-            if "cipher" not in wallet_data:
-                return wallet_data  # Not encrypted
-
-            # Encrypted wallet format uses HypGammaEngine.decrypt()
-            # The wallet was encrypted as: engine.encrypt(wallet_json_bytes, password_as_pubkey)
-            cipher_data = wallet_data.get("cipher", "")
-            message_tag = wallet_data.get("message_tag") or wallet_data.get("auth", "")
-
-            if not cipher_data:
-                logger.error("[HYP-WALLET] Encrypted wallet missing cipher data")
-                return None
-
-            try:
-                # Use HypGammaEngine to decrypt with password as private key
-                self._init_engine()
-
-                # Decrypt using engine.decrypt with password
-                ciphertext_dict = {
-                    "ciphertext": cipher_data,
-                    "message_tag": message_tag if message_tag else "",
-                }
-
-                plaintext_bytes = self.engine.decrypt(ciphertext_dict, password)
-
-                # Parse decrypted JSON
-                import json as _json
-
-                decrypted_data = _json.loads(plaintext_bytes.decode("utf-8"))
-                logger.info(
-                    "[HYP-WALLET] ✅ Successfully decrypted wallet using HypGammaEngine"
-                )
-                return decrypted_data
-
-            except Exception as _decrypt_err:
-                logger.debug(
-                    f"[HYP-WALLET] HypGammaEngine.decrypt() failed: {_decrypt_err}"
-                )
-                return None
-
-        except Exception as e:
-            logger.error(f"[HYP-WALLET] Wallet decryption failed: {e}")
-            return None
-
-    def load(self, password: str) -> bool:
-        """Load wallet from wallet.json file using password."""
-        wallet_file = Path("data") / "wallet.json"
-
-        # If already loaded, return True
-        if self.is_loaded():
-            return True
-
-        # If file doesn't exist, return False
-        if not wallet_file.exists():
-            logger.debug(f"[HYP-WALLET] No wallet file at {wallet_file}")
-            return False
-
-        try:
-            self._init_engine()  # Initialize engine if not already done
-            import json as _json
-
-            wallet_data = _json.loads(wallet_file.read_text())
-
-            # Try to decrypt if wallet is encrypted
-            if "cipher" in wallet_data:
-                decrypted = self._decrypt_wallet_data(wallet_data, password)
-                if decrypted:
-                    wallet_data = decrypted
-                else:
-                    # Decryption failed — password is wrong
-                    logger.error(
-                        "[HYP-WALLET] ❌ Failed to decrypt wallet — password is incorrect"
-                    )
-                    return False
-
-            # Validate required fields
-            if not all(
-                k in wallet_data for k in ["address", "public_key", "private_key"]
-            ):
-                # Decrypted wallet missing fields — likely wrong password or corrupted
-                logger.warning(
-                    "[HYP-WALLET] Wallet data missing required fields (likely wrong password)"
-                )
-                logger.info("[HYP-WALLET] Generating fresh keypair for this session")
-                self.keypair = self.engine.generate_keypair()
-                self._loaded = True
-                logger.info(
-                    f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}..."
-                )
-                return True
-
-            # Reconstruct keypair from wallet data
-            self.keypair = HypKeyPair(
-                public_key=wallet_data["public_key"],
-                private_key=wallet_data["private_key"],
-                address=wallet_data["address"],
-            )
-            self._loaded = True
-            logger.info(
-                f"[HYP-WALLET] ✅ Loaded wallet — address: {self.keypair.address[:16]}..."
-            )
-            return True
-        except Exception as e:
-            logger.error(f"[HYP-WALLET] Failed to load wallet: {e}")
-            logger.info(
-                "[HYP-WALLET] Falling back to generating fresh keypair for this session"
-            )
-            try:
-                self._init_engine()
-                self.keypair = self.engine.generate_keypair()
-                self._loaded = True
-                logger.info(
-                    f"[HYP-WALLET] ✅ Fresh keypair generated — address: {self.keypair.address[:16]}..."
-                )
-                return True
-            except Exception:
-                return False
+    def mnemonic_file(self) -> Path: return Path("data") / "wallet_mnemonic.enc"
+    def is_loaded(self) -> bool: return bool(self.keypair) and self._password_verified
 
     def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
-        """Restore from mnemonic. Not supported by HypGammaWallet (no BIP-39)."""
-        logger.warning(
-            "[HYP-WALLET] restore_from_mnemonic not supported (HypΓ uses direct key generation)"
-        )
+        logger.warning("[HYP-WALLET] restore_from_mnemonic not supported (HypΓ)")
         return False
-
     def show_mnemonic(self, password: str) -> Optional[str]:
-        """Show mnemonic. HypGammaWallet doesn't use mnemonics."""
-        logger.warning(
-            "[HYP-WALLET] show_mnemonic not supported (HypΓ uses direct key generation)"
-        )
+        logger.warning("[HYP-WALLET] show_mnemonic not supported (HypΓ)")
         return None
 
+    def _decrypt_wallet_data(self, wallet_data: dict, password: str) -> Optional[dict]:
+        """DEPRECATED compat. Use verify_password() or load() instead."""
+        try:
+            enc_pk = wallet_data.get("encrypted_private_key")
+            if not enc_pk: return None
+            from hyp_lwe import verify_wallet_password
+            return wallet_data if verify_wallet_password(enc_pk, password) else None
+        except Exception:
+            return None
 
 class HypGammaEngine:
     """HypΓ cryptosystem — post-quantum signatures and encryption."""
@@ -20840,26 +20728,19 @@ class QtclClientApp:
             pw = _silent_getpass("  Wallet password: ").strip()
         except (EOFError, KeyboardInterrupt):
             pw = ""
-        return self.wallet.load(pw)
+        if not pw:
+            logger.warning("[HYP-WALLET] Empty password — cannot unlock")
+            return False
+        try:
+            return self.wallet.load(pw)
+        except ValueError as e:
+            logger.error(f"[HYP-WALLET] ❌ {e}")
+            print("  ❌ Wrong password", flush=True)
+            return False
 
     def _verify_password(self, password: str) -> bool:
-        """Verify wallet password by attempting to decrypt."""
-        try:
-            import json as _json
-            from pathlib import Path as _Path
-
-            wallet_file = _Path("data") / "wallet.json"
-            if not wallet_file.exists():
-                return False
-
-            wallet_data = _json.loads(wallet_file.read_text())
-
-            if "cipher" in wallet_data:
-                decrypted = self.wallet._decrypt_wallet_data(wallet_data, password)
-                return decrypted is not None
-            return True
-        except Exception:
-            return False
+        """Verify wallet password via HMAC verifier (constant-time)."""
+        return self.wallet.verify_password(password)
 
     # ═══════════════════════════════════════════════════════════════════════
     # TRIPARTITE LOCAL ORACLE: <pq0, pq0_IV, pq0_V>
@@ -23983,14 +23864,15 @@ class QtclClientApp:
 
             wallet_pw = _os.environ.get("WALLET_PASSWORD", "").strip()
             if wallet_pw:
-                if self.wallet.load(wallet_pw):
+                try:
+                    if self.wallet.load(wallet_pw):
+                        print(
+                            f"  ✅ Wallet loaded from WALLET_PASSWORD env var: {self.wallet.address}",
+                            flush=True,
+                        )
+                except ValueError as _vpw_err:
                     print(
-                        f"  ✅ Wallet loaded from WALLET_PASSWORD env var: {self.wallet.address}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        "  ❌ Wallet password from WALLET_PASSWORD env var failed",
+                        f"  ❌ WALLET_PASSWORD rejected: {_vpw_err}",
                         flush=True,
                     )
             # Try interactive if not loaded yet
@@ -27917,8 +27799,10 @@ class QtclClientApp:
             print("  5.) 📜  Show mnemonic phrase")
             print("  6.) 🔑  Show private key")
             print("  7.) 🔙  Back")
+            print("  8.) 🔗  Recover from Shamir shares")
+            print("  0.) 🔒  Change password")
             try:
-                ch = input("  Choice [1-7]: ").strip()
+                ch = input("  Choice [0-9]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if ch == "1":
@@ -27952,9 +27836,27 @@ class QtclClientApp:
                 if not pw:
                     print("  ❌ Password required")
                     continue
+                shamir = False
                 try:
-                    addr = HypGammaWallet().create(pw)
+                    sh = input("  Enable peer recovery (Shamir 3-of-5)? [y/N]: ").strip().lower()
+                    shamir = sh in ("y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+                try:
+                    addr = HypGammaWallet().create(pw, enable_shamir=shamir)
                     print(f"  ✅ Created: {addr}")
+                    if shamir:
+                        shares = HypGammaWallet().get_shamir_shares()
+                        if shares:
+                            print(f"\n  {'═' * 58}")
+                            print(f"  ⚠️   SHAMIR RECOVERY SHARES — distribute to 5 peers")
+                            print(f"  {'═' * 58}")
+                            print(f"  Threshold: 3 of 5 required to recover")
+                            for idx, share in shares:
+                                print(f"  Share {idx}: {share.hex()}")
+                            print(f"  {'═' * 58}")
+                            print(f"  ⚠️  SAVE THESE NOW — they won't be shown again!")
+                            HypGammaWallet().clear_shamir_shares()
                 except Exception as e:
                     print(f"  ❌ {e}")
             elif ch == "4":
@@ -28013,6 +27915,46 @@ class QtclClientApp:
                     print("  ❌ Incorrect password")
             elif ch == "7":
                 break
+            elif ch == "8":
+                print("\n  🔗 Shamir Peer Recovery")
+                print("  Enter shares from trusted peers. Format: index:hex")
+                shares = []
+                while True:
+                    try:
+                        s = input(f"  Share {len(shares)+1} (or 'done'): ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if s.lower() == "done":
+                        break
+                    try:
+                        idx_s, hex_s = s.split(":", 1)
+                        shares.append((int(idx_s), bytes.fromhex(hex_s)))
+                    except Exception:
+                        print("  ❌ Invalid. Use index:hex (e.g. 1:abcdef...)")
+                if len(shares) >= 2:
+                    try:
+                        HypGammaWallet().load_from_shares(shares)
+                        print(f"  ✅ Wallet recovered: {HypGammaWallet().address}")
+                    except Exception as e:
+                        print(f"  ❌ Recovery failed: {e}")
+                else:
+                    print("  ❌ Need at least 2 shares (typically 3)")
+            elif ch == "0":
+                try:
+                    old = getpass.getpass("  Current password: ").strip()
+                    new = getpass.getpass("  New password    : ").strip()
+                    new2 = getpass.getpass("  Confirm new     : ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if new != new2:
+                    print("  ❌ New passwords don't match"); continue
+                if not new:
+                    print("  ❌ New password required"); continue
+                try:
+                    HypGammaWallet().change_password(old, new)
+                    print("  ✅ Password changed")
+                except Exception as e:
+                    print(f"  ❌ {e}")
 
     def _recover_mnemonic(self) -> None:
         print("\n  ⚠️  Mnemonic Recovery")
