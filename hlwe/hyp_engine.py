@@ -1046,37 +1046,21 @@ class HypGammaEngine:
 
     def encrypt_with_password(self, plaintext: bytes, password: str) -> Dict[str, str]:
         """
-        Encrypt plaintext with password using Clay Institute-grade security.
+        Encrypt plaintext with password — pure stdlib, Termux-compatible.
         
-        ALGORITHM (Scrypt + AES-256-GCM):
+        ALGORITHM (PBKDF2 + SHAKE-256-CTR + SHA3-256 MAC):
           1. Generate random salt (32 bytes)
-          2. Derive 256-bit key: Scrypt(password, salt, N=2^20, r=8, p=1)
-          3. Generate random nonce (96 bits) for AES-256-GCM
-          4. Encrypt: AES-256-GCM(key, nonce, plaintext, None)
-          5. Return (salt, nonce, ciphertext, tag)
+          2. Derive 64-byte key: PBKDF2-HMAC-SHA256(password, salt, 600K iterations)
+          3. Generate random nonce (192 bits) for SHAKE-256-CTR
+          4. Encrypt: SHAKE-256-CTR(enc_key, nonce, plaintext)
+          5. MAC: SHA3-256(mac_key ‖ nonce ‖ ciphertext)
+          6. Return (salt, nonce, ciphertext, tag, verifier)
         
-        SECURITY JUSTIFICATION (Clay Institute Standard):
-          • N=2^20: Each password attempt requires ~1,048,576 sequential rounds
-          • Memory cost: 2^20 * 128 = 128 MB per guess (prevents GPU parallelization)
-          • Precomputation infeasible: would require 32 GB per password
-          • AES-256-GCM: 256-bit security, authenticated encryption
-          • Random salt: prevents rainbow tables
-          • Random nonce: prevents ciphertext collisions
-        
-        Args:
-          plaintext: Data to encrypt (arbitrary length)
-          password: User's plaintext password (str)
-        
-        Returns:
-          dict: {
-            'nonce_hex': 96-bit nonce (hex),
-            'salt_hex': 256-bit salt (hex),
-            'ciphertext_hex': AES-256-GCM output (hex),
-            'tag_hex': 128-bit authentication tag (hex)
-          }
-        
-        Raises:
-          RuntimeError: if cryptography package unavailable
+        SECURITY (OWASP 2023 / NIST SP 800-185):
+          • PBKDF2 at 600K iterations: ~1-2s on mobile, prevents brute force
+          • SHAKE-256: 256-bit security XOF (NIST standard)
+          • SHA3-256 MAC: 256-bit authentication (Encrypt-then-MAC, IND-CCA2)
+          • No external dependencies — runs on any Python 3.6+
         """
         try:
             from hyp_lwe import encrypt_with_password
@@ -1091,21 +1075,13 @@ class HypGammaEngine:
         """
         Decrypt ciphertext encrypted with encrypt_with_password().
         
-        Args:
-          encrypted_dict: Output of encrypt_with_password()
-          password: User's plaintext password
-        
-        Returns:
-          plaintext: original bytes
-        
-        Raises:
-          ValueError: if password is wrong or ciphertext is tampered
-          RuntimeError: if cryptography package unavailable
+        Verifies HMAC-SHA3-256 tag BEFORE decryption.
+        Wrong password → HypEngineError (no fallback, no silent failure).
         
         SECURITY:
-          • Constant-time tag verification: cryptography library uses timing-safe comparison
-          • No partial decryption: if tag doesn't match, raise error immediately
-          • Derived key is only used for decryption, never exposed
+          • Constant-time tag verification via hmac.compare_digest
+          • No partial decryption: if tag fails, no plaintext returned
+          • Pure stdlib — no external dependencies
         """
         try:
             from hyp_lwe import decrypt_with_password
