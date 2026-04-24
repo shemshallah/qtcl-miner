@@ -859,7 +859,7 @@ def get_mining_entropy(size: int = 32) -> bytes:
 
 
 def get_system_entropy(height: int = 0, pq_curr: str = "") -> bytes:
-    """System entropy for HypΓ keygen / mnemonics — same pool, height-aware."""
+    """System entropy for HypΓ keygen — height-aware."""
     with ENTROPY_LOCK:
         now = time.time()
         if (
@@ -3976,16 +3976,7 @@ class HypGammaWallet:
         return self.keypair.private_key if self.keypair else None
     @property
     def wallet_file(self) -> Path: return Path("data") / "wallet.json"
-    @property
-    def mnemonic_file(self) -> Path: return Path("data") / "wallet_mnemonic.enc"
     def is_loaded(self) -> bool: return bool(self.keypair) and self._password_verified
-
-    def restore_from_mnemonic(self, mnemonic: str, password: str) -> bool:
-        logger.warning("[HYP-WALLET] restore_from_mnemonic not supported (HypΓ)")
-        return False
-    def show_mnemonic(self, password: str) -> Optional[str]:
-        logger.warning("[HYP-WALLET] show_mnemonic not supported (HypΓ)")
-        return None
 
     def _decrypt_wallet_data(self, wallet_data: dict, password: str) -> Optional[dict]:
         """DEPRECATED compat. Use verify_password() or load() instead."""
@@ -27793,13 +27784,11 @@ class QtclClientApp:
                 _pyth_prev_wallet = _curr
             print("  " + "─" * 58)
             print("  1.) 💰  Get balance")
-            print("  2.) 🔄  Recover from 12-word mnemonic")
-            print("  3.) ➕  Create new wallet")
-            print("  4.) 🔍  Show address / public key")
-            print("  5.) 📜  Show mnemonic phrase")
-            print("  6.) 🔑  Show private key")
-            print("  7.) 🔙  Back")
-            print("  8.) 🔗  Recover from Shamir shares")
+            print("  2.) ➕  Create new wallet")
+            print("  3.) 🔍  Show address / public key")
+            print("  4.) 🔑  Show private key")
+            print("  5.) 🔙  Back")
+            print("  6.) 🔗  Recover from Shamir shares")
             print("  0.) 🔒  Change password")
             try:
                 ch = input("  Choice [0-9]: ").strip()
@@ -27821,10 +27810,7 @@ class QtclClientApp:
                 print(f"\n  💰 Balance : {bal_str}")
                 print(f"  Address  : {self.wallet.address}")
                 print(f"  Wallet   : {self.wallet.wallet_file}")
-                print(f"  Mnemonic : {self.wallet.mnemonic_file}  (AES-256 encrypted)")
             elif ch == "2":
-                self._recover_mnemonic()
-            elif ch == "3":
                 try:
                     pw = getpass.getpass("  New password: ").strip()
                     pw2 = getpass.getpass("  Confirm    : ").strip()
@@ -27859,7 +27845,7 @@ class QtclClientApp:
                             HypGammaWallet().clear_shamir_shares()
                 except Exception as e:
                     print(f"  ❌ {e}")
-            elif ch == "4":
+            elif ch == "3":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
                 print(f"  Address    : {self.wallet.address}")
@@ -27867,26 +27853,9 @@ class QtclClientApp:
                 print()
                 print(f"  ── Storage ─────────────────────────────────────────────────")
                 print(f"  wallet.json       : {self.wallet.wallet_file}")
-                print(f"  wallet_mnemonic   : {self.wallet.mnemonic_file}")
                 print(f"  Encryption        : HypΓ lattice cipher (post-quantum)")
-                print(f"  Mnemonic stored   : Encrypted with HypΓ-XOF key derivation")
-                print(f"                      (32-byte salt, post-quantum secure)")
-                print(
-                    f"  BIP-39 wordlist   : Embedded in qtcl_client.py (2048-word standard list)"
-                )
-                print(f"  HD path           : m/44'/0'/0'/0/0  (BIP-32)")
-            elif ch == "5":
-                try:
-                    pw = getpass.getpass("  Wallet password: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    continue
-                phrase = HypGammaWallet().show_mnemonic(pw)
-                if phrase:
-                    words = phrase.split()
-                    print("\n" + "═" * 60)
-                    print("  ⚠️   YOUR RECOVERY PHRASE — store offline")
-                    print("═" * 60)
-                    for i in range(0, 12, 3):
+                print(f"  Threshold scheme  : Shamir (k,n) secret sharing enabled")
+            elif ch == "4":
                         print(
                             f"  {i + 1:2}. {words[i]:<14} {i + 2:2}. {words[i + 1]:<14} {i + 3:2}. {words[i + 2]}"
                         )
@@ -27913,9 +27882,9 @@ class QtclClientApp:
                         print("  ❌ Private key not available")
                 else:
                     print("  ❌ Incorrect password")
-            elif ch == "7":
+            elif ch == "5":
                 break
-            elif ch == "8":
+            elif ch == "6":
                 print("\n  🔗 Shamir Peer Recovery")
                 print("  Enter shares from trusted peers. Format: index:hex")
                 shares = []
@@ -27955,13 +27924,6 @@ class QtclClientApp:
                     print("  ✅ Password changed")
                 except Exception as e:
                     print(f"  ❌ {e}")
-
-    def _recover_mnemonic(self) -> None:
-        print("\n  ⚠️  Mnemonic Recovery")
-        print("  HypΓ wallet uses direct key generation (not BIP-39).")
-        print("  Recovery from mnemonic is not supported.")
-        print("  ℹ️  Use 'Show address / public key' to view your current wallet.")
-        return
 
     _T_GRN = "\033[92m"
     _T_RED = "\033[91m"
