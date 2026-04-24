@@ -27856,12 +27856,27 @@ class QtclClientApp:
                 print(f"  Encryption        : HypΓ lattice cipher (post-quantum)")
                 print(f"  Threshold scheme  : Shamir (k,n) secret sharing enabled")
             elif ch == "4":
-                        print(
-                            f"  {i + 1:2}. {words[i]:<14} {i + 2:2}. {words[i + 1]:<14} {i + 3:2}. {words[i + 2]}"
-                        )
-                    print("═" * 60)
+                if not self.wallet.is_loaded() and not self._load_wallet():
+                    continue
+                try:
+                    pw = getpass.getpass("  Wallet password: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if self._verify_password(pw):
+                    pk = self.wallet.private_key
+                    if pk:
+                        print("\n" + "═" * 60)
+                        print("  ⚠️   YOUR PRIVATE KEY — never share")
+                        print("═" * 60)
+                        print(f"  {pk}")
+                        print("═" * 60)
+                        print("  ⚠️  Warning: Anyone with this key controls your funds!")
+                    else:
+                        print("  ❌ Private key not available")
                 else:
-                    print("  ❌ Not found or wrong password")
+                    print("  ❌ Incorrect password")
+            elif ch == "5":
+                break
             elif ch == "6":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
