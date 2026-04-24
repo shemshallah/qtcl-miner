@@ -1001,21 +1001,15 @@ def verify(
         )
 
         # Check 3: recompute challenge and compare
-        # Use the RECONSTRUCTED R' for the challenge to ensure signature was computed
-        # with the correct private key. However, allow for floating point tolerance:
-        # If R' is close to R (within tolerance), use R for backward compatibility.
-        # If R' is completely different (wrong key), use R' and expect challenge mismatch.
-        R_diff = max(
-            fabs(R_prime.a - sig.R.a),
-            fabs(R_prime.b - sig.R.b),
-            fabs(R_prime.c - sig.R.c),
-            fabs(R_prime.d - sig.R.d),
-        )
-        challenge_tol = mpf("1e-50")
-        if R_diff < challenge_tol:
-            c_prime = _fiat_shamir_challenge(sig.R, message)
+        # CRITICAL: Use R_canonical (exact serialization bytes) if available.
+        # Otherwise, fall back to sig.R.serialize_canonical().
+        # This ensures the challenge matches what was computed during signing.
+        if hasattr(sig.R, "_canonical_hex") and sig.R._canonical_hex:
+            # Use stored canonical form for exact binding
+            c_prime = _fiat_shamir_challenge_from_hex(sig.R._canonical_hex, message)
         else:
-            c_prime = _fiat_shamir_challenge(R_prime, message)
+            # Reconstruct from current matrix (may have minor FP differences)
+            c_prime = _fiat_shamir_challenge(sig.R, message)
         c_match = c_prime == sig.c_full
 
         if not c_match:
@@ -1244,10 +1238,12 @@ def signature_to_dict(sig: SchnorrSignature) -> Dict[str, Any]:
 
     Suitable for storage in QTCL block headers.
     The nonce_walk is NOT included (private information).
+    Includes R_canonical as hex for exact Fiat-Shamir binding.
     """
     return {
         "version": WIRE_VERSION,
         "R": sig.R.to_dict(),
+        "R_canonical": sig.R.serialize_canonical().hex(),  # BINDING: exact bytes
         "Z": sig.Z.to_dict(),
         "c_full": format(sig.c_full, "064x"),  # 64 hex chars = 256 bits
         "c_exp": sig.c_exp,
@@ -1260,6 +1256,9 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
 
     Supports both canonical format (with version, R, Z, c_full, c_exp)
     and legacy/certificate formats (with signature matrix as R, challenge as c).
+
+    If R_canonical (hex of serialize_canonical bytes) is present, it is preserved
+    for exact Fiat-Shamir verification.
 
     Raises
     ------
@@ -1283,6 +1282,9 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
         Z = PSLMatrix.from_dict(d["Z"])
         c_full = int(d["c_full"], 16)
         c_exp = int(d.get("c_exp", 0))
+        # Store R_canonical if present for later Fiat-Shamir use
+        if "R_canonical" in d:
+            R._canonical_hex = d["R_canonical"]  # Attach for verify
         return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[])
 
     # Legacy/certificate format: signature matrix is R, challenge is c
@@ -2183,6 +2185,8 @@ def sign_hash(
     from datetime import datetime, timezone
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    # Store R as canonical hex (serialize_canonical), not dict, to preserve binding
+    R_hex = sig.R.serialize_canonical().hex()
     return {
         "signature": sig_dict["R"]
         if isinstance(sig_dict.get("R"), str)
@@ -2192,6 +2196,7 @@ def sign_hash(
         "auth_tag": challenge_hex,
         # Include full dict for compatibility with verification
         "R": sig_dict["R"],
+        "R_canonical_hex": R_hex,  # NEW: canonical serialization for Fiat-Shamir
         "Z": sig_dict["Z"],
         "c_full": challenge_hex,
         "c_exp": sig.c_exp,
