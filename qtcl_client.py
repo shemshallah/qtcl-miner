@@ -29877,30 +29877,42 @@ class NodeRPCMeshServer:
                             f"[SUBMIT-BLOCK] local tx insert {tx_id[:16]}: {_txe}"
                         )
 
-                # Credit miner 7.2 QTCL NOW (embedded in this block)
+                # Credit miner 7.2 QTCL NOW (embedded in this block) — EXACTLY ONCE
                 miner_reward_base = 720
-                conn.execute(
-                    "INSERT INTO wallet_addresses "
-                    "(address, public_key, wallet_fingerprint, balance, "
-                    " address_type, balance_at_height, balance_updated_at, "
-                    " created_at, transaction_count) "
-                    "VALUES (?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),1) "
-                    "ON CONFLICT(address) DO UPDATE SET "
-                    " balance = balance + ?, "
-                    " transaction_count = transaction_count + 1, "
-                    " balance_at_height = ?, "
-                    " balance_updated_at = strftime('%s','now')",
-                    (
-                        miner_address,
-                        miner_address[:64],
-                        miner_address[:64],
-                        miner_reward_base,
-                        "miner",
-                        height,
-                        miner_reward_base,
-                        height,
-                    ),
-                )
+                # Check if address already exists
+                existing = conn.execute(
+                    "SELECT balance FROM wallet_addresses WHERE address=?",
+                    (miner_address,)
+                ).fetchone()
+                
+                if existing:
+                    # Address exists: UPDATE only (add reward)
+                    conn.execute(
+                        "UPDATE wallet_addresses SET "
+                        " balance = balance + ?, "
+                        " transaction_count = transaction_count + 1, "
+                        " balance_at_height = ?, "
+                        " balance_updated_at = strftime('%s','now') "
+                        "WHERE address=?",
+                        (miner_reward_base, height, miner_address),
+                    )
+                else:
+                    # Address new: INSERT with initial balance
+                    conn.execute(
+                        "INSERT INTO wallet_addresses "
+                        "(address, public_key, wallet_fingerprint, balance, "
+                        " address_type, balance_at_height, balance_updated_at, "
+                        " created_at, transaction_count) "
+                        "VALUES (?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),1)",
+                        (
+                            miner_address,
+                            miner_address[:64],
+                            miner_address[:64],
+                            miner_reward_base,
+                            "miner",
+                            height,
+                        ),
+                    )
 
                 # Treasury 0.8 QTCL → pending_rewards (requires NEXT block confirmation)
                 conn.execute(
