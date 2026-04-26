@@ -24647,15 +24647,15 @@ class QtclClientApp:
                         _block_txs.append(_pp_tx)
 
                     # If no template pending (genesis, or template fetch failed), add default treasury
-                    if not _prior_pending_treasury and target_height > 1:
-                        _default_treasury_id = f"cb_treasury_{target_height}_{target_height-1}_{_treasury_addr[:16]}"
+                    if not _prior_pending_treasury:
+                        _default_treasury_id = f"cb_treasury_{target_height}_{max(target_height-1,0)}_{_treasury_addr[:16]}"
                         _block_txs.append({
                             "tx_id": _default_treasury_id,
                             "from_addr": "TREASURY",
                             "to_addr": _treasury_addr,
                             "amount": _treasury_reward,
                             "block_height": target_height,
-                            "settled_from": target_height - 1,
+                            "settled_from": max(target_height - 1, 0),
                             "tx_type": "treasury_reward",
                             "version": 1,
                         })
