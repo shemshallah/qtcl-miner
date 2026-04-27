@@ -558,6 +558,38 @@ class HypGammaEngine:
         return cls._instance
 
     # ─────────────────────────────────────────────────────────────────────────────
+    # §2  PUBLIC ACCESSORS  (expose private components for external callers)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    @property
+    def lwe(self) -> "GeodesicLWE":
+        """Public accessor for the GeodesicLWE instance."""
+        if self._lwe is None:
+            raise HypEngineError("GeodesicLWE not initialized", {})
+        return self._lwe
+
+    @property
+    def schnorr(self) -> "SchnorrGamma":
+        """Public accessor for the SchnorrGamma instance."""
+        if self._schnorr is None:
+            raise HypEngineError("SchnorrGamma not initialized", {})
+        return self._schnorr
+
+    @property
+    def tessellation(self) -> "HypTessellation":
+        """Public accessor for the HypTessellation instance."""
+        if self._tessellation is None:
+            raise HypEngineError("HypTessellation not initialized", {})
+        return self._tessellation
+
+    @property
+    def ldpc(self) -> "LDPCCode":
+        """Public accessor for the LDPCCode instance."""
+        if self._ldpc_code is None:
+            raise HypEngineError("LDPCCode not initialized", {})
+        return self._ldpc_code
+
+    # ─────────────────────────────────────────────────────────────────────────────
     # §2a  KEY GENERATION
     # ─────────────────────────────────────────────────────────────────────────────
 
