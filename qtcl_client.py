@@ -24324,21 +24324,10 @@ class QtclClientApp:
 
         # pq_curr = target height (block we're mining) = current + 1
         # pq_last = parent height (current chain tip)
+        # NOTE: Always use bh+1 / bh for the mining target. Server block records
+        # contain historical pq_curr/pq_last for THAT block, not the next one.
         pq_curr_id = str(bh + 1) if bh >= 0 else "1"
         pq_last_id = str(bh) if bh >= 0 else "0"
-        # Fetch actual pq_curr/pq_last from server block record — they are sealed
-        # by the block sealer and may differ from a local modulo estimate.
-        try:
-            _blk_rec = self.api._rpc("qtcl_getBlock", [bh], timeout=5, retries=1)
-            if isinstance(_blk_rec, dict) and "error" not in _blk_rec:
-                _srv_pqc = _blk_rec.get("pq_curr") or _blk_rec.get("pq_curr_id")
-                _srv_pql = _blk_rec.get("pq_last") or _blk_rec.get("pq_last_id")
-                if _srv_pqc is not None:
-                    pq_curr_id = str(_srv_pqc)
-                if _srv_pql is not None:
-                    pq_last_id = str(_srv_pql)
-        except Exception:
-            pass  # keep local modulo fallback
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
@@ -24480,8 +24469,9 @@ class QtclClientApp:
 
             # CRITICAL FIX: pq_curr = target height (next block to mine) = current + 1
             # pq_last = parent height = current chain tip
-            _pqc = _safe_pq_int(pq_curr_id, _bh + 1)  # Target height for new block
-            _pql = _safe_pq_int(pq_last_id, _bh)  # Parent = current chain tip
+            # Always recompute from live _bh — outer pq_curr_id may be stale
+            _pqc = _bh + 1  # Target height for new block
+            _pql = _bh  # Parent = current chain tip
             # Genesis fix: at height 0, we mine block 1
             if _bh == 0:
                 _pqc = 1  # Mining first block
@@ -24609,16 +24599,20 @@ class QtclClientApp:
         if not _dm_ready and _sse_snap:
             _dm_ready = True  # SSE stream is delivering DMs
 
+        # Dynamic height: koyeb_state may have advanced since initial fetch
+        _live_bh = int(self.koyeb_state.block_height or bh)
+        _live_pqc = _live_bh + 1
+        _live_pql = _live_bh
         if _dm_ready:
             print(f"  ✅ Oracle state: ACTIVE  fidelity={_w_fid:.4f}", flush=True)
             print(
-                f"  ⛏️  Building block {pq_curr_id} (chain at {bh})  pq_curr={pq_curr_id}  pq_last={pq_last_id}",
+                f"  ⛏️  Building block {_live_pqc} (chain at {_live_bh})  pq_curr={_live_pqc}  pq_last={_live_pql}",
                 flush=True,
             )
         else:
             print(f"  ✅ Oracle state: ACTIVE (SSE stream primary)", flush=True)
             print(
-                f"  ⛏️  Building block {pq_curr_id} (chain at {bh})  pq_curr={pq_curr_id}  pq_last={pq_last_id}",
+                f"  ⛏️  Building block {_live_pqc} (chain at {_live_bh})  pq_curr={_live_pqc}  pq_last={_live_pql}",
                 flush=True,
             )
         print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
