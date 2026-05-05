@@ -24353,6 +24353,8 @@ class QtclClientApp:
                 _new_tip = self.db.get_chain_tip()
                 if _new_tip:
                     bh = int(_new_tip.get("height") or 0)
+                    pq_curr_id = str(bh + 1)
+                    pq_last_id = str(bh)
             else:
                 print(f"  ℹ️  Blockchain already up-to-date")
         except Exception as _ibd_e:
@@ -25316,6 +25318,7 @@ class QtclClientApp:
             except Exception:
                 return False
 
+        _REFRESH_INTERVAL = 1.0
         _print_dashboard(force_full=True)
         print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
