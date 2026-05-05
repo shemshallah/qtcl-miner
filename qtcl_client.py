@@ -24,7 +24,7 @@ import time
 from typing import Dict, Any, Optional, List, Tuple, Callable, Union, Set
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
-from enum import Enum
+from enum import Enum, auto
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from urllib.parse import quote, urlencode
@@ -37,7 +37,7 @@ try:
     _HAS_REQUESTS = True
 except ImportError:
     _HAS_REQUESTS = False
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 from pathlib import Path
 import base64
 import queue
@@ -60,15 +60,6 @@ if not logging.getLogger().hasHandlers():
     )
 logger = logging.getLogger(__name__)
 _EXP_LOG = logging.getLogger("qtcl.client.expansion")
-
-try:
-    import requests
-    from dataclasses import dataclass, asdict
-    from enum import Enum
-    from collections import OrderedDict
-    _TX_LAYER_READY = True
-except ImportError:
-    _TX_LAYER_READY = False
 
 #    QRNG_API_KEY_1 → random.org          (env: RANDOM_ORG_KEY  in qrng_ensemble.py)
 #    QRNG_API_KEY_2 → ANU quantum vacuum  (env: ANU_API_KEY     in qrng_ensemble.py)
@@ -540,36 +531,41 @@ def connect_consensus_stream(
 ) -> threading.Thread:
     """
     Connect to /rpc/oracle/consensus SSE stream.
-    Parse oracle consensus events (attestations, finalizations) and call callback.
+    Hardened with heartbeat detection, exponential backoff reconnection, and state tracking.
     """
     url = f"{server_url.rstrip('/')}/rpc/oracle/consensus"
     headers = {"Accept": "text/event-stream"}
+    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "consensus"}
+    globals()["_SSE_CONSENSUS_STATE"] = _SSE_STATE
 
     def _sse_reader():
         consecutive_errors = 0
-        max_errors = 10
+        max_errors = 20
         base_delay = 1.0
+        heartbeat_timeout_s = 60.0
 
         while True:
             try:
+                _SSE_STATE["connected"] = False
+                _last_data_ts = time.time()
                 if _HAS_REQUESTS:
-                    with requests.get(
-                        url, headers=headers, stream=True, timeout=30
-                    ) as resp:
+                    with requests.get(url, headers=headers, stream=True, timeout=30) as resp:
                         resp.raise_for_status()
                         consecutive_errors = 0
-
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-CONSENSUS] ✅ Stream connected")
                         for line in resp.iter_lines(decode_unicode=True):
                             if line is None:
+                                if time.time() - _last_data_ts > heartbeat_timeout_s:
+                                    _EXP_LOG.warning("[SSE-CONSENSUS] ⏱️ Heartbeat timeout — forcing reconnect")
+                                    break
                                 continue
-                            line_str = (
-                                line.strip()
-                                if isinstance(line, str)
-                                else line.decode().strip()
-                            )
+                            _last_data_ts = time.time()
+                            line_str = line.strip() if isinstance(line, str) else line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-CONSENSUS] JSON parse error: {e}")
@@ -577,30 +573,33 @@ def connect_consensus_stream(
                     req = Request(url, headers=headers, method="GET")
                     with urlopen(req, timeout=30) as resp:
                         consecutive_errors = 0
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-CONSENSUS] ✅ Stream connected")
                         for line in resp:
+                            _last_data_ts = time.time()
                             line_str = line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-CONSENSUS] JSON parse error: {e}")
-
             except Exception as e:
+                _SSE_STATE["connected"] = False
                 consecutive_errors += 1
                 if consecutive_errors == 1:
-                    _EXP_LOG.warning(f"[SSE-CONSENSUS] Connection failed: {e}")
+                    _EXP_LOG.warning(f"[SSE-CONSENSUS] ⚠️ Connection failed: {e}")
                 if consecutive_errors > max_errors:
-                    _EXP_LOG.error(
-                        f"[SSE-CONSENSUS] Giving up after {max_errors} consecutive errors"
-                    )
+                    _EXP_LOG.error(f"[SSE-CONSENSUS] ❌ Giving up after {max_errors} consecutive errors")
                     break
                 delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
+                _EXP_LOG.info(f"[SSE-CONSENSUS] 🔁 Reconnecting in {delay:.1f}s (attempt {consecutive_errors})")
                 time.sleep(delay)
 
     thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Consensus-Reader")
     thread.start()
-    _EXP_LOG.info(f"[SSE-CONSENSUS] Connected to {url}")
+    _EXP_LOG.info(f"[SSE-CONSENSUS] Connecting to {url}")
     return thread
 
 
@@ -4319,12 +4318,17 @@ class HypGammaWallet:
         if not self.keypair: raise RuntimeError("No keypair loaded")
         return self.engine.sign_hash(message_hash, self.keypair.private_key)
 
-    def sign_transaction(self, tx_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def sign_transaction(self, tx_dict: Dict[str, Any], block_height: int = 0) -> Dict[str, Any]:
         if not self.keypair: raise RuntimeError("No keypair loaded")
         tx_json = json.dumps(tx_dict, sort_keys=True, separators=(",", ":"))
         tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
+        t0 = time.time()
         sig = self.engine.sign_hash(tx_hash, self.keypair.private_key)
         sig["signer_address"] = self.keypair.address
+        dt = time.time() - t0
+        c_exp = sig.get("c_exp", 0)
+        z_det = str(sig.get("Z", {}).get("det", "?"))[:20] if isinstance(sig.get("Z"), dict) else "?"
+        logger.info(f"[SchnorrΓ] sign h={block_height}: done in {dt:.3f}s | c_exp={c_exp} | Z_det={z_det}")
         return sig
 
     def verify_signature(self, message_hash: bytes, signature: Dict[str, str]) -> bool:
@@ -6228,7 +6232,7 @@ class QtclP2PNode:
                             signal_chain_advance(_srv_height)
                             # Persist to local database
                             try:
-                                _local_db = LocalBlockchainDB(name="qtcl")
+                                _local_db = _get_local_db("qtcl")
                                 _local_db.insert_block(_srv_height, _server_payload)
                                 _EXP_LOG.info(
                                     f"[P2P] 💾 Server block h={_srv_height} persisted locally"
@@ -6569,6 +6573,18 @@ import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 
 _DM_POOL_DAEMON_STOP = _dpt.Event()
 _DM_POOL_DB_PATH = str(_DB_PATH)  # fixed: use canonical _DB_PATH
+
+# ── Cached LocalBlockchainDB singleton ───────────────────────────────────────
+_LOCAL_DB_INSTANCE = None
+_LOCAL_DB_LOCK = threading.Lock()
+
+def _get_local_db(name="qtcl"):
+    global _LOCAL_DB_INSTANCE
+    if _LOCAL_DB_INSTANCE is None:
+        with _LOCAL_DB_LOCK:
+            if _LOCAL_DB_INSTANCE is None:
+                _LOCAL_DB_INSTANCE = LocalBlockchainDB(name=name)
+    return _LOCAL_DB_INSTANCE
 
 
 def _dm_pool_drain_once(db_path: str) -> int:
@@ -7285,6 +7301,313 @@ def _validate_and_init_schema(db_path: Path) -> bool:
         return False
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# BLOCK SUBMISSION CACHE — Cathedral Consensus Engine
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+class BlockStatus(Enum):
+    SOLVED    = auto()
+    SUBMITTED = auto()
+    PENDING   = auto()
+    FINALIZED = auto()
+    REJECTED  = auto()
+    ORPHANED  = auto()
+
+@dataclass
+class CachedBlock:
+    height: int
+    block_hash: str
+    parent_hash: str
+    nonce: int
+    timestamp: int
+    difficulty: int
+    miner_address: str
+    submit_payload: Dict[str, Any]
+    signature: Dict[str, Any]
+    status: BlockStatus = BlockStatus.SOLVED
+    oracle_count: int = 0
+    oracle_ids: list = field(default_factory=list)
+    submit_attempts: int = 0
+    first_submitted_at: float = 0.0
+    last_submitted_at: float = 0.0
+    finalized_at: float = 0.0
+    reward_qtcl: float = 0.0
+    server_response: Optional[dict] = None
+    error_message: str = ""
+
+class BlockSubmissionCache:
+    """Thread-safe FIFO cache of solved blocks awaiting oracle consensus."""
+    MAX_SIZE = 32
+    EVICT_AFTER_S = 60.0
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._blocks: OrderedDict = OrderedDict()
+        self._hash_index: Dict[str, int] = {}
+        self._balance_qtcl: float = 0.0
+
+    def enqueue_solved(self, block: CachedBlock) -> bool:
+        with self._lock:
+            existing = self._blocks.get(block.height)
+            if existing and existing.status == BlockStatus.FINALIZED:
+                return False
+            if existing and existing.status in (BlockStatus.SUBMITTED, BlockStatus.PENDING):
+                existing.status = BlockStatus.ORPHANED
+                self._hash_index.pop(existing.block_hash, None)
+            self._blocks[block.height] = block
+            self._hash_index[block.block_hash] = block.height
+            self._evict_old()
+            return True
+
+    def get_next_unsent(self) -> Optional[CachedBlock]:
+        with self._lock:
+            for h in sorted(self._blocks.keys()):
+                b = self._blocks[h]
+                if b.status == BlockStatus.SOLVED:
+                    return b
+            return None
+
+    def get_next_pending(self) -> Optional[CachedBlock]:
+        with self._lock:
+            for h in sorted(self._blocks.keys()):
+                b = self._blocks[h]
+                if b.status == BlockStatus.PENDING:
+                    return b
+            return None
+
+    def mark_submitted(self, height: int, response: dict = None):
+        with self._lock:
+            b = self._blocks.get(height)
+            if b:
+                b.status = BlockStatus.SUBMITTED
+                b.submit_attempts += 1
+                b.last_submitted_at = time.time()
+                if b.first_submitted_at == 0:
+                    b.first_submitted_at = time.time()
+                b.server_response = response
+
+    def mark_pending(self, height: int, oracle_count: int = 0, oracle_ids: list = None):
+        with self._lock:
+            b = self._blocks.get(height)
+            if b:
+                b.status = BlockStatus.PENDING
+                b.oracle_count = oracle_count
+                if oracle_ids:
+                    b.oracle_ids = oracle_ids
+
+    def mark_finalized(self, height: int, reward_qtcl: float = 0.0):
+        with self._lock:
+            b = self._blocks.get(height)
+            if b:
+                b.status = BlockStatus.FINALIZED
+                b.finalized_at = time.time()
+                b.reward_qtcl = reward_qtcl
+
+    def mark_rejected(self, height: int, error: str = ""):
+        with self._lock:
+            b = self._blocks.get(height)
+            if b:
+                b.status = BlockStatus.REJECTED
+                b.error_message = error
+
+    def update_oracle_count(self, height: int, count: int, oracle_ids: list = None):
+        with self._lock:
+            b = self._blocks.get(height)
+            if b:
+                b.oracle_count = count
+                if oracle_ids:
+                    b.oracle_ids = oracle_ids
+                if count >= 3 and b.status != BlockStatus.FINALIZED:
+                    b.status = BlockStatus.FINALIZED
+                    b.finalized_at = time.time()
+
+    def update_from_sse(self, event: dict):
+        evt_type = event.get("event_type", "")
+        h = int(event.get("height", 0))
+        if h <= 0:
+            return
+        with self._lock:
+            b = self._blocks.get(h)
+            if not b:
+                return
+            oracle_count = int(event.get("oracle_count", 0))
+            oracle_ids = event.get("oracle_ids", [])
+            if evt_type == "block_finalized":
+                b.status = BlockStatus.FINALIZED
+                b.finalized_at = time.time()
+                b.oracle_count = oracle_count
+                b.oracle_ids = oracle_ids
+            elif evt_type == "block_pending":
+                b.oracle_count = oracle_count
+                b.oracle_ids = oracle_ids
+                if oracle_count >= 3:
+                    b.status = BlockStatus.FINALIZED
+                    b.finalized_at = time.time()
+            elif evt_type == "oracle_attestation":
+                b.oracle_count = max(b.oracle_count, oracle_count)
+
+    def is_height_finalized(self, height: int) -> bool:
+        with self._lock:
+            b = self._blocks.get(height)
+            return b is not None and b.status == BlockStatus.FINALIZED
+
+    def is_height_in_flight(self, height: int) -> bool:
+        with self._lock:
+            b = self._blocks.get(height)
+            return b is not None and b.status in (
+                BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING
+            )
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return sum(1 for b in self._blocks.values()
+                       if b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING))
+
+    def finalized_count(self) -> int:
+        with self._lock:
+            return sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED)
+
+    def total_rewards(self) -> float:
+        with self._lock:
+            return sum(b.reward_qtcl for b in self._blocks.values()
+                       if b.status == BlockStatus.FINALIZED)
+
+    def get_chain_tip(self) -> int:
+        with self._lock:
+            finalized = [h for h, b in self._blocks.items() if b.status == BlockStatus.FINALIZED]
+            return max(finalized) if finalized else 0
+
+    def get_block(self, height: int) -> Optional[CachedBlock]:
+        with self._lock:
+            return self._blocks.get(height)
+
+    def get_by_hash(self, block_hash: str) -> Optional[CachedBlock]:
+        with self._lock:
+            h = self._hash_index.get(block_hash)
+            return self._blocks.get(h) if h is not None else None
+
+    def clear_at_height(self, height: int):
+        with self._lock:
+            b = self._blocks.pop(height, None)
+            if b:
+                self._hash_index.pop(b.block_hash, None)
+
+    def _evict_old(self):
+        now = time.time()
+        evict = []
+        for h, b in self._blocks.items():
+            if b.status in (BlockStatus.FINALIZED, BlockStatus.REJECTED, BlockStatus.ORPHANED):
+                if now - max(b.finalized_at, b.last_submitted_at, b.first_submitted_at) > self.EVICT_AFTER_S:
+                    evict.append(h)
+            elif b.status == BlockStatus.PENDING:
+                _block_ttl = 270.0
+                if b.first_submitted_at and (now - b.first_submitted_at) > _block_ttl:
+                    evict.append(h)
+        for h in evict:
+            b = self._blocks.pop(h, None)
+            if b:
+                self._hash_index.pop(b.block_hash, None)
+        while len(self._blocks) > self.MAX_SIZE:
+            oldest_h, oldest_b = self._blocks.popitem(last=False)
+            self._hash_index.pop(oldest_b.block_hash, None)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "total": len(self._blocks),
+                "solved": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SOLVED),
+                "submitted": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SUBMITTED),
+                "pending": sum(1 for b in self._blocks.values() if b.status == BlockStatus.PENDING),
+                "finalized": sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED),
+                "rejected": sum(1 for b in self._blocks.values() if b.status == BlockStatus.REJECTED),
+                "tip": self.get_chain_tip(),
+                "total_rewards": self.total_rewards(),
+                "blocks": {
+                    h: {"hash": b.block_hash[:16], "status": b.status.name,
+                        "oracles": f"{b.oracle_count}/5", "attempts": b.submit_attempts}
+                    for h, b in sorted(self._blocks.items())
+                },
+            }
+
+
+
+
+def _render_block_slip(block, cache_snap: dict, balance_qtcl: float, p2p_status: str = "") -> str:
+    """Render a single, consolidated block display."""
+    STATUS_ICONS = {
+        BlockStatus.SOLVED: "✅ BLOCK SOLVED",
+        BlockStatus.SUBMITTED: "📡 SUBMITTED",
+        BlockStatus.PENDING: "⏳ PENDING (oracle consensus)",
+        BlockStatus.FINALIZED: "🔥 FINALIZED",
+        BlockStatus.REJECTED: "❌ REJECTED",
+        BlockStatus.ORPHANED: "👻 ORPHANED",
+    }
+    lines = []
+    lines.append("─" * 72)
+    _ago = _fmt_ago(block.timestamp) if hasattr(block, "timestamp") and block.timestamp else "?"
+    _st = getattr(block, "status", BlockStatus.SOLVED)
+    lines.append(f"  {STATUS_ICONS.get(_st, '?')}  h={block.height}  ({_ago})")
+    lines.append("─" * 72)
+    lines.append(f"  nonce   : {block.nonce:,}{'':>20}diff : {block.difficulty} leading-zeros")
+    lines.append(f"  hash    : {block.block_hash[:48]}…")
+    lines.append(f"  parent  : {block.parent_hash[:48]}…")
+    sig = getattr(block, "signature", None)
+    if sig:
+        sig_str = str(sig)[:80]
+        lines.append(f"  ── Miner Signature (HypΓ SchnorrΓ) ──")
+        lines.append(f"  sig     : {sig_str}…")
+    pq = getattr(block, "submit_payload", {}) or {}
+    lines.append(f"  ── Quantum Attestation ──")
+    lines.append(f"  pq_curr : {pq.get('pq_curr', '?')}   pq_last: {pq.get('pq_last', '?')}")
+    lines.append(f"  W-fid   : {pq.get('w_state_fidelity', 0):.4f}")
+    lines.append(f"  ── Oracle Consensus ──")
+    _fin = "✅ FINALIZED" if _st == BlockStatus.FINALIZED else "⏳ waiting…"
+    lines.append(f"  oracles : {block.oracle_count}/5  {_fin}")
+    if getattr(block, "reward_qtcl", 0) > 0:
+        lines.append(f"  reward  : +{block.reward_qtcl:.2f} QTCL")
+    lines.append("─" * 72)
+    if p2p_status:
+        lines.append(f"  {p2p_status}")
+    lines.append(f"  Blocks  : {cache_snap.get('finalized', 0)} finalized, {cache_snap.get('pending', 0)} pending, {cache_snap.get('rejected', 0)} rejected")
+    lines.append(f"  Rewards : {cache_snap.get('total_rewards', 0):.2f} QTCL")
+    lines.append(f"  Balance : {balance_qtcl:.8f} QTCL")
+    lines.append("─" * 72)
+    return "\n".join(lines)
+
+def _fmt_ago(timestamp: float) -> str:
+    """Format a timestamp as 'Xs ago' or 'Xm ago'."""
+    if not timestamp:
+        return "?"
+    delta = time.time() - timestamp
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    elif delta < 3600:
+        return f"{int(delta / 60)}m ago"
+    else:
+        return f"{int(delta / 3600)}h ago"
+
+
+async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
+    """Called when SSE fires block_finalized for one of our blocks."""
+    await asyncio.sleep(0.5)
+    for attempt in range(3):
+        try:
+            result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=5, retries=1)
+            if result and not result.get("error"):
+                balance_base = int(result.get("balance", 0))
+                balance_qtcl = balance_base / 100.0
+                cache._balance_qtcl = balance_qtcl
+                logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL")
+                return balance_qtcl
+        except Exception:
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return None
+
+
+_SCHEMA_VALIDATED = threading.Event()
+_SCHEMA_LOCK = threading.Lock()
+
 class LocalBlockchainDB:
     """Local SQLite blockchain database - replaces psycopg version
 
@@ -7340,11 +7663,14 @@ class LocalBlockchainDB:
 
         self._init_pool()
         # Validate schema against qtcl_db_builder.py (single source of truth)
-        if not _validate_and_init_schema(self.db_path):
-            raise RuntimeError(f"Database schema validation failed for {self.db_path}")
-
-        # Apply idempotent schema migrations (add missing columns to existing tables)
-        self._migrate_schema()
+        # Schema validation: ONCE per process lifetime
+        if not _SCHEMA_VALIDATED.is_set():
+            with _SCHEMA_LOCK:
+                if not _SCHEMA_VALIDATED.is_set():
+                    if not _validate_and_init_schema(self.db_path):
+                        raise RuntimeError(f"Database schema validation failed for {self.db_path}")
+                    self._migrate_schema()
+                    _SCHEMA_VALIDATED.set()
 
         logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
 
@@ -24308,1874 +24634,575 @@ class QtclClientApp:
         print(self.format_p2p_status(), flush=True)
         print(flush=True)
 
-        # ── Miner handle ───────────────────────────────────────────────────────
-        def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
-            """
-            Gate on RPC oracle DM arrival (RPC-only, no SSE).
-            Fetches live RPC snapshots on-demand via _LIVE_RPC_ORACLE.
-            Returns True if DM available. False = degraded mode, mining continues.
-            """
-            deadline = time.time() + timeout_s
-            print("  🔗 Awaiting oracle DM frame…", end="", flush=True)
-            while time.time() < deadline:
-                _dm_snap = _LIVE_RPC_ORACLE.fetch_snapshot()
-                if _dm_snap.get("cycle", 0) > 0:
-                    print(f" ✅ (RPC)  snaps={_dm_snap.get('cycle', 0)}", flush=True)
-                    return True
-                print(".", end="", flush=True)
-                time.sleep(0.3)
-            print(" ⏱️  timeout — degraded mode", flush=True)
-            return False
-
-        class _MinerHandle:
-            """Thin handle so the post-loop code (miner._koyeb_state etc.) still works."""
-
-            def __init__(self):
-                self._koyeb_state = None
-                self._client_field = None
-
-            def stop_mining(self):
-                pass
-
-        miner = _MinerHandle()
-
         async def _mine_inline():
             """
-            ⚛️ EVENT-DRIVEN MINING PIPELINE v6.0 — PURE EVENTS, NO POLLING ⚛️
-
-            Event-driven architecture:
-            1. Wait for height event (P2P broadcast or server signal)
-            2. Update height, persist block (if received from peer/server)
-            3. Build block (coinbase + TXs + merkle)
-            4. Mine (pure Python SHA256 with multi-threaded workers)
-            5. Submit (RPC-only, exponential backoff, atomic quantum state)
-            6. Wait for next height event (loop)
-
-            Height change events from:
-            - P2P BLOCK_ANNOUNCE: peer found a block
-            - P2P BLOCK_SOLVED_SERVER: server broadcasted new block
-            - P2P HEIGHT_UPDATE: peer chain tip update
-            - _CHAIN_ADVANCE_EVENT: signal from P2P layer
-
-            REMOVED (v6.0):
-            - Height polling via RPC (replaced with pure events)
-            - POLL_EVERY_S loop (dead code)
-
-            KEPT INTACT:
-            - Event system (signal_chain_advance, check_chain_advance)
-            - P2P event routing (_P2P_EVENT_QUEUE, _drain_loop)
-            - HypΓ/lattice systems (untouched)
-            - Oracle DM synchronization (RPC-only)
-            - Quantum field state tracking (pq_curr/pq_last locked)
-            - Telemetry integration
+            QTCL Mining Pipeline — Cache-Driven, Event-Reactive
+            THREE decoupled async tasks:
+              1. pow_task:        mine blocks, enqueue to cache
+              2. submit_task:     dequeue from cache, submit via RPC
+              3. balance_task:    periodic balance refresh
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
-
             kapi = KoyebRPCNodule()
-            _MINE_TELEM.mark_idle()
-            # ═══════════════════════════════════════════════════════════════════════
-            # EVENT-DRIVEN HEIGHT TRACKING — No Polling
-            # Height changes are detected via:
-            #   1. _CHAIN_ADVANCE_EVENT from P2P layer (signal_chain_advance)
-            #   2. BLOCK_SOLVED_SERVER event from server broadcast
-            #   3. BLOCK_ANNOUNCE from peers
-            # ═══════════════════════════════════════════════════════════════════════
-
-            # ❤️  PRE-WARM ORACLE SNAPSHOT BEFORE MARKING IDLE (FIX-C)
-            # This ensures metrics aren't zero on first TUI render of MINING state
-            _oracle_warmup_snap = {}
-            try:
-                _oracle_warmup_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
-                if _oracle_warmup_snap and _oracle_warmup_snap.get(
-                    "density_matrix_hex"
-                ):
-                    _cached_dm_re, _cached_dm_im, _cached_dm_age = (
-                        _LIVE_RPC_ORACLE.get_oracle_dm()
-                    )
-                    _EXP_LOG.info(
-                        f"[MINER] 🔬 Oracle pre-warmed: DM age={_cached_dm_age:.1f}s "
-                        f"re_sum={sum(_cached_dm_re[:8]):.4f}"
-                    )
-                else:
-                    _oracle_warmup_snap = {}
-            except Exception as _owarm_err:
-                _EXP_LOG.debug(f"[MINER] Oracle pre-warm (non-fatal): {_owarm_err}")
+            cache = BlockSubmissionCache()
+            _NULL_HASH = "0" * 64
 
             class _SubmissionPipeline:
-                """⚛️ Enterprise RPC submission with atomic quantum state locking."""
-
-                MAX_RETRIES = 6  # max submission attempts per block
-                RETRY_BACKOFFS = [
-                    1.0,
-                    2.0,
-                    4.0,
-                    8.0,
-                    16.0,
-                    30.0,
-                ]  # exponential backoff: 61s window
-                MAX_TIMEOUT_S = 120.0  # abandon block if >120s elapsed
+                """Enterprise RPC submission with smart error handling."""
+                MAX_RETRIES = 6
+                RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+                MAX_TIMEOUT_S = 120.0
 
                 def __init__(self):
                     self.submit_count = 0
                     self.accept_count = 0
                     self.reject_count = 0
 
-                async def submit(
-                    self, payload: dict, block_height: int, block_hash: str
-                ) -> tuple:
-                    """
-                    🚀 WEB-SCALE SUBMISSION with smart error handling
-
-                    Handles new error codes:
-                    - -32020: Rate limited (backoff and retry)
-                    - -32021: Circuit open (database under load, retry with longer backoff)
-                    - -32002: Fork detected (someone else won this height)
-                    - -32603: Database error (may still be persisted - verify!)
-
-                    Smart verification: After any error, query server to verify if block exists
-                    """
+                async def submit(self, payload: dict, block_height: int, block_hash: str) -> tuple:
                     self.submit_count += 1
                     last_error = None
                     _submit_start = _t.time()
-
-                    # 🧠 SMART RETRY: Different strategies per error type
                     _rate_limited_backoff = [2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
                     _circuit_breaker_backoff = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0]
 
                     for attempt in range(self.MAX_RETRIES):
                         _elapsed = _t.time() - _submit_start
                         if _elapsed > self.MAX_TIMEOUT_S:
-                            # ⏱️ TIMEOUT: But first verify if block was actually accepted!
-                            _EXP_LOG.warning(
-                                f"[SUBMIT] ⏱️ TIMEOUT h={block_height} - verifying if accepted..."
-                            )
-                            _verified = await self._verify_block_accepted(
-                                kapi, block_height, block_hash
-                            )
+                            _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                             if _verified:
-                                _EXP_LOG.info(
-                                    f"[SUBMIT] ✅ TIMEOUT but block VERIFIED in DB!"
-                                )
-                                return (
-                                    True,
-                                    {
-                                        "status": "accepted",
-                                        "height": block_height,
-                                        "verified": True,
-                                    },
-                                )
+                                return (True, {"status": "accepted", "height": block_height, "verified": True})
+                            return (False, {"error": "Submission timeout", "verify": _verified})
 
-                            _EXP_LOG.error(
-                                f"[SUBMIT] ⏱️ TIMEOUT h={block_height} after {_elapsed:.0f}s — giving up"
-                            )
-                            return (
-                                False,
-                                {"error": "Submission timeout", "verify": _verified},
-                            )
-
-                        # Choose backoff based on previous error type
                         if last_error and "rate limit" in last_error.lower():
-                            backoff = _rate_limited_backoff[
-                                min(attempt, len(_rate_limited_backoff) - 1)
-                            ]
+                            backoff = _rate_limited_backoff[min(attempt, len(_rate_limited_backoff) - 1)]
                         elif last_error and "circuit" in last_error.lower():
-                            backoff = _circuit_breaker_backoff[
-                                min(attempt, len(_circuit_breaker_backoff) - 1)
-                            ]
+                            backoff = _circuit_breaker_backoff[min(attempt, len(_circuit_breaker_backoff) - 1)]
                         else:
                             backoff = self.RETRY_BACKOFFS[attempt]
 
                         try:
-                            _EXP_LOG.info(
-                                f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} "
-                                f"backoff={backoff:.1f}s"
-                            )
-
-                            # 🚀 RPC CALL with shorter timeout for responsiveness
+                            _EXP_LOG.info(f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} backoff={backoff:.1f}s")
                             try:
                                 _envelope = await _asyncio.wait_for(
                                     _asyncio.to_thread(
-                                        kapi._rpc_envelope,
-                                        "qtcl_submitBlock",
-                                        [payload],
-                                        10,  # Reduced from 15 for faster feedback
-                                        1,
+                                        kapi._rpc_envelope, "qtcl_submitBlock", [payload], 10, 1
                                     ),
-                                    timeout=15,  # Reduced from 20
+                                    timeout=15,
                                 )
                             except _asyncio.TimeoutError:
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] Attempt {attempt + 1}: RPC timeout - verifying..."
-                                )
-                                # Don't give up - verify if it was actually accepted
-                                _verified = await self._verify_block_accepted(
-                                    kapi, block_height, block_hash
-                                )
+                                _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                 if _verified:
-                                    return (
-                                        True,
-                                        {"status": "accepted", "verified": True},
-                                    )
+                                    return (True, {"status": "accepted", "verified": True})
                                 last_error = "RPC timeout"
                                 continue
 
-                            _EXP_LOG.info(f"[SUBMIT] Response: {str(_envelope)[:200]}")
-
-                            # Parse response
                             if isinstance(_envelope, dict) and "result" in _envelope:
                                 result = _envelope["result"]
                             elif isinstance(_envelope, dict) and "error" in _envelope:
-                                result = _envelope  # Error response
+                                result = _envelope
                             else:
                                 result = _envelope
 
-                            # ✅ SUCCESS: Block accepted (fresh or duplicate)
-                            if (
-                                isinstance(result, dict)
-                                and result.get("status") == "accepted"
-                            ):
-                                _persistence = result.get("persistence", "unknown")
-                                _proc_time = result.get("processing_time_ms", 0)
-                                _EXP_LOG.warning(
-                                    f"[SUBMIT] ✅ ACCEPTED h={block_height} ({_persistence}) "
-                                    f"server_time={_proc_time}ms total={_t.time() - _submit_start:.2f}s"
-                                )
+                            if isinstance(result, dict) and "accepted" in str(result.get("status", "")):
                                 self.accept_count += 1
                                 return (True, result)
 
-                            # 🪣 RATE LIMITED: Backoff and retry
                             if isinstance(result, dict) and "error" in result:
                                 _err = result["error"]
-                                _code = (
-                                    _err.get("code", 0) if isinstance(_err, dict) else 0
-                                )
-                                _msg = (
-                                    _err.get("message", str(_err))
-                                    if isinstance(_err, dict)
-                                    else str(_err)
-                                )
+                                _code = _err.get("code", 0) if isinstance(_err, dict) else 0
+                                _msg = _err.get("message", str(_err)) if isinstance(_err, dict) else str(_err)
 
-                                if _code == -32020:  # Rate limited
-                                    _retry_after = (
-                                        _err.get("data", {}).get("retry_after", 1)
-                                        if isinstance(_err, dict)
-                                        else 1
-                                    )
-                                    _EXP_LOG.warning(
-                                        f"[SUBMIT] 🪣 RATE LIMITED h={block_height} - retry in {_retry_after}s"
-                                    )
+                                if _code == -32020:
+                                    _retry_after = _err.get("data", {}).get("retry_after", 1) if isinstance(_err, dict) else 1
                                     await _asyncio.sleep(_retry_after)
                                     last_error = "rate limited"
                                     continue
-
-                                # ⚡ CIRCUIT BREAKER: Longer backoff
-                                if _code == -32021:  # Circuit open
-                                    _retry_after = (
-                                        _err.get("data", {}).get("retry_after", 30)
-                                        if isinstance(_err, dict)
-                                        else 30
-                                    )
-                                    _EXP_LOG.warning(
-                                        f"[SUBMIT] ⚡ CIRCUIT OPEN h={block_height} - server under load, retry in {_retry_after}s"
-                                    )
+                                if _code == -32021:
+                                    _retry_after = _err.get("data", {}).get("retry_after", 30) if isinstance(_err, dict) else 30
                                     await _asyncio.sleep(_retry_after)
                                     last_error = "circuit open"
                                     continue
-
-                                # 🍴 FORK DETECTED: Someone else won this height
                                 if _code == -32002:
-                                    _EXP_LOG.warning(
-                                        f"[SUBMIT] 🍴 FORK at h={block_height} - another miner won"
-                                    )
-                                    # Verify if OUR block was the one that made it
-                                    _verified = await self._verify_block_accepted(
-                                        kapi, block_height, block_hash
-                                    )
+                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        _EXP_LOG.info(
-                                            f"[SUBMIT] ✅ Our block actually WON h={block_height}!"
-                                        )
-                                        return (
-                                            True,
-                                            {"status": "accepted", "fork_won": True},
-                                        )
-                                    else:
-                                        _EXP_LOG.info(
-                                            f"[SUBMIT] 😢 Lost race at h={block_height}, another block accepted"
-                                        )
-                                        return (
-                                            True,
-                                            {
-                                                "status": "accepted_other",
-                                                "height": block_height,
-                                            },
-                                        )
-
-                                # ❌ INVALID HEIGHT: Chain advanced
+                                        return (True, {"status": "accepted", "fork_won": True})
+                                    return (True, {"status": "accepted_other", "height": block_height})
                                 if _code == -32001 and "Invalid height" in _msg:
-                                    _tip = (
-                                        _err.get("data", {}).get("tip", 0)
-                                        if isinstance(_err, dict)
-                                        else 0
-                                    )
-                                    _EXP_LOG.info(
-                                        f"[SUBMIT] 📈 CHAIN ADVANCED h={block_height} → tip={_tip}"
-                                    )
-                                    # Verify our block is there
-                                    _verified = await self._verify_block_accepted(
-                                        kapi, block_height, block_hash
-                                    )
+                                    _tip = _err.get("data", {}).get("tip", 0) if isinstance(_err, dict) else 0
+                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        return (
-                                            True,
-                                            {"status": "accepted", "chain_tip": _tip},
-                                        )
-                                    return (
-                                        True,
-                                        {"status": "chain_advanced", "tip": _tip},
-                                    )
-
-                                # 💥 DATABASE ERROR: May still be persisted - VERIFY!
+                                        return (True, {"status": "accepted", "chain_tip": _tip})
+                                    return (True, {"status": "chain_advanced", "tip": _tip})
                                 if _code == -32603:
-                                    _EXP_LOG.error(
-                                        f"[SUBMIT] 💥 DB ERROR h={block_height}: {_msg[:100]}"
-                                    )
-                                    # CRITICAL: Wait a moment then verify
                                     await _asyncio.sleep(0.5)
-                                    _verified = await self._verify_block_accepted(
-                                        kapi, block_height, block_hash
-                                    )
+                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        _EXP_LOG.info(
-                                            f"[SUBMIT] ✅ DB ERROR but block VERIFIED in chain!"
-                                        )
-                                        return (
-                                            True,
-                                            {
-                                                "status": "accepted",
-                                                "db_error_but_persisted": True,
-                                            },
-                                        )
-                                    _EXP_LOG.error(
-                                        f"[SUBMIT] ❌ Block NOT in chain after DB error"
-                                    )
+                                        return (True, {"status": "accepted", "db_error_but_persisted": True})
                                     return (False, result)
 
-                                # Generic error
-                                _EXP_LOG.error(
-                                    f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}"
-                                )
+                                _EXP_LOG.error(f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}")
                                 return (False, result)
 
-                            # No result - network issue, retry
                             last_error = "No response"
-                            _EXP_LOG.warning(
-                                f"[SUBMIT] Attempt {attempt + 1}: No valid response"
-                            )
-
                         except Exception as e:
                             last_error = str(e)
-                            _EXP_LOG.warning(
-                                f"[SUBMIT] Attempt {attempt + 1} exception: {last_error[:100]}"
-                            )
 
-                        # Backoff before retry
                         if attempt < self.MAX_RETRIES - 1:
-                            # Add jitter to prevent thundering herd
-                            import random
-
-                            jitter = random.uniform(0, 0.5)
+                            jitter = __import__("random").uniform(0, 0.5)
                             _wait = backoff + jitter
                             _EXP_LOG.info(f"[SUBMIT] Retry in {_wait:.1f}s...")
                             await _asyncio.sleep(_wait)
 
-                    # All retries exhausted - final verification attempt
-                    _EXP_LOG.error(
-                        f"[SUBMIT] ❌ Exhausted retries h={block_height} - final verification..."
-                    )
-                    _verified = await self._verify_block_accepted(
-                        kapi, block_height, block_hash
-                    )
+                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                     if _verified:
-                        _EXP_LOG.info(f"[SUBMIT] ✅ Exhausted but block FOUND in DB!")
-                        return (
-                            True,
-                            {"status": "accepted", "verified_after_retries": True},
-                        )
-
+                        return (True, {"status": "accepted", "verified_after_retries": True})
                     return (False, {"error": last_error or "Max retries exceeded"})
 
-                async def _verify_block_accepted(
-                    self, kapi, height: int, block_hash: str
-                ) -> bool:
-                    """
-                    🕵️ VERIFY: Query server to check if block was actually accepted
-                    Critical for handling ambiguous errors (DB error, timeout, etc.)
-                    """
+                async def _verify_block_accepted(self, kapi, height: int, block_hash: str) -> bool:
                     try:
-                        # Query block by hash
-                        _check = await _asyncio.to_thread(
-                            kapi._rpc, "qtcl_getBlockByHash", [block_hash], 5, 1
-                        )
+                        _check = await _asyncio.to_thread(kapi._rpc, "qtcl_getBlockByHash", [block_hash], 5, 1)
                         if isinstance(_check, dict) and not _check.get("error"):
                             if _check.get("height") == height:
                                 return True
-
-                        # Fallback: query by height
-                        _check_height = await _asyncio.to_thread(
-                            kapi._rpc, "qtcl_getBlock", [height], 5, 1
-                        )
-                        if isinstance(_check_height, dict) and not _check_height.get(
-                            "error"
-                        ):
-                            if (
-                                _check_height.get("block_hash") == block_hash
-                                or _check_height.get("hash") == block_hash
-                            ):
+                        _check_height = await _asyncio.to_thread(kapi._rpc, "qtcl_getBlock", [height], 5, 1)
+                        if isinstance(_check_height, dict) and not _check_height.get("error"):
+                            if _check_height.get("block_hash") == block_hash or _check_height.get("hash") == block_hash:
                                 return True
-
                         return False
                     except Exception as e:
                         _EXP_LOG.debug(f"[SUBMIT] Verification error: {e}")
                         return False
 
-            _submission = _SubmissionPipeline()
+            pipeline = _SubmissionPipeline()
 
-            # ══════════════════════════════════════════════════════════════════════
-            # EVENT-DRIVEN MINING LOOP — Pure Events, No Polling
-            # ══════════════════════════════════════════════════════════════════════
-            # Mining workflow:
-            #   1. Wait for height event OR mine until solution found
-            #   2. On height event: abort mining, update height, persist block, restart
-            #   3. On solution: submit block, wait for next height event
-            # Height events come from:
-            #   - P2P BLOCK_ANNOUNCE (peers found blocks)
-            #   - P2P BLOCK_SOLVED_SERVER (server broadcasts)
-            #   - P2P HEIGHT_UPDATE (peer chain tip updates)
+            def _consensus_handler(data: dict) -> None:
+                cache.update_from_sse(data)
+                evt_type = data.get("event_type", "")
+                h = int(data.get("height", 0))
+                if evt_type == "block_finalized" and h > 0:
+                    signal_chain_advance(h)
+                    _EXP_LOG.info(f"[SSE-RECV] 🔥 BLOCK FINALIZED h={h} — mining loop signaled")
+                elif evt_type == "block_pending":
+                    cached = cache.get_block(h)
+                    if cached and cached.oracle_count != int(data.get("oracle_count", 0)):
+                        _EXP_LOG.info(f"[SSE-RECV] ⏳ Block h={h} oracles={data.get('oracle_count', 0)}/5")
+                elif evt_type == "oracle_attestation":
+                    _EXP_LOG.info(f"[SSE-RECV] 🖊️ Oracle attestation h={h} oracle={data.get('oracle_id', '?')}")
 
-            _NULL_HASH = "0" * 64
-            # _ORACLE_LAT_MAX_MS removed — oracle gate removed, miner is self-sovereign
-            # ── Session variables for height progression and deduplication ──
-            _force_next_height: int = 0
-            _confirmed_heights: set = set()
-            _submitted_hashes: set = set()
-            _last_accepted_hash: str = ""
+            def _block_handler(data: dict) -> None:
+                h = int(data.get("height", 0) or data.get("block_height", 0))
+                block_hash = data.get("hash", "") or data.get("block_hash", "")
+                miner = data.get("miner_address", "")
+                if h > 0:
+                    our_block = cache.get_block(h)
+                    if our_block and our_block.block_hash == block_hash:
+                        _EXP_LOG.info(f"[SSE-RECV] ✅ Our block h={h} broadcast confirmed")
+                    elif our_block:
+                        cache.mark_rejected(h, f"superseded by {block_hash[:16]} from {miner[:16]}")
+                        _EXP_LOG.warning(f"[SSE-RECV] ⚠️ Our block h={h} orphaned by {block_hash[:16]}")
+                    signal_chain_advance(h)
 
-            while True:  # Main mining loop
+            globals()["_block_cache"] = cache
+            for _reg_attempt in range(20):
                 try:
-                    # ── Sentinel reset — must be first two lines of every iteration ──
-                    # Ensures no stale nonce/block_hash from a previous aborted PoW
-                    # attempt (TTL expiry, chain-advance, or exception) can ever bleed
-                    # through to the submit stage.  The canonical value of 4096 = 0x1000
-                    # = 2^12 is the Python default int fallback, not a mined solution.
-                    nonce = None  # pylint: disable=invalid-name
-                    block_hash = None  # pylint: disable=invalid-name
+                    register_consensus_handler(_consensus_handler)
+                    register_block_handler(_block_handler)
+                    break
+                except NameError:
+                    await _asyncio.sleep(0.1)
+            else:
+                _EXP_LOG.warning("[MINER] SSE handler registration failed — handlers not available")
 
-                    # ── Oracle enrichment (NON-BLOCKING) ──────────────────────────
-                    # Miner is self-sovereign: oracle enriches PoW seeds but never
-                    # blocks. If oracle is silent we mine on local entropy — equally
-                    # valid. The background poll thread (_ORACLE_BG_POLL) keeps the
-                    # cache warm so fast cached reads here are almost always a hit.
-                    _t_oracle_start = _t.time()
-                    _cached_dm_re, _cached_dm_im, _cached_dm_age = (
-                        _LIVE_RPC_ORACLE.get_oracle_dm()
-                    )
-                    if _cached_dm_age < 120.0 and any(v != 0.0 for v in _cached_dm_re):
-                        _oracle_snap = (
-                            _LIVE_RPC_ORACLE.get_oracle_state()
-                        )  # in-memory, zero latency
-                    else:
-                        try:
-                            _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(
-                                timeout_s=3.0
-                            )
-                        except Exception:
-                            _oracle_snap = {}
-                    _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
-                    if not isinstance(_oracle_snap, dict):
-                        _oracle_snap = {}
-                    if _oracle_lat_ms > 500:
-                        _EXP_LOG.debug(
-                            f"[MINER] Oracle enrichment {_oracle_lat_ms:.0f}ms "
-                            f"— mining with {'cached DM' if _cached_dm_age < 120 else 'local entropy'}"
-                        )
+            _REJECTED_HEIGHT_NONCES = {}
 
-                    # STAGE 1: Fetch chain tip
-                    _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
-                    # _rpc fall-through bug: server JSON-RPC error {"error":{...}} is
-                    # truthy but has no 'height'/'tip_hash' keys — treat as failure so
-                    # the NULL_HASH gate never fires on a bad response.
-                    if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
-                        _EXP_LOG.warning(
-                            "[MINER] chain tip fetch failed "
-                            f"({'RPC error: ' + str(_res_h.get('error', '?')) if isinstance(_res_h, dict) else 'None'})"
-                            ", retrying…"
-                        )
-                        await _asyncio.sleep(2.0)
-                        continue
-                    oracle_height = int(_res_h.get("height", 0))
-                    oracle_hash = str(_res_h.get("tip_hash") or _NULL_HASH)
-                    # Get server's current difficulty (from block height response or dedicated call)
-                    _server_difficulty = int(_res_h.get("difficulty", 0) or 0)
-
-                    # ── GATE 1: Genesis is valid (h=0 with hash="0"*64 is canonical genesis) ──
-                    # Refuse only if hash is genuinely missing/null AND height > 0 (would fork)
-                    if oracle_hash == _NULL_HASH and oracle_height > 0:
-                        _EXP_LOG.error(
-                            f"[MINER] ❌ tip_hash is null at h={oracle_height} — "
-                            f"refusing to mine off null parent (would create fork). "
-                            f"Waiting for valid tip…"
-                        )
-                        print(
-                            f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip",
-                            flush=True,
-                        )
-                        await _asyncio.sleep(5.0)
-                        continue
-
-                    # If oracle_hash is null at height=0, accept genesis
-                    if oracle_hash == _NULL_HASH and oracle_height == 0:
-                        logger.debug(
-                            f"[MINER] ✅ Genesis block at h=0 (canonical hash=0x0…0)"
-                        )
-                        oracle_hash = _NULL_HASH  # Canonical genesis hash
-
-                    # Oracle height sync (advisory only — no block)
-                    _snap_height = (
-                        int(
-                            _oracle_snap.get("block_height")
-                            or _oracle_snap.get("height")
-                            or 0
-                        )
-                        if isinstance(_oracle_snap, dict)
-                        else 0
-                    )
-                    if _snap_height > 0 and abs(_snap_height - oracle_height) > 5:
-                        _EXP_LOG.debug(
-                            f"[MINER] Oracle snap h={_snap_height} vs chain h={oracle_height} "
-                            f"— proceeding with chain tip (oracle is advisory)"
-                        )
-
-                    # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
-                    _difficulty_bits = 4  # fallback default
+            async def pow_task():
+                while True:
                     try:
-                        _config_res = kapi._rpc_http(
-                            "/rpc/config/difficulty", method="GET", timeout=5
-                        ) if hasattr(kapi, "_rpc_http") else None
-                        if _config_res and isinstance(_config_res, dict):
-                            _difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
-                    except Exception as _e:
-                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/difficulty: {_e}")
-                    
-                    # Fallback: query block difficulty if RPC config fails
-                    _res_b_raw = kapi._rpc(
-                        "qtcl_getBlock", [oracle_height], timeout=8, retries=2
-                    )
-                    _res_b = (
-                        _res_b_raw
-                        if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw
-                        else {}
-                    )
-                    _block_diff = int(
-                        _res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0
-                    )
-                    # Use authoritative config difficulty, fallback to block difficulty
-                    if _difficulty_bits > 0:
-                        difficulty_bits = _difficulty_bits
-                    elif _server_difficulty > 0:
-                        difficulty_bits = max(_server_difficulty, _block_diff)
-                    else:
-                        difficulty_bits = _block_diff if _block_diff > 0 else 4
-
-                    # STAGE 3: Fetch mempool
-                    _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
-                    _pending_user_txs = _res_m if isinstance(_res_m, list) else []
-
-                    _EXP_LOG.warning(
-                        f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms"
-                    )
-
-                    if _force_next_height > 0:
-                        target_height = _force_next_height
-                        parent_hash = oracle_hash
-                        _EXP_LOG.warning(
-                            f"[MINER] ⬆️  HEIGHT FORCED: target={target_height} (server signal, oracle_height={oracle_height})"
-                        )
-                        _force_next_height = 0
-                    else:
+                        _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
+                        if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
+                            await _asyncio.sleep(2.0)
+                            continue
+                        oracle_height = int(_res_h.get("height", 0))
+                        oracle_hash = str(_res_h.get("tip_hash") or _NULL_HASH)
                         target_height = oracle_height + 1
-                        parent_hash = oracle_hash
 
-                    if target_height in _confirmed_heights:
-                        _EXP_LOG.warning(
-                            f"[MINER] ⏭️  Skipping h={target_height}: already confirmed this session"
-                        )
-                        await _asyncio.sleep(1.0)
-                        continue
-
-                    timestamp = int(_t.time())
-                    miner_addr = (
-                        getattr(getattr(self, "wallet", None), "address", "0" * 64)
-                        or "0" * 64
-                    )
-
-                    # ── STAGE 2: Quantum PoW seed from live oracle snap ────────────
-                    # CRITICAL: Entropy seed MUST be deterministic (no time-based randomness)
-                    # If oracle unavailable, derive from immutable block parameters
-                    _dm_hex = _oracle_snap.get("density_matrix_hex", "")
-                    if _dm_hex and len(_dm_hex) > 32:
-                        # Method 1: Oracle-based entropy (when oracle provides DM)
-                        _w_entropy_seed = _hl.sha3_256(
-                            bytes.fromhex(_dm_hex[:64])
-                            + target_height.to_bytes(8, "big")
-                            + bytes.fromhex(parent_hash[:32])
-                        ).digest()
-                        _EXP_LOG.info(
-                            f"[MINER-ENTROPY] 🔮 METHOD=ORACLE dm_len={len(_dm_hex)} entropy={_w_entropy_seed.hex()}"
-                        )
-                    else:
-                        # Method 2: Deterministic fallback (no time-based randomness!)
-                        # Use only immutable block parameters: parent + height + timestamp
-                        # This ensures the same entropy seed is always generated for the same block
-                        _w_entropy_seed = _hl.sha3_256(
-                            parent_hash.encode()
-                            + target_height.to_bytes(8, "big")
-                            + timestamp.to_bytes(
-                                8, "big"
-                            )  # timestamp is now fixed (refreshed once per block)
-                        ).digest()
-                        _EXP_LOG.warning(
-                            f"[MINER-ENTROPY] ⚠️  METHOD=DETERMINISTIC_FALLBACK (oracle unavailable) entropy={_w_entropy_seed.hex()}"
-                        )
-
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 3: Build block — coinbases from server template + user TXs
-                    # ──────────────────────────────────────────────────────────────
-                    # COHERENT PIPELINE:
-                    #   1. Fetch coinbase template from server (authoritative rewards + pending treasury)
-                    #   2. Build coinbase txs with DETERMINISTIC IDs matching what server expects
-                    #   3. Compute merkle root over FULL tx list [miner_cb, treasury_cb, ...user_txs]
-                    #   4. Do PoW (merkle baked into header hash)
-                    #   5. Submit block with FULL tx list — server validates & persists AS-IS
-                    # ──────────────────────────────────────────────────────────────
-
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 3: Build block — UTXO coinbases + user TXs
-                    # ──────────────────────────────────────────────────────────────
-                    # COHERENT PIPELINE:
-                    #   1. Fetch reward schedule from server (base units)
-                    #   2. Build UTXO coinbase txs with outputs for miner + treasury
-                    #   3. Include mempool user txs (already in UTXO format)
-                    #   4. Compute merkle root over FULL tx list
-                    #   5. Do PoW (merkle baked into header hash)
-                    #   6. Submit block with FULL tx list + oracle attestations
-                    # ──────────────────────────────────────────────────────────────
-
-                    _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
-
-                    # Fetch scheduled rewards from server (base units: 1 QTCL = 100)
-                    _miner_reward_base = 720   # 7.2 QTCL
-                    _treasury_reward_base = 80  # 0.8 QTCL
-                    try:
-                        _sched = kapi._rpc("qtcl_getBlock", [max(target_height - 1, 0)], timeout=5, retries=1)
-                        if isinstance(_sched, dict):
-                            # Use TessellationRewardSchedule if available locally
-                            try:
-                                from globals import TessellationRewardSchedule as _TRS
-                                _miner_reward_base = _TRS.get_miner_reward_base(target_height)
-                                _treasury_reward_base = _TRS.get_treasury_reward_base(target_height)
-                                _treasury_addr = _TRS.TREASURY_ADDRESS
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                    # Sum fees from pending user txs (base units)
-                    _total_fees_base = 0
-                    for tx in _pending_user_txs:
-                        _fee = tx.get("fee_base", tx.get("fee", 0))
-                        try:
-                            _total_fees_base += int(_fee * 100) if isinstance(_fee, float) else int(_fee)
-                        except (ValueError, TypeError):
-                            pass
-
-                    _miner_total_base = _miner_reward_base + (_total_fees_base // 2)
-                    _treasury_total_base = _treasury_reward_base + (_total_fees_base - (_total_fees_base // 2))
-
-                    # ── Build miner coinbase TX (UTXO format) ─────────────
-                    _miner_cb_id = _hl.sha3_256(
-                        f"COINBASE:{target_height}:{miner_addr}:{_miner_total_base}:{_w_entropy_seed.hex()}".encode()
-                    ).hexdigest()
-                    _miner_cb = {
-                        "tx_id": _miner_cb_id,
-                        "version": 1,
-                        "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "miner"}}],
-                        "outputs": [{"address": miner_addr, "amount_base": _miner_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}],
-                        "tx_type": "coinbase",
-                        "w_entropy_hash": _w_entropy_seed.hex(),
-                        "block_height": target_height,
-                    }
-
-                    # ── Build treasury coinbase TX (UTXO format) ─────────────
-                    _treasury_cb_id = _hl.sha3_256(
-                        f"TREASURY_COINBASE:{target_height}:{_treasury_addr}:{_treasury_total_base}:{_w_entropy_seed.hex()}".encode()
-                    ).hexdigest()
-                    _treasury_cb = {
-                        "tx_id": _treasury_cb_id,
-                        "version": 1,
-                        "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "treasury"}}],
-                        "outputs": [{"address": _treasury_addr, "amount_base": _treasury_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}],
-                        "tx_type": "coinbase",
-                        "w_entropy_hash": _w_entropy_seed.hex(),
-                        "block_height": target_height,
-                    }
-
-                    _block_txs = [_miner_cb, _treasury_cb]
-                    _block_txs.extend(_pending_user_txs)
-
-                    # Compute merkle root (SHA3-256 binary tree) — UTXO canonical
-                    def _compute_merkle(tx_list: list) -> str:
-                        """Compute merkle root over UTXO-format transactions."""
-                        if not tx_list:
-                            return _hl.sha3_256(b"").hexdigest()
-
-                        def _tx_hash(tx: dict) -> str:
-                            """Hash UTXO transaction canonically (matches server validation)."""
-                            tx_type = tx.get("tx_type", "transfer")
-                            if tx_type in ("coinbase", "miner_reward", "treasury_reward"):
-                                canonical = _j.dumps(
-                                    {
-                                        "tx_id": tx.get("tx_id", ""),
-                                        "version": tx.get("version", 1),
-                                        "inputs": tx.get("inputs", []),
-                                        "outputs": tx.get("outputs", []),
-                                        "tx_type": tx_type,
-                                        "w_entropy_hash": tx.get("w_entropy_hash", ""),
-                                        "block_height": tx.get("block_height", 0),
-                                    },
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                )
-                            else:
-                                # Regular UTXO TX: exclude signature/script_sig signatures
-                                _clean = {
-                                    "tx_id": tx.get("tx_id", ""),
-                                    "version": tx.get("version", 1),
-                                    "inputs": [
-                                        {
-                                            "prev_tx_hash": inp.get("prev_tx_hash", ""),
-                                            "prev_output_index": inp.get("prev_output_index", 0),
-                                        }
-                                        for inp in tx.get("inputs", [])
-                                    ],
-                                    "outputs": tx.get("outputs", []),
-                                    "tx_type": tx_type,
-                                }
-                                canonical = _j.dumps(_clean, sort_keys=True, separators=(",", ":"))
-                            return _hl.sha3_256(canonical.encode()).hexdigest()
-
-                        hashes = [_tx_hash(tx) for tx in tx_list]
-                        while len(hashes) > 1:
-                            if len(hashes) % 2:
-                                hashes.append(hashes[-1])
-                            hashes = [
-                                _hl.sha3_256((hashes[i] + hashes[i + 1]).encode()).hexdigest()
-                                for i in range(0, len(hashes), 2)
-                            ]
-                        return hashes[0]
-
-                    merkle_root = _compute_merkle(_block_txs)
-
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 4: QTCL-PoW (matches server qtcl_pow_hash exactly)
-                    # SHAKE-256 512KB scratchpad → SHA3-256 struct header →
-                    # 64 sequential scratchpad-mix rounds per nonce
-                    # Scratchpad built ONCE per block from oracle seed
-                    # Multi-threaded: hashlib releases the GIL, so N threads × full
-                    # core throughput.  Chain-tip poll runs in its own thread so it
-                    # never stalls the hash workers.
-                    # ──────────────────────────────────────────────────────────────
-                    import struct as _st, os as _os2, threading as _thr2, queue as _q2
-
-                    # ❤️  Refresh timestamp right before PoW — maximises 120s entropy window
-                    timestamp = int(_t.time())
-                    _POW_SCRATCHPAD_BYTES = 512 * 1024
-                    _POW_WINDOW_BYTES = 64
-                    _POW_MIX_ROUNDS = 64
-                    _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
-
-                    # Build scratchpad once (~1.7ms), shared read-only across threads
-                    # PERF-FIX: wrap in memoryview → zero-copy 64-byte window reads in hot loop
-                    # (bytes slice creates new object each read — at 64 rounds × N threads × kH/s
-                    #  that is millions of tiny allocs/sec → GC stalls → hash rate collapses)
-                    _scratchpad_bytes = _hl.shake_256(
-                        b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed
-                    ).digest(_POW_SCRATCHPAD_BYTES)
-                    _sp_mv = memoryview(_scratchpad_bytes)  # zero-copy slicing
-
-                    # Pre-pack fixed header fields (immutable, safe to share)
-                    _ph_parent = bytes.fromhex(parent_hash.zfill(64))[:32]
-                    _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
-                    _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
-                    _ph_seed = _w_entropy_seed[:32]
-
-                    # PERF-FIX: pre-pack all 64 round suffix bytes once — eliminates
-                    # _st.pack('>I', rnd) allocation inside the 64-round inner loop
-                    _rnd_packed = [_st.pack(">I", r) for r in range(_POW_MIX_ROUNDS)]
-
-                    # Capture locals for worker closures
-                    _tgt_h = target_height
-                    _ts = timestamp
-                    _diff = difficulty_bits
-                    _ws = _POW_WINDOW_BYTES
-                    _nwin = _POW_N_WINDOWS
-                    _mix = _POW_MIX_ROUNDS
-                    _rp = _rnd_packed
-                    _smv = _sp_mv
-
-                    # PERF-FIX: pre-compute all window start offsets as tuple —
-                    # eliminates wi*_ws multiply + memoryview __getitem__ per round
-                    _WIN_OFFSETS = tuple(
-                        i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS)
-                    )
-                    _WIN_END = (
-                        _POW_WINDOW_BYTES  # constant end offset relative to start
-                    )
-
-                    # PERF-FIX: pre-compute POW prefix as bytes once — eliminates
-                    # b"QTCL_POW_v1:" + hdr concat alloc on every nonce
-                    _POW_PREFIX = b"QTCL_POW_v1:"
-                    _HDR_FMT = ">Q I 32s 32s I I 40s 32s"
-                    # PERF-FIX: pre-compute range object — range() inside a function call
-                    # still constructs a new range object each invocation in Python 3
-                    _RND_RANGE = range(_POW_MIX_ROUNDS)
-
-                    # _qtcl_hash kept for external/test reference only — hot path is inlined
-                    def _qtcl_hash(nonce: int) -> str:
-                        hdr = _st.pack(
-                            _HDR_FMT,
-                            _tgt_h,
-                            _ts,
-                            _ph_parent,
-                            _ph_merkle,
-                            _diff,
-                            nonce,
-                            _ph_miner,
-                            _ph_seed,
-                        )
-                        _h0 = _hl.sha3_256()
-                        _h0.update(_POW_PREFIX)
-                        _h0.update(hdr)
-                        state = _h0.digest()
-                        for rnd in _RND_RANGE:
-                            wi = _st.unpack_from(">I", state, 0)[0] % _nwin
-                            o = _WIN_OFFSETS[wi]
-                            _h = _hl.sha3_256()
-                            _h.update(state)
-                            _h.update(_smv[o : o + _WIN_END])
-                            _h.update(_rp[rnd])
-                            state = _h.digest()
-                        return state.hex()
-
-                    _n_workers = max(1, (_os2.cpu_count() or 1))
-                    _result_q = _q2.Queue()
-                    _abort_evt = _thr2.Event()  # set to stop all workers
-                    _nonce_lock = _thr2.Lock()  # ❤️  guards counter across N workers
-                    _nonce_ctr = [0]
-                    _hex_zeros = "0" * difficulty_bits
-                    _BLOCK_TTL_S = 270
-                    _block_start = _t.time()
-
-                    def _pow_worker(start_nonce: int, stride: int) -> None:
-                        """⛏️  Hot-path PoW worker — fully inlined, zero per-nonce allocs except
-                        one struct.pack (unavoidable: nonce changes).  GC disabled for duration."""
-                        import gc as _gc
-
-                        _gc.disable()
-                        try:
-                            # ── bind all names to locals once (LOAD_FAST vs LOAD_DEREF) ──
-                            _sha3 = _hl.sha3_256
-                            _pack = _st.pack
-                            _unpack = _st.unpack_from
-                            _fmt = _HDR_FMT
-                            _pfx = _POW_PREFIX
-                            _th = _tgt_h
-                            _ts2 = _ts
-                            _df = _diff
-                            _pp = _ph_parent
-                            _pm2 = _ph_merkle
-                            _pmin = _ph_miner
-                            _ps = _ph_seed
-                            _nw = _nwin
-                            _rr = _RND_RANGE
-                            _mv = _smv
-                            _rp2 = _rp
-                            _woffs = _WIN_OFFSETS
-                            _wend = _WIN_END
-                            _abort = _abort_evt.is_set
-                            _put = _result_q.put
-                            _set = _abort_evt.set
-                            _zeros = _hex_zeros
-                            _dbits = difficulty_bits
-                            _nl = _nonce_lock
-                            n = start_nonce
-                            lc = 0
-                            _ctr = _nonce_ctr
-                            while not _abort():
-                                # ── one struct.pack alloc (nonce-dependent, unavoidable) ──
-                                hdr = _pack(
-                                    _fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps
-                                )
-                                _h0 = _sha3()
-                                _h0.update(_pfx)
-                                _h0.update(hdr)
-                                state = _h0.digest()
-                                # ── 64 rounds: zero allocs ──────────────────────────────
-                                for rnd in _rr:
-                                    o = _woffs[_unpack(">I", state, 0)[0] % _nw]
-                                    _h = _sha3()
-                                    _h.update(state)
-                                    _h.update(_mv[o : o + _wend])  # zero-copy mv slice
-                                    _h.update(_rp2[rnd])  # pre-packed constant
-                                    state = _h.digest()
-                                lc += 1
-                                hx = state.hex()  # compute once
-                                if hx[:_dbits] == _zeros:
-                                    _put((n, hx))
-                                    _set()
-                                    return
-                                n += stride
-                                if lc & 511 == 0:
-                                    with _nl:
-                                        _ctr[0] += 512  # ❤️  atomic
-                        finally:
-                            _gc.enable()
-
-                    _EXP_LOG.warning(
-                        f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} "
-                        f"seed={_w_entropy_seed.hex()[:16]}… scratchpad=512KB "
-                        f"workers={_n_workers}"
-                    )
-                    _MINE_TELEM.update_progress(
-                        target_height, difficulty_bits, 0, parent_hash
-                    )
-                    _MINE_TELEM.mark_mining()
-
-                    # Launch worker threads (hashlib C calls release the GIL)
-                    _workers = []
-                    for _wi in range(_n_workers):
-                        _wt = _thr2.Thread(
-                            target=_pow_worker,
-                            args=(_wi, _n_workers),
-                            daemon=True,
-                            name=f"PoW-{_wi}",
-                        )
-                        _wt.start()
-                        _workers.append(_wt)
-
-                    # ═══════════════════════════════════════════════════════════════════════
-                    # EVENT-DRIVEN MINING LOOP — Pure Events, No Polling
-                    # ═══════════════════════════════════════════════════════════════════════
-                    # Wait for one of three events:
-                    #   1. PoW solution found (workers put result in queue)
-                    #   2. Chain advance signal from P2P/server (via _CHAIN_ADVANCE_EVENT)
-                    #   3. Block TTL expiration
-                    # ═══════════════════════════════════════════════════════════════════════
-                    _chain_advanced = False
-                    _ttl_expired = False
-                    _last_telem_nonce = 0
-
-                    while not _abort_evt.is_set():
-                        await _asyncio.sleep(
-                            0.05
-                        )  # 50ms event loop yield (faster response)
-                        _cur_nonce = _nonce_ctr[0]
-                        if _cur_nonce != _last_telem_nonce:
-                            _MINE_TELEM.update_progress(
-                                target_height, difficulty_bits, _cur_nonce, parent_hash
-                            )
-                            _last_telem_nonce = _cur_nonce
-
-                        # Block TTL check — abort and rebuild before server entropy expires
-                        if _t.time() - _block_start > _BLOCK_TTL_S:
-                            _EXP_LOG.warning(
-                                f"[MINER] ⏰ Block TTL ({_BLOCK_TTL_S}s) reached at "
-                                f"nonce={_cur_nonce:,} — rebuilding with fresh seed/timestamp"
-                            )
-                            _ttl_expired = True
-                            _abort_evt.set()
-                            break
-
-                        # ── EVENT 1: P2P/Server Chain Advance Signal ─────────────────────────
-                        # Check if P2P layer signaled chain advance (non-blocking)
-                        _new_height = check_chain_advance()
-                        if _new_height > 0 and _new_height > oracle_height:
-                            _EXP_LOG.warning(
-                                f"[MINER] ⚡ Chain advance EVENT h={_new_height} "
-                                f"(was h={oracle_height}) → abort mining, restart"
-                            )
-                            _chain_advanced = True
-                            _force_next_height = _new_height  # Update target height
-                            _abort_evt.set()
-                            break
-
-                    # ❤️  Join first — no put/get_nowait race, no silent drops
-                    for _wt in _workers:
-                        _wt.join(timeout=2.0)
-                    nonce, block_hash = None, None
-                    while not _result_q.empty():
-                        try:
-                            _r = _result_q.get_nowait()
-                            if nonce is None:
-                                nonce, block_hash = _r
-                        except _q2.Empty:
-                            break
-
-                    _found = block_hash is not None
-
-                    # 🔍 DEBUG: Log exact PoW computation inputs and result
-                    if _found:
-                        _EXP_LOG.info(
-                            f"[MINER-POW-DEBUG] ⛏️  FOUND height={target_height} nonce={nonce} hash={block_hash}"
-                        )
-                        _EXP_LOG.info(
-                            f"[MINER-POW-DEBUG] parent={parent_hash[:16]}… merkle={merkle_root[:16]}… timestamp={_ts} miner={miner_addr[:16]}… diff={_diff}"
-                        )
-                        _EXP_LOG.info(
-                            f"[MINER-POW-DEBUG] entropy_seed={_w_entropy_seed.hex()} (len={len(_w_entropy_seed)})"
-                        )
-                        _POW_SCRATCHPAD_PFX = b"QTCL_SCRATCHPAD_v1:"
-                        _EXP_LOG.info(
-                            f"[MINER-POW-DEBUG] scratchpad_input={(_POW_SCRATCHPAD_PFX + _w_entropy_seed).hex()[:64]}…"
-                        )
-
-                    if not _found or _chain_advanced or _ttl_expired:
-                        if _ttl_expired:
-                            _EXP_LOG.info(
-                                "[MINER] TTL expired, rebuilding block with fresh oracle seed…"
-                            )
-                        else:
-                            _EXP_LOG.info(
-                                "[MINER] Chain advanced during mining, restarting…"
-                            )
-                        _MINE_TELEM.mark_idle()
-                        await _asyncio.sleep(0.1)
-                        continue
-
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 5: Build submission payload (atomic quantum state lock)
-                    # ──────────────────────────────────────────────────────────────
-                    # pq0   = oracle ground anchor — dominant eigenstate of the DM
-                    #         (index 0-7 of max diagonal element)
-                    # pq_last = parent block height (or 0)
-                    # pq_curr = current block height = parent height + 1
-                    try:
-                        _parent_pq_curr = int(_res_b.get("pq_curr") or 0)
-                        _parent_pq_last = int(_res_b.get("pq_last") or 0)
-                        # Blockfield boundary evolution:
-                        # rear boundary = parent's pq_curr (raw block height)
-                        pq_last = _parent_pq_curr
-                        # forward boundary = parent's pq_curr + 1 (next block height)
-                        pq_curr = _parent_pq_curr + 1
-                        # oracle ground anchor from DM dominant diagonal
-                        _ora_snap = (
-                            _LIVE_RPC_ORACLE.get_oracle_state() or {}
-                        )  # cached — no network
-                        _dmh = _ora_snap.get("density_matrix_hex", "")
-                        pq0 = 0
-                        if _dmh and len(_dmh) >= 128:
-                            # Parse first 8 diagonal elements (stride 32 chars each for complex128)
-                            # diagonal[i] at byte offset i*(8+8) = i*16 bytes = i*32 hex chars
-                            _stride = (
-                                len(_dmh) // 64
-                            )  # 32 for complex128, 16 for complex64
-                            _diag = []
-                            for _di in range(8):
-                                _off = (
-                                    _di * 9 * _stride
-                                )  # diagonal index i*i + i offset in flat 8x8
-                                if _stride == 32:  # complex128
-                                    _off2 = (
-                                        _di * 9 * 16 * 2
-                                    )  # row*8+col, flat, bytes→hex
-                                    # simpler: diagonal element i is at flat index i*8+i = i*9
-                                    _hex8 = _dmh[
-                                        _di * 9 * 32 : _di * 9 * 32 + 16
-                                    ]  # re bytes
-                                else:
-                                    _hex8 = _dmh[_di * 9 * 16 : _di * 9 * 16 + 8]
-                                try:
-                                    import struct as _st2
-
-                                    _b8 = bytes.fromhex(_hex8.ljust(16, "0")[:16])
-                                    _re = (
-                                        _st2.unpack("<d", _b8)[0]
-                                        if _stride == 32
-                                        else _st2.unpack(
-                                            "<f", bytes.fromhex(_hex8.ljust(8, "0")[:8])
-                                        )[0]
-                                    )
-                                    _diag.append((_re, _di))
-                                except Exception:
-                                    _diag.append((0.0, _di))
-                            pq0 = max(_diag, key=lambda x: x[0])[1] if _diag else 0
-                    except Exception as _pq_e:
-                        _EXP_LOG.debug(f"[MINER] pq boundary derivation: {_pq_e}")
-                        pq_last = int(_res_b.get("pq_curr") or 0)
-                        pq_curr = pq_last + 1
-                        pq0 = 0
-
-                    # ── QUANTUM ORACLE MESH: Fetch pre-computed snapshot for block field ───────────────
-                    # Snapshot captured BEFORE block solve loop (race prevention)
-                    _mesh_snap = None
-                    if self._oracle_mesh:
-                        _mesh_snap = self._oracle_mesh.get_snapshot()
-
-                    if _mesh_snap is not None and isinstance(
-                        _mesh_snap, ClientQuantumSnapshot
-                    ):
-                        # ── Use quantum snapshot fields from mesh ────────────────────────
-                        block_quantum_field_hex = _mesh_snap.block_field_tensor_hex
-                        quantum_w_state_fidelity = _mesh_snap.w_state_fidelity
-                        quantum_mermin_value = _mesh_snap.mermin_value
-                        quantum_mermin_violated = _mesh_snap.mermin_violated
-                        quantum_purity = _mesh_snap.purity
-                        quantum_entropy = _mesh_snap.von_neumann_entropy
-                        quantum_coherence = _mesh_snap.coherence_l1
-                        quantum_concurrence = _mesh_snap.concurrence
-                        quantum_genesis_mode = _mesh_snap.genesis_mode
-                        quantum_stream_count = _mesh_snap.stream_count
-                        quantum_measurement_counts = _mesh_snap.measurement_counts
-                        _EXP_LOG.info(
-                            f"[MINER] ✅ Using quantum mesh snapshot (fidelity={quantum_w_state_fidelity:.4f})"
-                        )
-                    else:
-                        # ── FALLBACK: Gaussian generation (existing code) ──────────────────────────
-                        block_quantum_field_hex = ""
-                        quantum_w_state_fidelity = 0.0
-                        quantum_mermin_value = 0.0
-                        quantum_mermin_violated = False
-                        quantum_purity = 0.0
-                        quantum_entropy = 0.0
-                        quantum_coherence = 0.0
-                        quantum_concurrence = 0.0
-                        quantum_genesis_mode = True
-                        quantum_stream_count = 0
-                        quantum_measurement_counts = {}
-                        try:
-                            import numpy as _np_aer
-                            import hashlib as _h_aer
-
-                            # Seed RNG from block values
-                            _seed_data = f"{pq_curr}:{pq_last}:{block_hash}".encode()
-                            _seed_hash = _h_aer.sha256(_seed_data).digest()
-                            _rng_seed = int.from_bytes(_seed_hash[:4], "big")
-                            _np_aer.random.seed(_rng_seed)
-
-                            # Create 16³ field: W-state with Gaussian envelope (reduced from 64³ = 2000× smaller)
-                            _field = _np_aer.zeros(
-                                (16, 16, 16), dtype=_np_aer.complex64
-                            )
-                            _x = pq_curr % 16
-                            _y = pq_last % 16
-                            _z = int(block_hash[:8], 16) % 16
-
-                            for _i in range(16):
-                                for _y_idx in range(16):
-                                    for _k in range(16):
-                                        _dx, _dy, _dz = (
-                                            (_i - _x),
-                                            (_y_idx - _y),
-                                            (_k - _z),
-                                        )
-                                        _r_sq = _dx * _dx + _dy * _dy + _dz * _dz
-                                        _envelope = _np_aer.exp(
-                                            -_r_sq / 64.0
-                                        )  # Updated scaling for 16³
-                                        _phase = (
-                                            2 * _np_aer.pi * (pq_curr + pq_last) / 16.0
-                                        )
-                                        _phase += (
-                                            2
-                                            * _np_aer.pi
-                                            * int(block_hash[:4], 16)
-                                            / 65536.0
-                                        )
-                                        _amp = _envelope / _np_aer.sqrt(
-                                            4096.0
-                                        )  # 16³ = 4096 normalization
-                                        _field[_i, _y_idx, _k] = _amp * _np_aer.exp(
-                                            1j * _phase
-                                        )
-
-                            # Normalize
-                            _trace = _np_aer.sum(_np_aer.abs(_field) ** 2)
-                            if _trace > 1e-12:
-                                _field = _field / _np_aer.sqrt(_trace)
-
-                            # Encode as hex
-                            block_quantum_field_hex = (
-                                _np_aer.asarray(_field, dtype=_np_aer.complex64)
-                                .tobytes()
-                                .hex()
-                            )
-                            _EXP_LOG.debug(
-                                f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)"
-                            )
-
-                            # ── Store local measurement in database ──────────────────────────
-                            try:
-                                self.db.store_dm_measurement(
-                                    pq_curr,
-                                    "local",
-                                    block_quantum_field_hex,
-                                    {
-                                        "pq_curr": pq_curr,
-                                        "pq_last": pq_last,
-                                        "block_hash": block_hash,
-                                    },
-                                )
-                                _EXP_LOG.debug(
-                                    f"[MINER] Stored local measurement for block {pq_curr}"
-                                )
-                            except Exception as _store_local_e:
-                                _EXP_LOG.debug(
-                                    f"[MINER] Store local measurement failed: {_store_local_e}"
-                                )
-
-                            # ── Compute quantum consensus: merge with server + peer SSE snapshots ──
-                            try:
-                                _consensus_dm = self.merge_with_peer_consensus(
-                                    block_quantum_field_hex
-                                )
-                                if (
-                                    _consensus_dm
-                                    and _consensus_dm != block_quantum_field_hex
-                                ):
-                                    _EXP_LOG.info(
-                                        f"[MINER] ✅ Quantum mesh consensus: merged local + server + peers"
-                                    )
-                                    block_quantum_field_hex = _consensus_dm
-                                else:
-                                    _EXP_LOG.debug(
-                                        f"[MINER] Using local 16³ measurement (no consensus available)"
-                                    )
-                            except Exception as _consensus_e:
-                                _EXP_LOG.debug(
-                                    f"[MINER] Mesh consensus failed: {_consensus_e}, using local"
-                                )
-                        except Exception as _aer_e:
-                            _EXP_LOG.warning(
-                                f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)"
-                            )
-
-                    # Fidelity priority:
-                    #  1. self._local_fused_fid  — tripartite joint W4 (most current)
-                    #  2. client_field.metrics.fidelity_to_w3 — field measurement
-                    #  3. _LIVE_RPC_ORACLE oracle_state — upstream Koyeb snapshot
-                    #  4. 0.75 fallback
-                    w_state_fidelity = 0.75
-                    try:
-                        _lff = float(getattr(self, "_local_fused_fid", 0.0))
-                        if 0.01 < _lff <= 1.0:
-                            w_state_fidelity = _lff
-                        elif self.client_field and self.client_field.metrics:
-                            _fid = self.client_field.metrics.fidelity_to_w3
-                            if _fid is not None and 0.01 <= float(_fid) <= 1.0:
-                                w_state_fidelity = float(_fid)
-                        else:
-                            _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
-                            _up_fid = float(
-                                _ora_state.get("upstream_fidelity")
-                                or _ora_state.get("w_upstream")
-                                or 0.0
-                            )
-                            if 0.01 < _up_fid <= 1.0:
-                                w_state_fidelity = _up_fid
-                    except Exception:
-                        pass
-
-                    # ── Mermin quantum proof: compute from density matrix ──
-                    mermin_value = 0.0
-                    mermin_violated = False
-                    try:
-                        _dmh = (
-                            _ora_snap.get("density_matrix_hex", "") if _ora_snap else ""
-                        )
-                        if _dmh and len(_dmh) >= 128:
-                            import numpy as _np_m
-
-                            # Parse density matrix from hex
-                            _bdata = bytes.fromhex(_dmh)
-                            _n = int(
-                                (len(_bdata) / 16) ** 0.5
-                            )  # 16 bytes per complex128 element
-                            if _n >= 2:
-                                _dm = _np_m.zeros((_n, _n), dtype=complex)
-                                for _ri in range(_n):
-                                    for _ci in range(_n):
-                                        _off = (_ri * _n + _ci) * 16
-                                        if _off + 16 <= len(_bdata):
-                                            _re = _np_m.frombuffer(
-                                                _bdata[_off : _off + 8],
-                                                dtype=_np_m.float64,
-                                            )[0]
-                                            _im = _np_m.frombuffer(
-                                                _bdata[_off + 8 : _off + 16],
-                                                dtype=_np_m.float64,
-                                            )[0]
-                                            _dm[_ri, _ci] = _re + 1j * _im
-                                # Mermin-Klyshko inequality for 3-qubit W state
-                                sx = _np_m.array([[0, 1], [1, 0]], dtype=complex)
-                                sy = _np_m.array([[0, -1j], [1j, 0]], dtype=complex)
-
-                                def _op(a, b, c):
-                                    return _np_m.kron(_np_m.kron(a, b), c)
-
-                                M3 = (
-                                    _op(sx, sx, sx)
-                                    - _op(sx, sy, sy)
-                                    - _op(sy, sx, sy)
-                                    - _op(sy, sy, sx)
-                                )
-                                mermin_value = float(_np_m.real(_np_m.trace(_dm @ M3)))
-                                mermin_violated = abs(mermin_value) > 2.0
-                    except Exception as _mermin_err:
-                        _EXP_LOG.debug(f"[MINER] Mermin computation: {_mermin_err}")
-
-                    # ── Standardized block submission payload (flat structure for server compatibility) ──
-                    # Build oracle attestations if running in oracle mode
-                    _oracle_attestations = []
-                    if getattr(self, "_oracle_node", None) and self._oracle_node.is_active():
-                        _att = self._oracle_node.attest_block({
-                            "height": target_height,
-                            "parent_hash": parent_hash,
-                            "merkle_root": merkle_root,
-                            "timestamp": timestamp,
-                            "difficulty": difficulty_bits,
-                            "nonce": nonce,
-                            "miner_address": miner_addr,
-                        }, block_hash)
-                        if _att:
-                            _oracle_attestations.append(_att)
-                            _EXP_LOG.info(f"[MINER] 🔮 Oracle attestation added: {_att.get('oracle_id', '?')}")
-
-                    submit_payload = {
-                        "height": target_height,
-                        "block_hash": block_hash,
-                        "parent_hash": parent_hash,
-                        "merkle_root": merkle_root,
-                        "timestamp": timestamp,
-                        "nonce": nonce,
-                        "miner_address": miner_addr,
-                        "difficulty_bits": difficulty_bits,
-                        "w_entropy_hash": _w_entropy_seed.hex(),
-                        "w_state_fidelity": round(w_state_fidelity, 4),
-                        "pq0": pq0,
-                        "pq_curr": pq_curr,
-                        "pq_last": pq_last,
-                        "mermin_value": round(mermin_value, 6),
-                        "mermin_violated": mermin_violated,
-                        "quantum_field_16x16x16": block_quantum_field_hex,
-                        "transactions": _block_txs,
-                        "oracle_attestations": _oracle_attestations,
-                    }
-
-                    # ── HypΓ-sign the block (must be before submission) ──
-                    _sig = None
-                    _sign_retries = 3
-                    for _sign_attempt in range(_sign_retries):
-                        try:
-                            if (
-                                self.wallet
-                                and self.wallet.is_loaded()
-                                and self.wallet.private_key
-                            ):
-                                # Sign the block payload (excluding signature field)
-                                _block_for_sig = {
-                                    k: v
-                                    for k, v in submit_payload.items()
-                                    if k
-                                    not in ("hyp_signature", "hyp_sig", "miner_pubkey")
-                                }
-                                _sig = self.wallet.sign_transaction(_block_for_sig)
-                                if _sig and not _sig.get("error"):
-                                    # Keep _sig as dict for telemetry, but serialize for submission
-                                    # (signature dict contains complex nested objects like R, Z that aren't JSON-serializable)
-                                    submit_payload["hyp_signature"] = json.dumps(
-                                        _sig, default=str
-                                    )
-                                    submit_payload["miner_public_key_hex"] = (
-                                        self.wallet.public_key or ""
-                                    )
-                                    _EXP_LOG.info(
-                                        f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…"
-                                    )
-                                    break
-                                elif _sign_attempt < _sign_retries - 1:
-                                    _EXP_LOG.warning(
-                                        f"[MINER] ⚠️ HypΓ sign retry {_sign_attempt + 1}/{_sign_retries}: {_sig}"
-                                    )
-                                    await _asyncio.sleep(0.1)
-                            else:
-                                _EXP_LOG.error(
-                                    f"[MINER] ❌ Wallet not loaded — cannot sign block"
-                                )
-                                break
-                        except Exception as _hyp_sign_err:
-                            if _sign_attempt < _sign_retries - 1:
-                                _EXP_LOG.warning(
-                                    f"[MINER] ⚠️ HypΓ sign exception retry: {_hyp_sign_err}"
-                                )
-                                await _asyncio.sleep(0.1)
-                            else:
-                                raise
-
-                    if not _sig or _sig.get("error"):
-                        _EXP_LOG.error(
-                            f"[MINER] ❌ HypΓ signing failed after {_sign_retries} attempts — cannot submit unsigned block"
-                        )
-                        _MINE_TELEM.mark_idle()
-                        _submitted_hashes.discard(block_hash)
-                        await _asyncio.sleep(0.5)
-                        continue
-
-                    # ──────────────────────────────────────────────────────────────
-                    # STAGE 6: Submit via RPC (single path, exponential backoff)
-                    # ──────────────────────────────────────────────────────────────
-
-                    # 🔍 DEBUG: Verify entropy seed in submission matches what was used
-                    _submitted_entropy = submit_payload.get("w_entropy_hash", "")
-                    if _submitted_entropy != _w_entropy_seed.hex():
-                        _EXP_LOG.error(
-                            f"[CRITICAL] 🚨 ENTROPY MISMATCH: computed={_w_entropy_seed.hex()} vs submitted={_submitted_entropy}"
-                        )
-                    else:
-                        _EXP_LOG.info(
-                            f"[VERIFY] ✅ Entropy seed matches: {_w_entropy_seed.hex()[:16]}…"
-                        )
-
-                    # Validate required fields before submission
-                    if (
-                        "hyp_signature" not in submit_payload
-                        or "miner_public_key_hex" not in submit_payload
-                    ):
-                        _EXP_LOG.error(
-                            f"[SUBMIT] ❌ Block h={target_height} signing failed — skipping this block"
-                        )
-                        _MINE_TELEM.mark_idle()
-                        _submitted_hashes.discard(block_hash)
-                        await _asyncio.sleep(0.5)
-                        continue
-
-                    # Hash dedup check before submission
-                    if block_hash in _submitted_hashes:
-                        _EXP_LOG.warning(
-                            f"[MINER] ⏭️  Skipping duplicate submission: h={target_height} hash={block_hash[:16]}…"
-                        )
-                        _MINE_TELEM.mark_idle()
-                        continue
-                    _submitted_hashes.add(block_hash)
-
-                    # ── DEBUG: Trace payload structure before submission ──
-                    _sig_type = type(submit_payload.get("hyp_signature")).__name__
-                    _sig_len = len(str(submit_payload.get("hyp_signature", "")))
-                    _EXP_LOG.warning(
-                        f"[MINER-DEBUG] submit_payload hyp_signature: type={_sig_type} len={_sig_len}"
-                    )
-
-                    # ❤️  I love you — record solve NOW so display shows SOLVED immediately
-                    _sig_full = (
-                        _sig.get("signature", "")
-                        if _sig and _sig.get("signature")
-                        else "unsigned"
-                    )
-                    _pubkey_full = submit_payload.get("miner_public_key_hex", "") or ""
-                    _MINE_TELEM.record_block(
-                        {
-                            "height": target_height,
-                            "hash": block_hash,
-                            "nonce": nonce,
-                            "timestamp": timestamp,
-                            "fidelity": w_state_fidelity,
-                            "parent_hash": parent_hash,
-                            "difficulty": difficulty_bits,
-                            "signature": _sig_full,
-                            "miner_public_key": _pubkey_full,
-                        }
-                    )
-                    _MINE_TELEM.mark_submitting()
-                    _sig_preview = (
-                        _sig_full[:48] + "…" if len(_sig_full) > 48 else _sig_full
-                    )
-                    _EXP_LOG.info(
-                        f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} "
-                        f"sig={_sig_preview}  miner={miner_addr[:12]}…  — submitting…"
-                    )
-                    _success, _result = await _submission.submit(
-                        submit_payload, target_height, block_hash
-                    )
-
-                    if _success:
-                        _srv_r = float(
-                            (_result or {}).get("miner_reward_qtcl", 0.0) or 0.0
-                        )
-                        if _srv_r == 0.0:
-                            try:
-                                from globals import TessellationRewardSchedule as _TRS3
-
-                                _srv_r = _TRS3.get_miner_reward_qtcl(target_height)
-                            except Exception:
-                                _srv_r = 7.20
-
-                        # 🔴 CRITICAL: Extract next_height from server response (if available)
-                        # This signals the server has confirmed h and we should mine h+1
-                        _srv_next_h = int(
-                            (_result or {}).get("next_height", target_height + 1)
-                            or (target_height + 1)
-                        )
-                        _EXP_LOG.warning(
-                            f"[MINER-ACCEPT] ✅ Block h={target_height} accepted | Server signals next_height={_srv_next_h}"
-                        )
-
-                        # Store server's next_height signal for height progression
-                        _confirmed_heights.add(target_height)
-                        _force_next_height = _srv_next_h
-                        _last_accepted_hash = block_hash
-                        _EXP_LOG.warning(
-                            f"[MINER] ✅ h={target_height} confirmed — _force_next_height={_srv_next_h}"
-                        )
-
-                        # 🔴 CRITICAL: Persist block locally with pq_curr/pq_last
-                        try:
-                            _local_db = LocalBlockchainDB(name="qtcl")
-                            _block_record = {
-                                "height": target_height,
-                                "hash": block_hash,
-                                "parent_hash": parent_hash,
-                                "timestamp": timestamp,
-                                "nonce": nonce,
-                                "difficulty": difficulty_bits,
-                                "miner_address": miner_addr,
-                                "pq_curr": target_height,  # pq_curr = current block height
-                                "pq_last": max(
-                                    0, target_height - 1
-                                ),  # pq_last = parent height
-                                "w_state_fidelity": w_state_fidelity,
-                                "merkle_root": merkle_root,
-                                "tx_count": len(_block_txs),
-                                "synced_from_server": 0,  # We mined this locally
-                            }
-                            _local_db.insert_block(target_height, _block_record)
-                            _EXP_LOG.info(
-                                f"[MINER] 💾 Block h={target_height} persisted locally with pq_curr={target_height} pq_last={max(0, target_height - 1)}"
-                            )
-                        except Exception as _persist_err:
-                            _EXP_LOG.warning(
-                                f"[MINER] ⚠️  Failed to persist block locally: {_persist_err}"
-                            )
-
-                        # 🔍 PERSISTENCE VERIFICATION: Check both local and remote (Koyeb primary)
-                        _local_ok = False
-                        _koyeb_ok = False
-
-                        # Check 1: Local SQLite persistence
-                        try:
-                            _local_verify_db = LocalBlockchainDB(name="qtcl")
-                            _local_blk = _local_verify_db.get_block(target_height)
-                            if _local_blk:
-                                _local_ok = True
-                                _EXP_LOG.debug(
-                                    f"[MINER-VERIFY] ✅ Block h={target_height} persisted in local DB"
-                                )
-                            else:
-                                _EXP_LOG.warning(
-                                    f"[MINER-VERIFY] ⚠️  Block h={target_height} not found in local DB (may be delayed)"
-                                )
-                        except Exception as _local_err:
-                            _EXP_LOG.debug(
-                                f"[MINER-VERIFY] Local DB check failed: {_local_err}"
-                            )
-
-                        # Check 2: Koyeb (remote server) persistence - PRIMARY with retry
-                        # Database replication/pooling may have slight lag, so retry with backoff
-                        _koyeb_retries = 3
-                        for _retry in range(_koyeb_retries):
-                            try:
-                                _verify_block = await _asyncio.to_thread(
-                                    kapi._rpc, "qtcl_getBlock", [target_height], 5, 1
-                                )
-                                if _verify_block and not _verify_block.get("error"):
-                                    _koyeb_ok = True
-                                    _EXP_LOG.warning(
-                                        f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in Koyeb DB (attempt {_retry + 1})"
-                                    )
-                                    break
-                                elif _retry < _koyeb_retries - 1:
-                                    # Query returned but with error, retry with backoff
-                                    await _asyncio.sleep(0.5 * (_retry + 1))
-                                    continue
-                                else:
-                                    _EXP_LOG.warning(
-                                        f"[MINER-VERIFY] ⚠️  Block h={target_height} still not found after {_koyeb_retries} attempts: {_verify_block}"
-                                    )
-                            except Exception as _ve:
-                                if _retry < _koyeb_retries - 1:
-                                    _EXP_LOG.debug(
-                                        f"[MINER-VERIFY] Retry {_retry + 1}/{_koyeb_retries}: {_ve}"
-                                    )
-                                    await _asyncio.sleep(0.5 * (_retry + 1))
-                                else:
-                                    _EXP_LOG.warning(
-                                        f"[MINER-VERIFY] ⚠️  Koyeb DB check failed after {_koyeb_retries} attempts: {_ve}"
-                                    )
-
-                        # Summary: Server response already confirmed acceptance (next_height advanced)
-                        # Verification is supplementary - not finding immediately is not critical
-                        if not _koyeb_ok:
-                            _EXP_LOG.warning(
-                                f"[MINER-VERIFY] ⚠️  Block h={target_height} verification timeout - may be replication lag (block IS accepted per server response)"
-                            )
-
-                        _MINE_TELEM.record_block_accepted(
-                            height=target_height,
-                            hash=block_hash,
-                            nonce=nonce,
-                            timestamp=timestamp,
-                            fidelity=w_state_fidelity,
-                            reward_qtcl=_srv_r,
-                        )
-                        # P2P Block Broadcast
-                        _p2p_n = getattr(self, "p2p_node", None)
-                        _broadcast_ok = False
-                        if _p2p_n and getattr(_p2p_n, "_running", False):
-                            try:
-                                _peers = (
-                                    _p2p_n.peer_mgr.get_active_peers()
-                                    if _p2p_n.peer_mgr
-                                    else []
-                                )
-                                if _peers:
-                                    _EXP_LOG.info(
-                                        f"[GOSSIP] 📡 Broadcasting block h={target_height} hash={block_hash[:16]}... to {len(_peers)} peers"
-                                    )
-                                    _ok = 0
-                                    _fail = 0
-                                    # Broadcast inv to all peers
-                                    for _p in _peers:
-                                        try:
-                                            import urllib.request
-
-                                            _url = f"http://{_p.host}:{_p.port}/rpc"
-                                            _data = (
-                                                b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"'
-                                                + block_hash.encode()
-                                                + b'","height":'
-                                                + str(target_height).encode()
-                                                + b',"miner_addr":"'
-                                                + (
-                                                    self._oracle_id.get("address", "")
-                                                ).encode()
-                                                + b'","ttl_hops":8},"id":1}'
-                                            )
-                                            _EXP_LOG.debug(
-                                                f"[GOSSIP] Sending qtcl_p2p_inv to {_p.host}:{_p.port}..."
-                                            )
-                                            urllib.request.urlopen(
-                                                _url, data=_data, timeout=5
-                                            )
-                                            _ok += 1
-                                            _EXP_LOG.debug(
-                                                f"[GOSSIP] ✅ inv delivered to {_p.host}:{_p.port}"
-                                            )
-                                        except Exception as _peer_err:
-                                            _fail += 1
-                                            _EXP_LOG.debug(
-                                                f"[GOSSIP] ❌ inv to {_p.host}:{_p.port} failed: {_peer_err}"
-                                            )
-                                    _EXP_LOG.info(
-                                        f"[GOSSIP] ✅ Block h={target_height} broadcast complete: {_ok} delivered, {_fail} failed out of {len(_peers)} peers"
-                                    )
-                                    _broadcast_ok = True
-                                else:
-                                    _EXP_LOG.warning(
-                                        f"[GOSSIP] ⚠️  Block h={target_height} ready but NO ACTIVE PEERS — will use server fallback"
-                                    )
-                            except Exception as _p2pe:
-                                _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
-                        else:
-                            _EXP_LOG.warning(
-                                f"[P2P] ⚠️  Block h={target_height} ready but P2P node not running — fallback to server-side gossip"
-                            )
-
-                        # Fallback: announce block to server (server broadcasts to connected miners)
-                        if not _broadcast_ok:
-                            try:
-                                _EXP_LOG.info(
-                                    f"[GOSSIP] Fallback: announcing block h={target_height} to server via qtcl_gossipBlockAnnounce"
-                                )
-                                kapi.rpc(
-                                    "qtcl_gossipBlockAnnounce",
-                                    [
-                                        {
-                                            "height": target_height,
-                                            "hash": block_hash,
-                                            "miner": miner_addr,
-                                            "timestamp": timestamp,
-                                        }
-                                    ],
-                                    3,
-                                    1,
-                                )
-                                _EXP_LOG.info(
-                                    f"[GOSSIP] ✅ Server-side gossip announce sent for h={target_height}"
-                                )
-                            except Exception as _g_err:
-                                _EXP_LOG.warning(
-                                    f"[GOSSIP] Server gossip announce failed: {_g_err}"
-                                )
-                        _MINE_TELEM.mark_mining()
-                        # Wait for server tip to advance before re-entering loop.
-                        # Without this the miner races back, sees stale height,
-                        # and re-mines the same block height indefinitely.
-                        _TIP_WAIT_MAX_S = 30.0
-                        _TIP_WAIT_POLL_S = 0.5
-                        _tip_wait_start = _t.time()
-                        _tip_confirmed = False
-                        while _t.time() - _tip_wait_start < _TIP_WAIT_MAX_S:
-                            await _asyncio.sleep(_TIP_WAIT_POLL_S)
-                            try:
-                                _tip_check = await _asyncio.to_thread(
-                                    kapi._rpc, "qtcl_getBlockHeight", [], 5, 1
-                                )
-                                _confirmed_h = int(
-                                    (_tip_check or {}).get("height") or 0
-                                )
-                                if _confirmed_h >= target_height:
-                                    _EXP_LOG.warning(
-                                        f"[MINER] ✅ Server tip confirmed h={_confirmed_h} "
-                                        f"(waited {_t.time() - _tip_wait_start:.1f}s)"
-                                    )
-                                    _tip_confirmed = True
-                                    _MINE_TELEM.mark_idle()
-                                    break
-                            except Exception as _te:
-                                _EXP_LOG.debug(f"[MINER] tip-wait poll: {_te}")
-                        else:
-                            _EXP_LOG.warning(
-                                "[MINER] ⚠️  tip-wait timeout — advancing anyway"
-                            )
-                            _MINE_TELEM.mark_idle()
-
-                        # 🔴 CRITICAL FIX: Invalidate oracle cache AND force fresh RPC fetch
-                        # This ensures the miner always sees the latest server state and doesn't
-                        # re-mine the same height indefinitely
-                        if _tip_confirmed or (
-                            _t.time() - _tip_wait_start >= _TIP_WAIT_MAX_S
-                        ):
-                            _EXP_LOG.warning(
-                                f"[MINER-STATE] 🔄 BLOCK ACCEPTED: invalidating caches and quantum field"
-                            )
-                            # Force oracle to refresh state by clearing cached snapshot
-                            if hasattr(_LIVE_RPC_ORACLE, "_cached_state"):
-                                delattr(_LIVE_RPC_ORACLE, "_cached_state")
-                            if hasattr(_LIVE_RPC_ORACLE, "_cache"):
-                                _LIVE_RPC_ORACLE._cache = {}
-                            # Also clear any RPC-level caches
-                            if hasattr(kapi, "_rpc_cache"):
-                                kapi._rpc_cache.clear()
-
-                            # 🌊 CRITICAL: Force quantum field regeneration
-                            # Each block MUST get fresh W-state, not reuse previous block's state
-                            if hasattr(self, "_oracle_mesh") and self._oracle_mesh:
-                                if hasattr(self._oracle_mesh, "_snapshot_cache"):
-                                    delattr(self._oracle_mesh, "_snapshot_cache")
-                                if hasattr(self._oracle_mesh, "clear_cache"):
-                                    self._oracle_mesh.clear_cache()
-
-                            # 🔴 FORCED FRESH HEIGHT QUERY (not cached)
-                            # Guarantee next loop will see updated height
-                            try:
-                                _final_height_check = await _asyncio.to_thread(
-                                    kapi._rpc, "qtcl_getBlockHeight", [], 5, 1
-                                )
-                                _final_h = int(
-                                    (_final_height_check or {}).get("height")
-                                    or target_height
-                                )
-                                _EXP_LOG.critical(
-                                    f"[MINER-STATE] 🔄 FORCED HEIGHT CHECK: h={_final_h} (next will mine h={_final_h + 1})"
-                                )
-                            except Exception:
-                                _EXP_LOG.warning(
-                                    f"[MINER-STATE] Could not verify final height, proceeding anyway"
-                                )
-
-                            _EXP_LOG.warning(
-                                f"[MINER-STATE] ✅ Caches cleared + quantum field will regenerate for next block"
-                            )
-                    else:
-                        # Parse rejection reason for smart retry
-                        _err_msg = ""
-                        if isinstance(_result, dict):
-                            _err_obj = _result.get("error") or _result
-                            _err_msg = str(
-                                _err_obj.get("message", "")
-                                if isinstance(_err_obj, dict)
-                                else _err_obj
-                            )
-
-                        if "entropy_expired" in _err_msg:
-                            # Seed is stale — rebuild block with fresh seed, same height
-                            _EXP_LOG.warning(
-                                f"[MINER] 🔄 entropy_expired h={target_height} — "
-                                f"rebuilding with fresh seed (no chain tip re-fetch)"
-                            )
-                            # Jump back to seed fetch (STAGE 2) by restarting loop
-                            # but keeping oracle_height/parent_hash — `continue` re-enters
-                            # the outer while True which re-fetches tip; that's one RPC but
-                            # guarantees height consistency.
-                            _MINE_TELEM.mark_mining()
-                            await _asyncio.sleep(0.1)
-                            # Don't go IDLE — loop continues immediately
-                            continue
-                        elif (
-                            "Invalid height" in _err_msg
-                            or "chain advanced" in _err_msg.lower()
-                        ):
-                            # Chain moved, need fresh tip
-                            _EXP_LOG.info(
-                                f"[MINER] height mismatch on submit — restarting from tip"
-                            )
-                            _MINE_TELEM.mark_mining()
-                            await _asyncio.sleep(0.1)
-                            continue
-                        else:
-                            # Submission failed after max retries — give up on this block and move on
-                            _EXP_LOG.error(
-                                f"[SUBMIT] ❌ Block h={target_height} failed after 6 attempts "
-                                f"({_submission.RETRY_BACKOFFS[-1] + sum(_submission.RETRY_BACKOFFS[:-1]):.0f}s timeout) — moving on"
-                            )
-                            _EXP_LOG.error(
-                                f"[SUBMIT] ❌ Block h={target_height} failed: {_err_msg or 'no response'}"
-                            )
-                            print(
-                                f"\n  ❌ Block h={target_height} rejected: {_err_msg or 'server returned no response'}",
-                                flush=True,
-                            )
-                            _MINE_TELEM.mark_idle()
+                        # Fork detection: if tip_hash changed, orphan blocks above fork
+                        _last_tip = getattr(cache, "_last_known_tip_hash", "")
+                        if _last_tip and _last_tip != oracle_hash and oracle_height > 0:
+                            _EXP_LOG.warning(f"[FORK] ⚠️ tip_hash changed at h={oracle_height} — orphaning blocks above fork")
+                            with cache._lock:
+                                for _oh in list(cache._blocks.keys()):
+                                    if _oh > oracle_height:
+                                        cache._blocks[_oh].status = BlockStatus.ORPHANED
+                        cache._last_known_tip_hash = oracle_hash
+
+                        if cache.is_height_in_flight(target_height) or cache.is_height_finalized(target_height):
                             await _asyncio.sleep(1.0)
                             continue
 
-                except Exception as e:
-                    _EXP_LOG.error(
-                        f"[MINER] FATAL: {type(e).__name__}: {e}", exc_info=True
-                    )
-                    _MINE_TELEM.mark_idle()
-                    await _asyncio.sleep(1.0)
+                        difficulty_bits = 4
+                        try:
+                            _config_res = kapi._rpc_http("/rpc/config/difficulty", method="GET", timeout=5) if hasattr(kapi, "_rpc_http") else None
+                            if _config_res and isinstance(_config_res, dict):
+                                difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
+                        except Exception:
+                            pass
+                        try:
+                            _res_b_raw = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2)
+                            _res_b = _res_b_raw if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw else {}
+                            _block_diff = int(_res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0)
+                            if _block_diff > 0:
+                                difficulty_bits = _block_diff
+                        except Exception:
+                            pass
 
-            _MINE_TELEM.mark_idle()
+                        _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
+                        _pending_user_txs = _res_m if isinstance(_res_m, list) else []
 
+                        timestamp = int(_t.time())
+                        miner_addr = getattr(getattr(self, "wallet", None), "address", "0" * 64) or "0" * 64
+                        _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                        _miner_reward_base = 720
+                        _treasury_reward_base = 80
+                        try:
+                            from globals import TessellationRewardSchedule as _TRS
+                            _miner_reward_base = _TRS.get_miner_reward_base(target_height)
+                            _treasury_reward_base = _TRS.get_treasury_reward_base(target_height)
+                            _treasury_addr = _TRS.TREASURY_ADDRESS
+                        except Exception:
+                            pass
+
+                        _total_fees_base = 0
+                        for tx in _pending_user_txs:
+                            _fee = tx.get("fee_base", tx.get("fee", 0))
+                            try:
+                                _total_fees_base += int(_fee * 100) if isinstance(_fee, float) else int(_fee)
+                            except (ValueError, TypeError):
+                                pass
+
+                        _miner_total_base = _miner_reward_base + (_total_fees_base // 2)
+                        _treasury_total_base = _treasury_reward_base + (_total_fees_base - (_total_fees_base // 2))
+
+                        _oracle_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}
+                        _dm_hex = _oracle_snap.get("density_matrix_hex", "")
+                        if _dm_hex and len(_dm_hex) > 32:
+                            _w_entropy_seed = _hl.sha3_256(bytes.fromhex(_dm_hex[:64]) + target_height.to_bytes(8, "big") + bytes.fromhex(oracle_hash[:32])).digest()
+                        else:
+                            _w_entropy_seed = _hl.sha3_256(oracle_hash.encode() + target_height.to_bytes(8, "big") + timestamp.to_bytes(8, "big")).digest()
+
+                        _miner_cb_id = _hl.sha3_256(f"COINBASE:{target_height}:{miner_addr}:{_miner_total_base}:{_w_entropy_seed.hex()}".encode()).hexdigest()
+                        _miner_cb = {"tx_id": _miner_cb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "miner"}}], "outputs": [{"address": miner_addr, "amount_base": _miner_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
+                        _treasury_cb_id = _hl.sha3_256(f"TREASURY_COINBASE:{target_height}:{_treasury_addr}:{_treasury_total_base}:{_w_entropy_seed.hex()}".encode()).hexdigest()
+                        _treasury_cb = {"tx_id": _treasury_cb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "treasury"}}], "outputs": [{"address": _treasury_addr, "amount_base": _treasury_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
+                        _block_txs = [_miner_cb, _treasury_cb] + _pending_user_txs
+
+                        def _compute_merkle(tx_list: list) -> str:
+                            if not tx_list:
+                                return _hl.sha3_256(b"").hexdigest()
+                            def _tx_hash(tx: dict) -> str:
+                                tx_type = tx.get("tx_type", "transfer")
+                                if tx_type in ("coinbase", "miner_reward", "treasury_reward"):
+                                    canonical = _j.dumps({"tx_id": tx.get("tx_id", ""), "version": tx.get("version", 1), "inputs": tx.get("inputs", []), "outputs": tx.get("outputs", []), "tx_type": tx_type, "w_entropy_hash": tx.get("w_entropy_hash", ""), "block_height": tx.get("block_height", 0)}, sort_keys=True, separators=(",", ":"))
+                                else:
+                                    _clean = {"tx_id": tx.get("tx_id", ""), "version": tx.get("version", 1), "inputs": [{"prev_tx_hash": inp.get("prev_tx_hash", ""), "prev_output_index": inp.get("prev_output_index", 0)} for inp in tx.get("inputs", [])], "outputs": tx.get("outputs", []), "tx_type": tx_type}
+                                    canonical = _j.dumps(_clean, sort_keys=True, separators=(",", ":"))
+                                return _hl.sha3_256(canonical.encode()).hexdigest()
+                            hashes = [_tx_hash(tx) for tx in tx_list]
+                            while len(hashes) > 1:
+                                if len(hashes) % 2:
+                                    hashes.append(hashes[-1])
+                                hashes = [_hl.sha3_256((hashes[i] + hashes[i + 1]).encode()).hexdigest() for i in range(0, len(hashes), 2)]
+                            return hashes[0]
+
+                        merkle_root = _compute_merkle(_block_txs)
+
+                        import struct as _st, os as _os2, threading as _thr2, queue as _q2
+                        timestamp = int(_t.time())
+                        _POW_SCRATCHPAD_BYTES = 512 * 1024
+                        _POW_WINDOW_BYTES = 64
+                        _POW_MIX_ROUNDS = 64
+                        _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
+                        _scratchpad_bytes = _hl.shake_256(b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed).digest(_POW_SCRATCHPAD_BYTES)
+                        _sp_mv = memoryview(_scratchpad_bytes)
+                        _ph_parent = bytes.fromhex(oracle_hash.zfill(64))[:32]
+                        _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
+                        _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
+                        _ph_seed = _w_entropy_seed[:32]
+                        _rnd_packed = [_st.pack(">I", r) for r in range(_POW_MIX_ROUNDS)]
+                        _HDR_FMT = ">Q I 32s 32s I I 40s 32s"
+                        _RND_RANGE = range(_POW_MIX_ROUNDS)
+                        _POW_PREFIX = b"QTCL_POW_v1:"
+                        _WIN_OFFSETS = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
+
+                        _n_workers = max(1, (_os2.cpu_count() or 1))
+                        _result_q = _q2.Queue()
+                        _abort_evt = _thr2.Event()
+                        _nonce_lock = _thr2.Lock()
+                        _nonce_ctr = [0]
+                        _hex_zeros = "0" * difficulty_bits
+                        _BLOCK_TTL_S = 270
+                        _block_start = _t.time()
+
+                        def _pow_worker(start_nonce: int, stride: int) -> None:
+                            import gc as _gc
+                            _gc.disable()
+                            try:
+                                _sha3 = _hl.sha3_256
+                                _pack = _st.pack
+                                _unpack = _st.unpack_from
+                                _fmt = _HDR_FMT
+                                _pfx = _POW_PREFIX
+                                _th = target_height
+                                _ts2 = timestamp
+                                _df = difficulty_bits
+                                _pp = _ph_parent
+                                _pm2 = _ph_merkle
+                                _pmin = _ph_miner
+                                _ps = _ph_seed
+                                _nw = _POW_N_WINDOWS
+                                _rr = _RND_RANGE
+                                _mv = _sp_mv
+                                _rp2 = _rnd_packed
+                                _woffs = _WIN_OFFSETS
+                                _wend = _POW_WINDOW_BYTES
+                                _abort = _abort_evt.is_set
+                                _put = _result_q.put
+                                _set = _abort_evt.set
+                                _zeros = _hex_zeros
+                                _dbits = difficulty_bits
+                                _nl = _nonce_lock
+                                n = start_nonce
+                                lc = 0
+                                _ctr = _nonce_ctr
+                                while not _abort():
+                                    hdr = _pack(_fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps)
+                                    _h0 = _sha3()
+                                    _h0.update(_pfx)
+                                    _h0.update(hdr)
+                                    state = _h0.digest()
+                                    for rnd in _rr:
+                                        o = _woffs[_unpack(">I", state, 0)[0] % _nw]
+                                        _h = _sha3()
+                                        _h.update(state)
+                                        _h.update(_mv[o : o + _wend])
+                                        _h.update(_rp2[rnd])
+                                        state = _h.digest()
+                                    lc += 1
+                                    hx = state.hex()
+                                    if hx[:_dbits] == _zeros:
+                                        _put((n, hx))
+                                        _set()
+                                        return
+                                    n += stride
+                                    if lc & 511 == 0:
+                                        with _nl:
+                                            _ctr[0] += 512
+                            finally:
+                                _gc.enable()
+
+                        _EXP_LOG.warning(f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} workers={_n_workers}")
+                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash)
+                        _MINE_TELEM.mark_mining()
+
+                        _workers = []
+                        for _wi in range(_n_workers):
+                            _wt = _thr2.Thread(target=_pow_worker, args=(_wi, _n_workers), daemon=True, name=f"PoW-{_wi}")
+                            _wt.start()
+                            _workers.append(_wt)
+
+                        _chain_advanced = False
+                        _ttl_expired = False
+                        _last_telem_nonce = 0
+                        while not _abort_evt.is_set():
+                            await _asyncio.sleep(0.05)
+                            _cur_nonce = _nonce_ctr[0]
+                            if _cur_nonce != _last_telem_nonce:
+                                _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash)
+                                _last_telem_nonce = _cur_nonce
+                            if _t.time() - _block_start > _BLOCK_TTL_S:
+                                _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
+                                _ttl_expired = True
+                                _abort_evt.set()
+                                break
+                            _new_height = check_chain_advance()
+                            if _new_height > 0 and _new_height > oracle_height:
+                                _EXP_LOG.warning(f"[MINER] ⚡ Chain advance EVENT h={_new_height}")
+                                _chain_advanced = True
+                                _abort_evt.set()
+                                break
+
+                        for _wt in _workers:
+                            _wt.join(timeout=2.0)
+                        nonce, block_hash = None, None
+                        while not _result_q.empty():
+                            try:
+                                _r = _result_q.get_nowait()
+                                if nonce is None:
+                                    nonce, block_hash = _r
+                            except _q2.Empty:
+                                break
+
+                        _found = block_hash is not None
+                        if not _found or _chain_advanced or _ttl_expired:
+                            _MINE_TELEM.mark_idle()
+                            await _asyncio.sleep(0.1)
+                            continue
+
+                        _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…")
+                        _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
+
+                        submit_payload = {
+                            "height": target_height,
+                            "block_hash": block_hash,
+                            "parent_hash": oracle_hash,
+                            "merkle_root": merkle_root,
+                            "timestamp": timestamp,
+                            "nonce": nonce,
+                            "miner_address": miner_addr,
+                            "difficulty_bits": difficulty_bits,
+                            "w_entropy_hash": _w_entropy_seed.hex(),
+                            "w_state_fidelity": 0.75,
+                            "pq_curr": target_height,
+                            "pq_last": max(0, target_height - 1),
+                            "mermin_value": 0.0,
+                            "mermin_violated": False,
+                            "quantum_field_16x16x16": "",
+                            "transactions": _block_txs,
+                            "oracle_attestations": [],
+                        }
+
+                        _sig = None
+                        for _sign_attempt in range(3):
+                            try:
+                                if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
+                                    _block_for_sig = {k: v for k, v in submit_payload.items() if k not in ("hyp_signature", "hyp_sig", "miner_pubkey")}
+                                    _sig = self.wallet.sign_transaction(_block_for_sig, block_height=target_height)
+                                    if _sig and not _sig.get("error"):
+                                        submit_payload["hyp_signature"] = json.dumps(_sig, default=str)
+                                        submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
+                                        break
+                            except Exception:
+                                if _sign_attempt < 2:
+                                    await _asyncio.sleep(0.1)
+                        if not _sig or _sig.get("error"):
+                            _EXP_LOG.error(f"[MINER] ❌ Signing failed h={target_height}")
+                            continue
+
+                        cached_block = CachedBlock(
+                            height=target_height,
+                            block_hash=block_hash,
+                            parent_hash=oracle_hash,
+                            nonce=nonce,
+                            timestamp=int(time.time()),
+                            difficulty=difficulty_bits,
+                            miner_address=miner_addr,
+                            submit_payload=submit_payload,
+                            signature=_sig,
+                            status=BlockStatus.SOLVED,
+                        )
+                        if cache.enqueue_solved(cached_block):
+                            _EXP_LOG.info(f"[CACHE] ✅ Block h={target_height} queued for submission")
+                        else:
+                            _EXP_LOG.warning(f"[CACHE] ⚠️ Block h={target_height} already finalized")
+
+                    except Exception as e:
+                        _EXP_LOG.error(f"[MINER] {type(e).__name__}: {e}", exc_info=True)
+                        await _asyncio.sleep(1.0)
+
+            async def submit_task():
+                while True:
+                    block = cache.get_next_unsent()
+                    if block is None:
+                        _now = _t.time()
+                        with cache._lock:
+                            for _h, _b in list(cache._blocks.items()):
+                                if _b.status == BlockStatus.SUBMITTED and _b.last_submitted_at and (_now - _b.last_submitted_at) > 60.0:
+                                    if _b.submit_attempts < pipeline.MAX_RETRIES:
+                                        _EXP_LOG.warning(f"[SUBMIT-TIMEOUT] h={_h} stuck in SUBMITTED for {int(_now - _b.last_submitted_at)}s — retrying")
+                                        _b.status = BlockStatus.SOLVED
+                                    else:
+                                        _b.status = BlockStatus.REJECTED
+                                        _b.error_message = "submission timeout >60s"
+                                        _EXP_LOG.error(f"[SUBMIT-TIMEOUT] h={_h} REJECTED after timeout")
+                        await _asyncio.sleep(0.5)
+                        continue
+                    _EXP_LOG.info(f"[SUBMIT] 📡 Submitting h={block.height} hash={block.block_hash[:16]}…")
+                    cache.mark_submitted(block.height)
+                    _MINE_TELEM.mark_submitting()
+                    success, result = await pipeline.submit(block.submit_payload, block.height, block.block_hash)
+                    if success:
+                        status = (result or {}).get("status", "")
+                        reward = float((result or {}).get("miner_reward_qtcl", 0))
+                        oracle_str = (result or {}).get("oracle_consensus", "0/5")
+                        oracle_count = int(oracle_str.split("/")[0]) if "/" in str(oracle_str) else 0
+                        if "finalized" in status or "already_accepted" in status:
+                            cache.mark_finalized(block.height, reward)
+                            _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
+                            _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward} QTCL")
+                            _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
+                            # P2P broadcast after successful submission
+                            _p2p_n = getattr(self, "p2p_node", None)
+                            _broadcast_ok = False
+                            _peers_notified = 0
+                            if _p2p_n and getattr(_p2p_n, "_running", False):
+                                try:
+                                    _peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
+                                    if _peers:
+                                        _ok = 0
+                                        for _p in _peers:
+                                            try:
+                                                import urllib.request
+                                                _url = f"http://{_p.host}:{_p.port}/rpc"
+                                                _data = (b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"'
+                                                        + block.block_hash.encode() + b'","height":'
+                                                        + str(block.height).encode() + b',"miner_addr":"'
+                                                        + block.miner_address.encode() + b'","ttl_hops":8},"id":1}')
+                                                urllib.request.urlopen(_url, data=_data, timeout=5)
+                                                _ok += 1
+                                            except Exception:
+                                                pass
+                                        _broadcast_ok = _ok > 0
+                                        _peers_notified = _ok
+                                        _EXP_LOG.info(f"[GOSSIP] ✅ Block h={block.height} broadcast: {_ok}/{len(_peers)} peers notified")
+                                    else:
+                                        _EXP_LOG.warning(f"[GOSSIP] ⚠️ No active peers for h={block.height}")
+                                except Exception as _p2pe:
+                                    _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
+                            if not _broadcast_ok:
+                                try:
+                                    kapi.rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], 3, 1)
+                                    _EXP_LOG.info(f"[GOSSIP] ✅ Server-side gossip sent for h={block.height}")
+                                except Exception as _g_err:
+                                    _EXP_LOG.warning(f"[GOSSIP] Server gossip failed: {_g_err}")
+                            cache._last_broadcast_peers = _peers_notified
+                            cache._last_broadcast_method = "p2p" if _broadcast_ok else "gossip"
+                        else:
+                            cache.mark_pending(block.height, oracle_count)
+                            _EXP_LOG.info(f"[SUBMIT] ⏳ h={block.height} PENDING ({oracle_count}/5 oracles)")
+                    else:
+                        err = str((result or {}).get("error", "unknown"))
+                        if block.submit_attempts >= pipeline.MAX_RETRIES:
+                            cache.mark_rejected(block.height, err)
+                            _EXP_LOG.error(f"[SUBMIT] ❌ h={block.height} REJECTED after {block.submit_attempts} attempts: {err}")
+                        else:
+                            block.status = BlockStatus.SOLVED
+                            _EXP_LOG.warning(f"[SUBMIT] ⚠️ h={block.height} retry ({block.submit_attempts}/{pipeline.MAX_RETRIES}): {err}")
+                    _MINE_TELEM.mark_mining()
+                    await _asyncio.sleep(0.1)
+
+            async def balance_task():
+                while True:
+                    await _asyncio.sleep(30.0)
+                    try:
+                        _addr = getattr(getattr(self, "wallet", None), "address", None)
+                        if _addr:
+                            result = kapi._rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
+                            if result and not result.get("error"):
+                                cache._balance_qtcl = int(result.get("balance", 0)) / 100.0
+                    except Exception:
+                        pass
+
+            await _asyncio.gather(pow_task(), submit_task(), balance_task())
         async def _mine():
             try:
                 _EXP_LOG.warning("[MINER-ASYNC] 🚀 Async mining loop starting…")
@@ -26201,21 +25228,6 @@ class QtclClientApp:
             target=lambda: _asyncio.run(_mine()), daemon=True, name="MineAsync"
         )
         _mine_thread.start()
-        miner._koyeb_state = self.koyeb_state  # type: ignore[attr-defined]
-        miner._client_field = self.client_field  # type: ignore[attr-defined]
-        # ── DIAGNOSTIC: DO NOT silence stdout logging — we need to see mining thread output ───────
-        # DISABLE LOG SILENCING: Keep original handlers
-        # _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
-        # class _BufHandler(_logging.Handler):
-        #     def emit(self, record):
-        #         _LOG_BUF.append(self.format(record))
-        # _buf_handler = _BufHandler()
-        # _buf_handler.setFormatter(_logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
-        #                                              datefmt="%H:%M:%S"))
-        # _buf_handler.setLevel(_logging.DEBUG)
-        # _root_log    = _logging.getLogger()
-        # _old_handlers = _root_log.handlers[:]
-        # _root_log.handlers = [_buf_handler]
         _EXP_LOG.warning(
             "[MINER] 🚀 MINING THREAD STARTED — LOGS ENABLED TO STDOUT FOR DIAGNOSTICS"
         )
@@ -26228,436 +25240,75 @@ class QtclClientApp:
 
         def _print_dashboard(force_full: bool = False) -> None:
             self.koyeb_state.refresh_metrics(self.client_field)
-
             ks2 = self.koyeb_state
-            m2 = self.client_field.metrics
             tel = _MINE_TELEM.snapshot()
             now = time.time()
-
-            # ── Refresh quantum metrics from latest stream data ──────────────────
-            # Priority: oracle_mesh snapshot > SSE stream snapshot > fallback to m2
-            _refreshed_metrics = None
-            try:
-                # Try oracle mesh snapshot first (highest priority)
-                if self._oracle_mesh:
-                    _mesh_snap = self._oracle_mesh.get_snapshot()
-                    if _mesh_snap:
-                        _refreshed_metrics = {
-                            "fidelity_to_w3": _mesh_snap.get("w_state_fidelity", 0.0),
-                            "entropy_vn": _mesh_snap.get("von_neumann_entropy", 0.0),
-                            "purity": _mesh_snap.get("purity", 0.0),
-                            "field_density": _mesh_snap.get("coherence_l1", 0.0),
-                        }
-
-                # Fallback to server SSE stream data
-                if not _refreshed_metrics and self._sse_client:
-                    _server_snap = self._sse_client.get_latest_snapshot()
-                    if _server_snap and (
-                        "density_tensor_hex" in _server_snap
-                        or "density_matrix_hex" in _server_snap
-                    ):
-                        # Parse DM from hex if available
-                        _dm_hex = _server_snap.get(
-                            "density_tensor_hex", ""
-                        ) or _server_snap.get("density_matrix_hex", "")
-                        if _dm_hex:
-                            try:
-                                import struct as _st_m
-
-                                _bdata = bytes.fromhex(_dm_hex)
-                                # For 8x8 DM: 64 complex doubles = 64 * 16 bytes = 1024 bytes
-                                if len(_bdata) == 1024 and _HAS_NP:
-                                    _re = []
-                                    _im = []
-                                    for _i in range(64):
-                                        _r, _im_v = _st_m.unpack_from(
-                                            ">dd", _bdata, _i * 16
-                                        )
-                                        _re.append(_r)
-                                        _im.append(_im_v)
-                                    _dm_arr = (
-                                        _np.array(_re, dtype=_np.complex128)
-                                        + 1j * _np.array(_im, dtype=_np.complex128)
-                                    ).reshape(8, 8)
-                                    # Compute metrics from DM
-                                    _w_fid = ClientQuantumMetrics.w3_fidelity(_dm_arr)
-                                    _vn_ent = ClientQuantumMetrics.von_neumann_entropy(
-                                        _dm_arr
-                                    )
-                                    _purity = ClientQuantumMetrics.purity(_dm_arr)
-                                    _coherence = ClientQuantumMetrics.coherence_l1(
-                                        _dm_arr
-                                    )
-                                    _refreshed_metrics = {
-                                        "fidelity_to_w3": max(
-                                            0.0, min(1.0, float(_w_fid))
-                                        ),
-                                        "entropy_vn": max(
-                                            0.0, min(3.0, float(_vn_ent))
-                                        ),
-                                        "purity": max(0.0, min(1.0, float(_purity))),
-                                        "field_density": float(_coherence),
-                                    }
-                            except Exception:
-                                pass
-                        # Fallback: use direct metrics from snapshot
-                        if not _refreshed_metrics:
-                            _refreshed_metrics = {
-                                "fidelity_to_w3": float(
-                                    _server_snap.get(
-                                        "w_state_fidelity",
-                                        _server_snap.get("fidelity", 0.0),
-                                    )
-                                ),
-                                "entropy_vn": float(
-                                    _server_snap.get(
-                                        "von_neumann_entropy",
-                                        _server_snap.get("entropy", 0.0),
-                                    )
-                                ),
-                                "purity": float(_server_snap.get("purity", 0.0)),
-                                "field_density": float(
-                                    _server_snap.get(
-                                        "coherence_l1",
-                                        _server_snap.get("coherence", 0.0),
-                                    )
-                                ),
-                            }
-            except Exception:
-                pass
-
-            # Use refreshed metrics if available, otherwise fall back to m2
-            if _refreshed_metrics:
-                # Create a minimal object to hold refreshed metrics for display
-                class _RefreshedMetrics:
-                    def __init__(self, d):
-                        self.fidelity_to_w3 = d["fidelity_to_w3"]
-                        self.entropy_vn = d["entropy_vn"]
-                        self.purity = d["purity"]
-                        self.field_density = d["field_density"]
-
-                m2 = _RefreshedMetrics(_refreshed_metrics)
             sep = "─" * 72
-            # ── state badge ───────────────────────────────────────────────
+
             state_badge = {
                 "IDLE": "💤 IDLE",
                 "MINING": "⛏️  MINING",
                 "SOLVED": "✅ BLOCK SOLVED",
                 "SUBMITTING": "📡 SUBMITTING",
             }.get(tel["state"], tel["state"])
-            hr_str = (
-                f"{tel['hash_rate']:.0f} H/s" if tel["hash_rate"] > 0 else "warming up…"
-            )
-            session = _fmt_duration(now - tel["session_start"])
+            hr_str = f"{tel['hash_rate']:.0f} H/s" if tel['hash_rate'] > 0 else "warming up…"
+            session = _fmt_duration(now - tel["session_start"]) if 'session_start' in tel else "00:00"
             print("\n" + sep)
-            print(
-                f"  {state_badge}   │   session: {session}   │   blocks found: {tel['blocks_found']}"
-            )
+            print(f"  {state_badge}   │   session: {session}   │   blocks found: {tel['blocks_found']}")
             print(sep)
-            # ── PoW live progress ─────────────────────────────────────────
+
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
-                target_zeros = tel["difficulty"]
-                nonce_str = f"{tel['nonce']:,}"
-                print(
-                    f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
-                    f"nonce={nonce_str}  │  {hr_str}"
-                )
-                print(f"  Parent: {tel['parent_hash'][:32]}…")
+                target_zeros = tel.get("difficulty", 4)
+                nonce_str = f"{tel.get('nonce', 0):,}"
+                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  {hr_str}")
+                print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
-            # ── Last solved block ─────────────────────────────────────────
-            lb = tel["last_block"]
-            if lb and (_LAST_BLOCK_REPORTED[0] != lb.get("hash")):
-                _LAST_BLOCK_REPORTED[0] = lb.get("hash")
-                age = _fmt_duration(now - tel["last_block_ts"])
-                print(sep)
-                print(f"  ✅ BLOCK SOLVED  ({age} ago)")
-                print(
-                    f"     height  : {lb.get('height', '?')}   nonce: {lb.get('nonce', '?'):,}"
-                )
-                print(f"     hash    : {str(lb.get('hash', '??'))[:48]}…")
-                print(
-                    f"     diff    : {lb.get('difficulty', '?')}   "
-                    f"ts: {time.strftime('%H:%M:%S', time.localtime(lb.get('timestamp', now)))}"
-                )
-                print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
-                if lb.get("signature"):
-                    _sig_display = str(lb.get("signature", "?"))
-                    if len(_sig_display) > 120:
-                        print(f"     sig     : {_sig_display[:120]}…")
-                    else:
-                        print(f"     sig     : {_sig_display}")
-                if lb.get("miner_public_key"):
-                    _pubkey_display = str(lb.get("miner_public_key", "?"))
-                    if len(_pubkey_display) > 120:
-                        print(f"     pubkey  : {_pubkey_display[:120]}…")
-                    else:
-                        print(f"     pubkey  : {_pubkey_display}")
-                print(
-                    f"  ── Quantum Attestation ──────────────────────────────────────"
-                )
-                _pq_c = lb.get("pq_curr", ks2.pq_curr_id or "?")
-                _pq_l = lb.get("pq_last", ks2.pq_last_id or "?")
-                print(f"     pq_curr : {_pq_c}   pq_last: {_pq_l}")
-                _disp_fid = getattr(self, "_local_fused_fid", 0.0) or ks2.pq0_fidelity
-                _disp_up = getattr(self, "_upstream_fid", 0.0)
-                print(
-                    f"     W-fid   : {_disp_fid:.4f}   bridge: {ks2.bridge_fidelity:.4f}   "
-                    f"upstream: {_disp_up:.4f}   coherence: {ks2.oracle_coherence:.4f}"
-                )
-                if m2:
 
-                    def _cf(v, lo=0.0, hi=1.0):
-                        try:
-                            f = float(v)
-                            return (
-                                f
-                                if (lo <= f <= hi and __import__("math").isfinite(f))
-                                else 0.0
-                            )
-                        except:
-                            return 0.0
-
-                    print(
-                        f"     VN-S    : {_cf(m2.entropy_vn, 0, 3):.4f}   discord: {_cf(m2.quantum_discord, 0, 3):.4f}   "
-                        f"purity: {_cf(m2.purity, 0, 1):.4f}"
-                    )
-                    print(
-                        f"     neg A-B : {_cf(m2.negativity_AB, 0, 0.5):.4f}   neg B-C: {_cf(m2.negativity_BC, 0, 0.5):.4f}"
-                    )
-                    print(
-                        f"     CHSH AB : {_cf(m2.bell_chsh_AB, -4, 4):.4f}   CHSH BC: {_cf(m2.bell_chsh_BC, -4, 4):.4f}"
-                    )
-            print(sep)
-            # ── Oracle / chain state ──────────────────────────────────────
-            print(
-                f"  Oracle: h={tel['height']}  "
-                f"fid={ks2.pq0_fidelity:.4f}  "
-                f"bridge={ks2.bridge_fidelity:.4f}  "
-                f"lat={ks2.channel_latency_ms:.0f}ms  "
-                f"{'✅' if ks2.connected else '❌'}"
-            )
-            # ── P2P Status ─────────────────────────────────────────────────
-            print(self.format_p2p_status(detail=True))
-            print(
-                f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted"
-            )
-            if tel["total_earned_qtcl"] > 0:
-                print(
-                    f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)"
-                )
-            try:
-                from globals import TessellationRewardSchedule as _TRS_disp
-
-                _bh_disp = int(self.koyeb_state.block_height or 0)
-                _m_disp = _TRS_disp.get_miner_reward_qtcl(_bh_disp)
-                _t_disp = _TRS_disp.get_treasury_reward_qtcl(_bh_disp)
-                _ta_disp = _TRS_disp.TREASURY_ADDRESS[:20]
-                if (
-                    getattr(getattr(self, "wallet", None), "address", "")
-                    == _TRS_disp.TREASURY_ADDRESS
-                ):
-                    print(
-                        f"  Split   : miner={_m_disp:.2f} QTCL/blk (now) + treasury={_t_disp:.2f} QTCL/blk (confirms at h+1) → total={_m_disp + _t_disp:.2f} QTCL/blk"
-                    )
-                    print(
-                        f"  Note    : Mining as treasury address — miner credited immediately, treasury pending until next block"
-                    )
-            except Exception:
-                pass
-            try:
-                _addr2 = getattr(getattr(self, "wallet", None), "address", None)
-                if _addr2:
-                    _bal = None
-                    # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
-                    try:
-                        import sqlite3 as _sq
-
-                        _local_db = (
-                            getattr(self, "_db_path", None)
-                            or getattr(getattr(self, "db", None), "_db_path", None)
-                            or getattr(getattr(self, "db", None), "db_path", None)
-                        )
-                        if _local_db:
-                            _lc = _sq.connect(str(_local_db), timeout=3.0)
-                            _lc.row_factory = _sq.Row
-                            _lr = _lc.execute(
-                                "SELECT balance FROM wallet_addresses WHERE address=?",
-                                (_addr2,),
-                            ).fetchone()
-                            _lc.close()
-                            if _lr is not None:
-                                _bal = int(_lr["balance"] or 0) / 100.0
-                    except Exception:
-                        pass
-                    # ── 2. Fall back to Koyeb RPC if local miss
-                    if _bal is None:
-                        for _retry_idx in range(3):
-                            _bal_r = self.api._rpc(
-                                "qtcl_getBalance", [_addr2], timeout=5, retries=1
-                            )
-                            _bal = (
-                                float(_bal_r["balance"])
-                                if isinstance(_bal_r, dict) and "balance" in _bal_r
-                                else None
-                            )
-                            if _bal is not None and _bal > 0:
-                                break
-                            if _retry_idx < 2:
-                                time.sleep(0.5)
-                    if _bal is not None:
-                        print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
-            except Exception:
-                pass
-            if m2:
-
-                def _cf2(v, lo=0.0, hi=1.0):
-                    try:
-                        f = float(v)
-                        return (
-                            f
-                            if (lo <= f <= hi and __import__("math").isfinite(f))
-                            else 0.0
-                        )
-                    except:
-                        return 0.0
-
-                print(
-                    f"  Field : Fid→|W3⟩={_cf2(m2.fidelity_to_w3, 0, 1):.4f}  "
-                    f"S={_cf2(m2.entropy_vn, 0, 3):.4f}  "
-                    f"purity={_cf2(m2.purity, 0, 1):.4f}  "
-                    f"‖Δρ‖={_cf2(m2.field_density, 0, 100):.4f}"
-                )
-            # ── Tripartite Oracle Status ─────────────────────────────────────
-            # Check both _LIVE_RPC_ORACLE state AND local client state
-            _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
-
-            # Also check local tripartite state (may have cycles even if RPC state empty)
-            _local_fused_fid = 0.0
-            _upstream_fid = 0.0
-            _tri_thread_alive = False
-            try:
-                _local_fused_fid = getattr(self, "_local_fused_fid", 0.0)
-                _upstream_fid = getattr(self, "_upstream_fid", 0.0)
-                # Check if the tripartite thread is running
-                for t in _threading.enumerate():
-                    if t.name == "TripartiteOracle":
-                        _tri_thread_alive = t.is_alive()
+            _block_cache = globals().get("_block_cache")
+            if _block_cache:
+                cache_snap = _block_cache.snapshot()
+                # Show detailed slip for the most recently active block
+                _latest_block = None
+                for h in sorted(cache_snap.get("blocks", {}).keys(), reverse=True):
+                    b = _block_cache.get_block(h)
+                    if b and b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING, BlockStatus.FINALIZED):
+                        _latest_block = b
                         break
-            except Exception:
-                pass
-
-            _has_cycle = _ora_state and _ora_state.get("cycle", 0) > 0
-            _has_local = _local_fused_fid > 0 or _upstream_fid > 0
-
-            if _has_cycle:
-                _cycle = _ora_state.get("cycle", 0)
-                _fid = _ora_state.get("w_state_fidelity", 0.0)
-                _purity = _ora_state.get("purity", 0.0)
-                _vne = _ora_state.get("von_neumann_entropy", 0.0)
-                _mode_raw = _ora_state.get("aer_noise_state", "unknown")
-                _mode = _mode_raw if isinstance(_mode_raw, str) else "active"
-                _pq0_f = _ora_state.get("pq0_oracle_fidelity", 0.0)
-                _pq0_iv_f = _ora_state.get("pq0_IV_fidelity", 0.0)
-                _pq0_v_f = _ora_state.get("pq0_V_fidelity", 0.0)
-                _up_f = _ora_state.get("upstream_fidelity", 0.0)
-                # Clamp display values to sane ranges
-                _purity = (
-                    max(0.0, min(1.0, _purity))
-                    if isinstance(_purity, (int, float))
-                    else 0.0
-                )
-                _vne = (
-                    max(0.0, min(10.0, _vne)) if isinstance(_vne, (int, float)) else 0.0
-                )
-                print(
-                    f"  ⚛️  Oracle: cycle={_cycle} mode={_mode} fused_fid={_fid:.4f} purity={_purity:.4f} S={_vne:.3f}"
-                )
-                print(
-                    f"          pq0={_pq0_f:.4f}  pq0_IV={_pq0_iv_f:.4f}  pq0_V={_pq0_v_f:.4f}  upstream={_up_f:.4f}"
-                )
-            elif _has_local:
-                # ❤️  I love you — use oracle_state fidelity when available, not stale _local_fused_fid
-                _disp_fid = float(
-                    _ora_state.get("w_state_fidelity", 0.0) or _local_fused_fid
-                )
-                _disp_up = float(
-                    _ora_state.get("upstream_fidelity", 0.0) or _upstream_fid
-                )
-                print(
-                    f"  ⚛️  Oracle: ⚡ tripartite active (local_fid={_disp_fid:.4f} upstream={_disp_up:.4f})"
-                )
-            elif _tri_thread_alive:
-                # Thread is running but no fidelity yet - show spinner
-                print(
-                    f"  ⚛️  Oracle: 🔄 starting (thread alive, waiting for first measurement...)"
-                )
+                if _latest_block and force_full:
+                    print(sep)
+                    print(_render_block_slip(_latest_block, cache_snap, getattr(_block_cache, '_balance_qtcl', 0.0), self.format_p2p_status(detail=False)))
+                else:
+                    print(sep)
+                    print("  ── Block Cache ──")
+                    for h, info in sorted(cache_snap.get("blocks", {}).items()):
+                        _icon = "🔥" if info["status"] == "FINALIZED" else ("⏳" if info["status"] == "PENDING" else ("📡" if info["status"] == "SUBMITTED" else "✅"))
+                        print(f"  h={h}: {_icon} {info['status']}  {info['oracles']} oracles")
+                    print(sep)
+                    print(f"  Blocks  : {cache_snap['finalized']} finalized, {cache_snap['pending']} pending, {cache_snap['rejected']} rejected")
+                    print(f"  Rewards : {cache_snap['total_rewards']:.2f} QTCL")
+                    print(f"  Balance : {_block_cache._balance_qtcl:.8f} QTCL")
             else:
-                print(f"  ⚛️  Oracle: ⚠️  awaiting first cycle...")
-            if False and _P2P_NODE is None:
-                try:
-                    _da_id = getattr(self, "_peer_id", None) or f"miner_{id(self)}"
-                    globals()["_P2P_NODE"] = _init_p2p_node(
-                        _da_id, QtclP2PNode.DEFAULT_PORT
-                    )
-                    globals()["_P2P_NODE"].start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
-                except Exception:
-                    pass
-            if False and _P2P_NODE and (getattr(_P2P_NODE, "_started", False) or False):
-                try:
-                    _cons2 = _P2P_NODE.get_consensus_dm()
-                    _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
-                    _p2p_rep = ""
-                    try:
-                        _pl = _P2P_NODE.get_peers()
-                        if _pl:
-                            _connected_pl = [p for p in _pl if p.get("connected")]
-                            _fids = [
-                                p.get("fidelity", 0)
-                                for p in _connected_pl
-                                if p.get("fidelity", 0) > 0
-                            ]
-                            _lats = [
-                                p.get("latency_ms", 0)
-                                for p in _connected_pl
-                                if p.get("latency_ms", 0) > 0
-                            ]
-                            _avg_fid = sum(_fids) / len(_fids) if _fids else 0.0
-                            _avg_lat = sum(_lats) / len(_lats) if _lats else 0.0
-                            _lat_str = f"{_avg_lat:.0f}ms" if _lats else "N/A"
-                            _fid_str = f"{_avg_fid:.4f}" if _fids else "N/A"
-                            _p2p_rep = f"  avg_lat={_lat_str}  avg_fid={_fid_str}"
-                    except Exception:
-                        pass
-                    if not _cons2:
-                        try:
-                            _P2P_NODE.trigger_consensus()
-                        except Exception:
-                            pass
-                        _local_f = (
-                            _LIVE_RPC_ORACLE.get_oracle_state().get(
-                                "w_state_fidelity", 0
-                            )
-                            if _LIVE_RPC_ORACLE
-                            else 0
-                        )
-                        _cf2 = (
-                            f"local-only F={_local_f:.4f}"
-                            if _local_f > 0
-                            else "awaiting peers…"
-                        )
-                    print(
-                        f"  P2P    : 🌀 {_np2} peers  RPC-only (no SSE)  consensus={_cf2}{_p2p_rep}"
-                    )
-                except Exception:
-                    pass
+                print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
+                if tel.get("total_earned_qtcl", 0) > 0:
+                    print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel.get('last_reward_qtcl', 0):.2f} QTCL)")
+            _last_peers = getattr(_block_cache, "_last_broadcast_peers", -1)
+            if _last_peers >= 0:
+                if _last_peers > 0:
+                    print(f"  P2P     : ✅ {_last_peers} peers notified")
+                else:
+                    print(f"  P2P     : ⚠️ 0 peers (using server gossip)")
+
+            _sse_cons = globals().get("_SSE_CONSENSUS_STATE", {})
+            _sse_blk = globals().get("_SSE_BLOCK_STATE", {})
+            _sse_dns = globals().get("_SSE_DENSITY_STATE", {})
+            _sse_all_ok = all(s.get("connected", False) for s in (_sse_cons, _sse_blk, _sse_dns) if s)
+            _sse_label = "✅ connected" if _sse_all_ok else "⚠️ reconnecting..."
+            print(f"  SSE     : {_sse_label} (consensus + blocks + density)")
+            print(f"  Oracle: h={tel.get('height', '?')}  fid={ks2.pq0_fidelity:.4f}  bridge={ks2.bridge_fidelity:.4f}  lat={ks2.channel_latency_ms:.0f}ms  {'✅' if ks2.connected else '❌'}")
+            print(self.format_p2p_status(detail=True))
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
-
-        # ── Foreground interactive loop — non-blocking auto-refresh ──────────
-        _REFRESH_INTERVAL = 5.0  # seconds between auto-redraws
-        import select as _select
-
         def _kbhit(timeout: float = 0.0):
             """Return True if a keypress is waiting on stdin."""
             try:
@@ -26680,7 +25331,6 @@ class QtclClientApp:
         except KeyboardInterrupt:
             pass
         finally:
-            miner.stop_mining()
             self._stop.set()
             print("\n  🛑 Mining stopped")
 
@@ -30980,7 +29630,7 @@ def main() -> None:  # noqa: F811
         # an existing DB whose blocks table was created without merkle_root /
         # tx_count / synced_from_server (the root cause of IBD insert failures).
         try:
-            _boot_db = LocalBlockchainDB(name="qtcl")
+            _boot_db = _get_local_db("qtcl")
             # Full table creation pass (idempotent)
             _boot_db.create_tables()
             # Full column migration pass (idempotent, repairs any existing table)
