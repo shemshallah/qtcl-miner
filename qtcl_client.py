@@ -1239,31 +1239,185 @@ class _OracleNode:
             return None
 
     def submit_attestation(self, attestation: Dict[str, Any]) -> bool:
-        """Submit attestation to server via RPC."""
+        """Submit attestation to standalone oracle server first, then blockchain server."""
+        height = attestation.get("block_height", 0)
+        # ── Try standalone oracle server on :9092 first ──
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "qtcl_submitOracleAttestation",
+                "params": attestation,
+                "id": 1,
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:9092/rpc",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status == 200:
+                _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation accepted by oracle server: h={height}")
+                return True
+        except Exception as _e:
+            _EXP_LOG.debug(f"[ORACLE-NODE] Oracle server unavailable, falling back to blockchain: {_e}")
+        
+        # ── Fallback: submit to blockchain server ──
         try:
             _res = self.kapi._rpc("qtcl_submitOracleAttestation", [attestation], timeout=10, retries=2)
             if isinstance(_res, dict) and _res.get("status") in ("accepted", "finalized"):
-                _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation accepted by server: h={attestation.get('block_height')}")
+                _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation accepted by blockchain: h={height}")
                 return True
             else:
-                _EXP_LOG.debug(f"[ORACLE-NODE] Attestation response: {_res}")
+                _EXP_LOG.debug(f"[ORACLE-NODE] Blockchain attestation response: {_res}")
                 return False
         except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Submit failed: {e}")
+            _EXP_LOG.debug(f"[ORACLE-NODE] Blockchain submit failed: {e}")
             return False
 
-    def gossip_attestation(self, attestation: Dict[str, Any], p2p_node=None):
-        """Gossip attestation to P2P peers."""
-        if p2p_node and hasattr(p2p_node, "gossip_ingest"):
+    def store_attestation_locally(self, attestation: Dict[str, Any], is_local: bool = False) -> bool:
+        """Store attestation in local SQLite. Survives restarts."""
+        try:
+            from qtcl_client import _get_local_db
+            db = _get_local_db("qtcl")
+            db.execute(
+                """
+                INSERT OR REPLACE INTO oracle_attestations
+                (block_height, oracle_id, oracle_address, block_hash, header_hash,
+                 attestation_signature, w_state_fidelity, attestation_timestamp, received_at, is_local)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(attestation.get("block_height", 0)),
+                    str(attestation.get("oracle_id", "")),
+                    str(attestation.get("oracle_address", "")),
+                    str(attestation.get("block_hash", "")),
+                    str(attestation.get("header_hash", "")),
+                    json.dumps(attestation.get("signature", {})),
+                    float(attestation.get("w_state_fidelity", 0.0)),
+                    int(attestation.get("timestamp", time.time())),
+                    time.time(),
+                    1 if is_local else 0,
+                ),
+            )
+            return True
+        except Exception as e:
+            _EXP_LOG.debug(f"[ORACLE-NODE] Local store failed: {e}")
+            return False
+
+    def get_attestation_count(self, height: int) -> int:
+        """Count unique attestations for a block height (memory + DB)."""
+        count = 0
+        try:
+            from qtcl_client import _get_local_db
+            db = _get_local_db("qtcl")
+            row = db.fetchone("SELECT COUNT(DISTINCT oracle_id) FROM oracle_attestations WHERE block_height = ?", (height,))
+            count = int(row[0]) if row else 0
+        except Exception as e:
+            _EXP_LOG.debug(f"[ORACLE-NODE] Count query failed: {e}")
+        return count
+
+    def get_attestations_for_block(self, height: int) -> List[Dict[str, Any]]:
+        """Return all attestations for a block height."""
+        try:
+            from qtcl_client import _get_local_db
+            db = _get_local_db("qtcl")
+            rows = db.fetchall("SELECT * FROM oracle_attestations WHERE block_height = ?", (height,))
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _EXP_LOG.debug(f"[ORACLE-NODE] Fetch failed: {e}")
+            return []
+
+    def broadcast_attestation_to_peers(self, attestation: Dict[str, Any], p2p_node=None) -> int:
+        """HTTP POST attestation to all active P2P peers. Returns count of successful sends."""
+        if not p2p_node:
+            return 0
+        peer_mgr = getattr(p2p_node, "peer_mgr", None)
+        if not peer_mgr:
+            return 0
+        peers = peer_mgr.get_active_peers()
+        if not peers:
+            return 0
+        ok = 0
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "qtcl_p2p_attestation",
+            "params": {
+                "attestation": attestation,
+                "relay_by": self.oracle_id,
+                "relay_timestamp": int(time.time()),
+            },
+            "id": 1,
+        }).encode()
+        for peer in peers:
             try:
-                p2p_node.gossip_ingest({
-                    "type": "oracle_attestation",
-                    "attestation": attestation,
-                    "relay_by": self.oracle_id,
-                    "timestamp": int(time.time()),
-                })
-            except Exception as e:
-                _EXP_LOG.debug(f"[ORACLE-NODE] Gossip failed: {e}")
+                import urllib.request
+                url = f"http://{peer.host}:{peer.port}/rpc"
+                req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=5)
+                ok += 1
+            except Exception:
+                pass
+        _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation broadcast: {ok}/{len(peers)} peers reached")
+        return ok
+
+    def receive_peer_attestation(self, data: Dict[str, Any]) -> bool:
+        """Validate and store a peer attestation. Returns True if accepted."""
+        try:
+            att = data.get("attestation", {})
+            if not att:
+                return False
+            height = int(att.get("block_height", 0))
+            oid = str(att.get("oracle_id", ""))
+            if height <= 0 or not oid:
+                return False
+            # Deduplicate: ignore if we already have this oracle's attestation for this height
+            existing = self.get_attestations_for_block(height)
+            for ea in existing:
+                if ea.get("oracle_id") == oid:
+                    return False  # already seen
+            self.store_attestation_locally(att, is_local=False)
+            _EXP_LOG.info(f"[ORACLE-NODE] 📨 Peer attestation accepted: h={height} oracle={oid[:16]}…")
+            return True
+        except Exception as e:
+            _EXP_LOG.debug(f"[ORACLE-NODE] Receive failed: {e}")
+            return False
+
+    def on_block_solved(self, block_data: Dict[str, Any], block_hash: str, p2p_node=None) -> Optional[Dict[str, Any]]:
+        """
+        FULL ORACLE WORKFLOW when client solves a block:
+        1. Sign self-attestation
+        2. Store locally
+        3. Submit to server
+        4. Broadcast to P2P peers
+        Returns the attestation dict.
+        """
+        header = {
+            "height": block_data.get("height", 0),
+            "parent_hash": block_data.get("parent_hash", ""),
+            "merkle_root": block_data.get("merkle_root", ""),
+            "timestamp": block_data.get("timestamp", 0),
+            "difficulty": block_data.get("difficulty", 4),
+            "nonce": block_data.get("nonce", 0),
+            "miner_address": block_data.get("miner_address", ""),
+        }
+        att = self.attest_block(header, block_hash)
+        if not att:
+            _EXP_LOG.error("[ORACLE-NODE] ❌ Self-attestation failed")
+            return None
+        # Store locally first (never fails)
+        self.store_attestation_locally(att, is_local=True)
+        # Submit to server
+        self.submit_attestation(att)
+        # Broadcast to P2P mesh
+        self.broadcast_attestation_to_peers(att, p2p_node)
+        _EXP_LOG.critical(f"[ORACLE-NODE] 🔮 Self-attested h={header['height']} — stored + server + peers")
+        return att
+
+    def gossip_attestation(self, attestation: Dict[str, Any], p2p_node=None):
+        """Gossip attestation to P2P peers (legacy wrapper — use broadcast_attestation_to_peers)."""
+        self.broadcast_attestation_to_peers(attestation, p2p_node)
 
 
 def init_p2p_bootstrap() -> None:
@@ -7754,8 +7908,51 @@ class LocalBlockchainDB:
                 " created_at INTEGER DEFAULT (strftime('%s','now'))"
                 ")"
             )
+            # oracle_attestations — local mirror of mesh attestations
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS oracle_attestations ("
+                " block_height INTEGER NOT NULL,"
+                " oracle_id TEXT NOT NULL,"
+                " oracle_address TEXT NOT NULL DEFAULT '',"
+                " block_hash TEXT NOT NULL DEFAULT '',"
+                " header_hash TEXT NOT NULL DEFAULT '',"
+                " attestation_signature TEXT NOT NULL DEFAULT '',"
+                " w_state_fidelity REAL DEFAULT 0.0,"
+                " attestation_timestamp INTEGER DEFAULT 0,"
+                " received_at REAL DEFAULT (strftime('%s','now')),"
+                " is_local INTEGER DEFAULT 0,"
+                " PRIMARY KEY (block_height, oracle_id)"
+                " )"
+            )
+            # pending_blocks — local queue of blocks awaiting consensus
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS pending_blocks ("
+                " height INTEGER PRIMARY KEY,"
+                " block_hash TEXT NOT NULL,"
+                " parent_hash TEXT NOT NULL,"
+                " miner_address TEXT NOT NULL,"
+                " nonce INTEGER DEFAULT 0,"
+                " difficulty INTEGER DEFAULT 4,"
+                " timestamp INTEGER DEFAULT 0,"
+                " submit_payload TEXT NOT NULL DEFAULT '',"
+                " status TEXT DEFAULT 'pending',"
+                " oracle_count INTEGER DEFAULT 0,"
+                " created_at REAL DEFAULT (strftime('%s','now')),"
+                " finalized_at REAL"
+                " )"
+            )
+            # peer_blocks — blocks received from P2P mesh
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS peer_blocks ("
+                " height INTEGER NOT NULL,"
+                " block_hash TEXT NOT NULL,"
+                " peer_node_id TEXT NOT NULL,"
+                " received_at REAL DEFAULT (strftime('%s','now')),"
+                " PRIMARY KEY (height, peer_node_id)"
+                " )"
+            )
             self.conn.commit()
-            logging.info("[SCHEMA] ✅ migrations applied")
+            logging.info("[SCHEMA] ✅ migrations applied (oracle mesh tables)")
         except Exception as _me:
             logging.warning(f"[SCHEMA] migration error: {_me}")
 
@@ -24836,11 +25033,13 @@ class QtclClientApp:
                             await _asyncio.sleep(1.0)
                             continue
 
-                        difficulty_bits = 4
+                        # BLOCK_DIFFICULTY env var overrides everything (for debugging)
+                        _env_diff = os.environ.get("BLOCK_DIFFICULTY", "").strip()
+                        difficulty_bits = int(_env_diff) if _env_diff.isdigit() else 4
                         try:
                             _config_res = kapi._rpc_http("/rpc/config/difficulty", method="GET", timeout=5) if hasattr(kapi, "_rpc_http") else None
                             if _config_res and isinstance(_config_res, dict):
-                                difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
+                                difficulty_bits = int(_config_res.get("result", {}).get("difficulty", difficulty_bits))
                         except Exception:
                             pass
                         try:
@@ -24851,6 +25050,8 @@ class QtclClientApp:
                                 difficulty_bits = _block_diff
                         except Exception:
                             pass
+                        if _env_diff.isdigit():
+                            _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY env override: {difficulty_bits} leading-zeros")
 
                         _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
                         _pending_user_txs = _res_m if isinstance(_res_m, list) else []
@@ -25045,6 +25246,10 @@ class QtclClientApp:
                             continue
 
                         _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…")
+                        # ── CLIENT-AS-ORACLE: sign attestation, broadcast to mesh ──
+                        _oracle_n = getattr(self, "_oracle_node", None)
+                        if _oracle_n and _oracle_n.is_active():
+                            _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
                         _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
 
                         submit_payload = {
