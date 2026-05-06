@@ -7744,7 +7744,7 @@ def _fmt_ago(timestamp: float) -> str:
 
 async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
     """Called when SSE fires block_finalized for one of our blocks."""
-    await asyncio.sleep(0.5)
+    await _asyncio.sleep(0.5)
     for attempt in range(3):
         try:
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=5, retries=1)
@@ -7755,7 +7755,7 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
                 logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL")
                 return balance_qtcl
         except Exception:
-            await asyncio.sleep(1.0 * (attempt + 1))
+            await _asyncio.sleep(1.0 * (attempt + 1))
     return None
 
 
