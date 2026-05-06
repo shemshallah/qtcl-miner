@@ -7475,7 +7475,7 @@ class CachedBlock:
     parent_hash: str
     nonce: int
     timestamp: int
-    difficulty: int
+    difficulty: float
     miner_address: str
     submit_payload: Dict[str, Any]
     signature: Dict[str, Any]
@@ -7497,7 +7497,7 @@ class BlockSubmissionCache:
     rewards, block counts and chain tip survive script restarts.
     """
     MAX_SIZE = 32
-    EVICT_AFTER_S = 60.0
+    EVICT_AFTER_S = 0.0
 
     def __init__(self, db=None):
         self._lock = threading.RLock()
@@ -7505,6 +7505,9 @@ class BlockSubmissionCache:
         self._hash_index: Dict[str, int] = {}
         self._balance_qtcl: float = 0.0
         self._db = db
+        self._highest_finalized_height: int = 0
+        self._finalized_count: int = 0
+        self._total_rewards: float = 0.0
         self._rehydrate()
 
     def _rehydrate(self):
@@ -7513,7 +7516,7 @@ class BlockSubmissionCache:
             return
         try:
             # Rehydrate finalized blocks
-            rows = self._db.conn.execute(
+            rows = self._db.execute(
                 "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at "
                 "FROM client_blocks WHERE finalized = 1 ORDER BY height"
             ).fetchall()
@@ -7532,7 +7535,11 @@ class BlockSubmissionCache:
                 self._hash_index[row["block_hash"]] = row["height"]
             # Compute balance from local UTXO mirror
             self._balance_qtcl = self._compute_balance_from_utxos()
+            if rows:
+                self._highest_finalized_height = max(row["height"] for row in rows)
             logger.info(f"[CACHE-REHYDRATE] ✅ {len(rows)} blocks, balance={self._balance_qtcl:.8f} QTCL")
+            # Evict rehydrated finalized blocks immediately — already in SQLite
+            self._evict_old()
         except Exception as _rh_err:
             logger.debug(f"[CACHE-REHYDRATE] {_rh_err}")
 
@@ -7541,7 +7548,7 @@ class BlockSubmissionCache:
         if self._db is None:
             return 0.0
         try:
-            row = self._db.conn.execute(
+            row = self._db.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM client_utxos WHERE spent = 0"
             ).fetchone()
             total_base = int(row[0]) if row and row[0] else 0
@@ -7554,13 +7561,12 @@ class BlockSubmissionCache:
         if self._db is None:
             return
         try:
-            self._db.conn.execute(
+            self._db.execute(
                 "INSERT OR REPLACE INTO client_blocks (height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized, finalized_at) "
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (height, block.block_hash, block.parent_hash, block.miner_address,
                  block.reward_qtcl, block.oracle_count, 1, int(block.finalized_at))
             )
-            self._db.conn.commit()
         except Exception as _pe:
             logger.debug(f"[CACHE-PERSIST] block h={height}: {_pe}")
 
@@ -7569,11 +7575,10 @@ class BlockSubmissionCache:
         if self._db is None:
             return
         try:
-            self._db.conn.execute(
+            self._db.execute(
                 "INSERT OR IGNORE INTO client_rewards (block_height, reward_type, amount_qtcl, recipient) VALUES (?,?,?,?)",
                 (height, reward_type, reward_qtcl, recipient)
             )
-            self._db.conn.commit()
         except Exception as _pe:
             logger.debug(f"[CACHE-PERSIST] reward h={height}: {_pe}")
 
@@ -7586,7 +7591,7 @@ class BlockSubmissionCache:
             if result and not result.get("error"):
                 utxos = result.get("utxos", [])
                 for utxo in utxos:
-                    self._db.conn.execute(
+                    self._db.execute(
                         "INSERT OR REPLACE INTO client_utxos (tx_hash, output_index, address, amount, spent, created_at_height) VALUES (?,?,?,?,?,?)",
                         (utxo["tx_hash"], utxo["output_index"], address,
                          int(utxo["amount"]), 0, utxo.get("created_at_height", 0))
@@ -7595,11 +7600,10 @@ class BlockSubmissionCache:
                 if utxos:
                     tx_hashes = [u["tx_hash"] for u in utxos]
                     placeholders = ",".join("?" * len(tx_hashes))
-                    self._db.conn.execute(
+                    self._db.execute(
                         f"UPDATE client_utxos SET spent = 1 WHERE address = ? AND tx_hash NOT IN ({placeholders})",
                         (address, *tx_hashes)
                     )
-                self._db.conn.commit()
                 self._balance_qtcl = self._compute_balance_from_utxos()
         except Exception as _ue:
             logger.debug(f"[CACHE-UTXO-SYNC] {_ue}")
@@ -7653,16 +7657,28 @@ class BlockSubmissionCache:
                 if oracle_ids:
                     b.oracle_ids = oracle_ids
 
-    def mark_finalized(self, height: int, reward_qtcl: float = 0.0, recipient: str = ""):
+    def mark_finalized(self, height: int, reward_qtcl: float = 0.0, recipient: str = "", oracle_count: int = 0, oracle_ids: list = None):
         with self._lock:
             b = self._blocks.get(height)
             if b:
                 b.status = BlockStatus.FINALIZED
                 b.finalized_at = time.time()
                 b.reward_qtcl = reward_qtcl
+                if oracle_count > 0:
+                    b.oracle_count = oracle_count
+                if oracle_ids:
+                    b.oracle_ids = oracle_ids
                 self._persist_block_finalized(height, b)
                 if reward_qtcl > 0:
                     self._persist_reward(height, reward_qtcl, recipient or b.miner_address, "miner")
+                # Update aggregate metrics and evict from memory immediately
+                # (block is already persisted to local SQLite)
+                self._highest_finalized_height = max(self._highest_finalized_height, height)
+                self._finalized_count += 1
+                self._total_rewards += reward_qtcl
+                b = self._blocks.pop(height, None)
+                if b:
+                    self._hash_index.pop(b.block_hash, None)
 
     def mark_rejected(self, height: int, error: str = ""):
         with self._lock:
@@ -7697,22 +7713,38 @@ class BlockSubmissionCache:
             if evt_type == "block_finalized":
                 b.status = BlockStatus.FINALIZED
                 b.finalized_at = time.time()
-                b.oracle_count = oracle_count
-                b.oracle_ids = oracle_ids
+                # Never downgrade oracle count on a finalized block
+                if oracle_count >= b.oracle_count:
+                    b.oracle_count = oracle_count
+                    b.oracle_ids = oracle_ids
                 if not _was_finalized:
                     self._persist_block_finalized(h, b)
+                    self._highest_finalized_height = max(self._highest_finalized_height, h)
+                    self._finalized_count += 1
+                    b2 = self._blocks.pop(h, None)
+                    if b2:
+                        self._hash_index.pop(b2.block_hash, None)
             elif evt_type == "block_pending":
-                b.oracle_count = oracle_count
-                b.oracle_ids = oracle_ids
+                # Only update count if it increases; never downgrade
+                if oracle_count > b.oracle_count:
+                    b.oracle_count = oracle_count
+                    b.oracle_ids = oracle_ids
                 if oracle_count >= 3 and b.status != BlockStatus.FINALIZED:
                     b.status = BlockStatus.FINALIZED
                     b.finalized_at = time.time()
                     self._persist_block_finalized(h, b)
+                    self._highest_finalized_height = max(self._highest_finalized_height, h)
+                    self._finalized_count += 1
+                    b2 = self._blocks.pop(h, None)
+                    if b2:
+                        self._hash_index.pop(b2.block_hash, None)
             elif evt_type == "oracle_attestation":
                 b.oracle_count = max(b.oracle_count, oracle_count)
 
     def is_height_finalized(self, height: int) -> bool:
         with self._lock:
+            if height <= self._highest_finalized_height:
+                return True
             b = self._blocks.get(height)
             return b is not None and b.status == BlockStatus.FINALIZED
 
@@ -7730,17 +7762,15 @@ class BlockSubmissionCache:
 
     def finalized_count(self) -> int:
         with self._lock:
-            return sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED)
+            return self._finalized_count + sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED)
 
     def total_rewards(self) -> float:
         with self._lock:
-            return sum(b.reward_qtcl for b in self._blocks.values()
+            return self._total_rewards + sum(b.reward_qtcl for b in self._blocks.values()
                        if b.status == BlockStatus.FINALIZED)
 
     def get_chain_tip(self) -> int:
-        with self._lock:
-            finalized = [h for h, b in self._blocks.items() if b.status == BlockStatus.FINALIZED]
-            return max(finalized) if finalized else 0
+        return self._highest_finalized_height
 
     def get_block(self, height: int) -> Optional[CachedBlock]:
         with self._lock:
@@ -7871,11 +7901,110 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
 _SCHEMA_VALIDATED = threading.Event()
 _SCHEMA_LOCK = threading.Lock()
 
+class SQLiteConnectionPool:
+    """Thread-safe SQLite connection pool with WAL mode.
+
+    SQLite is fundamentally single-writer; WAL mode allows concurrent readers
+    while one writer proceeds.  We keep a pool of connections so that readers
+    never block behind a long-running writer.
+    """
+
+    def __init__(self, db_path: Path, min_conn: int = 2, max_conn: int = 8):
+        import sqlite3
+        self._db_path = str(db_path)
+        self._min_conn = min_conn
+        self._max_conn = max_conn
+        self._pool = queue.Queue(maxsize=max_conn)
+        self._lock = threading.Lock()
+        self._created = 0
+        self._in_use = 0
+        self._shutdown = False
+
+        # Bootstrap the pool with WAL-enabled connections
+        for _ in range(min_conn):
+            conn = self._new_conn()
+            self._pool.put(conn)
+            self._created += 1
+
+    def _new_conn(self):
+        import sqlite3
+        conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            timeout=30,
+            isolation_level=None,  # we manage tx manually for speed
+        )
+        conn.row_factory = sqlite3.Row
+        # WAL mode is idempotent — safe to run on every checkout
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-64000")  # 64 MB page cache
+        conn.execute("PRAGMA mmap_size=268435456")  # 256 MB mmap
+        return conn
+
+    def get(self, timeout: float = 10.0):
+        if self._shutdown:
+            raise RuntimeError("Pool is shut down")
+        try:
+            conn = self._pool.get(timeout=timeout)
+        except queue.Empty:
+            with self._lock:
+                if self._created < self._max_conn:
+                    conn = self._new_conn()
+                    self._created += 1
+                else:
+                    raise RuntimeError("SQLite connection pool exhausted")
+        with self._lock:
+            self._in_use += 1
+        return conn
+
+    def put(self, conn):
+        with self._lock:
+            self._in_use -= 1
+        if self._shutdown:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        try:
+            # Reset any leftover transaction state before returning
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+            with self._lock:
+                self._created -= 1
+
+    def close_all(self):
+        self._shutdown = True
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except Exception:
+                pass
+
+    @property
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "created": self._created,
+                "in_use": self._in_use,
+                "available": self._pool.qsize(),
+                "max": self._max_conn,
+            }
+
+
 class LocalBlockchainDB:
     """Local SQLite blockchain database - replaces psycopg version
 
     Maintains 100% interface compatibility with original while using SQLite instead of PostgreSQL.
-    All methods from original are preserved and re-implemented using SQLite.
+    Uses a connection pool (WAL mode) for concurrent read/write safety at scale.
     """
 
     def __init__(
@@ -7886,7 +8015,7 @@ class LocalBlockchainDB:
         min_size: int = 10,
         max_size: int = 20,
         pool_min: int = 2,
-        pool_max: int = 10,
+        pool_max: int = 8,
         **kwargs,
     ):
         """Initialize SQLite database with full parameter compatibility
@@ -7918,11 +8047,17 @@ class LocalBlockchainDB:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = _DB_PATH
 
+        # Legacy single conn kept for code that directly accesses self.conn
         self.conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, timeout=10
         )
         self.conn.row_factory = sqlite3.Row
-        self._pool = None
+        # Enable WAL on the legacy connection too
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+
+        self._pool = SQLiteConnectionPool(self.db_path, pool_min, pool_max)
+        self._lock = threading.RLock()
 
         self._init_pool()
         # Validate schema against qtcl_db_builder.py (single source of truth)
@@ -7935,7 +8070,7 @@ class LocalBlockchainDB:
                     self._migrate_schema()
                     _SCHEMA_VALIDATED.set()
 
-        logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
+        logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path} (pool={pool_min}-{pool_max})")
 
     def _migrate_schema(self):
         """Idempotent schema migrations — add missing columns to pre-existing tables.
@@ -8139,16 +8274,17 @@ class LocalBlockchainDB:
             logging.warning(f"[SCHEMA] migration error: {_me}")
 
     def _init_pool(self):
-        """Initialize connection pool (no-op for SQLite, kept for interface compatibility)"""
+        """Pool already created in __init__; kept for interface compatibility."""
         pass
 
     def _teardown_pool(self):
-        """Teardown pool (no-op for SQLite, kept for interface compatibility)"""
-        pass
+        """Close all pooled connections."""
+        if self._pool:
+            self._pool.close_all()
 
     def _get_conn(self):
-        """Get database connection"""
-        return self.conn
+        """Get a pooled database connection (checkout)."""
+        return self._pool.get(timeout=10.0)
 
     def create_tables(self):
         """DEPRECATED: Schema creation now handled by _validate_and_init_schema() which uses qtcl_db_builder.py.
@@ -8158,46 +8294,61 @@ class LocalBlockchainDB:
     # ========= Interface-compatible query methods =========
 
     def execute(self, query: str, params=None):
-        """Execute SQL query"""
-        cursor = self.conn.cursor()
-        try:
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            self.conn.commit()
-            return cursor
-        except Exception as e:
-            self.conn.rollback()
-            _emsg = str(e)
-            # Silence expected schema-not-yet-created noise at DEBUG level
-            if "no such table" in _emsg or "no such column" in _emsg:
-                logging.debug(f"DB execute (schema not ready): {e}")
-            else:
-                logging.error(f"DB execute error: {e}")
-            raise
+        """Execute SQL query using pooled connection (thread-safe via RLock)."""
+        with self._lock:
+            conn = self._pool.get(timeout=10.0)
+            try:
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                conn.commit()
+                return cursor
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _emsg = str(e)
+                # Silence expected schema-not-yet-created noise at DEBUG level
+                if "no such table" in _emsg or "no such column" in _emsg:
+                    logging.debug(f"DB execute (schema not ready): {e}")
+                else:
+                    logging.error(f"DB execute error: {e}")
+                raise
+            finally:
+                self._pool.put(conn)
 
     def run_query(self, query: str, params=None):
         """Run query (alias for execute)"""
         return self.execute(query, params)
 
     def fetchone(self, query: str, params=None):
-        """Fetch one row"""
-        cursor = self.conn.cursor()
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        return cursor.fetchone()
+        """Fetch one row using pooled connection (thread-safe)."""
+        conn = self._pool.get(timeout=10.0)
+        try:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor.fetchone()
+        finally:
+            self._pool.put(conn)
 
     def fetchall(self, query: str, params=None):
-        """Fetch all rows"""
-        cursor = self.conn.cursor()
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        return cursor.fetchall()
+        """Fetch all rows using pooled connection (thread-safe)."""
+        conn = self._pool.get(timeout=10.0)
+        try:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor.fetchall()
+        finally:
+            self._pool.put(conn)
 
     # ========= Block operations =========
 
@@ -12909,6 +13060,84 @@ def _reconstruct_dm_from_bloch(snap: dict):
     return dm
 
 
+class CircuitBreaker:
+    """Circuit breaker for RPC calls.  Prevents cascading failures when the
+    server is down or overloaded by failing fast after a threshold of errors.
+
+    States:
+      CLOSED   – normal operation, calls pass through
+      OPEN     – failure threshold exceeded, calls fail immediately
+      HALF_OPEN – after recovery timeout, one probe call is allowed
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+        self._failures = 0
+        self._last_failure_time = 0.0
+        self._state = "CLOSED"
+        self._lock = _threading.Lock()
+        self._half_open_calls = 0
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def call(self, fn, *args, **kwargs):
+        """Execute fn if the circuit is closed or half-open."""
+        with self._lock:
+            if self._state == "OPEN":
+                if time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "HALF_OPEN"
+                    self._half_open_calls = 0
+                    _EXP_LOG.info("[CIRCUIT] 🔓 HALF_OPEN — probing server recovery")
+                else:
+                    raise RuntimeError(
+                        f"Circuit breaker OPEN ({self.recovery_timeout:.0f}s cooldown)"
+                    )
+            elif self._state == "HALF_OPEN" and self._half_open_calls >= self.half_open_max_calls:
+                raise RuntimeError("Circuit breaker HALF_OPEN — too many probe calls")
+
+            if self._state == "HALF_OPEN":
+                self._half_open_calls += 1
+
+        try:
+            result = fn(*args, **kwargs)
+            self._on_success()
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise
+
+    def _on_success(self):
+        with self._lock:
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                self._failures = 0
+                self._half_open_calls = 0
+                _EXP_LOG.info("[CIRCUIT] ✅ CLOSED — server recovered")
+            elif self._state == "CLOSED" and self._failures > 0:
+                self._failures = max(0, self._failures - 1)
+
+    def _on_failure(self):
+        with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.time()
+            if self._failures >= self.failure_threshold:
+                if self._state != "OPEN":
+                    self._state = "OPEN"
+                    _EXP_LOG.warning(
+                        f"[CIRCUIT] 🔴 OPEN after {self._failures} consecutive failures"
+                    )
+
+
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
 # SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
 # γ-SWARM  KoyebRPCNodule  (endpoints verified vs GossipHTTPHandler)
@@ -12924,6 +13153,11 @@ class KoyebRPCNodule:
         self._lock = _threading.Lock()
         self._last_error = None
         self._health_check_cache = {"timestamp": 0, "status": False}
+        self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        # Idempotency keys for submission RPCs — prevents duplicate blocks/txs on retry
+        self._idempotency_cache: Dict[str, float] = {}
+        self._idempotency_lock = _threading.Lock()
+        self._idempotency_ttl = 300.0
 
     def _get_session(self):
         if self._session is None and _HAS_REQUESTS:
@@ -12935,7 +13169,10 @@ class KoyebRPCNodule:
     def _rpc(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
-        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
+        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely).
+
+        Protected by circuit breaker + jittered exponential backoff.
+        """
         import urllib.parse as _up
 
         t = timeout or self.timeout
@@ -12945,59 +13182,43 @@ class KoyebRPCNodule:
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
 
-        for attempt in range(retries):
-            try:
-                if _HAS_REQUESTS:
-                    r = self._get_session().get(full_url, timeout=t)
-                    if r.status_code == 200:
-                        result = r.json()
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            # Return the full error dict so callers can handle rejections
-                            return result
-                    else:
-                        # Attempt to parse error from body even on non-200
-                        try:
-                            result = r.json()
-                            if isinstance(result, dict) and "error" in result:
-                                return result
-                        except:
-                            pass
-
-                    _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
-                    last_error = f"HTTP {r.status_code}"
+        def _do_request():
+            if _HAS_REQUESTS:
+                r = self._get_session().get(full_url, timeout=t)
+                if r.status_code == 200:
+                    result = r.json()
+                    if "result" in result:
+                        return result.get("result")
+                    elif "error" in result:
+                        return result
                 else:
-                    import urllib.request as _ur
-
-                    req = _ur.Request(full_url)
-                    with _ur.urlopen(req, timeout=t) as resp:
-                        result = _json.loads(resp.read().decode("utf-8"))
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            # Return the full error dict so callers can handle rejections
-                            return result
-            except Exception as e:
-                # Check if it's an HTTP error from urllib (not defined when using requests)
-                if (
-                    "_ur" in dir()
-                    and hasattr(_ur, "HTTPError")
-                    and isinstance(e, _ur.HTTPError)
-                ):
                     try:
-                        result = _json.loads(e.read().decode("utf-8"))
+                        result = r.json()
                         if isinstance(result, dict) and "error" in result:
                             return result
-                    except:
+                    except Exception:
                         pass
-                    last_error = f"HTTP {e.code}"
-                else:
-                    last_error = str(e)
+                    raise RuntimeError(f"HTTP {r.status_code}")
+            else:
+                import urllib.request as _ur
+                req = _ur.Request(full_url)
+                with _ur.urlopen(req, timeout=t) as resp:
+                    result = _json.loads(resp.read().decode("utf-8"))
+                    if "result" in result:
+                        return result.get("result")
+                    elif "error" in result:
+                        return result
+
+        for attempt in range(retries):
+            try:
+                return self._circuit.call(_do_request)
+            except Exception as e:
+                last_error = str(e)
                 if attempt < retries - 1:
-                    backoff = 2**attempt
+                    # Jittered exponential backoff: base * 2^attempt + random [0, 1)s
+                    backoff = (2 ** attempt) + random.random()
                     _EXP_LOG.debug(
-                        f"[RPC] {method} attempt {attempt + 1}/{retries} failed: {e}. Retrying..."
+                        f"[RPC] {method} attempt {attempt + 1}/{retries} failed: {e}. Retrying in {backoff:.1f}s..."
                     )
                     time.sleep(backoff)
                 else:
@@ -13005,6 +13226,26 @@ class KoyebRPCNodule:
 
         self._last_error = last_error
         return None
+
+    def _make_idempotency_key(self, method: str, params: list) -> str:
+        """Generate an idempotency key for submission RPCs."""
+        canonical = _json.dumps({"m": method, "p": params}, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha3_256(canonical.encode()).hexdigest()[:32]
+
+    def _is_idempotent_seen(self, key: str) -> bool:
+        """Check if an idempotency key was recently processed successfully."""
+        with self._idempotency_lock:
+            now = time.time()
+            # Expire old entries
+            expired = [k for k, ts in self._idempotency_cache.items() if now - ts > self._idempotency_ttl]
+            for k in expired:
+                del self._idempotency_cache[k]
+            return key in self._idempotency_cache
+
+    def _mark_idempotent_seen(self, key: str):
+        """Mark an idempotency key as successfully processed."""
+        with self._idempotency_lock:
+            self._idempotency_cache[key] = time.time()
 
     def _rpc_envelope(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
@@ -13020,36 +13261,48 @@ class KoyebRPCNodule:
         t = timeout or self.timeout
 
         if method == "qtcl_submitBlock":
+            # Idempotency: avoid duplicate submissions on retry
+            _idemp_key = self._make_idempotency_key(method, params)
+            if self._is_idempotent_seen(_idemp_key):
+                _EXP_LOG.info(f"[RPC-IDEMP] ✅ Block already submitted (key={_idemp_key[:8]}…)")
+                return {"jsonrpc": "2.0", "result": {"status": "already_accepted", "idempotency_key": _idemp_key}, "id": 1}
+
             payload = {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or [],
                 "id": 1,
+                "idempotency_key": _idemp_key,
             }
 
-            # POST /rpc directly to Koyeb-managed reverse proxy (no fallback port)
-            post_url = f"{self.base_url}/rpc"
+            def _do_post():
+                post_url = f"{self.base_url}/rpc"
+                if _HAS_REQUESTS:
+                    r = self._get_session().post(post_url, json=payload, timeout=t)
+                    if r.status_code == 200:
+                        return r.json()
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                else:
+                    data = _json.dumps(payload).encode("utf-8")
+                    req = _ur.Request(
+                        post_url,
+                        data=data,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        return _json.loads(resp.read().decode("utf-8"))
+
             for attempt in range(retries):
                 try:
-                    if _HAS_REQUESTS:
-                        r = self._get_session().post(
-                            post_url, json=payload, timeout=t
-                        )
-                        if r.status_code == 200:
-                            return r.json()
-                    else:
-                        data = _json.dumps(payload).encode("utf-8")
-                        req = _ur.Request(
-                            post_url,
-                            data=data,
-                            headers={"Content-Type": "application/json"},
-                        )
-                        with _ur.urlopen(req, timeout=t) as resp:
-                            return _json.loads(resp.read().decode("utf-8"))
+                    result = self._circuit.call(_do_post)
+                    # Mark idempotent on any success (even if server says duplicate)
+                    if isinstance(result, dict) and "error" not in result:
+                        self._mark_idempotent_seen(_idemp_key)
+                    return result
                 except Exception as e:
                     logger.debug(f"[RPC] POST attempt {attempt + 1} failed: {e}")
                     if attempt < retries - 1:
-                        time.sleep(2**attempt)
+                        time.sleep((2 ** attempt) + random.random())
             return None
 
         # GET /rpc directly to Koyeb-managed reverse proxy (no fallback port)
@@ -20974,22 +21227,14 @@ class QtclClientApp:
             # Patch any column-level deltas from previous schema versions
             self._verify_db_schema()
 
-            # ── SSE CLIENT INITIALIZATION (moved here to ensure DB is ready first) ──
-            # The SSE client depends on DB being initialized for persistence
+            # ── SSE CLIENT INITIALIZATION ──
+            # Redundant standalone SSE client removed; density/consensus/block
+            # streams are already started at module load via connect_*_stream().
+            # This avoids duplicate /rpc/oracle/snapshot connections that exhaust
+            # the server's per-IP SSE limit.
             global _sse_client
-            if not hasattr(self, "_sse_client") or self._sse_client is None:
-                try:
-                    self._sse_client = init_sse_client(self.oracle_url)
-                    _sse_client = self._sse_client  # Update global reference
-                    _EXP_LOG.info(
-                        f"[INIT] ✅ SSE stream client initialized for {self.oracle_url}"
-                    )
-                except Exception as _sse_err:
-                    _EXP_LOG.warning(
-                        f"[INIT] ⚠️ SSE client initialization failed: {_sse_err}"
-                    )
-                    self._sse_client = None
-                    _sse_client = None
+            self._sse_client = None
+            _sse_client = None
 
             # ── SYNC LOCAL CHAIN WITH SERVER ──
             try:
@@ -25597,7 +25842,8 @@ class QtclClientApp:
                         oracle_str = (result or {}).get("oracle_consensus", "0/5")
                         oracle_count = int(oracle_str.split("/")[0]) if "/" in str(oracle_str) else 0
                         if "finalized" in status or "already_accepted" in status:
-                            cache.mark_finalized(block.height, reward)
+                            _oid_list = (result or {}).get("oracle_ids", [])
+                            cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
                             _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward} QTCL")
                             _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
@@ -30302,7 +30548,7 @@ def main() -> None:  # noqa: F811
                 # Persist to quantum_density for distributed sensor mesh
                 try:
                     _qdb = _get_local_db("qtcl")
-                    _qdb.conn.execute(
+                    _qdb.execute(
                         "INSERT INTO quantum_density (source, density_matrix_hex, fidelity, coherence, block_height, metadata) VALUES (?,?,?,?,?,?)",
                         (
                             "server",
@@ -30313,7 +30559,6 @@ def main() -> None:  # noqa: F811
                             json.dumps(data, default=str),
                         ),
                     )
-                    _qdb.conn.commit()
                 except Exception:
                     pass
             globals()["_LATEST_DENSITY_SNAPSHOT"] = data
@@ -30328,19 +30573,32 @@ def main() -> None:  # noqa: F811
                 )
             globals()["_LATEST_BLOCK_EVENT"] = data
 
+        # Deduplication buffer for consensus events (suppress reconnect replays)
+        _CONSENSUS_DEDUP: Dict[Tuple[str, int, int], float] = {}
+        _CONSENSUS_DEDUP_LOCK = threading.Lock()
+
         def _default_consensus_handler(data: dict) -> None:
             """Default handler for oracle consensus stream - logs attestations/finalizations."""
             _evt = data.get("event_type", "")
-            _h = data.get("height", 0)
+            _h = int(data.get("height", 0))
             _oid = data.get("oracle_ids", [])
             _final = data.get("finalized", False)
+            _oc = int(data.get("oracle_count", len(_oid)))
+            # Deduplicate: suppress identical (event, height, count) within 10s
+            _key = (_evt, _h, _oc)
+            _now = time.time()
+            with _CONSENSUS_DEDUP_LOCK:
+                _last = _CONSENSUS_DEDUP.get(_key, 0)
+                if _now - _last < 10.0:
+                    return
+                _CONSENSUS_DEDUP[_key] = _now
             if _evt == "block_finalized":
                 logger.critical(
-                    f"[SSE-RECV] 🔥 BLOCK FINALIZED h={_h}  oracles={len(_oid)}/5  ids={_oid}"
+                    f"[SSE-RECV] 🔥 BLOCK FINALIZED h={_h}  oracles={_oc}/5  ids={_oid}"
                 )
             elif _evt == "block_pending":
                 logger.info(
-                    f"[SSE-RECV] ⏳ Block pending h={_h}  oracles={len(_oid)}/5"
+                    f"[SSE-RECV] ⏳ Block pending h={_h}  oracles={_oc}/5"
                 )
             elif _evt == "oracle_attestation":
                 logger.info(
