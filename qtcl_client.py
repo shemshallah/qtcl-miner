@@ -5464,13 +5464,25 @@ class LiveRPCOracleSnapshot:
         self._start_sse_stream()
 
     def _start_sse_stream(self):
-        """Initialize EventSource listener for live density matrix stream."""
+        """Initialize EventSource listener for live density matrix stream.
+
+        SKIPS starting a redundant listener if the module-level density SSE
+        stream (connect_density_stream) is already active. This prevents
+        exhausting the server’s 5-connection-per-IP SSE limit.
+        """
+        # Check if module-level density stream is already running
+        _dt = globals().get("_SSE_DENSITY_THREAD")
+        if _dt is not None and _dt.is_alive():
+            logger.debug(
+                "[CLIENT] Density SSE stream already active — skipping QuantumClient redundant listener"
+            )
+            return
+
         try:
             # Import EventSourceListener at runtime to avoid circular deps
             import sys
 
             if "sse_listener" not in sys.modules:
-                # SSE listener module not available — that's OK, fall back to RPC polling
                 logger.debug(
                     "[CLIENT] SSE listener module not available, using RPC polling"
                 )
@@ -25512,6 +25524,7 @@ class QtclClientApp:
                 _EXP_LOG.warning("[MINER] SSE handler registration failed — handlers not available")
 
             _REJECTED_HEIGHT_NONCES = {}
+            _PERSISTENT_NONCE_BASE = [secrets.randbelow(2 ** 32)]
 
             async def pow_task():
                 while True:
@@ -25624,8 +25637,8 @@ class QtclClientApp:
                         _POW_WINDOW_BYTES = 64
                         _POW_MIX_ROUNDS = 64
                         _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
-                        _scratchpad_bytes = _hl.shake_256(b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed).digest(_POW_SCRATCHPAD_BYTES)
-                        _sp_mv = memoryview(_scratchpad_bytes)
+                        _SCRATCHPAD_EPOCH_NONCES = 524_288  # 2^19 — rotate scratchpad every ~75s @ 7KH/s
+                        # ASIC-hard: scratchpad rotates every epoch, seeded by epoch number
                         _ph_parent = bytes.fromhex(oracle_hash.zfill(64))[:32]
                         _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
                         _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
@@ -25634,7 +25647,12 @@ class QtclClientApp:
                         _HDR_FMT = ">Q I 32s 32s I I 40s 32s"
                         _RND_RANGE = range(_POW_MIX_ROUNDS)
                         _POW_PREFIX = b"QTCL_POW_v1:"
-                        _WIN_OFFSETS = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
+
+                        def _make_scratchpad(epoch: int) -> bytes:
+                            """Generate epoch-scratchpad. ASICs must recompute 512KB every epoch."""
+                            return _hl.shake_256(
+                                b"QTCL_SCRATCHPAD_v1:" + _ph_seed + epoch.to_bytes(8, "big")
+                            ).digest(_POW_SCRATCHPAD_BYTES)
 
                         _n_workers = max(1, (_os2.cpu_count() or 1))
                         _result_q = _q2.Queue()
@@ -25663,9 +25681,7 @@ class QtclClientApp:
                                 _ps = _ph_seed
                                 _nw = _POW_N_WINDOWS
                                 _rr = _RND_RANGE
-                                _mv = _sp_mv
                                 _rp2 = _rnd_packed
-                                _woffs = _WIN_OFFSETS
                                 _wend = _POW_WINDOW_BYTES
                                 _abort = _abort_evt.is_set
                                 _put = _result_q.put
@@ -25673,10 +25689,22 @@ class QtclClientApp:
                                 _zeros = _hex_zeros
                                 _dbits = difficulty_bits
                                 _nl = _nonce_lock
+                                _epoch_size = _SCRATCHPAD_EPOCH_NONCES
                                 n = start_nonce
                                 lc = 0
                                 _ctr = _nonce_ctr
+                                # Initial scratchpad for worker's start epoch
+                                _epoch = n // _epoch_size
+                                _scratch = _make_scratchpad(_epoch)
+                                _mv = memoryview(_scratch)
+                                _woffs = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
                                 while not _abort():
+                                    # Rotate scratchpad on epoch boundary (ASIC-hard)
+                                    _new_epoch = n // _epoch_size
+                                    if _new_epoch != _epoch:
+                                        _epoch = _new_epoch
+                                        _scratch = _make_scratchpad(_epoch)
+                                        _mv = memoryview(_scratch)
                                     hdr = _pack(_fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps)
                                     _h0 = _sha3()
                                     _h0.update(_pfx)
@@ -25695,7 +25723,7 @@ class QtclClientApp:
                                         _put((n, hx))
                                         _set()
                                         return
-                                    n += stride
+                                    n = (n + stride) & 0xFFFFFFFF
                                     if lc & 511 == 0:
                                         with _nl:
                                             _ctr[0] += 512
@@ -25708,7 +25736,7 @@ class QtclClientApp:
 
                         _workers = []
                         for _wi in range(_n_workers):
-                            _wt = _thr2.Thread(target=_pow_worker, args=(_wi, _n_workers), daemon=True, name=f"PoW-{_wi}")
+                            _wt = _thr2.Thread(target=_pow_worker, args=((_PERSISTENT_NONCE_BASE[0] + _wi) & 0xFFFFFFFF, _n_workers), daemon=True, name=f"PoW-{_wi}")
                             _wt.start()
                             _workers.append(_wt)
 
@@ -25717,7 +25745,7 @@ class QtclClientApp:
                         _last_telem_nonce = 0
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
-                            _cur_nonce = _nonce_ctr[0]
+                            _cur_nonce = _PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]
                             if _cur_nonce != _last_telem_nonce:
                                 _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash)
                                 _last_telem_nonce = _cur_nonce
@@ -25745,6 +25773,13 @@ class QtclClientApp:
                                 break
 
                         _found = block_hash is not None
+                        if _found:
+                            _PERSISTENT_NONCE_BASE[0] = secrets.randbelow(2 ** 32)
+                        elif _chain_advanced:
+                            _PERSISTENT_NONCE_BASE[0] = secrets.randbelow(2 ** 32)
+                        elif _ttl_expired:
+                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0] + secrets.randbelow(1_000_000)
+
                         if not _found or _chain_advanced or _ttl_expired:
                             _MINE_TELEM.mark_idle()
                             await _asyncio.sleep(0.1)
@@ -25752,9 +25787,10 @@ class QtclClientApp:
 
                         _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…")
                         # ── CLIENT-AS-ORACLE: sign attestation, broadcast to mesh ──
+                        _self_attestation = None
                         _oracle_n = getattr(self, "_oracle_node", None)
                         if _oracle_n and _oracle_n.is_active():
-                            _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
+                            _self_attestation = _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
                         _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
 
                         submit_payload = {
@@ -25774,7 +25810,7 @@ class QtclClientApp:
                             "mermin_violated": False,
                             "quantum_field_16x16x16": "",
                             "transactions": _block_txs,
-                            "oracle_attestations": [],
+                            "oracle_attestations": [_self_attestation] if _self_attestation else [],
                         }
 
                         _sig = None
@@ -26044,6 +26080,9 @@ class QtclClientApp:
             pass
         finally:
             self._stop.set()
+            _oracle_n = getattr(self, "_oracle_node", None)
+            if _oracle_n and _oracle_n.is_active():
+                _oracle_n.deactivate()
             print("\n  🛑 Mining stopped")
 
     # ── Transact mode ─────────────────────────────────────────────────────────
@@ -26132,6 +26171,9 @@ class QtclClientApp:
         _tx_root_log.handlers = _tx_old_handlers
         _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
+        _oracle_n = getattr(self, "_oracle_node", None)
+        if _oracle_n and _oracle_n.is_active():
+            _oracle_n.deactivate()
 
     def _send_tx_wizard(self) -> None:
         try:
