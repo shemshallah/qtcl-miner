@@ -7491,15 +7491,118 @@ class CachedBlock:
     error_message: str = ""
 
 class BlockSubmissionCache:
-    """Thread-safe FIFO cache of solved blocks awaiting oracle consensus."""
+    """Thread-safe FIFO cache of solved blocks awaiting oracle consensus.
+
+    Rehydrates finalized block history from local SQLite on startup so
+    rewards, block counts and chain tip survive script restarts.
+    """
     MAX_SIZE = 32
     EVICT_AFTER_S = 60.0
 
-    def __init__(self):
+    def __init__(self, db=None):
         self._lock = threading.RLock()
         self._blocks: OrderedDict = OrderedDict()
         self._hash_index: Dict[str, int] = {}
         self._balance_qtcl: float = 0.0
+        self._db = db
+        self._rehydrate()
+
+    def _rehydrate(self):
+        """Load finalized blocks and UTXOs from local SQLite mirror."""
+        if self._db is None:
+            return
+        try:
+            # Rehydrate finalized blocks
+            rows = self._db.conn.execute(
+                "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at "
+                "FROM client_blocks WHERE finalized = 1 ORDER BY height"
+            ).fetchall()
+            for row in rows:
+                b = CachedBlock(
+                    height=row["height"],
+                    block_hash=row["block_hash"],
+                    parent_hash=row["parent_hash"] or "",
+                    miner_address=row["miner_address"] or "",
+                )
+                b.status = BlockStatus.FINALIZED
+                b.finalized_at = row["finalized_at"] or 0.0
+                b.reward_qtcl = row["reward_qtcl"] or 0.0
+                b.oracle_count = row["oracle_count"] or 0
+                self._blocks[row["height"]] = b
+                self._hash_index[row["block_hash"]] = row["height"]
+            # Compute balance from local UTXO mirror
+            self._balance_qtcl = self._compute_balance_from_utxos()
+            logger.info(f"[CACHE-REHYDRATE] ✅ {len(rows)} blocks, balance={self._balance_qtcl:.8f} QTCL")
+        except Exception as _rh_err:
+            logger.debug(f"[CACHE-REHYDRATE] {_rh_err}")
+
+    def _compute_balance_from_utxos(self) -> float:
+        """Sum unspent outputs from client_utxos mirror."""
+        if self._db is None:
+            return 0.0
+        try:
+            row = self._db.conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM client_utxos WHERE spent = 0"
+            ).fetchone()
+            total_base = int(row[0]) if row and row[0] else 0
+            return total_base / 100.0
+        except Exception:
+            return 0.0
+
+    def _persist_block_finalized(self, height: int, block: CachedBlock):
+        """Persist a finalized block to client_blocks."""
+        if self._db is None:
+            return
+        try:
+            self._db.conn.execute(
+                "INSERT OR REPLACE INTO client_blocks (height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized, finalized_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (height, block.block_hash, block.parent_hash, block.miner_address,
+                 block.reward_qtcl, block.oracle_count, 1, int(block.finalized_at))
+            )
+            self._db.conn.commit()
+        except Exception as _pe:
+            logger.debug(f"[CACHE-PERSIST] block h={height}: {_pe}")
+
+    def _persist_reward(self, height: int, reward_qtcl: float, recipient: str, reward_type: str = "miner"):
+        """Persist a reward entry to client_rewards."""
+        if self._db is None:
+            return
+        try:
+            self._db.conn.execute(
+                "INSERT OR IGNORE INTO client_rewards (block_height, reward_type, amount_qtcl, recipient) VALUES (?,?,?,?)",
+                (height, reward_type, reward_qtcl, recipient)
+            )
+            self._db.conn.commit()
+        except Exception as _pe:
+            logger.debug(f"[CACHE-PERSIST] reward h={height}: {_pe}")
+
+    def _sync_utxos_from_server(self, kapi, address: str):
+        """Query server UTXOs and mirror locally in client_utxos."""
+        if self._db is None or not address:
+            return
+        try:
+            result = kapi._rpc("qtcl_getUTXOs", [{"address": address, "limit": 1000}], timeout=5, retries=1)
+            if result and not result.get("error"):
+                utxos = result.get("utxos", [])
+                for utxo in utxos:
+                    self._db.conn.execute(
+                        "INSERT OR REPLACE INTO client_utxos (tx_hash, output_index, address, amount, spent, created_at_height) VALUES (?,?,?,?,?,?)",
+                        (utxo["tx_hash"], utxo["output_index"], address,
+                         int(utxo["amount"]), 0, utxo.get("created_at_height", 0))
+                    )
+                # Mark any UTXOs not in the server list as spent (simple sync)
+                if utxos:
+                    tx_hashes = [u["tx_hash"] for u in utxos]
+                    placeholders = ",".join("?" * len(tx_hashes))
+                    self._db.conn.execute(
+                        f"UPDATE client_utxos SET spent = 1 WHERE address = ? AND tx_hash NOT IN ({placeholders})",
+                        (address, *tx_hashes)
+                    )
+                self._db.conn.commit()
+                self._balance_qtcl = self._compute_balance_from_utxos()
+        except Exception as _ue:
+            logger.debug(f"[CACHE-UTXO-SYNC] {_ue}")
 
     def enqueue_solved(self, block: CachedBlock) -> bool:
         with self._lock:
@@ -7550,13 +7653,16 @@ class BlockSubmissionCache:
                 if oracle_ids:
                     b.oracle_ids = oracle_ids
 
-    def mark_finalized(self, height: int, reward_qtcl: float = 0.0):
+    def mark_finalized(self, height: int, reward_qtcl: float = 0.0, recipient: str = ""):
         with self._lock:
             b = self._blocks.get(height)
             if b:
                 b.status = BlockStatus.FINALIZED
                 b.finalized_at = time.time()
                 b.reward_qtcl = reward_qtcl
+                self._persist_block_finalized(height, b)
+                if reward_qtcl > 0:
+                    self._persist_reward(height, reward_qtcl, recipient or b.miner_address, "miner")
 
     def mark_rejected(self, height: int, error: str = ""):
         with self._lock:
@@ -7587,17 +7693,21 @@ class BlockSubmissionCache:
                 return
             oracle_count = int(event.get("oracle_count", 0))
             oracle_ids = event.get("oracle_ids", [])
+            _was_finalized = b.status == BlockStatus.FINALIZED
             if evt_type == "block_finalized":
                 b.status = BlockStatus.FINALIZED
                 b.finalized_at = time.time()
                 b.oracle_count = oracle_count
                 b.oracle_ids = oracle_ids
+                if not _was_finalized:
+                    self._persist_block_finalized(h, b)
             elif evt_type == "block_pending":
                 b.oracle_count = oracle_count
                 b.oracle_ids = oracle_ids
-                if oracle_count >= 3:
+                if oracle_count >= 3 and b.status != BlockStatus.FINALIZED:
                     b.status = BlockStatus.FINALIZED
                     b.finalized_at = time.time()
+                    self._persist_block_finalized(h, b)
             elif evt_type == "oracle_attestation":
                 b.oracle_count = max(b.oracle_count, oracle_count)
 
@@ -7749,8 +7859,7 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
         try:
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=5, retries=1)
             if result and not result.get("error"):
-                balance_base = int(result.get("balance", 0))
-                balance_qtcl = balance_base / 100.0
+                balance_qtcl = float(result.get("balance", 0))
                 cache._balance_qtcl = balance_qtcl
                 logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL")
                 return balance_qtcl
@@ -7951,8 +8060,81 @@ class LocalBlockchainDB:
                 " PRIMARY KEY (height, peer_node_id)"
                 " )"
             )
+            # ═══════════════════════════════════════════════════════════════════════
+            # CLIENT-SIDE MIRROR TABLES  (rehydrate cache + distributed sensor mesh)
+            # ═══════════════════════════════════════════════════════════════════════
+            # finalized blocks mined by this client
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS client_blocks ("
+                " height INTEGER PRIMARY KEY,"
+                " block_hash TEXT NOT NULL,"
+                " parent_hash TEXT NOT NULL DEFAULT '',"
+                " miner_address TEXT NOT NULL DEFAULT '',"
+                " reward_qtcl REAL DEFAULT 0.0,"
+                " tx_count INTEGER DEFAULT 0,"
+                " oracle_count INTEGER DEFAULT 0,"
+                " finalized INTEGER DEFAULT 1,"
+                " finalized_at INTEGER DEFAULT 0,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                " )"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_client_blocks_miner ON client_blocks(miner_address)"
+            )
+            # UTXO mirror — Bitcoin-style unspent output set
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS client_utxos ("
+                " tx_hash TEXT NOT NULL,"
+                " output_index INTEGER NOT NULL,"
+                " address TEXT NOT NULL,"
+                " amount INTEGER NOT NULL,"
+                " spent INTEGER DEFAULT 0,"
+                " spent_at_height INTEGER,"
+                " spent_in_tx_hash TEXT,"
+                " created_at_height INTEGER,"
+                " created_at INTEGER DEFAULT (strftime('%s','now')),"
+                " PRIMARY KEY (tx_hash, output_index)"
+                " )"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_client_utxos_addr_spent ON client_utxos(address, spent)"
+            )
+            # reward history
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS client_rewards ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " block_height INTEGER NOT NULL,"
+                " reward_type TEXT NOT NULL DEFAULT 'miner',"
+                " amount_qtcl REAL NOT NULL,"
+                " recipient TEXT NOT NULL,"
+                " claimed INTEGER DEFAULT 0,"
+                " created_at INTEGER DEFAULT (strftime('%s','now'))"
+                " )"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_client_rewards_recipient ON client_rewards(recipient)"
+            )
+            # quantum density matrix snapshots (distributed sensor mesh repository)
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS quantum_density ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " source TEXT NOT NULL DEFAULT 'server',"
+                " density_matrix_hex TEXT,"
+                " fidelity REAL DEFAULT 0.0,"
+                " coherence REAL DEFAULT 0.0,"
+                " block_height INTEGER,"
+                " timestamp INTEGER DEFAULT (strftime('%s','now')),"
+                " metadata TEXT DEFAULT '{}'"
+                " )"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quantum_density_ts ON quantum_density(timestamp)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quantum_density_source ON quantum_density(source)"
+            )
             self.conn.commit()
-            logging.info("[SCHEMA] ✅ migrations applied (oracle mesh tables)")
+            logging.info("[SCHEMA] ✅ migrations applied (oracle mesh + client mirror tables)")
         except Exception as _me:
             logging.warning(f"[SCHEMA] migration error: {_me}")
 
@@ -9029,6 +9211,78 @@ class LocalBlockchainDB:
                 pass
             return balance_qtcl
         return None
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # DISTRIBUTED SENSOR MESH — serve local quantum data to peers
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def get_latest_density_snapshot(self) -> Optional[dict]:
+        """Return the most recent density matrix from quantum_density table."""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM quantum_density ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                return dict(row)
+        except Exception:
+            pass
+        return None
+
+    def get_density_history(self, limit: int = 32) -> list:
+        """Return recent density matrix snapshots for mesh distribution."""
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM quantum_density ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def get_local_finalized_blocks(self, limit: int = 100) -> list:
+        """Return finalized blocks mined by this node."""
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM client_blocks ORDER BY height DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def get_local_utxos(self, address: str = "", unspent_only: bool = True) -> list:
+        """Return UTXO mirror for mesh consensus / balance proofs."""
+        try:
+            if address:
+                sql = "SELECT * FROM client_utxos WHERE address = ?"
+                params = (address,)
+                if unspent_only:
+                    sql += " AND spent = 0"
+            else:
+                sql = "SELECT * FROM client_utxos"
+                params = ()
+                if unspent_only:
+                    sql += " WHERE spent = 0"
+            sql += " ORDER BY created_at_height ASC"
+            rows = self.conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def get_local_rewards(self, recipient: str = "") -> list:
+        """Return reward history for this node."""
+        try:
+            if recipient:
+                rows = self.conn.execute(
+                    "SELECT * FROM client_rewards WHERE recipient = ? ORDER BY block_height DESC",
+                    (recipient,),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM client_rewards ORDER BY block_height DESC"
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
 
 
 def compress(data: bytes) -> bytes:
@@ -24837,7 +25091,13 @@ class QtclClientApp:
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
             kapi = KoyebRPCNodule()
-            cache = BlockSubmissionCache()
+            # Pass local DB so cache rehydrates finalized blocks + UTXOs on startup
+            _local_db = None
+            try:
+                _local_db = self.db
+            except Exception:
+                pass
+            cache = BlockSubmissionCache(db=_local_db)
             _NULL_HASH = "0" * 64
 
             class _SubmissionPipeline:
@@ -25392,16 +25652,20 @@ class QtclClientApp:
                     await _asyncio.sleep(0.1)
 
             async def balance_task():
+                # Immediate fetch on startup, then every 30s
                 while True:
-                    await _asyncio.sleep(30.0)
                     try:
                         _addr = getattr(getattr(self, "wallet", None), "address", None)
                         if _addr:
+                            # 1. Server balance (authoritative)
                             result = kapi._rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
-                                cache._balance_qtcl = int(result.get("balance", 0)) / 100.0
+                                cache._balance_qtcl = float(result.get("balance", 0))
+                            # 2. UTXO mirror sync — persists to client_utxos for mesh/rehydrate
+                            cache._sync_utxos_from_server(kapi, _addr)
                     except Exception:
                         pass
+                    await _asyncio.sleep(30.0)
 
             await _asyncio.gather(pow_task(), submit_task(), balance_task())
         async def _mine():
@@ -30028,13 +30292,30 @@ def main() -> None:  # noqa: F811
         _sse_consensus_handlers: List[Callable[[dict], None]] = []
 
         def _default_density_handler(data: dict) -> None:
-            """Default handler for density stream - stores to global for reference."""
+            """Default handler for density stream - stores to global + local DB mesh repository."""
             dm_hex = data.get("density_tensor_hex", "") or data.get(
                 "density_matrix_hex", ""
             )
             ts = data.get("timestamp_ns", 0) or data.get("timestamp", 0)
             if dm_hex:
                 logger.debug(f"[SSE-RECV] Density snapshot received (ts={ts})")
+                # Persist to quantum_density for distributed sensor mesh
+                try:
+                    _qdb = _get_local_db("qtcl")
+                    _qdb.conn.execute(
+                        "INSERT INTO quantum_density (source, density_matrix_hex, fidelity, coherence, block_height, metadata) VALUES (?,?,?,?,?,?)",
+                        (
+                            "server",
+                            dm_hex,
+                            float(data.get("fidelity", 0.0)),
+                            float(data.get("coherence", 0.0)),
+                            int(data.get("block_height", 0)),
+                            json.dumps(data, default=str),
+                        ),
+                    )
+                    _qdb.conn.commit()
+                except Exception:
+                    pass
             globals()["_LATEST_DENSITY_SNAPSHOT"] = data
 
         def _default_block_handler(data: dict) -> None:
