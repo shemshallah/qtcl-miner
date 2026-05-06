@@ -15633,7 +15633,8 @@ class _MiningTelemetry:
         self.height = 0  # target block height
         self.difficulty = 0  # current PoW difficulty
         self.parent_hash = "0" * 64  # parent block hash
-        self.nonce = 0  # current nonce being tried
+        self.nonce = 0  # current nonce being tried (cumulative, includes PERSISTENT_BASE)
+        self.block_nonce = 0  # nonces tried for THIS block attempt only (display purposes)
         self.hash_rate = 0.0  # hashes/second (rolling 5 s window)
         self.blocks_found = 0  # blocks solved this session
         self.blocks_accepted = 0  # ✅ blocks accepted by server
@@ -15646,7 +15647,8 @@ class _MiningTelemetry:
         self.state = "IDLE"  # IDLE | MINING | SOLVED | SUBMITTING
 
     def update_progress(
-        self, height: int, difficulty: int, nonce: int, parent_hash: str = ""
+        self, height: int, difficulty: int, nonce: int, parent_hash: str = "",
+        block_nonce: int = 0
     ) -> None:
         with self._lock:
             if (height != self.height) or (nonce < self.nonce and self.nonce > 0):
@@ -15655,29 +15657,26 @@ class _MiningTelemetry:
             self.height = height
             self.difficulty = difficulty
             self.nonce = nonce
+            # block_nonce is the nonce TRIED within THIS BLOCK ATTEMPT ONLY
+            # (passed explicitly from the mining loop so the display never sees
+            # PERSISTENT_BASE accumulation). Falls back to derived value if 0.
+            if block_nonce > 0:
+                self.block_nonce = block_nonce
+            elif len(self._nonce_samples) > 0:
+                self.block_nonce = max(0, nonce - self._nonce_samples[0][1])
             if parent_hash:
                 self.parent_hash = parent_hash
             self.state = "MINING"
             now = time.time()
             self._nonce_samples.append((now, nonce))
             if len(self._nonce_samples) >= 2:
-                t0 = self._nonce_samples[0][0]
-                dt = now - t0
-                # Walk forward to find a ≥1s window — prevents the first-sample
-                # spike where dt=50ms makes hash_rate = dn/0.05, which can reach
-                # hundreds of millions on fast hardware before settling.
-                if dt >= 1.0:
-                    for t_old, n_old in self._nonce_samples:
-                        if now - t_old >= 1.0:
-                            t0, n0 = t_old, n_old
-                            dt = now - t0
-                            break
-                    else:
-                        n0 = self._nonce_samples[0][1]
-                else:
-                    n0 = self._nonce_samples[0][1]
+                t_first = self._nonce_samples[0][0]
+                n_first = self._nonce_samples[0][1]
+                dt = now - t_first
                 if dt > 0:
-                    raw_rate = (self.nonce - n0) / dt
+                    raw_rate = (self.nonce - n_first) / dt
+                    # Clamp: 50M H/s ceiling prevents transient spike on first
+                    # few samples where dt < 1s inflates the display.
                     self.hash_rate = min(raw_rate, 50_000_000.0)
 
     def record_block(self, block: dict) -> None:
@@ -15742,6 +15741,7 @@ class _MiningTelemetry:
                 "difficulty": self.difficulty,
                 "parent_hash": self.parent_hash,
                 "nonce": self.nonce,
+                "block_nonce": self.block_nonce,
                 "hash_rate": self.hash_rate,
                 "blocks_found": self.blocks_found,
                 "blocks_accepted": self.blocks_accepted,
@@ -25595,8 +25595,14 @@ class QtclClientApp:
                             _miner_reward_base = _TRS.get_miner_reward_base(target_height)
                             _treasury_reward_base = _TRS.get_treasury_reward_base(target_height)
                             _treasury_addr = _TRS.TREASURY_ADDRESS
+                            # Deferred treasury chain:
+                            #   Block 1: includes genesis miner(720) + block 1 miner(720) + genesis treasury(80)
+                            #   Block N (N>=2): block N miner + block N-1 treasury
+                            _genesis_extra = _TRS.get_miner_reward_base(0) if target_height == 1 else 0
+                            _prev_treasury = _TRS.get_treasury_reward_base(target_height - 1) if target_height > 0 else 0
                         except Exception:
-                            pass
+                            _genesis_extra = 720 if target_height == 1 else 0
+                            _prev_treasury = 80 if target_height > 0 else 0
 
                         _total_fees_base = 0
                         for tx in _pending_user_txs:
@@ -25606,8 +25612,8 @@ class QtclClientApp:
                             except (ValueError, TypeError):
                                 pass
 
-                        _miner_total_base = _miner_reward_base + (_total_fees_base // 2)
-                        _treasury_total_base = _treasury_reward_base + (_total_fees_base - (_total_fees_base // 2))
+                        _miner_total_base = _miner_reward_base + _genesis_extra + (_total_fees_base // 2)
+                        _treasury_total_base = _prev_treasury + (_total_fees_base - (_total_fees_base // 2))
 
                         _oracle_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}
                         _dm_hex = _oracle_snap.get("density_matrix_hex", "")
@@ -25742,7 +25748,10 @@ class QtclClientApp:
                                 _gc.enable()
 
                         _EXP_LOG.warning(f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} workers={_n_workers}")
-                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash)
+                        # Warmup: nonce=0 triggers the height/nonce regression check -> deque clear.
+                        # block_nonce is passed from the telemetry loop as _nonce_ctr[0],
+                        # which is the actual nonces tried this block attempt (monotonic).
+                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash, block_nonce=0)
                         _MINE_TELEM.mark_mining()
 
                         _workers = []
@@ -25758,7 +25767,7 @@ class QtclClientApp:
                             await _asyncio.sleep(0.05)
                             _cur_nonce = _PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]
                             if _cur_nonce != _last_telem_nonce:
-                                _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash)
+                                _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash, block_nonce=_nonce_ctr[0])
                                 _last_telem_nonce = _cur_nonce
                             if _t.time() - _block_start > _BLOCK_TTL_S:
                                 _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
@@ -26017,7 +26026,7 @@ class QtclClientApp:
 
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
                 target_zeros = tel.get("difficulty", 4)
-                nonce_str = f"{tel.get('nonce', 0):,}"
+                nonce_str = f"{tel.get('block_nonce', tel.get('nonce', 0)):,}"
                 print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
