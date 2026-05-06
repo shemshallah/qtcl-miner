@@ -15649,8 +15649,6 @@ class _MiningTelemetry:
         self, height: int, difficulty: int, nonce: int, parent_hash: str = ""
     ) -> None:
         with self._lock:
-            # Check if starting a new block (nonce reset to 0) - clear samples
-            # ❤️  clear on new block: height change OR nonce regression
             if (height != self.height) or (nonce < self.nonce and self.nonce > 0):
                 self._nonce_samples.clear()
                 self.hash_rate = 0.0
@@ -15663,11 +15661,24 @@ class _MiningTelemetry:
             now = time.time()
             self._nonce_samples.append((now, nonce))
             if len(self._nonce_samples) >= 2:
-                t0, n0 = self._nonce_samples[0]
-                t1, n1 = self._nonce_samples[-1]
-                dt = t1 - t0
+                t0 = self._nonce_samples[0][0]
+                dt = now - t0
+                # Walk forward to find a ≥1s window — prevents the first-sample
+                # spike where dt=50ms makes hash_rate = dn/0.05, which can reach
+                # hundreds of millions on fast hardware before settling.
+                if dt >= 1.0:
+                    for t_old, n_old in self._nonce_samples:
+                        if now - t_old >= 1.0:
+                            t0, n0 = t_old, n_old
+                            dt = now - t0
+                            break
+                    else:
+                        n0 = self._nonce_samples[0][1]
+                else:
+                    n0 = self._nonce_samples[0][1]
                 if dt > 0:
-                    self.hash_rate = (n1 - n0) / dt
+                    raw_rate = (self.nonce - n0) / dt
+                    self.hash_rate = min(raw_rate, 50_000_000.0)
 
     def record_block(self, block: dict) -> None:
         """
