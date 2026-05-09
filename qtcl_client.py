@@ -7825,7 +7825,7 @@ class BlockSubmissionCache:
                 "solved": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SOLVED),
                 "submitted": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SUBMITTED),
                 "pending": sum(1 for b in self._blocks.values() if b.status == BlockStatus.PENDING),
-                "finalized": sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED),
+                "finalized": self.finalized_count(),
                 "rejected": sum(1 for b in self._blocks.values() if b.status == BlockStatus.REJECTED),
                 "tip": self.get_chain_tip(),
                 "total_rewards": self.total_rewards(),
