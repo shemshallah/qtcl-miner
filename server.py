@@ -6580,9 +6580,15 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
                 )
 
             # ── CATHEDRAL-GRADE: Transaction signature verification ──
+            _tx_meta = tx.get("metadata", {})
+            if isinstance(_tx_meta, str):
+                try:
+                    _tx_meta = json.loads(_tx_meta)
+                except Exception:
+                    _tx_meta = {}
             _tx_pubkey = (tx.get("sender_public_key_hex") or tx.get("public_key", "")
-                          or (tx.get("metadata") or {}).get("sender_public_key_hex", "")
-                          or (tx.get("metadata") or {}).get("public_key", ""))
+                          or _tx_meta.get("sender_public_key_hex", "")
+                          or _tx_meta.get("public_key", ""))
             if not _tx_pubkey:
                 _sig_raw = tx.get("signature", "")
                 if isinstance(_sig_raw, str) and _sig_raw.startswith("{"):
@@ -7782,9 +7788,7 @@ def _rpc_signAndSubmitTx(params: Any, rpc_id: Any) -> dict:
             _fee = float(_raw_fee)
             _memo = tx_data.get("memo", "")
 
-            if _amount <= 0:
-                return _rpc_ok({"valid": False, "reason": "Invalid amount — must be positive"}, rpc_id)
-            if _fee < 0:
+            if _fee < 0 or _fee is None:
                 _fee = 0.01
             _amount_base = int(round(_amount * 100))
             _fee_base = int(round(_fee * 100))
