@@ -6471,6 +6471,15 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
         _coinbase_txs = []
 
         for tx in txs or []:
+            if isinstance(tx, str):
+                try:
+                    tx = json.loads(tx)
+                except Exception:
+                    logger.warning(f"[RPC-submitBlock] Skipping non-JSON tx string")
+                    continue
+            if not isinstance(tx, dict):
+                logger.warning(f"[RPC-submitBlock] Skipping non-dict tx: {type(tx).__name__}")
+                continue
             tx_type = tx.get("tx_type", "").lower()
             if tx_type in ("coinbase", "miner_reward", "treasury_reward"):
                 _coinbase_txs.append(tx)
@@ -6503,7 +6512,21 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
         _treasury_coinbase = None
 
         for cb in _coinbase_txs:
-            _outputs = cb.get("outputs", [])
+            if not isinstance(cb, dict):
+                logger.warning(f"[RPC-submitBlock] Skipping non-dict coinbase tx: {type(cb).__name__}")
+                continue
+            _raw_outputs = cb.get("outputs", [])
+            _outputs = []
+            for _o in (_raw_outputs if isinstance(_raw_outputs, list) else []):
+                if isinstance(_o, dict):
+                    _outputs.append(_o)
+                elif isinstance(_o, str):
+                    try:
+                        _parsed = json.loads(_o)
+                        if isinstance(_parsed, dict):
+                            _outputs.append(_parsed)
+                    except Exception:
+                        pass
             # Extract recipient from direct field or first output address
             _to = (
                 cb.get("to_addr")
@@ -6570,6 +6593,16 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
 
         # Validate non-coinbase transactions (if any)
         for tx in _non_coinbase_txs:
+            if not isinstance(tx, dict):
+                logger.warning(f"[RPC-submitBlock] Skipping non-dict tx: {type(tx).__name__}")
+                continue
+            # Parse metadata if it's a JSON string
+            _tx_meta = tx.get("metadata", {})
+            if isinstance(_tx_meta, str):
+                try:
+                    _tx_meta = json.loads(_tx_meta)
+                except Exception:
+                    _tx_meta = {}
             # Every non-coinbase must have a valid signature
             _sig = tx.get("signature") or tx.get("hyp_sig") or tx.get("sig", {})
             if not _sig:
@@ -6580,12 +6613,6 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
                 )
 
             # ── CATHEDRAL-GRADE: Transaction signature verification ──
-            _tx_meta = tx.get("metadata", {})
-            if isinstance(_tx_meta, str):
-                try:
-                    _tx_meta = json.loads(_tx_meta)
-                except Exception:
-                    _tx_meta = {}
             _tx_pubkey = (tx.get("sender_public_key_hex") or tx.get("public_key", "")
                           or _tx_meta.get("sender_public_key_hex", "")
                           or _tx_meta.get("public_key", ""))
@@ -6992,6 +7019,16 @@ def _rpc_submitBlock(params: Any, rpc_id: Any) -> dict:
             })
         except Exception:
             pass
+
+        # Mark confirmed txs in mempool so they're removed from pending
+        try:
+            _confirmed_hashes = [tx.get("tx_id") or tx.get("tx_hash", "") for tx in (txs or []) if tx.get("tx_type", "").lower() not in ("coinbase", "miner_reward", "treasury_reward")]
+            _confirmed_hashes = [h for h in _confirmed_hashes if h]
+            if _confirmed_hashes:
+                from mempool import mark_included_in_block as _mark_included
+                _mark_included(_confirmed_hashes, height)
+        except Exception as _mark_err:
+            logger.debug(f"[RPC-submitBlock] Mempool mark_included skipped: {_mark_err}")
 
         # Return accepted immediately (settlement happens in background)
         logger.info(
