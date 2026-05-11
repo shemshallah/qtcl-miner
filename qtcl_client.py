@@ -1398,7 +1398,7 @@ class _OracleNode:
             "parent_hash": block_data.get("parent_hash", ""),
             "merkle_root": block_data.get("merkle_root", ""),
             "timestamp": block_data.get("timestamp", 0),
-            "difficulty": block_data.get("difficulty", 4),
+            "difficulty": block_data.get("difficulty", 5),
             "nonce": block_data.get("nonce", 0),
             "miner_address": block_data.get("miner_address", ""),
         }
@@ -8190,7 +8190,7 @@ class LocalBlockchainDB:
                 " parent_hash TEXT NOT NULL,"
                 " miner_address TEXT NOT NULL,"
                 " nonce INTEGER DEFAULT 0,"
-                " difficulty INTEGER DEFAULT 4,"
+                " difficulty INTEGER DEFAULT 5,"
                 " timestamp INTEGER DEFAULT 0,"
                 " submit_payload TEXT NOT NULL DEFAULT '',"
                 " status TEXT DEFAULT 'pending',"
@@ -8907,7 +8907,7 @@ class LocalBlockchainDB:
             ("parent_hash", "TEXT    DEFAULT ''"),
             ("timestamp", "INTEGER DEFAULT 0"),
             ("nonce", "INTEGER DEFAULT 0"),
-            ("difficulty", "REAL    DEFAULT 4.0"),
+            ("difficulty", "REAL    DEFAULT 5.0"),
             ("miner_address", "TEXT    DEFAULT ''"),
             ("pq_curr", "INTEGER DEFAULT 0"),
             ("pq_last", "INTEGER DEFAULT 0"),
@@ -9213,7 +9213,7 @@ class LocalBlockchainDB:
                             parent,
                             int(blk.get("timestamp_s") or blk.get("timestamp", 0)),
                             int(blk.get("nonce", 0)),
-                            int(blk.get("difficulty_bits") or blk.get("difficulty", 4)),
+                            int(blk.get("difficulty_bits") or blk.get("difficulty", 5)),
                             str(blk.get("miner_address", "")),
                             int(blk.get("pq_curr", h)),
                             int(blk.get("pq_last", max(0, h - 1))),
@@ -9541,7 +9541,7 @@ def _forge_and_store_genesis_block(
         "parent_hash": "0" * 64,
         "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
         "timestamp": 1_700_000_000,
-        "difficulty": 4,
+        "difficulty": 5,
         "miner_id": NULL_COINBASE_ADDRESS,
         "tx_count": 1,
         "nonce": 0,
@@ -10099,7 +10099,7 @@ class SnapshotManager(ComponentBase):
                 errors.append(
                     f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…"
                 )
-        difficulty = float(block.get("difficulty", 4.0))
+        difficulty = float(block.get("difficulty", 5.0))
         if not self._hash.verify_pow(block, difficulty):
             errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
         height = block.get("height", 0)
@@ -11690,7 +11690,7 @@ class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
 
     GENESIS_HASH: str = "0" * 64
-    DEFAULT_DIFFICULTY: int = 4  # Miner queries /rpc/config/difficulty on startup; this is fallback only
+    DEFAULT_DIFFICULTY: int = 5  # BLOCK_DIFFICULTY env var is authoritative; this is fallback only
     BLOCK_REWARD: int = 800  # 8.0 QTCL total per block (miner+treasury) — depth-agnostic display constant only
     MAX_TX_PER_BLOCK: int = 500
     DEFAULT_N_QUBITS: int = 8
@@ -25564,25 +25564,11 @@ class QtclClientApp:
                             await _asyncio.sleep(1.0)
                             continue
 
-                        # BLOCK_DIFFICULTY env var overrides everything (for debugging)
+                        # Single source of truth: BLOCK_DIFFICULTY env var (server-authoritative)
                         _env_diff = os.environ.get("BLOCK_DIFFICULTY", "").strip()
-                        difficulty_bits = int(_env_diff) if _env_diff.isdigit() else 4
-                        try:
-                            _config_res = kapi._rpc_http("/rpc/config/difficulty", method="GET", timeout=5) if hasattr(kapi, "_rpc_http") else None
-                            if _config_res and isinstance(_config_res, dict):
-                                difficulty_bits = int(_config_res.get("result", {}).get("difficulty", difficulty_bits))
-                        except Exception:
-                            pass
-                        try:
-                            _res_b_raw = kapi._rpc("qtcl_getBlock", [oracle_height], timeout=8, retries=2)
-                            _res_b = _res_b_raw if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw else {}
-                            _block_diff = int(_res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0)
-                            if _block_diff > 0:
-                                difficulty_bits = _block_diff
-                        except Exception:
-                            pass
+                        difficulty_bits = int(_env_diff) if _env_diff.isdigit() else 5
                         if _env_diff.isdigit():
-                            _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY env override: {difficulty_bits} leading-zeros")
+                            _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY={difficulty_bits} leading-zeros")
 
                         _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
                         _pending_user_txs = _res_m if isinstance(_res_m, list) else []
@@ -25796,9 +25782,9 @@ class QtclClientApp:
 
                         _found = block_hash is not None
                         if _found:
-                            _PERSISTENT_NONCE_BASE[0] = secrets.randbelow(2 ** 32)
+                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
                         elif _chain_advanced:
-                            _PERSISTENT_NONCE_BASE[0] = secrets.randbelow(2 ** 32)
+                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
                         elif _ttl_expired:
                             _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0] + secrets.randbelow(1_000_000)
 
@@ -26027,7 +26013,7 @@ class QtclClientApp:
             print(sep)
 
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
-                target_zeros = tel.get("difficulty", 4)
+                target_zeros = tel.get("difficulty", 5)
                 nonce_str = f"{tel.get('block_nonce', tel.get('nonce', 0)):,}"
                 print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
@@ -29038,7 +29024,7 @@ class NodeRPCMeshServer:
                 "height": h,
                 "total_blocks": total,
                 "tip_hash": str(tip["hash"]) if tip else "",
-                "difficulty": float(tip["difficulty"] or 4.0) if tip else 4.0,
+                "difficulty": float(tip["difficulty"] or 5.0) if tip else 5.0,
                 "w_state_fidelity": float(tip["w_state_fidelity"] or 0.0)
                 if tip
                 else 0.0,
@@ -29559,7 +29545,7 @@ class NodeRPCMeshServer:
         timestamp_s = int(hdr.get("timestamp", int(time.time())))
         nonce = int(hdr.get("nonce", 0))
         miner_address = str(hdr.get("miner_address", hdr.get("miner", "")))
-        difficulty = int(hdr.get("difficulty", 6))
+        difficulty = int(hdr.get("difficulty", 5))
         w_entropy_hex = str(
             hdr.get("w_entropy_hash", hdr.get("oracle_w_state_hash", ""))
         )
