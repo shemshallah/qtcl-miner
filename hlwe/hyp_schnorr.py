@@ -193,22 +193,13 @@ def _elevated_precision():
     Context manager: temporarily raise mp.dps to DPS_ELEVATED=210 for
     the eigendecomposition-based matrix power computation.
 
-    The 210-digit working precision absorbs the ~60-digit cancellation
-    margin that arises when computing P⁻¹ for a hyperbolic PSL element
-    with large off-diagonal entries. On exit, precision is restored to
-    DPS_DEFAULT=150 and the result matrix is re-validated at 150 dps.
-
-    Usage:
-        with _elevated_precision():
-            result = _eigen_matrix_pow(y, c)
-        # precision now back to 150; result entries at 150-digit accuracy
+    Uses mp.workdps() — thread-local precision context.  Direct mp.dps mutation
+    is a global write; under gunicorn threading two concurrent sign() calls would
+    corrupt each other's precision mid-squaring, producing det errors like 1025.0.
+    workdps() eliminates that race entirely.
     """
-    old_dps = mp.dps
-    mp.dps = DPS_ELEVATED
-    try:
+    with mp.workdps(DPS_ELEVATED):
         yield
-    finally:
-        mp.dps = old_dps
 
 
 # ════════════════════════════════════════════════════════════════════════════

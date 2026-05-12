@@ -341,26 +341,19 @@ class PSLMatrix:
             self._validated = True
             return self
 
-        # Save original dps and elevate precision for rescaling
-        original_dps = mp.dps
-        try:
-            mp.dps = DPS_ELEVATED
-            
+        # Elevate precision for rescaling — use workdps() for thread safety.
+        # Direct mp.dps mutation is a global write; concurrent sign() calls under
+        # gunicorn threading corrupt each other's precision context mid-squaring.
+        with mp.workdps(DPS_ELEVATED):
             # Recompute determinant at elevated precision
             det = self.a * self.d - self.b * self.c
             
-            # Rescaling is needed. Compute scale factor at elevated precision.
-            # The scale satisfies: (s*a)*(s*d) - (s*b)*(s*c) = s^2 * det = 1
-            # So s = 1/sqrt(det), and scaling all entries by s gives det=1 (mathematically).
+            # Rescaling: (s*a)*(s*d) - (s*b)*(s*c) = s^2 * det = 1 → s = 1/sqrt(det)
             scale = mpf("1") / sqrt(fabs(det))
             scaled_a = self.a * scale
             scaled_b = self.b * scale
             scaled_c = self.c * scale
             scaled_d = self.d * scale
-        
-        finally:
-            # Restore original precision
-            mp.dps = original_dps
         
         # Create the rescaled matrix WITHOUT validation.
         # The rescaling operation at elevated precision should give det very close to 1,
