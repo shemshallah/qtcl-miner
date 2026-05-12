@@ -25693,6 +25693,8 @@ class QtclClientApp:
                         else:
                             _w_entropy_seed = _hl.sha3_256(oracle_hash.encode() + target_height.to_bytes(8, "big") + timestamp.to_bytes(8, "big")).digest()
 
+                        import struct as _st, os as _os2, threading as _thr2, queue as _q2
+
                         # ═══ MUTABLE BLOCK STATE — updated inline by mempool SSE ═══
                         _block_txs_list = []  # mutable list: [miner_cb, treasury_cb, user_tx, ...]
                         _merkle_bytes = [b'\x00' * 32]  # mutable wrapper: workers read [0] each iteration
@@ -25791,7 +25793,6 @@ class QtclClientApp:
 
                         merkle_root = _compute_merkle(_block_txs_list)
 
-                        import struct as _st, os as _os2, threading as _thr2, queue as _q2
                         timestamp = int(_t.time())
                         _POW_SCRATCHPAD_BYTES = 512 * 1024
                         _POW_WINDOW_BYTES = 64
