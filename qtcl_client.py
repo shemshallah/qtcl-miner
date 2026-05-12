@@ -603,6 +603,72 @@ def connect_consensus_stream(
     return thread
 
 
+def connect_mempool_stream(
+    server_url: str, callback: Callable[[dict], None]
+) -> threading.Thread:
+    """
+    Connect to /rpc/events/mempool SSE stream.
+    Receive real-time new transaction events and call callback.
+
+    Args:
+        server_url: Base URL of the server
+        callback: Function to call with each new TX event dict
+
+    Returns:
+        Daemon thread handle (already started)
+    """
+    url = f"{server_url.rstrip('/')}/rpc/events/mempool"
+    headers = {"Accept": "text/event-stream"}
+
+    def _sse_reader():
+        consecutive_errors = 0
+        max_errors = 10
+        base_delay = 1.0
+
+        while True:
+            try:
+                if _HAS_REQUESTS:
+                    with requests.get(url, headers=headers, stream=True, timeout=30) as resp:
+                        resp.raise_for_status()
+                        consecutive_errors = 0
+                        for line in resp.iter_lines(decode_unicode=True):
+                            if line is None:
+                                continue
+                            line_str = line.strip() if isinstance(line, str) else line.decode().strip()
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError:
+                                    pass
+                else:
+                    req = Request(url, headers=headers, method="GET")
+                    with urlopen(req, timeout=30) as resp:
+                        consecutive_errors = 0
+                        for line in resp:
+                            line_str = line.decode().strip()
+                            if line_str.startswith("data: "):
+                                try:
+                                    payload = json.loads(line_str[6:])
+                                    callback(payload)
+                                except json.JSONDecodeError:
+                                    pass
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    _EXP_LOG.warning(f"[SSE-MEMPOOL] Connection failed: {e}")
+                if consecutive_errors > max_errors:
+                    _EXP_LOG.error(f"[SSE-MEMPOOL] Giving up after {max_errors} errors")
+                    break
+                delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
+                time.sleep(delay)
+
+    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Mempool-Reader")
+    thread.start()
+    _EXP_LOG.info(f"[SSE-MEMPOOL] Connected to {url}")
+    return thread
+
+
 def average_density_matrices(measurements: List[str]) -> Optional[str]:
     """Average multiple 16³ density matrices (hex encoded) into consensus state."""
     try:
@@ -25571,7 +25637,38 @@ class QtclClientApp:
                             _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY={difficulty_bits} leading-zeros")
 
                         _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
-                        _pending_user_txs = _res_m if isinstance(_res_m, list) else []
+                        _raw_pending_txs = _res_m if isinstance(_res_m, list) else []
+                        _pending_user_txs = []
+                        for _rptx in _raw_pending_txs:
+                            if isinstance(_rptx, dict):
+                                _tx = dict(_rptx)
+                            elif hasattr(_rptx, "to_dict"):
+                                _tx = _rptx.to_dict()
+                            else:
+                                continue
+                            _tx_hash = _tx.get("tx_hash") or _tx.get("tx_id", "")
+                            if not _tx_hash:
+                                continue
+                            _tx["tx_id"] = _tx_hash
+                            _tx["tx_hash"] = _tx_hash
+                            _tx["from_addr"] = _tx.get("from_address") or _tx.get("from_addr", "")
+                            _tx["to_addr"] = _tx.get("to_address") or _tx.get("to_addr", "")
+                            _tx["amount_base"] = int(_tx.get("amount_base") or (float(_tx.get("amount", 0)) * 100) or 0)
+                            _tx["fee_base"] = int(_tx.get("fee_base") or _tx.get("fee", 0) or 0)
+                            _tx["tx_type"] = _tx.get("tx_type", "transfer")
+                            if not _tx.get("signature"):
+                                _tx["signature"] = _tx.get("sig", "")
+                            if not _tx.get("public_key"):
+                                _tx["public_key"] = _tx.get("sender_public_key_hex") or _tx.get("public_key", "")
+                            if not _tx.get("inputs"):
+                                _tx["inputs"] = _tx.get("inputs", [])
+                            if not _tx.get("outputs"):
+                                _tx["outputs"] = _tx.get("outputs", [])
+                            if not _tx.get("version"):
+                                _tx["version"] = 1
+                            _pending_user_txs.append(_tx)
+                        if _pending_user_txs:
+                            _EXP_LOG.info(f"[MINER] 📦 Including {len(_pending_user_txs)} pending mempool TXs in block")
 
                         timestamp = int(_t.time())
                         miner_addr = getattr(getattr(self, "wallet", None), "address", "0" * 64) or "0" * 64
@@ -25583,25 +25680,11 @@ class QtclClientApp:
                             _miner_reward_base = _TRS.get_miner_reward_base(target_height)
                             _treasury_reward_base = _TRS.get_treasury_reward_base(target_height)
                             _treasury_addr = _TRS.TREASURY_ADDRESS
-                            # Deferred treasury chain:
-                            #   Block 1: includes genesis miner(720) + block 1 miner(720) + genesis treasury(80)
-                            #   Block N (N>=2): block N miner + block N-1 treasury
                             _genesis_extra = _TRS.get_miner_reward_base(0) if target_height == 1 else 0
                             _prev_treasury = _TRS.get_treasury_reward_base(target_height - 1) if target_height > 0 else 0
                         except Exception:
                             _genesis_extra = 720 if target_height == 1 else 0
                             _prev_treasury = 80 if target_height > 0 else 0
-
-                        _total_fees_base = 0
-                        for tx in _pending_user_txs:
-                            _fee = tx.get("fee_base", tx.get("fee", 0))
-                            try:
-                                _total_fees_base += int(_fee * 100) if isinstance(_fee, float) else int(_fee)
-                            except (ValueError, TypeError):
-                                pass
-
-                        _miner_total_base = _miner_reward_base + _genesis_extra + (_total_fees_base // 2)
-                        _treasury_total_base = _prev_treasury + (_total_fees_base - (_total_fees_base // 2))
 
                         _oracle_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}
                         _dm_hex = _oracle_snap.get("density_matrix_hex", "")
@@ -25610,11 +25693,12 @@ class QtclClientApp:
                         else:
                             _w_entropy_seed = _hl.sha3_256(oracle_hash.encode() + target_height.to_bytes(8, "big") + timestamp.to_bytes(8, "big")).digest()
 
-                        _miner_cb_id = _hl.sha3_256(f"COINBASE:{target_height}:{miner_addr}:{_miner_total_base}:{_w_entropy_seed.hex()}".encode()).hexdigest()
-                        _miner_cb = {"tx_id": _miner_cb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "miner"}}], "outputs": [{"address": miner_addr, "amount_base": _miner_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
-                        _treasury_cb_id = _hl.sha3_256(f"TREASURY_COINBASE:{target_height}:{_treasury_addr}:{_treasury_total_base}:{_w_entropy_seed.hex()}".encode()).hexdigest()
-                        _treasury_cb = {"tx_id": _treasury_cb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "treasury"}}], "outputs": [{"address": _treasury_addr, "amount_base": _treasury_total_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
-                        _block_txs = [_miner_cb, _treasury_cb] + _pending_user_txs
+                        # ═══ MUTABLE BLOCK STATE — updated inline by mempool SSE ═══
+                        _block_txs_list = []  # mutable list: [miner_cb, treasury_cb, user_tx, ...]
+                        _merkle_bytes = [b'\x00' * 32]  # mutable wrapper: workers read [0] each iteration
+                        _tx_hashes_seen = set()  # dedup: track included tx hashes
+                        _fee_total = [0]  # mutable: total fees, updated when txs change
+                        _block_lock = _thr2.Lock()  # protects _block_txs_list and _merkle_bytes during submit
 
                         def _compute_merkle(tx_list: list) -> str:
                             if not tx_list:
@@ -25634,7 +25718,78 @@ class QtclClientApp:
                                 hashes = [_hl.sha3_256((hashes[i] + hashes[i + 1]).encode()).hexdigest() for i in range(0, len(hashes), 2)]
                             return hashes[0]
 
-                        merkle_root = _compute_merkle(_block_txs)
+                        def _rebuild_coinbases():
+                            """Rebuild coinbase TXs with current fee total and update _block_txs_list."""
+                            _fts = _fee_total[0]
+                            _miner_amt = _miner_reward_base + _genesis_extra + (_fts // 2)
+                            _treasury_amt = _prev_treasury + (_fts - (_fts // 2))
+                            _mcb_id = _hl.sha3_256(f"COINBASE:{target_height}:{miner_addr}:{_miner_amt}:{_w_entropy_seed.hex()}".encode()).hexdigest()
+                            _tcb_id = _hl.sha3_256(f"TREASURY_COINBASE:{target_height}:{_treasury_addr}:{_treasury_amt}:{_w_entropy_seed.hex()}".encode()).hexdigest()
+                            _mcb = {"tx_id": _mcb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "miner"}}], "outputs": [{"address": miner_addr, "amount_base": _miner_amt, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
+                            _tcb = {"tx_id": _tcb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "treasury"}}], "outputs": [{"address": _treasury_addr, "amount_base": _treasury_amt, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
+                            with _block_lock:
+                                _block_txs_list[:] = [_mcb, _tcb] + [tx for tx in _block_txs_list if tx.get("tx_type") not in ("coinbase", "miner_reward", "treasury_reward")]
+                                _merkle_bytes[0] = bytes.fromhex(_compute_merkle(_block_txs_list).zfill(64))[:32]
+
+                        # Initial population
+                        for _utx in _pending_user_txs:
+                            _h = _utx.get("tx_hash", "")
+                            if _h and _h not in _tx_hashes_seen:
+                                _tx_hashes_seen.add(_h)
+                                _block_txs_list.append(_utx)
+                                _fee_total[0] += _utx.get("fee_base", 0)
+                        _rebuild_coinbases()
+
+                        # ═══ MEMPOOL SSE CALLBACK — adds new TXs to block inline ═══
+                        def _on_mempool_tx(tx_event: dict):
+                            try:
+                                _eh = tx_event.get("tx_hash", "")
+                                if not _eh or _eh in _tx_hashes_seen:
+                                    return
+                                # Fetch full TX dict from mempool for signature/inputs/outputs
+                                try:
+                                    _full_tx_list = kapi._rpc("qtcl_getMempool", [500], timeout=5, retries=1)
+                                    _full_tx = None
+                                    if isinstance(_full_tx_list, list):
+                                        for _ftx in _full_tx_list:
+                                            _fh = (_ftx.get("tx_hash") if isinstance(_ftx, dict) else getattr(_ftx, "tx_hash", ""))
+                                            if not _fh and isinstance(_ftx, dict):
+                                                _fh = _ftx.get("tx_id", "")
+                                            if _fh == _eh:
+                                                _full_tx = dict(_ftx) if isinstance(_ftx, dict) else _ftx.to_dict() if hasattr(_ftx, "to_dict") else _ftx
+                                                break
+                                    if not _full_tx:
+                                        _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": "", "public_key": "", "inputs": [], "outputs": [], "version": 1}
+                                except Exception:
+                                    _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": "", "public_key": "", "inputs": [], "outputs": [], "version": 1}
+                                _full_tx["tx_id"] = _full_tx.get("tx_id") or _full_tx.get("tx_hash", _eh)
+                                _full_tx["tx_hash"] = _full_tx.get("tx_hash") or _full_tx.get("tx_id", _eh)
+                                _full_tx["tx_type"] = _full_tx.get("tx_type", "transfer")
+                                if not _full_tx.get("from_addr"):
+                                    _full_tx["from_addr"] = _full_tx.get("from_address", "")
+                                if not _full_tx.get("to_addr"):
+                                    _full_tx["to_addr"] = _full_tx.get("to_address", "")
+                                with _block_lock:
+                                    if _eh in _tx_hashes_seen:
+                                        return
+                                    _tx_hashes_seen.add(_eh)
+                                    _block_txs_list.append(_full_tx)
+                                    _fee_total[0] += _full_tx.get("fee_base", 0)
+                                _rebuild_coinbases()
+                                _EXP_LOG.info(f"[MINER] ✨ New TX {_eh[:16]}… added inline — block now has {len(_block_txs_list)} txs")
+                            except Exception as _mpe:
+                                _EXP_LOG.debug(f"[MINER] mempool callback error: {_mpe}")
+
+                        # Start mempool SSE listener (runs in background daemon thread)
+                        _mempool_sse_thread = None
+                        try:
+                            _mempool_sse_thread = connect_mempool_stream(ENTROPY_SERVER_URL, _on_mempool_tx)
+                        except Exception as _msse_e:
+                            _EXP_LOG.debug(f"[MINER] Mempool SSE connect failed (non-fatal): {_msse_e}")
+
+                        # ═══ POI W setup — refer to mutable _block_txs_list and _merkle_bytes ═══
+
+                        merkle_root = _compute_merkle(_block_txs_list)
 
                         import struct as _st, os as _os2, threading as _thr2, queue as _q2
                         timestamp = int(_t.time())
@@ -25642,10 +25797,8 @@ class QtclClientApp:
                         _POW_WINDOW_BYTES = 64
                         _POW_MIX_ROUNDS = 64
                         _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
-                        _SCRATCHPAD_EPOCH_NONCES = 524_288  # 2^19 — rotate scratchpad every ~75s @ 7KH/s
-                        # ASIC-hard: scratchpad rotates every epoch, seeded by epoch number
+                        _SCRATCHPAD_EPOCH_NONCES = 524_288
                         _ph_parent = bytes.fromhex(oracle_hash.zfill(64))[:32]
-                        _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
                         _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
                         _ph_seed = _w_entropy_seed[:32]
                         _rnd_packed = [_st.pack(">I", r) for r in range(_POW_MIX_ROUNDS)]
@@ -25681,7 +25834,7 @@ class QtclClientApp:
                                 _ts2 = timestamp
                                 _df = difficulty_bits
                                 _pp = _ph_parent
-                                _pm2 = _ph_merkle
+                                _pm2 = _merkle_bytes  # mutable list ref: workers read _pm2[0] each iter
                                 _pmin = _ph_miner
                                 _ps = _ph_seed
                                 _nw = _POW_N_WINDOWS
@@ -25710,7 +25863,7 @@ class QtclClientApp:
                                         _epoch = _new_epoch
                                         _scratch = _make_scratchpad(_epoch)
                                         _mv = memoryview(_scratch)
-                                    hdr = _pack(_fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps)
+                                    hdr = _pack(_fmt, _th, _ts2, _pp, _pm2[0], _df, n, _pmin, _ps)
                                     _h0 = _sha3()
                                     _h0.update(_pfx)
                                     _h0.update(hdr)
@@ -25793,13 +25946,12 @@ class QtclClientApp:
                             await _asyncio.sleep(0.1)
                             continue
 
-                        _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…")
-                        # ── CLIENT-AS-ORACLE: sign attestation, broadcast to mesh ──
-                        _self_attestation = None
-                        _oracle_n = getattr(self, "_oracle_node", None)
-                        if _oracle_n and _oracle_n.is_active():
-                            _self_attestation = _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
-                        _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
+                        _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…  txs={len(_block_txs_list)}")
+                        # Snapshot merkle root and tx list under lock — prevents SSE callback from
+                        # changing the merkle root after PoW solution was found (would invalidate block hash)
+                        with _block_lock:
+                            merkle_root = _compute_merkle(_block_txs_list)
+                            _final_txs = list(_block_txs_list)  # frozen copy for submission
 
                         submit_payload = {
                             "height": target_height,
@@ -25817,9 +25969,18 @@ class QtclClientApp:
                             "mermin_value": 0.0,
                             "mermin_violated": False,
                             "quantum_field_16x16x16": "",
-                            "transactions": _block_txs,
-                            "oracle_attestations": [_self_attestation] if _self_attestation else [],
+                            "transactions": _final_txs,
+                            "oracle_attestations": [],
                         }
+
+                        # ── CLIENT-AS-ORACLE: sign attestation, broadcast to mesh ──
+                        _self_attestation = None
+                        _oracle_n = getattr(self, "_oracle_node", None)
+                        if _oracle_n and _oracle_n.is_active():
+                            _self_attestation = _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
+                            if _self_attestation:
+                                submit_payload["oracle_attestations"] = [_self_attestation]
+                        _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
 
                         _sig = None
                         for _sign_attempt in range(3):
