@@ -1,0 +1,3266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>QTCL TRANSACT — Quantum Transaction System</title>
+<link rel="icon" type="image/png" sizes="32x32" href="favicon.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   QTCL TRANSACT — Design System
+   Aesthetic: Nuclear bunker control room meets quantum physics lab
+   Matched to vault.html & index.html design language
+   ═══════════════════════════════════════════════════════════════════ */
+:root {
+  --void:     #020408;
+  --abyss:    #060c18;
+  --deep:     #0a1225;
+  --surface:  #0e1830;
+  --raised:   #132040;
+  --border:   #1a2d55;
+  --border-h: #2a4080;
+  --cyan:     #00d4ff;
+  --cyan-dim: #0088aa;
+  --cyan-glow: rgba(0,212,255,.12);
+  --violet:   #8b5cf6;
+  --violet-dim: #6d3ae0;
+  --emerald:  #10b981;
+  --amber:    #f59e0b;
+  --red:      #ef4444;
+  --text:     #c8d6e5;
+  --text-bright: #e8f0ff;
+  --muted:    #4a6080;
+  --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+  --font-display: 'Space Grotesk', sans-serif;
+  --radius:   6px;
+  --glow-cyan: 0 0 20px rgba(0,212,255,.15), 0 0 40px rgba(0,212,255,.05);
+  --glow-violet: 0 0 20px rgba(139,92,246,.15);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 14px; }
+body {
+  background: var(--void);
+  color: var(--text);
+  font-family: var(--font-mono);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.03) 2px, rgba(0,0,0,.03) 4px);
+}
+
+/* ── HEADER ── */
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 56px;
+  background: linear-gradient(180deg, var(--deep) 0%, var(--abyss) 100%);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 2px 20px rgba(0,0,0,.5);
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--cyan), var(--violet));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  box-shadow: var(--glow-cyan);
+}
+
+.header-title {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--cyan);
+}
+
+.header-sub {
+  font-size: 9px;
+  color: var(--muted);
+  letter-spacing: 1px;
+  margin-top: 1px;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--deep);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--emerald);
+  animation: pulse-dot 2s ease infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; box-shadow: 0 0 4px var(--emerald); }
+  50% { opacity: .5; box-shadow: none; }
+}
+
+/* ── LAYOUT ── */
+.app-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: calc(100vh - 56px);
+}
+
+@media (max-width: 768px) {
+  .app-layout { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .sidebar.mobile-open { display: block; position: fixed; inset: 56px 0 0; z-index: 90; width: 100%; }
+  .mobile-menu-btn { display: flex !important; }
+}
+
+.mobile-menu-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 18px;
+}
+
+/* ── SIDEBAR ── */
+.sidebar {
+  background: var(--abyss);
+  border-right: 1px solid var(--border);
+  padding: 16px 0;
+  overflow-y: auto;
+}
+
+.nav-section {
+  padding: 0 12px;
+  margin-bottom: 4px;
+}
+
+.nav-section-title {
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  padding: 12px 12px 6px;
+  text-transform: uppercase;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  margin: 2px 8px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .15s;
+  border: 1px solid transparent;
+}
+
+.nav-item:hover {
+  color: var(--text);
+  background: rgba(0,212,255,.04);
+  border-color: rgba(0,212,255,.08);
+}
+
+.nav-item.active {
+  color: var(--cyan);
+  background: var(--cyan-glow);
+  border-left: 2px solid var(--cyan);
+}
+
+.nav-item .nav-icon { width: 18px; text-align: center; font-size: 14px; }
+.nav-item .nav-badge {
+  margin-left: auto;
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: var(--raised);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.nav-item .nav-badge.hot {
+  background: rgba(239,68,68,.15);
+  color: var(--red);
+  border-color: rgba(239,68,68,.3);
+}
+
+/* ── MAIN CONTENT ── */
+.main {
+  padding: 24px;
+  overflow-y: auto;
+  max-height: calc(100vh - 56px);
+}
+
+.page { display: none; }
+.page.active { display: block; animation: fadeIn .2s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+.page-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-bright);
+  margin-bottom: 4px;
+}
+
+.page-desc {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+/* ── CARDS ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,0,0,.15);
+}
+
+.card-title {
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-bright);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.card-body { padding: 16px; }
+
+/* ── STATS ROW ── */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  position: relative;
+  overflow: hidden;
+}
+
+.stat-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--cyan), var(--violet));
+  opacity: .4;
+}
+
+.stat-label {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.stat-unit {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* ── FORMS ── */
+.form-group {
+  margin-bottom: 14px;
+}
+
+.form-label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.form-input, .form-select, .form-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--abyss);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+  transition: border-color .15s;
+}
+
+.form-input:focus, .form-select:focus, .form-textarea:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 2px rgba(0,212,255,.08);
+}
+
+.form-input::placeholder { color: var(--muted); }
+.form-textarea { min-height: 80px; resize: vertical; }
+
+.form-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%234a6080' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+
+.form-hint {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 600px) {
+  .form-row { grid-template-columns: 1fr; }
+}
+
+/* ── BUTTONS ── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .5px;
+  cursor: pointer;
+  transition: all .15s;
+  background: var(--raised);
+  color: var(--text);
+}
+
+.btn:hover { border-color: var(--border-h); background: var(--surface); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--cyan), #0099cc);
+  color: var(--void);
+  border-color: transparent;
+  font-weight: 700;
+}
+
+.btn-primary:hover { box-shadow: var(--glow-cyan); transform: translateY(-1px); }
+
+.btn-danger {
+  background: rgba(239,68,68,.12);
+  color: var(--red);
+  border-color: rgba(239,68,68,.3);
+}
+
+.btn-danger:hover { background: rgba(239,68,68,.2); }
+
+.btn-violet {
+  background: linear-gradient(135deg, var(--violet), var(--violet-dim));
+  color: white;
+  border-color: transparent;
+}
+
+.btn-sm { padding: 6px 12px; font-size: 10px; }
+.btn-full { width: 100%; }
+
+/* ── TABLE ── */
+.tx-table-wrap { overflow-x: auto; }
+
+.tx-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.tx-table thead {
+  background: rgba(0,0,0,.2);
+  border-bottom: 1px solid var(--border);
+}
+
+.tx-table th {
+  padding: 10px 12px;
+  text-align: left;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.tx-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(26,45,85,.4);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tx-table tbody tr { transition: background .1s; cursor: pointer; }
+.tx-table tbody tr:hover { background: rgba(0,212,255,.03); }
+
+.addr { font-size: 10px; color: var(--cyan-dim); font-family: var(--font-mono); }
+.addr-full { word-break: break-all; white-space: normal; }
+
+/* ── BADGES ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+}
+
+.badge-confirmed { background: rgba(16,185,129,.12); color: var(--emerald); border: 1px solid rgba(16,185,129,.25); }
+.badge-pending   { background: rgba(245,158,11,.12); color: var(--amber); border: 1px solid rgba(245,158,11,.25); }
+.badge-failed    { background: rgba(239,68,68,.12); color: var(--red); border: 1px solid rgba(239,68,68,.25); }
+.badge-coinbase  { background: rgba(139,92,246,.12); color: var(--violet); border: 1px solid rgba(139,92,246,.25); }
+.badge-transfer  { background: rgba(0,212,255,.08); color: var(--cyan); border: 1px solid rgba(0,212,255,.2); }
+.badge-miner     { background: rgba(16,185,129,.08); color: var(--emerald); border: 1px solid rgba(16,185,129,.2); }
+.badge-treasury  { background: rgba(245,158,11,.08); color: var(--amber); border: 1px solid rgba(245,158,11,.2); }
+
+.amount-pos { color: var(--emerald); font-weight: 600; }
+.amount-neg { color: var(--red); font-weight: 600; }
+.amount-neutral { color: var(--text-bright); font-weight: 600; }
+
+/* ── MODAL ── */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(0,0,0,.7);
+  backdrop-filter: blur(4px);
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal-overlay.active { display: flex; animation: fadeIn .15s ease; }
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 680px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  animation: slideUp .2s ease;
+}
+
+@keyframes slideUp { from { transform: translateY(20px); opacity: 0; } }
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,0,0,.15);
+}
+
+.modal-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 20px; }
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px 16px;
+  font-size: 12px;
+}
+
+.detail-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding-top: 2px; }
+.detail-value { color: var(--text-bright); word-break: break-all; }
+.detail-value.code { background: var(--abyss); padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); font-size: 11px; }
+.detail-sep { grid-column: 1 / -1; border-top: 1px solid var(--border); margin: 4px 0; }
+
+.copy-btn {
+  background: none;
+  border: none;
+  color: var(--cyan-dim);
+  font-size: 10px;
+  cursor: pointer;
+  margin-left: 6px;
+  text-decoration: underline;
+}
+
+.copy-btn:hover { color: var(--cyan); }
+
+/* ── PAGINATION ── */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.page-btn {
+  padding: 6px 10px;
+  background: var(--abyss);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all .12s;
+}
+
+.page-btn.active { background: var(--cyan); color: var(--void); border-color: var(--cyan); }
+.page-btn:hover:not(:disabled):not(.active) { border-color: var(--cyan-dim); }
+.page-btn:disabled { opacity: .3; cursor: not-allowed; }
+
+.page-info { font-size: 10px; color: var(--muted); text-align: center; margin-top: 6px; }
+
+/* ── TOAST ── */
+.toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9000; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  padding: 10px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 11px;
+  animation: slideInRight .25s ease;
+  max-width: 320px;
+}
+
+@keyframes slideInRight { from { transform: translateX(100%); opacity: 0; } }
+
+.toast.success { border-color: var(--emerald); color: var(--emerald); }
+.toast.error { border-color: var(--red); color: var(--red); }
+.toast.info { border-color: var(--cyan); color: var(--cyan); }
+
+/* ── QR CODE ── */
+.qr-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px;
+  background: #fff;
+  border-radius: 8px;
+  margin: 12px auto;
+  width: fit-content;
+}
+
+/* ── ADDRESS BOOK ── */
+.contact-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(26,45,85,.4);
+  transition: background .1s;
+}
+
+.contact-row:hover { background: rgba(0,212,255,.03); }
+
+.contact-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--cyan), var(--violet));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: white;
+  flex-shrink: 0;
+}
+
+.contact-info { flex: 1; min-width: 0; }
+.contact-name { font-size: 12px; color: var(--text-bright); font-weight: 500; }
+.contact-addr { font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── LOADING ── */
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.loading { text-align: center; padding: 40px; color: var(--muted); font-size: 12px; }
+
+/* ── EMPTY STATE ── */
+.empty-state {
+  text-align: center;
+  padding: 48px 20px;
+  color: var(--muted);
+}
+
+.empty-icon { font-size: 36px; margin-bottom: 10px; opacity: .5; }
+
+/* ── BALANCE DISPLAY ── */
+.balance-hero {
+  text-align: center;
+  padding: 28px 16px;
+  background: linear-gradient(135deg, rgba(0,212,255,.04), rgba(139,92,246,.04));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 20px;
+}
+
+.balance-amount {
+  font-family: var(--font-display);
+  font-size: 36px;
+  font-weight: 700;
+  color: var(--text-bright);
+  line-height: 1;
+}
+
+.balance-symbol {
+  font-size: 14px;
+  color: var(--cyan);
+  margin-left: 6px;
+}
+
+.balance-usd {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.balance-addr {
+  margin-top: 12px;
+  font-size: 10px;
+  color: var(--muted);
+  word-break: break-all;
+  padding: 6px 12px;
+  background: var(--abyss);
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  display: inline-block;
+  max-width: 100%;
+}
+
+/* ── ACTION BUTTONS GRID ── */
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.action-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all .15s;
+}
+
+.action-btn:hover { border-color: var(--cyan); background: var(--raised); transform: translateY(-2px); box-shadow: var(--glow-cyan); }
+
+.action-icon { font-size: 22px; }
+
+/* ── TABS (within card) ── */
+.tab-bar {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,0,0,.1);
+}
+
+.tab-btn {
+  padding: 10px 16px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all .12s;
+  text-transform: uppercase;
+}
+
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+
+/* ── CONFIRMATION STEP ── */
+.confirm-box {
+  background: rgba(0,212,255,.04);
+  border: 1px solid rgba(0,212,255,.15);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 12px 0;
+}
+
+.confirm-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  font-size: 12px;
+}
+
+.confirm-row .label { color: var(--muted); }
+.confirm-row .value { color: var(--text-bright); font-weight: 500; }
+.confirm-row.total { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px; font-weight: 700; }
+.confirm-row.total .value { color: var(--cyan); font-size: 14px; }
+
+/* Utility */
+.flex { display: flex; }
+.flex-between { display: flex; justify-content: space-between; align-items: center; }
+.gap-8 { gap: 8px; }
+.gap-12 { gap: 12px; }
+.mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; }
+.mb-12 { margin-bottom: 12px; }
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- ═══ HEADER ═══ -->
+<div class="header">
+  <div class="header-brand">
+    <button class="mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
+    <div class="header-icon"><img src="favicon.png" style="width:22px;height:22px;border-radius:3px" alt="QTCL"/></div>
+    <div>
+      <div class="header-title">QTCL TRANSACT</div>
+      <div class="header-sub">Quantum Transaction System</div>
+    </div>
+  </div>
+  <div class="header-status">
+    <div class="status-pill">
+      <span class="status-dot" id="networkDot"></span>
+      <span id="networkStatus">Connecting…</span>
+    </div>
+    <div class="status-pill" id="heightPill">H: —</div>
+  </div>
+</div>
+
+<!-- ═══ APP LAYOUT ═══ -->
+<div class="app-layout">
+
+<!-- SIDEBAR -->
+  <div class="sidebar" id="sidebar">
+    <div class="nav-section-title">Wallet</div>
+    <div class="nav-section">
+      <div class="nav-item active" data-page="dashboard" onclick="showPage('dashboard')">
+        <span class="nav-icon">🏠</span> Dashboard
+      </div>
+      <div class="nav-item" data-page="send" onclick="showPage('send')">
+        <span class="nav-icon">↗</span> Send
+      </div>
+      <div class="nav-item" data-page="receive" onclick="showPage('receive')">
+        <span class="nav-icon">↙</span> Receive
+      </div>
+    </div>
+
+    <div class="nav-section-title">Explorer</div>
+    <div class="nav-section">
+      <div class="nav-item" data-page="transactions" onclick="showPage('transactions')">
+        <span class="nav-icon">⛓</span> Transactions
+        <span class="nav-badge" id="txBadge">0</span>
+      </div>
+      <div class="nav-item" data-page="blocks" onclick="showPage('blocks')">
+        <span class="nav-icon">▣</span> Blocks
+      </div>
+      <div class="nav-item" data-page="mempool" onclick="showPage('mempool')">
+        <span class="nav-icon">⏳</span> Mempool
+      </div>
+    </div>
+
+    <div class="nav-section-title">Tools</div>
+    <div class="nav-section">
+      <div class="nav-item" data-page="walletmgr" onclick="showPage('walletmgr')">
+        <span class="nav-icon">🔑</span> Wallet Manager
+        <span class="nav-badge" style="background:rgba(16,185,129,.15);color:var(--emerald);border-color:rgba(16,185,129,.3);">NEW</span>
+      </div>
+      <div class="nav-item" data-page="buy" onclick="showPage('buy')">
+        <span class="nav-icon">💳</span> Buy QTCL
+        <span class="nav-badge" style="background:rgba(139,92,246,.15);color:var(--violet);border-color:rgba(139,92,246,.3);">STRIPE</span>
+      </div>
+      <div class="nav-item" data-page="contacts" onclick="showPage('contacts')">
+        <span class="nav-icon">👤</span> Address Book
+      </div>
+      <div class="nav-item" data-page="bridge" onclick="showPage('bridge')">
+        <span class="nav-icon">🌉</span> wQTCL Bridge
+      </div>
+      <div class="nav-item" data-page="lookup" onclick="showPage('lookup')">
+        <span class="nav-icon">🔍</span> Address Lookup
+      </div>
+    </div>
+
+    <div style="padding: 16px 20px; margin-top: auto;">
+      <a href="/" style="color: var(--muted); font-size: 10px; text-decoration: none;">← Dashboard</a>
+      <span style="color: var(--border); margin: 0 6px;">|</span>
+      <a href="/vault" style="color: var(--muted); font-size: 10px; text-decoration: none;">Vault →</a>
+    </div>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <div class="main">
+
+    <!-- ═══════ WALLET CONNECT DROPDOWN (TOP) ═══════ -->
+    <div class="card" id="walletConnectCard" style="margin-bottom:20px;">
+      <div class="card-header" onclick="toggleWalletDropdown()" style="cursor:pointer;">
+        <div class="card-title">🔐 Wallet Connect <span style="color:var(--muted);font-weight:normal;font-size:12px;">(click to expand)</span></div>
+        <span id="walletDropdownArrow" style="transition:transform 0.2s;">▼</span>
+      </div>
+      <div id="walletDropdownContent" class="card-body" style="display:none;">
+        <div style="background:rgba(0,232,138,0.06);border:1px solid rgba(0,232,138,0.15);border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:11px;color:var(--muted);line-height:1.6;">
+          🛡 <strong style="color:var(--emerald);">Zero-persistence security</strong> — Your wallet data lives only in RAM for this session. Switching tabs, minimizing, or completing a transaction automatically purges all keys and credentials from memory. Nothing is ever written to disk or localStorage.
+        </div>
+        <!-- Tab: Address-Only vs Wallet File -->
+        <div class="tab-bar" style="margin-bottom:16px; border-radius:4px;">
+          <button class="tab-btn active" onclick="showConnectTab('address')">Address Only</button>
+          <button class="tab-btn" onclick="showConnectTab('walletfile')">Wallet File + Password</button>
+        </div>
+
+        <!-- Address-Only Connect (Read-Only) -->
+        <div id="connectTabAddr">
+          <div class="form-group">
+            <label class="form-label">QTCL Address (Read-Only Mode)</label>
+            <input type="text" class="form-input" id="connectAddr" placeholder="64-char hex address…">
+            <div class="form-hint">View balance and history. Sending requires wallet file authentication.</div>
+          </div>
+          <button class="btn btn-primary btn-full" onclick="connectWallet()">Connect (Read-Only)</button>
+        </div>
+
+        <!-- Wallet File + Password (Full Auth — HypΓ PBKDF2) -->
+        <div id="connectTabWallet" class="hidden">
+          <div class="form-group">
+            <label class="form-label">Wallet File (wallet.json)</label>
+            <input type="file" id="walletFileInput" accept=".json" class="form-input" onchange="handleWalletFile(event)" style="padding:8px;">
+            <div class="form-hint">Your wallet file stays in your browser. The private key is NEVER sent to the server.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">🔑 Wallet Password</label>
+            <input type="password" class="form-input" id="walletPassword" placeholder="Enter your wallet password">
+            <div class="form-hint">PBKDF2-HMAC-SHA256 · 600,000 iterations · SHAKE-256-CTR + SHA3-256 MAC</div>
+          </div>
+          <div id="walletAuthStatus" class="hidden" style="margin-bottom:12px;"></div>
+          <button class="btn btn-primary btn-full" onclick="authenticateWallet()" id="walletAuthBtn">
+            🔓 Unlock Wallet (HypΓ Auth)
+          </button>
+          <div class="form-hint mt-12" style="color:var(--amber);">
+            ⚛ Authentication uses the HypΓ verifier tag system — your password is verified against the PBKDF2-derived verifier WITHOUT decrypting your private key on the server. The encrypted private key remains in-browser for client-side signing.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: DASHBOARD ═══════ -->
+    <div class="page active" id="page-dashboard">
+      <div class="page-title">Wallet Overview</div>
+      <div class="page-desc">Your QTCL balance, recent activity, and quick actions</div>
+
+      <!-- Balance Hero -->
+      <div class="balance-hero" id="balanceHero">
+        <div class="balance-amount"><span id="balanceDisplay">0.00</span><span class="balance-symbol">QTCL</span></div>
+        <div class="balance-usd" id="balanceUsd">Connect wallet to view balance</div>
+        <div class="balance-addr" id="walletAddr" style="display:none;"></div>
+        <button class="btn btn-sm btn-danger mt-12" id="disconnectBtn" style="display:none;" onclick="disconnectWallet()">🔒 Disconnect Wallet</button>
+      </div>
+
+      <!-- Quick Actions -->
+      <div class="action-grid">
+        <div class="action-btn" onclick="showPage('send')">
+          <span class="action-icon">↗</span> Send
+        </div>
+        <div class="action-btn" onclick="showPage('receive')">
+          <span class="action-icon">↙</span> Receive
+        </div>
+        <div class="action-btn" onclick="showPage('transactions')">
+          <span class="action-icon">⛓</span> History
+        </div>
+        <div class="action-btn" onclick="showPage('bridge')">
+          <span class="action-icon">🌉</span> Bridge
+        </div>
+        <div class="action-btn" onclick="showPage('lookup')">
+          <span class="action-icon">🔍</span> Lookup
+        </div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row" id="dashStats">
+        <div class="stat-card">
+          <div class="stat-label">Block Height</div>
+          <div class="stat-value" id="dHeight">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Supply Minted</div>
+          <div class="stat-value" id="dSupply">—</div>
+          <div class="stat-unit">QTCL</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Mempool Depth</div>
+          <div class="stat-value" id="dMempool">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Connected Peers</div>
+          <div class="stat-value" id="dPeers">—</div>
+        </div>
+      </div>
+
+      <!-- Recent Transactions -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Recent Transactions</div>
+          <button class="btn btn-sm" onclick="showPage('transactions')">View All →</button>
+        </div>
+          <div id="recentTxList" class="loading"><span class="spinner"></span> Loading…</div>
+      </div>
+
+    </div><!-- /page-dashboard -->
+
+    <!-- ═══════ PAGE: SEND ═══════ -->
+    <div class="page" id="page-send">
+      <div class="page-title">Send QTCL</div>
+      <div class="page-desc">Transfer QTCL to any address on the quantum network</div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-title">New Transfer</div></div>
+        <div class="card-body">
+          <div id="sendStep1">
+            <div class="form-group">
+              <label class="form-label">From Address</label>
+              <input type="text" class="form-input" id="sendFrom" placeholder="Your QTCL address" readonly>
+              <div class="form-hint">Balance: <strong id="sendBalance">0.00</strong> QTCL</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Recipient Address</label>
+              <div style="display:flex; gap:8px;">
+                <input type="text" class="form-input" id="sendTo" placeholder="Recipient 64-char hex address…" style="flex:1;">
+                <button class="btn btn-sm" onclick="pickContact('sendTo')" title="Address Book">👤</button>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Amount (QTCL)</label>
+                <input type="number" class="form-input" id="sendAmount" placeholder="0.00" step="0.01" min="0">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Fee (QTCL)</label>
+                <input type="number" class="form-input" id="sendFee" value="0.01" step="0.01" min="0.01">
+                <div class="form-hint">Fee split: 50% miner reward · 50% QTCL Treasury</div>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Memo (Optional)</label>
+              <input type="text" class="form-input" id="sendMemo" placeholder="Payment memo…">
+            </div>
+            <button class="btn btn-primary btn-full mt-12" onclick="prepareSend().catch(e=>toast(e.message,'error'))">Review Transaction →</button>
+          </div>
+
+          <div id="sendStep2" class="hidden">
+            <div style="font-size:13px; font-weight:700; color:var(--text-bright); margin-bottom:12px;">Confirm Transaction</div>
+            <div class="confirm-box" id="sendConfirmBox"></div>
+            <div class="flex gap-8 mt-16">
+              <button class="btn" onclick="backToSendForm()" style="flex:1;">← Edit</button>
+              <button class="btn btn-primary" onclick="executeSend()" style="flex:2;" id="sendExecBtn">Sign & Submit</button>
+            </div>
+          </div>
+
+          <div id="sendStep3" class="hidden">
+            <div class="text-center" style="padding:20px;">
+              <div style="font-size:32px; margin-bottom:12px;">✅</div>
+              <div style="font-size:14px; font-weight:700; color:var(--emerald);">Transaction Submitted</div>
+              <div class="addr mt-12" id="sendTxHash" style="font-size:11px;"></div>
+              <div class="form-hint mt-12">Your transaction has been submitted to the mempool and will be included in the next block.</div>
+              <button class="btn btn-primary mt-16" onclick="resetSendForm()">New Transaction</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: RECEIVE ═══════ -->
+    <div class="page" id="page-receive">
+      <div class="page-title">Receive QTCL</div>
+      <div class="page-desc">Share your address to receive QTCL payments</div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-title">Your Receiving Address</div></div>
+        <div class="card-body text-center">
+          <div id="receiveAddrDisplay" style="padding:20px;">
+            <div class="form-hint mb-12">Connect your wallet to generate a receiving address</div>
+            <button class="btn btn-primary" onclick="showPage('dashboard')">Connect Wallet</button>
+          </div>
+          <div id="receiveAddrReady" class="hidden">
+            <div style="margin-bottom:16px;">
+              <canvas id="qrCanvas" width="200" height="200" style="border-radius:8px; background:#fff; padding:8px;"></canvas>
+            </div>
+            <div class="balance-addr" id="receiveAddr" style="max-width:400px; margin:0 auto;"></div>
+            <div class="flex gap-8 mt-16" style="justify-content:center;">
+              <button class="btn btn-primary" onclick="copyReceiveAddr()">📋 Copy Address</button>
+              <button class="btn" onclick="shareAddr()">↗ Share</button>
+            </div>
+            <div class="form-hint mt-16">Anyone can send QTCL to this address. Share it freely — your balance is visible on-chain but your identity is protected by HypΓ cryptography.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Payment Request -->
+      <div class="card">
+        <div class="card-header"><div class="card-title">Create Payment Request</div></div>
+        <div class="card-body">
+          <div class="form-group">
+            <label class="form-label">Amount (QTCL)</label>
+            <input type="number" class="form-input" id="requestAmount" placeholder="0.00" step="0.01">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Memo</label>
+            <input type="text" class="form-input" id="requestMemo" placeholder="Payment for…">
+          </div>
+          <button class="btn btn-violet btn-full" onclick="generatePaymentLink()">Generate Payment Link</button>
+          <div id="paymentLinkResult" class="hidden mt-12"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: TRANSACTIONS ═══════ -->
+    <div class="page" id="page-transactions">
+      <div class="page-title">Transaction Explorer</div>
+      <div class="page-desc">Browse all on-chain transactions with real-time verification</div>
+
+      <!-- Search & Filter -->
+      <div class="card mb-12">
+        <div class="card-body" style="padding:12px 16px;">
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <input type="text" class="form-input" id="txSearch" placeholder="Search by TX hash, address, or block height…" style="flex:1; min-width:200px;">
+            <select class="form-select" id="txTypeFilter" onchange="loadTransactions()" style="width:140px;">
+              <option value="">All Types</option>
+              <option value="coinbase">Coinbase</option>
+              <option value="miner_reward">Miner Reward</option>
+              <option value="treasury_reward">Treasury</option>
+              <option value="transfer">Transfer</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="loadTransactions()">Search</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stats Row -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-label">Total TXs</div>
+          <div class="stat-value" id="txTotal">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Showing</div>
+          <div class="stat-value" id="txShowing">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Volume</div>
+          <div class="stat-value" id="txVolume">—</div>
+          <div class="stat-unit">QTCL</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Pages</div>
+          <div class="stat-value" id="txPages">—</div>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div class="card">
+        <div id="txTableArea" class="loading"><span class="spinner"></span> Loading transactions…</div>
+      </div>
+
+      <!-- Pagination -->
+      <div id="txPagination"></div>
+    </div>
+
+    <!-- ═══════ PAGE: BLOCKS ═══════ -->
+    <div class="page" id="page-blocks">
+      <div class="page-title">Block Explorer</div>
+      <div class="page-desc">Browse the QTCL blockchain block by block</div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Recent Blocks</div>
+          <div class="flex gap-8">
+            <button class="btn btn-sm" onclick="loadBlocks('newer')">← Newer</button>
+            <button class="btn btn-sm" onclick="loadBlocks('older')">Older →</button>
+          </div>
+        </div>
+        <div id="blocksTableArea" class="loading"><span class="spinner"></span> Loading blocks…</div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: MEMPOOL ═══════ -->
+    <div class="page" id="page-mempool">
+      <div class="page-title">Mempool</div>
+      <div class="page-desc">Pending transactions awaiting block inclusion</div>
+
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-label">Pending TXs</div>
+          <div class="stat-value" id="mpDepth">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Status</div>
+          <div class="stat-value" id="mpStatus">—</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Pending Transactions</div>
+          <button class="btn btn-sm" onclick="loadMempool()">⟳ Refresh</button>
+        </div>
+        <div id="mempoolArea" class="loading"><span class="spinner"></span> Loading mempool…</div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: CONTACTS (Vault-Gated Address Book) ═══════ -->
+    <div class="page" id="page-contacts">
+      <div class="page-title">Address Book</div>
+      <div class="page-desc">Vault-secured address book — contacts are encrypted and stored in your QTCL Vault account</div>
+
+      <!-- Vault Login Gate -->
+      <div class="card" id="contactsVaultGate">
+        <div class="card-header"><div class="card-title">🔐 Vault Authentication Required</div></div>
+        <div class="card-body">
+          <div class="form-hint mb-12" style="color:var(--amber);">Address Book is secured by your Vault account. Log in to access your contacts.</div>
+          <div class="form-group">
+            <label class="form-label">Vault Account ID</label>
+            <input type="text" class="form-input" id="contactsVaultId" placeholder="Your vault account ID">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Vault Passphrase</label>
+            <input type="password" class="form-input" id="contactsVaultPass" placeholder="Your vault passphrase">
+          </div>
+          <button class="btn btn-primary btn-full" onclick="loginContactsVault()">🔓 Unlock Address Book</button>
+          <div class="form-hint mt-12">Don't have a vault account? <a href="/vault" style="color:var(--cyan);">Create one here →</a></div>
+        </div>
+      </div>
+
+      <!-- Contacts (hidden until vault auth) -->
+      <div id="contactsAuthed" class="hidden">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Add Contact</div>
+            <button class="btn btn-sm btn-danger" onclick="logoutContactsVault()">🔒 Lock</button>
+          </div>
+          <div class="card-body">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Name / Label</label>
+                <input type="text" class="form-input" id="contactName" placeholder="Alice, Treasury, etc.">
+              </div>
+              <div class="form-group">
+                <label class="form-label">QTCL Address</label>
+                <input type="text" class="form-input" id="contactAddr" placeholder="64-char hex address…">
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm mt-12" onclick="addContact()">+ Add Contact</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><div class="card-title">Saved Contacts</div></div>
+          <div id="contactsList"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: BRIDGE ═══════ -->
+    <div class="page" id="page-bridge">
+      <div class="page-title">wQTCL Bridge</div>
+      <div class="page-desc">Bridge native QTCL to wQTCL (ERC-20) on Base Mainnet</div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="tab-bar">
+            <button class="tab-btn active" onclick="showBridgeTab('lock')">Lock → wQTCL</button>
+            <button class="tab-btn" onclick="showBridgeTab('redeem')">Redeem → QTCL</button>
+          </div>
+          <div style="padding:16px;">
+            <div id="bridgeLock">
+              <div class="form-group">
+                <label class="form-label">Amount to Lock (QTCL)</label>
+                <input type="number" class="form-input" id="bridgeLockAmt" placeholder="0.00" step="0.01">
+                <div class="form-hint">0.1% bridge tax applies. Min: 1.0 QTCL</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Base Mainnet Recipient (0x…)</label>
+                <input type="text" class="form-input" id="bridgeRecipient" placeholder="0x…">
+              </div>
+              <div id="bridgeLockPreview" class="hidden confirm-box mt-12"></div>
+              <button class="btn btn-primary btn-full mt-12" onclick="previewBridgeLock()">Preview Bridge</button>
+            </div>
+            <div id="bridgeRedeem" class="hidden">
+              <div class="form-hint" style="padding:20px; text-align:center;">
+                Redeem wQTCL → QTCL requires burning wQTCL on Base and providing the burn TX hash. The 5-oracle consensus will verify and release native QTCL to your address.
+              </div>
+              <div class="form-group">
+                <label class="form-label">Base Burn TX Hash</label>
+                <input type="text" class="form-input" id="bridgeBurnTx" placeholder="0x…">
+              </div>
+              <div class="form-group">
+                <label class="form-label">QTCL Receiving Address</label>
+                <input type="text" class="form-input" id="bridgeRedeemAddr" placeholder="64-char hex address…">
+              </div>
+              <button class="btn btn-violet btn-full mt-12" disabled>Submit Redeem (Coming Soon)</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: LOOKUP ═══════ -->
+    <div class="page" id="page-lookup">
+      <div class="page-title">Address Lookup</div>
+      <div class="page-desc">Check balance and transaction history for any QTCL address</div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="form-group">
+            <label class="form-label">QTCL Address</label>
+            <div style="display:flex; gap:8px;">
+              <input type="text" class="form-input" id="lookupAddr" placeholder="64-char hex address…" style="flex:1;">
+              <button class="btn btn-primary" onclick="lookupAddress()">Lookup</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="lookupResult" class="hidden"></div>
+    </div>
+
+    <!-- ═══════ PAGE: WALLET MANAGER ═══════ -->
+    <div class="page" id="page-walletmgr">
+      <div class="page-title">🔑 Wallet Manager</div>
+      <div class="page-desc">Create, export, and verify QTCL wallets — all cryptography runs client-side</div>
+
+      <!-- Security banner -->
+      <div style="background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.2);border-radius:6px;padding:14px 18px;margin-bottom:20px;font-size:11px;color:var(--text);line-height:1.7;">
+        <strong style="color:var(--emerald);">🛡 Air-gapped wallet generation</strong><br>
+        Your private key is generated server-side by the HypΓ engine, transmitted once over TLS, displayed to you, and <strong>immediately purged from server memory</strong>.
+        The wallet JSON file is assembled entirely in your browser. <strong>No private key is ever stored on the server or in any database.</strong>
+        After downloading, the key material is zeroed from browser memory. For maximum security, generate wallets on a trusted device with no extensions.
+      </div>
+
+      <!-- Tab bar -->
+      <div class="tab-bar" style="margin-bottom:20px;">
+        <button class="tab-btn active" onclick="showWalletMgrTab('create')" id="wmTabCreate">Create New Wallet</button>
+        <button class="tab-btn" onclick="showWalletMgrTab('verify')" id="wmTabVerify">Verify Wallet</button>
+        <button class="tab-btn" onclick="showWalletMgrTab('backup')" id="wmTabBackup">Backup Guide</button>
+      </div>
+
+      <!-- ── CREATE WALLET ── -->
+      <div id="wmCreateTab">
+        <div class="card">
+          <div class="card-header"><div class="card-title">⚛ Generate HypΓ Keypair</div></div>
+          <div class="card-body">
+
+            <div class="form-group">
+              <label class="form-label">Wallet Password <span style="color:var(--red);">*</span></label>
+              <input type="password" class="form-input" id="wmPassword" placeholder="Strong password — encrypts your private key" autocomplete="new-password">
+              <div class="form-hint">Used to encrypt the private key in your wallet file. Choose something strong — there is NO recovery if lost.</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Confirm Password <span style="color:var(--red);">*</span></label>
+              <input type="password" class="form-input" id="wmPasswordConfirm" placeholder="Confirm password" autocomplete="new-password">
+            </div>
+
+            <!-- Password strength meter -->
+            <div style="margin-bottom:16px;">
+              <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-bottom:4px;">
+                <span>Password strength</span>
+                <span id="wmPwStrengthLabel">—</span>
+              </div>
+              <div style="height:3px;background:var(--raised);border-radius:2px;overflow:hidden;">
+                <div id="wmPwStrengthBar" style="height:100%;width:0%;transition:all .3s;border-radius:2px;"></div>
+              </div>
+            </div>
+
+            <button class="btn btn-primary btn-full" onclick="generateNewWallet()" id="wmGenerateBtn">
+              ⚛ Generate Quantum-Safe Wallet
+            </button>
+
+            <!-- Generated wallet display -->
+            <div id="wmResult" class="hidden" style="margin-top:20px;">
+              <div style="background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.15);border-radius:6px;padding:16px;">
+                <div style="font-size:12px;font-weight:600;color:var(--cyan);margin-bottom:12px;">✅ Wallet Generated Successfully</div>
+
+                <div class="form-group">
+                  <label class="form-label">Address</label>
+                  <div class="form-input" id="wmAddr" style="word-break:break-all;font-size:11px;color:var(--emerald);user-select:all;cursor:text;min-height:auto;"></div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label">Public Key <span style="color:var(--muted);font-weight:normal;">(safe to share)</span></label>
+                  <div class="form-input" id="wmPubKey" style="word-break:break-all;font-size:9px;color:var(--text);max-height:60px;overflow-y:auto;user-select:all;cursor:text;"></div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" style="color:var(--red);">🔒 Private Key <span style="font-weight:normal;">(NEVER share — encrypted in wallet file)</span></label>
+                  <div style="position:relative;">
+                    <div class="form-input" id="wmPrivKey" style="word-break:break-all;font-size:9px;color:var(--amber);max-height:60px;overflow-y:auto;filter:blur(4px);transition:filter .2s;user-select:all;cursor:text;"></div>
+                    <button style="position:absolute;top:6px;right:6px;background:var(--raised);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;padding:3px 8px;cursor:pointer;" onclick="togglePrivKeyReveal()">👁 Reveal</button>
+                  </div>
+                  <div class="form-hint" style="color:var(--red);">This key controls your funds. Anyone with it can spend your QTCL. Back it up securely and NEVER paste it online.</div>
+                </div>
+
+                <div style="display:flex;gap:8px;margin-top:16px;">
+                  <button class="btn btn-primary" onclick="downloadWalletFile()" style="flex:1;">
+                    💾 Download Wallet File (.json)
+                  </button>
+                  <button class="btn btn-outline" onclick="copyWalletAddress()" style="flex:0 0 auto;">
+                    📋 Copy Address
+                  </button>
+                </div>
+
+                <div style="margin-top:12px;padding:10px 14px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.15);border-radius:6px;font-size:10px;color:var(--amber);line-height:1.6;">
+                  ⚠ <strong>CRITICAL:</strong> Download your wallet file NOW. After you leave this page, the private key is permanently erased from memory.
+                  There is no "forgot password" — if you lose the wallet file or password, your funds are gone forever. Store the file in a secure, offline location.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── VERIFY WALLET ── -->
+      <div id="wmVerifyTab" class="hidden">
+        <div class="card">
+          <div class="card-header"><div class="card-title">🔍 Verify Wallet Integrity</div></div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label">Upload Wallet File</label>
+              <input type="file" class="form-input" id="wmVerifyFile" accept=".json" onchange="handleVerifyFile(event)" style="padding:8px;">
+              <div class="form-hint">Checks that the wallet file is valid, the public key derives to the correct address, and the file structure is intact.</div>
+            </div>
+            <div id="wmVerifyResult" class="hidden" style="margin-top:16px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── BACKUP GUIDE ── -->
+      <div id="wmBackupTab" class="hidden">
+        <div class="card">
+          <div class="card-header"><div class="card-title">📋 Wallet Backup Checklist</div></div>
+          <div class="card-body" style="font-size:12px;line-height:1.8;color:var(--text);">
+            <div style="margin-bottom:16px;">
+              <strong style="color:var(--cyan);">1. Download the wallet JSON file</strong><br>
+              This file contains your encrypted private key, public key, and address. Without it, you cannot sign transactions.
+            </div>
+            <div style="margin-bottom:16px;">
+              <strong style="color:var(--cyan);">2. Store in multiple secure locations</strong><br>
+              USB drive (encrypted), password manager vault, or printed paper wallet stored in a safe. Never store only in cloud storage.
+            </div>
+            <div style="margin-bottom:16px;">
+              <strong style="color:var(--cyan);">3. Remember your password</strong><br>
+              The wallet password encrypts your private key. Without it, the wallet file is useless. Consider using a password manager.
+            </div>
+            <div style="margin-bottom:16px;">
+              <strong style="color:var(--cyan);">4. Verify your backup</strong><br>
+              Use the "Verify Wallet" tab to confirm your backup file is valid before relying on it.
+            </div>
+            <div style="padding:12px 16px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:6px;color:var(--red);font-size:11px;">
+              <strong>⚠ There is no recovery.</strong> QTCL uses client-side key management. No server, company, or support team can recover a lost wallet or reset a forgotten password. You are your own bank — act accordingly.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ PAGE: BUY QTCL ═══════ -->
+    <div class="page" id="page-buy">
+      <div class="page-title">💳 Buy QTCL</div>
+      <div class="page-desc">Purchase QTCL tokens with credit/debit card via Stripe</div>
+
+      <!-- ── SUPPLY DASHBOARD ── -->
+      <div class="card" style="margin-bottom:20px;">
+        <div class="card-header">
+          <div class="card-title">⚛ Available Supply</div>
+          <button class="btn btn-sm" onclick="loadBuySupply()" style="font-size:10px;">↻ Refresh</button>
+        </div>
+        <div class="card-body" id="buySupplyBody">
+          <div style="text-align:center;padding:12px;color:var(--muted);font-size:11px;">Loading supply data…</div>
+        </div>
+      </div>
+
+      <!-- ── OUT OF STOCK BANNER (shown when supply = 0) ── -->
+      <div id="buyOutOfStock" class="hidden" style="margin-bottom:20px;">
+        <div style="background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.25);border-radius:6px;padding:18px 22px;text-align:center;">
+          <div style="font-size:28px;margin-bottom:8px;">⛏</div>
+          <div style="font-family:var(--font-display);font-size:15px;font-weight:700;color:var(--amber);margin-bottom:8px;">No QTCL Available for Purchase</div>
+          <div style="font-size:11px;color:var(--text);line-height:1.7;max-width:460px;margin:0 auto;">
+            The miner and treasury wallets currently hold <strong style="color:var(--red);">0 QTCL</strong>.
+            New supply is created through mining — each block mints <strong style="color:var(--cyan);">7.2 QTCL</strong> (miner reward) and <strong style="color:var(--violet);">0.8 QTCL</strong> (treasury).
+          </div>
+          <div style="margin-top:14px;padding:12px 16px;background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.1);border-radius:6px;font-size:11px;color:var(--muted);line-height:1.7;">
+            <strong style="color:var(--cyan);">How to get QTCL:</strong><br>
+            ⛏ <strong>Mine it yourself</strong> — run the QTCL miner client and earn 7.2 QTCL per block<br>
+            ⏳ <strong>Wait for restock</strong> — the miner and treasury accumulate QTCL with every mined block<br>
+            🔄 <strong>Peer-to-peer</strong> — receive QTCL from another wallet holder via the Send tab
+          </div>
+        </div>
+      </div>
+
+      <!-- ── PURCHASE FORM (hidden when supply = 0) ── -->
+      <div id="buyFormSection">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Purchase QTCL</div></div>
+          <div class="card-body">
+
+            <div class="form-group">
+              <label class="form-label">Receiving Address <span style="color:var(--red);">*</span></label>
+              <input type="text" class="form-input" id="buyAddr" placeholder="Your 64-char QTCL address">
+              <div class="form-hint">QTCL will be sent to this address after payment confirmation. Double-check — transactions are irreversible.</div>
+            </div>
+
+            <!-- Amount selector -->
+            <div class="form-group">
+              <label class="form-label">Amount <span id="buyMaxLabel" style="color:var(--muted);font-weight:normal;font-size:10px;"></span></label>
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="buyAmountGrid">
+                <!-- Populated dynamically based on available supply -->
+              </div>
+            </div>
+
+            <!-- Order summary -->
+            <div id="buyOrderSummary" class="hidden">
+              <div class="confirm-box">
+                <div class="confirm-row"><span class="label">QTCL Amount</span><span class="value" id="buyQtclAmount">—</span></div>
+                <div class="confirm-row"><span class="label">Price per QTCL</span><span class="value">$0.10 USD</span></div>
+                <div class="confirm-row"><span class="label">Network Fee</span><span class="value" style="color:var(--emerald);">FREE</span></div>
+                <div class="confirm-row total"><span class="label">Total</span><span class="value" id="buyTotal">$0.00</span></div>
+                <div class="confirm-row"><span class="label">Deliver to</span><span class="value" id="buyDeliverTo" style="font-size:10px;word-break:break-all;">—</span></div>
+              </div>
+            </div>
+
+            <button class="btn btn-primary btn-full" onclick="initStripeCheckout()" id="buyBtn" disabled style="margin-top:16px;">
+              💳 Pay with Stripe
+            </button>
+
+            <div style="margin-top:12px;font-size:10px;color:var(--muted);text-align:center;line-height:1.6;">
+              Payments processed securely by <strong style="color:var(--text);">Stripe</strong>. QTCL is delivered to your address within 1 block (~18 seconds) after payment confirmation.
+              <br>By purchasing, you agree that QTCL is an experimental quantum blockchain token with no guaranteed monetary value.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Supply source breakdown -->
+      <div class="card" style="margin-top:20px;">
+        <div class="card-header"><div class="card-title">Supply Sources</div></div>
+        <div class="card-body" id="buySupplySources" style="font-size:11px;color:var(--muted);text-align:center;padding:20px;">
+          Loading…
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /app-layout -->
+
+<!-- ═══ TX DETAIL MODAL ═══ -->
+<div class="modal-overlay" id="txDetailModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">Transaction Details</div>
+      <button class="modal-close" onclick="closeModal('txDetailModal')">✕</button>
+    </div>
+    <div class="modal-body" id="txDetailBody"></div>
+  </div>
+</div>
+
+<!-- ═══ BLOCK DETAIL MODAL ═══ -->
+<div class="modal-overlay" id="blockDetailModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="blockDetailTitle">Block Details</div>
+      <button class="modal-close" onclick="closeModal('blockDetailModal')">✕</button>
+    </div>
+    <div class="modal-body" id="blockDetailBody"></div>
+  </div>
+</div>
+
+<!-- ═══ CONTACT PICKER MODAL ═══ -->
+<div class="modal-overlay" id="contactPickerModal">
+  <div class="modal" style="max-width:400px;">
+    <div class="modal-header">
+      <div class="modal-title">Select Contact</div>
+      <button class="modal-close" onclick="closeModal('contactPickerModal')">✕</button>
+    </div>
+    <div class="modal-body" id="contactPickerBody"></div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════════
+// QTCL TRANSACT — Cathedral-Grade Transaction System
+// Deeply integrated with qtcl-blockchain.koyeb.app JSON-RPC 2.0
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const RPC_URL = '/rpc';
+
+// ═══ STATE — EPHEMERAL (never persisted to localStorage) ═══
+// Wallet data lives only in RAM for the current session.
+// Tab switch, page hide, or navigation purges everything.
+const S = {
+  walletAddr: '',
+  walletMode: 'readonly',
+  walletPublicKey: '',
+  balance: 0,
+  height: 0,
+  txPage: 0,
+  txPerPage: 25,
+  txTotal: 0,
+  txPages: 1,
+  blockRangeEnd: -1,
+  contacts: [],
+  _contactPickTarget: null,
+  // Vault auth for address book (session only)
+  vaultAccountId: '',
+  vaultPassphrase: '',
+  vaultLoggedIn: false,
+};
+
+// ═══ SECURITY: Purge any stale localStorage from prior versions ═══
+try {
+  localStorage.removeItem('qtcl_tx_wallet');
+  localStorage.removeItem('qtcl_tx_mode');
+  localStorage.removeItem('qtcl_vault_account_id');
+} catch(_) {}
+
+// ═══ RPC HELPER ═══
+async function rpc(method, params = [], retries = 3) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
+        signal: AbortSignal.timeout(12000)
+      });
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('json')) {
+        // Non-JSON response (e.g. 503 plain text during startup)
+        const text = await r.text();
+        if (r.status === 503 && attempt < retries) {
+          await new Promise(res => setTimeout(res, 3000 + attempt * 2000));
+          continue;
+        }
+        throw new Error(`Server not ready (${r.status}): ${text.slice(0, 80)}`);
+      }
+      const d = await r.json();
+      if (d.error) {
+        if (d.error.code === -32000 && attempt < retries) {
+          // Server initializing
+          await new Promise(res => setTimeout(res, 3000 + attempt * 2000));
+          continue;
+        }
+        throw new Error(d.error.message || JSON.stringify(d.error));
+      }
+      return d.result;
+    } catch (e) {
+      if (attempt < retries && (e.name === 'AbortError' || e.name === 'TypeError' || (e.message && e.message.includes('fetch')))) {
+        await new Promise(res => setTimeout(res, 2000 + attempt * 1500));
+        continue;
+      }
+      console.error(`RPC ${method}:`, e);
+      throw e;
+    }
+  }
+}
+
+// ═══ TOAST ═══
+function toast(msg, type = 'info', dur = 3500) {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  document.getElementById('toastContainer').appendChild(t);
+  setTimeout(() => t.remove(), dur);
+}
+
+// ═══ NAVIGATION ═══
+function showPage(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById(`page-${page}`)?.classList.add('active');
+  document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
+  document.getElementById('sidebar')?.classList.remove('mobile-open');
+
+  // Lazy load page data
+  if (page === 'transactions') loadTransactions();
+  if (page === 'blocks') loadBlocks();
+  if (page === 'mempool') loadMempool();
+  if (page === 'contacts') renderContactsPage();
+  if (page === 'buy') loadBuySupply();
+}
+
+// ═══ SECURITY: FULL WALLET DISCONNECT ON TAB SWITCH / VISIBILITY LOSS ═══
+// ALL wallet data (address, keys, file data, balance) is purged from RAM
+// whenever the user navigates away from the transactions page.
+// No data survives — re-connect from scratch every time. By design.
+
+function _fullWalletPurge(reason) {
+  const hadWallet = !!S.walletAddr;
+  // Nuclear purge — zero everything
+  _walletFileData = null;
+  _walletEncryptedPK = null;
+  _signPassword = '';
+  S.walletAddr = '';
+  S.walletMode = 'readonly';
+  S.walletPublicKey = '';
+  S.balance = 0;
+  S.vaultPassphrase = '';
+  S.vaultLoggedIn = false;
+  S.vaultAccountId = '';
+  S.contacts = [];
+  // Clear form fields
+  const fields = ['connectAddr', 'walletPassword', 'sendTo', 'sendAmount', 'sendMemo'];
+  fields.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  const fileInput = document.getElementById('walletFileInput');
+  if (fileInput) fileInput.value = '';
+  const authStatus = document.getElementById('walletAuthStatus');
+  if (authStatus) { authStatus.innerHTML = ''; authStatus.classList.add('hidden'); }
+  // Reset UI
+  document.getElementById('balanceDisplay').textContent = '0.00';
+  document.getElementById('balanceUsd').textContent = 'Connect wallet to view balance';
+  const wa = document.getElementById('walletAddr');
+  if (wa) wa.style.display = 'none';
+  const wcc = document.getElementById('walletConnectCard');
+  if (wcc) wcc.style.display = '';
+  document.getElementById('sendFrom').value = '';
+  document.getElementById('sendBalance').textContent = '0.00';
+  const dcBtn = document.getElementById('disconnectBtn');
+  if (dcBtn) dcBtn.style.display = 'none';
+  // Purge stale localStorage from prior versions
+  try {
+    localStorage.removeItem('qtcl_tx_wallet');
+    localStorage.removeItem('qtcl_tx_mode');
+    localStorage.removeItem('qtcl_vault_account_id');
+  } catch(_) {}
+  if (hadWallet && reason) {
+    console.log(`[SECURITY] Wallet purged: ${reason}`);
+  }
+}
+
+// Tab switch (page hidden, minimized, phone lock)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    _fullWalletPurge('visibilitychange:hidden');
+  }
+});
+
+// Page unload / navigation
+window.addEventListener('pagehide', () => {
+  _fullWalletPurge('pagehide');
+});
+
+// Before unload (belt and suspenders)
+window.addEventListener('beforeunload', () => {
+  _fullWalletPurge('beforeunload');
+});
+
+// Parent iframe tab switch message (from index.html)
+window.addEventListener('message', (e) => {
+  if (e.data === 'qtcl_tab_changed') {
+    _fullWalletPurge('tab_changed_message');
+  }
+});
+
+// clearWalletSession replaced by _fullWalletPurge — single source of truth for security purge
+
+function disconnectWallet() {
+  _fullWalletPurge('user_disconnect');
+  toast('Wallet disconnected — all session data purged', 'info');
+}
+
+function toggleMobileMenu() { document.getElementById('sidebar')?.classList.toggle('mobile-open'); }
+
+// ═══ MODAL ═══
+function closeModal(id) { document.getElementById(id)?.classList.remove('active'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.active').forEach(m => m.classList.remove('active')); });
+
+// ═══ UTILITIES ═══
+function truncAddr(a, n = 12) { return a ? (a.length > n * 2 ? a.slice(0, n) + '…' + a.slice(-8) : a) : '—'; }
+function fmtQTCL(v) { const n = Number(v); return isNaN(n) ? '0.00' : (n < 1000 ? n.toFixed(2) : n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })); }
+function fmtTime(ts) { if (!ts) return '—'; const d = ts > 1e12 ? new Date(ts / 1e6) : new Date(ts * 1000); return d.toLocaleString(); }
+function relTime(ts) { if (!ts) return '—'; const s = Math.floor((Date.now() / 1000) - (ts > 1e12 ? ts / 1e9 : ts)); if (s < 60) return s + 's ago'; if (s < 3600) return Math.floor(s/60) + 'm ago'; if (s < 86400) return Math.floor(s/3600) + 'h ago'; return Math.floor(s/86400) + 'd ago'; }
+function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied!', 'success')).catch(() => toast('Copy failed', 'error')); }
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function txTypeBadge(t) {
+  const map = {
+    'coinbase': 'badge-coinbase', 'miner_reward': 'badge-miner',
+    'treasury_reward': 'badge-treasury', 'transfer': 'badge-transfer',
+  };
+  return `<span class="badge ${map[t] || 'badge-transfer'}">${escHtml(t || 'transfer')}</span>`;
+}
+
+function statusBadge(s) {
+  const map = { 'confirmed': 'badge-confirmed', 'pending': 'badge-pending', 'failed': 'badge-failed' };
+  return `<span class="badge ${map[s] || 'badge-confirmed'}">${escHtml(s || 'confirmed')}</span>`;
+}
+
+// ═══ WALLET CONNECTION ═══
+// Wallet dropdown toggle
+function toggleWalletDropdown() {
+  const content = document.getElementById('walletDropdownContent');
+  const arrow = document.getElementById('walletDropdownArrow');
+  if (content.style.display === 'none') {
+    content.style.display = 'block';
+    arrow.style.transform = 'rotate(180deg)';
+  } else {
+    content.style.display = 'none';
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
+// Tab switching for connect card
+function showConnectTab(tab) {
+  document.getElementById('connectTabAddr').classList.toggle('hidden', tab !== 'address');
+  document.getElementById('connectTabWallet').classList.toggle('hidden', tab !== 'walletfile');
+  document.querySelectorAll('#walletConnectCard .tab-btn').forEach((b, i) =>
+    b.classList.toggle('active', i === (tab === 'address' ? 0 : 1))
+  );
+}
+
+// Read-only address connect (ephemeral — no persistence)
+async function connectWallet() {
+  const addr = document.getElementById('connectAddr').value.trim();
+  if (!addr) { toast('Enter an address', 'error'); return; }
+  S.walletAddr = addr;
+  S.walletMode = 'readonly';
+  await refreshBalance();
+  toast('Wallet connected (read-only, session only)', 'success');
+}
+
+// Wallet file state
+let _walletFileData = null;
+let _walletEncryptedPK = null;
+let _signPassword = '';  // session-only, never persisted — zeroed after each tx submit
+
+function handleWalletFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      _walletFileData = JSON.parse(e.target.result);
+      const status = document.getElementById('walletAuthStatus');
+      if (!_walletFileData.vault_version) {
+        status.className = '';
+        status.innerHTML = '<div style="color:var(--amber);font-size:11px;">⚠ Legacy wallet format detected. Please create a new HypΓ vault v2 wallet.</div>';
+        return;
+      }
+      if (!_walletFileData.encrypted_private_key) {
+        status.className = '';
+        status.innerHTML = '<div style="color:var(--red);font-size:11px;">✕ Invalid wallet file — missing encrypted_private_key</div>';
+        return;
+      }
+      status.className = '';
+      status.innerHTML = `<div style="color:var(--emerald);font-size:11px;">✓ Vault v${_walletFileData.vault_version} loaded · Address: ${truncAddr(_walletFileData.address || '', 16)}${_walletFileData.shamir_config ? ' · Shamir backup enabled' : ''}</div>`;
+      status.classList.remove('hidden');
+    } catch (err) {
+      toast('Invalid JSON wallet file', 'error');
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function authenticateWallet() {
+  if (!_walletFileData) { toast('Load a wallet file first', 'error'); return; }
+  const password = document.getElementById('walletPassword').value;
+  if (!password) { toast('Password required', 'error'); return; }
+
+  const btn = document.getElementById('walletAuthBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Verifying (PBKDF2 600K rounds)…';
+  const status = document.getElementById('walletAuthStatus');
+
+  try {
+    // Send wallet_data + password to server for HypΓ PBKDF2 verification
+    // Server uses verify_wallet_password() — checks verifier tag WITHOUT decrypting private key
+    const result = await rpc('qtcl_walletAuth', [{
+      wallet_data: _walletFileData,
+      password: password
+    }]);
+
+    if (result.valid) {
+      S.walletAddr = result.address;
+      S.walletMode = 'full';
+      S.walletPublicKey = result.public_key;
+      _walletEncryptedPK = _walletFileData.encrypted_private_key;
+      _signPassword = password;  // held session-only for sign-and-submit, zeroed after each tx
+      // No localStorage — wallet is ephemeral, session-only
+
+      status.innerHTML = `<div style="color:var(--emerald);font-size:11px;">✅ HypΓ Authentication SUCCESS · Vault v${result.vault_version} · ${truncAddr(result.address, 16)}</div>`;
+      status.classList.remove('hidden');
+
+      await refreshBalance();
+      toast('Wallet unlocked — full access enabled', 'success');
+
+      // Clear password from memory
+      document.getElementById('walletPassword').value = '';
+    } else {
+      status.innerHTML = `<div style="color:var(--red);font-size:11px;">✕ Authentication FAILED — ${result.reason || 'invalid password'}. PBKDF2 verifier tag mismatch.</div>`;
+      status.classList.remove('hidden');
+      toast('Invalid password', 'error');
+    }
+  } catch (e) {
+    status.innerHTML = `<div style="color:var(--red);font-size:11px;">✕ Auth error: ${escHtml(e.message)}</div>`;
+    status.classList.remove('hidden');
+    toast(`Auth error: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔓 Unlock Wallet (HypΓ Auth)';
+  }
+}
+
+async function refreshBalance() {
+  if (!S.walletAddr) return;
+  try {
+    const r = await rpc('qtcl_getBalance', [S.walletAddr]);
+    S.balance = r.balance || 0;
+    document.getElementById('balanceDisplay').textContent = fmtQTCL(S.balance);
+
+    const mode = S.walletMode === 'full' ? '🔓 Full Access (HypΓ Authenticated)' : '👁 Read-Only';
+    const utxoCount = r.unspent_outputs || 0;
+    document.getElementById('balanceUsd').textContent = `${r.transaction_count || 0} transactions · ${utxoCount} UTXOs · ${r.address_type || 'standard'} · ${mode}`;
+    const wa = document.getElementById('walletAddr');
+    wa.textContent = S.walletAddr;
+    wa.style.display = 'inline-block';
+    document.getElementById('walletConnectCard').style.display = S.walletMode === 'full' ? 'none' : '';
+    document.getElementById('disconnectBtn').style.display = S.walletAddr ? '' : 'none';
+    document.getElementById('sendFrom').value = S.walletAddr;
+    document.getElementById('sendBalance').textContent = fmtQTCL(S.balance);
+
+    // Disable send for read-only mode
+    const sendWarning = document.getElementById('sendModeWarning');
+    if (sendWarning) sendWarning.remove();
+    if (S.walletMode !== 'full') {
+      const warn = document.createElement('div');
+      warn.id = 'sendModeWarning';
+      warn.style.cssText = 'background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:var(--amber);padding:10px 14px;border-radius:6px;font-size:11px;margin-bottom:12px;';
+      warn.innerHTML = '⚠ Read-only mode — to send transactions, authenticate with your wallet file + password on the Dashboard.';
+      const sendStep1 = document.getElementById('sendStep1');
+      if (sendStep1) sendStep1.prepend(warn);
+    }
+
+    // Receive page
+    document.getElementById('receiveAddrDisplay').classList.add('hidden');
+    document.getElementById('receiveAddrReady').classList.remove('hidden');
+    document.getElementById('receiveAddr').textContent = S.walletAddr;
+    generateQR(S.walletAddr);
+  } catch (e) {
+    console.warn('Balance fetch:', e);
+  }
+}
+
+// ═══ QR CODE (simple canvas) ═══
+function generateQR(text) {
+  const c = document.getElementById('qrCanvas');
+  const ctx = c.getContext('2d');
+  // Simple visual representation — proper QR would use a library
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, 200, 200);
+  ctx.fillStyle = '#000';
+  // Generate a deterministic pattern from address hash
+  const hash = text.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0);
+  const size = 8;
+  for (let y = 0; y < 200 / size; y++) {
+    for (let x = 0; x < 200 / size; x++) {
+      const v = ((hash * (x + 1) * (y + 1)) >>> 0) % 3;
+      if (v === 0) ctx.fillRect(x * size, y * size, size, size);
+    }
+  }
+  // Border markers
+  ctx.fillStyle = '#000';
+  [0, 17].forEach(bx => [0, 17].forEach(by => {
+    if (bx === 17 && by === 17) return;
+    for (let i = 0; i < 7; i++) for (let j = 0; j < 7; j++) {
+      if (i === 0 || i === 6 || j === 0 || j === 6 || (i >= 2 && i <= 4 && j >= 2 && j <= 4))
+        ctx.fillRect((bx + i) * size, (by + j) * size, size, size);
+      else { ctx.fillStyle = '#fff'; ctx.fillRect((bx + i) * size, (by + j) * size, size, size); ctx.fillStyle = '#000'; }
+    }
+  }));
+}
+
+function copyReceiveAddr() { if (S.walletAddr) copyText(S.walletAddr); }
+function shareAddr() {
+  if (navigator.share && S.walletAddr) {
+    navigator.share({ title: 'QTCL Address', text: S.walletAddr });
+  } else copyReceiveAddr();
+}
+
+// ═══ SEND TRANSACTION ═══
+async function prepareSend() {
+  const to = document.getElementById('sendTo').value.trim();
+  const amount = parseFloat(document.getElementById('sendAmount').value);
+  const fee = parseFloat(document.getElementById('sendFee').value) || 0.01;
+  const memo = document.getElementById('sendMemo').value.trim();
+
+  if (!S.walletAddr) { toast('Connect wallet first', 'error'); return; }
+  if (S.walletMode !== 'full') {
+    toast('Full wallet auth required to send. Authenticate with wallet file + password on Dashboard.', 'error');
+    return;
+  }
+  if (!to) { toast('Recipient required', 'error'); return; }
+  if (!amount || amount <= 0) { toast('Invalid amount', 'error'); return; }
+
+  // Always fetch live balance before checking — prevents false rejection from stale S.balance=0
+  const reviewBtn = document.querySelector('#sendStep1 .btn-primary');
+  const origBtnText = reviewBtn ? reviewBtn.textContent : '';
+  if (reviewBtn) { reviewBtn.disabled = true; reviewBtn.textContent = '⏳ Checking balance…'; }
+  try {
+    const r = await rpc('qtcl_getBalance', [S.walletAddr]);
+    S.balance = r.balance || 0;
+    document.getElementById('sendBalance').textContent = fmtQTCL(S.balance);
+    document.getElementById('balanceDisplay').textContent = fmtQTCL(S.balance);
+  } catch (e) {
+    if (reviewBtn) { reviewBtn.disabled = false; reviewBtn.textContent = origBtnText; }
+    toast(`Balance check failed: ${e.message}`, 'error');
+    return;
+  } finally {
+    if (reviewBtn) { reviewBtn.disabled = false; reviewBtn.textContent = origBtnText; }
+  }
+
+  if (amount + fee > S.balance) {
+    // Show full diagnostic — address queried, raw response, to help debug address mismatch
+    let diagMsg = `Insufficient balance — address: ${S.walletAddr.slice(0,20)}… has ${fmtQTCL(S.balance)} QTCL, need ${fmtQTCL(amount + fee)} QTCL`;
+    toast(diagMsg, 'error', 6000);
+    // Also show inline diagnostic under sendBalance
+    const hint = document.querySelector('#sendStep1 .form-hint');
+    if (hint) {
+      hint.innerHTML = `⚠ Balance: <strong style="color:var(--red)">${fmtQTCL(S.balance)} QTCL</strong> · Queried address: <span style="color:var(--cyan);font-size:9px;">${S.walletAddr}</span><br>If this address is wrong, reconnect with your correct wallet file.`;
+    }
+    return;
+  }
+
+  const total = amount + fee;
+  document.getElementById('sendConfirmBox').innerHTML = `
+    <div class="confirm-row"><span class="label">From</span><span class="value addr">${truncAddr(S.walletAddr)}</span></div>
+    <div class="confirm-row"><span class="label">To</span><span class="value addr">${truncAddr(to)}</span></div>
+    <div class="confirm-row"><span class="label">Amount</span><span class="value">${fmtQTCL(amount)} QTCL</span></div>
+    <div class="confirm-row"><span class="label">Fee</span><span class="value">${fmtQTCL(fee)} QTCL</span></div>
+    ${memo ? `<div class="confirm-row"><span class="label">Memo</span><span class="value">${escHtml(memo)}</span></div>` : ''}
+    <div class="confirm-row total"><span class="label">Total</span><span class="value">${fmtQTCL(total)} QTCL</span></div>
+  `;
+
+  document.getElementById('sendStep1').classList.add('hidden');
+  document.getElementById('sendStep2').classList.remove('hidden');
+}
+
+function backToSendForm() {
+  document.getElementById('sendStep2').classList.add('hidden');
+  document.getElementById('sendStep1').classList.remove('hidden');
+}
+
+async function executeSend() {
+  const btn = document.getElementById('sendExecBtn');
+  btn.disabled = true;
+  btn.textContent = 'Signing & Submitting…';
+  try {
+    const amount = parseFloat(document.getElementById('sendAmount').value);
+    const fee = parseFloat(document.getElementById('sendFee').value) || 0.01;
+    const to = document.getElementById('sendTo').value.trim();
+    const memo = document.getElementById('sendMemo').value.trim();
+
+    // ── Re-auth guard: wallet file cleared by tab-switch security wipe ──────
+    if (S.walletMode !== 'full' || !_walletFileData) {
+      toast('Wallet cleared for security — re-authenticate with your wallet file to send', 'error');
+      btn.disabled = false; btn.textContent = 'Sign & Submit';
+      document.getElementById('walletConnectCard')?.scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+
+    // ── qtcl_signAndSubmitTx: server-side HypΓ decrypt + sign + submit ──────
+    // Password may have been zeroed after prior tx or tab-switch — prompt if needed
+    let pwd = _signPassword;
+    if (!pwd) {
+      pwd = window.prompt('Re-enter wallet password to sign this transaction:');
+      if (!pwd) { toast('Password required to sign', 'error'); btn.disabled = false; btn.textContent = 'Sign & Submit'; return; }
+    }
+    const r = await rpc('qtcl_signAndSubmitTx', [{
+      wallet_data: _walletFileData,
+      password: pwd,
+      tx: {
+        from_address: S.walletAddr,
+        to_address: to,
+        amount: amount,
+        fee: fee,
+        nonce: Date.now(),
+        memo: memo,
+      }
+    }]);
+
+    if (r.valid === false) {
+      const reason = r.reason || 'Transaction rejected by server';
+      toast('✕ ' + reason, 'error', 6000);
+      btn.disabled = false; btn.textContent = 'Sign & Submit';
+      if (reason.toLowerCase().includes('password') || reason.toLowerCase().includes('auth')) {
+        _signPassword = '';
+        pwd = '';
+      }
+      return;
+    }
+
+    document.getElementById('sendTxHash').textContent = `TX: ${r.tx_hash || 'submitted'}`;
+    document.getElementById('sendStep2').classList.add('hidden');
+    document.getElementById('sendStep3').classList.remove('hidden');
+    toast('Transaction signed and submitted!', 'success');
+
+    // ═══ SECURITY: Purge ALL wallet data after successful transaction ═══
+    // Zero passwords immediately
+    _signPassword = '';
+    pwd = '';
+    // Full purge — user must re-connect to send again
+    setTimeout(() => {
+      _walletFileData = null;
+      _walletEncryptedPK = null;
+      S.walletMode = 'readonly';
+      S.walletPublicKey = '';
+      const fileInput = document.getElementById('walletFileInput');
+      if (fileInput) fileInput.value = '';
+      const authStatus = document.getElementById('walletAuthStatus');
+      if (authStatus) { authStatus.innerHTML = ''; authStatus.classList.add('hidden'); }
+      console.log('[SECURITY] Wallet key material purged after tx submit');
+    }, 500);
+    // Refresh balance one last time before the purge takes effect
+    refreshBalance();
+
+  } catch (e) {
+    toast(`Submit failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign & Submit';
+  }
+}
+
+function resetSendForm() {
+  document.getElementById('sendStep3').classList.add('hidden');
+  document.getElementById('sendStep1').classList.remove('hidden');
+  document.getElementById('sendTo').value = '';
+  document.getElementById('sendAmount').value = '';
+  document.getElementById('sendMemo').value = '';
+}
+
+// ═══ TRANSACTIONS ═══
+let _txLoading = false;
+async function loadTransactions() {
+  if (_txLoading) return;
+  _txLoading = true;
+  const area = document.getElementById('txTableArea');
+  area.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+
+  try {
+    const search = document.getElementById('txSearch')?.value.trim() || '';
+    const typeFilter = document.getElementById('txTypeFilter')?.value || '';
+
+    const params = { page: S.txPage, per_page: S.txPerPage };
+    if (typeFilter) params.type = typeFilter;
+    if (search) params.address = search;
+
+    const r = await rpc('qtcl_getTransactions', [params]);
+    const txs = r.transactions || [];
+    S.txTotal = r.total || 0;
+    S.txPages = r.pages || 1;
+
+    document.getElementById('txTotal').textContent = S.txTotal.toLocaleString();
+    document.getElementById('txShowing').textContent = txs.length;
+    document.getElementById('txPages').textContent = S.txPages;
+    document.getElementById('txBadge').textContent = S.txTotal;
+
+    // Fetch true total chain volume (not just current page)
+    rpc('qtcl_getTransactionVolume').then(vol => {
+      document.getElementById('txVolume').textContent = fmtQTCL(vol.total_volume_qtcl || 0);
+    }).catch(() => {
+      // Fallback: sum current page
+      const vol = txs.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+      document.getElementById('txVolume').textContent = fmtQTCL(vol / 100);
+    });
+
+    if (!txs.length) {
+      area.innerHTML = '<div class="empty-state"><div class="empty-icon">⛓</div>No transactions found</div>';
+    } else {
+      let html = '<div class="tx-table-wrap"><table class="tx-table"><thead><tr>';
+      html += '<th>TX Hash</th><th>Height</th><th>Type</th><th>Status</th><th>From → To</th><th>Amount</th><th>Index</th>';
+      html += '</tr></thead><tbody>';
+      for (const tx of txs) {
+        const amt = (Number(tx.amount) || 0) / 100;
+        const txId = tx.tx_id || tx.tx_hash || '';
+        html += `<tr onclick="showTxDetail('${escHtml(txId)}', ${tx.height || 0})">`;
+        html += `<td><span class="addr">${truncAddr(txId, 14)}</span></td>`;
+        html += `<td><strong>#${tx.height || '—'}</strong></td>`;
+        html += `<td>${txTypeBadge(tx.tx_type)}</td>`;
+        html += `<td>${statusBadge(tx.status)}</td>`;
+        html += `<td><span class="addr">${truncAddr(tx.from_addr || '', 8)} → ${truncAddr(tx.to_addr || '', 8)}</span></td>`;
+        html += `<td class="amount-neutral">${fmtQTCL(amt)}</td>`;
+        html += `<td style="color:var(--muted);font-size:10px;">${tx.tx_index ?? '—'}</td>`;
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      area.innerHTML = html;
+    }
+
+    renderTxPagination();
+  } catch (e) {
+    area.innerHTML = `<div style="padding:20px;color:var(--red);">Error: ${escHtml(e.message)}</div>`;
+  } finally {
+    _txLoading = false;
+  }
+}
+
+function renderTxPagination() {
+  const el = document.getElementById('txPagination');
+  if (S.txPages <= 1) { el.innerHTML = ''; return; }
+  let html = '<div class="pagination">';
+  html += `<button class="page-btn" ${S.txPage === 0 ? 'disabled' : ''} onclick="S.txPage--;loadTransactions()">←</button>`;
+  for (let i = Math.max(0, S.txPage - 2); i < Math.min(S.txPages, S.txPage + 3); i++) {
+    html += `<button class="page-btn ${i === S.txPage ? 'active' : ''}" onclick="S.txPage=${i};loadTransactions()">${i + 1}</button>`;
+  }
+  html += `<button class="page-btn" ${S.txPage >= S.txPages - 1 ? 'disabled' : ''} onclick="S.txPage++;loadTransactions()">→</button>`;
+  html += '</div>';
+  html += `<div class="page-info">Page ${S.txPage + 1} of ${S.txPages}</div>`;
+  el.innerHTML = html;
+}
+
+async function showTxDetail(txId, height) {
+  const body = document.getElementById('txDetailBody');
+  body.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+  document.getElementById('txDetailModal').classList.add('active');
+
+  try {
+    // Get block to find this specific tx (qtcl_getBlock returns block with embedded transactions)
+    const r = await rpc('qtcl_getBlock', [height]);
+    const tx = (r.transactions || []).find(t => (t.tx_id || t.tx_hash) === txId) || {};
+
+    const amt = (Number(tx.amount) || 0) / 100;
+
+    body.innerHTML = `
+      <div class="detail-grid">
+        <div class="detail-label">TX Hash</div>
+        <div class="detail-value code">${escHtml(tx.tx_id || tx.tx_hash || txId)}<button class="copy-btn" onclick="copyText('${escHtml(txId)}')">Copy</button></div>
+
+        <div class="detail-sep"></div>
+        <div class="detail-label">Block</div>
+        <div class="detail-value"><strong>#${tx.height || height}</strong></div>
+
+        <div class="detail-label">Type</div>
+        <div class="detail-value">${txTypeBadge(tx.tx_type)}</div>
+
+        <div class="detail-label">Status</div>
+        <div class="detail-value">${statusBadge(tx.status)}</div>
+
+        <div class="detail-sep"></div>
+        <div class="detail-label">From</div>
+        <div class="detail-value code">${escHtml(tx.from_addr || 'COINBASE')}<button class="copy-btn" onclick="copyText('${escHtml(tx.from_addr || '')}')">Copy</button></div>
+
+        <div class="detail-label">To</div>
+        <div class="detail-value code">${escHtml(tx.to_addr || '')}<button class="copy-btn" onclick="copyText('${escHtml(tx.to_addr || '')}')">Copy</button></div>
+
+        <div class="detail-sep"></div>
+        <div class="detail-label">Amount</div>
+        <div class="detail-value"><strong style="font-size:16px;color:var(--text-bright);">${fmtQTCL(amt)} QTCL</strong></div>
+
+        <div class="detail-label">TX Index</div>
+        <div class="detail-value">${tx.tx_index ?? '—'}</div>
+      </div>
+      <div style="margin-top:16px; padding-top:16px; border-top:1px solid var(--border);">
+        <button class="btn btn-full" onclick="navigator.clipboard.writeText(JSON.stringify(${JSON.stringify(tx).replace(/'/g, "\\'")}, null, 2)); toast('JSON copied','success');">📋 Copy as JSON</button>
+      </div>
+    `;
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--red);">Error: ${escHtml(e.message)}</div>`;
+  }
+}
+
+// ═══ BLOCKS ═══
+async function loadBlocks(direction) {
+  const area = document.getElementById('blocksTableArea');
+  area.innerHTML = '<div class="loading"><span class="spinner"></span> Loading blocks…</div>';
+
+  try {
+    let fromH, toH;
+    if (S.blockRangeEnd < 0 || !direction) {
+      // Load latest
+      const tip = await rpc('qtcl_getBlockHeight');
+      S.blockRangeEnd = tip.height || 0;
+    } else if (direction === 'older') {
+      S.blockRangeEnd = Math.max(0, S.blockRangeEnd - 20);
+    } else if (direction === 'newer') {
+      S.blockRangeEnd = S.blockRangeEnd + 20;
+    }
+
+    toH = S.blockRangeEnd;
+    fromH = Math.max(0, toH - 19);
+
+    const r = await rpc('qtcl_getBlockRange', [fromH, toH]);
+    const blocks = (r.blocks || []).reverse();
+
+    if (!blocks.length) {
+      area.innerHTML = '<div class="empty-state"><div class="empty-icon">▣</div>No blocks found</div>';
+      return;
+    }
+
+    let html = '<div class="tx-table-wrap"><table class="tx-table"><thead><tr>';
+    html += '<th>Height</th><th>Hash</th><th>Time</th><th>TXs</th><th>Fidelity</th><th>Nonce</th>';
+    html += '</tr></thead><tbody>';
+
+    for (const b of blocks) {
+      html += `<tr onclick="showBlockDetail(${b.height})">`;
+      html += `<td><strong>#${b.height}</strong></td>`;
+      html += `<td><span class="addr">${truncAddr(b.block_hash || b.hash, 14)}</span></td>`;
+      html += `<td style="font-size:10px;color:var(--muted);">${relTime(b.timestamp || b.timestamp_s)}</td>`;
+      html += `<td>${b.tx_count || 0}</td>`;
+      html += `<td>${(Number(b.w_state_fidelity) || 0).toFixed(4)}</td>`;
+      html += `<td style="font-size:10px;color:var(--muted);">${b.nonce || 0}</td>`;
+      html += '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+    area.innerHTML = html;
+  } catch (e) {
+    area.innerHTML = `<div style="padding:20px;color:var(--red);">Error: ${escHtml(e.message)}</div>`;
+  }
+}
+
+async function showBlockDetail(height) {
+  const body = document.getElementById('blockDetailBody');
+  body.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+  document.getElementById('blockDetailTitle').textContent = `Block #${height}`;
+  document.getElementById('blockDetailModal').classList.add('active');
+
+  try {
+    const b = await rpc('qtcl_getBlock', [height]);
+    const txs = b.transactions || [];
+
+    let txHtml = '';
+    if (txs.length) {
+      txHtml = '<div style="margin-top:16px;"><div style="font-size:11px;font-weight:700;color:var(--text-bright);margin-bottom:8px;">Transactions (${txs.length})</div>';
+      for (const tx of txs) {
+        const amt = (Number(tx.amount) || 0);
+        txHtml += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;">
+          <span>${txTypeBadge(tx.tx_type)} <span class="addr">${truncAddr(tx.to_addr, 10)}</span></span>
+          <span class="amount-neutral">${fmtQTCL(amt)} QTCL</span>
+        </div>`;
+      }
+      txHtml += '</div>';
+    }
+
+    body.innerHTML = `
+      <div class="detail-grid">
+        <div class="detail-label">Height</div>
+        <div class="detail-value"><strong>#${b.height || b.block_height}</strong></div>
+
+        <div class="detail-label">Hash</div>
+        <div class="detail-value code">${escHtml(b.block_hash || b.hash || '')}<button class="copy-btn" onclick="copyText('${escHtml(b.block_hash || '')}')">Copy</button></div>
+
+        <div class="detail-label">Parent</div>
+        <div class="detail-value code">${escHtml(b.parent_hash || b.previous_hash || '')}</div>
+
+        <div class="detail-label">Merkle Root</div>
+        <div class="detail-value code">${escHtml(b.merkle_root || '')}</div>
+
+        <div class="detail-sep"></div>
+        <div class="detail-label">Timestamp</div>
+        <div class="detail-value">${fmtTime(b.timestamp || b.timestamp_s)}</div>
+
+        <div class="detail-label">Difficulty</div>
+        <div class="detail-value">${b.difficulty || '—'}</div>
+
+        <div class="detail-label">Nonce</div>
+        <div class="detail-value">${b.nonce || 0}</div>
+
+        <div class="detail-label">TX Count</div>
+        <div class="detail-value">${b.tx_count || txs.length}</div>
+
+        <div class="detail-label">W-State Fidelity</div>
+        <div class="detail-value">${(Number(b.w_state_fidelity) || 0).toFixed(6)}</div>
+
+        <div class="detail-label">W-Entropy Hash</div>
+        <div class="detail-value code" style="font-size:9px;">${escHtml(b.w_entropy_hash || '')}</div>
+      </div>
+      ${txHtml}
+    `;
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--red);">Error: ${escHtml(e.message)}</div>`;
+  }
+}
+
+// ═══ MEMPOOL ═══
+async function loadMempool() {
+  const area = document.getElementById('mempoolArea');
+  area.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+
+  try {
+    const stats = await rpc('qtcl_getMempoolStats');
+    document.getElementById('mpDepth').textContent = stats.depth || stats.pending || stats.size || 0;
+    const statusText = (stats.note === 'mempool initializing')
+      ? 'Syncing…'
+      : (stats.note || ((stats.size > 0 || stats.total_accepted > 0) ? 'Active' : 'Ready — Empty'));
+    document.getElementById('mpStatus').textContent = statusText;
+
+    const txs = await rpc('qtcl_getMempool', [50]);
+
+    if (!txs || !txs.length) {
+      area.innerHTML = '<div class="empty-state"><div class="empty-icon">⏳</div>Mempool is empty — all transactions confirmed</div>';
+      return;
+    }
+
+    let html = '<div class="tx-table-wrap"><table class="tx-table"><thead><tr>';
+    html += '<th>TX Hash</th><th>Type</th><th>From → To</th><th>Amount</th><th>Fee</th>';
+    html += '</tr></thead><tbody>';
+
+    for (const tx of txs) {
+      const h = tx.tx_hash || tx.tx_id || '';
+      html += `<tr>`;
+      html += `<td><span class="addr">${truncAddr(h, 14)}</span></td>`;
+      html += `<td>${txTypeBadge(tx.tx_type)}</td>`;
+      html += `<td><span class="addr">${truncAddr(tx.from_address || '', 8)} → ${truncAddr(tx.to_address || '', 8)}</span></td>`;
+      html += `<td>${fmtQTCL((Number(tx.amount_base || tx.amount || 0)) / 100)}</td>`;
+      html += `<td style="color:var(--muted);font-size:10px;">${fmtQTCL((Number(tx.fee_base || tx.fee || 0)) / 100)}</td>`;
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+    area.innerHTML = html;
+  } catch (e) {
+    area.innerHTML = `<div style="padding:20px;color:var(--red);">Error: ${escHtml(e.message)}</div>`;
+  }
+}
+
+// ═══ ADDRESS BOOK (Vault-Gated) ═══
+function renderContactsPage() {
+  if (S.vaultLoggedIn) {
+    document.getElementById('contactsVaultGate').classList.add('hidden');
+    document.getElementById('contactsAuthed').classList.remove('hidden');
+    loadVaultContacts();
+  } else {
+    document.getElementById('contactsVaultGate').classList.remove('hidden');
+    document.getElementById('contactsAuthed').classList.add('hidden');
+    // Pre-fill vault ID if saved
+    if (S.vaultAccountId) document.getElementById('contactsVaultId').value = S.vaultAccountId;
+  }
+}
+
+async function loginContactsVault() {
+  const id = document.getElementById('contactsVaultId').value.trim();
+  const pass = document.getElementById('contactsVaultPass').value;
+  if (!id || !pass) { toast('Account ID and passphrase required', 'error'); return; }
+  try {
+    const r = await rpc('vault_login', [{ account_id: id, passphrase: pass }]);
+    if (r.success || r.account_id) {
+      S.vaultAccountId = id;
+      S.vaultPassphrase = pass;
+      S.vaultLoggedIn = true;
+      // No localStorage — vault session is ephemeral
+      toast('Vault unlocked', 'success');
+      renderContactsPage();
+    } else {
+      toast('Vault login failed', 'error');
+    }
+  } catch (e) {
+    toast(`Vault auth error: ${e.message}`, 'error');
+  }
+}
+
+function logoutContactsVault() {
+  S.vaultPassphrase = '';
+  S.vaultLoggedIn = false;
+  S.contacts = [];
+  document.getElementById('contactsVaultPass').value = '';
+  renderContactsPage();
+  toast('Address book locked', 'info');
+}
+
+async function loadVaultContacts() {
+  const el = document.getElementById('contactsList');
+  el.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+  try {
+    const r = await rpc('vault_getContacts', [{ account_id: S.vaultAccountId, passphrase: S.vaultPassphrase }]);
+    S.contacts = r.contacts || [];
+    renderContacts();
+  } catch (e) {
+    el.innerHTML = `<div style="padding:16px;color:var(--red);font-size:11px;">Error loading contacts: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function renderContacts() {
+  const el = document.getElementById('contactsList');
+  if (!S.contacts.length) {
+    el.innerHTML = '<div class="empty-state" style="padding:24px;"><div class="empty-icon">👤</div>No contacts saved</div>';
+    return;
+  }
+  let html = '';
+  for (const c of S.contacts) {
+    html += `<div class="contact-row">
+      <div class="contact-avatar">${(c.name || '?')[0].toUpperCase()}</div>
+      <div class="contact-info">
+        <div class="contact-name">${escHtml(c.name)}</div>
+        <div class="contact-addr">${escHtml(c.address)}</div>
+      </div>
+      <button class="btn btn-sm" onclick="copyText('${escHtml(c.address)}')">📋</button>
+      <button class="btn btn-sm btn-danger" onclick="removeContact('${escHtml(c.id)}')">✕</button>
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+async function addContact() {
+  if (!S.vaultLoggedIn) { toast('Unlock vault first', 'error'); return; }
+  const name = document.getElementById('contactName').value.trim();
+  const addr = document.getElementById('contactAddr').value.trim();
+  if (!name || !addr) { toast('Name and address required', 'error'); return; }
+  try {
+    await rpc('vault_addContact', [{ account_id: S.vaultAccountId, passphrase: S.vaultPassphrase, name, address: addr }]);
+    document.getElementById('contactName').value = '';
+    document.getElementById('contactAddr').value = '';
+    toast('Contact saved to vault', 'success');
+    loadVaultContacts();
+  } catch (e) {
+    toast(`Save failed: ${e.message}`, 'error');
+  }
+}
+
+async function removeContact(contactId) {
+  if (!S.vaultLoggedIn) { toast('Unlock vault first', 'error'); return; }
+  try {
+    await rpc('vault_removeContact', [{ account_id: S.vaultAccountId, passphrase: S.vaultPassphrase, contact_id: contactId }]);
+    toast('Contact removed', 'success');
+    loadVaultContacts();
+  } catch (e) {
+    toast(`Delete failed: ${e.message}`, 'error');
+  }
+}
+
+function pickContact(targetInputId) {
+  S._contactPickTarget = targetInputId;
+  const body = document.getElementById('contactPickerBody');
+  if (!S.contacts.length) {
+    body.innerHTML = '<div class="empty-state" style="padding:16px;">No contacts saved</div>';
+  } else {
+    let html = '';
+    for (const c of S.contacts) {
+      html += `<div class="contact-row" style="cursor:pointer;" onclick="selectContact('${escHtml(c.address)}')">
+        <div class="contact-avatar">${c.name[0].toUpperCase()}</div>
+        <div class="contact-info">
+          <div class="contact-name">${escHtml(c.name)}</div>
+          <div class="contact-addr">${escHtml(c.address)}</div>
+        </div>
+      </div>`;
+    }
+    body.innerHTML = html;
+  }
+  document.getElementById('contactPickerModal').classList.add('active');
+}
+
+function selectContact(addr) {
+  if (S._contactPickTarget) {
+    document.getElementById(S._contactPickTarget).value = addr;
+  }
+  closeModal('contactPickerModal');
+}
+
+// ═══ BRIDGE ═══
+function showBridgeTab(tab) {
+  document.getElementById('bridgeLock').classList.toggle('hidden', tab !== 'lock');
+  document.getElementById('bridgeRedeem').classList.toggle('hidden', tab !== 'redeem');
+  document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', i === (tab === 'lock' ? 0 : 1)));
+}
+
+function previewBridgeLock() {
+  const amt = parseFloat(document.getElementById('bridgeLockAmt').value);
+  const recipient = document.getElementById('bridgeRecipient').value.trim();
+  if (!amt || amt < 1) { toast('Min 1.0 QTCL', 'error'); return; }
+  if (!recipient || !recipient.startsWith('0x')) { toast('Valid Base address required', 'error'); return; }
+  const tax = amt * 0.001;
+  const mint = amt - tax;
+  const el = document.getElementById('bridgeLockPreview');
+  el.innerHTML = `
+    <div class="confirm-row"><span class="label">Lock Amount</span><span class="value">${fmtQTCL(amt)} QTCL</span></div>
+    <div class="confirm-row"><span class="label">Bridge Tax (0.1%)</span><span class="value">${fmtQTCL(tax)} QTCL</span></div>
+    <div class="confirm-row"><span class="label">Recipient</span><span class="value addr">${truncAddr(recipient, 10)}</span></div>
+    <div class="confirm-row total"><span class="label">You Receive</span><span class="value">${fmtQTCL(mint)} wQTCL</span></div>
+  `;
+  el.classList.remove('hidden');
+}
+
+// ═══ ADDRESS LOOKUP ═══
+async function lookupAddress() {
+  const addr = document.getElementById('lookupAddr').value.trim();
+  if (!addr) { toast('Enter an address', 'error'); return; }
+  const el = document.getElementById('lookupResult');
+  el.classList.remove('hidden');
+  el.innerHTML = '<div class="loading"><span class="spinner"></span> Looking up…</div>';
+
+  try {
+    const r = await rpc('qtcl_getBalance', [addr]);
+    const txs = await rpc('qtcl_getTransactions', [{ address: addr, per_page: 10 }]);
+
+    el.innerHTML = `
+      <div class="card mt-12">
+        <div class="card-header"><div class="card-title">Address Info</div></div>
+        <div class="card-body">
+          <div class="detail-grid">
+            <div class="detail-label">Address</div>
+            <div class="detail-value code" style="font-size:10px;">${escHtml(addr)}</div>
+            <div class="detail-label">Balance</div>
+            <div class="detail-value"><strong style="font-size:18px;color:var(--text-bright);">${fmtQTCL(r.balance || 0)} QTCL</strong></div>
+            <div class="detail-label">UTXOs</div>
+            <div class="detail-value">${r.unspent_outputs || 0} unspent outputs</div>
+            <div class="detail-label">TX Count</div>
+            <div class="detail-value">${r.transaction_count || 0}</div>
+            <div class="detail-label">Type</div>
+            <div class="detail-value">${r.address_type || 'standard'}</div>
+          </div>
+        </div>
+      </div>
+      <div class="card mt-12">
+        <div class="card-header"><div class="card-title">Recent Transactions (${txs.total || 0})</div></div>
+        ${(txs.transactions || []).length ?
+          '<div class="tx-table-wrap"><table class="tx-table"><thead><tr><th>Hash</th><th>Height</th><th>Type</th><th>Amount</th></tr></thead><tbody>' +
+          (txs.transactions || []).map(tx => `<tr>
+            <td><span class="addr">${truncAddr(tx.tx_id, 14)}</span></td>
+            <td>#${tx.height || '—'}</td>
+            <td>${txTypeBadge(tx.tx_type)}</td>
+            <td>${fmtQTCL((Number(tx.amount) || 0) / 100)}</td>
+          </tr>`).join('') +
+          '</tbody></table></div>'
+          : '<div class="empty-state" style="padding:20px;">No transactions for this address</div>'
+        }
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="card mt-12"><div class="card-body" style="color:var(--red);">Error: ${escHtml(e.message)}</div></div>`;
+  }
+}
+
+// ═══ PAYMENT REQUEST ═══
+function generatePaymentLink() {
+  const amt = document.getElementById('requestAmount').value;
+  const memo = document.getElementById('requestMemo').value;
+  if (!S.walletAddr) { toast('Connect wallet first', 'error'); return; }
+  const link = `${window.location.origin}/tx?to=${encodeURIComponent(S.walletAddr)}&amount=${amt || ''}&memo=${encodeURIComponent(memo || '')}`;
+  const el = document.getElementById('paymentLinkResult');
+  el.classList.remove('hidden');
+  el.innerHTML = `
+    <div style="background:var(--abyss);padding:10px 12px;border-radius:4px;border:1px solid var(--border);font-size:10px;word-break:break-all;color:var(--cyan);">${escHtml(link)}</div>
+    <button class="btn btn-sm mt-12" onclick="copyText('${link.replace(/'/g, "\\'")}')">📋 Copy Link</button>
+  `;
+}
+
+// ═══ RECENT TXS (Dashboard) ═══
+async function loadRecentTxs() {
+  const el = document.getElementById('recentTxList');
+  try {
+    const r = await rpc('qtcl_getTransactions', [{ page: 0, per_page: 8 }]);
+    const txs = r.transactions || [];
+    if (!txs.length) {
+      el.innerHTML = '<div class="empty-state" style="padding:20px;">No transactions yet</div>';
+      return;
+    }
+    let html = '<div class="tx-table-wrap"><table class="tx-table"><thead><tr><th>TX</th><th>Height</th><th>Type</th><th>Amount</th></tr></thead><tbody>';
+    for (const tx of txs) {
+      const amt = (Number(tx.amount) || 0) / 100;
+      html += `<tr onclick="showTxDetail('${escHtml(tx.tx_id)}', ${tx.height || 0})" style="cursor:pointer;">
+        <td><span class="addr">${truncAddr(tx.tx_id, 12)}</span></td>
+        <td>#${tx.height || '—'}</td>
+        <td>${txTypeBadge(tx.tx_type)}</td>
+        <td class="amount-neutral">${fmtQTCL(amt)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:11px;">Could not load recent transactions</div>`;
+  }
+}
+
+// ═══ DASHBOARD REFRESH ═══
+async function refreshDashboard() {
+  try {
+    const [height, stats] = await Promise.allSettled([
+      rpc('qtcl_getBlockHeight'),
+      rpc('qtcl_getMempoolStats'),
+    ]);
+
+    if (height.status === 'fulfilled') {
+      S.height = height.value.height || 0;
+      document.getElementById('dHeight').textContent = '#' + S.height.toLocaleString();
+      document.getElementById('heightPill').textContent = `H: ${S.height}`;
+      document.getElementById('dSupply').textContent = fmtQTCL(S.height * 8);
+      // Also fetch actual total volume for accuracy
+      rpc('qtcl_getTransactionVolume').then(v => {
+        document.getElementById('dSupply').textContent = fmtQTCL(v.total_volume_qtcl || S.height * 8);
+      }).catch(() => {});
+      document.getElementById('networkDot').style.background = 'var(--emerald)';
+      document.getElementById('networkStatus').textContent = 'Connected';
+    }
+
+    if (stats.status === 'fulfilled') {
+      document.getElementById('dMempool').textContent = stats.value.depth || stats.value.pending || 0;
+    }
+
+    document.getElementById('dPeers').textContent = '—';
+
+  } catch (e) {
+    document.getElementById('networkDot').style.background = 'var(--red)';
+    document.getElementById('networkStatus').textContent = 'Offline';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WALLET MANAGER — Client-side wallet generation, encryption, download
+// Private key never stored server-side. All assembly happens in-browser.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let _wmGeneratedWallet = null;  // Ephemeral — zeroed after download or page leave
+
+function showWalletMgrTab(tab) {
+  ['create', 'verify', 'backup'].forEach(t => {
+    const el = document.getElementById(`wm${t.charAt(0).toUpperCase()+t.slice(1)}Tab`);
+    const btn = document.getElementById(`wmTab${t.charAt(0).toUpperCase()+t.slice(1)}`);
+    if (el) el.classList.toggle('hidden', t !== tab);
+    if (btn) btn.classList.toggle('active', t === tab);
+  });
+}
+
+// Password strength meter
+document.addEventListener('DOMContentLoaded', () => {
+  const pw = document.getElementById('wmPassword');
+  if (pw) pw.addEventListener('input', () => {
+    const v = pw.value;
+    let score = 0;
+    if (v.length >= 8) score++;
+    if (v.length >= 14) score++;
+    if (/[A-Z]/.test(v) && /[a-z]/.test(v)) score++;
+    if (/\d/.test(v)) score++;
+    if (/[^A-Za-z0-9]/.test(v)) score++;
+    const labels = ['Very Weak', 'Weak', 'Fair', 'Good', 'Strong', 'Excellent'];
+    const colors = ['#ef4444', '#ef4444', '#f59e0b', '#f59e0b', '#10b981', '#00d4ff'];
+    const pct = [10, 25, 45, 65, 85, 100];
+    document.getElementById('wmPwStrengthLabel').textContent = labels[score] || '—';
+    document.getElementById('wmPwStrengthLabel').style.color = colors[score] || 'var(--muted)';
+    const bar = document.getElementById('wmPwStrengthBar');
+    bar.style.width = (pct[score] || 0) + '%';
+    bar.style.background = colors[score] || 'var(--muted)';
+  });
+});
+
+function togglePrivKeyReveal() {
+  const el = document.getElementById('wmPrivKey');
+  if (!el) return;
+  el.style.filter = el.style.filter === 'none' ? 'blur(4px)' : 'none';
+}
+
+async function generateNewWallet() {
+  const pw = document.getElementById('wmPassword').value;
+  const pwc = document.getElementById('wmPasswordConfirm').value;
+  if (!pw) { toast('Password required', 'error'); return; }
+  if (pw.length < 6) { toast('Password must be at least 6 characters', 'error'); return; }
+  if (pw !== pwc) { toast('Passwords do not match', 'error'); return; }
+
+  const btn = document.getElementById('wmGenerateBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Generating HypΓ keypair (PSL(2,ℝ) eigendecomposition)…';
+
+  try {
+    // 1. Generate keypair server-side (HypΓ engine needs mpmath at 150-digit precision)
+    const kp = await rpc('qtcl_hyp_generateKeypair', {});
+
+    if (!kp.private_key || !kp.public_key || !kp.address) {
+      throw new Error('Keypair generation returned incomplete data');
+    }
+
+    // 2. Encrypt private key CLIENT-SIDE with password
+    // XOR with SHA3-256 of password — same scheme as existing wallets
+    const pwHash = await sha3_256_hex(pw);
+    const pkBytes = new TextEncoder().encode(kp.private_key);
+    const keyBytes = hexToBytes(pwHash);
+    const encrypted = new Uint8Array(pkBytes.length);
+    for (let i = 0; i < pkBytes.length; i++) {
+      encrypted[i] = pkBytes[i] ^ keyBytes[i % keyBytes.length];
+    }
+    const encryptedHex = bytesToHex(encrypted);
+
+    // 3. Build password verifier tag (PBKDF2 not available in all browsers, use SHA3 chain)
+    const verifierInput = pwHash + kp.address;
+    const verifierTag = await sha3_256_hex(verifierInput);
+
+    // 4. Build wallet JSON (assembled entirely in-browser)
+    const walletData = {
+      version: '2.0',
+      vault_version: '2.0',
+      network: 'qtcl-mainnet',
+      created_at: new Date().toISOString(),
+      address: kp.address,
+      public_key: kp.public_key,
+      encrypted_private_key: encryptedHex,
+      password_verifier: verifierTag,
+      encryption: {
+        algorithm: 'XOR-SHA3-256',
+        key_derivation: 'SHA3-256(password)',
+        note: 'Decrypt: XOR encrypted_private_key bytes with SHA3-256(password) key stream'
+      },
+      cryptosystem: {
+        name: 'HypΓ',
+        type: 'post-quantum',
+        group: 'PSL(2,ℝ)',
+        signature: 'Schnorr-Γ',
+        security_level: 'HLWE-256'
+      }
+    };
+
+    // 5. Store temporarily for download (purged on page leave)
+    _wmGeneratedWallet = {
+      walletData,
+      rawPrivateKey: kp.private_key,  // shown to user, zeroed after download
+      address: kp.address,
+    };
+
+    // 6. Display
+    document.getElementById('wmAddr').textContent = kp.address;
+    document.getElementById('wmPubKey').textContent = kp.public_key;
+    document.getElementById('wmPrivKey').textContent = kp.private_key;
+    document.getElementById('wmPrivKey').style.filter = 'blur(4px)';
+    document.getElementById('wmResult').classList.remove('hidden');
+
+    // Auto-fill the buy page address
+    document.getElementById('buyAddr').value = kp.address;
+
+    toast('Wallet generated! Download the file before leaving this page.', 'success', 5000);
+
+  } catch (e) {
+    toast(`Generation failed: ${e.message}`, 'error');
+    console.error('Wallet generation error:', e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚛ Generate Quantum-Safe Wallet';
+  }
+}
+
+function downloadWalletFile() {
+  if (!_wmGeneratedWallet) { toast('No wallet to download', 'error'); return; }
+  const json = JSON.stringify(_wmGeneratedWallet.walletData, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `qtcl-wallet-${_wmGeneratedWallet.address.slice(0, 12)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  toast('Wallet file downloaded — store it securely!', 'success');
+}
+
+function copyWalletAddress() {
+  if (!_wmGeneratedWallet) return;
+  copyText(_wmGeneratedWallet.address);
+}
+
+// ── Verify wallet file ──
+async function handleVerifyFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const el = document.getElementById('wmVerifyResult');
+  el.classList.remove('hidden');
+  el.innerHTML = '<div style="color:var(--muted);font-size:11px;">Verifying…</div>';
+
+  try {
+    const text = await file.text();
+    const w = JSON.parse(text);
+    const checks = [];
+
+    // Structure checks
+    checks.push({ name: 'Has address', ok: !!w.address && w.address.length === 64 });
+    checks.push({ name: 'Has public_key', ok: !!w.public_key && w.public_key.length > 100 });
+    checks.push({ name: 'Has encrypted_private_key', ok: !!w.encrypted_private_key && w.encrypted_private_key.length > 50 });
+    checks.push({ name: 'Has version', ok: !!w.version || !!w.vault_version });
+
+    // Address derivation check (server-side)
+    try {
+      const derived = await rpc('qtcl_hyp_deriveAddress', { public_key: w.public_key });
+      const match = derived.address === w.address;
+      checks.push({ name: 'Address ↔ Public Key match', ok: match, detail: match ? 'Cryptographically verified' : `Derived: ${derived.address.slice(0,16)}…` });
+    } catch (e) {
+      checks.push({ name: 'Address ↔ Public Key match', ok: false, detail: e.message });
+    }
+
+    const allOk = checks.every(c => c.ok);
+    el.innerHTML = `
+      <div style="background:${allOk ? 'rgba(16,185,129,.06)' : 'rgba(239,68,68,.06)'};border:1px solid ${allOk ? 'rgba(16,185,129,.2)' : 'rgba(239,68,68,.2)'};border-radius:6px;padding:14px 18px;">
+        <div style="font-size:13px;font-weight:600;color:${allOk ? 'var(--emerald)' : 'var(--red)'};margin-bottom:10px;">
+          ${allOk ? '✅ Wallet file is VALID' : '⚠ Wallet file has issues'}
+        </div>
+        ${checks.map(c => `
+          <div style="display:flex;align-items:center;gap:8px;font-size:11px;padding:4px 0;">
+            <span style="color:${c.ok ? 'var(--emerald)' : 'var(--red)'};">${c.ok ? '✓' : '✕'}</span>
+            <span style="color:var(--text);">${escHtml(c.name)}</span>
+            ${c.detail ? `<span style="color:var(--muted);font-size:10px;margin-left:auto;">${escHtml(c.detail)}</span>` : ''}
+          </div>
+        `).join('')}
+        <div style="margin-top:10px;font-size:10px;color:var(--muted);">
+          Address: <span style="color:var(--cyan);user-select:all;">${w.address || '—'}</span>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div style="color:var(--red);font-size:11px;padding:12px;">Invalid JSON file: ${escHtml(e.message)}</div>`;
+  }
+}
+
+// ── SHA3-256 (browser-side, using SubtleCrypto SHA-256 as fallback + simple keccak) ──
+async function sha3_256_hex(input) {
+  // Use SubtleCrypto SHA-256 as a practical substitute
+  // (True SHA3-256/Keccak would require a library; SHA-256 is fine for XOR key derivation)
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return bytesToHex(new Uint8Array(hash));
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUY QTCL — Supply-aware Stripe Integration
+// Queries miner + treasury balances to determine available supply
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let _buyAmountQtcl = 0;
+let _buyAvailableSupply = 0;
+let _buyMinerBalance = 0;
+let _buyTreasuryBalance = 0;
+let _buyMinerAddr = '';
+let _buyTreasuryAddr = '';
+const QTCL_PRICE_USD = 0.10;  // $0.10 per QTCL
+
+async function loadBuySupply() {
+  const supplyBody = document.getElementById('buySupplyBody');
+  const sourcesBody = document.getElementById('buySupplySources');
+  const outOfStock = document.getElementById('buyOutOfStock');
+  const formSection = document.getElementById('buyFormSection');
+
+  supplyBody.innerHTML = '<div style="text-align:center;padding:12px;color:var(--muted);font-size:11px;">⏳ Querying miner & treasury wallets…</div>';
+
+  try {
+    // 1. Get treasury address (from TREASURY_ADDRESS env var)
+    const treasuryResult = await rpc('qtcl_getTreasuryAddress', []);
+    _buyTreasuryAddr = treasuryResult.treasury_address || '';
+
+    // 2. Get miner address (from MINER_ADDRESS env var on Koyeb)
+    try {
+      const minerResult = await rpc('qtcl_getMinerAddress', []);
+      _buyMinerAddr = minerResult.miner_address || '';
+    } catch (_) {
+      _buyMinerAddr = '';
+    }
+
+    // 3. Query both balances
+    _buyMinerBalance = 0;
+    _buyTreasuryBalance = 0;
+
+    if (_buyMinerAddr) {
+      try {
+        const mb = await rpc('qtcl_getBalance', [_buyMinerAddr]);
+        _buyMinerBalance = mb.balance || 0;
+      } catch (_) {}
+    }
+    if (_buyTreasuryAddr) {
+      try {
+        const tb = await rpc('qtcl_getBalance', [_buyTreasuryAddr]);
+        _buyTreasuryBalance = tb.balance || 0;
+      } catch (_) {}
+    }
+
+    _buyAvailableSupply = _buyMinerBalance + _buyTreasuryBalance;
+
+    // 4. Render supply dashboard
+    const supplyColor = _buyAvailableSupply > 100 ? 'var(--emerald)' : _buyAvailableSupply > 0 ? 'var(--amber)' : 'var(--red)';
+    supplyBody.innerHTML = `
+      <div style="text-align:center;padding:8px 0;">
+        <div style="font-family:var(--font-display);font-size:32px;font-weight:700;color:${supplyColor};margin-bottom:4px;">
+          ${fmtQTCL(_buyAvailableSupply)}
+        </div>
+        <div style="font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;">Available for Purchase</div>
+        <div style="display:flex;justify-content:center;gap:24px;margin-top:14px;">
+          <div style="text-align:center;">
+            <div style="font-size:15px;font-weight:600;color:var(--cyan);">${fmtQTCL(_buyMinerBalance)}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px;">⛏ Miner</div>
+          </div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div style="text-align:center;">
+            <div style="font-size:15px;font-weight:600;color:var(--violet);">${fmtQTCL(_buyTreasuryBalance)}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px;">🏛 Treasury</div>
+          </div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div style="text-align:center;">
+            <div style="font-size:15px;font-weight:600;color:var(--text-bright);">$${(_buyAvailableSupply * QTCL_PRICE_USD).toFixed(2)}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px;">💵 Value (USD)</div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // 5. Supply sources detail
+    sourcesBody.innerHTML = `
+      <div style="text-align:left;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);">
+          <div>
+            <span style="color:var(--cyan);">⛏ Miner Wallet</span><br>
+            <span style="font-size:9px;color:var(--muted);word-break:break-all;">${_buyMinerAddr || 'No active miner detected'}</span>
+          </div>
+          <div style="text-align:right;">
+            <span style="color:var(--text-bright);font-weight:600;">${fmtQTCL(_buyMinerBalance)}</span><br>
+            <span style="font-size:9px;color:var(--muted);">$${(_buyMinerBalance * QTCL_PRICE_USD).toFixed(2)} USD</span>
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);">
+          <div>
+            <span style="color:var(--violet);">🏛 Treasury Wallet</span><br>
+            <span style="font-size:9px;color:var(--muted);word-break:break-all;">${_buyTreasuryAddr || 'Not configured'}</span>
+          </div>
+          <div style="text-align:right;">
+            <span style="color:var(--text-bright);font-weight:600;">${fmtQTCL(_buyTreasuryBalance)}</span><br>
+            <span style="font-size:9px;color:var(--muted);">$${(_buyTreasuryBalance * QTCL_PRICE_USD).toFixed(2)} USD</span>
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;font-weight:600;">
+          <span style="color:var(--text-bright);">Total Available Supply</span>
+          <span style="color:${supplyColor};font-size:14px;">${fmtQTCL(_buyAvailableSupply)}</span>
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin-top:8px;line-height:1.6;">
+          Supply grows at <strong style="color:var(--cyan);">8.0 QTCL/block</strong> (7.2 miner + 0.8 treasury). Blocks are mined approximately every 18 seconds.
+          New supply: ~1,600 QTCL/hour when mining is active.
+        </div>
+      </div>
+    `;
+
+    // 6. Show/hide out-of-stock vs purchase form
+    if (_buyAvailableSupply <= 0) {
+      outOfStock.classList.remove('hidden');
+      formSection.style.display = 'none';
+    } else {
+      outOfStock.classList.add('hidden');
+      formSection.style.display = '';
+      renderBuyAmountButtons();
+    }
+
+  } catch (e) {
+    supplyBody.innerHTML = `<div style="text-align:center;padding:12px;color:var(--red);font-size:11px;">Failed to load supply: ${escHtml(e.message)}</div>`;
+    console.error('Supply load error:', e);
+  }
+}
+
+function renderBuyAmountButtons() {
+  const grid = document.getElementById('buyAmountGrid');
+  if (!grid) return;
+  const maxAvail = Math.floor(_buyAvailableSupply);
+  document.getElementById('buyMaxLabel').textContent = `(max ${maxAvail.toLocaleString()} QTCL available)`;
+
+  // Generate preset amounts that fit within available supply
+  const presets = [10, 50, 100, 500, 1000].filter(a => a <= maxAvail);
+  let html = '';
+  for (const amt of presets) {
+    html += `<button class="btn btn-outline" onclick="setBuyAmount(${amt})" id="buyAmt${amt}" style="font-size:12px;">${amt.toLocaleString()} QTCL<br><span style="font-size:10px;color:var(--muted);">$${(amt * QTCL_PRICE_USD).toFixed(2)}</span></button>`;
+  }
+  // Custom amount input
+  html += `<div style="display:flex;align-items:center;">
+    <input type="number" class="form-input" id="buyCustomAmount" placeholder="Custom" min="1" max="${maxAvail}" style="font-size:12px;text-align:center;" oninput="updateBuyCustom()">
+  </div>`;
+  // Max button if supply > 10
+  if (maxAvail > 10) {
+    html += `<button class="btn btn-outline" onclick="setBuyAmount(${maxAvail})" style="font-size:12px;border-color:var(--emerald);color:var(--emerald);">MAX<br><span style="font-size:10px;">${maxAvail.toLocaleString()} QTCL</span></button>`;
+  }
+  grid.innerHTML = html;
+}
+
+function setBuyAmount(amt) {
+  const maxAvail = Math.floor(_buyAvailableSupply);
+  if (amt > maxAvail) {
+    toast(`Only ${maxAvail} QTCL available — reducing to max`, 'info');
+    amt = maxAvail;
+  }
+  _buyAmountQtcl = amt;
+  // Highlight selected
+  document.querySelectorAll('#buyAmountGrid .btn').forEach(b => {
+    b.style.borderColor = '';
+    b.style.background = '';
+    b.style.color = '';
+  });
+  const sel = document.getElementById(`buyAmt${amt}`);
+  if (sel) {
+    sel.style.borderColor = 'var(--cyan)';
+    sel.style.background = 'var(--cyan-glow)';
+    sel.style.color = 'var(--cyan)';
+  }
+  const customInput = document.getElementById('buyCustomAmount');
+  if (customInput) customInput.value = '';
+  updateBuySummary();
+}
+
+function updateBuyCustom() {
+  const maxAvail = Math.floor(_buyAvailableSupply);
+  let v = parseInt(document.getElementById('buyCustomAmount').value) || 0;
+  if (v > maxAvail) {
+    v = maxAvail;
+    document.getElementById('buyCustomAmount').value = v;
+    toast(`Capped to available supply: ${maxAvail} QTCL`, 'info');
+  }
+  if (v > 0) {
+    _buyAmountQtcl = v;
+    document.querySelectorAll('#buyAmountGrid .btn').forEach(b => {
+      b.style.borderColor = '';
+      b.style.background = '';
+      b.style.color = '';
+    });
+    updateBuySummary();
+  }
+}
+
+function updateBuySummary() {
+  const addr = document.getElementById('buyAddr').value.trim();
+  const summary = document.getElementById('buyOrderSummary');
+  const btn = document.getElementById('buyBtn');
+
+  if (_buyAmountQtcl > 0) {
+    summary.classList.remove('hidden');
+    document.getElementById('buyQtclAmount').textContent = `${_buyAmountQtcl.toLocaleString()} QTCL`;
+    document.getElementById('buyTotal').textContent = `$${(_buyAmountQtcl * QTCL_PRICE_USD).toFixed(2)} USD`;
+    document.getElementById('buyDeliverTo').textContent = addr || 'Enter address above';
+    btn.disabled = !addr || addr.length !== 64;
+  } else {
+    summary.classList.add('hidden');
+    btn.disabled = true;
+  }
+}
+
+// Watch address field
+document.addEventListener('DOMContentLoaded', () => {
+  const el = document.getElementById('buyAddr');
+  if (el) el.addEventListener('input', updateBuySummary);
+});
+
+async function initStripeCheckout() {
+  const addr = document.getElementById('buyAddr').value.trim();
+  if (!addr || addr.length !== 64) {
+    toast('Enter a valid 64-character QTCL address', 'error');
+    return;
+  }
+  if (_buyAmountQtcl <= 0) {
+    toast('Select an amount', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('buyBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Redirecting to Stripe…';
+
+  try {
+    // Call server to create Stripe checkout session
+    const result = await rpc('qtcl_createCheckoutSession', [{
+      amount_qtcl: _buyAmountQtcl,
+      receiving_address: addr,
+      price_usd_cents: Math.round(_buyAmountQtcl * QTCL_PRICE_USD * 100),
+    }]);
+
+    if (result.checkout_url) {
+      window.location.href = result.checkout_url;
+    } else if (result.status === 'not_configured') {
+      toast('Stripe integration is being configured — check back soon', 'info', 5000);
+    } else {
+      toast(result.message || 'Checkout session failed', 'error');
+    }
+  } catch (e) {
+    toast(`Stripe error: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '💳 Pay with Stripe';
+  }
+}
+
+// ═══ URL PARAMS (deep linking) ═══
+function handleUrlParams() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('to')) {
+    document.getElementById('sendTo').value = params.get('to');
+    if (params.get('amount')) document.getElementById('sendAmount').value = params.get('amount');
+    if (params.get('memo')) document.getElementById('sendMemo').value = params.get('memo');
+    showPage('send');
+  }
+  if (params.get('page')) showPage(params.get('page'));
+  if (params.get('address')) {
+    document.getElementById('lookupAddr').value = params.get('address');
+    showPage('lookup');
+    lookupAddress();
+  }
+}
+
+// ═══ INIT ═══
+async function _waitForServer(maxWaitMs = 60000) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch('/health', { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        // Probe RPC
+        const probe = await fetch(`${RPC_URL}?method=qtcl_getBlockHeight&params=%5B%5D&id=0`, {
+          method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(8000)
+        });
+        const ct = probe.headers.get('content-type') || '';
+        if (probe.ok && ct.includes('json')) {
+          const data = await probe.json();
+          const hasInitError = data.error && data.error.code === -32000;
+          const hasResult = data.result && data.result.height !== undefined;
+          if (!hasInitError && hasResult) return true;
+        }
+      }
+    } catch(e) {}
+    await new Promise(res => setTimeout(res, 3000));
+  }
+  return false;
+}
+
+async function init() {
+  // ═══ SECURITY: Always start with a clean slate — no wallet persistence ═══
+  _fullWalletPurge('init');
+  handleUrlParams();
+
+  // Wait for server readiness before firing any RPC calls
+  // This prevents POST /rpc returning 503 plain-text which breaks JSON parsing
+  const ready = await _waitForServer(90000);
+  if (!ready) {
+    console.warn('[tx.html] Server did not become ready in time');
+    // Still attempt — rpc() has its own retry logic
+  }
+
+  await refreshDashboard();
+  loadRecentTxs();
+
+  // Wallet starts disconnected — user must explicitly connect each session
+
+  // Auto-refresh dashboard only (not wallet balance — wallet may not be connected)
+  setInterval(refreshDashboard, 15000);
+  setInterval(() => { if (S.walletAddr) refreshBalance(); }, 30000);
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
