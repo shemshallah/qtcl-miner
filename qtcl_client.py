@@ -25947,6 +25947,13 @@ class QtclClientApp:
                             await _asyncio.sleep(0.1)
                             continue
 
+                        # 🔴 CRITICAL: Reject nonce=0 — server will reject it for non-genesis blocks
+                        if nonce is None or nonce == 0:
+                            _EXP_LOG.error(f"[MINER] ❌ Invalid nonce={nonce} for h={target_height} — skipping submission")
+                            _MINE_TELEM.mark_idle()
+                            await _asyncio.sleep(0.1)
+                            continue
+
                         _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…  txs={len(_block_txs_list)}")
                         # Snapshot merkle root and tx list under lock — prevents SSE callback from
                         # changing the merkle root after PoW solution was found (would invalidate block hash)
