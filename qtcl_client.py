@@ -20852,41 +20852,6 @@ class QtclClientApp:
             return engine.verify_signature(_hash, sig_dict, wallet_pub)
         except Exception:
             return False
-            signing_key = _hm_v.new(
-                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
-            ).digest()
-            computed = _hm_v.new(
-                signing_key, _hash + sig_bytes, _hashlib.sha256
-            ).hexdigest()
-            return _hm_v.compare_digest(computed, cert["auth_tag"])
-        except Exception:
-            return False
-        try:
-            _payload = (oracle_pub + "|" + wallet_addr).encode()
-            _hash = _hashlib.sha256(_payload).digest()
-            sig_bytes = bytes.fromhex(cert["signature"])
-            signing_key = _hm_v.new(
-                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
-            ).digest()
-            computed = _hm_v.new(
-                signing_key, _hash + sig_bytes, _hashlib.sha256
-            ).hexdigest()
-            return _hm_v.compare_digest(computed, cert["auth_tag"])
-        except Exception:
-            return False
-        try:
-            _payload = (oracle_pub + "|" + wallet_addr).encode()
-            _hash = _hashlib.sha256(_payload).digest()
-            sig_bytes = bytes.fromhex(cert["signature"])
-            signing_key = _hm_v.new(
-                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
-            ).digest()
-            computed = _hm_v.new(
-                signing_key, _hash + sig_bytes, _hashlib.sha256
-            ).hexdigest()
-            return _hm_v.compare_digest(computed, cert["auth_tag"])
-        except Exception:
-            return False
 
     def _broadcast_oracle_registration(self) -> None:
         """
