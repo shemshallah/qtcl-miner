@@ -2191,6 +2191,8 @@ def sign_hash(
         "Z": sig_dict["Z"],
         "c_full": challenge_hex,
         "c_exp": sig.c_exp,
+        "R_canonical": R_hex,  # both keys for compatibility
+        "R_canonical_hex": R_hex,
     }
 
 
@@ -2240,6 +2242,12 @@ class SchnorrGamma:
             challenge = _result_dict.get("challenge", "")
             auth_tag = _result_dict.get("auth_tag", "")
             timestamp = _result_dict.get("timestamp", "")
+            # Canonical fields required for verification — must survive serialization
+            R = _result_dict.get("R", {})
+            Z = _result_dict.get("Z", {})
+            c_full = _result_dict.get("c_full", "")
+            c_exp = _result_dict.get("c_exp", 0)
+            R_canonical_hex = _result_dict.get("R_canonical_hex", "")
 
         return _SigResult()
 

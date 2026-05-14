@@ -696,13 +696,20 @@ class HypGammaEngine:
                     message_hash, walk_indices, generators
                 )
 
-            # Format output
+            # Format output — include ALL canonical fields for verification pipeline
             timestamp = datetime.now(timezone.utc).isoformat()
             result = {
                 'signature': sig.signature,
                 'challenge': sig.challenge,
                 'auth_tag': sig.challenge,  # Backward compat
                 'timestamp': timestamp,
+                # Canonical fields — MUST survive serialization for signature_from_dict
+                'R': getattr(sig, 'R', {}),
+                'Z': getattr(sig, 'Z', {}),
+                'c_full': getattr(sig, 'c_full', sig.challenge),
+                'c_exp': getattr(sig, 'c_exp', 0),
+                'R_canonical_hex': getattr(sig, 'R_canonical_hex', ''),
+                'R_canonical': getattr(sig, 'R_canonical_hex', ''),  # for signature_from_dict
             }
 
             logger.debug(f"✓ Hash signed: challenge={sig.challenge[:16]}...")
@@ -753,20 +760,12 @@ class HypGammaEngine:
                 # Deserialize public key
                 public_matrix = self._deserialize_psl_matrix(public_key)
 
-                # Decode the inner signature dict from the wire-format sig.
-                # sign_hash() stores the full signature_to_dict() blob as
-                # hex-encoded JSON in sig['signature'].  Decode it back.
-                _sig_field = sig.get('signature', '')
-                try:
-                    import json as _json_v
-                    _inner_sig_dict = _json_v.loads(bytes.fromhex(_sig_field).decode())
-                except Exception:
-                    # Fallback: maybe sig IS already the inner dict (old format)
-                    _inner_sig_dict = sig
-
-                # Verify
+                # The signature dict from sign_hash() contains both wire fields
+                # ('signature', 'challenge') and canonical fields ('R', 'Z', 'c_full').
+                # Pass the dict directly — signature_from_dict will find canonical
+                # keys first and use the proper verification path.
                 valid = self._schnorr.verify_signature(
-                    message_hash, _inner_sig_dict, public_matrix
+                    message_hash, sig, public_matrix
                 )
 
             logger.debug(f"✓ Signature {'valid' if valid else 'invalid'}")
