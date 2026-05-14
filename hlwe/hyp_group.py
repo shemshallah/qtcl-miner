@@ -163,7 +163,7 @@ class PSLMatrix:
     projected onto PSL(2,ℝ) by sign normalization.
     """
 
-    __slots__ = ("a", "b", "c", "d", "_validated")
+    __slots__ = ("a", "b", "c", "d", "_validated", "_canonical_hex")
 
     def __init__(self, a: mpf, b: mpf, c: mpf, d: mpf, skip_validation: bool = False):
         """
@@ -183,6 +183,7 @@ class PSLMatrix:
         self.c = mpf(c)
         self.d = mpf(d)
         self._validated = False
+        self._canonical_hex = None  # Set by signature_from_dict for Fiat-Shamir binding
 
         if not skip_validation:
             self._enforce_invariants()

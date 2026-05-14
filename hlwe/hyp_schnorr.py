@@ -2237,19 +2237,10 @@ class SchnorrGamma:
         _kp = keygen_from_walk(private_walk)
         _result_dict = sign_hash(message_hash, private_walk, _kp.public_key)
 
-        class _SigResult:
-            signature = _result_dict.get("signature", "")
-            challenge = _result_dict.get("challenge", "")
-            auth_tag = _result_dict.get("auth_tag", "")
-            timestamp = _result_dict.get("timestamp", "")
-            # Canonical fields required for verification — must survive serialization
-            R = _result_dict.get("R", {})
-            Z = _result_dict.get("Z", {})
-            c_full = _result_dict.get("c_full", "")
-            c_exp = _result_dict.get("c_exp", 0)
-            R_canonical_hex = _result_dict.get("R_canonical_hex", "")
-
-        return _SigResult()
+        # Return dict directly with canonical fields preserved.
+        # Previously used _SigResult class but class attributes can be fragile.
+        _result_dict["public_key_hex"] = _kp.public_key_hex if hasattr(_kp, 'public_key_hex') else ""
+        return _result_dict
 
     def verify(
         self, sig: SchnorrSignature, message: bytes, public_key: PSLMatrix

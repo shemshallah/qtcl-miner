@@ -698,21 +698,22 @@ class HypGammaEngine:
 
             # Format output — include ALL canonical fields for verification pipeline
             timestamp = datetime.now(timezone.utc).isoformat()
+            # sig is now a dict directly from SchnorrGamma.sign_hash (not _SigResult)
             result = {
-                'signature': sig.signature,
-                'challenge': sig.challenge,
-                'auth_tag': sig.challenge,  # Backward compat
+                'signature': sig.get('signature', ''),
+                'challenge': sig.get('challenge', ''),
+                'auth_tag': sig.get('auth_tag', sig.get('challenge', '')),
                 'timestamp': timestamp,
                 # Canonical fields — MUST survive serialization for signature_from_dict
-                'R': getattr(sig, 'R', {}),
-                'Z': getattr(sig, 'Z', {}),
-                'c_full': getattr(sig, 'c_full', sig.challenge),
-                'c_exp': getattr(sig, 'c_exp', 0),
-                'R_canonical_hex': getattr(sig, 'R_canonical_hex', ''),
-                'R_canonical': getattr(sig, 'R_canonical_hex', ''),  # for signature_from_dict
+                'R': sig.get('R', {}),
+                'Z': sig.get('Z', {}),
+                'c_full': sig.get('c_full', sig.get('challenge', '')),
+                'c_exp': sig.get('c_exp', 0),
+                'R_canonical_hex': sig.get('R_canonical_hex', ''),
+                'R_canonical': sig.get('R_canonical', sig.get('R_canonical_hex', '')),
             }
 
-            logger.debug(f"✓ Hash signed: challenge={sig.challenge[:16]}...")
+            logger.debug(f"✓ Hash signed: challenge={sig.get('challenge', '?')[:16]}...")
             return result
 
         except Exception as e:
@@ -764,8 +765,16 @@ class HypGammaEngine:
                 # ('signature', 'challenge') and canonical fields ('R', 'Z', 'c_full').
                 # Pass the dict directly — signature_from_dict will find canonical
                 # keys first and use the proper verification path.
+                logger.info(
+                    f"[ENGINE-VERIFY] 🔍 sig keys: {list(sig.keys())[:12]} "
+                    f"msg_hash={message_hash.hex()[:24]}… "
+                    f"pub_key={public_key[:20]}…"
+                )
                 valid = self._schnorr.verify_signature(
                     message_hash, sig, public_matrix
+                )
+                logger.info(
+                    f"[ENGINE-VERIFY] 🔍 result: {'✅ VALID' if valid else '❌ INVALID'}"
                 )
 
             logger.debug(f"✓ Signature {'valid' if valid else 'invalid'}")
