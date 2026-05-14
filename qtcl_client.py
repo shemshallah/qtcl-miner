@@ -20697,7 +20697,7 @@ class QtclClientApp:
         ① WALLET-BOUND  (oracle_context provided)
           oracle_priv = sha3_256(wallet_priv ‖ "QTCL_ORACLE_DELEGATE_v1")
           oracle_pub  = sha3_256(oracle_priv.encode())
-          oracle_addr = "qtcl1" + sha3_256(pub_bytes)[:20].hex()
+          oracle_addr = sha3_256(sha3_256(pub_bytes)).hexdigest()
           cert        = HLWE_sign(sha256(oracle_pub ‖ wallet_addr), wallet_priv)
           The cert binds: "wallet_addr authorised oracle_addr to sign".
           Any peer can verify without a central server: recompute cert_hash,
@@ -20748,7 +20748,7 @@ class QtclClientApp:
             private_key = _wpriv  # Walk index sequence - already in correct format
             public_key = engine.derive_public_key(private_key)
             pub_bytes = bytes.fromhex(public_key)
-            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            address = _hashlib.sha3_256(_hashlib.sha3_256(pub_bytes).digest()).hexdigest()
             cert = self._create_oracle_cert(public_key, _waddr, _wpriv)
             identity = {
                 "address": address,
@@ -20768,7 +20768,7 @@ class QtclClientApp:
             private_key = keypair.private_key
             public_key = keypair.public_key
             pub_bytes = bytes.fromhex(public_key)
-            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
+            address = _hashlib.sha3_256(_hashlib.sha3_256(pub_bytes).digest()).hexdigest()
             identity = {
                 "address": address,
                 "private_key": private_key,
@@ -25637,7 +25637,7 @@ class QtclClientApp:
 
                         timestamp = int(_t.time())
                         miner_addr = getattr(getattr(self, "wallet", None), "address", "0" * 64) or "0" * 64
-                        _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                        _treasury_addr = self.koyeb_state.treasury_address or "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
                         _miner_reward_base = 720
                         _treasury_reward_base = 80
                         try:
@@ -26319,7 +26319,7 @@ class QtclClientApp:
 
     def _send_tx_wizard(self) -> None:
         try:
-            to_addr = input("  To address (qtcl1…): ").strip()
+            to_addr = input("  To address (64-char hex): ").strip()
             amount = float(input("  Amount (QTCL): ").strip())
 
             # Use existing fee structure for network donations
@@ -26333,8 +26333,8 @@ class QtclClientApp:
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled")
             return
-        if not to_addr.startswith("qtcl1"):
-            print("  ❌ Invalid QTCL address")
+        if not to_addr or len(to_addr) < 40 or not all(c in '0123456789abcdef' for c in to_addr.lower()):
+            print("  ❌ Invalid QTCL address (expected hex)")
             return
         tx = {
             "from_address": self.wallet.address,
@@ -29835,7 +29835,7 @@ class NodeRPCMeshServer:
                     ")"
                 )
                 treasury_address = (
-                    "qtcl1treasury0reward0dist0address00000000000000000000001"
+                    "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
                 )
                 treasury_reward_base = 80
                 try:
