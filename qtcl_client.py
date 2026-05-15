@@ -15842,13 +15842,6 @@ class _MiningTelemetry:
 
 
 _MINE_TELEM = _MiningTelemetry()
-_sse_local_subs: list = []  # DEPRECATED: SSE subscribers (RPC-only now)
-_sse_event_subs: list = []  # DEPRECATED: SSE event subscribers (RPC-only now)
-
-
-def _broadcast_oracle_to_local_subs(snap: dict) -> None:
-    """DEPRECATED: SSE broadcast removed in RPC-only migration. Stub for compatibility."""
-    pass
 
 
 # SERVER RPC CLIENT — Pyth oracle metrics from server
@@ -24224,10 +24217,6 @@ class QtclClientApp:
                 _EXP_LOG.debug(f"[EVENTS-RPC] fatal: {_e}")
                 self._stop.wait(2)
 
-    def _handle_sse_event(self, raw: str) -> None:
-        """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
-        pass
-
     def _local_http_server(self) -> None:
         """
         Full oracle+mesh node HTTP server on 0.0.0.0:{_LOCAL_HTTP_PORT}.
@@ -25745,9 +25734,9 @@ class QtclClientApp:
                                                 _full_tx = dict(_ftx) if isinstance(_ftx, dict) else _ftx.to_dict() if hasattr(_ftx, "to_dict") else _ftx
                                                 break
                                     if not _full_tx:
-                                        _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": "", "public_key": "", "inputs": [], "outputs": [], "version": 1}
+                                        _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "from_address": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "to_address": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": tx_event.get("signature", ""), "sender_public_key_hex": tx_event.get("sender_public_key_hex", ""), "public_key": tx_event.get("public_key", ""), "inputs": tx_event.get("inputs", []), "outputs": tx_event.get("outputs", []), "version": 1}
                                 except Exception:
-                                    _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": "", "public_key": "", "inputs": [], "outputs": [], "version": 1}
+                                    _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "from_address": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "to_address": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": tx_event.get("signature", ""), "sender_public_key_hex": tx_event.get("sender_public_key_hex", ""), "public_key": tx_event.get("public_key", ""), "inputs": tx_event.get("inputs", []), "outputs": tx_event.get("outputs", []), "version": 1}
                                 _full_tx["tx_id"] = _full_tx.get("tx_id") or _full_tx.get("tx_hash", _eh)
                                 _full_tx["tx_hash"] = _full_tx.get("tx_hash") or _full_tx.get("tx_id", _eh)
                                 _full_tx["tx_type"] = _full_tx.get("tx_type", "transfer")
@@ -25944,6 +25933,46 @@ class QtclClientApp:
                         with _block_lock:
                             merkle_root = _compute_merkle(_block_txs_list)
                             _final_txs = list(_block_txs_list)  # frozen copy for submission
+
+                        # Recompute block hash with snapshot merkle to guard against race condition
+                        # where SSE callback changed merkle between solution and snapshot
+                        _snap_merkle_bytes = bytes.fromhex(merkle_root.zfill(64))[:32]
+                        _snap_epoch = nonce // _SCRATCHPAD_EPOCH_NONCES
+                        _snap_scratch = _hl.shake_256(
+                            b"QTCL_SCRATCHPAD_v1:" + _ph_seed + _snap_epoch.to_bytes(8, "big")
+                        ).digest(_POW_SCRATCHPAD_BYTES)
+                        _snap_mv = memoryview(_snap_scratch)
+                        _snap_woffs = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
+                        _snap_hdr = _st.pack(_HDR_FMT, target_height, timestamp, _ph_parent,
+                                             _snap_merkle_bytes, difficulty_bits, nonce,
+                                             _ph_miner, _ph_seed)
+                        _snap_h0 = _hl.sha3_256()
+                        _snap_h0.update(_POW_PREFIX)
+                        _snap_h0.update(_snap_hdr)
+                        _snap_state = _snap_h0.digest()
+                        for _rnd in range(_POW_MIX_ROUNDS):
+                            _snap_wi = _st.unpack(">I", _snap_state, 0)[0] % _POW_N_WINDOWS
+                            _snap_o = _snap_woffs[_snap_wi]
+                            _snap_h = _hl.sha3_256()
+                            _snap_h.update(_snap_state)
+                            _snap_h.update(_snap_mv[_snap_o:_snap_o + _POW_WINDOW_BYTES])
+                            _snap_h.update(_rnd_packed[_rnd])
+                            _snap_state = _snap_h.digest()
+                        _recomputed_hash = _snap_state.hex()
+                        if _recomputed_hash != block_hash:
+                            if _recomputed_hash[:difficulty_bits] == _hex_zeros:
+                                _EXP_LOG.warning(
+                                    f"[MINER] 🔄 Merkle changed during mining — "
+                                    f"recomputed hash={_recomputed_hash[:16]}… (still valid, using recomputed)"
+                                )
+                                block_hash = _recomputed_hash
+                            else:
+                                _EXP_LOG.warning(
+                                    f"[MINER] ❌ Merkle changed during mining — recomputed hash "
+                                    f"{_recomputed_hash[:16]}… does not meet difficulty — re-mining"
+                                )
+                                _MINE_TELEM.mark_idle()
+                                continue
 
                         submit_payload = {
                             "height": target_height,
