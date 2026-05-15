@@ -7964,12 +7964,10 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
     """Called when a block we mined is finalized.
 
     Retries with backoff until a non-zero balance is seen.
-    Zero is NOT a valid final answer immediately after finalization —
-    it means Neon read-replica lag or settlement hasn't propagated yet.
-    Up to 12 attempts over ~30 s total.
+    Up to 20 attempts over ~120 s total.
     """
-    await _asyncio.sleep(2.0)  # give server settlement + Neon replica time to sync
-    for attempt in range(12):
+    await _asyncio.sleep(2.0)
+    for attempt in range(20):
         try:
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2)
             if result and not result.get("error"):
@@ -7978,13 +7976,11 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
                     cache._balance_qtcl = balance_qtcl
                     logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL (attempt {attempt+1})")
                     return balance_qtcl
-                # balance == 0: settlement lag — keep retrying
                 logger.debug(f"[BALANCE] Still 0 after finalize (attempt {attempt+1}) — retrying")
-            delay = min(2.0 * (attempt + 1), 10.0)
+            delay = min(3.0 * (attempt + 1), 15.0)
             await _asyncio.sleep(delay)
         except Exception:
-            await _asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
-    # Final read — accept whatever the server says (may legitimately be 0 on new wallet)
+            await _asyncio.sleep(min(3.0 * (attempt + 1), 15.0))
     try:
         result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1)
         if result and not result.get("error"):
@@ -25951,7 +25947,7 @@ class QtclClientApp:
                         _snap_h0.update(_snap_hdr)
                         _snap_state = _snap_h0.digest()
                         for _rnd in range(_POW_MIX_ROUNDS):
-                            _snap_wi = _st.unpack(">I", _snap_state, 0)[0] % _POW_N_WINDOWS
+                            _snap_wi = _st.unpack_from(">I", _snap_state, 0)[0] % _POW_N_WINDOWS
                             _snap_o = _snap_woffs[_snap_wi]
                             _snap_h = _hl.sha3_256()
                             _snap_h.update(_snap_state)
@@ -26124,32 +26120,27 @@ class QtclClientApp:
                     await _asyncio.sleep(0.1)
 
             async def balance_task():
-                # Poll balance: fast (3s) for 60s after any finalize, then slow (30s).
+                # Poll balance: fast (3s) for 120s after any finalize, then slow (30s).
                 # Prevents the "0.00 QTCL" display caused by Neon read-replica lag.
                 _last_seen_finalized = cache._highest_finalized_height
-                _fast_until = 0.0  # time.time() deadline for fast polling
+                _fast_until = 0.0
                 while True:
                     try:
                         _addr = getattr(getattr(self, "wallet", None), "address", None)
                         if _addr:
-                            # Detect new finalization → enter fast-poll window
                             _cur_fin = cache._highest_finalized_height
                             if _cur_fin > _last_seen_finalized:
                                 _last_seen_finalized = _cur_fin
-                                _fast_until = _asyncio.get_event_loop().time() + 60.0
+                                _fast_until = _asyncio.get_event_loop().time() + 120.0
 
-                            # 1. Server balance (authoritative) — only update if > 0
-                            #    OR if we've been in fast-poll for >10s (accept 0 after that)
                             result = kapi._rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
                                 _b = float(result.get("balance", 0))
-                                if _b > 0 or _asyncio.get_event_loop().time() > _fast_until + 10:
+                                if _b > 0:
                                     cache._balance_qtcl = _b
-                            # 2. UTXO mirror sync — persists to client_utxos for mesh/rehydrate
                             cache._sync_utxos_from_server(kapi, _addr)
                     except Exception:
                         pass
-                    # Sleep: 3s in fast-poll window, 30s otherwise
                     _in_fast = _asyncio.get_event_loop().time() < _fast_until
                     await _asyncio.sleep(3.0 if _in_fast else 30.0)
 
