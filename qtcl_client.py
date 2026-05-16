@@ -339,18 +339,19 @@ def get_server_snapshot() -> Optional[dict]:
 def fetch_peer_measurement(
     peer_host: str, peer_port: int = 9091, timeout_s: float = 5.0
 ) -> Optional[str]:
-    """Fetch a single measurement from peer's one-shot snapshot endpoint."""
+    """Fetch a single measurement from peer's SSE endpoint."""
     try:
-        url = f"http://{peer_host}:{peer_port}/rpc/oracle/snapshot/latest"
+        url = f"http://{peer_host}:{peer_port}/rpc/oracle/snapshot"
         req = Request(url, method="GET")
-        req.add_header("Accept", "application/json")
+        req.add_header("Accept", "text/event-stream")
         with urlopen(req, timeout=timeout_s) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            dm_hex = payload.get("density_matrix_hex", "")
-            if not dm_hex:
-                dm_hex = payload.get("result", {}).get("density_matrix_hex", "")
-            if dm_hex:
-                return dm_hex
+            for line in resp:
+                line_str = line.decode().strip()
+                if line_str.startswith("data: "):
+                    payload = json.loads(line_str[6:])
+                    dm_hex = payload.get("result", {}).get("density_matrix_hex", "")
+                    if dm_hex:
+                        return dm_hex
     except Exception as e:
         _EXP_LOG.debug(f"[PEER-DM] Fetch from {peer_host}:{peer_port}: {e}")
     return None
@@ -5625,69 +5626,67 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
 
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Read snapshot from /rpc/oracle/snapshot/latest (one-shot JSON) OR fallback to RPC.
+        """Read snapshot from persistent SSE stream cache OR fallback to RPC.
 
-        Fetches quantum state: tries one-shot JSON endpoint first, falls back to RPC POST.
-        Processes snapshot: parses density matrix, converts W-state if needed,
-        updates oracle state cache.
+        The module-level density SSE stream (connect_density_stream) feeds
+        _dm_re/_dm_im and _oracle_state continuously.  This method reads
+        from that in-memory cache first (zero network cost).  Only falls
+        back to an RPC GET when the cache is stale (>30s).
         """
         _t0 = time.time()
-        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot/latest"
         _rpc_url = f"{self.ORACLE_URL}/rpc"
-        _payload = {
-            "jsonrpc": "2.0",
-            "method": "qtcl_getQuantumMetrics",
-            "params": [],
-            "id": 1,
-        }
         snap = {}
 
         try:
-            session = self._get_session()
-            if not session:
-                return {}
+            # PRIMARY: Read from in-memory cache (fed by persistent SSE stream)
+            with self._dm_lock:
+                _cached_dm_re = list(self._dm_re) if self._dm_re else None
+                _cached_dm_im = list(self._dm_im) if self._dm_im else None
+                _cache_age = time.time() - self._last_fetch_ts
 
-            # PRIMARY: One-shot JSON from /rpc/oracle/snapshot/latest (no SSE, no connection leak)
-            try:
-                _r = session.get(
-                    _snap_url,
-                    timeout=(timeout_s / 2, timeout_s),
-                    headers={"Accept": "application/json"},
+            if _cached_dm_re and _cache_age < 30.0:
+                # Cache is fresh — build snap from cached state
+                with self._oracle_state_lock:
+                    snap = dict(self._oracle_state)
+                snap["_from_cache"] = True
+                snap["_cache_age_s"] = round(_cache_age, 1)
+                logger.debug(f"[RPC-ORACLE] ✅ Cache hit (age={_cache_age:.1f}s)")
+            else:
+                # Cache stale or empty — single RPC fallback
+                logger.debug(
+                    f"[RPC-ORACLE] Cache stale ({_cache_age:.0f}s), trying RPC"
                 )
-                if _r.status_code == 200:
-                    _envelope = _r.json()
-                    if _envelope and not _envelope.get("status") == "no_snapshot_yet":
-                        snap = _envelope.get("result", _envelope)
-                        logger.debug(f"[RPC-ORACLE] ✅ One-shot snapshot received")
-                elif _r.status_code == 429:
-                    logger.debug(f"[RPC-ORACLE] HTTP 429 (trying RPC)")
-                else:
-                    logger.debug(f"[RPC-ORACLE] HTTP {_r.status_code} (trying RPC)")
-            except Exception as _snap_e:
-                logger.debug(f"[RPC-ORACLE] Snapshot/latest failed: {_snap_e} (trying RPC)")
 
             # FALLBACK: GET /rpc with qtcl_getQuantumMetrics
             if not snap:
                 try:
-                    import urllib.parse as _up
+                    session = self._get_session()
+                    if session:
+                        import urllib.parse as _up
 
-                    params_json = json.dumps(_payload.get("params", []))
-                    query = _up.urlencode(
-                        {
-                            "method": _payload.get("method"),
-                            "params": params_json,
+                        _payload = {
+                            "jsonrpc": "2.0",
+                            "method": "qtcl_getQuantumMetrics",
+                            "params": [],
                             "id": 1,
                         }
-                    )
-                    _rpc_get_url = f"{_rpc_url}?{query}"
-                    _r = session.get(_rpc_get_url, timeout=timeout_s)
-                    if _r.status_code in (200, 202):
-                        _body = _r.json()
-                        snap = _body.get("result") or {}
-                        if snap and snap.get("density_matrix_hex"):
-                            logger.debug(
-                                f"[RPC-ORACLE] ✅ RPC fallback succeeded with 16³ DM (32 KB)"
-                            )
+                        params_json = json.dumps(_payload.get("params", []))
+                        query = _up.urlencode(
+                            {
+                                "method": _payload.get("method"),
+                                "params": params_json,
+                                "id": 1,
+                            }
+                        )
+                        _rpc_get_url = f"{_rpc_url}?{query}"
+                        _r = session.get(_rpc_get_url, timeout=timeout_s)
+                        if _r.status_code in (200, 202):
+                            _body = _r.json()
+                            snap = _body.get("result") or {}
+                            if snap and snap.get("density_matrix_hex"):
+                                logger.debug(
+                                    f"[RPC-ORACLE] ✅ RPC fallback succeeded with 16³ DM (32 KB)"
+                                )
                 except Exception as _rpc_e:
                     logger.debug(f"[RPC-ORACLE] RPC fallback failed: {_rpc_e}")
 
@@ -23920,7 +23919,7 @@ class QtclClientApp:
         from urllib.request import Request as _PoR, urlopen as _PoU
         from urllib.error import URLError as _PoE
 
-        url = f"http://{host}:{port}/rpc/oracle/snapshot/latest"
+        url = f"http://{host}:{port}/rpc/oracle/snapshot"
         BACKOFF = [5, 10, 20, 40]
         bi = 0
         _last_snap_count = 0
@@ -24040,147 +24039,31 @@ class QtclClientApp:
 
     def _subscribe_snapshot_rpc(self) -> None:
         """
-        ⚛️  Aggressive RPC polling for /rpc/oracle/snapshot every 300ms.
-        Ingests each new snapshot directly into _LIVE_RPC_ORACLE; the
-        tripartite oracle loop fuses on its next cycle.
-        """
-        import time as _pt, ssl as _ssl, json as _pj
-        from urllib.request import Request as _SR, urlopen as _SO
-        from urllib.error import URLError as _SE, HTTPError as _HE
+        ⚛️  Oracle state sync — reads from the persistent density SSE stream cache
+        (connect_density_stream) instead of opening its own connections.
 
-        _oracle_url = SSE_SERVICE_URL
-        url = f"{_oracle_url}/rpc/oracle/snapshot/latest"
-        _last_snap_hash = None
-        _fail_count = 0
-        _backoff_ms = 1000  # Start at 1s (was 300ms — reduced server churn)
-        _max_backoff_ms = 5000  # Cap at 5s
+        The module-level density SSE stream feeds _LIVE_RPC_ORACLE via the
+        _default_density_handler callback.  This thread just monitors cache
+        freshness and logs staleness warnings.  No network calls needed.
+        """
+        import time as _pt
 
         _EXP_LOG.info(
-            f"[SNAPSHOT-RPC] 🚀 Starting polling every {_backoff_ms}ms → {url}"
+            "[SNAPSHOT-SYNC] ✅ Using persistent density SSE stream (no polling)"
         )
 
         while not self._stop.is_set():
             try:
-                req = _SR(url, method="GET")
-                req.add_header("Content-Type", "application/json")
-                req.add_header("User-Agent", "QTCL-PyRPC/5.0")
-                ssl_ctx = _ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = _ssl.CERT_NONE
-
-                try:
-                    with _SO(req, timeout=5, context=ssl_ctx) as resp:
-                        data = _pj.loads(resp.read().decode("utf-8"))
-
-                        if data and data.get("ready"):
-                            snap_hash = (
-                                __import__("hashlib")
-                                .sha256(_pj.dumps(data, sort_keys=True).encode())
-                                .hexdigest()
-                            )
-
-                            if snap_hash != _last_snap_hash:
-                                try:
-                                    # Write upstream snapshot directly into _LIVE_RPC_ORACLE
-                                    # The tripartite loop will fuse it on its next cycle
-                                    _dm_hex_up = data.get("density_matrix_hex", "")
-                                    if _dm_hex_up:
-                                        import struct as _sr
-
-                                        _bd = bytes.fromhex(_dm_hex_up)
-                                        if len(_bd) == 1024:
-                                            _re = [0.0] * 64
-                                            _im = [0.0] * 64
-                                            for _i in range(64):
-                                                _re[_i], _im[_i] = _sr.unpack_from(
-                                                    ">dd", _bd, _i * 16
-                                                )
-                                            with _LIVE_RPC_ORACLE._dm_lock:
-                                                _LIVE_RPC_ORACLE._dm_re = _re
-                                                _LIVE_RPC_ORACLE._dm_im = _im
-                                                _LIVE_RPC_ORACLE._last_fetch_ts = (
-                                                    _pt.time()
-                                                )
-                                    # Merge scalar oracle fields into _oracle_state
-                                    _state_update = {
-                                        k: data[k]
-                                        for k in (
-                                            "w_state_fidelity",
-                                            "fidelity",
-                                            "purity",
-                                            "von_neumann_entropy",
-                                            "coherence_l1",
-                                            "pq0_oracle_fidelity",
-                                            "pq0_IV_fidelity",
-                                            "pq0_V_fidelity",
-                                            "cycle",
-                                            "timestamp_ns",
-                                        )
-                                        if k in data
-                                    }
-                                    if _state_update:
-                                        with _LIVE_RPC_ORACLE._oracle_state_lock:
-                                            _LIVE_RPC_ORACLE._oracle_state.update(
-                                                _state_update
-                                            )
-                                    _last_snap_hash = snap_hash
-                                    _fail_count = 0
-                                    _backoff_ms = 1000
-                                except Exception as _ie:
-                                    _EXP_LOG.debug(
-                                        f"[SNAPSHOT-RPC] ingest error: {_ie}"
-                                    )
-                except _HE as _http_err:
-                    # ⚛️  Diagnostic: throttle 5xx to avoid log spam from transient Koyeb 503s
-                    _fail_count += 1
-                    if _http_err.code >= 500:
-                        if _fail_count == 1 or _fail_count % 50 == 0:
-                            try:
-                                error_body = _http_err.read().decode(
-                                    "utf-8", errors="replace"
-                                )[:80]
-                                # Strip HTML — log only first 80 chars of plain text portion
-                                import re as _re2
-
-                                error_body = _re2.sub(
-                                    r"<[^>]+>", "", error_body
-                                ).strip()[:60]
-                                _EXP_LOG.error(
-                                    f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count}) → {error_body}"
-                                )
-                            except:
-                                _EXP_LOG.error(
-                                    f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count})"
-                                )
-                        else:
-                            _EXP_LOG.debug(
-                                f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count}), retrying…"
-                            )
-                    elif _fail_count % 10 == 0:
-                        _EXP_LOG.debug(
-                            f"[SNAPSHOT-RPC] HTTP {_http_err.code}, retrying..."
-                        )
-                    # Exponential backoff on repeated failures
-                    _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
-                except Exception as _re:
-                    _fail_count += 1
-                    if _fail_count % 10 == 0:
-                        _EXP_LOG.debug(f"[SNAPSHOT-RPC] GET error ({_re}), retrying...")
-                    _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
-
-                self._stop.wait(min(_backoff_ms / 1000.0, 5.0))
-
-            except (_SE, OSError, TimeoutError) as _e:
-                _fail_count += 1
-                _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
-                if _fail_count % 5 == 0:
-                    _EXP_LOG.debug(
-                        f"[SNAPSHOT-RPC] conn failed ({_e}) — backoff {_backoff_ms:.0f}ms"
-                    )
-                self._stop.wait(_backoff_ms / 1000.0)
+                _, _, _age = _LIVE_RPC_ORACLE.get_oracle_dm()
+                if _age > 30.0:
+                    # Cache stale — density stream may have died, nudge a single fetch
+                    try:
+                        _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)
+                    except Exception:
+                        pass
             except Exception as _e:
-                _EXP_LOG.debug(f"[SNAPSHOT-RPC] fatal: {_e}")
-                self._stop.wait(2)
+                _EXP_LOG.debug(f"[SNAPSHOT-SYNC] check: {_e}")
+            self._stop.wait(5.0)  # Check every 5s, not 300ms
 
     def _subscribe_koyeb_events(self) -> None:
         """
