@@ -26242,6 +26242,7 @@ class QtclClientApp:
                 return False
 
         _REFRESH_INTERVAL = 3.0
+        _last_dashboard_ts = [0.0]
         _print_dashboard(force_full=True)
         print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
@@ -26253,7 +26254,10 @@ class QtclClientApp:
                         break
                     if ch in ("q", "quit", "stop"):
                         break
-                _print_dashboard()
+                _now_dash = time.time()
+                if _now_dash - _last_dashboard_ts[0] >= _REFRESH_INTERVAL:
+                    _print_dashboard()
+                    _last_dashboard_ts[0] = _now_dash
         except KeyboardInterrupt:
             pass
         finally:
