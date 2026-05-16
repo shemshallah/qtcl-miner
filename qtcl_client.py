@@ -379,6 +379,9 @@ def connect_density_stream(
     url = f"{server_url.rstrip('/')}/rpc/oracle/snapshot"
     headers = {"Accept": "text/event-stream"}
 
+    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "density"}
+    globals()["_SSE_DENSITY_STATE"] = _SSE_STATE
+
     def _sse_reader():
         consecutive_errors = 0
         max_errors = 10
@@ -386,6 +389,7 @@ def connect_density_stream(
 
         while True:
             try:
+                _SSE_STATE["connected"] = False
                 if _HAS_REQUESTS:
                     # Use requests with stream=True
                     with requests.get(
@@ -393,6 +397,8 @@ def connect_density_stream(
                     ) as resp:
                         resp.raise_for_status()
                         consecutive_errors = 0
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-DENSITY] ✅ Stream connected")
 
                         for line in resp.iter_lines(decode_unicode=True):
                             if line is None:
@@ -405,6 +411,7 @@ def connect_density_stream(
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(
@@ -415,11 +422,14 @@ def connect_density_stream(
                     req = Request(url, headers=headers, method="GET")
                     with urlopen(req, timeout=30) as resp:
                         consecutive_errors = 0
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-DENSITY] ✅ Stream connected")
                         for line in resp:
                             line_str = line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(
@@ -427,6 +437,7 @@ def connect_density_stream(
                                     )
 
             except Exception as e:
+                _SSE_STATE["connected"] = False
                 consecutive_errors += 1
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-DENSITY] Connection failed: {e}")
@@ -464,6 +475,9 @@ def connect_block_stream(
     url = f"{server_url.rstrip('/')}/rpc/blocks/stream"
     headers = {"Accept": "text/event-stream"}
 
+    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "blocks"}
+    globals()["_SSE_BLOCK_STATE"] = _SSE_STATE
+
     def _sse_reader():
         consecutive_errors = 0
         max_errors = 10
@@ -471,6 +485,7 @@ def connect_block_stream(
 
         while True:
             try:
+                _SSE_STATE["connected"] = False
                 if _HAS_REQUESTS:
                     # Use requests with stream=True
                     with requests.get(
@@ -478,6 +493,8 @@ def connect_block_stream(
                     ) as resp:
                         resp.raise_for_status()
                         consecutive_errors = 0
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-BLOCK] ✅ Stream connected")
 
                         for line in resp.iter_lines(decode_unicode=True):
                             if line is None:
@@ -490,6 +507,7 @@ def connect_block_stream(
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
@@ -498,16 +516,20 @@ def connect_block_stream(
                     req = Request(url, headers=headers, method="GET")
                     with urlopen(req, timeout=30) as resp:
                         consecutive_errors = 0
+                        _SSE_STATE["connected"] = True
+                        _EXP_LOG.info("[SSE-BLOCK] ✅ Stream connected")
                         for line in resp:
                             line_str = line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
+                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
 
             except Exception as e:
+                _SSE_STATE["connected"] = False
                 consecutive_errors += 1
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-BLOCK] Connection failed: {e}")
@@ -26126,8 +26148,14 @@ class QtclClientApp:
             m, s = divmod(r, 60)
             return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+        _METRICS_REFRESH_INTERVAL = 5.0  # RPC refresh every 5s, not every tick
+        _last_metrics_refresh = [0.0]
+
         def _print_dashboard(force_full: bool = False) -> None:
-            self.koyeb_state.refresh_metrics(self.client_field)
+            _now_ts = time.time()
+            if _now_ts - _last_metrics_refresh[0] >= _METRICS_REFRESH_INTERVAL:
+                self.koyeb_state.refresh_metrics(self.client_field)
+                _last_metrics_refresh[0] = _now_ts
             ks2 = self.koyeb_state
             tel = _MINE_TELEM.snapshot()
             now = time.time()
@@ -26190,9 +26218,18 @@ class QtclClientApp:
             _sse_cons = globals().get("_SSE_CONSENSUS_STATE", {})
             _sse_blk = globals().get("_SSE_BLOCK_STATE", {})
             _sse_dns = globals().get("_SSE_DENSITY_STATE", {})
-            _sse_all_ok = all(s.get("connected", False) for s in (_sse_cons, _sse_blk, _sse_dns) if s)
-            _sse_label = "✅ connected" if _sse_all_ok else "⚠️ reconnecting..."
-            print(f"  SSE     : {_sse_label} (consensus + blocks + density)")
+            _sse_streams = [("cons", _sse_cons), ("blk", _sse_blk), ("dns", _sse_dns)]
+            _sse_initialized = [(n, s) for n, s in _sse_streams if s]
+            if not _sse_initialized:
+                _sse_label = "⏳ initializing..."
+            else:
+                _sse_up = sum(1 for _, s in _sse_initialized if s.get("connected", False))
+                _sse_total = len(_sse_initialized)
+                if _sse_up == _sse_total:
+                    _sse_label = f"✅ {_sse_up}/{_sse_total} streams connected"
+                else:
+                    _sse_label = f"⚠️ {_sse_up}/{_sse_total} streams"
+            print(f"  SSE     : {_sse_label}")
             print(f"  Oracle: h={tel.get('height', '?')}  fid={ks2.pq0_fidelity:.4f}  bridge={ks2.bridge_fidelity:.4f}  lat={ks2.channel_latency_ms:.0f}ms  {'✅' if ks2.connected else '❌'}")
             print(self.format_p2p_status(detail=True))
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
