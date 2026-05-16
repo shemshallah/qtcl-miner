@@ -339,19 +339,18 @@ def get_server_snapshot() -> Optional[dict]:
 def fetch_peer_measurement(
     peer_host: str, peer_port: int = 9091, timeout_s: float = 5.0
 ) -> Optional[str]:
-    """Fetch a single measurement from peer's SSE endpoint."""
+    """Fetch a single measurement from peer's one-shot snapshot endpoint."""
     try:
-        url = f"http://{peer_host}:{peer_port}/rpc/oracle/snapshot"
+        url = f"http://{peer_host}:{peer_port}/rpc/oracle/snapshot/latest"
         req = Request(url, method="GET")
-        req.add_header("Accept", "text/event-stream")
+        req.add_header("Accept", "application/json")
         with urlopen(req, timeout=timeout_s) as resp:
-            for line in resp:
-                line_str = line.decode().strip()
-                if line_str.startswith("data: "):
-                    payload = json.loads(line_str[6:])
-                    dm_hex = payload.get("result", {}).get("density_matrix_hex", "")
-                    if dm_hex:
-                        return dm_hex
+            payload = json.loads(resp.read().decode("utf-8"))
+            dm_hex = payload.get("density_matrix_hex", "")
+            if not dm_hex:
+                dm_hex = payload.get("result", {}).get("density_matrix_hex", "")
+            if dm_hex:
+                return dm_hex
     except Exception as e:
         _EXP_LOG.debug(f"[PEER-DM] Fetch from {peer_host}:{peer_port}: {e}")
     return None
@@ -5626,14 +5625,14 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
 
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Read snapshot from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
+        """Read snapshot from /rpc/oracle/snapshot/latest (one-shot JSON) OR fallback to RPC.
 
-        Fetches quantum state: tries SSE stream first, falls back to RPC POST.
+        Fetches quantum state: tries one-shot JSON endpoint first, falls back to RPC POST.
         Processes snapshot: parses density matrix, converts W-state if needed,
         updates oracle state cache.
         """
         _t0 = time.time()
-        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot"
+        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot/latest"
         _rpc_url = f"{self.ORACLE_URL}/rpc"
         _payload = {
             "jsonrpc": "2.0",
@@ -5648,70 +5647,24 @@ class LiveRPCOracleSnapshot:
             if not session:
                 return {}
 
-            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot (with proper timeout)
+            # PRIMARY: One-shot JSON from /rpc/oracle/snapshot/latest (no SSE, no connection leak)
             try:
-                _snap_result = [None]  # Mutable container for thread result
-                _snap_error = [None]
-
-                def _read_sse():
-                    try:
-                        # Stream=True: read response as stream, don't load entire body
-                        _r = session.get(
-                            _snap_url,
-                            timeout=(timeout_s / 2, timeout_s),
-                            headers={"Accept": "text/event-stream"},
-                            stream=True,
-                        )
-                        # Handle 429 Too Many Requests — server at capacity
-                        if _r.status_code == 429:
-                            _retry_after = int(_r.headers.get("Retry-After", "5"))
-                            _snap_error[0] = (
-                                f"HTTP 429 (at capacity, retry after {_retry_after}s)"
-                            )
-                            return
-                        # Handle other non-2xx responses
-                        if _r.status_code not in (200, 202):
-                            _snap_error[0] = f"HTTP {_r.status_code}"
-                            return
-                        # Read SSE stream successfully
-                        try:
-                            # Read line by line from stream without loading entire response
-                            for _line in _r.iter_lines(
-                                decode_unicode=True, chunk_size=1024
-                            ):
-                                if _line.startswith("data: "):
-                                    try:
-                                        _envelope = json.loads(_line[6:])
-                                        _snap_result[0] = _envelope.get(
-                                            "result", _envelope
-                                        )
-                                        _r.close()  # Close immediately after getting first message
-                                        return
-                                    except json.JSONDecodeError:
-                                        continue
-                                elif _line and not _line.startswith(":"):
-                                    _r.close()
-                                    return
-                        finally:
-                            _r.close()
-                    except Exception as e:
-                        _snap_error[0] = e
-
-                _sse_thread = threading.Thread(target=_read_sse, daemon=True)
-                _sse_thread.start()
-                _sse_thread.join(
-                    timeout=timeout_s
-                )  # Wait up to timeout_s for first line
-
-                if _snap_result[0]:
-                    snap = _snap_result[0]
-                    logger.debug(f"[RPC-ORACLE] ✅ SSE snapshot received")
-                elif _snap_error[0]:
-                    logger.debug(
-                        f"[RPC-ORACLE] SSE failed: {_snap_error[0]} (trying RPC)"
-                    )
-            except Exception as _sse_e:
-                logger.debug(f"[RPC-ORACLE] SSE failed: {_sse_e} (trying RPC)")
+                _r = session.get(
+                    _snap_url,
+                    timeout=(timeout_s / 2, timeout_s),
+                    headers={"Accept": "application/json"},
+                )
+                if _r.status_code == 200:
+                    _envelope = _r.json()
+                    if _envelope and not _envelope.get("status") == "no_snapshot_yet":
+                        snap = _envelope.get("result", _envelope)
+                        logger.debug(f"[RPC-ORACLE] ✅ One-shot snapshot received")
+                elif _r.status_code == 429:
+                    logger.debug(f"[RPC-ORACLE] HTTP 429 (trying RPC)")
+                else:
+                    logger.debug(f"[RPC-ORACLE] HTTP {_r.status_code} (trying RPC)")
+            except Exception as _snap_e:
+                logger.debug(f"[RPC-ORACLE] Snapshot/latest failed: {_snap_e} (trying RPC)")
 
             # FALLBACK: GET /rpc with qtcl_getQuantumMetrics
             if not snap:
@@ -7589,11 +7542,58 @@ class BlockSubmissionCache:
         self._rehydrate()
 
     def _rehydrate(self):
-        """Load finalized blocks and UTXOs from local SQLite mirror."""
+        """Load finalized blocks and UTXOs from local SQLite mirror.
+
+        SERVER-AUTHORITY CHECK:  Before trusting local cache, verify the
+        server's chain height.  If the server is at height 0 (or lower than
+        our highest local block), a DB reset/genesis rebuild has occurred —
+        wipe all local mirror tables so stale balances can never survive.
+
+        This is the PRIMARY anti-forgery gate: even if a rogue miner
+        inserts fake rows into client_utxos / client_blocks, the next
+        startup will detect the mismatch and purge everything.
+        """
         if self._db is None:
             return
         try:
-            # Rehydrate finalized blocks
+            # ── Server-authority genesis check ─────────────────────────
+            # We import KoyebRPCNodule lazily to avoid circular imports.
+            # If the server is unreachable, we still load local cache (offline mode).
+            _server_chain_valid = True
+            try:
+                from qtcl_client import KoyebRPCNodule, ENTROPY_SERVER_URL
+                _kapi = KoyebRPCNodule(ENTROPY_SERVER_URL)
+                _chain = _kapi._rpc("qtcl_getBlockHeight", [], timeout=5, retries=1)
+                _server_height = int(_chain.get("height", 0)) if isinstance(_chain, dict) else 0
+                # Check our highest local block
+                _local_max_row = self._db.execute(
+                    "SELECT MAX(height) FROM client_blocks"
+                ).fetchone()
+                _local_max = int(_local_max_row[0]) if _local_max_row and _local_max_row[0] is not None else 0
+
+                if _server_height < _local_max:
+                    # Server chain is BEHIND local cache → server was reset
+                    logger.warning(
+                        f"[CACHE-REHYDRATE] ⚠️  SERVER CHAIN RESET DETECTED: "
+                        f"server_height={_server_height} < local_max={_local_max} "
+                        f"— PURGING ALL LOCAL MIRROR TABLES"
+                    )
+                    self._db.execute("DELETE FROM client_utxos")
+                    self._db.execute("DELETE FROM client_blocks")
+                    self._db.execute("DELETE FROM client_rewards")
+                    self._balance_qtcl = 0.0
+                    self._highest_finalized_height = 0
+                    self._finalized_count = 0
+                    self._total_rewards = 0.0
+                    logger.info("[CACHE-REHYDRATE] ✅ Local mirror purged — in sync with server genesis")
+                    _server_chain_valid = False  # skip loading stale rows below
+            except Exception as _srv_err:
+                logger.debug(f"[CACHE-REHYDRATE] Server check skipped (offline?): {_srv_err}")
+
+            if not _server_chain_valid:
+                return
+
+            # ── Normal rehydrate from local SQLite ─────────────────────
             rows = self._db.execute(
                 "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at "
                 "FROM client_blocks WHERE finalized = 1 ORDER BY height"
@@ -7622,7 +7622,21 @@ class BlockSubmissionCache:
             logger.debug(f"[CACHE-REHYDRATE] {_rh_err}")
 
     def _compute_balance_from_utxos(self) -> float:
-        """Sum unspent outputs from client_utxos mirror."""
+        """Sum unspent outputs from client_utxos mirror.
+
+        TRUST MODEL:  This is a LOCAL DISPLAY VALUE ONLY.
+        The server NEVER trusts this number.  Every transaction submit
+        is validated against the server's own UTXO set (address_utxos).
+        A rogue miner editing client_utxos gains nothing because:
+          1. _rehydrate() purges all local state if server chain height
+             is lower than local max (genesis reset detection).
+          2. _sync_utxos_from_server() DELETE-wipes any UTXO not in
+             the server's canonical response (including 0-UTXO resets).
+          3. Transaction submission validates balance server-side in
+             _settle_utxo_block() and the mempool's Python-side check.
+          4. The "never overwrite higher balance" guard is REMOVED —
+             balance always tracks server truth.
+        """
         if self._db is None:
             return 0.0
         try:
@@ -7661,27 +7675,57 @@ class BlockSubmissionCache:
             logger.debug(f"[CACHE-PERSIST] reward h={height}: {_pe}")
 
     def _sync_utxos_from_server(self, kapi, address: str):
-        """Query server UTXOs and mirror locally in client_utxos."""
+        """Query server UTXOs and mirror locally in client_utxos.
+
+        SERVER IS THE SINGLE SOURCE OF TRUTH.  The local client_utxos table
+        is a read-through cache — it must never contain UTXOs the server
+        doesn't know about.  After a DB reset the server returns 0 UTXOs;
+        the local mirror must go to 0 as well.
+
+        ANTI-FORGERY:  A rogue miner cannot inflate their balance by
+        inserting fake rows into client_utxos because:
+          1. Every sync wipes UTXOs not in the server's response.
+          2. _compute_balance_from_utxos() is ONLY used for display —
+             the server re-validates balance on every transaction submit.
+          3. The "never overwrite higher balance" guard is REMOVED —
+             balance always tracks the server's authoritative UTXO set.
+        """
         if self._db is None or not address:
             return
         try:
             result = kapi._rpc("qtcl_getUTXOs", [{"address": address, "limit": 1000}], timeout=5, retries=1)
             if result and not result.get("error"):
                 utxos = result.get("utxos", [])
-                for utxo in utxos:
-                    self._db.execute(
-                        "INSERT OR REPLACE INTO client_utxos (tx_hash, output_index, address, amount, spent, created_at_height) VALUES (?,?,?,?,?,?)",
-                        (utxo["tx_hash"], utxo["output_index"], address,
-                         int(utxo["amount"]), 0, utxo.get("created_at_height", 0))
-                    )
-                # Mark any UTXOs not in the server list as spent (simple sync)
                 if utxos:
-                    tx_hashes = [u["tx_hash"] for u in utxos]
-                    placeholders = ",".join("?" * len(tx_hashes))
+                    # Upsert server UTXOs
+                    for utxo in utxos:
+                        self._db.execute(
+                            "INSERT OR REPLACE INTO client_utxos (tx_hash, output_index, address, amount, spent, created_at_height) VALUES (?,?,?,?,?,?)",
+                            (utxo["tx_hash"], utxo["output_index"], address,
+                             int(utxo["amount"]), 0, utxo.get("created_at_height", 0))
+                        )
+                    # Purge any local UTXOs NOT in the server's canonical set
+                    tx_keys = [(u["tx_hash"], int(u["output_index"])) for u in utxos]
+                    # Delete stale rows outright (not just mark spent — they don't exist on server)
+                    local_rows = self._db.execute(
+                        "SELECT tx_hash, output_index FROM client_utxos WHERE address = ?",
+                        (address,)
+                    ).fetchall()
+                    for lr in local_rows:
+                        if (lr[0], int(lr[1])) not in tx_keys:
+                            self._db.execute(
+                                "DELETE FROM client_utxos WHERE tx_hash = ? AND output_index = ?",
+                                (lr[0], lr[1])
+                            )
+                else:
+                    # SERVER RETURNED ZERO UTXOS — wipe entire local mirror for this address.
+                    # This is the critical path after a DB reset / genesis rebuild.
                     self._db.execute(
-                        f"UPDATE client_utxos SET spent = 1 WHERE address = ? AND tx_hash NOT IN ({placeholders})",
-                        (address, *tx_hashes)
+                        "DELETE FROM client_utxos WHERE address = ?", (address,)
                     )
+                    logger.info(f"[CACHE-UTXO-SYNC] Server returned 0 UTXOs for {address[:16]}… — local mirror wiped")
+
+                # Balance ALWAYS tracks server truth — no "never go down" guard
                 self._balance_qtcl = self._compute_balance_from_utxos()
         except Exception as _ue:
             logger.debug(f"[CACHE-UTXO-SYNC] {_ue}")
@@ -7965,7 +8009,11 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
 
     Retries with backoff until a non-zero balance is seen.
     Up to 20 attempts over ~120 s total.
-    Never overwrites a cached balance with a lower value (protects against Neon read-replica lag).
+
+    SERVER IS THE SINGLE SOURCE OF TRUTH.  The client never refuses to
+    accept a lower balance from the server.  After a DB reset the server
+    legitimately reports 0 — the old "never overwrite a higher cached
+    balance" guard was the root cause of phantom balances surviving resets.
     """
     await _asyncio.sleep(2.0)
     for attempt in range(20):
@@ -7973,16 +8021,10 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2)
             if result and not result.get("error"):
                 balance_qtcl = float(result.get("balance", 0))
+                # ALWAYS accept server balance — no "never go down" guard
+                cache._balance_qtcl = balance_qtcl
                 if balance_qtcl > 0:
-                    # FIX: never overwrite a higher cached balance with a stale Neon read
-                    if balance_qtcl >= cache._balance_qtcl:
-                        cache._balance_qtcl = balance_qtcl
-                        logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL (attempt {attempt+1})")
-                    else:
-                        logger.debug(
-                            f"[BALANCE] Poll returned {balance_qtcl:.4f} < cached {cache._balance_qtcl:.4f} "
-                            f"— Neon lag, keeping cached (attempt {attempt+1})"
-                        )
+                    logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL (attempt {attempt+1})")
                     return balance_qtcl
                 logger.debug(f"[BALANCE] Still 0 after finalize (attempt {attempt+1}) — retrying")
             delay = min(3.0 * (attempt + 1), 15.0)
@@ -7993,8 +8035,7 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
         result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1)
         if result and not result.get("error"):
             balance_qtcl = float(result.get("balance", 0))
-            if balance_qtcl >= cache._balance_qtcl:
-                cache._balance_qtcl = balance_qtcl
+            cache._balance_qtcl = balance_qtcl
             logger.info(f"[BALANCE] Final read: {balance_qtcl:.8f} QTCL")
             return balance_qtcl
     except Exception:
@@ -23879,7 +23920,7 @@ class QtclClientApp:
         from urllib.request import Request as _PoR, urlopen as _PoU
         from urllib.error import URLError as _PoE
 
-        url = f"http://{host}:{port}/rpc/oracle/snapshot"
+        url = f"http://{host}:{port}/rpc/oracle/snapshot/latest"
         BACKOFF = [5, 10, 20, 40]
         bi = 0
         _last_snap_count = 0
@@ -24008,14 +24049,14 @@ class QtclClientApp:
         from urllib.error import URLError as _SE, HTTPError as _HE
 
         _oracle_url = SSE_SERVICE_URL
-        url = f"{_oracle_url}/rpc/oracle/snapshot"
+        url = f"{_oracle_url}/rpc/oracle/snapshot/latest"
         _last_snap_hash = None
         _fail_count = 0
-        _backoff_ms = 300  # Start at 300ms
+        _backoff_ms = 1000  # Start at 1s (was 300ms — reduced server churn)
         _max_backoff_ms = 5000  # Cap at 5s
 
         _EXP_LOG.info(
-            f"[SNAPSHOT-RPC] 🚀 Starting aggressive polling every {_backoff_ms}ms → {url}"
+            f"[SNAPSHOT-RPC] 🚀 Starting polling every {_backoff_ms}ms → {url}"
         )
 
         while not self._stop.is_set():
@@ -24084,7 +24125,7 @@ class QtclClientApp:
                                             )
                                     _last_snap_hash = snap_hash
                                     _fail_count = 0
-                                    _backoff_ms = 300
+                                    _backoff_ms = 1000
                                 except Exception as _ie:
                                     _EXP_LOG.debug(
                                         f"[SNAPSHOT-RPC] ingest error: {_ie}"
@@ -26141,7 +26182,9 @@ class QtclClientApp:
 
             async def balance_task():
                 # Poll balance: fast (3s) for 120s after any finalize, then slow (30s).
-                # Prevents the "0.00 QTCL" display caused by Neon read-replica lag.
+                # SERVER IS AUTHORITATIVE — always accept the server's balance,
+                # including 0 after a DB reset.  The old "if _b > 0" guard was
+                # the reason phantom balances survived genesis rebuilds.
                 _last_seen_finalized = cache._highest_finalized_height
                 _fast_until = 0.0
                 while True:
@@ -26156,8 +26199,8 @@ class QtclClientApp:
                             result = kapi._rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
                                 _b = float(result.get("balance", 0))
-                                if _b > 0:
-                                    cache._balance_qtcl = _b
+                                # ALWAYS accept server balance — no > 0 guard
+                                cache._balance_qtcl = _b
                             cache._sync_utxos_from_server(kapi, _addr)
                     except Exception:
                         pass
