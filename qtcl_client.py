@@ -26241,7 +26241,7 @@ class QtclClientApp:
             except Exception:
                 return False
 
-        _REFRESH_INTERVAL = 1.0
+        _REFRESH_INTERVAL = 3.0
         _print_dashboard(force_full=True)
         print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
