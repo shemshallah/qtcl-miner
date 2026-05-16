@@ -749,8 +749,14 @@ class HypGammaEngine:
             if not isinstance(sig, dict):
                 raise ValueError("sig must be a dict")
 
-            if 'signature' not in sig or 'challenge' not in sig:
-                raise ValueError("sig missing required keys")
+            # Accept canonical format (R, Z, c_full) OR legacy wire format (signature, challenge).
+            # Do NOT gate here on wire-only keys — signature_from_dict handles both paths.
+            _has_canonical = 'R' in sig and 'Z' in sig and 'c_full' in sig
+            _has_wire = 'signature' in sig and 'challenge' in sig
+            if not _has_canonical and not _has_wire:
+                raise ValueError(
+                    "sig missing required keys: need (R, Z, c_full) or (signature, challenge)"
+                )
 
             logger.debug(f"Verifying signature: {sig.get('challenge', '?')[:16]}...")
 

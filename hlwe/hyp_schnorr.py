@@ -1267,7 +1267,9 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
             f"got {version!r}, expected {WIRE_VERSION!r}"
         )
 
-    # Canonical format with full signature fields
+    # Canonical format takes priority — must check BEFORE legacy path.
+    # A dict produced by sign_hash() may ALSO have 'signature'/'challenge' for
+    # wire compat, but if R/Z/c_full are present we always prefer the canonical path.
     if "R" in d and "Z" in d and "c_full" in d:
         R = PSLMatrix.from_dict(d["R"])
         Z = PSLMatrix.from_dict(d["Z"])
@@ -1278,7 +1280,10 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
             R._canonical_hex = d["R_canonical"]  # Attach for verify
         return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=c_exp, nonce_walk=[])
 
-    # Legacy/certificate format: signature matrix is R, challenge is c
+    # Legacy/certificate format: signature matrix is R, challenge is c.
+    # NOTE: This path produces Z=R as a placeholder. Verification only works if
+    # the server's verify() uses R directly (certificate-style), not Z@y^{-c}.
+    # Always prefer the canonical path (R, Z, c_full) when possible.
     if "signature" in d and "challenge" in d:
         sig_field = d["signature"]
         # Parse signature as PSL matrix (JSON with a, b, c, d)
@@ -1297,14 +1302,18 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
             # Z = R · y^c, but we don't have y here. Use placeholder Z = R.
             # This is a verification-only path where the actual Z would be computed
             # by the caller with knowledge of the public key.
-            c_hex = d["challenge"]
+            c_hex = d.get("c_full", d["challenge"])  # prefer c_full, fall back to challenge
             if isinstance(c_hex, str):
                 c_full = int(c_hex, 16)
             else:
                 c_full = int(c_hex)
             # For certificates, Z is not stored; verification uses different logic
             # Return signature with Z=R as placeholder - verification code handles this
-            return SchnorrSignature(R=R, Z=R, c_full=c_full, c_exp=0, nonce_walk=[])
+            sig = SchnorrSignature(R=R, Z=R, c_full=c_full, c_exp=0, nonce_walk=[])
+            # Preserve R_canonical if available so Fiat-Shamir binding is exact
+            if "R_canonical" in d:
+                R._canonical_hex = d["R_canonical"]
+            return sig
 
     raise ValueError(
         f"signature_from_dict: unrecognized signature format. "
@@ -2263,7 +2272,15 @@ class SchnorrGamma:
             bool: True if signature is valid, False otherwise.
         """
         try:
-            sig = signature_from_dict(sig_dict)
+            # If the dict has both wire fields (signature/challenge) AND canonical
+            # fields (R, Z, c_full), strip the wire fields before deserializing so
+            # signature_from_dict always takes the canonical path.  This avoids any
+            # ambiguity in dicts produced by sign_hash() which emits both formats.
+            _d = sig_dict
+            if "R" in _d and "Z" in _d and "c_full" in _d:
+                # Already canonical — safe to pass directly; strip legacy noise
+                _d = {k: v for k, v in _d.items() if k not in ("signature",)}
+            sig = signature_from_dict(_d)
             result = verify(sig, message_hash, public_key)
             return result.valid
         except Exception as e:
