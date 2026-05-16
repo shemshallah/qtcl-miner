@@ -15309,7 +15309,9 @@ class KoyebOracleState:
                 )
                 self.pq0_fidelity = float(fid)
                 self.w_state_fidelity = float(fid)
-                self.channel_latency_ms = (time.time() - t0) * 1000.0
+                # Only update latency if this was a real RPC call (not SSE cache hit)
+                if not live.get("_from_cache"):
+                    self.channel_latency_ms = (time.time() - t0) * 1000.0
                 self.connected = True
                 self.last_sync_ts = time.time()
                 if client_field:
@@ -15789,6 +15791,8 @@ class _MiningTelemetry:
         self.parent_hash = "0" * 64  # parent block hash
         self.nonce = 0  # current nonce being tried (cumulative, includes PERSISTENT_BASE)
         self.block_nonce = 0  # nonces tried for THIS block attempt only (display purposes)
+        self._session_nonces = 0  # cumulative nonces tried at current height (survives TTL restarts)
+        self._session_nonce_base = 0  # banked nonces from completed attempts at this height
         self.hash_rate = 0.0  # hashes/second (rolling 5 s window)
         self.blocks_found = 0  # blocks solved this session
         self.blocks_accepted = 0  # ✅ blocks accepted by server
@@ -15805,17 +15809,25 @@ class _MiningTelemetry:
         block_nonce: int = 0
     ) -> None:
         with self._lock:
-            if (height != self.height) or (nonce < self.nonce and self.nonce > 0):
+            # Only reset samples on actual HEIGHT change, not same-height TTL restart
+            if height != self.height:
                 self._nonce_samples.clear()
                 self.hash_rate = 0.0
+                self._session_nonces = 0
+                self._session_nonce_base = 0
             self.height = height
             self.difficulty = difficulty
             self.nonce = nonce
-            # block_nonce is the nonce TRIED within THIS BLOCK ATTEMPT ONLY
-            # (passed explicitly from the mining loop so the display never sees
-            # PERSISTENT_BASE accumulation). Falls back to derived value if 0.
+            # Track cumulative nonces tried this session (never resets within a height)
             if block_nonce > 0:
                 self.block_nonce = block_nonce
+                # _session_nonces accumulates across TTL restarts at same height
+                if not hasattr(self, '_session_nonces'):
+                    self._session_nonces = 0
+                # Update session total: base accumulated + current attempt progress
+                if not hasattr(self, '_session_nonce_base'):
+                    self._session_nonce_base = 0
+                self._session_nonces = self._session_nonce_base + block_nonce
             elif len(self._nonce_samples) > 0:
                 self.block_nonce = max(0, nonce - self._nonce_samples[0][1])
             if parent_hash:
@@ -15827,11 +15839,21 @@ class _MiningTelemetry:
                 t_first = self._nonce_samples[0][0]
                 n_first = self._nonce_samples[0][1]
                 dt = now - t_first
-                if dt > 0:
-                    raw_rate = (self.nonce - n_first) / dt
-                    # Clamp: 50M H/s ceiling prevents transient spike on first
-                    # few samples where dt < 1s inflates the display.
-                    self.hash_rate = min(raw_rate, 50_000_000.0)
+                dn = nonce - n_first
+                if dt > 0.5 and dn > 0:
+                    # Only compute rate with >0.5s window and positive nonce delta
+                    self.hash_rate = min(dn / dt, 50_000_000.0)
+                elif dt > 0 and dn <= 0:
+                    # Nonce wrapped/reset — clear stale samples, keep rate until fresh data
+                    self._nonce_samples.clear()
+                    self._nonce_samples.append((now, nonce))
+
+    def _accumulate_session_nonces(self, nonces_tried: int) -> None:
+        """Called when a block attempt ends (TTL/found/advance) to bank nonces."""
+        with self._lock:
+            if not hasattr(self, '_session_nonce_base'):
+                self._session_nonce_base = 0
+            self._session_nonce_base += nonces_tried
 
     def record_block(self, block: dict) -> None:
         """
@@ -15896,6 +15918,7 @@ class _MiningTelemetry:
                 "parent_hash": self.parent_hash,
                 "nonce": self.nonce,
                 "block_nonce": self.block_nonce,
+                "session_nonces": getattr(self, '_session_nonces', self.block_nonce),
                 "hash_rate": self.hash_rate,
                 "blocks_found": self.blocks_found,
                 "blocks_accepted": self.blocks_accepted,
@@ -25860,10 +25883,13 @@ class QtclClientApp:
 
                         _found = block_hash is not None
                         if _found:
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
                             _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
                         elif _chain_advanced:
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
                             _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
                         elif _ttl_expired:
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
                             _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0] + secrets.randbelow(1_000_000)
 
                         if not _found or _chain_advanced or _ttl_expired:
@@ -26175,7 +26201,8 @@ class QtclClientApp:
 
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
                 target_zeros = tel.get("difficulty", 5)
-                nonce_str = f"{tel.get('block_nonce', tel.get('nonce', 0)):,}"
+                _session_n = tel.get('session_nonces', tel.get('block_nonce', tel.get('nonce', 0)))
+                nonce_str = f"{_session_n:,}"
                 print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
