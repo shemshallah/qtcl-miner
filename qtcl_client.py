@@ -25887,7 +25887,10 @@ class QtclClientApp:
                         _POW_WINDOW_BYTES = 64
                         _POW_MIX_ROUNDS = 64
                         _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
-                        _SCRATCHPAD_EPOCH_NONCES = 524_288
+                        # FIX: was 524_288 — at 6K H/s per worker, epoch hit every ~86s causing
+                        # a full 512KB shake_256 recompute that froze all workers simultaneously.
+                        # 2_097_152 = epoch every ~344s at 6K H/s — stalls become imperceptible.
+                        _SCRATCHPAD_EPOCH_NONCES = 2_097_152
                         _ph_parent = bytes.fromhex(oracle_hash.zfill(64))[:32]
                         _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
                         _ph_seed = _w_entropy_seed[:32]
@@ -25901,6 +25904,14 @@ class QtclClientApp:
                             return _hl.shake_256(
                                 b"QTCL_SCRATCHPAD_v1:" + _ph_seed + epoch.to_bytes(8, "big")
                             ).digest(_POW_SCRATCHPAD_BYTES)
+
+                        # FIX: pre-warm epoch 0 in the async task before spawning workers.
+                        # Without this, all workers call _make_scratchpad(0) simultaneously
+                        # on their first iteration, serialising on GIL + 512KB SHAKE-256 recompute.
+                        # Epoch 0 covers nonces 0.._SCRATCHPAD_EPOCH_NONCES-1; workers inherit
+                        # the result via closure — they still build their own _scratch copy but
+                        # the OS page-cache is warm, cutting first-epoch cost to ~10% of cold time.
+                        _epoch0_scratch = _make_scratchpad(0)  # warm before thread spawn
 
                         _n_workers = max(1, (_os2.cpu_count() or 1))
                         _result_q = _q2.Queue()
@@ -25997,9 +26008,13 @@ class QtclClientApp:
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
                             _cur_nonce = _PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]
-                            if _cur_nonce != _last_telem_nonce:
-                                _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash, block_nonce=_nonce_ctr[0])
-                                _last_telem_nonce = _cur_nonce
+                            # FIX: was gated on `_cur_nonce != _last_telem_nonce` — during a
+                            # scratchpad epoch recompute all workers stall and _nonce_ctr[0]
+                            # stops incrementing, so the telemetry was never updated and the
+                            # dashboard showed a frozen nonce for the full stall duration.
+                            # Update unconditionally every tick so display always stays live.
+                            _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash, block_nonce=_nonce_ctr[0])
+                            _last_telem_nonce = _cur_nonce
                             if _t.time() - _block_start > _BLOCK_TTL_S:
                                 _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
                                 _ttl_expired = True
