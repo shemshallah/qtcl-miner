@@ -8196,12 +8196,15 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
 
     FIX: was returning on first balance > 0 result even if unchanged (Neon lag).
     Now polls until balance INCREASES above the pre-finalization snapshot.
+    FIX2: kapi._rpc() is synchronous — run in executor to avoid blocking event loop.
     """
     _pre_balance = cache._balance_qtcl  # snapshot — must exceed this to stop
     await _asyncio.sleep(0.5)
+    _loop = _asyncio.get_event_loop()
     for attempt in range(25):
         try:
-            result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2)
+            result = await _loop.run_in_executor(
+                None, lambda: kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2))
             if result and not result.get("error"):
                 balance_qtcl = float(result.get("balance", 0))
                 if balance_qtcl > _pre_balance:
@@ -8223,7 +8226,8 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
             await _asyncio.sleep(min(2.0 * (attempt + 1), 8.0))
     # Exhausted retries — one final authoritative read
     try:
-        result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1)
+        result = await _loop.run_in_executor(
+            None, lambda: kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1))
         if result and not result.get("error"):
             balance_qtcl = float(result.get("balance", 0))
             cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
@@ -16129,6 +16133,8 @@ _MINE_TELEM = _MiningTelemetry()
 # [0] = total hashes tried this block (all workers combined)
 # [1] = current PERSISTENT_NONCE_BASE (start of this block's nonce range)
 _MINE_RAW_CTR = [0, 0]
+# Session-wide total hashes tried across all block attempts (persists across IDLE)
+_SESSION_TOTAL_TRIED = [0]
 
 
 # SERVER RPC CLIENT — Pyth oracle metrics from server
@@ -25808,12 +25814,30 @@ class QtclClientApp:
                 _EXP_LOG.warning("[MINER] SSE handler registration failed — handlers not available")
 
             _REJECTED_HEIGHT_NONCES = {}
-            _PERSISTENT_NONCE_BASE = [secrets.randbelow(2 ** 32)]
+            # FIX: was secrets.randbelow(2**32) → nonces started at ~2B, confusing display.
+            # Start small; workers still cover the full uint32 space via wraparound.
+            _PERSISTENT_NONCE_BASE = [secrets.randbelow(1_000_000)]
+            # Reset session tried counter for this mining session
+            _SESSION_TOTAL_TRIED[0] = 0
+
+            # FIX: kapi._rpc() is synchronous (urllib.request.urlopen) and blocks the
+            # entire asyncio event loop when called from async tasks. This prevented
+            # the mining monitor's await sleep(0.05) from returning, freezing the
+            # nonce display for 8-16s during every RPC call in balance_task/oracle_task.
+            # Wrap all RPC calls through this helper to run them in a thread executor.
+            _rpc_executor = None  # use default ThreadPoolExecutor
+            async def _async_rpc(method, params=None, timeout=5, retries=2):
+                """Non-blocking async wrapper around kapi._rpc()."""
+                loop = _asyncio.get_event_loop()
+                # Use default-arg capture to freeze values at call time
+                def _call(m=method, p=params, t=timeout, r=retries):
+                    return kapi._rpc(m, p or [], timeout=t, retries=r)
+                return await loop.run_in_executor(_rpc_executor, _call)
 
             async def pow_task():
                 while True:
                     try:
-                        _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
+                        _res_h = await _async_rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
                         if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
                             await _asyncio.sleep(2.0)
                             continue
@@ -25841,7 +25865,7 @@ class QtclClientApp:
                         if _env_diff.isdigit():
                             _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY={difficulty_bits} leading-zeros")
 
-                        _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
+                        _res_m = await _async_rpc("qtcl_getMempool", [], timeout=5, retries=1)
                         _raw_pending_txs = _res_m if isinstance(_res_m, list) else []
                         _pending_user_txs = []
                         for _rptx in _raw_pending_txs:
@@ -25955,7 +25979,7 @@ class QtclClientApp:
                                     return
                                 # Fetch full TX dict from mempool for signature/inputs/outputs
                                 try:
-                                    _full_tx_list = kapi._rpc("qtcl_getMempool", [500], timeout=5, retries=1)
+                                    _full_tx_list = await _async_rpc("qtcl_getMempool", [500], timeout=5, retries=1)
                                     _full_tx = None
                                     if isinstance(_full_tx_list, list):
                                         for _ftx in _full_tx_list:
@@ -26079,6 +26103,7 @@ class QtclClientApp:
                                 n = start_nonce
                                 lc = 0
                                 _ctr = _nonce_ctr
+                                _raw_ctr = _MINE_RAW_CTR  # direct ref for display updates
                                 # Initial scratchpad for worker's start epoch
                                 _epoch = n // _epoch_size
                                 _scratch = _make_scratchpad(_epoch)
@@ -26113,6 +26138,13 @@ class QtclClientApp:
                                     if lc & 511 == 0:
                                         with _nl:
                                             _ctr[0] += 512
+                                        # FIX: Write display counters directly from worker thread.
+                                        # The async event loop gets blocked by synchronous kapi._rpc()
+                                        # calls in balance_task/oracle_task, preventing the old
+                                        # _MINE_RAW_CTR copy in the async mining monitor from running.
+                                        # Workers always run (GIL releases during I/O), so this
+                                        # keeps the dashboard live even when the event loop is stalled.
+                                        _raw_ctr[0] = _ctr[0]
                             finally:
                                 _gc.enable()
 
@@ -26125,7 +26157,8 @@ class QtclClientApp:
                         _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash,
                                                     block_nonce=0, persistent_base=_PERSISTENT_NONCE_BASE[0])
                         _MINE_TELEM.mark_mining()
-                        # Reset raw counter for this block attempt
+                        # Accumulate session total before resetting per-block counter
+                        _SESSION_TOTAL_TRIED[0] += _nonce_ctr[0]
                         _nonce_ctr[0] = 0
                         _MINE_RAW_CTR[0] = 0
                         _MINE_RAW_CTR[1] = _PERSISTENT_NONCE_BASE[0]
@@ -26141,10 +26174,11 @@ class QtclClientApp:
                         _last_telem_nonce = 0
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
-                            # Write raw counters directly — dashboard reads these, bypassing
-                            # the broken _session_nonces telemetry path that shows base when ctr=0.
+                            # Workers write _MINE_RAW_CTR[0] directly every 512 hashes.
+                            # This async copy is a backup in case workers are between updates.
                             _raw_tried = _nonce_ctr[0]
-                            _MINE_RAW_CTR[0] = _raw_tried
+                            if _raw_tried > _MINE_RAW_CTR[0]:
+                                _MINE_RAW_CTR[0] = _raw_tried
                             _cur_nonce = (_PERSISTENT_NONCE_BASE[0] + _raw_tried) & 0xFFFFFFFF
                             _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
                                                         block_nonce=_raw_tried, persistent_base=_PERSISTENT_NONCE_BASE[0])
@@ -26355,7 +26389,7 @@ class QtclClientApp:
                             # which now includes miner_reward_qtcl + miner_balance_qtcl.
                             if reward <= 0 or balance_qtcl <= 0:
                                 try:
-                                    _bs = kapi._rpc("qtcl_getBlockStatus", {"height": block.height}, timeout=8, retries=1)
+                                    _bs = await _async_rpc("qtcl_getBlockStatus", {"height": block.height}, timeout=8, retries=1)
                                     if isinstance(_bs, dict) and not _bs.get("error"):
                                         if reward <= 0:
                                             reward = float(_bs.get("miner_reward_qtcl", 0))
@@ -26413,7 +26447,7 @@ class QtclClientApp:
                                     _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
                             if not _broadcast_ok:
                                 try:
-                                    kapi._rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], 3, 1)
+                                    await _async_rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], timeout=3, retries=1)
                                     _EXP_LOG.info(f"[GOSSIP] ✅ Server-side gossip sent for h={block.height}")
                                 except Exception as _g_err:
                                     _EXP_LOG.warning(f"[GOSSIP] Server gossip failed: {_g_err}")
@@ -26449,7 +26483,7 @@ class QtclClientApp:
                                 _last_seen_finalized = _cur_fin
                                 _fast_until = _asyncio.get_event_loop().time() + 120.0
 
-                            result = kapi._rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
+                            result = await _async_rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
                                 _b = float(result.get("balance", 0))
                                 # ALWAYS accept server balance — no > 0 guard
@@ -26460,7 +26494,8 @@ class QtclClientApp:
                             # return stale/low value if UTXOs haven't settled yet,
                             # overwriting the correct server-returned balance.
                             _rpc_balance_snap = cache._balance_qtcl
-                            cache._sync_utxos_from_server(kapi, _addr)
+                            _loop = _asyncio.get_event_loop()
+                            await _loop.run_in_executor(None, cache._sync_utxos_from_server, kapi, _addr)
                             if cache._balance_qtcl < _rpc_balance_snap:
                                 cache._balance_qtcl = _rpc_balance_snap
                     except Exception:
@@ -26551,7 +26586,7 @@ class QtclClientApp:
                         # ── Poll each height ───────────────────────────────────
                         for _poll_h, _poll_hash in _need_poll:
                             try:
-                                _st = kapi._rpc(
+                                _st = await _async_rpc(
                                     "qtcl_getBlockStatus",
                                     {"height": _poll_h},
                                     timeout=8,
@@ -26706,9 +26741,13 @@ class QtclClientApp:
                 _raw_tried  = _MINE_RAW_CTR[0]
                 _raw_base   = _MINE_RAW_CTR[1]
                 _cur_nonce_disp = (_raw_base + _raw_tried) & 0xFFFFFFFF
+                # Session total = all previous block attempts + current block attempt
+                _session_tried = _SESSION_TOTAL_TRIED[0] + _raw_tried
                 tried_str = f"{_raw_tried:,}"
                 nonce_str = f"{_cur_nonce_disp:,}"
-                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={tried_str}  │  {hr_str}")
+                session_str = f"{_session_tried:,}" if _session_tried > _raw_tried else ""
+                _extra = f"  │  session={session_str}" if session_str else ""
+                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={tried_str}{_extra}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
