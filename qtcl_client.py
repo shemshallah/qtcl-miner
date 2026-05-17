@@ -1106,110 +1106,6 @@ logger.info(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
-# UTXO HELPERS — Query UTXOs, build transactions, compute balances
-# ═══════════════════════════════════════════════════════════════════════════════════════
-
-def _utxo_get_for_address(address: str, server_url: str = None) -> List[Dict[str, Any]]:
-    """Query unspent outputs for an address from the server."""
-    if not address or len(address) < 10:
-        return []
-    _url = (server_url or ENTROPY_SERVER_URL).rstrip("/")
-    kapi = KoyebRPCNodule(_url)
-    try:
-        _res = kapi._rpc("qtcl_getUTXOs", [address], timeout=8, retries=2)
-        if isinstance(_res, list):
-            return _res
-        elif isinstance(_res, dict) and "error" not in _res:
-            return _res.get("utxos", _res.get("outputs", []))
-    except Exception as e:
-        _EXP_LOG.debug(f"[UTXO-QUERY] Failed for {address[:16]}: {e}")
-    return []
-
-
-def _utxo_build_transaction(
-    from_address: str,
-    to_address: str,
-    amount_base: int,
-    fee_base: int,
-    private_key: str,
-    public_key: str,
-    server_url: str = None,
-) -> Optional[Dict[str, Any]]:
-    """Build a signed UTXO transaction spending from `from_address` to `to_address`."""
-    if amount_base <= 0:
-        return None
-
-    # Gather unspent outputs
-    _unspent = _utxo_get_for_address(from_address, server_url)
-    if not _unspent:
-        _EXP_LOG.warning(f"[UTXO-BUILD] No unspent outputs for {from_address[:16]}")
-        return None
-
-    # Sort by amount (largest first) to minimize inputs
-    _unspent.sort(key=lambda u: int(u.get("amount_base", 0)), reverse=True)
-
-    _inputs = []
-    _total_in = 0
-    _needed = amount_base + fee_base
-
-    for u in _unspent:
-        _amt = int(u.get("amount_base", 0))
-        _inputs.append({
-            "prev_tx_hash": u.get("tx_hash", u.get("prev_tx_hash", "")),
-            "prev_output_index": u.get("output_index", u.get("prev_output_index", 0)),
-            "script_sig": {},  # filled after signing
-        })
-        _total_in += _amt
-        if _total_in >= _needed:
-            break
-
-    if _total_in < _needed:
-        _EXP_LOG.warning(f"[UTXO-BUILD] Insufficient balance: {_total_in} < {_needed}")
-        return None
-
-    _outputs = [{"address": to_address, "amount_base": amount_base, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}]
-    _change = _total_in - _needed
-    if _change > 0:
-        _outputs.append({"address": from_address, "amount_base": _change, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"})
-
-    _tx = {
-        "tx_id": "",  # computed below
-        "version": 1,
-        "inputs": _inputs,
-        "outputs": _outputs,
-        "tx_type": "transfer",
-        "timestamp_ns": time.time_ns(),
-    }
-
-    # Compute tx_id
-    _canonical = json.dumps({
-        "version": _tx["version"],
-        "inputs": [{"prev_tx_hash": inp["prev_tx_hash"], "prev_output_index": inp["prev_output_index"]} for inp in _inputs],
-        "outputs": _outputs,
-        "tx_type": "transfer",
-    }, sort_keys=True, separators=(",", ":"))
-    _tx["tx_id"] = hashlib.sha3_256(_canonical.encode()).hexdigest()
-
-    # Sign each input
-    try:
-        _engine = HypGammaEngine()
-        _tx_bytes = hashlib.sha3_256(_canonical.encode()).digest()
-        _sig = _engine.sign_hash(_tx_bytes, private_key)
-        for inp in _tx["inputs"]:
-            inp["script_sig"] = {"signature": _sig, "public_key": public_key}
-    except Exception as e:
-        _EXP_LOG.error(f"[UTXO-BUILD] Signing failed: {e}")
-        return None
-
-    return _tx
-
-
-def _utxo_get_balance(address: str, server_url: str = None) -> int:
-    """Return total unspent balance for an address in base units."""
-    _unspent = _utxo_get_for_address(address, server_url)
-    return sum(int(u.get("amount_base", 0)) for u in _unspent)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════════════
 # ORACLE NODE — Local quantum measurement, block attestation, chain sync
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -13898,109 +13794,45 @@ class KoyebRPCNodule:
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
         Submit transaction via JSON-RPC 2.0 (qtcl_submitTransaction).
-
-        Normalizes amount/fee to float and ensures timestamp_ns is present.
-        Includes fallback for legacy servers without qtcl_submitTransaction.
+        Passes the TX dict directly to the server — the mempool normalizes
+        amounts, validates signatures, and checks balances server-side.
         """
         import time as _t2
-        import hashlib as _hl
 
         payload = dict(tx)
-        if "amount" in payload:
-            payload["amount"] = float(payload["amount"])
-        if "fee" in payload:
-            payload["fee"] = float(payload["fee"])
-        if "timestamp_ns" not in payload:
-            payload["timestamp_ns"] = str(_t2.time_ns())
-        payload.setdefault("from", payload.get("from_address", ""))
-        payload.setdefault("to", payload.get("to_address", ""))
+
+        # Ensure timestamp_ns is int (not str)
+        if "timestamp_ns" in payload and isinstance(payload["timestamp_ns"], str):
+            payload["timestamp_ns"] = int(payload["timestamp_ns"])
+        elif "timestamp_ns" not in payload:
+            payload["timestamp_ns"] = _t2.time_ns()
+
+        # Canonical dual-key aliases for mempool field name compat
+        payload.setdefault("from_address", payload.get("from", ""))
+        payload.setdefault("to_address", payload.get("to", ""))
         payload.setdefault("from_addr", payload.get("from_address", ""))
         payload.setdefault("to_addr", payload.get("to_address", ""))
+        payload.setdefault("tx_type", "transfer")
 
-        # Generate tx_hash if not provided
-        if "tx_hash" not in payload and "txid" not in payload:
-            from_addr = payload.get("from_address", "")
-            to_addr = payload.get("to_address", "")
-            amount = payload.get("amount", 0)
-            fee = payload.get("fee", 0.0)
-            nonce = payload.get("nonce", 0)
-            ts = payload.get("timestamp_ns", _t2.time_ns())
-            tx_data = f"{from_addr}:{to_addr}:{amount}:{fee}:{nonce}:{ts}"
-            payload["tx_hash"] = _hl.sha256(tx_data.encode()).hexdigest()
-
-        # ── Try JSON-RPC 2.0 first ───────────────────────────────
-        _EXP_LOG.info(
-            f"[TX] Submitting transaction: {payload.get('tx_hash', 'unknown')[:16]}..."
+        self._EXP_LOG.info(
+            f"[TX] Submitting transaction: {payload.get('tx_hash', '?')[:16]}..."
         )
-        r = self._rpc("qtcl_submitTransaction", [payload])
-
-        # Check for method not found error - try fallback
-        if r and isinstance(r, dict) and r.get("error"):
-            err_msg = str(r.get("error", ""))
-            if "Method not found" in err_msg or "-32601" in err_msg:
-                _EXP_LOG.warning(
-                    f"[TX] Server doesn't support qtcl_submitTransaction, trying fallback..."
-                )
-                # Fallback: try sending as block transaction via submitBlock (includes TXs)
-                return self._submit_transaction_fallback(payload)
+        r = self._rpc("qtcl_submitTransaction", [payload], timeout=30, retries=2)
 
         if r and isinstance(r, dict):
-            _EXP_LOG.info(
-                f"[TX] Response: status={r.get('status')} accepted={r.get('accepted')}"
+            if "error" in r:
+                err_msg = str(r.get("error", ""))
+                self._EXP_LOG.warning(f"[TX] Server rejected: {err_msg}")
+                return {"status": "rejected", "error": err_msg, "accepted": False}
+            self._EXP_LOG.info(
+                f"[TX] Response: status={r.get('status')} accepted={r.get('accepted')} "
+                f"tx_hash={r.get('tx_hash', '?')[:16]}"
             )
-        elif r is None:
-            _EXP_LOG.warning(f"[TX] No response from server, trying fallback...")
-            return self._submit_transaction_fallback(payload)
+        else:
+            self._EXP_LOG.warning("[TX] No response from server")
+            r = {"status": "no_response", "accepted": False, "error": "No response from server"}
 
-        return r if r is not None else None
-
-    def _submit_transaction_fallback(self, payload: dict) -> Optional[dict]:
-        """Fallback: try to submit transaction via getEvents (observer pattern) or direct DB."""
-        import time as _t2
-
-        _EXP_LOG.info(f"[TX-FALLBACK] Attempting alternative submission...")
-
-        # Try mempool stats endpoint which might expose transaction acceptance
-        try:
-            mempool = self._rpc("qtcl_getMempoolStats", [])
-            _EXP_LOG.info(f"[TX-FALLBACK] Mempool stats: {mempool}")
-        except Exception as e:
-            _EXP_LOG.debug(f"[TX-FALLBACK] Mempool check failed: {e}")
-
-        # Check balance to confirm wallet works
-        try:
-            from_addr = payload.get("from_address", "")
-            bal = self._rpc("qtcl_getBalance", [from_addr])
-            if bal and isinstance(bal, dict):
-                balance = float(bal.get("balance", 0) or 0)
-                _EXP_LOG.info(f"[TX-FALLBACK] Balance check: {balance} QTCL")
-
-                # If we have sufficient balance, note that TX system needs server upgrade
-                amount = float(payload.get("amount", 0))
-                fee = float(payload.get("fee", 0.0))
-                if balance >= amount + fee:
-                    _EXP_LOG.warning(
-                        f"[TX-FALLBACK] ⚠️ Balance sufficient but server lacks qtcl_submitTransaction. Server needs upgrade."
-                    )
-                    return {
-                        "status": "pending_upgrade",
-                        "accepted": False,
-                        "message": "Server does not support qtcl_submitTransaction. Please upgrade server to latest version.",
-                        "balance": balance,
-                        "required": amount + fee,
-                    }
-                else:
-                    return {
-                        "status": "insufficient_balance",
-                        "accepted": False,
-                        "message": f"Insufficient balance: {balance} QTCL, need {amount + fee} QTCL",
-                        "balance": balance,
-                        "required": amount + fee,
-                    }
-        except Exception as e:
-            _EXP_LOG.warning(f"[TX-FALLBACK] Balance check failed: {e}")
-
-        return {"error": "Transaction submission failed - server may need upgrade"}
+        return r
 
     def get_peers(self) -> list:
         """Get peer list via JSON-RPC."""
@@ -27086,88 +26918,100 @@ class QtclClientApp:
     def _send_tx_wizard(self) -> None:
         try:
             to_addr = input("  To address (64-char hex): ").strip()
-            amount = float(input("  Amount (QTCL): ").strip())
-
-            # Use existing fee structure for network donations
-            donate = input("  Donate to the network? [y/N]: ").strip().lower()
-            if donate == "y":
-                fee = float(
-                    input("  Donation amount [default 0.001]: ").strip() or "0.001"
-                )
+            amount_qtcl = float(input("  Amount (QTCL): ").strip())
+            memo = input("  Memo [optional]: ").strip()
+            use_fee = input("  Custom fee? [y/N]: ").strip().lower()
+            if use_fee == "y":
+                fee_qtcl = float(input("  Fee (QTCL) [default 0.01]: ").strip() or "0.01")
             else:
-                fee = 0.0
+                fee_qtcl = 0.01
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled")
             return
         if not to_addr or len(to_addr) < 40 or not all(c in '0123456789abcdef' for c in to_addr.lower()):
-            print("  ❌ Invalid QTCL address (expected hex)")
+            print("  ❌ Invalid QTCL address (expected 64-char hex)")
             return
-        tx = {
-            "from_address": self.wallet.address,
-            "to_address": to_addr,
-            "amount": amount,
-            "fee": fee,
-            "timestamp": time.time(),
-            "nonce": int(time.time() * 1000),
-            "public_key": self.wallet.public_key or "",
-            "pq_curr": self.koyeb_state.pq_curr_id,
-            "block_height": self.koyeb_state.block_height,
-            "w_state_fidelity": self.koyeb_state.w_state_fidelity,
+        if not self.wallet.private_key:
+            print("  ❌ No private key loaded — cannot sign transaction")
+            return
+
+        from_addr = self.wallet.address
+        amount_base = int(round(amount_qtcl * 100))
+        fee_base = int(round(fee_qtcl * 100))
+        nonce = int(time.time() * 1000)
+        timestamp_ns = time.time_ns()
+
+        # ── Compute canonical tx_hash (must match mempool MempoolTx.canonical_hash) ──
+        # Format: SHA3-256("from_addr:to_addr:amount_qtcl_float:fee_qtcl_float:nonce:timestamp_ns")
+        _amt_f = float(amount_base / 100.0)
+        _fee_f = float(fee_base / 100.0)
+        _canon_str = f"{from_addr}:{to_addr}:{_amt_f}:{_fee_f}:{nonce}:{timestamp_ns}"
+        tx_hash = hashlib.sha3_256(_canon_str.encode()).hexdigest()
+
+        # ── Build signing payload (must match mempool MempoolTx.get_signing_hash) ──
+        # SHA3-256(json.dumps({"sender": from, "recipient": to, "amount": amt_f, "nonce": nonce}, sort_keys=True))
+        _sign_data = {
+            "sender": from_addr,
+            "recipient": to_addr,
+            "amount": _amt_f,
+            "nonce": nonce,
         }
-        # ── SIGNATURE GENERATION (HypΓ CANONICAL) ──────────────────
-        if self.wallet.private_key:
-            tx_to_sign = {
-                "sender": self.wallet.address,
-                "recipient": to_addr,
-                "amount": float(amount),
-                "nonce": tx["nonce"],
-            }
-            sig_dict = hyp_sign_transaction(tx_to_sign, self.wallet.private_key)
-            # wallet.public_key is guaranteed canonical (2048-char lattice key) after
-            # migration in load() — never re-derive here to avoid engine version skew.
-            sig_dict["public_key_hex"] = self.wallet.public_key or ""
-            tx["signature"] = _json.dumps(sig_dict)
+        _sign_json = json.dumps(_sign_data, sort_keys=True, default=str)
+        _message_hash = hashlib.sha3_256(_sign_json.encode("utf-8")).digest()
 
-        # Standard tx_id for display
-        tx_id = _hashlib.sha256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
-        tx["tx_id"] = tx_id
+        # ── Sign with HypΓ engine ──
+        _engine = HypGammaEngine()
+        sig = _engine.sign_hash(_message_hash, self.wallet.private_key)
+        sig["public_key_hex"] = self.wallet.public_key or ""
+        sig["public_key"] = self.wallet.public_key or ""
 
-        import time as _tw
+        # ── Build the full transaction dict matching mempool expectations exactly ──
+        tx = {
+            "tx_hash": tx_hash,
+            "from_address": from_addr,
+            "to_address": to_addr,
+            "amount": _amt_f,
+            "amount_base": amount_base,
+            "fee": _fee_f,
+            "fee_base": fee_base,
+            "nonce": nonce,
+            "timestamp_ns": timestamp_ns,
+            "tx_type": "transfer",
+            "memo": memo[:256] if memo else "",
+            "signature": sig,
+            "sender_public_key_hex": self.wallet.public_key or "",
+            "public_key": self.wallet.public_key or "",
+            "outputs": [{"address": to_addr, "amount_base": amount_base}],
+            "inputs": [],
+            "metadata": {
+                "sender_public_key_hex": self.wallet.public_key or "",
+            },
+        }
 
-        tx["timestamp_ns"] = str(_tw.time_ns())
+        print(f"\n  ── Transaction Summary ──")
+        print(f"     From:  {from_addr[:20]}…")
+        print(f"     To:    {to_addr[:20]}…")
+        print(f"     Amt:   {amount_qtcl:.2f} QTCL")
+        print(f"     Fee:   {fee_qtcl:.4f} QTCL")
+        print(f"     Hash:  {tx_hash[:32]}…")
+        print(f"     Nonce: {nonce}")
+        confirm = input("  Submit? [Y/n]: ").strip().lower()
+        if confirm == "n":
+            print("  ❌ Cancelled")
+            return
+
         result = self.api.submit_transaction(tx)
-        if result and result.get("tx_hash"):
-            srv = result.get("tx_hash", result.get("txid", tx_id))
+        if result and result.get("accepted"):
+            srv = result.get("tx_hash", tx_hash)
             print(f"\n  ✅ Submitted  │  hash: {srv}")
-            print(
-                f"  Status: {result.get('status', 'pending')}  │  "
-                f"donation: {result.get('fee', fee):.8f}  │  "
-                f"query: /api/transactions/{srv}"
-            )
-            try:
-                pass  # SSE removed - RPC only
-            except Exception:
-                pass
+            print(f"  Status: {result.get('status', 'pending')}")
         elif result and result.get("error"):
             err = result.get("error", "unknown rejection")
-            code = result.get("code", "")
-            print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
+            print(f"\n  ❌ Rejected: {err}")
+            print(f"  Try: {self.oracle_url}")
         else:
-            print("  ❌ Submission failed — no response from RPC nodule")
-            print("")
-            print(self.api.get_diagnostics())
-            print("")
-            print(f"  📋 TX details (not submitted):")
-            print(f"     Hash:  {tx_id[:32]}…")
-            print(f"     From:  {tx['from_address'][:16]}…")
-            print(f"     To:    {tx['to_address'][:16]}…")
-            print(f"     Amt:   {tx['amount']} QTCL")
-            print("")
-            print(f"  💡 Troubleshooting:")
-            print(f"     1. Verify {self.oracle_url} is online")
-            print(f"     2. Check your internet connection")
-            print(f"     3. Try again in a few moments (server may be restarting)")
-            print(f"     4. If persistent, the RPC nodule may be down")
+            print("  ❌ Submission failed — no response")
+            print(f"  Try: {self.oracle_url}")
 
     def _query_tx(self) -> None:
         try:
