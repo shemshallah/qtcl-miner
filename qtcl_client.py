@@ -16021,6 +16021,7 @@ class _MiningTelemetry:
         self.session_start = time.time()
         self._nonce_samples: "_deque" = _deque(maxlen=50)  # (ts, nonce) for rate calc
         self.state = "IDLE"  # IDLE | MINING | SOLVED | SUBMITTING
+        self._mining_height = 0  # height currently being mined (for state priority)
 
     def update_progress(
         self, height: int, difficulty: int, nonce: int, parent_hash: str = "",
@@ -16110,8 +16111,11 @@ class _MiningTelemetry:
             self.last_block_ts = time.time()
             self.state = "SOLVED"
 
-    def mark_submitting(self) -> None:
+    def mark_submitting(self, submit_height: int = 0) -> None:
         with self._lock:
+            # Don't override MINING state if pow_task has already moved to next block
+            if self.state == "MINING" and self._mining_height > submit_height > 0:
+                return
             self.state = "SUBMITTING"
 
     def record_block_accepted(
@@ -16137,9 +16141,11 @@ class _MiningTelemetry:
         with self._lock:
             self.state = "IDLE"
 
-    def mark_mining(self) -> None:
+    def mark_mining(self, height: int = 0) -> None:
         with self._lock:
             self.state = "MINING"
+            if height > 0:
+                self._mining_height = height
 
     def snapshot(self) -> dict:
         """Lock-free snapshot for display with rewards."""
@@ -26192,7 +26198,7 @@ class QtclClientApp:
                         # block_nonce is updated from _nonce_ctr[0] every 50ms in the mining loop.
                         _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash,
                                                     block_nonce=0, persistent_base=_PERSISTENT_NONCE_BASE[0])
-                        _MINE_TELEM.mark_mining()
+                        _MINE_TELEM.mark_mining(target_height)
                         # Accumulate session total before resetting per-block counter
                         _SESSION_TOTAL_TRIED[0] += _nonce_ctr[0]
                         _nonce_ctr[0] = 0
@@ -26253,10 +26259,17 @@ class QtclClientApp:
                             _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
                             _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0] + secrets.randbelow(1_000_000)) & 0xFFFFFFFF
 
-                        if not _found or _chain_advanced or _ttl_expired:
+                        if not _found:
+                            # No solution found — chain advanced, TTL expired, or aborted
                             _MINE_TELEM.mark_idle()
                             await _asyncio.sleep(0.1)
                             continue
+
+                        # Block WAS found — even if chain also advanced simultaneously
+                        # (SSE fired block_finalized for previous height during our solve),
+                        # we still submit our solution. The server will accept or reject it.
+                        # Previously this path discarded valid solutions when _chain_advanced
+                        # was True, losing the block entirely.
 
                         # 🔴 CRITICAL: Reject nonce=0 — server will reject it for non-genesis blocks
                         if nonce is None or nonce == 0:
@@ -26408,7 +26421,7 @@ class QtclClientApp:
                         continue
                     _EXP_LOG.info(f"[SUBMIT] 📡 Submitting h={block.height} hash={block.block_hash[:16]}…")
                     cache.mark_submitted(block.height)
-                    _MINE_TELEM.mark_submitting()
+                    _MINE_TELEM.mark_submitting(block.height)
                     success, result = await pipeline.submit(block.submit_payload, block.height, block.block_hash)
                     if success:
                         status = (result or {}).get("status", "")
