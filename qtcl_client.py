@@ -27166,8 +27166,7 @@ class QtclClientApp:
         }
 
         # ── Summary ───────────────────────────────────────────────────────────
-        print(f"
-  ── Transaction Summary ──")
+        print(f"\n  ── Transaction Summary ──")
         print(f"     From:  {from_addr[:20]}…")
         print(f"     To:    {to_addr[:20]}…")
         print(f"     Amt:   {amount_qtcl:.2f} QTCL")
@@ -27186,8 +27185,7 @@ class QtclClientApp:
         # ── Result display ────────────────────────────────────────────────────
         if result and result.get("accepted"):
             srv_hash = result.get("tx_hash", tx_hash)
-            print(f"
-  ✅ Submitted  │  hash: {srv_hash}")
+            print(f"\n  ✅ Submitted  │  hash: {srv_hash}")
             print(f"     Status  : {result.get('status', 'pending')}")
             print(f"     Message : {result.get('message', 'ok')}")
             if srv_hash != tx_hash:
@@ -27204,18 +27202,14 @@ class QtclClientApp:
             # Classify for a helpful message
             _em = err_str.lower()
             if any(k in _em for k in ("initializing", "starting", "boot", "warming")):
-                print(f"
-  ❌ Server still warming up after retries.")
+                print(f"\n  ❌ Server still warming up after retries.")
                 print(f"     Retry in ~30s or visit: {self.api.base_url}")
             elif any(k in _em for k in ("insufficient", "balance")):
-                print(f"
-  ❌ Insufficient balance: {err_str}")
+                print(f"\n  ❌ Insufficient balance: {err_str}")
             elif any(k in _em for k in ("signature", "sig")):
-                print(f"
-  ❌ Signature rejected: {err_str}")
+                print(f"\n  ❌ Signature rejected: {err_str}")
             else:
-                print(f"
-  ❌ Rejected: {err_str}")
+                print(f"\n  ❌ Rejected: {err_str}")
             print(f"     Try: {self.oracle_url}")
         else:
             _err_detail = (result or {}).get('error', 'no response from server')
@@ -31726,10 +31720,7 @@ def main() -> None:  # noqa: F811
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TX PATCH v4.0 — INLINED (no companion module required)
-# Standalone helpers: _raw_rpc_post, _submit_with_startup_retry, TxSubmitter,
-# patch_qtcl_client.  All previously in qtcl_tx_patch.py — merged here so
-# qtcl_client.py is the single source of truth.
+# TX PATCH v4.0 — INLINED (single-file, no companion module)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PATCH_DEFAULT_URL       = "https://qtcl-blockchain.koyeb.app"
@@ -31777,13 +31768,7 @@ def _patch_is_permanent(err: str) -> bool: m = str(err).lower(); return any(k in
 
 
 def _submit_with_startup_retry(tx: dict, base_url: str, session=None, print_fn=print) -> dict:
-    """
-    Submit tx with cold-start awareness.
-    1. Poll /health up to _PATCH_HEALTH_WAIT s.
-    2. POST qtcl_submitTransaction.
-    3. Transient error (-32000 + init/starting): backoff + retry up to _PATCH_MAX_RETRIES.
-    4. Permanent error: return immediately.
-    """
+    """Submit tx with cold-start awareness — polls /health, retries transient errors, returns on permanent."""
     import random as _rand
     if not _patch_poll_health(base_url, timeout=_PATCH_HEALTH_WAIT, session=session):
         print_fn("  ⏳ /health still starting — proceeding anyway (wsgi will wait)…")
@@ -31803,8 +31788,7 @@ def _submit_with_startup_retry(tx: dict, base_url: str, session=None, print_fn=p
             err = resp["error"]
             err_msg = str(err.get("message","")) if isinstance(err, dict) else str(err)
             last_error = err
-            if _patch_is_permanent(err_msg):
-                return {"accepted":False,"error":err,"status":"rejected"}
+            if _patch_is_permanent(err_msg): return {"accepted":False,"error":err,"status":"rejected"}
             if _patch_is_transient(err_msg) and attempt < _PATCH_MAX_RETRIES - 1:
                 backoff = _PATCH_BASE_BACKOFF * (2 ** attempt) + _rand.random()
                 print_fn(f"  ⏳ Server warming up (attempt {attempt+1}/{_PATCH_MAX_RETRIES}) — retrying in {backoff:.1f}s…")
@@ -31818,9 +31802,9 @@ class TxSubmitter:
     """Self-contained tx builder + submitter — no dependency on KoyebRPCNodule internals."""
     def __init__(self, base_url: str = _PATCH_DEFAULT_URL, private_key: str = "",
                  address: str = "", public_key: str = "", fee_qtcl: float = _PATCH_DEFAULT_FEE_QTCL):
-        self.base_url = base_url.rstrip("/"); self.private_key = private_key
-        self.address = address; self.public_key = public_key; self.fee_qtcl = fee_qtcl
-        self._session = _requests.Session() if _HAS_REQUESTS else None
+        self.base_url    = base_url.rstrip("/"); self.private_key = private_key
+        self.address     = address; self.public_key = public_key; self.fee_qtcl = fee_qtcl
+        self._session    = _requests.Session() if _HAS_REQUESTS else None
 
     def _build_tx(self, to_addr: str, amount_qtcl: float, fee_qtcl: float, memo: str = "") -> dict:
         amount_base = int(round(amount_qtcl * 100)); fee_base = int(round(fee_qtcl * 100))
@@ -31841,7 +31825,6 @@ class TxSubmitter:
 
     def build_and_submit(self, to_addr: str, amount_qtcl: float, memo: str = "",
                          fee_qtcl: Optional[float] = None, print_fn=print) -> dict:
-        """Build, sign, and submit a QTCL transfer."""
         tx = self._build_tx(to_addr, amount_qtcl, fee_qtcl or self.fee_qtcl, memo)
         return _submit_with_startup_retry(tx, self.base_url, session=self._session, print_fn=print_fn)
 
@@ -31865,10 +31848,8 @@ class TxSubmitter:
 def patch_qtcl_client(app) -> None:
     """
     Monkey-patch a QtclClientApp in-place with v4.0 tx layer.
-    Call after instantiation, before app.run():
-        patch_qtcl_client(app)
-    Both _send_tx_wizard and api.submit_transaction are replaced with startup-resilient v4.0.
-    No-op if symbols already patched (idempotent).
+    Replaces _send_tx_wizard and api.submit_transaction with startup-resilient versions.
+    Idempotent — safe to call multiple times.
     """
     import types as _types
 
@@ -31922,15 +31903,12 @@ def patch_qtcl_client(app) -> None:
 
     tx_mode = getattr(app, "_tx_mode", app)
     if hasattr(tx_mode, "_send_tx_wizard"):
-        tx_mode._send_tx_wizard = _types.MethodType(_wizard_v4, tx_mode)
-        print("[PATCH] ✅ _send_tx_wizard → v4.0")
+        tx_mode._send_tx_wizard = _types.MethodType(_wizard_v4, tx_mode); print("[PATCH] ✅ _send_tx_wizard → v4.0")
     elif hasattr(app, "_send_tx_wizard"):
-        app._send_tx_wizard = _types.MethodType(_wizard_v4, app)
-        print("[PATCH] ✅ _send_tx_wizard → v4.0")
+        app._send_tx_wizard = _types.MethodType(_wizard_v4, app); print("[PATCH] ✅ _send_tx_wizard → v4.0")
     api = getattr(app, "api", None)
     if api and hasattr(api, "submit_transaction"):
-        api.submit_transaction = _types.MethodType(_submit_v4, api)
-        print("[PATCH] ✅ api.submit_transaction → v4.0")
+        api.submit_transaction = _types.MethodType(_submit_v4, api); print("[PATCH] ✅ api.submit_transaction → v4.0")
     print("[PATCH] ✅ qtcl_tx_patch v4.0 inlined — single-file mode")
 
 
