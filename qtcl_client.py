@@ -8227,14 +8227,25 @@ def _fmt_ago(timestamp: float) -> str:
         return f"{int(delta / 3600)}h ago"
 
 
-async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
+async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache,
+                                       pre_balance: float = None):
     """Confirmatory balance poll after block finalization.
 
     Polls until balance INCREASES above the pre-finalization snapshot.
     Uses run_in_executor to avoid blocking the async event loop.
+
+    pre_balance: the balance value BEFORE this block was submitted. Pass explicitly
+                 so the function does not accidentally snapshot a value that was
+                 already updated from the submitBlock response or oracle_task — which
+                 caused the function to never detect an increase and the display to
+                 permanently show the pre-settlement balance.
     """
-    _pre_balance = cache._balance_qtcl  # snapshot — must exceed this to stop
-    await _asyncio.sleep(0.3)
+    # FIX: accept explicit pre_balance so we always compare against the correct
+    # baseline.  Snapshotting cache._balance_qtcl here is wrong when balance was
+    # already updated from the submitBlock response (same value as server would
+    # return, so "balance_qtcl > _pre_balance" never fires).
+    _pre_balance = pre_balance if pre_balance is not None else cache._balance_qtcl
+    await _asyncio.sleep(0.5)
     _loop = _asyncio.get_event_loop()
     # 40 attempts: first 10 at 1s, next 10 at 2s, next 10 at 4s, last 10 at 8s
     # Total window: ~150 seconds — covers Neon settlement lag
@@ -8251,8 +8262,13 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
                         f"(+{balance_qtcl - _pre_balance:.2f}, attempt {attempt+1})"
                     )
                     return balance_qtcl
-                # Keep display live at whatever server has (never go backwards)
-                cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
+                # FIX: do NOT use max() ratchet here — if server is returning the same
+                # old balance due to settlement lag, we want to keep polling.  Using max()
+                # silently accepted the stale value and set _balance_qtcl = old, which
+                # then caused the display to never update.  Instead, only update if the
+                # server returns a positive value that is strictly higher than old balance.
+                if balance_qtcl > 0 and balance_qtcl > cache._balance_qtcl:
+                    cache._balance_qtcl = balance_qtcl
             if attempt < 10:
                 await _asyncio.sleep(1.0)
             elif attempt < 20:
@@ -8263,14 +8279,19 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
                 await _asyncio.sleep(8.0)
         except Exception:
             await _asyncio.sleep(2.0)
-    # Exhausted retries — one final authoritative read
+    # Exhausted retries — one final authoritative read.
+    # FIX: use force=True via the force_refresh param so the server bypasses the
+    # balance cache and returns the live UTXO sum.
     try:
         result = await _loop.run_in_executor(
-            None, lambda: kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1))
+            None, lambda: kapi._rpc("qtcl_getBalance",
+                                    [{"address": wallet_addr, "force_refresh": True}],
+                                    timeout=10, retries=1))
         if result and not result.get("error"):
             balance_qtcl = float(result.get("balance", 0))
-            cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
-            logger.info(f"[BALANCE] Final read: {balance_qtcl:.8f} QTCL")
+            if balance_qtcl > 0:
+                cache._balance_qtcl = balance_qtcl
+                logger.info(f"[BALANCE] Final forced read: {balance_qtcl:.8f} QTCL")
             return balance_qtcl
     except Exception:
         pass
@@ -25837,6 +25858,20 @@ class QtclClientApp:
                 if evt_type == "block_finalized" and h > 0:
                     signal_chain_advance(h)
                     _EXP_LOG.info(f"[SSE-RECV] 🔥 BLOCK FINALIZED h={h} — mining loop signaled")
+                    # FIX: server now includes miner_balance_qtcl in block_finalized SSE event.
+                    # Update cache immediately — no polling needed if the event has the value.
+                    _sse_balance = float(data.get("miner_balance_qtcl", 0) or 0)
+                    _sse_reward  = float(data.get("miner_reward_qtcl", 0) or 0)
+                    _sse_miner   = data.get("miner_address", "")
+                    _wallet_addr = getattr(getattr(self, "wallet", None), "address", None)
+                    if _sse_balance > 0 and (_sse_miner == _wallet_addr or not _sse_miner):
+                        if _sse_balance > cache._balance_qtcl:
+                            _pre_sse = cache._balance_qtcl
+                            cache._balance_qtcl = _sse_balance
+                            _EXP_LOG.critical(
+                                f"[BALANCE] 💰 SSE block_finalized: {_pre_sse:.4f} "
+                                f"→ {_sse_balance:.8f} QTCL (+{_sse_reward:.2f} reward, h={h})"
+                            )
                 elif evt_type == "block_pending":
                     cached = cache.get_block(h)
                     if cached and cached.oracle_count != int(data.get("oracle_count", 0)):
@@ -26436,6 +26471,9 @@ class QtclClientApp:
                     _EXP_LOG.info(f"[SUBMIT] 📡 Submitting h={block.height} hash={block.block_hash[:16]}…")
                     cache.mark_submitted(block.height)
                     _MINE_TELEM.mark_submitting(block.height)
+                    # Snapshot pre-submit balance BEFORE any update so
+                    # _refresh_balance_on_finalize can detect the increase.
+                    _pre_submit_balance = cache._balance_qtcl
                     success, result = await pipeline.submit(block.submit_payload, block.height, block.block_hash)
                     if success:
                         status = (result or {}).get("status", "")
@@ -26479,7 +26517,11 @@ class QtclClientApp:
                             _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
                             # Always fire confirmatory refresh — polls until balance increases
                             # above pre-finalization value, catching all Neon settlement lag.
-                            _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
+                            # FIX: pass _pre_submit_balance so the refresh function uses the
+                            # balance from BEFORE this block was submitted, not the possibly
+                            # already-updated value (which could == server value, terminating
+                            # the poll loop immediately without actually confirming settlement).
+                            _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache, _pre_submit_balance))
                             # P2P broadcast after successful submission
                             _p2p_n = getattr(self, "p2p_node", None)
                             _broadcast_ok = False
@@ -26552,13 +26594,17 @@ class QtclClientApp:
                             result = await _async_rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
                                 _b = float(result.get("balance", 0))
-                                # Ratchet UP only — don't overwrite a higher balance from
-                                # _refresh_balance_on_finalize with a stale server read.
-                                # On startup, rehydrate sets the initial balance correctly.
-                                # A genuine balance decrease (spend) will be caught by
-                                # _sync_utxos_from_server which has the UTXO-level truth.
-                                if _b >= cache._balance_qtcl:
+                                # FIX: accept any non-zero value from server — the old
+                                # "if _b >= cache._balance_qtcl" ratchet prevented updating
+                                # when the server returned the correct new balance that
+                                # happened to equal the already-cached (pre-settlement) value.
+                                # The server is authoritative.  We only skip zero to avoid
+                                # a flash-zero during the settlement race window.
+                                if _b > 0:
                                     cache._balance_qtcl = _b
+                                elif _b == 0 and cache._balance_qtcl == 0:
+                                    # Both are 0 — genuinely no balance (or fresh start)
+                                    cache._balance_qtcl = 0.0
                             # FIX: snapshot authoritative RPC balance before calling
                             # _sync_utxos_from_server — that method calls
                             # _compute_balance_from_utxos() on local SQLite which may
@@ -26723,8 +26769,11 @@ class QtclClientApp:
                                         )
                                         _ot_wallet = getattr(getattr(self, "wallet", None), "address", None)
                                         if _ot_wallet:
+                                            # FIX: pass the balance BEFORE oracle finalization
+                                            # so the polling function detects the increase correctly.
+                                            _ot_pre_balance = cache._balance_qtcl
                                             _asyncio.create_task(
-                                                _refresh_balance_on_finalize(_ot_wallet, kapi, cache)
+                                                _refresh_balance_on_finalize(_ot_wallet, kapi, cache, _ot_pre_balance)
                                             )
                                 else:
                                     # Still genuinely PENDING on server — update oracle count
