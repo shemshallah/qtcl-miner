@@ -25856,8 +25856,16 @@ class QtclClientApp:
                 evt_type = data.get("event_type", "")
                 h = int(data.get("height", 0))
                 if evt_type == "block_finalized" and h > 0:
-                    signal_chain_advance(h)
-                    _EXP_LOG.info(f"[SSE-RECV] 🔥 BLOCK FINALIZED h={h} — mining loop signaled")
+                    # FIX: Only abort mining if the finalized block is AT OR ABOVE the
+                    # height we are currently targeting. Finalizing h=71 while we mine
+                    # h=72 is EXPECTED — don't abort. Abort only when h >= target_height
+                    # (chain has moved past us or someone else solved our target).
+                    _current_target = getattr(cache, "_current_target_height", 0)
+                    if h >= _current_target and _current_target > 0:
+                        signal_chain_advance(h)
+                        _EXP_LOG.info(f"[SSE-RECV] 🔥 BLOCK FINALIZED h={h} >= target={_current_target} — mining abort")
+                    else:
+                        _EXP_LOG.debug(f"[SSE-RECV] 🔔 BLOCK FINALIZED h={h} (target={_current_target}) — no abort, continuing")
                     # FIX: server now includes miner_balance_qtcl in block_finalized SSE event.
                     # Update cache immediately — no polling needed if the event has the value.
                     _sse_balance = float(data.get("miner_balance_qtcl", 0) or 0)
@@ -25890,7 +25898,12 @@ class QtclClientApp:
                     elif our_block:
                         cache.mark_rejected(h, f"superseded by {block_hash[:16]} from {miner[:16]}")
                         _EXP_LOG.warning(f"[SSE-RECV] ⚠️ Our block h={h} orphaned by {block_hash[:16]}")
-                    signal_chain_advance(h)
+                    # FIX: Only abort if this block is at/above our current mining target.
+                    # Block broadcasts for h < target_height are settlement notifications,
+                    # not chain-advance events — don't kill active mining.
+                    _current_target = getattr(cache, "_current_target_height", 0)
+                    if h >= _current_target and _current_target > 0:
+                        signal_chain_advance(h)
 
             globals()["_block_cache"] = cache
             for _reg_attempt in range(20):
@@ -26239,6 +26252,10 @@ class QtclClientApp:
                                 _gc.enable()
 
                         _EXP_LOG.warning(f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} workers={_n_workers}")
+                        # Stamp target height so SSE handlers know what height we're solving.
+                        # _consensus_handler and _block_handler use this to skip aborts for
+                        # block events that are BELOW our target (settlement of prior blocks).
+                        cache._current_target_height = target_height
                         # FIX BUG-1: Warmup call now passes persistent_base=_PERSISTENT_NONCE_BASE[0]
                         # so the display shows the cumulative nonces already tried this session,
                         # not 0. Without this, every SUBMITTED→MINING transition zeroed the nonce
@@ -26279,11 +26296,14 @@ class QtclClientApp:
                                 _abort_evt.set()
                                 break
                             _new_height = check_chain_advance()
-                            if _new_height > 0 and _new_height > oracle_height:
-                                _EXP_LOG.warning(f"[MINER] ⚡ Chain advance EVENT h={_new_height}")
+                            if _new_height > 0 and _new_height >= target_height:
+                                _EXP_LOG.warning(f"[MINER] ⚡ Chain advance h={_new_height} >= target={target_height} — abort")
                                 _chain_advanced = True
                                 _abort_evt.set()
                                 break
+                            elif _new_height > 0:
+                                # Stale signal for h < target_height (e.g. previous block settling)
+                                _EXP_LOG.debug(f"[MINER] ⏭  Chain advance h={_new_height} < target={target_height} — ignored")
 
                         for _wt in _workers:
                             _wt.join(timeout=2.0)
