@@ -7549,7 +7549,7 @@ class BlockSubmissionCache:
     rewards, block counts and chain tip survive script restarts.
     """
     MAX_SIZE = 32
-    EVICT_AFTER_S = 30.0  # FIX: was 0.0 — FINALIZED blocks never evicted from _blocks, accumulated in display forever
+    EVICT_AFTER_S = 30.0  # FIX: was 0.0 — FINALIZED blocks never evicted
 
     def __init__(self, db=None):
         self._lock = threading.RLock()
@@ -26002,21 +26002,33 @@ class QtclClientApp:
                         _RND_RANGE = range(_POW_MIX_ROUNDS)
                         _POW_PREFIX = b"QTCL_POW_v1:"
 
+                        # Shared scratchpad cache: epoch → bytes. Pre-computed in async task
+                        # and shared into workers via closure. Workers read from cache on first
+                        # iter instead of each recomputing 512KB shake_256 serially under GIL.
+                        _scratch_cache: dict = {}
+                        _scratch_lock = _thr2.Lock()
+
                         def _make_scratchpad(epoch: int) -> bytes:
                             """Generate epoch-scratchpad. ASICs must recompute 512KB every epoch."""
-                            return _hl.shake_256(
+                            with _scratch_lock:
+                                if epoch in _scratch_cache:
+                                    return _scratch_cache[epoch]
+                            result = _hl.shake_256(
                                 b"QTCL_SCRATCHPAD_v1:" + _ph_seed + epoch.to_bytes(8, "big")
                             ).digest(_POW_SCRATCHPAD_BYTES)
-
-                        # FIX-EPOCH: pre-warm the epoch that workers will ACTUALLY start on.
-                        # Workers start at _PERSISTENT_NONCE_BASE[0] which is a random uint32
-                        # (~2.7B). Their initial epoch = base // _SCRATCHPAD_EPOCH_NONCES, NOT 0.
-                        # Pre-warming epoch 0 was useless — every worker immediately called
-                        # _make_scratchpad(base_epoch) and serialized on a cold 512KB SHAKE-256.
-                        _base_epoch = _PERSISTENT_NONCE_BASE[0] // _SCRATCHPAD_EPOCH_NONCES
-                        _epoch0_scratch = _make_scratchpad(_base_epoch)  # warm actual start epoch
+                            with _scratch_lock:
+                                # Keep at most 2 epochs in cache (current + next) to bound memory
+                                if len(_scratch_cache) >= 4:
+                                    oldest = min(_scratch_cache)
+                                    del _scratch_cache[oldest]
+                                _scratch_cache[epoch] = result
+                            return result
 
                         _n_workers = max(1, (_os2.cpu_count() or 1))
+                        # Pre-compute the starting epoch in the async task (no GIL contention here)
+                        # so workers read from cache on first iter — zero cold-start stall.
+                        _start_epoch = _PERSISTENT_NONCE_BASE[0] // _SCRATCHPAD_EPOCH_NONCES
+                        _make_scratchpad(_start_epoch)  # populate cache before spawning
                         _result_q = _q2.Queue()
                         _abort_evt = _thr2.Event()
                         _nonce_lock = _thr2.Lock()
@@ -26113,10 +26125,9 @@ class QtclClientApp:
                         _last_telem_nonce = 0
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
-                            # _nonce_ctr[0] is the TOTAL hashes tried across all workers —
-                            # each worker independently adds 512 to the shared counter every
-                            # 512 local iters. No multiply needed.
-                            # _cur_nonce is worker-0's approximate position (masked uint32).
+                            # _nonce_ctr[0]: shared counter, ALL workers add to it (512 per 512 local iters).
+                            # It is the total hashes tried across all workers — no multiply needed.
+                            # _cur_nonce: worker-0 approximate position, masked to uint32 domain.
                             _cur_nonce = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
                             _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
                                                         block_nonce=_nonce_ctr[0], persistent_base=_PERSISTENT_NONCE_BASE[0])
@@ -26145,9 +26156,9 @@ class QtclClientApp:
                                 break
 
                         _found = block_hash is not None
-                        # _nonce_ctr[0] is already total hashes across all workers.
-                        # Advance base by total tried (masked uint32) so next block workers
-                        # start past all nonces already covered — no repeats, no gaps.
+                        # _nonce_ctr[0] is total hashes tried (all workers combined).
+                        # Advance base by that amount masked to uint32 — next block workers
+                        # start past all covered nonces with no overlap.
                         if _found:
                             _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
                             _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
@@ -26354,8 +26365,7 @@ class QtclClientApp:
                                     reward = 7.20  # depth-5 default
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
-                            # FIX-BALANCE: if balance still 0 after all recovery, sync fetch now
-                            # so dashboard shows correct balance on next tick, not async lag.
+                            # FIX-BALANCE: sync fetch if still 0 so dashboard updates immediately
                             if cache._balance_qtcl <= 0 or balance_qtcl <= 0:
                                 try:
                                     _bal_now = kapi._rpc("qtcl_getBalance", [block.miner_address], timeout=6, retries=1)
@@ -26683,8 +26693,8 @@ class QtclClientApp:
                 target_zeros = tel.get("difficulty", 5)
                 _tried = tel.get('session_nonces', tel.get('block_nonce', 0))
                 _cur_nonce_disp = tel.get('nonce', 0) & 0xFFFFFFFF
-                nonce_str = f"{_cur_nonce_disp:,}"
                 tried_str = f"{_tried:,}"
+                nonce_str = f"{_cur_nonce_disp:,}"
                 print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={tried_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
