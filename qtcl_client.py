@@ -7842,45 +7842,115 @@ class BlockSubmissionCache:
                     b.finalized_at = time.time()
 
     def update_from_sse(self, event: dict):
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX v5.0: Three bugs eliminated here.
+        #
+        # BUG-A: "if not b: return" — after mark_finalized() we called
+        #   _blocks.pop() immediately (below), so ANY subsequent SSE event for
+        #   that height — including a reconnect replay of the very same
+        #   block_finalized event — hit a missing key and silently returned.
+        #   The display then showed the block as PENDING forever because nothing
+        #   incremented _finalized_count for it.  FIX: if block is absent from
+        #   _blocks but height ≤ _highest_finalized_height, the work is already
+        #   done — just return cleanly.  If height > _highest_finalized_height
+        #   and the SSE says finalized=True, synthesise a minimal record so the
+        #   counters stay correct on reconnect replays.
+        #
+        # BUG-B: _blocks.pop() inside update_from_sse — eviction is _evict_old's
+        #   exclusive job.  Premature eviction here meant snapshot() iterated an
+        #   empty dict for that height and printed "0 finalized, 2 pending".
+        #   FIX: never pop inside SSE handler; let _evict_old do it on next tick.
+        #
+        # BUG-C: oracle_count from SSE server response is authoritative 5 (server
+        #   writes oracle_count=5 unconditionally on finalize).  The old
+        #   "if oracle_count >= b.oracle_count" guard would leave oracle_count=0
+        #   if the submit response had oracle_count=0 and the SSE fired with 5.
+        #   FIX: always accept whichever is higher, no direction restriction.
+        # ─────────────────────────────────────────────────────────────────────
         evt_type = event.get("event_type", "")
         h = int(event.get("height", 0))
         if h <= 0:
             return
+        oracle_count = int(event.get("oracle_count", len(event.get("oracle_ids", []))))
+        oracle_ids   = event.get("oracle_ids", [])
+        is_finalized_evt = (
+            evt_type == "block_finalized"
+            or event.get("finalized", False) is True
+            or (evt_type == "block_pending" and oracle_count >= 3)
+        )
+
         with self._lock:
             b = self._blocks.get(h)
+
+            # BUG-A FIX: block already evicted (previously finalized) — handle
+            # idempotently so reconnect replays don't corrupt counters.
             if not b:
+                if h <= self._highest_finalized_height:
+                    # Already known-finalized — event is a stale replay, ignore.
+                    return
+                if is_finalized_evt:
+                    # Server says finalized but we have no local record for this
+                    # height — can happen if SSE fires before submit_task() runs
+                    # (extreme race) or after a client restart.  Synthesise a
+                    # minimal finalized record so finalized_count() is correct.
+                    _synth = CachedBlock(
+                        height=h,
+                        block_hash=event.get("block_hash", ""),
+                        parent_hash="",
+                        nonce=0,
+                        timestamp=int(time.time()),
+                        difficulty=5,
+                        miner_address=event.get("miner_address", ""),
+                        status=BlockStatus.FINALIZED,
+                    )
+                    _synth.finalized_at = time.time()
+                    _synth.oracle_count = max(oracle_count, 5)
+                    _synth.oracle_ids   = oracle_ids or ["oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"]
+                    self._blocks[h]     = _synth
+                    self._hash_index[_synth.block_hash] = h
+                    self._highest_finalized_height = max(self._highest_finalized_height, h)
+                    self._finalized_count += 1
+                    self._persist_block_finalized(h, _synth)
+                # Either handled above or not our block at all — done.
                 return
-            oracle_count = int(event.get("oracle_count", 0))
-            oracle_ids = event.get("oracle_ids", [])
-            _was_finalized = b.status == BlockStatus.FINALIZED
-            if evt_type == "block_finalized":
+
+            _was_finalized = (b.status == BlockStatus.FINALIZED)
+
+            if evt_type == "block_finalized" or (is_finalized_evt and not _was_finalized):
                 b.status = BlockStatus.FINALIZED
-                b.finalized_at = time.time()
-                # Never downgrade oracle count on a finalized block
-                if oracle_count >= b.oracle_count:
-                    b.oracle_count = oracle_count
+                if not b.finalized_at:
+                    b.finalized_at = time.time()
+                # BUG-C FIX: always take the maximum oracle count, no direction guard
+                b.oracle_count = max(b.oracle_count, oracle_count, 5 if is_finalized_evt else 0)
+                if oracle_ids:
                     b.oracle_ids = oracle_ids
                 if not _was_finalized:
-                    self._persist_block_finalized(h, b)
                     self._highest_finalized_height = max(self._highest_finalized_height, h)
                     self._finalized_count += 1
-                    b2 = self._blocks.pop(h, None)
-                    if b2:
-                        self._hash_index.pop(b2.block_hash, None)
+                    self._persist_block_finalized(h, b)
+                # BUG-B FIX: DO NOT pop from _blocks here.
+                # _evict_old() runs every loop tick and will evict FINALIZED
+                # blocks after EVICT_AFTER_S.  Popping here caused the display
+                # to lose the block before snapshot() could render it FINALIZED.
+
             elif evt_type == "block_pending":
-                # Only update count if it increases; never downgrade
+                # Only update count upward; never downgrade
                 if oracle_count > b.oracle_count:
                     b.oracle_count = oracle_count
-                    b.oracle_ids = oracle_ids
+                    if oracle_ids:
+                        b.oracle_ids = oracle_ids
+                # Promote to FINALIZED if threshold reached (3-of-5 BFT)
                 if oracle_count >= 3 and b.status != BlockStatus.FINALIZED:
                     b.status = BlockStatus.FINALIZED
-                    b.finalized_at = time.time()
-                    self._persist_block_finalized(h, b)
-                    self._highest_finalized_height = max(self._highest_finalized_height, h)
-                    self._finalized_count += 1
-                    b2 = self._blocks.pop(h, None)
-                    if b2:
-                        self._hash_index.pop(b2.block_hash, None)
+                    if not b.finalized_at:
+                        b.finalized_at = time.time()
+                    b.oracle_count = max(b.oracle_count, oracle_count)
+                    if not _was_finalized:
+                        self._highest_finalized_height = max(self._highest_finalized_height, h)
+                        self._finalized_count += 1
+                        self._persist_block_finalized(h, b)
+                    # BUG-B FIX: no pop here either
+
             elif evt_type == "oracle_attestation":
                 b.oracle_count = max(b.oracle_count, oracle_count)
 
@@ -7931,16 +8001,43 @@ class BlockSubmissionCache:
                 self._hash_index.pop(b.block_hash, None)
 
     def _evict_old(self):
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX v5.0: PENDING block TTL eviction was silently dropping blocks that
+        # the server had already finalized.  The client never polled
+        # qtcl_getBlockStatus, so after 270s the block vanished from _blocks
+        # without incrementing _finalized_count — the display counter stayed at
+        # "2 pending, 0 finalized" forever.
+        #
+        # New policy: PENDING blocks past TTL are marked ORPHANED (display shows
+        # them briefly), not silently removed.  The oracle_task() coroutine
+        # (added below in run_mine_mode) polls getBlockStatus and will promote
+        # them to FINALIZED if the server confirms finalization.
+        #
+        # FINALIZED/REJECTED/ORPHANED blocks: evict after EVICT_AFTER_S so
+        # the display shows them long enough to be read.
+        # ─────────────────────────────────────────────────────────────────────
         now = time.time()
         evict = []
         for h, b in self._blocks.items():
             if b.status in (BlockStatus.FINALIZED, BlockStatus.REJECTED, BlockStatus.ORPHANED):
-                if now - max(b.finalized_at, b.last_submitted_at, b.first_submitted_at) > self.EVICT_AFTER_S:
+                ref_ts = max(
+                    b.finalized_at or 0.0,
+                    b.last_submitted_at or 0.0,
+                    b.first_submitted_at or 0.0,
+                )
+                if self.EVICT_AFTER_S > 0 and ref_ts > 0 and (now - ref_ts) > self.EVICT_AFTER_S:
                     evict.append(h)
             elif b.status == BlockStatus.PENDING:
                 _block_ttl = 270.0
                 if b.first_submitted_at and (now - b.first_submitted_at) > _block_ttl:
-                    evict.append(h)
+                    # FIX: don't silently drop — mark ORPHANED so oracle_task
+                    # can poll the server and promote to FINALIZED if appropriate.
+                    # Silent eviction was the reason "2 pending" stuck forever.
+                    b.status = BlockStatus.ORPHANED
+                    _EXP_LOG.warning(
+                        f"[CACHE] ⚠️  h={h} PENDING TTL exceeded — marked ORPHANED "
+                        f"(oracle_task will reconcile from server)"
+                    )
         for h in evict:
             b = self._blocks.pop(h, None)
             if b:
@@ -26138,7 +26235,184 @@ class QtclClientApp:
                     _in_fast = _asyncio.get_event_loop().time() < _fast_until
                     await _asyncio.sleep(3.0 if _in_fast else 30.0)
 
-            await _asyncio.gather(pow_task(), submit_task(), balance_task())
+            async def oracle_task():
+                """
+                ═══════════════════════════════════════════════════════════════
+                oracle_task — DB-authoritative pending-block reconciliation
+                ═══════════════════════════════════════════════════════════════
+                FIX v5.0: This task is the SOLE reason h=24/h=25 stayed
+                PENDING forever.
+
+                Root cause:
+                  submit_task() marks blocks PENDING then waits for an SSE
+                  block_finalized event via update_from_sse().  But:
+                    1. SSE events have no replay on reconnect — if the stream
+                       dropped during the 18-second finalization window, the
+                       event is gone forever.
+                    2. update_from_sse() bailed on `if not b: return` when
+                       blocks were already evicted from _blocks (fixed in
+                       FIX-1 above, but defense in depth is required).
+                    3. _evict_old() silently dropped PENDING blocks after 270s
+                       without ever asking the server (fixed in FIX-2, but
+                       oracle_task() provides the active resolution).
+
+                This task polls qtcl_getBlockStatus for every block in
+                PENDING, SUBMITTED, or ORPHANED state every 8 seconds.
+                The server's response is DB-authoritative: finalized=True means
+                the block is finalized regardless of what any SSE event said.
+
+                It also performs a sweep on SSE reconnect: whenever the
+                consensus SSE stream reconnects, we poll all tracked heights
+                immediately rather than waiting for the next 8s tick.
+                ═══════════════════════════════════════════════════════════════
+                """
+                _POLL_INTERVAL  = 8.0   # steady-state poll cadence (seconds)
+                _FAST_INTERVAL  = 2.0   # fast cadence immediately after submit
+                _FAST_WINDOW_S  = 60.0  # poll fast for 60s after any new PENDING block
+
+                _last_reconnect_poll = 0.0
+                _last_submission_ts  = 0.0
+
+                while True:
+                    try:
+                        # ── Detect SSE reconnect: stream dropped and came back ──
+                        _cons_state = globals().get("_SSE_CONSENSUS_STATE", {})
+                        _cons_connected = _cons_state.get("connected", False)
+                        _cons_last_evt  = _cons_state.get("last_event_ts", 0.0)
+
+                        # If stream just reconnected (within last 5s), do an
+                        # immediate reconciliation sweep regardless of interval.
+                        _do_reconnect_sweep = (
+                            _cons_connected
+                            and _cons_last_evt > _last_reconnect_poll
+                            and (time.time() - _cons_last_evt) < 5.0
+                        )
+                        if _do_reconnect_sweep:
+                            _last_reconnect_poll = _cons_last_evt
+                            _EXP_LOG.info("[ORACLE-TASK] 🔄 SSE reconnect detected — sweeping pending heights")
+
+                        # ── Collect heights that need resolution ───────────────
+                        _need_poll = []
+                        with cache._lock:
+                            for _h, _b in list(cache._blocks.items()):
+                                if _b.status in (
+                                    BlockStatus.PENDING,
+                                    BlockStatus.SUBMITTED,
+                                    BlockStatus.ORPHANED,
+                                ):
+                                    _need_poll.append((_h, _b.block_hash))
+                                    if _b.status == BlockStatus.PENDING:
+                                        _last_submission_ts = max(
+                                            _last_submission_ts,
+                                            _b.first_submitted_at or 0.0,
+                                        )
+
+                        if not _need_poll and not _do_reconnect_sweep:
+                            await _asyncio.sleep(_POLL_INTERVAL)
+                            continue
+
+                        # ── Poll each height ───────────────────────────────────
+                        for _poll_h, _poll_hash in _need_poll:
+                            try:
+                                _st = kapi._rpc(
+                                    "qtcl_getBlockStatus",
+                                    {"height": _poll_h},
+                                    timeout=8,
+                                    retries=1,
+                                )
+                                if not _st or _st.get("error"):
+                                    continue
+
+                                _db_finalized = bool(_st.get("finalized", False)) or (
+                                    _st.get("status", "").upper() == "FINALIZED"
+                                )
+                                _db_oracle_count = int(_st.get("attestation_count", 0))
+                                _db_oracle_ids   = _st.get("oracle_ids", [])
+
+                                if _db_finalized:
+                                    # Server is authoritative — finalize locally
+                                    with cache._lock:
+                                        _cb = cache._blocks.get(_poll_h)
+                                        if _cb and _cb.status != BlockStatus.FINALIZED:
+                                            _cb.status       = BlockStatus.FINALIZED
+                                            _cb.finalized_at = _cb.finalized_at or time.time()
+                                            _cb.oracle_count = max(
+                                                _cb.oracle_count,
+                                                _db_oracle_count,
+                                                5,  # server returns 5/5 on finalize
+                                            )
+                                            if _db_oracle_ids:
+                                                _cb.oracle_ids = _db_oracle_ids
+                                            cache._highest_finalized_height = max(
+                                                cache._highest_finalized_height, _poll_h
+                                            )
+                                            cache._finalized_count += 1
+                                            cache._persist_block_finalized(_poll_h, _cb)
+                                            _EXP_LOG.critical(
+                                                f"[ORACLE-TASK] ✅ h={_poll_h} FINALIZED via DB poll "
+                                                f"(was {_cb.status.name if hasattr(_cb.status,'name') else _cb.status}) "
+                                                f"oracles={_cb.oracle_count}/5"
+                                            )
+                                        elif not _cb and _poll_h <= cache._highest_finalized_height:
+                                            # Already evicted as finalized — no-op
+                                            pass
+                                        elif not _cb and _db_finalized:
+                                            # Block was evicted before we could update —
+                                            # synthesise a finalized record so counts are right
+                                            _synth = CachedBlock(
+                                                height=_poll_h,
+                                                block_hash=_poll_hash,
+                                                parent_hash="",
+                                                nonce=0,
+                                                timestamp=int(time.time()),
+                                                difficulty=5,
+                                                miner_address="",
+                                                status=BlockStatus.FINALIZED,
+                                            )
+                                            _synth.finalized_at  = time.time()
+                                            _synth.oracle_count  = max(_db_oracle_count, 5)
+                                            _synth.oracle_ids    = _db_oracle_ids or [
+                                                "oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"
+                                            ]
+                                            cache._blocks[_poll_h]            = _synth
+                                            cache._hash_index[_poll_hash]     = _poll_h
+                                            cache._highest_finalized_height   = max(
+                                                cache._highest_finalized_height, _poll_h
+                                            )
+                                            cache._finalized_count += 1
+                                            cache._persist_block_finalized(_poll_h, _synth)
+                                            _EXP_LOG.critical(
+                                                f"[ORACLE-TASK] ✅ h={_poll_h} SYNTHESISED FINALIZED "
+                                                f"(block was evicted before DB poll returned)"
+                                            )
+                                else:
+                                    # Still genuinely PENDING on server — update oracle count
+                                    _db_oracle_now = int(_st.get("attestation_count", 0))
+                                    if _db_oracle_now > 0:
+                                        cache.update_oracle_count(
+                                            _poll_h, _db_oracle_now, _db_oracle_ids
+                                        )
+                                        _EXP_LOG.debug(
+                                            f"[ORACLE-TASK] ⏳ h={_poll_h} still pending "
+                                            f"({_db_oracle_now}/5 oracles)"
+                                        )
+                            except Exception as _pe:
+                                _EXP_LOG.debug(f"[ORACLE-TASK] poll h={_poll_h}: {_pe}")
+
+                        # ── Adaptive sleep ─────────────────────────────────────
+                        _in_fast_window = (
+                            _last_submission_ts > 0
+                            and (time.time() - _last_submission_ts) < _FAST_WINDOW_S
+                        )
+                        await _asyncio.sleep(
+                            _FAST_INTERVAL if (_in_fast_window or _need_poll) else _POLL_INTERVAL
+                        )
+
+                    except Exception as _ot_err:
+                        _EXP_LOG.debug(f"[ORACLE-TASK] outer: {_ot_err}")
+                        await _asyncio.sleep(_POLL_INTERVAL)
+
+            await _asyncio.gather(pow_task(), submit_task(), balance_task(), oracle_task())
         async def _mine():
             try:
                 _EXP_LOG.warning("[MINER-ASYNC] 🚀 Async mining loop starting…")
