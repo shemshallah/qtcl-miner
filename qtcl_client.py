@@ -27003,6 +27003,8 @@ class QtclClientApp:
         sig["public_key_hex"] = self.wallet.public_key or ""
         sig["public_key"] = self.wallet.public_key or ""
 
+        _amt_f = amount_base / 100.0  # float repr for legacy fields only
+        _fee_f = fee_base    / 100.0
         # ── Build the full transaction dict matching mempool expectations exactly ──
         tx = {
             "tx_hash": tx_hash,
