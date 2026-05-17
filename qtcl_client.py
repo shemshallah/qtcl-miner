@@ -13793,11 +13793,15 @@ class KoyebRPCNodule:
 
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
-        Submit transaction via JSON-RPC 2.0 (qtcl_submitTransaction).
-        Passes the TX dict directly to the server — the mempool normalizes
-        amounts, validates signatures, and checks balances server-side.
+        Submit transaction via HTTP POST JSON-RPC 2.0 (qtcl_submitTransaction).
+        Uses POST to avoid GET URL length limits from large HypΓ signature dicts.
+        Passes the TX dict directly to the mempool which normalizes amounts,
+        validates signatures, and checks balances server-side.
         """
         import time as _t2
+        import json as _json
+        import urllib.request as _ur
+        import socket
 
         payload = dict(tx)
 
@@ -13814,25 +13818,55 @@ class KoyebRPCNodule:
         payload.setdefault("to_addr", payload.get("to_address", ""))
         payload.setdefault("tx_type", "transfer")
 
-        self._EXP_LOG.info(
+        _EXP_LOG.info(
             f"[TX] Submitting transaction: {payload.get('tx_hash', '?')[:16]}..."
         )
-        r = self._rpc("qtcl_submitTransaction", [payload], timeout=30, retries=2)
+
+        # POST with JSON-RPC 2.0 envelope to avoid GET URL length issues
+        rpc_body = _json.dumps({
+            "jsonrpc": "2.0",
+            "method": "qtcl_submitTransaction",
+            "params": [payload],
+            "id": 1,
+        }).encode("utf-8")
+
+        post_url = f"{self.base_url}/rpc"
+        r = None
+        for attempt in range(2):
+            try:
+                socket.setdefaulttimeout(30)
+                req = _ur.Request(
+                    post_url,
+                    data=rpc_body,
+                    headers={"Content-Type": "application/json"},
+                )
+                with _ur.urlopen(req) as resp:
+                    result = _json.loads(resp.read().decode("utf-8"))
+                    if "result" in result:
+                        r = result["result"]
+                        break
+                    elif "error" in result:
+                        r = result
+                        break
+            except Exception as e:
+                _EXP_LOG.warning(f"[TX] Attempt {attempt+1}/2 failed: {e}")
+                if attempt == 0:
+                    _t2.sleep(1)
+                continue
 
         if r and isinstance(r, dict):
             if "error" in r:
                 err_msg = str(r.get("error", ""))
-                self._EXP_LOG.warning(f"[TX] Server rejected: {err_msg}")
+                _EXP_LOG.warning(f"[TX] Server rejected: {err_msg}")
                 return {"status": "rejected", "error": err_msg, "accepted": False}
-            self._EXP_LOG.info(
+            _EXP_LOG.info(
                 f"[TX] Response: status={r.get('status')} accepted={r.get('accepted')} "
                 f"tx_hash={r.get('tx_hash', '?')[:16]}"
             )
-        else:
-            self._EXP_LOG.warning("[TX] No response from server")
-            r = {"status": "no_response", "accepted": False, "error": "No response from server"}
+            return r
 
-        return r
+        _EXP_LOG.warning("[TX] No response from server")
+        return {"status": "no_response", "accepted": False, "error": "No response from server"}
 
     def get_peers(self) -> list:
         """Get peer list via JSON-RPC."""
