@@ -13527,23 +13527,46 @@ class KoyebRPCNodule:
 
     def _tx_poll_health(self, timeout: float = None) -> bool:
         """
-        Poll /health until HTTP 200 or timeout.
-        Returns True as soon as the server is ready; False on timeout.
-        Non-blocking if server is already up (first request succeeds instantly).
+        Poll /mcp/health until ready:true or timeout.
+
+        /health is a wsgi_config stub that ALWAYS returns 200, even before the full
+        server app loads. /mcp/health returns {"ready": true/false} and is the only
+        accurate readiness signal. Falls back to /health if /mcp/health is 404.
         """
         import urllib.request as _ur
-        url      = f"{self.base_url}/health"
-        deadline = time.monotonic() + (timeout or self._TX_HEALTH_WAIT)
-        session  = self._get_session()
+        mcp_url    = f"{self.base_url}/mcp/health"
+        health_url = f"{self.base_url}/health"
+        deadline   = time.monotonic() + (timeout or self._TX_HEALTH_WAIT)
+        session    = self._get_session()
+        _mcp_available = True
+
         while time.monotonic() < deadline:
             try:
-                if session and _HAS_REQUESTS:
-                    r = session.get(url, timeout=3.0)
-                    if r.status_code == 200:
-                        return True
-                else:
-                    with _ur.urlopen(url, timeout=3.0):
-                        return True
+                if _mcp_available:
+                    if session and _HAS_REQUESTS:
+                        r = session.get(mcp_url, timeout=3.0)
+                        if r.status_code == 200:
+                            try:
+                                data = r.json()
+                                if data.get("ready"):
+                                    return True
+                            except Exception:
+                                pass
+                        elif r.status_code == 404:
+                            _mcp_available = False
+                    else:
+                        with _ur.urlopen(mcp_url, timeout=3.0) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            if data.get("ready"):
+                                return True
+                if not _mcp_available:
+                    if session and _HAS_REQUESTS:
+                        r = session.get(health_url, timeout=3.0)
+                        if r.status_code == 200:
+                            return True
+                    else:
+                        with _ur.urlopen(health_url, timeout=3.0):
+                            return True
             except Exception:
                 pass
             remaining = deadline - time.monotonic()
@@ -27125,6 +27148,24 @@ class QtclClientApp:
             print("  ❌ No private key loaded — cannot sign transaction")
             return
 
+        # ── Pre-flight balance check ───────────────────────────────────────────
+        # Check server balance before spending time on signing. Gives a clear
+        # error instead of a confusing rejection after full tx construction.
+        _total_needed = amount_qtcl + fee_qtcl
+        print(f"  🔍 Checking balance…", end="", flush=True)
+        try:
+            _bal = self.api.get_balance(self.wallet.address)
+        except Exception:
+            _bal = None
+        if _bal is not None:
+            print(f"  {_bal:.4f} QTCL available")
+            if _bal < _total_needed:
+                print(f"\n  ❌ Insufficient balance: have {_bal:.4f} QTCL, need {_total_needed:.4f} QTCL")
+                print(f"     Mine a block first to earn rewards, or receive QTCL from another address.")
+                return
+        else:
+            print("  (balance query failed — proceeding)")
+
         # ── Build tx ──────────────────────────────────────────────────────────
         from_addr    = self.wallet.address
         amount_base  = int(round(amount_qtcl * 100))
@@ -27193,8 +27234,8 @@ class QtclClientApp:
             print("  ❌ Cancelled")
             return
 
-        # ── Submit — v4.0 startup-resilient path via _submit_with_startup_retry ──
-        # Uses _raw_rpc_post directly, retries on None/network errors properly.
+        # ── Submit — route through _submit_with_startup_retry ──
+        # Polls /mcp/health for true readiness, retries network errors with backoff.
         result = _submit_with_startup_retry(
             tx, self.api.base_url,
             session=self.api._get_session(),
@@ -31767,18 +31808,58 @@ def _raw_rpc_post(base_url: str, method: str, params: list, timeout: float = 30.
 
 
 def _patch_poll_health(base_url: str, timeout: float = 15.0, interval: float = 0.5, session=None) -> bool:
-    """Poll /health until 200 or timeout. Returns True when server ready."""
+    """Poll /mcp/health until ready:true or timeout.
+
+    /health is a stub that always returns 200 even before _full_app loads (wsgi_config design).
+    /mcp/health returns {ready: true/false} — the only accurate readiness signal.
+    Falls back to /health if /mcp/health is unreachable (older deployments).
+    """
     import urllib.request as _ur
-    url = f"{base_url.rstrip('/')}/health"; deadline = time.monotonic() + timeout
+    mcp_url    = f"{base_url.rstrip('/')}/mcp/health"
+    health_url = f"{base_url.rstrip('/')}/health"
+    deadline   = time.monotonic() + timeout
+    _mcp_available = True  # assume /mcp/health exists until proven otherwise
+
     while time.monotonic() < deadline:
         try:
-            if session and _HAS_REQUESTS:
-                r = session.get(url, timeout=3.0)
-                if r.status_code == 200: return True
-            else:
-                with _ur.urlopen(url, timeout=3.0): return True
-        except Exception: pass
+            if _mcp_available:
+                if session and _HAS_REQUESTS:
+                    r = session.get(mcp_url, timeout=3.0)
+                    if r.status_code == 200:
+                        try:
+                            data = r.json()
+                            if data.get("ready"):
+                                return True
+                            # Server responded but not ready yet — keep polling
+                            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+                            continue
+                        except Exception:
+                            pass
+                    elif r.status_code == 404:
+                        _mcp_available = False  # fall through to /health
+                else:
+                    with _ur.urlopen(mcp_url, timeout=3.0) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("ready"):
+                            return True
+                        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+                        continue
+
+            if not _mcp_available:
+                # Fallback: /health always-200 stub — just check it's reachable
+                if session and _HAS_REQUESTS:
+                    r = session.get(health_url, timeout=3.0)
+                    if r.status_code == 200:
+                        return True
+                else:
+                    with _ur.urlopen(health_url, timeout=3.0):
+                        return True
+
+        except Exception:
+            pass
+
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
     return False
 
 
