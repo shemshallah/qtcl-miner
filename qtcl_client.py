@@ -7428,27 +7428,36 @@ def _validate_and_init_schema(db_path: Path) -> bool:
                     pass
 
         logger.info(
-            "[DB-SCHEMA] 🔨 Running qtcl_db_builder.py to create fresh schema..."
+            "[DB-SCHEMA] 🔨 Building fresh schema in-process (no subprocess)..."
         )
-        builder_path = _REPO_ROOT / "qtcl_db_builder.py"
-
-        if not builder_path.exists():
-            logger.error(
-                f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}"
+        # Direct in-process call — avoids the module-level pip install hang
+        # that blocked startup for up to 180 s on every cold start.
+        try:
+            import importlib.util as _ilu
+            builder_path = _REPO_ROOT / "qtcl_db_builder.py"
+            if not builder_path.exists():
+                logger.error(f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}")
+                return False
+            spec = _ilu.spec_from_file_location("qtcl_db_builder", str(builder_path))
+            _mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(_mod)
+            server_cls = _mod.QuantumTemporalCoherenceLedgerServer
+            builder = server_cls(
+                db_url=str(db_path),
+                db_mode="sqlite",
+                tessellation_depth=3,   # shallow — schema only, no data seeding
             )
-            return False
-
-        # Run builder
-        result = subprocess.run(
-            [sys.executable, str(builder_path)],
-            cwd=str(_REPO_ROOT),
-            capture_output=True,
-            timeout=180,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            logger.error(f"[DB-SCHEMA] ❌ Builder FAILED:\n{result.stderr[-1000:]}")
+            import sqlite3 as _sq3
+            builder.conn = _sq3.connect(str(db_path), check_same_thread=False, timeout=30)
+            builder.conn.row_factory = _sq3.Row
+            builder.cursor = builder.conn.cursor()
+            builder.conn.execute("PRAGMA journal_mode=WAL")
+            builder.conn.execute("PRAGMA synchronous=NORMAL")
+            builder.create_schema()
+            builder.conn.commit()
+            builder.conn.close()
+        except Exception as _build_err:
+            logger.error(f"[DB-SCHEMA] ❌ In-process builder failed: {_build_err}")
             return False
 
         logger.info("[DB-SCHEMA] ✅ Fresh schema created successfully")
