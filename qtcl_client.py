@@ -31725,5 +31725,214 @@ def main() -> None:  # noqa: F811
         app.run()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TX PATCH v4.0 — INLINED (no companion module required)
+# Standalone helpers: _raw_rpc_post, _submit_with_startup_retry, TxSubmitter,
+# patch_qtcl_client.  All previously in qtcl_tx_patch.py — merged here so
+# qtcl_client.py is the single source of truth.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PATCH_DEFAULT_URL       = "https://qtcl-blockchain.koyeb.app"
+_PATCH_DEFAULT_FEE_QTCL  = 0.01
+_PATCH_TRANSIENT_MSGS    = ("initializing","starting","retry","server starting","boot","warming","503","service unavailable","not ready",)
+_PATCH_PERMANENT_MSGS    = ("insufficient","balance","invalid_signature","invalid_address","self_transfer","nonce_reuse","double_spend","missing_field","negative_nonce","amount_must_be_positive","low_fee","format",)
+_PATCH_HEALTH_WAIT       = 15.0
+_PATCH_MAX_RETRIES       = 5
+_PATCH_BASE_BACKOFF      = 1.0
+
+
+def _raw_rpc_post(base_url: str, method: str, params: list, timeout: float = 30.0, session=None) -> dict:
+    """Single JSON-RPC 2.0 POST — returns full response dict. Raises RuntimeError on HTTP failure."""
+    body = json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode("utf-8")
+    url  = f"{base_url.rstrip('/')}/rpc"
+    if session and _HAS_REQUESTS:
+        r = session.post(url, data=body, headers={"Content-Type":"application/json"}, timeout=timeout)
+        if r.status_code == 200: return r.json()
+        try:    return r.json()
+        except Exception: raise RuntimeError(f"HTTP {r.status_code} from {url}")
+    import urllib.request as _ur
+    req = _ur.Request(url, data=body, headers={"Content-Type":"application/json"})
+    with _ur.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _patch_poll_health(base_url: str, timeout: float = 15.0, interval: float = 0.5, session=None) -> bool:
+    """Poll /health until 200 or timeout. Returns True when server ready."""
+    import urllib.request as _ur
+    url = f"{base_url.rstrip('/')}/health"; deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if session and _HAS_REQUESTS:
+                r = session.get(url, timeout=3.0)
+                if r.status_code == 200: return True
+            else:
+                with _ur.urlopen(url, timeout=3.0): return True
+        except Exception: pass
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+def _patch_is_transient(err: str) -> bool: m = str(err).lower(); return any(k in m for k in _PATCH_TRANSIENT_MSGS)
+def _patch_is_permanent(err: str) -> bool: m = str(err).lower(); return any(k in m for k in _PATCH_PERMANENT_MSGS)
+
+
+def _submit_with_startup_retry(tx: dict, base_url: str, session=None, print_fn=print) -> dict:
+    """
+    Submit tx with cold-start awareness.
+    1. Poll /health up to _PATCH_HEALTH_WAIT s.
+    2. POST qtcl_submitTransaction.
+    3. Transient error (-32000 + init/starting): backoff + retry up to _PATCH_MAX_RETRIES.
+    4. Permanent error: return immediately.
+    """
+    import random as _rand
+    if not _patch_poll_health(base_url, timeout=_PATCH_HEALTH_WAIT, session=session):
+        print_fn("  ⏳ /health still starting — proceeding anyway (wsgi will wait)…")
+    last_error = None
+    for attempt in range(_PATCH_MAX_RETRIES):
+        try:
+            resp = _raw_rpc_post(base_url, "qtcl_submitTransaction", [tx], timeout=45.0, session=session)
+        except Exception as exc:
+            last_error = str(exc)
+            backoff = _PATCH_BASE_BACKOFF * (2 ** attempt) + _rand.random()
+            if attempt < _PATCH_MAX_RETRIES - 1:
+                print_fn(f"  ⏳ Network error (attempt {attempt+1}): {exc} — retrying in {backoff:.1f}s…")
+                time.sleep(backoff)
+            continue
+        if "result" in resp: return resp["result"]
+        if "error" in resp:
+            err = resp["error"]
+            err_msg = str(err.get("message","")) if isinstance(err, dict) else str(err)
+            last_error = err
+            if _patch_is_permanent(err_msg):
+                return {"accepted":False,"error":err,"status":"rejected"}
+            if _patch_is_transient(err_msg) and attempt < _PATCH_MAX_RETRIES - 1:
+                backoff = _PATCH_BASE_BACKOFF * (2 ** attempt) + _rand.random()
+                print_fn(f"  ⏳ Server warming up (attempt {attempt+1}/{_PATCH_MAX_RETRIES}) — retrying in {backoff:.1f}s…")
+                time.sleep(backoff); continue
+            return {"accepted":False,"error":err,"status":"rejected"}
+        last_error = resp; break
+    return {"accepted":False,"error":last_error or "unknown_error","status":"rejected"}
+
+
+class TxSubmitter:
+    """Self-contained tx builder + submitter — no dependency on KoyebRPCNodule internals."""
+    def __init__(self, base_url: str = _PATCH_DEFAULT_URL, private_key: str = "",
+                 address: str = "", public_key: str = "", fee_qtcl: float = _PATCH_DEFAULT_FEE_QTCL):
+        self.base_url = base_url.rstrip("/"); self.private_key = private_key
+        self.address = address; self.public_key = public_key; self.fee_qtcl = fee_qtcl
+        self._session = _requests.Session() if _HAS_REQUESTS else None
+
+    def _build_tx(self, to_addr: str, amount_qtcl: float, fee_qtcl: float, memo: str = "") -> dict:
+        amount_base = int(round(amount_qtcl * 100)); fee_base = int(round(fee_qtcl * 100))
+        nonce = int(time.time() * 1000); ts_ns = time.time_ns()
+        _canon = f"{self.address}:{to_addr}:{amount_base}:{fee_base}:{nonce}:{ts_ns}"
+        tx_hash = hashlib.sha3_256(_canon.encode()).hexdigest()
+        sign_data = {"sender":self.address,"recipient":to_addr,"amount_base":amount_base,
+                     "fee_base":fee_base,"nonce":nonce,"timestamp_ns":ts_ns}
+        msg_hash = hashlib.sha3_256(json.dumps(sign_data, sort_keys=True).encode("utf-8")).digest()
+        engine = HypGammaEngine(); sig = engine.sign_hash(msg_hash, self.private_key)
+        sig["public_key_hex"] = self.public_key; sig["public_key"] = self.public_key
+        return {"tx_hash":tx_hash,"from_address":self.address,"to_address":to_addr,
+                "amount":amount_base/100.0,"amount_base":amount_base,"fee":fee_base/100.0,
+                "fee_base":fee_base,"nonce":nonce,"timestamp_ns":ts_ns,"tx_type":"transfer",
+                "memo":(memo or "")[:256],"signature":sig,"sender_public_key_hex":self.public_key,
+                "public_key":self.public_key,"inputs":[],"outputs":[{"address":to_addr,"amount_base":amount_base}],
+                "metadata":{"sender_public_key_hex":self.public_key}}
+
+    def build_and_submit(self, to_addr: str, amount_qtcl: float, memo: str = "",
+                         fee_qtcl: Optional[float] = None, print_fn=print) -> dict:
+        """Build, sign, and submit a QTCL transfer."""
+        tx = self._build_tx(to_addr, amount_qtcl, fee_qtcl or self.fee_qtcl, memo)
+        return _submit_with_startup_retry(tx, self.base_url, session=self._session, print_fn=print_fn)
+
+    def check_balance(self, address: Optional[str] = None) -> Optional[float]:
+        addr = address or self.address
+        try:
+            resp = _raw_rpc_post(self.base_url, "qtcl_getBalance", [addr], timeout=10.0, session=self._session)
+            if "result" in resp:
+                r = resp["result"]
+                return float(r.get("balance_qtcl", r.get("balance", 0)) if isinstance(r, dict) else r)
+        except Exception: pass
+        return None
+
+    def query_tx(self, tx_hash: str) -> Optional[dict]:
+        try:
+            resp = _raw_rpc_post(self.base_url, "qtcl_getTransaction", [tx_hash], timeout=10.0, session=self._session)
+            return resp.get("result")
+        except Exception: return None
+
+
+def patch_qtcl_client(app) -> None:
+    """
+    Monkey-patch a QtclClientApp in-place with v4.0 tx layer.
+    Call after instantiation, before app.run():
+        patch_qtcl_client(app)
+    Both _send_tx_wizard and api.submit_transaction are replaced with startup-resilient v4.0.
+    No-op if symbols already patched (idempotent).
+    """
+    import types as _types
+
+    def _wizard_v4(self_app) -> None:
+        try:
+            to_addr     = input("  To address (64-char hex): ").strip()
+            amount_qtcl = float(input("  Amount (QTCL): ").strip())
+            memo        = input("  Memo [optional]: ").strip()
+            use_fee     = input("  Custom fee? [y/N]: ").strip().lower()
+            fee_qtcl    = float(input("  Fee (QTCL) [default 0.01]: ").strip() or "0.01") if use_fee == "y" else 0.01
+        except (ValueError, EOFError, KeyboardInterrupt): print("  ❌ Cancelled"); return
+        if not to_addr or len(to_addr) < 40: print("  ❌ Address too short (expected ≥40 hex chars)"); return
+        if not all(c in "0123456789abcdef" for c in to_addr.lower()): print("  ❌ Non-hex chars in address"); return
+        wallet = getattr(self_app, "wallet", None)
+        if not wallet or not getattr(wallet, "private_key", None): print("  ❌ No private key loaded"); return
+        sub = TxSubmitter(base_url=getattr(getattr(self_app,"api",None),"base_url",_PATCH_DEFAULT_URL),
+                          private_key=wallet.private_key, address=wallet.address,
+                          public_key=getattr(wallet,"public_key","") or "")
+        tx = sub._build_tx(to_addr, amount_qtcl, fee_qtcl, memo)
+        print(f"\n  ── Transaction Summary ──")
+        print(f"     From:  {wallet.address[:20]}…"); print(f"     To:    {to_addr[:20]}…")
+        print(f"     Amt:   {amount_qtcl:.2f} QTCL"); print(f"     Fee:   {fee_qtcl:.4f} QTCL")
+        print(f"     Hash:  {tx['tx_hash'][:32]}…"); print(f"     Nonce: {tx['nonce']}")
+        try: confirm = input("  Submit? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt): print("  ❌ Cancelled"); return
+        if confirm == "n": print("  ❌ Cancelled"); return
+        result = _submit_with_startup_retry(tx, sub.base_url, session=sub._session, print_fn=print)
+        if result and result.get("accepted"):
+            srv = result.get("tx_hash", tx["tx_hash"])
+            print(f"\n  ✅ Submitted  │  server hash: {srv}")
+            print(f"     Client hash : {tx['tx_hash']}")
+            print(f"     Status      : {result.get('status','pending')}")
+            if srv != tx["tx_hash"]: print(f"     ⚠️  Hashes differ — server recomputed canonical hash")
+            print(f"     Message     : {result.get('message','ok')}")
+        else:
+            err = (result or {}).get("error","no response"); err_str = f"[{err.get('code','')}] {err.get('message',str(err))}" if isinstance(err,dict) else str(err)
+            if _patch_is_transient(err_str): print(f"\n  ❌ Server still initializing after retries.\n     Try again in ~30s")
+            elif _patch_is_permanent(err_str): print(f"\n  ❌ Rejected (permanent): {err_str}")
+            else: print(f"\n  ❌ Rejected: {err_str}")
+            print(f"     Endpoint: {sub.base_url}/rpc")
+
+    def _submit_v4(self_nodule, tx: dict) -> Optional[dict]:
+        payload = dict(tx)
+        if isinstance(payload.get("timestamp_ns"), str): payload["timestamp_ns"] = int(payload["timestamp_ns"])
+        elif "timestamp_ns" not in payload: payload["timestamp_ns"] = time.time_ns()
+        payload.setdefault("from_address", payload.get("from","")); payload.setdefault("to_address", payload.get("to",""))
+        payload.setdefault("from_addr", payload.get("from_address","")); payload.setdefault("to_addr", payload.get("to_address",""))
+        payload.setdefault("tx_type","transfer")
+        return _submit_with_startup_retry(payload, getattr(self_nodule,"base_url",_PATCH_DEFAULT_URL),
+                                          session=getattr(self_nodule,"_session",None), print_fn=lambda m: None)
+
+    tx_mode = getattr(app, "_tx_mode", app)
+    if hasattr(tx_mode, "_send_tx_wizard"):
+        tx_mode._send_tx_wizard = _types.MethodType(_wizard_v4, tx_mode)
+        print("[PATCH] ✅ _send_tx_wizard → v4.0")
+    elif hasattr(app, "_send_tx_wizard"):
+        app._send_tx_wizard = _types.MethodType(_wizard_v4, app)
+        print("[PATCH] ✅ _send_tx_wizard → v4.0")
+    api = getattr(app, "api", None)
+    if api and hasattr(api, "submit_transaction"):
+        api.submit_transaction = _types.MethodType(_submit_v4, api)
+        print("[PATCH] ✅ api.submit_transaction → v4.0")
+    print("[PATCH] ✅ qtcl_tx_patch v4.0 inlined — single-file mode")
+
+
 if __name__ == "__main__":
     main()
