@@ -13475,6 +13475,22 @@ class CircuitBreaker:
 class KoyebRPCNodule:
     """Thread-safe JSON-RPC 2.0 client for qtcl-blockchain.koyeb.app (https/443). RPC-only, no REST."""
 
+    # ── v4.0 TX submission constants ─────────────────────────────────────────
+    # Transient server errors — safe to retry (server still booting)
+    _TX_TRANSIENT_MSGS: tuple = (
+        "initializing", "starting", "retry", "not ready",
+        "boot", "warming", "service unavailable", "503",
+    )
+    # Permanent rejections — surface immediately, never retry
+    _TX_PERMANENT_MSGS: tuple = (
+        "insufficient", "balance", "invalid_signature", "invalid_address",
+        "self_transfer", "nonce_reuse", "double_spend", "missing_field",
+        "negative_nonce", "amount_must_be_positive", "low_fee", "format",
+    )
+    _TX_MAX_RETRIES:   int   = 5
+    _TX_BASE_BACKOFF:  float = 1.2   # seconds; doubles each attempt + jitter
+    _TX_HEALTH_WAIT:   float = 15.0  # max seconds to poll /health before first attempt
+
     TIMEOUT: int = 10
 
     def __init__(self, base_url: str = None, timeout: int = 10):
@@ -13496,6 +13512,43 @@ class KoyebRPCNodule:
                 if self._session is None:
                     self._session = _requests.Session()
         return self._session
+
+    # ── v4.0 TX helpers ───────────────────────────────────────────────────────
+
+    def _tx_is_transient(self, err_msg: str) -> bool:
+        """True when a JSON-RPC error is a transient startup condition worth retrying."""
+        m = str(err_msg).lower()
+        return any(k in m for k in self._TX_TRANSIENT_MSGS)
+
+    def _tx_is_permanent(self, err_msg: str) -> bool:
+        """True when a JSON-RPC error is a permanent business-logic rejection."""
+        m = str(err_msg).lower()
+        return any(k in m for k in self._TX_PERMANENT_MSGS)
+
+    def _tx_poll_health(self, timeout: float = None) -> bool:
+        """
+        Poll /health until HTTP 200 or timeout.
+        Returns True as soon as the server is ready; False on timeout.
+        Non-blocking if server is already up (first request succeeds instantly).
+        """
+        import urllib.request as _ur
+        url      = f"{self.base_url}/health"
+        deadline = time.monotonic() + (timeout or self._TX_HEALTH_WAIT)
+        session  = self._get_session()
+        while time.monotonic() < deadline:
+            try:
+                if session and _HAS_REQUESTS:
+                    r = session.get(url, timeout=3.0)
+                    if r.status_code == 200:
+                        return True
+                else:
+                    with _ur.urlopen(url, timeout=3.0):
+                        return True
+            except Exception:
+                pass
+            remaining = deadline - time.monotonic()
+            time.sleep(min(0.5, max(0.0, remaining)))
+        return False
 
     def _rpc(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
@@ -13835,42 +13888,115 @@ class KoyebRPCNodule:
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
         Submit transaction via JSON-RPC 2.0 (qtcl_submitTransaction).
-        Uses _rpc which handles POST for large payloads automatically.
+        v4.0: startup-resilient — polls /health first, then retries transient
+        JSON-RPC errors (code -32000 + "initializing"/"starting"/etc.) with
+        jittered exponential backoff. Permanent rejections (balance, sig, etc.)
+        are surfaced immediately without retry.
+
+        Key fix over v3.x: previously, a JSON body {"error": {"code":-32000,
+        "message":"Server initializing..."}} was returned to the caller without
+        retry because _rpc()'s retry loop only triggers on network exceptions,
+        not on valid-HTTP JSON error responses. v4.0 adds an explicit retry loop
+        over transient JSON-RPC errors on top of _rpc's network-level retries.
         """
         import time as _t2
+        import random as _rand
 
         payload = dict(tx)
 
-        if "timestamp_ns" in payload and isinstance(payload["timestamp_ns"], str):
+        if isinstance(payload.get("timestamp_ns"), str):
             payload["timestamp_ns"] = int(payload["timestamp_ns"])
         elif "timestamp_ns" not in payload:
             payload["timestamp_ns"] = _t2.time_ns()
 
         payload.setdefault("from_address", payload.get("from", ""))
-        payload.setdefault("to_address", payload.get("to", ""))
-        payload.setdefault("from_addr", payload.get("from_address", ""))
-        payload.setdefault("to_addr", payload.get("to_address", ""))
-        payload.setdefault("tx_type", "transfer")
+        payload.setdefault("to_address",   payload.get("to",   ""))
+        payload.setdefault("from_addr",    payload.get("from_address", ""))
+        payload.setdefault("to_addr",      payload.get("to_address",   ""))
+        payload.setdefault("tx_type",      "transfer")
 
-        _EXP_LOG.info(
-            f"[TX] Submitting transaction: {payload.get('tx_hash', '?')[:16]}..."
-        )
-        r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=4)
+        tx_short = payload.get("tx_hash", "?")[:16]
+        _EXP_LOG.info(f"[TX-v4] Submitting: {tx_short}…")
 
-        if r and isinstance(r, dict):
-            if "error" in r:
-                err_msg = str(r.get("error", ""))
-                _EXP_LOG.warning(f"[TX] Server rejected: {err_msg}")
-                return {"status": "rejected", "error": err_msg, "accepted": False}
-            _EXP_LOG.info(
-                f"[TX] Response: status={r.get('status')} accepted={r.get('accepted')} "
-                f"tx_hash={r.get('tx_hash', '?')[:16]}"
+        # ── Phase 1: /health gate ─────────────────────────────────────────────
+        # Poll until server is ready (non-blocking if already up).
+        # If server is ready, reset circuit breaker so past startup failures
+        # don't block a now-healthy server.
+        server_ready = self._tx_poll_health(timeout=self._TX_HEALTH_WAIT)
+        if server_ready:
+            try:
+                with self._circuit._lock:
+                    if self._circuit._state != "CLOSED":
+                        self._circuit._state    = "CLOSED"
+                        self._circuit._failures = 0
+                        _EXP_LOG.info("[TX-v4] ✅ Circuit reset after /health OK")
+            except Exception:
+                pass
+        else:
+            _EXP_LOG.warning(
+                f"[TX-v4] /health still 'starting' after {self._TX_HEALTH_WAIT:.0f}s "
+                "— submitting anyway (wsgi_config v4.0 will hold the request up to 10s)"
             )
-            return r
 
-        _err_detail = str(self._last_error) if self._last_error else "connection refused or timeout"
-        _EXP_LOG.warning(f"[TX] No response from server: {_err_detail}")
-        return {"status": "no_response", "accepted": False, "error": f"No response from server: {_err_detail}"}
+        # ── Phase 2: submit with retry on transient JSON-RPC errors ──────────
+        last_error = None
+
+        for attempt in range(self._TX_MAX_RETRIES):
+            try:
+                r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=1)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < self._TX_MAX_RETRIES - 1:
+                    backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
+                    _EXP_LOG.warning(
+                        f"[TX-v4] Network error attempt {attempt+1}/{self._TX_MAX_RETRIES}: "
+                        f"{exc} — retry in {backoff:.1f}s"
+                    )
+                    _t2.sleep(backoff)
+                continue
+
+            if r is None:
+                last_error = "no_response"
+                break
+
+            if isinstance(r, dict):
+                if "error" in r:
+                    err     = r["error"]
+                    err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    last_error = err
+
+                    if self._tx_is_permanent(err_msg):
+                        _EXP_LOG.warning(f"[TX-v4] Permanent rejection: {err_msg}")
+                        return {"status": "rejected", "error": err, "accepted": False}
+
+                    if self._tx_is_transient(err_msg) and attempt < self._TX_MAX_RETRIES - 1:
+                        backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
+                        _EXP_LOG.info(
+                            f"[TX-v4] Transient error attempt {attempt+1}/{self._TX_MAX_RETRIES}: "
+                            f"{err_msg!r} — retry in {backoff:.1f}s"
+                        )
+                        _t2.sleep(backoff)
+                        continue
+
+                    # Unknown error or final attempt — surface it
+                    return {"status": "rejected", "error": err, "accepted": False}
+
+                # No "error" key → accepted
+                _EXP_LOG.info(
+                    f"[TX-v4] ✅ accepted: status={r.get('status')} "
+                    f"accepted={r.get('accepted')} hash={r.get('tx_hash','?')[:16]}"
+                )
+                return r
+
+        _err_detail = str(last_error) if last_error else (
+            str(self._last_error) if self._last_error else "max_retries_exceeded"
+        )
+        _EXP_LOG.warning(f"[TX-v4] All {self._TX_MAX_RETRIES} attempts failed: {_err_detail}")
+        return {
+            "status":   "no_response",
+            "accepted": False,
+            "error":    f"Submission failed after {self._TX_MAX_RETRIES} attempts: {_err_detail}",
+        }
 
     def get_peers(self) -> list:
         """Get peer list via JSON-RPC."""
@@ -26954,11 +27080,17 @@ class QtclClientApp:
             _oracle_n.deactivate()
 
     def _send_tx_wizard(self) -> None:
+        """
+        Interactive QTCL transaction wizard — v4.0.
+        Identical user flow to v3.x; uses startup-resilient api.submit_transaction()
+        which polls /health and retries transient server errors automatically.
+        """
+        # ── Inputs ────────────────────────────────────────────────────────────
         try:
-            to_addr = input("  To address (64-char hex): ").strip()
+            to_addr     = input("  To address (64-char hex): ").strip()
             amount_qtcl = float(input("  Amount (QTCL): ").strip())
-            memo = input("  Memo [optional]: ").strip()
-            use_fee = input("  Custom fee? [y/N]: ").strip().lower()
+            memo        = input("  Memo [optional]: ").strip()
+            use_fee     = input("  Custom fee? [y/N]: ").strip().lower()
             if use_fee == "y":
                 fee_qtcl = float(input("  Fee (QTCL) [default 0.01]: ").strip() or "0.01")
             else:
@@ -26966,25 +27098,31 @@ class QtclClientApp:
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled")
             return
-        if not to_addr or len(to_addr) < 40 or not all(c in '0123456789abcdef' for c in to_addr.lower()):
-            print("  ❌ Invalid QTCL address (expected 64-char hex)")
+
+        # ── Validate address ──────────────────────────────────────────────────
+        if not to_addr or len(to_addr) < 40:
+            print("  ❌ Invalid QTCL address (must be ≥40 hex chars)")
+            return
+        if not all(c in '0123456789abcdef' for c in to_addr.lower()):
+            print("  ❌ Invalid QTCL address (non-hex characters detected)")
             return
         if not self.wallet.private_key:
             print("  ❌ No private key loaded — cannot sign transaction")
             return
 
-        from_addr = self.wallet.address
-        amount_base = int(round(amount_qtcl * 100))
-        fee_base = int(round(fee_qtcl * 100))
-        nonce = int(time.time() * 1000)
+        # ── Build tx ──────────────────────────────────────────────────────────
+        from_addr    = self.wallet.address
+        amount_base  = int(round(amount_qtcl * 100))
+        fee_base     = int(round(fee_qtcl    * 100))
+        nonce        = int(time.time() * 1000)
         timestamp_ns = time.time_ns()
 
-        # ── Compute canonical tx_hash v2 (integer-only — matches mempool canonical_hash) ──
-        # Format: SHA3-256("from:to:amount_base:fee_base:nonce:timestamp_ns") — no float repr issues
+        # Canonical tx_hash v2 — integer-only, matches mempool canonical_hash
+        # Format: SHA3-256("from:to:amount_base:fee_base:nonce:timestamp_ns")
         _canon_str = f"{from_addr}:{to_addr}:{amount_base}:{fee_base}:{nonce}:{timestamp_ns}"
-        tx_hash = hashlib.sha3_256(_canon_str.encode()).hexdigest()
+        tx_hash    = hashlib.sha3_256(_canon_str.encode()).hexdigest()
 
-        # ── Build signing payload v2 (integer fields — matches mempool get_signing_hash) ──
+        # Signing payload v2 — integer fields, sort_keys=True, matches mempool get_signing_hash
         # SHA3-256(json.dumps({"amount_base":int,"fee_base":int,"nonce":int,"recipient":str,"sender":str,"timestamp_ns":int}))
         _sign_data = {
             "sender"      : from_addr,
@@ -26994,41 +27132,42 @@ class QtclClientApp:
             "nonce"       : nonce,
             "timestamp_ns": timestamp_ns,
         }
-        _sign_json = json.dumps(_sign_data, sort_keys=True)
+        _sign_json    = json.dumps(_sign_data, sort_keys=True)
         _message_hash = hashlib.sha3_256(_sign_json.encode("utf-8")).digest()
 
-        # ── Sign with HypΓ engine ──
+        # Sign with HypΓ engine
         _engine = HypGammaEngine()
         sig = _engine.sign_hash(_message_hash, self.wallet.private_key)
         sig["public_key_hex"] = self.wallet.public_key or ""
-        sig["public_key"] = self.wallet.public_key or ""
+        sig["public_key"]     = self.wallet.public_key or ""
 
-        _amt_f = amount_base / 100.0  # float repr for legacy fields only
+        _amt_f = amount_base / 100.0   # float repr for legacy fields only
         _fee_f = fee_base    / 100.0
-        # ── Build the full transaction dict matching mempool expectations exactly ──
+
+        # Full transaction dict — matches mempool._validate_format expectations exactly
         tx = {
-            "tx_hash": tx_hash,
-            "from_address": from_addr,
-            "to_address": to_addr,
-            "amount": _amt_f,
-            "amount_base": amount_base,
-            "fee": _fee_f,
-            "fee_base": fee_base,
-            "nonce": nonce,
-            "timestamp_ns": timestamp_ns,
-            "tx_type": "transfer",
-            "memo": memo[:256] if memo else "",
-            "signature": sig,
+            "tx_hash"             : tx_hash,
+            "from_address"        : from_addr,
+            "to_address"          : to_addr,
+            "amount"              : _amt_f,
+            "amount_base"         : amount_base,
+            "fee"                 : _fee_f,
+            "fee_base"            : fee_base,
+            "nonce"               : nonce,
+            "timestamp_ns"        : timestamp_ns,
+            "tx_type"             : "transfer",
+            "memo"                : memo[:256] if memo else "",
+            "signature"           : sig,
             "sender_public_key_hex": self.wallet.public_key or "",
-            "public_key": self.wallet.public_key or "",
-            "outputs": [{"address": to_addr, "amount_base": amount_base}],
-            "inputs": [],
-            "metadata": {
-                "sender_public_key_hex": self.wallet.public_key or "",
-            },
+            "public_key"          : self.wallet.public_key or "",
+            "outputs"             : [{"address": to_addr, "amount_base": amount_base}],
+            "inputs"              : [],
+            "metadata"            : {"sender_public_key_hex": self.wallet.public_key or ""},
         }
 
-        print(f"\n  ── Transaction Summary ──")
+        # ── Summary ───────────────────────────────────────────────────────────
+        print(f"
+  ── Transaction Summary ──")
         print(f"     From:  {from_addr[:20]}…")
         print(f"     To:    {to_addr[:20]}…")
         print(f"     Amt:   {amount_qtcl:.2f} QTCL")
@@ -27040,19 +27179,48 @@ class QtclClientApp:
             print("  ❌ Cancelled")
             return
 
+        # ── Submit — v4.0 startup-resilient path via api.submit_transaction ──
+        # Polls /health first, retries transient errors, surfaces permanent ones.
         result = self.api.submit_transaction(tx)
+
+        # ── Result display ────────────────────────────────────────────────────
         if result and result.get("accepted"):
-            srv = result.get("tx_hash", tx_hash)
-            print(f"\n  ✅ Submitted  │  hash: {srv}")
-            print(f"  Status: {result.get('status', 'pending')}")
+            srv_hash = result.get("tx_hash", tx_hash)
+            print(f"
+  ✅ Submitted  │  hash: {srv_hash}")
+            print(f"     Status  : {result.get('status', 'pending')}")
+            print(f"     Message : {result.get('message', 'ok')}")
+            if srv_hash != tx_hash:
+                print(f"     ⚠️  Server recomputed canonical hash (client hash: {tx_hash[:20]}…)")
         elif result and result.get("error"):
-            err = result.get("error", "unknown rejection")
-            print(f"\n  ❌ Rejected: {err}")
-            print(f"  Try: {self.oracle_url}")
+            err     = result.get("error", "unknown rejection")
+            err_str = ""
+            if isinstance(err, dict):
+                err_code = err.get("code", "")
+                err_msg  = err.get("message", str(err))
+                err_str  = f"[{err_code}] {err_msg}" if err_code else err_msg
+            else:
+                err_str = str(err)
+            # Classify for a helpful message
+            _em = err_str.lower()
+            if any(k in _em for k in ("initializing", "starting", "boot", "warming")):
+                print(f"
+  ❌ Server still warming up after retries.")
+                print(f"     Retry in ~30s or visit: {self.api.base_url}")
+            elif any(k in _em for k in ("insufficient", "balance")):
+                print(f"
+  ❌ Insufficient balance: {err_str}")
+            elif any(k in _em for k in ("signature", "sig")):
+                print(f"
+  ❌ Signature rejected: {err_str}")
+            else:
+                print(f"
+  ❌ Rejected: {err_str}")
+            print(f"     Try: {self.oracle_url}")
         else:
             _err_detail = (result or {}).get('error', 'no response from server')
             print(f"  ❌ Submission failed: {_err_detail}")
-            print(f"  Endpoint: {self.base_url}/rpc")
+            print(f"  Endpoint: {self.api.base_url}/rpc")
 
     def _query_tx(self) -> None:
         try:
