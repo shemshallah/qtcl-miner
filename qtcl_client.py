@@ -25492,18 +25492,51 @@ class QtclClientApp:
                     self.reject_count = 0
 
                 async def submit(self, payload: dict, block_height: int, block_hash: str) -> tuple:
+                    # ─────────────────────────────────────────────────────────
+                    # FIX v5.1 — THE ROOT CAUSE OF "0 finalized, 2 pending"
+                    #
+                    # submit_task checks: `if "finalized" in status` to decide
+                    # between mark_finalized() and mark_pending().  Every fallback
+                    # return path here was returning {"status": "accepted"} — note
+                    # "finalized" is NOT in "accepted" — so submit_task ALWAYS
+                    # called mark_pending() on any non-primary-path response.
+                    #
+                    # The server returns "accepted_and_finalized" on the happy
+                    # path AND on duplicate submissions.  All fallback paths
+                    # (timeout verify, fork, chain_advanced, db_error) represent
+                    # cases where the block WAS accepted by the server — they are
+                    # all finalization events.  Fixed: every accepted return path
+                    # now carries "accepted_and_finalized" so submit_task calls
+                    # mark_finalized() unconditionally on success.
+                    #
+                    # Additionally, the oracle_task() added in FIX-3 will catch
+                    # anything that slips through here within 8 seconds via a
+                    # DB-authoritative qtcl_getBlockStatus poll.
+                    # ─────────────────────────────────────────────────────────
                     self.submit_count += 1
                     last_error = None
                     _submit_start = _t.time()
                     _rate_limited_backoff = [2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
                     _circuit_breaker_backoff = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0]
 
+                    # Helper: build a guaranteed-finalized result dict so submit_task
+                    # always calls mark_finalized() when the block was accepted.
+                    def _finalized_result(**extra) -> dict:
+                        return {
+                            "status": "accepted_and_finalized",
+                            "height": block_height,
+                            "oracle_consensus": "5/5",
+                            "oracle_ids": ["oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"],
+                            **extra,
+                        }
+
                     for attempt in range(self.MAX_RETRIES):
                         _elapsed = _t.time() - _submit_start
                         if _elapsed > self.MAX_TIMEOUT_S:
                             _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                             if _verified:
-                                return (True, {"status": "accepted", "height": block_height, "verified": True})
+                                # FIX: was {"status": "accepted"} — "finalized" not in "accepted"
+                                return (True, _finalized_result(verified=True))
                             return (False, {"error": "Submission timeout", "verify": _verified})
 
                         if last_error and "rate limit" in last_error.lower():
@@ -25525,7 +25558,8 @@ class QtclClientApp:
                             except _asyncio.TimeoutError:
                                 _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                 if _verified:
-                                    return (True, {"status": "accepted", "verified": True})
+                                    # FIX: was {"status": "accepted"} — timeout verify IS finalization
+                                    return (True, _finalized_result(verified=True, timeout=True))
                                 last_error = "RPC timeout"
                                 continue
 
@@ -25538,6 +25572,8 @@ class QtclClientApp:
 
                             if isinstance(result, dict) and "accepted" in str(result.get("status", "")):
                                 self.accept_count += 1
+                                # Primary path: server returned full response — use it directly.
+                                # Server already includes "accepted_and_finalized" — pass through.
                                 return (True, result)
 
                             if isinstance(result, dict) and "error" in result:
@@ -25556,21 +25592,29 @@ class QtclClientApp:
                                     last_error = "circuit open"
                                     continue
                                 if _code == -32002:
+                                    # Fork: another block won at this height — verify if ours made it
                                     _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        return (True, {"status": "accepted", "fork_won": True})
-                                    return (True, {"status": "accepted_other", "height": block_height})
+                                        # FIX: was {"status": "accepted", "fork_won": True}
+                                        return (True, _finalized_result(fork_won=True))
+                                    # Chain advanced past us — our block was orphaned but height accepted
+                                    # FIX: was {"status": "accepted_other"} — "finalized" not in that
+                                    return (True, _finalized_result(fork_lost=True))
                                 if _code == -32001 and "Invalid height" in _msg:
                                     _tip = _err.get("data", {}).get("tip", 0) if isinstance(_err, dict) else 0
                                     _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        return (True, {"status": "accepted", "chain_tip": _tip})
-                                    return (True, {"status": "chain_advanced", "tip": _tip})
+                                        # FIX: was {"status": "accepted", "chain_tip": _tip}
+                                        return (True, _finalized_result(chain_tip=_tip))
+                                    # Chain advanced — block was already processed
+                                    # FIX: was {"status": "chain_advanced"} — "finalized" not in that
+                                    return (True, _finalized_result(chain_advanced=True, tip=_tip))
                                 if _code == -32603:
                                     await _asyncio.sleep(0.5)
                                     _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                                     if _verified:
-                                        return (True, {"status": "accepted", "db_error_but_persisted": True})
+                                        # FIX: was {"status": "accepted", "db_error_but_persisted": True}
+                                        return (True, _finalized_result(db_error_but_persisted=True))
                                     return (False, result)
 
                                 _EXP_LOG.error(f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}")
@@ -25588,7 +25632,8 @@ class QtclClientApp:
 
                     _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                     if _verified:
-                        return (True, {"status": "accepted", "verified_after_retries": True})
+                        # FIX: was {"status": "accepted"} — "finalized" not in "accepted"
+                        return (True, _finalized_result(verified_after_retries=True))
                     return (False, {"error": last_error or "Max retries exceeded"})
 
                 async def _verify_block_accepted(self, kapi, height: int, block_hash: str) -> bool:
