@@ -13472,8 +13472,6 @@ class CircuitBreaker:
 
 
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
-# SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
-# γ-SWARM  KoyebRPCNodule  (endpoints verified vs GossipHTTPHandler)
 class KoyebRPCNodule:
     """Thread-safe JSON-RPC 2.0 client for qtcl-blockchain.koyeb.app (https/443). RPC-only, no REST."""
 
@@ -13512,35 +13510,78 @@ class KoyebRPCNodule:
         last_error = None
 
         params_json = _json.dumps(params or [])
-        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-        full_url = f"{self.base_url}/rpc?{query}"
-
+        # Use POST when params JSON is large to avoid GET URL length limits
+        _use_post = len(params_json) > 2000 or method in ("qtcl_submitTransaction", "qtcl_submitBlock")
+        if _use_post:
+            _rpc_body = _json.dumps({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params or [],
+                "id": 1,
+            }).encode("utf-8")
+            _post_url = f"{self.base_url}/rpc"
+        
         def _do_request():
-            if _HAS_REQUESTS:
-                r = self._get_session().get(full_url, timeout=t)
-                if r.status_code == 200:
-                    result = r.json()
-                    if "result" in result:
-                        return result.get("result")
-                    elif "error" in result:
-                        return result
-                else:
-                    try:
+            if _use_post:
+                # POST with JSON body for large payloads
+                if _HAS_REQUESTS:
+                    r = self._get_session().post(
+                        _post_url, data=_rpc_body,
+                        headers={"Content-Type": "application/json"},
+                        timeout=t,
+                    )
+                    if r.status_code == 200:
                         result = r.json()
-                        if isinstance(result, dict) and "error" in result:
+                        if "result" in result:
+                            return result.get("result")
+                        elif "error" in result:
                             return result
-                    except Exception:
-                        pass
-                    raise RuntimeError(f"HTTP {r.status_code}")
+                    else:
+                        try:
+                            result = r.json()
+                            if isinstance(result, dict) and "error" in result:
+                                return result
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                else:
+                    import urllib.request as _ur
+                    req = _ur.Request(_post_url, data=_rpc_body,
+                                      headers={"Content-Type": "application/json"})
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        result = _json.loads(resp.read().decode("utf-8"))
+                        if "result" in result:
+                            return result.get("result")
+                        elif "error" in result:
+                            return result
             else:
-                import urllib.request as _ur
-                req = _ur.Request(full_url)
-                with _ur.urlopen(req, timeout=t) as resp:
-                    result = _json.loads(resp.read().decode("utf-8"))
-                    if "result" in result:
-                        return result.get("result")
-                    elif "error" in result:
-                        return result
+                query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+                full_url = f"{self.base_url}/rpc?{query}"
+                if _HAS_REQUESTS:
+                    r = self._get_session().get(full_url, timeout=t)
+                    if r.status_code == 200:
+                        result = r.json()
+                        if "result" in result:
+                            return result.get("result")
+                        elif "error" in result:
+                            return result
+                    else:
+                        try:
+                            result = r.json()
+                            if isinstance(result, dict) and "error" in result:
+                                return result
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                else:
+                    import urllib.request as _ur
+                    req = _ur.Request(full_url)
+                    with _ur.urlopen(req, timeout=t) as resp:
+                        result = _json.loads(resp.read().decode("utf-8"))
+                        if "result" in result:
+                            return result.get("result")
+                        elif "error" in result:
+                            return result
 
         for attempt in range(retries):
             try:
@@ -13793,25 +13834,18 @@ class KoyebRPCNodule:
 
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
-        Submit transaction via HTTP POST JSON-RPC 2.0 (qtcl_submitTransaction).
-        Uses POST to avoid GET URL length limits from large HypΓ signature dicts.
-        Passes the TX dict directly to the mempool which normalizes amounts,
-        validates signatures, and checks balances server-side.
+        Submit transaction via JSON-RPC 2.0 (qtcl_submitTransaction).
+        Uses _rpc which handles POST for large payloads automatically.
         """
         import time as _t2
-        import json as _json
-        import urllib.request as _ur
-        import socket
 
         payload = dict(tx)
 
-        # Ensure timestamp_ns is int (not str)
         if "timestamp_ns" in payload and isinstance(payload["timestamp_ns"], str):
             payload["timestamp_ns"] = int(payload["timestamp_ns"])
         elif "timestamp_ns" not in payload:
             payload["timestamp_ns"] = _t2.time_ns()
 
-        # Canonical dual-key aliases for mempool field name compat
         payload.setdefault("from_address", payload.get("from", ""))
         payload.setdefault("to_address", payload.get("to", ""))
         payload.setdefault("from_addr", payload.get("from_address", ""))
@@ -13821,38 +13855,7 @@ class KoyebRPCNodule:
         _EXP_LOG.info(
             f"[TX] Submitting transaction: {payload.get('tx_hash', '?')[:16]}..."
         )
-
-        # POST with JSON-RPC 2.0 envelope to avoid GET URL length issues
-        rpc_body = _json.dumps({
-            "jsonrpc": "2.0",
-            "method": "qtcl_submitTransaction",
-            "params": [payload],
-            "id": 1,
-        }).encode("utf-8")
-
-        post_url = f"{self.base_url}/rpc"
-        r = None
-        for attempt in range(2):
-            try:
-                socket.setdefaulttimeout(30)
-                req = _ur.Request(
-                    post_url,
-                    data=rpc_body,
-                    headers={"Content-Type": "application/json"},
-                )
-                with _ur.urlopen(req) as resp:
-                    result = _json.loads(resp.read().decode("utf-8"))
-                    if "result" in result:
-                        r = result["result"]
-                        break
-                    elif "error" in result:
-                        r = result
-                        break
-            except Exception as e:
-                _EXP_LOG.warning(f"[TX] Attempt {attempt+1}/2 failed: {e}")
-                if attempt == 0:
-                    _t2.sleep(1)
-                continue
+        r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=4)
 
         if r and isinstance(r, dict):
             if "error" in r:
@@ -13865,8 +13868,9 @@ class KoyebRPCNodule:
             )
             return r
 
-        _EXP_LOG.warning("[TX] No response from server")
-        return {"status": "no_response", "accepted": False, "error": "No response from server"}
+        _err_detail = str(self._last_error) if self._last_error else "connection refused or timeout"
+        _EXP_LOG.warning(f"[TX] No response from server: {_err_detail}")
+        return {"status": "no_response", "accepted": False, "error": f"No response from server: {_err_detail}"}
 
     def get_peers(self) -> list:
         """Get peer list via JSON-RPC."""
@@ -26975,22 +26979,22 @@ class QtclClientApp:
         nonce = int(time.time() * 1000)
         timestamp_ns = time.time_ns()
 
-        # ── Compute canonical tx_hash (must match mempool MempoolTx.canonical_hash) ──
-        # Format: SHA3-256("from_addr:to_addr:amount_qtcl_float:fee_qtcl_float:nonce:timestamp_ns")
-        _amt_f = float(amount_base / 100.0)
-        _fee_f = float(fee_base / 100.0)
-        _canon_str = f"{from_addr}:{to_addr}:{_amt_f}:{_fee_f}:{nonce}:{timestamp_ns}"
+        # ── Compute canonical tx_hash v2 (integer-only — matches mempool canonical_hash) ──
+        # Format: SHA3-256("from:to:amount_base:fee_base:nonce:timestamp_ns") — no float repr issues
+        _canon_str = f"{from_addr}:{to_addr}:{amount_base}:{fee_base}:{nonce}:{timestamp_ns}"
         tx_hash = hashlib.sha3_256(_canon_str.encode()).hexdigest()
 
-        # ── Build signing payload (must match mempool MempoolTx.get_signing_hash) ──
-        # SHA3-256(json.dumps({"sender": from, "recipient": to, "amount": amt_f, "nonce": nonce}, sort_keys=True))
+        # ── Build signing payload v2 (integer fields — matches mempool get_signing_hash) ──
+        # SHA3-256(json.dumps({"amount_base":int,"fee_base":int,"nonce":int,"recipient":str,"sender":str,"timestamp_ns":int}))
         _sign_data = {
-            "sender": from_addr,
-            "recipient": to_addr,
-            "amount": _amt_f,
-            "nonce": nonce,
+            "sender"      : from_addr,
+            "recipient"   : to_addr,
+            "amount_base" : amount_base,
+            "fee_base"    : fee_base,
+            "nonce"       : nonce,
+            "timestamp_ns": timestamp_ns,
         }
-        _sign_json = json.dumps(_sign_data, sort_keys=True, default=str)
+        _sign_json = json.dumps(_sign_data, sort_keys=True)
         _message_hash = hashlib.sha3_256(_sign_json.encode("utf-8")).digest()
 
         # ── Sign with HypΓ engine ──
@@ -27044,8 +27048,9 @@ class QtclClientApp:
             print(f"\n  ❌ Rejected: {err}")
             print(f"  Try: {self.oracle_url}")
         else:
-            print("  ❌ Submission failed — no response")
-            print(f"  Try: {self.oracle_url}")
+            _err_detail = (result or {}).get('error', 'no response from server')
+            print(f"  ❌ Submission failed: {_err_detail}")
+            print(f"  Endpoint: {self.base_url}/rpc")
 
     def _query_tx(self) -> None:
         try:
