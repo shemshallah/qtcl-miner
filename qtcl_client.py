@@ -26008,13 +26008,13 @@ class QtclClientApp:
                                 b"QTCL_SCRATCHPAD_v1:" + _ph_seed + epoch.to_bytes(8, "big")
                             ).digest(_POW_SCRATCHPAD_BYTES)
 
-                        # FIX: pre-warm epoch 0 in the async task before spawning workers.
-                        # Without this, all workers call _make_scratchpad(0) simultaneously
-                        # on their first iteration, serialising on GIL + 512KB SHAKE-256 recompute.
-                        # Epoch 0 covers nonces 0.._SCRATCHPAD_EPOCH_NONCES-1; workers inherit
-                        # the result via closure — they still build their own _scratch copy but
-                        # the OS page-cache is warm, cutting first-epoch cost to ~10% of cold time.
-                        _epoch0_scratch = _make_scratchpad(0)  # warm before thread spawn
+                        # FIX-EPOCH: pre-warm the epoch that workers will ACTUALLY start on.
+                        # Workers start at _PERSISTENT_NONCE_BASE[0] which is a random uint32
+                        # (~2.7B). Their initial epoch = base // _SCRATCHPAD_EPOCH_NONCES, NOT 0.
+                        # Pre-warming epoch 0 was useless — every worker immediately called
+                        # _make_scratchpad(base_epoch) and serialized on a cold 512KB SHAKE-256.
+                        _base_epoch = _PERSISTENT_NONCE_BASE[0] // _SCRATCHPAD_EPOCH_NONCES
+                        _epoch0_scratch = _make_scratchpad(_base_epoch)  # warm actual start epoch
 
                         _n_workers = max(1, (_os2.cpu_count() or 1))
                         _result_q = _q2.Queue()
@@ -26113,14 +26113,13 @@ class QtclClientApp:
                         _last_telem_nonce = 0
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
-                            # FIX-NONCE: workers use uint32 space: n = (n + stride) & 0xFFFFFFFF.
-                            # _cur_nonce must be masked to match — without the mask, base(~2^31)
-                            # + ctr(growing) drifts into a 33-bit value that never equals any
-                            # worker nonce. block_nonce=hashes_tried (all workers) for rate calc.
-                            _hashes_tried = _nonce_ctr[0] * _n_workers
+                            # _nonce_ctr[0] is the TOTAL hashes tried across all workers —
+                            # each worker independently adds 512 to the shared counter every
+                            # 512 local iters. No multiply needed.
+                            # _cur_nonce is worker-0's approximate position (masked uint32).
                             _cur_nonce = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
                             _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
-                                                        block_nonce=_hashes_tried, persistent_base=_PERSISTENT_NONCE_BASE[0])
+                                                        block_nonce=_nonce_ctr[0], persistent_base=_PERSISTENT_NONCE_BASE[0])
                             _last_telem_nonce = _cur_nonce
                             if _t.time() - _block_start > _BLOCK_TTL_S:
                                 _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
@@ -26146,19 +26145,18 @@ class QtclClientApp:
                                 break
 
                         _found = block_hash is not None
-                        # FIX-NONCE: _nonce_ctr[0] is per-worker counter (each worker adds 512 per 512 local iters).
-                        # Total hashes tried = _nonce_ctr[0] * _n_workers. Advance base by total so next block
-                        # workers start past all nonces already tried — prevents overlap/repeat.
-                        _total_tried = _nonce_ctr[0] * _n_workers
+                        # _nonce_ctr[0] is already total hashes across all workers.
+                        # Advance base by total tried (masked uint32) so next block workers
+                        # start past all nonces already covered — no repeats, no gaps.
                         if _found:
-                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried) & 0xFFFFFFFF
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
                         elif _chain_advanced:
-                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried) & 0xFFFFFFFF
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
                         elif _ttl_expired:
-                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried + secrets.randbelow(1_000_000)) & 0xFFFFFFFF
+                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0] + secrets.randbelow(1_000_000)) & 0xFFFFFFFF
 
                         if not _found or _chain_advanced or _ttl_expired:
                             _MINE_TELEM.mark_idle()
@@ -26356,7 +26354,8 @@ class QtclClientApp:
                                     reward = 7.20  # depth-5 default
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
-                            # FIX: sync balance fetch if still 0 after all recovery — dashboard shows updated balance immediately on next tick
+                            # FIX-BALANCE: if balance still 0 after all recovery, sync fetch now
+                            # so dashboard shows correct balance on next tick, not async lag.
                             if cache._balance_qtcl <= 0 or balance_qtcl <= 0:
                                 try:
                                     _bal_now = kapi._rpc("qtcl_getBalance", [block.miner_address], timeout=6, retries=1)
@@ -26682,11 +26681,11 @@ class QtclClientApp:
 
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
                 target_zeros = tel.get("difficulty", 5)
-                _hashes_tried = tel.get('session_nonces', tel.get('block_nonce', 0))
+                _tried = tel.get('session_nonces', tel.get('block_nonce', 0))
                 _cur_nonce_disp = tel.get('nonce', 0) & 0xFFFFFFFF
                 nonce_str = f"{_cur_nonce_disp:,}"
-                htried_str = f"{_hashes_tried:,}"
-                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={htried_str}  │  {hr_str}")
+                tried_str = f"{_tried:,}"
+                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={tried_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
