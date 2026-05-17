@@ -743,7 +743,7 @@ def connect_balance_stream(
 
     thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Balance-Reader")
     thread.start()
-    _EXP_LOG.info(f"[SSE-BALANCE] Connected to {url}")
+    _EXP_LOG.debug(f"[SSE-BALANCE] Connected to {url}")
     return thread
 
 
@@ -31611,7 +31611,7 @@ def main() -> None:  # noqa: F811
             height = data.get("height", 0) or data.get("block_height", 0)
             block_hash = data.get("hash", "") or data.get("block_hash", "")
             if height:
-                logger.info(
+                logger.debug(
                     f"[SSE-RECV] New block received: height={height}, hash={block_hash[:16]}..."
                 )
             globals()["_LATEST_BLOCK_EVENT"] = data
@@ -31648,11 +31648,11 @@ def main() -> None:  # noqa: F811
                     f"[SSE-RECV] 🔥 BLOCK FINALIZED h={_h}  oracles={_oc}/5  ids={_oid}"
                 )
             elif _evt == "block_pending":
-                logger.info(
+                logger.debug(
                     f"[SSE-RECV] ⏳ Block pending h={_h}  oracles={_oc}/5"
                 )
             elif _evt == "oracle_attestation":
-                logger.info(
+                logger.debug(
                     f"[SSE-RECV] 🖊️  Oracle attestation: h={_h}  oracle={data.get('oracle_id', '?')}"
                 )
             globals()["_LATEST_CONSENSUS_EVENT"] = data
@@ -31666,11 +31666,11 @@ def main() -> None:  # noqa: F811
                     pass
 
         def _default_balance_handler(data: dict) -> None:
-            """Default balance SSE handler — logs received balance updates."""
+            """Default balance SSE handler — dispatches to registered handlers silently."""
             _addr = data.get("address", "")[:16]
             _bal  = data.get("balance_qtcl", 0)
             _trigger = data.get("trigger", "?")
-            logger.info(f"[SSE-BAL] Balance update: {_addr}… = {_bal:.8f} QTCL (trigger={_trigger})")
+            logger.debug(f"[SSE-BAL] Balance update: {_addr}… = {_bal:.8f} QTCL (trigger={_trigger})")
             globals()["_LATEST_BALANCE_EVENT"] = data
             # Dispatch to all registered balance handlers
             for _h in list(_sse_balance_handlers):
