@@ -8538,12 +8538,20 @@ class LocalBlockchainDB:
                 " oracle_count INTEGER DEFAULT 0,"
                 " finalized INTEGER DEFAULT 1,"
                 " finalized_at INTEGER DEFAULT 0,"
+                " nonce INTEGER DEFAULT 0,"
+                " difficulty INTEGER DEFAULT 5,"
                 " created_at INTEGER DEFAULT (strftime('%s','now'))"
                 " )"
             )
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_client_blocks_miner ON client_blocks(miner_address)"
             )
+            # Migrate existing DBs: add columns if missing
+            for _col, _dtype in [("nonce", "INTEGER DEFAULT 0"), ("difficulty", "INTEGER DEFAULT 5")]:
+                try:
+                    self.conn.execute(f"ALTER TABLE client_blocks ADD COLUMN {_col} {_dtype}")
+                except Exception:
+                    pass  # already exists
             # UTXO mirror — Bitcoin-style unspent output set
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS client_utxos ("
@@ -23615,6 +23623,19 @@ class QtclClientApp:
                         raise
             if not _bind_success:
                 raise RuntimeError("P2P bind failed after 3 attempts")
+            # ── Fix: if we fell back to an alternate port, update external_addr ──
+            # ExternalAddressResolver used _P2P_PORT (9091) but we may have bound
+            # to _bind_port (e.g. 9101). Patch the port in the advertised address.
+            if _bind_port != _port and self.p2p_node.external_addr:
+                _ea = self.p2p_node.external_addr
+                if ":" in _ea:
+                    _ea_host = _ea.rsplit(":", 1)[0]
+                    self.p2p_node.external_addr = f"{_ea_host}:{_bind_port}"
+                else:
+                    self.p2p_node.external_addr = f"{_ea}:{_bind_port}"
+                _EXP_LOG.info(
+                    f"[P2P] ⚠️  Port fallback: updated external_addr to {self.p2p_node.external_addr}"
+                )
             _P2P_NODE = self.p2p_node
             _EXP_LOG.info(
                 f"[CLIENT] 🌐 P2P RPC node started on {self.p2p_node.external_addr}"
