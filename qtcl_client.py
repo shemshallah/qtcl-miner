@@ -8230,14 +8230,15 @@ def _fmt_ago(timestamp: float) -> str:
 async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
     """Confirmatory balance poll after block finalization.
 
-    FIX: was returning on first balance > 0 result even if unchanged (Neon lag).
-    Now polls until balance INCREASES above the pre-finalization snapshot.
-    FIX2: kapi._rpc() is synchronous — run in executor to avoid blocking event loop.
+    Polls until balance INCREASES above the pre-finalization snapshot.
+    Uses run_in_executor to avoid blocking the async event loop.
     """
     _pre_balance = cache._balance_qtcl  # snapshot — must exceed this to stop
-    await _asyncio.sleep(0.5)
+    await _asyncio.sleep(0.3)
     _loop = _asyncio.get_event_loop()
-    for attempt in range(25):
+    # 40 attempts: first 10 at 1s, next 10 at 2s, next 10 at 4s, last 10 at 8s
+    # Total window: ~150 seconds — covers Neon settlement lag
+    for attempt in range(40):
         try:
             result = await _loop.run_in_executor(
                 None, lambda: kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2))
@@ -8250,16 +8251,18 @@ async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmi
                         f"(+{balance_qtcl - _pre_balance:.2f}, attempt {attempt+1})"
                     )
                     return balance_qtcl
-                logger.debug(
-                    f"[BALANCE] Waiting for settle: server={balance_qtcl:.2f} "
-                    f"pre={_pre_balance:.2f} (attempt {attempt+1})"
-                )
                 # Keep display live at whatever server has (never go backwards)
                 cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
-            delay = 1.0 if attempt < 6 else min(2.0 + (attempt - 6), 8.0)
-            await _asyncio.sleep(delay)
+            if attempt < 10:
+                await _asyncio.sleep(1.0)
+            elif attempt < 20:
+                await _asyncio.sleep(2.0)
+            elif attempt < 30:
+                await _asyncio.sleep(4.0)
+            else:
+                await _asyncio.sleep(8.0)
         except Exception:
-            await _asyncio.sleep(min(2.0 * (attempt + 1), 8.0))
+            await _asyncio.sleep(2.0)
     # Exhausted retries — one final authoritative read
     try:
         result = await _loop.run_in_executor(
@@ -26535,8 +26538,13 @@ class QtclClientApp:
                             result = await _async_rpc("qtcl_getBalance", [_addr], timeout=5, retries=1)
                             if result and not result.get("error"):
                                 _b = float(result.get("balance", 0))
-                                # ALWAYS accept server balance — no > 0 guard
-                                cache._balance_qtcl = _b
+                                # Ratchet UP only — don't overwrite a higher balance from
+                                # _refresh_balance_on_finalize with a stale server read.
+                                # On startup, rehydrate sets the initial balance correctly.
+                                # A genuine balance decrease (spend) will be caught by
+                                # _sync_utxos_from_server which has the UTXO-level truth.
+                                if _b >= cache._balance_qtcl:
+                                    cache._balance_qtcl = _b
                             # FIX: snapshot authoritative RPC balance before calling
                             # _sync_utxos_from_server — that method calls
                             # _compute_balance_from_utxos() on local SQLite which may
