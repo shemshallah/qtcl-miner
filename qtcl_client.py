@@ -8194,31 +8194,39 @@ def _fmt_ago(timestamp: float) -> str:
 async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
     """Confirmatory balance poll after block finalization.
 
-    SERVER IS THE SINGLE SOURCE OF TRUTH — always accepts server balance.
-    Polls fast initially to catch quick Neon commits, then backs off.
+    FIX: was returning on first balance > 0 result even if unchanged (Neon lag).
+    Now polls until balance INCREASES above the pre-finalization snapshot.
     """
-    # FIX: was 2.0s — misses fast Neon commits. 0.5s catches typical settlement lag.
+    _pre_balance = cache._balance_qtcl  # snapshot — must exceed this to stop
     await _asyncio.sleep(0.5)
-    for attempt in range(20):
+    for attempt in range(25):
         try:
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2)
             if result and not result.get("error"):
                 balance_qtcl = float(result.get("balance", 0))
-                cache._balance_qtcl = balance_qtcl
-                if balance_qtcl > 0:
-                    logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL (attempt {attempt+1})")
+                if balance_qtcl > _pre_balance:
+                    cache._balance_qtcl = balance_qtcl
+                    logger.info(
+                        f"[BALANCE] ✅ Settled: {_pre_balance:.2f} → {balance_qtcl:.8f} QTCL "
+                        f"(+{balance_qtcl - _pre_balance:.2f}, attempt {attempt+1})"
+                    )
                     return balance_qtcl
-                logger.debug(f"[BALANCE] Still 0 after finalize (attempt {attempt+1}) — retrying")
-            # First 3 attempts at 1s, then back off to 10s max
-            delay = 1.0 if attempt < 3 else min(3.0 + attempt, 10.0)
+                logger.debug(
+                    f"[BALANCE] Waiting for settle: server={balance_qtcl:.2f} "
+                    f"pre={_pre_balance:.2f} (attempt {attempt+1})"
+                )
+                # Keep display live at whatever server has (never go backwards)
+                cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
+            delay = 1.0 if attempt < 6 else min(2.0 + (attempt - 6), 8.0)
             await _asyncio.sleep(delay)
         except Exception:
-            await _asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
+            await _asyncio.sleep(min(2.0 * (attempt + 1), 8.0))
+    # Exhausted retries — one final authoritative read
     try:
         result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1)
         if result and not result.get("error"):
             balance_qtcl = float(result.get("balance", 0))
-            cache._balance_qtcl = balance_qtcl
+            cache._balance_qtcl = max(cache._balance_qtcl, balance_qtcl)
             logger.info(f"[BALANCE] Final read: {balance_qtcl:.8f} QTCL")
             return balance_qtcl
     except Exception:
@@ -26371,18 +26379,9 @@ class QtclClientApp:
                                     reward = 7.20  # depth-5 default
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
-                            if cache._balance_qtcl <= 0 or balance_qtcl <= 0:
-                                try:
-                                    _bal_now = kapi._rpc("qtcl_getBalance", [block.miner_address], timeout=6, retries=1)
-                                    if _bal_now and not _bal_now.get("error"):
-                                        _b_val = float(_bal_now.get("balance", 0))
-                                        if _b_val > 0:
-                                            cache._balance_qtcl = _b_val
-                                            _EXP_LOG.info(f"[BALANCE] 💰 Sync fetch on finalize: {_b_val:.8f} QTCL h={block.height}")
-                                except Exception as _bfe:
-                                    _EXP_LOG.debug(f"[BALANCE] Sync fetch failed: {_bfe}")
                             _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
-                            # Always fire confirmatory refresh — catches any Neon lag
+                            # Always fire confirmatory refresh — polls until balance increases
+                            # above pre-finalization value, catching all Neon settlement lag.
                             _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
                             # P2P broadcast after successful submission
                             _p2p_n = getattr(self, "p2p_node", None)
@@ -26455,7 +26454,15 @@ class QtclClientApp:
                                 _b = float(result.get("balance", 0))
                                 # ALWAYS accept server balance — no > 0 guard
                                 cache._balance_qtcl = _b
+                            # FIX: snapshot authoritative RPC balance before calling
+                            # _sync_utxos_from_server — that method calls
+                            # _compute_balance_from_utxos() on local SQLite which may
+                            # return stale/low value if UTXOs haven't settled yet,
+                            # overwriting the correct server-returned balance.
+                            _rpc_balance_snap = cache._balance_qtcl
                             cache._sync_utxos_from_server(kapi, _addr)
+                            if cache._balance_qtcl < _rpc_balance_snap:
+                                cache._balance_qtcl = _rpc_balance_snap
                     except Exception:
                         pass
                     _in_fast = _asyncio.get_event_loop().time() < _fast_until
