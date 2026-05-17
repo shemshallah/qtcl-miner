@@ -25979,7 +25979,7 @@ class QtclClientApp:
                                     return
                                 # Fetch full TX dict from mempool for signature/inputs/outputs
                                 try:
-                                    _full_tx_list = await _async_rpc("qtcl_getMempool", [500], timeout=5, retries=1)
+                                    _full_tx_list = kapi._rpc("qtcl_getMempool", [500], timeout=5, retries=1)
                                     _full_tx = None
                                     if isinstance(_full_tx_list, list):
                                         for _ftx in _full_tx_list:
