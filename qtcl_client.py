@@ -25695,6 +25695,13 @@ class QtclClientApp:
                         }
 
                     for attempt in range(self.MAX_RETRIES):
+                        # FIX: If SSE or oracle_task already finalized this block while
+                        # we're retrying, bail out immediately — don't waste 120s on retries
+                        # for a block the server already accepted. This was causing submit_task
+                        # to be stuck on pipeline.submit() for the PREVIOUS block, unable to
+                        # pick up newly solved blocks.
+                        if cache.is_height_finalized(block_height):
+                            return (True, _finalized_result(early_exit="already_finalized_externally"))
                         _elapsed = _t.time() - _submit_start
                         if _elapsed > self.MAX_TIMEOUT_S:
                             _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
@@ -25797,6 +25804,9 @@ class QtclClientApp:
                             _EXP_LOG.info(f"[SUBMIT] Retry in {_wait:.1f}s...")
                             await _asyncio.sleep(_wait)
 
+                    # Final check: block may have been finalized externally during retries
+                    if cache.is_height_finalized(block_height):
+                        return (True, _finalized_result(early_exit="already_finalized_externally"))
                     _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
                     if _verified:
                         # FIX: was {"status": "accepted"} — "finalized" not in "accepted"
@@ -26398,6 +26408,7 @@ class QtclClientApp:
             async def submit_task():
                 _last_evict = _t.time()
                 while True:
+                  try:
                     block = cache.get_next_unsent()
                     if block is None:
                         _now = _t.time()
@@ -26518,6 +26529,9 @@ class QtclClientApp:
                             _EXP_LOG.warning(f"[SUBMIT] ⚠️ h={block.height} retry ({block.submit_attempts}/{pipeline.MAX_RETRIES}): {err}")
                     _MINE_TELEM.mark_mining()
                     await _asyncio.sleep(0.1)
+                  except Exception as _submit_err:
+                    _EXP_LOG.error(f"[SUBMIT-TASK] ❌ Unhandled: {type(_submit_err).__name__}: {_submit_err}", exc_info=True)
+                    await _asyncio.sleep(1.0)
 
             async def balance_task():
                 # Poll balance: fast (3s) for 120s after any finalize, then slow (30s).
@@ -26739,7 +26753,7 @@ class QtclClientApp:
                         _EXP_LOG.debug(f"[ORACLE-TASK] outer: {_ot_err}")
                         await _asyncio.sleep(_POLL_INTERVAL)
 
-            await _asyncio.gather(pow_task(), submit_task(), balance_task(), oracle_task())
+            await _asyncio.gather(pow_task(), submit_task(), balance_task(), oracle_task(), return_exceptions=True)
         async def _mine():
             try:
                 _EXP_LOG.warning("[MINER-ASYNC] 🚀 Async mining loop starting…")
