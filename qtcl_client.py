@@ -691,6 +691,62 @@ def connect_mempool_stream(
     return thread
 
 
+def connect_balance_stream(
+    server_url: str, callback: Callable[[dict], None]
+) -> threading.Thread:
+    """
+    Connect to /rpc/events/balance SSE stream for real-time UTXO balance updates.
+    Client-side filtering by address — all addresses broadcast on one channel.
+    """
+    url = f"{server_url.rstrip('/')}/rpc/events/balance"
+    headers = {"Accept": "text/event-stream"}
+
+    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "balance"}
+    globals()["_SSE_BALANCE_STATE"] = _SSE_STATE
+
+    def _sse_reader():
+        import time as _t, json as _j, requests as _r
+        backoff = 1.0
+        while True:
+            try:
+                resp = _r.get(url, headers=headers, stream=True, timeout=(10, 60))
+                resp.raise_for_status()
+                _SSE_STATE["connected"] = True
+                _SSE_STATE["last_event_ts"] = _t.time()
+                backoff = 1.0
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        try:
+                            data = _j.loads(line[6:])
+                            _SSE_STATE["last_event_ts"] = _t.time()
+                            # Deduplicate identical events within 5s window
+                            _event_key = _j.dumps(data, sort_keys=True)
+                            _now = _t.time()
+                            _last_ts = globals().get("_SSE_BALANCE_LAST_TS", {}).get(_event_key, 0)
+                            if _now - _last_ts < 5.0:
+                                continue
+                            globals().setdefault("_SSE_BALANCE_LAST_TS", {})[_event_key] = _now
+                            # Trim dedup cache to prevent memory leak
+                            _cache = globals().get("_SSE_BALANCE_LAST_TS", {})
+                            if len(_cache) > 500:
+                                globals()["_SSE_BALANCE_LAST_TS"] = {
+                                    k: v for k, v in _cache.items()
+                                    if _now - v < 60.0
+                                }
+                            callback(data)
+                        except Exception:
+                            pass
+            except Exception as e:
+                _SSE_STATE["connected"] = False
+                _t.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Balance-Reader")
+    thread.start()
+    _EXP_LOG.info(f"[SSE-BALANCE] Connected to {url}")
+    return thread
+
+
 def average_density_matrices(measurements: List[str]) -> Optional[str]:
     """Average multiple 16³ density matrices (hex encoded) into consensus state."""
     try:
@@ -25905,11 +25961,28 @@ class QtclClientApp:
                     if h >= _current_target and _current_target > 0:
                         signal_chain_advance(h)
 
+            def _balance_handler(data: dict) -> None:
+                if data.get("type") != "balance_update":
+                    return
+                _addr = data.get("address", "")
+                _wallet_addr = getattr(getattr(self, "wallet", None), "address", None)
+                if _addr and _wallet_addr and _addr == _wallet_addr:
+                    _b = float(data.get("balance_qtcl", 0) or 0)
+                    if _b > 0:
+                        _prev = cache._balance_qtcl
+                        cache._balance_qtcl = _b
+                        if abs(_b - _prev) > 0.0001:
+                            _EXP_LOG.info(
+                                f"[BALANCE] 💰 SSE balance stream: {_prev:.4f} → {_b:.8f} QTCL "
+                                f"(trigger={data.get('trigger','?')})"
+                            )
+
             globals()["_block_cache"] = cache
             for _reg_attempt in range(20):
                 try:
                     register_consensus_handler(_consensus_handler)
                     register_block_handler(_block_handler)
+                    register_balance_handler(_balance_handler)
                     break
                 except NameError:
                     await _asyncio.sleep(0.1)
@@ -26942,7 +27015,8 @@ class QtclClientApp:
             _sse_cons = globals().get("_SSE_CONSENSUS_STATE", {})
             _sse_blk = globals().get("_SSE_BLOCK_STATE", {})
             _sse_dns = globals().get("_SSE_DENSITY_STATE", {})
-            _sse_streams = [("cons", _sse_cons), ("blk", _sse_blk), ("dns", _sse_dns)]
+            _sse_bal = globals().get("_SSE_BALANCE_STATE", {})
+            _sse_streams = [("cons", _sse_cons), ("blk", _sse_blk), ("dns", _sse_dns), ("bal", _sse_bal)]
             _sse_initialized = [(n, s) for n, s in _sse_streams if s]
             if not _sse_initialized:
                 _sse_label = "⏳ initializing..."
@@ -31496,6 +31570,7 @@ def main() -> None:  # noqa: F811
         _sse_density_handlers: List[Callable[[dict], None]] = []
         _sse_block_handlers: List[Callable[[dict], None]] = []
         _sse_consensus_handlers: List[Callable[[dict], None]] = []
+        _sse_balance_handlers: List[Callable[[dict], None]] = []
 
         def _default_density_handler(data: dict) -> None:
             """Default handler for density stream - stores to global + local DB mesh repository."""
@@ -31522,6 +31597,14 @@ def main() -> None:  # noqa: F811
                 except Exception:
                     pass
             globals()["_LATEST_DENSITY_SNAPSHOT"] = data
+            # Dispatch to all registered density handlers
+            for _h in list(_sse_density_handlers):
+                if _h is _default_density_handler:
+                    continue
+                try:
+                    _h(data)
+                except Exception:
+                    pass
 
         def _default_block_handler(data: dict) -> None:
             """Default handler for block stream - logs new blocks."""
@@ -31532,6 +31615,14 @@ def main() -> None:  # noqa: F811
                     f"[SSE-RECV] New block received: height={height}, hash={block_hash[:16]}..."
                 )
             globals()["_LATEST_BLOCK_EVENT"] = data
+            # Dispatch to all registered block handlers
+            for _h in list(_sse_block_handlers):
+                if _h is _default_block_handler:
+                    continue
+                try:
+                    _h(data)
+                except Exception:
+                    pass
 
         # Deduplication buffer for consensus events (suppress reconnect replays)
         _CONSENSUS_DEDUP: Dict[Tuple[str, int, int], float] = {}
@@ -31565,11 +31656,36 @@ def main() -> None:  # noqa: F811
                     f"[SSE-RECV] 🖊️  Oracle attestation: h={_h}  oracle={data.get('oracle_id', '?')}"
                 )
             globals()["_LATEST_CONSENSUS_EVENT"] = data
+            # Dispatch to all registered consensus handlers
+            for _h in list(_sse_consensus_handlers):
+                if _h is _default_consensus_handler:
+                    continue
+                try:
+                    _h(data)
+                except Exception:
+                    pass
+
+        def _default_balance_handler(data: dict) -> None:
+            """Default balance SSE handler — logs received balance updates."""
+            _addr = data.get("address", "")[:16]
+            _bal  = data.get("balance_qtcl", 0)
+            _trigger = data.get("trigger", "?")
+            logger.info(f"[SSE-BAL] Balance update: {_addr}… = {_bal:.8f} QTCL (trigger={_trigger})")
+            globals()["_LATEST_BALANCE_EVENT"] = data
+            # Dispatch to all registered balance handlers
+            for _h in list(_sse_balance_handlers):
+                if _h is _default_balance_handler:
+                    continue
+                try:
+                    _h(data)
+                except Exception:
+                    pass
 
         # Register default handlers
         _sse_density_handlers.append(_default_density_handler)
         _sse_block_handlers.append(_default_block_handler)
         _sse_consensus_handlers.append(_default_consensus_handler)
+        _sse_balance_handlers.append(_default_balance_handler)
 
         # Start SSE streams (only in non-audit modes to avoid cluttering logs)
         if not _is_oracle_audit:
@@ -31591,10 +31707,17 @@ def main() -> None:  # noqa: F811
             except Exception as _sse_err:
                 logger.debug(f"[SSE] Consensus stream init failed: {_sse_err}")
 
+            try:
+                _balance_thread = connect_balance_stream(url, _default_balance_handler)
+                globals()["_SSE_BALANCE_THREAD"] = _balance_thread
+            except Exception as _sse_err:
+                logger.debug(f"[SSE] Balance stream init failed: {_sse_err}")
+
         # Make handler registration available globally
         globals()["_SSE_DENSITY_HANDLERS"] = _sse_density_handlers
         globals()["_SSE_BLOCK_HANDLERS"] = _sse_block_handlers
         globals()["_SSE_CONSENSUS_HANDLERS"] = _sse_consensus_handlers
+        globals()["_SSE_BALANCE_HANDLERS"] = _sse_balance_handlers
 
         def register_density_handler(handler: Callable[[dict], None]) -> None:
             _sse_density_handlers.append(handler)
@@ -31605,9 +31728,13 @@ def main() -> None:  # noqa: F811
         def register_consensus_handler(handler: Callable[[dict], None]) -> None:
             _sse_consensus_handlers.append(handler)
 
+        def register_balance_handler(handler: Callable[[dict], None]) -> None:
+            _sse_balance_handlers.append(handler)
+
         globals()["register_density_handler"] = register_density_handler
         globals()["register_block_handler"] = register_block_handler
         globals()["register_consensus_handler"] = register_consensus_handler
+        globals()["register_balance_handler"] = register_balance_handler
 
         print("✅ Ready for input", flush=True)
     except Exception as e:
