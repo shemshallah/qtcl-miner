@@ -7560,6 +7560,10 @@ class BlockSubmissionCache:
         self._highest_finalized_height: int = 0
         self._finalized_count: int = 0
         self._total_rewards: float = 0.0
+        # Idempotency guards — prevent double-counting when SSE and submit_task
+        # both call mark_finalized for the same height
+        self._finalized_heights: set = set()
+        self._rewarded_heights: set = set()
         self._rehydrate()
 
     def _rehydrate(self):
@@ -7644,6 +7648,9 @@ class BlockSubmissionCache:
             # If EVICT_AFTER_S > 0, blocks would be evicted and count would fall to 0.
             if rows:
                 self._finalized_count = len(rows)
+                # Populate idempotency sets from rehydrated data
+                for _rr in rows:
+                    self._finalized_heights.add(_rr["height"])
                 # Backfill rows where reward_qtcl was persisted as 0 (pre-fix blocks)
                 _rehydrate_total = 0.0
                 for _rr in rows:
@@ -7662,6 +7669,8 @@ class BlockSubmissionCache:
                         except Exception:
                             _rr_reward = 7.20
                     _rehydrate_total += _rr_reward
+                    if _rr_reward > 0:
+                        self._rewarded_heights.add(_rr["height"])
                 self._total_rewards = _rehydrate_total
                 self._highest_finalized_height = max(row["height"] for row in rows)
             # Compute balance from local UTXO mirror
@@ -7840,25 +7849,49 @@ class BlockSubmissionCache:
     def mark_finalized(self, height: int, reward_qtcl: float = 0.0, recipient: str = "", oracle_count: int = 0, oracle_ids: list = None):
         with self._lock:
             b = self._blocks.get(height)
-            if b:
-                b.status = BlockStatus.FINALIZED
+            if not b:
+                # Already popped — check if previously processed
+                if height in self._finalized_heights:
+                    # Idempotent: block already finalized and evicted.
+                    # But if we now have a reward and didn't before, add it.
+                    if reward_qtcl > 0 and height not in self._rewarded_heights:
+                        self._total_rewards += reward_qtcl
+                        self._rewarded_heights.add(height)
+                    return
+                return  # unknown block, nothing to do
+
+            b.status = BlockStatus.FINALIZED
+            if not b.finalized_at:
                 b.finalized_at = time.time()
+
+            # Reward: only overwrite with a positive value (don't clobber good with 0)
+            if reward_qtcl > 0:
                 b.reward_qtcl = reward_qtcl
-                if oracle_count > 0:
-                    b.oracle_count = oracle_count
-                if oracle_ids:
-                    b.oracle_ids = oracle_ids
-                self._persist_block_finalized(height, b)
-                if reward_qtcl > 0:
-                    self._persist_reward(height, reward_qtcl, recipient or b.miner_address, "miner")
-                # Update aggregate metrics and evict from memory immediately
-                # (block is already persisted to local SQLite)
+            if oracle_count > 0:
+                b.oracle_count = max(b.oracle_count, oracle_count)
+            if oracle_ids:
+                b.oracle_ids = oracle_ids
+
+            self._persist_block_finalized(height, b)
+            if b.reward_qtcl > 0:
+                self._persist_reward(height, b.reward_qtcl, recipient or b.miner_address, "miner")
+
+            # Aggregate metrics — ONLY increment finalized_count ONCE per height
+            _first_finalize = height not in self._finalized_heights
+            if _first_finalize:
+                self._finalized_heights.add(height)
                 self._highest_finalized_height = max(self._highest_finalized_height, height)
                 self._finalized_count += 1
-                self._total_rewards += reward_qtcl
-                b = self._blocks.pop(height, None)
-                if b:
-                    self._hash_index.pop(b.block_hash, None)
+
+            # Add reward to total ONCE per height (when we first get a positive reward)
+            if b.reward_qtcl > 0 and height not in self._rewarded_heights:
+                self._rewarded_heights.add(height)
+                self._total_rewards += b.reward_qtcl
+
+            # Evict from memory — block is persisted to local SQLite
+            b = self._blocks.pop(height, None)
+            if b:
+                self._hash_index.pop(b.block_hash, None)
 
     def mark_rejected(self, height: int, error: str = ""):
         with self._lock:
@@ -7936,7 +7969,7 @@ class BlockSubmissionCache:
             # BUG-A FIX: block already evicted (previously finalized) — handle
             # idempotently so reconnect replays don't corrupt counters.
             if not b:
-                if h <= self._highest_finalized_height:
+                if h in self._finalized_heights:
                     # Already known-finalized — event is a stale replay, ignore.
                     return
                 if is_finalized_evt:
@@ -7960,6 +7993,7 @@ class BlockSubmissionCache:
                     self._blocks[h]     = _synth
                     self._hash_index[_synth.block_hash] = h
                     self._highest_finalized_height = max(self._highest_finalized_height, h)
+                    self._finalized_heights.add(h)
                     self._finalized_count += 1
                     self._persist_block_finalized(h, _synth)
                 # Either handled above or not our block at all — done.
@@ -7975,7 +8009,8 @@ class BlockSubmissionCache:
                 b.oracle_count = max(b.oracle_count, oracle_count, 5 if is_finalized_evt else 0)
                 if oracle_ids:
                     b.oracle_ids = oracle_ids
-                if not _was_finalized:
+                if h not in self._finalized_heights:
+                    self._finalized_heights.add(h)
                     self._highest_finalized_height = max(self._highest_finalized_height, h)
                     self._finalized_count += 1
                     self._persist_block_finalized(h, b)
@@ -7996,7 +8031,8 @@ class BlockSubmissionCache:
                     if not b.finalized_at:
                         b.finalized_at = time.time()
                     b.oracle_count = max(b.oracle_count, oracle_count)
-                    if not _was_finalized:
+                    if h not in self._finalized_heights:
+                        self._finalized_heights.add(h)
                         self._highest_finalized_height = max(self._highest_finalized_height, h)
                         self._finalized_count += 1
                         self._persist_block_finalized(h, b)
@@ -26570,14 +26606,19 @@ class QtclClientApp:
                                 ):
                                     _need_poll.append((_h, _b.block_hash))
                                     if _b.status in (BlockStatus.PENDING, BlockStatus.SUBMITTED):
-                                        # FIX: was PENDING only — blocks go SUBMITTED→FINALIZED directly
-                                        # (submit_task calls mark_finalized, skipping PENDING entirely).
-                                        # Fast-window never activated because _last_submission_ts stayed 0.
-                                        # Now track any in-flight block so we poll at 2s not 8s cadence.
                                         _last_submission_ts = max(
                                             _last_submission_ts,
                                             _b.first_submitted_at or _b.last_submitted_at or 0.0,
                                         )
+                                # FIX: Also poll FINALIZED blocks that have no reward yet.
+                                # This catches the SSE-finalizes-before-submit-responds race:
+                                # update_from_sse promotes to FINALIZED with reward=0,
+                                # submit_task hasn't responded yet. Without this, the block
+                                # sits at reward=0 and balance never updates.
+                                elif (_b.status == BlockStatus.FINALIZED
+                                      and _b.reward_qtcl <= 0
+                                      and _h not in cache._rewarded_heights):
+                                    _need_poll.append((_h, _b.block_hash))
 
                         if not _need_poll and not _do_reconnect_sweep:
                             await _asyncio.sleep(_POLL_INTERVAL)
@@ -26605,16 +26646,18 @@ class QtclClientApp:
                                 _db_balance = float(_st.get("miner_balance_qtcl", 0))
 
                                 if _db_finalized:
-                                    # FIX: was directly mutating _cb bypassing mark_finalized(),
-                                    # so _total_rewards and reward_qtcl were never updated.
-                                    # Now call mark_finalized() for all bookkeeping.
+                                    # Check if reward is still needed (SSE may have finalized with reward=0)
                                     with cache._lock:
                                         _cb = cache._blocks.get(_poll_h)
-                                        _already_done = (
-                                            (_cb and _cb.status == BlockStatus.FINALIZED)
-                                            or (not _cb and _poll_h <= cache._highest_finalized_height)
+                                        _needs_reward = (
+                                            _poll_h not in cache._rewarded_heights
+                                            and (_cb is None or _cb.reward_qtcl <= 0)
                                         )
-                                    if not _already_done:
+                                        _already_finalized_and_rewarded = (
+                                            _poll_h in cache._finalized_heights
+                                            and _poll_h in cache._rewarded_heights
+                                        )
+                                    if not _already_finalized_and_rewarded:
                                         if _db_reward <= 0:
                                             try:
                                                 from globals import TessellationRewardSchedule as _TRS2
