@@ -26609,28 +26609,33 @@ class QtclClientApp:
                     await _asyncio.sleep(1.0)
 
             async def balance_task():
-                # Poll balance: fast (3s) for 120s after any finalize, then slow (30s).
-                # SERVER IS AUTHORITATIVE — always accept the server's balance,
-                # including 0 after a DB reset.  The old "if _b > 0" guard was
-                # the reason phantom balances survived genesis rebuilds.
-                _last_seen_finalized = cache._highest_finalized_height
-                _fast_until = 0.0
+                # Syncs UTXO mirror from server. Balance is authoritative from SSE stream;
+                # one-time bootstrap: if balance is 0 at startup, do a single RPC query
+                # to seed it, then let the SSE stream take over permanently.
+                _bootstrapped = False
                 while True:
                     try:
                         _addr = getattr(getattr(self, "wallet", None), "address", None)
                         if _addr:
-                            _cur_fin = cache._highest_finalized_height
-                            if _cur_fin > _last_seen_finalized:
-                                _last_seen_finalized = _cur_fin
-                                _fast_until = _asyncio.get_event_loop().time() + 120.0
-
-                            # Sync UTXO mirror from server — no balance writes, SSE balance stream is authoritative
+                            # Bootstrap: one-time RPC balance query if cache is zero on startup
+                            if not _bootstrapped and cache._balance_qtcl <= 0:
+                                _bootstrapped = True
+                                try:
+                                    result = await _async_rpc("qtcl_getBalance", [_addr], timeout=8, retries=2)
+                                    if result and not result.get("error"):
+                                        _b = float(result.get("balance", 0))
+                                        if _b > 0:
+                                            cache._balance_qtcl = _b
+                                            _EXP_LOG.info(f"[BALANCE] 🔌 Bootstrap from RPC: {_b:.8f} QTCL")
+                                except Exception:
+                                    # Fallback: compute from local UTXO mirror
+                                    cache._balance_qtcl = cache._compute_balance_from_utxos()
+                            # Sync UTXO mirror from server — SSE balance stream is authoritative thereafter
                             _loop = _asyncio.get_event_loop()
                             await _loop.run_in_executor(None, cache._sync_utxos_from_server, kapi, _addr)
                     except Exception:
                         pass
-                    _in_fast = _asyncio.get_event_loop().time() < _fast_until
-                    await _asyncio.sleep(3.0 if _in_fast else 30.0)
+                    await _asyncio.sleep(30.0)
 
             async def oracle_task():
                 """
