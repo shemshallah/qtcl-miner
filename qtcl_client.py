@@ -7549,7 +7549,7 @@ class BlockSubmissionCache:
     rewards, block counts and chain tip survive script restarts.
     """
     MAX_SIZE = 32
-    EVICT_AFTER_S = 0.0
+    EVICT_AFTER_S = 30.0  # FIX: was 0.0 — FINALIZED blocks never evicted from _blocks, accumulated in display forever
 
     def __init__(self, db=None):
         self._lock = threading.RLock()
@@ -26352,6 +26352,17 @@ class QtclClientApp:
                                     reward = 7.20  # depth-5 default
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
+                            # FIX: sync balance fetch if still 0 after all recovery — dashboard shows updated balance immediately on next tick
+                            if cache._balance_qtcl <= 0 or balance_qtcl <= 0:
+                                try:
+                                    _bal_now = kapi._rpc("qtcl_getBalance", [block.miner_address], timeout=6, retries=1)
+                                    if _bal_now and not _bal_now.get("error"):
+                                        _b_val = float(_bal_now.get("balance", 0))
+                                        if _b_val > 0:
+                                            cache._balance_qtcl = _b_val
+                                            _EXP_LOG.info(f"[BALANCE] 💰 Sync fetch on finalize: {_b_val:.8f} QTCL h={block.height}")
+                                except Exception as _bfe:
+                                    _EXP_LOG.debug(f"[BALANCE] Sync fetch failed: {_bfe}")
                             _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
                             # Always fire confirmatory refresh — catches any Neon lag
                             _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
