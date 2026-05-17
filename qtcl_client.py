@@ -7428,36 +7428,27 @@ def _validate_and_init_schema(db_path: Path) -> bool:
                     pass
 
         logger.info(
-            "[DB-SCHEMA] 🔨 Building fresh schema in-process (no subprocess)..."
+            "[DB-SCHEMA] 🔨 Running qtcl_db_builder.py to create fresh schema..."
         )
-        # Direct in-process call — avoids the module-level pip install hang
-        # that blocked startup for up to 180 s on every cold start.
-        try:
-            import importlib.util as _ilu
-            builder_path = _REPO_ROOT / "qtcl_db_builder.py"
-            if not builder_path.exists():
-                logger.error(f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}")
-                return False
-            spec = _ilu.spec_from_file_location("qtcl_db_builder", str(builder_path))
-            _mod = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(_mod)
-            server_cls = _mod.QuantumTemporalCoherenceLedgerServer
-            builder = server_cls(
-                db_url=str(db_path),
-                db_mode="sqlite",
-                tessellation_depth=3,   # shallow — schema only, no data seeding
+        builder_path = _REPO_ROOT / "qtcl_db_builder.py"
+
+        if not builder_path.exists():
+            logger.error(
+                f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}"
             )
-            import sqlite3 as _sq3
-            builder.conn = _sq3.connect(str(db_path), check_same_thread=False, timeout=30)
-            builder.conn.row_factory = _sq3.Row
-            builder.cursor = builder.conn.cursor()
-            builder.conn.execute("PRAGMA journal_mode=WAL")
-            builder.conn.execute("PRAGMA synchronous=NORMAL")
-            builder.create_schema()
-            builder.conn.commit()
-            builder.conn.close()
-        except Exception as _build_err:
-            logger.error(f"[DB-SCHEMA] ❌ In-process builder failed: {_build_err}")
+            return False
+
+        # Run builder
+        result = subprocess.run(
+            [sys.executable, str(builder_path)],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            timeout=180,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            logger.error(f"[DB-SCHEMA] ❌ Builder FAILED:\n{result.stderr[-1000:]}")
             return False
 
         logger.info("[DB-SCHEMA] ✅ Fresh schema created successfully")
@@ -31816,6 +31807,139 @@ def _raw_rpc_post(base_url: str, method: str, params: list, timeout: float = 30.
         return json.loads(resp.read().decode("utf-8"))
 
 
+# ── MCP TOOLS/CALL TRANSPORT ──────────────────────────────────────────────────
+# Uses the MCP streamable-http endpoint (/mcp) which has direct in-process
+# dispatch (no HTTP self-loop) and better timeout handling than /rpc.
+# Protocol: MCP 2025-06-18 streamable HTTP — single POST per tool call.
+
+_mcp_session_id: str = ""
+
+def _mcp_initialize(base_url: str, session=None, timeout: float = 15.0) -> str:
+    """MCP initialize handshake — returns session ID for subsequent calls."""
+    global _mcp_session_id
+    if _mcp_session_id:
+        return _mcp_session_id
+    url = f"{base_url.rstrip('/')}/mcp"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "qtcl-client", "version": "5.0.0"},
+        },
+        "id": 1,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    try:
+        if session and _HAS_REQUESTS:
+            r = session.post(url, data=body, headers=headers, timeout=timeout)
+            sid = r.headers.get("Mcp-Session-Id", "")
+            _mcp_session_id = sid
+            return sid
+        else:
+            import urllib.request as _ur
+            req = _ur.Request(url, data=body, headers=headers, method="POST")
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                sid = resp.headers.get("Mcp-Session-Id", "")
+                _mcp_session_id = sid
+                return sid
+    except Exception as e:
+        logger.debug(f"[MCP-INIT] Initialize failed: {e}")
+        return ""
+
+
+def _mcp_tool_call(base_url: str, tool_name: str, arguments: dict,
+                   session=None, timeout: float = 45.0) -> dict:
+    """Call an MCP tool via streamable-http. Returns the tool result dict."""
+    url = f"{base_url.rstrip('/')}/mcp"
+
+    # Ensure we have a session ID
+    sid = _mcp_initialize(base_url, session, timeout=10.0)
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+        "id": int(time.time() * 1000),
+    }
+    body = json.dumps(payload, default=str).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+
+    if session and _HAS_REQUESTS:
+        r = session.post(url, data=body, headers=headers, timeout=timeout)
+        data = r.json()
+    else:
+        import urllib.request as _ur
+        req = _ur.Request(url, data=body, headers=headers, method="POST")
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+    if "error" in data:
+        err = data["error"]
+        raise RuntimeError(f"MCP error [{err.get('code', -1)}]: {err.get('message', 'unknown')}")
+
+    # MCP tools/call result: {result: {content: [{type: "text", text: "..."}]}}
+    result = data.get("result", {})
+    content = result.get("content", [])
+    if content and isinstance(content, list):
+        text = content[0].get("text", "{}") if content else "{}"
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return {"raw": text}
+    return result
+
+
+def _submit_via_mcp(tx: dict, base_url: str, session=None, print_fn=print) -> Optional[dict]:
+    """Submit a pre-built TX via MCP qtcl_send_transaction tool.
+
+    This uses the MCP streamable-http endpoint which has direct in-process
+    dispatch — no HTTP self-loop, no gthread deadlock risk.
+    Returns the tool result dict, or None on failure.
+    """
+    try:
+        sig = tx.get("signature", {})
+        sig_str = json.dumps(sig, default=str) if isinstance(sig, dict) else str(sig)
+        pub_key = tx.get("sender_public_key_hex", "") or tx.get("public_key", "")
+
+        args = {
+            "from_address": tx.get("from_address", ""),
+            "to_address":   tx.get("to_address", ""),
+            "amount":       float(tx.get("amount", 0)),
+            "memo":         tx.get("memo", ""),
+            "signature":    sig_str,
+            "public_key":   pub_key,
+            "nonce":        int(tx.get("nonce", 0)),
+        }
+
+        result = _mcp_tool_call(base_url, "qtcl_send_transaction", args,
+                                session=session, timeout=45.0)
+
+        # Normalize MCP result to match what _submit_with_startup_retry expects
+        if isinstance(result, dict):
+            if result.get("status") == "accepted" or result.get("accepted"):
+                return {
+                    "accepted": True,
+                    "tx_hash": result.get("tx_hash", tx.get("tx_hash", "")),
+                    "status": "accepted",
+                    "message": result.get("message", "ok"),
+                }
+            else:
+                return {
+                    "accepted": False,
+                    "error": result.get("error", result.get("message", str(result))),
+                    "status": "rejected",
+                }
+        return None
+    except Exception as e:
+        print_fn(f"  ⚠️  MCP submit failed ({e}), falling back to RPC…")
+        return None
+
+
 def _patch_poll_health(base_url: str, timeout: float = 15.0, interval: float = 0.5, session=None) -> bool:
     """Poll /mcp/health until ready:true or timeout.
 
@@ -31877,10 +32001,22 @@ def _patch_is_permanent(err: str) -> bool: m = str(err).lower(); return any(k in
 
 
 def _submit_with_startup_retry(tx: dict, base_url: str, session=None, print_fn=print) -> dict:
-    """Submit tx with cold-start awareness — polls /health, retries transient errors, returns on permanent."""
+    """Submit tx with cold-start awareness.
+
+    v5.0: Tries MCP tools/call first (direct dispatch, no self-loop deadlock),
+    falls back to JSON-RPC /rpc if MCP fails.
+    """
     import random as _rand
     if not _patch_poll_health(base_url, timeout=_PATCH_HEALTH_WAIT, session=session):
         print_fn("  ⏳ /health still starting — proceeding anyway (wsgi will wait)…")
+
+    # ── PRIMARY: MCP tools/call (direct in-process dispatch) ──────────────
+    mcp_result = _submit_via_mcp(tx, base_url, session=session, print_fn=print_fn)
+    if mcp_result is not None:
+        return mcp_result
+
+    # ── FALLBACK: JSON-RPC /rpc (original path) ──────────────────────────
+    print_fn("  ⏳ Using JSON-RPC fallback for submission…")
     last_error = None
     for attempt in range(_PATCH_MAX_RETRIES):
         try:
