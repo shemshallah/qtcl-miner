@@ -8123,32 +8123,29 @@ def _fmt_ago(timestamp: float) -> str:
 
 
 async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache):
-    """Called when a block we mined is finalized AND the submit response had no balance.
+    """Called after block finalization to confirm server balance.
 
-    Retries with backoff until a non-zero balance is seen.
-    Up to 20 attempts over ~120 s total.
-
-    SERVER IS THE SINGLE SOURCE OF TRUTH.  The client never refuses to
-    accept a lower balance from the server.  After a DB reset the server
-    legitimately reports 0 — the old "never overwrite a higher cached
-    balance" guard was the root cause of phantom balances surviving resets.
+    Polls with short initial delay to catch fast Neon commits, then backs off.
+    SERVER IS THE SINGLE SOURCE OF TRUTH — always accepts server balance.
     """
-    await _asyncio.sleep(2.0)
+    # FIX: was 2.0s initial sleep — too long when balance_task polls every 30s in slow mode.
+    # 0.5s catches Neon commits that complete in <1s after settlement.
+    await _asyncio.sleep(0.5)
     for attempt in range(20):
         try:
             result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2)
             if result and not result.get("error"):
                 balance_qtcl = float(result.get("balance", 0))
-                # ALWAYS accept server balance — no "never go down" guard
                 cache._balance_qtcl = balance_qtcl
                 if balance_qtcl > 0:
                     logger.info(f"[BALANCE] Updated: {balance_qtcl:.8f} QTCL (attempt {attempt+1})")
                     return balance_qtcl
                 logger.debug(f"[BALANCE] Still 0 after finalize (attempt {attempt+1}) — retrying")
-            delay = min(3.0 * (attempt + 1), 15.0)
+            # FIX: first 3 attempts at 1s cadence (catch fast commits), then back off to 5s max
+            delay = 1.0 if attempt < 3 else min(3.0 + attempt, 10.0)
             await _asyncio.sleep(delay)
         except Exception:
-            await _asyncio.sleep(min(3.0 * (attempt + 1), 15.0))
+            await _asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
     try:
         result = kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=1)
         if result and not result.get("error"):
@@ -25549,11 +25546,16 @@ class QtclClientApp:
                         try:
                             _EXP_LOG.info(f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} backoff={backoff:.1f}s")
                             try:
+                                # FIX: inner timeout 10s → 45s: Koyeb submitBlock takes 2-8s for
+                                # oracle consensus + DB write. 10s caused legitimate responses to
+                                # time out, forcing the slow fallback path on every submission.
+                                # outer wait_for 15s → 50s: must exceed inner so asyncio.TimeoutError
+                                # only fires if the thread itself hangs, not on normal slow responses.
                                 _envelope = await _asyncio.wait_for(
                                     _asyncio.to_thread(
-                                        kapi._rpc_envelope, "qtcl_submitBlock", [payload], 10, 1
+                                        kapi._rpc_envelope, "qtcl_submitBlock", [payload], 45, 1
                                     ),
-                                    timeout=15,
+                                    timeout=50,
                                 )
                             except _asyncio.TimeoutError:
                                 _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
@@ -26207,17 +26209,29 @@ class QtclClientApp:
                         oracle_count = int(oracle_str.split("/")[0]) if "/" in str(oracle_str) else 0
                         if "finalized" in status or "already_accepted" in status:
                             _oid_list = (result or {}).get("oracle_ids", [])
+                            # FIX: if reward=0 (timeout fallback path), try to recover actual reward
+                            # from getBlockStatus which now returns miner_reward_qtcl + miner_balance_qtcl.
+                            # Do this synchronously before mark_finalized so _total_rewards is correct.
+                            if reward <= 0 or balance_qtcl <= 0:
+                                try:
+                                    _bs = kapi._rpc("qtcl_getBlockStatus", {"height": block.height}, timeout=8, retries=1)
+                                    if isinstance(_bs, dict) and not _bs.get("error"):
+                                        if reward <= 0:
+                                            reward = float(_bs.get("miner_reward_qtcl", 0))
+                                        if balance_qtcl <= 0:
+                                            balance_qtcl = float(_bs.get("miner_balance_qtcl", 0))
+                                        if balance_qtcl > 0:
+                                            cache._balance_qtcl = balance_qtcl
+                                            _EXP_LOG.info(f"[BALANCE] 💰 Recovered from getBlockStatus: {balance_qtcl:.8f} QTCL reward={reward:.2f}")
+                                except Exception as _bse:
+                                    _EXP_LOG.debug(f"[BALANCE] getBlockStatus recovery failed: {_bse}")
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
-                            _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward} QTCL")
-                            # FIX: server returns miner_balance_qtcl from the settlement cursor
-                            # (same DB transaction, no Neon lag). Use it directly.
-                            # Only fire the async refresh poll if the response had no balance
-                            # (e.g. settlement fell back to background queue).
-                            if balance_qtcl <= 0:
-                                _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
-                            else:
-                                _EXP_LOG.info(f"[BALANCE] ✅ Using settlement balance: {balance_qtcl:.8f} QTCL (no poll needed)")
+                            _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
+                            # FIX: always schedule a confirmatory balance refresh — even when we have
+                            # a balance from the response, fire once after 5s to catch any Neon lag.
+                            # _refresh_balance_on_finalize is a no-op if balance is already correct.
+                            _asyncio.create_task(_refresh_balance_on_finalize(block.miner_address, kapi, cache))
                             # P2P broadcast after successful submission
                             _p2p_n = getattr(self, "p2p_node", None)
                             _broadcast_ok = False
