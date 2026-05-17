@@ -26113,14 +26113,14 @@ class QtclClientApp:
                         _last_telem_nonce = 0
                         while not _abort_evt.is_set():
                             await _asyncio.sleep(0.05)
-                            _cur_nonce = _PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]
-                            # FIX: was gated on `_cur_nonce != _last_telem_nonce` — during a
-                            # scratchpad epoch recompute all workers stall and _nonce_ctr[0]
-                            # stops incrementing, so the telemetry was never updated and the
-                            # dashboard showed a frozen nonce for the full stall duration.
-                            # Update unconditionally every tick so display always stays live.
+                            # FIX-NONCE: workers use uint32 space: n = (n + stride) & 0xFFFFFFFF.
+                            # _cur_nonce must be masked to match — without the mask, base(~2^31)
+                            # + ctr(growing) drifts into a 33-bit value that never equals any
+                            # worker nonce. block_nonce=hashes_tried (all workers) for rate calc.
+                            _hashes_tried = _nonce_ctr[0] * _n_workers
+                            _cur_nonce = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
                             _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
-                                                        block_nonce=_nonce_ctr[0], persistent_base=_PERSISTENT_NONCE_BASE[0])
+                                                        block_nonce=_hashes_tried, persistent_base=_PERSISTENT_NONCE_BASE[0])
                             _last_telem_nonce = _cur_nonce
                             if _t.time() - _block_start > _BLOCK_TTL_S:
                                 _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
@@ -26146,15 +26146,19 @@ class QtclClientApp:
                                 break
 
                         _found = block_hash is not None
+                        # FIX-NONCE: _nonce_ctr[0] is per-worker counter (each worker adds 512 per 512 local iters).
+                        # Total hashes tried = _nonce_ctr[0] * _n_workers. Advance base by total so next block
+                        # workers start past all nonces already tried — prevents overlap/repeat.
+                        _total_tried = _nonce_ctr[0] * _n_workers
                         if _found:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
+                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried) & 0xFFFFFFFF
                         elif _chain_advanced:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0]
+                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried) & 0xFFFFFFFF
                         elif _ttl_expired:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] += _nonce_ctr[0] + secrets.randbelow(1_000_000)
+                            _MINE_TELEM._accumulate_session_nonces(_total_tried)
+                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _total_tried + secrets.randbelow(1_000_000)) & 0xFFFFFFFF
 
                         if not _found or _chain_advanced or _ttl_expired:
                             _MINE_TELEM.mark_idle()
@@ -26678,9 +26682,11 @@ class QtclClientApp:
 
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
                 target_zeros = tel.get("difficulty", 5)
-                _session_n = tel.get('session_nonces', tel.get('block_nonce', tel.get('nonce', 0)))
-                nonce_str = f"{_session_n:,}"
-                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  {hr_str}")
+                _hashes_tried = tel.get('session_nonces', tel.get('block_nonce', 0))
+                _cur_nonce_disp = tel.get('nonce', 0) & 0xFFFFFFFF
+                nonce_str = f"{_cur_nonce_disp:,}"
+                htried_str = f"{_hashes_tried:,}"
+                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={htried_str}  │  {hr_str}")
                 print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
