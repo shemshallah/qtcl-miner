@@ -7616,7 +7616,8 @@ class BlockSubmissionCache:
 
             # ── Normal rehydrate from local SQLite ─────────────────────
             rows = self._db.execute(
-                "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at "
+                "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at, "
+                "COALESCE(nonce, 0) as nonce, COALESCE(difficulty, 5) as difficulty "
                 "FROM client_blocks WHERE finalized = 1 ORDER BY height"
             ).fetchall()
             for row in rows:
@@ -7624,7 +7625,12 @@ class BlockSubmissionCache:
                     height=row["height"],
                     block_hash=row["block_hash"],
                     parent_hash=row["parent_hash"] or "",
+                    nonce=int(row["nonce"]),
+                    timestamp=int(row["finalized_at"] or 0),
+                    difficulty=int(row["difficulty"]),
                     miner_address=row["miner_address"] or "",
+                    submit_payload={},
+                    signature={},
                 )
                 b.status = BlockStatus.FINALIZED
                 b.finalized_at = row["finalized_at"] or 0.0
@@ -7632,12 +7638,41 @@ class BlockSubmissionCache:
                 b.oracle_count = row["oracle_count"] or 0
                 self._blocks[row["height"]] = b
                 self._hash_index[row["block_hash"]] = row["height"]
+            # Set aggregates from loaded rows so they survive _evict_old()
+            # FIX BUG-11: Previously _finalized_count and _total_rewards stayed 0
+            # after rehydrate, relying on in-cache sum via finalized_count().
+            # If EVICT_AFTER_S > 0, blocks would be evicted and count would fall to 0.
+            if rows:
+                self._finalized_count = len(rows)
+                # Backfill rows where reward_qtcl was persisted as 0 (pre-fix blocks)
+                _rehydrate_total = 0.0
+                for _rr in rows:
+                    _rr_reward = float(_rr["reward_qtcl"] or 0)
+                    if _rr_reward <= 0:
+                        try:
+                            from globals import TessellationRewardSchedule as _TRS_rh
+                            _rr_reward = _TRS_rh.get_miner_reward_qtcl(_rr["height"])
+                            if _rr["height"] == 1:
+                                _rr_reward += _TRS_rh.get_miner_reward_qtcl(0)
+                            # Patch the SQLite row so future rehydrates are correct
+                            self._db.execute(
+                                "UPDATE client_blocks SET reward_qtcl=? WHERE height=? AND (reward_qtcl IS NULL OR reward_qtcl=0)",
+                                (_rr_reward, _rr["height"])
+                            )
+                        except Exception:
+                            _rr_reward = 7.20
+                    _rehydrate_total += _rr_reward
+                self._total_rewards = _rehydrate_total
+                self._highest_finalized_height = max(row["height"] for row in rows)
             # Compute balance from local UTXO mirror
             self._balance_qtcl = self._compute_balance_from_utxos()
-            if rows:
-                self._highest_finalized_height = max(row["height"] for row in rows)
-            logger.info(f"[CACHE-REHYDRATE] ✅ {len(rows)} blocks, balance={self._balance_qtcl:.8f} QTCL")
+            logger.info(
+                f"[CACHE-REHYDRATE] ✅ {len(rows)} blocks rehydrated, "
+                f"finalized={self._finalized_count}, total_rewards={self._total_rewards:.2f} QTCL, "
+                f"balance={self._balance_qtcl:.8f} QTCL"
+            )
             # Evict rehydrated finalized blocks immediately — already in SQLite
+            # They remain counted via _finalized_count (fixed above)
             self._evict_old()
         except Exception as _rh_err:
             logger.debug(f"[CACHE-REHYDRATE] {_rh_err}")
@@ -7675,10 +7710,12 @@ class BlockSubmissionCache:
             return
         try:
             self._db.execute(
-                "INSERT OR REPLACE INTO client_blocks (height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized, finalized_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO client_blocks "
+                "(height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized, finalized_at, nonce, difficulty) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (height, block.block_hash, block.parent_hash, block.miner_address,
-                 block.reward_qtcl, block.oracle_count, 1, int(block.finalized_at))
+                 block.reward_qtcl, block.oracle_count, 1, int(block.finalized_at),
+                 getattr(block, "nonce", 0), getattr(block, "difficulty", 5))
             )
         except Exception as _pe:
             logger.debug(f"[CACHE-PERSIST] block h={height}: {_pe}")
@@ -7831,15 +7868,29 @@ class BlockSubmissionCache:
                 b.error_message = error
 
     def update_oracle_count(self, height: int, count: int, oracle_ids: list = None):
+        # FIX BUG-5: Never mutate b.status = FINALIZED directly here.
+        # Doing so bypasses mark_finalized() which handles:
+        #   - _finalized_count increment
+        #   - _total_rewards update
+        #   - SQLite persist via _persist_block_finalized
+        #   - block pop from _blocks (so _evict_old doesn't double-count)
+        # Without that bookkeeping, finalized_count() was correct only while
+        # the block remained in _blocks (in-cache sum), then dropped when
+        # _evict_old ran — producing "0 finalized" after eviction.
+        # Route through mark_finalized for all >= 3 oracle confirmations.
+        _do_finalize = False
         with self._lock:
             b = self._blocks.get(height)
             if b:
-                b.oracle_count = count
+                b.oracle_count = max(b.oracle_count, count)
                 if oracle_ids:
                     b.oracle_ids = oracle_ids
-                if count >= 3 and b.status != BlockStatus.FINALIZED:
-                    b.status = BlockStatus.FINALIZED
-                    b.finalized_at = time.time()
+                if count >= 3 and b.status not in (BlockStatus.FINALIZED, BlockStatus.REJECTED):
+                    _do_finalize = True
+        if _do_finalize:
+            # Call mark_finalized outside the lock (it acquires its own lock)
+            # reward_qtcl=0 here — caller (oracle_task) will recover from getBlockStatus
+            self.mark_finalized(height, reward_qtcl=0.0, oracle_count=count, oracle_ids=oracle_ids or [])
 
     def update_from_sse(self, event: dict):
         # ─────────────────────────────────────────────────────────────────────
@@ -7975,12 +8026,16 @@ class BlockSubmissionCache:
 
     def finalized_count(self) -> int:
         with self._lock:
-            return self._finalized_count + sum(1 for b in self._blocks.values() if b.status == BlockStatus.FINALIZED)
+            # FIX BUG-12: _finalized_count is now authoritative — set from DB on
+            # rehydrate and incremented on every mark_finalized() call.
+            # The old "+ sum(FINALIZED in _blocks)" caused double-counting after
+            # _rehydrate set _finalized_count AND left blocks in _blocks.
+            return self._finalized_count
 
     def total_rewards(self) -> float:
         with self._lock:
-            return self._total_rewards + sum(b.reward_qtcl for b in self._blocks.values()
-                       if b.status == BlockStatus.FINALIZED)
+            # FIX BUG-12: Same as finalized_count — _total_rewards is authoritative.
+            return self._total_rewards
 
     def get_chain_tip(self) -> int:
         return self._highest_finalized_height
@@ -8008,10 +8063,14 @@ class BlockSubmissionCache:
         # without incrementing _finalized_count — the display counter stayed at
         # "2 pending, 0 finalized" forever.
         #
-        # New policy: PENDING blocks past TTL are marked ORPHANED (display shows
-        # them briefly), not silently removed.  The oracle_task() coroutine
-        # (added below in run_mine_mode) polls getBlockStatus and will promote
-        # them to FINALIZED if the server confirms finalization.
+        # New policy: PENDING and SUBMITTED blocks past TTL are marked ORPHANED
+        # (display shows them briefly), not silently removed.  The oracle_task()
+        # coroutine polls getBlockStatus and will promote them to FINALIZED if
+        # the server confirms finalization.
+        #
+        # FIX BUG-3: SUBMITTED blocks were not being caught here at all —
+        # only PENDING was checked. A block stuck in SUBMITTED for > 270s
+        # (e.g. oracle_task failing to poll) would never be resolved.
         #
         # FINALIZED/REJECTED/ORPHANED blocks: evict after EVICT_AFTER_S so
         # the display shows them long enough to be read.
@@ -8027,16 +8086,18 @@ class BlockSubmissionCache:
                 )
                 if self.EVICT_AFTER_S > 0 and ref_ts > 0 and (now - ref_ts) > self.EVICT_AFTER_S:
                     evict.append(h)
-            elif b.status == BlockStatus.PENDING:
+            elif b.status in (BlockStatus.PENDING, BlockStatus.SUBMITTED):
+                # FIX BUG-3: catch both PENDING and SUBMITTED for TTL eviction
                 _block_ttl = 270.0
-                if b.first_submitted_at and (now - b.first_submitted_at) > _block_ttl:
-                    # FIX: don't silently drop — mark ORPHANED so oracle_task
+                _ref = b.first_submitted_at or b.last_submitted_at or 0.0
+                if _ref and (now - _ref) > _block_ttl:
+                    # Don't silently drop — mark ORPHANED so oracle_task
                     # can poll the server and promote to FINALIZED if appropriate.
                     # Silent eviction was the reason "2 pending" stuck forever.
                     b.status = BlockStatus.ORPHANED
                     _EXP_LOG.warning(
-                        f"[CACHE] ⚠️  h={h} PENDING TTL exceeded — marked ORPHANED "
-                        f"(oracle_task will reconcile from server)"
+                        f"[CACHE] ⚠️  h={h} {b.status.name} TTL exceeded after {int(now - _ref)}s "
+                        f"— marked ORPHANED (oracle_task will reconcile from server)"
                     )
         for h in evict:
             b = self._blocks.pop(h, None)
@@ -8048,13 +8109,21 @@ class BlockSubmissionCache:
 
     def snapshot(self) -> dict:
         with self._lock:
+            _submitted = sum(1 for b in self._blocks.values() if b.status == BlockStatus.SUBMITTED)
+            _pending   = sum(1 for b in self._blocks.values() if b.status == BlockStatus.PENDING)
             return {
                 "total": len(self._blocks),
                 "solved": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SOLVED),
-                "submitted": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SUBMITTED),
-                "pending": sum(1 for b in self._blocks.values() if b.status == BlockStatus.PENDING),
+                "submitted": _submitted,
+                "pending": _pending,
+                # FIX BUG-8: "pending_display" combines SUBMITTED+PENDING for the
+                # "X pending" line in the dashboard. A block stuck in SUBMITTED is
+                # waiting for oracle consensus exactly like a PENDING block —
+                # showing "0 pending" when we have a SUBMITTED block is misleading.
+                "pending_display": _submitted + _pending,
                 "finalized": self.finalized_count(),
                 "rejected": sum(1 for b in self._blocks.values() if b.status == BlockStatus.REJECTED),
+                "orphaned": sum(1 for b in self._blocks.values() if b.status == BlockStatus.ORPHANED),
                 "tip": self.get_chain_tip(),
                 "total_rewards": self.total_rewards(),
                 "blocks": {
@@ -8103,7 +8172,7 @@ def _render_block_slip(block, cache_snap: dict, balance_qtcl: float, p2p_status:
     lines.append("─" * 72)
     if p2p_status:
         lines.append(f"  {p2p_status}")
-    lines.append(f"  Blocks  : {cache_snap.get('finalized', 0)} finalized, {cache_snap.get('pending', 0)} pending, {cache_snap.get('rejected', 0)} rejected")
+    lines.append(f"  Blocks  : {cache_snap.get('finalized', 0)} finalized, {cache_snap.get('pending_display', cache_snap.get('pending', 0))} pending, {cache_snap.get('rejected', 0)} rejected")
     lines.append(f"  Rewards : {cache_snap.get('total_rewards', 0):.2f} QTCL")
     lines.append(f"  Balance : {balance_qtcl:.8f} QTCL")
     lines.append("─" * 72)
@@ -15899,7 +15968,7 @@ class _MiningTelemetry:
 
     def update_progress(
         self, height: int, difficulty: int, nonce: int, parent_hash: str = "",
-        block_nonce: int = 0
+        block_nonce: int = 0, persistent_base: int = 0
     ) -> None:
         with self._lock:
             # Only reset samples on actual HEIGHT change, not same-height TTL restart
@@ -15910,7 +15979,11 @@ class _MiningTelemetry:
                 self._session_nonce_base = 0
             self.height = height
             self.difficulty = difficulty
-            self.nonce = nonce
+            # FIX BUG-1: On warmup call (nonce=0, block_nonce=0), display the
+            # persistent base so nonce never visually resets to 0 between blocks.
+            # The persistent base is the total nonces tried across all previous blocks
+            # this session — it is the correct display value during the "warming up" gap.
+            self.nonce = nonce if nonce > 0 else persistent_base
             # Track cumulative nonces tried this session (never resets within a height)
             if block_nonce > 0:
                 self.block_nonce = block_nonce
@@ -15930,8 +16003,12 @@ class _MiningTelemetry:
             # FIX: block_nonce=0 + nonce=0 is the warmup call at block-start.
             # Adding this sample causes nonce jump 0→real_start in one 50ms tick
             # → dn/dt = millions → fake 50M H/s. Clear stale samples instead.
+            # FIX BUG-1 cont: also update _session_nonces to persistent_base
+            # so the dashboard shows the real cumulative count, not 0.
             if block_nonce == 0 and nonce == 0:
                 self._nonce_samples.clear()
+                if persistent_base > 0:
+                    self._session_nonces = self._session_nonce_base + persistent_base
                 return
             self._nonce_samples.append((now, nonce))
             if len(self._nonce_samples) >= 2:
@@ -25995,10 +26072,13 @@ class QtclClientApp:
                                 _gc.enable()
 
                         _EXP_LOG.warning(f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} workers={_n_workers}")
-                        # Warmup: nonce=0 triggers the height/nonce regression check -> deque clear.
-                        # block_nonce is passed from the telemetry loop as _nonce_ctr[0],
-                        # which is the actual nonces tried this block attempt (monotonic).
-                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash, block_nonce=0)
+                        # FIX BUG-1: Warmup call now passes persistent_base=_PERSISTENT_NONCE_BASE[0]
+                        # so the display shows the cumulative nonces already tried this session,
+                        # not 0. Without this, every SUBMITTED→MINING transition zeroed the nonce
+                        # display for the entire warmup window before workers produced samples.
+                        # block_nonce is updated from _nonce_ctr[0] every 50ms in the mining loop.
+                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash,
+                                                    block_nonce=0, persistent_base=_PERSISTENT_NONCE_BASE[0])
                         _MINE_TELEM.mark_mining()
 
                         _workers = []
@@ -26018,7 +26098,8 @@ class QtclClientApp:
                             # stops incrementing, so the telemetry was never updated and the
                             # dashboard showed a frozen nonce for the full stall duration.
                             # Update unconditionally every tick so display always stays live.
-                            _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash, block_nonce=_nonce_ctr[0])
+                            _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
+                                                        block_nonce=_nonce_ctr[0], persistent_base=_PERSISTENT_NONCE_BASE[0])
                             _last_telem_nonce = _cur_nonce
                             if _t.time() - _block_start > _BLOCK_TTL_S:
                                 _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
@@ -26181,10 +26262,20 @@ class QtclClientApp:
                         await _asyncio.sleep(1.0)
 
             async def submit_task():
+                _last_evict = _t.time()
                 while True:
                     block = cache.get_next_unsent()
                     if block is None:
                         _now = _t.time()
+                        # FIX BUG-3: Call _evict_old periodically so SUBMITTED/PENDING
+                        # blocks past their TTL get promoted to ORPHANED even when no
+                        # new blocks are being enqueued. Previously _evict_old was only
+                        # called from enqueue_solved(), meaning a miner that submitted
+                        # and never solved another block would never trigger eviction/reconciliation.
+                        if _now - _last_evict >= 30.0:
+                            with cache._lock:
+                                cache._evict_old()
+                            _last_evict = _now
                         with cache._lock:
                             for _h, _b in list(cache._blocks.items()):
                                 if _b.status == BlockStatus.SUBMITTED and _b.last_submitted_at and (_now - _b.last_submitted_at) > 60.0:
@@ -26227,6 +26318,17 @@ class QtclClientApp:
                                             _EXP_LOG.info(f"[BALANCE] 💰 Recovered from getBlockStatus: {balance_qtcl:.8f} QTCL reward={reward:.2f}")
                                 except Exception as _bse:
                                     _EXP_LOG.debug(f"[BALANCE] getBlockStatus recovery: {_bse}")
+                            # Final fallback — getBlockStatus may not yet have reward populated
+                            # (server cold path). Use canonical schedule so _total_rewards is never 0.
+                            if reward <= 0:
+                                try:
+                                    from globals import TessellationRewardSchedule as _TRS_fb
+                                    reward = _TRS_fb.get_miner_reward_qtcl(block.height)
+                                    if block.height == 1:
+                                        reward += _TRS_fb.get_miner_reward_qtcl(0)
+                                    _EXP_LOG.info(f"[BALANCE] 💰 reward=0 from server — using schedule: {reward:.2f} QTCL h={block.height}")
+                                except Exception:
+                                    reward = 7.20  # depth-5 default
                             cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
                             _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
                             _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
@@ -26262,7 +26364,7 @@ class QtclClientApp:
                                     _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
                             if not _broadcast_ok:
                                 try:
-                                    kapi.rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], 3, 1)
+                                    kapi._rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], 3, 1)
                                     _EXP_LOG.info(f"[GOSSIP] ✅ Server-side gossip sent for h={block.height}")
                                 except Exception as _g_err:
                                     _EXP_LOG.warning(f"[GOSSIP] Server gossip failed: {_g_err}")
@@ -26425,6 +26527,8 @@ class QtclClientApp:
                                             try:
                                                 from globals import TessellationRewardSchedule as _TRS2
                                                 _db_reward = _TRS2.get_miner_reward_qtcl(_poll_h)
+                                                if _poll_h == 1:
+                                                    _db_reward += _TRS2.get_miner_reward_qtcl(0)
                                             except Exception:
                                                 _db_reward = 7.20
                                         _miner_addr = ""
@@ -26556,7 +26660,11 @@ class QtclClientApp:
                 _latest_block = None
                 for h in sorted(cache_snap.get("blocks", {}).keys(), reverse=True):
                     b = _block_cache.get_block(h)
-                    if b and b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING, BlockStatus.FINALIZED):
+                    # FIX BUG-20: include ORPHANED so blocks promoted by _evict_old TTL
+                    # stay visible while oracle_task polls for their final status
+                    if b and b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED,
+                                         BlockStatus.PENDING, BlockStatus.FINALIZED,
+                                         BlockStatus.ORPHANED):
                         _latest_block = b
                         break
                 if _latest_block and force_full:
@@ -26566,23 +26674,25 @@ class QtclClientApp:
                     print(sep)
                     print("  ── Block Cache ──")
                     for h, info in sorted(cache_snap.get("blocks", {}).items()):
-                        _icon = "🔥" if info["status"] == "FINALIZED" else ("⏳" if info["status"] == "PENDING" else ("📡" if info["status"] == "SUBMITTED" else "✅"))
+                        _icon = "🔥" if info["status"] == "FINALIZED" else ("⏳" if info["status"] == "PENDING" else ("📡" if info["status"] == "SUBMITTED" else ("👻" if info["status"] == "ORPHANED" else "✅")))
                         print(f"  h={h}: {_icon} {info['status']}  {info['oracles']} oracles")
                     print(sep)
-                    print(f"  Blocks  : {cache_snap['finalized']} finalized, {cache_snap['pending']} pending, {cache_snap['rejected']} rejected")
+                    _orph = cache_snap.get('orphaned', 0)
+                    _orph_str = f", {_orph} orphaned" if _orph > 0 else ""
+                    print(f"  Blocks  : {cache_snap['finalized']} finalized, {cache_snap['pending_display']} pending, {cache_snap['rejected']} rejected{_orph_str}")
                     print(f"  Rewards : {cache_snap['total_rewards']:.2f} QTCL")
                     print(f"  Balance : {_block_cache._balance_qtcl:.8f} QTCL")
             else:
                 print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
                 if tel.get("total_earned_qtcl", 0) > 0:
                     print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel.get('last_reward_qtcl', 0):.2f} QTCL)")
-            _last_peers = getattr(_block_cache, "_last_broadcast_peers", -1)
+            # FIX BUG-18: guard against _block_cache being None before attribute access
+            _last_peers = getattr(_block_cache, "_last_broadcast_peers", -1) if _block_cache else -1
             if _last_peers >= 0:
                 if _last_peers > 0:
                     print(f"  P2P     : ✅ {_last_peers} peers notified")
                 else:
                     print(f"  P2P     : ⚠️ 0 peers (using server gossip)")
-
             _sse_cons = globals().get("_SSE_CONSENSUS_STATE", {})
             _sse_blk = globals().get("_SSE_BLOCK_STATE", {})
             _sse_dns = globals().get("_SSE_DENSITY_STATE", {})
@@ -26598,7 +26708,19 @@ class QtclClientApp:
                 else:
                     _sse_label = f"⚠️ {_sse_up}/{_sse_total} streams"
             print(f"  SSE     : {_sse_label}")
-            print(f"  Oracle: h={tel.get('height', '?')}  fid={ks2.pq0_fidelity:.4f}  bridge={ks2.bridge_fidelity:.4f}  lat={ks2.channel_latency_ms:.0f}ms  {'✅' if ks2.connected else '❌'}")
+            # FIX BUG-16: Show highest in-flight block's oracle count, not just mining height.
+            # tel['height'] is the block currently being mined (next height) — the submitted
+            # block awaiting consensus is at height-1. Pull actual oracle count from cache.
+            _oracle_display_h = tel.get('height', '?')
+            _oracle_count_str = ""
+            if _block_cache:
+                _in_flight = [(h, b) for h, b in _block_cache._blocks.items()
+                              if b.status in (BlockStatus.SUBMITTED, BlockStatus.PENDING, BlockStatus.ORPHANED)]
+                if _in_flight:
+                    _top_h, _top_b = max(_in_flight, key=lambda x: x[0])
+                    _oracle_display_h = _top_h
+                    _oracle_count_str = f"  oracles={_top_b.oracle_count}/5"
+            print(f"  Oracle: h={_oracle_display_h}  fid={ks2.pq0_fidelity:.4f}  bridge={ks2.bridge_fidelity:.4f}  lat={ks2.channel_latency_ms:.0f}ms{_oracle_count_str}  {'✅' if ks2.connected else '❌'}")
             print(self.format_p2p_status(detail=True))
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
