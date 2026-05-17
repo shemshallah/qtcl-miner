@@ -13589,6 +13589,8 @@ class KoyebRPCNodule:
                             return result.get("result")
                         elif "error" in result:
                             return result
+                        else:
+                            raise RuntimeError(f"Malformed JSON-RPC response (no result/error): {str(result)[:120]}")
                     else:
                         try:
                             result = r.json()
@@ -13607,6 +13609,8 @@ class KoyebRPCNodule:
                             return result.get("result")
                         elif "error" in result:
                             return result
+                        else:
+                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
             else:
                 query = _up.urlencode({"method": method, "params": params_json, "id": 1})
                 full_url = f"{self.base_url}/rpc?{query}"
@@ -13618,6 +13622,8 @@ class KoyebRPCNodule:
                             return result.get("result")
                         elif "error" in result:
                             return result
+                        else:
+                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
                     else:
                         try:
                             result = r.json()
@@ -13635,6 +13641,8 @@ class KoyebRPCNodule:
                             return result.get("result")
                         elif "error" in result:
                             return result
+                        else:
+                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
 
         for attempt in range(retries):
             try:
@@ -13943,7 +13951,7 @@ class KoyebRPCNodule:
 
         for attempt in range(self._TX_MAX_RETRIES):
             try:
-                r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=1)
+                r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=2)
             except Exception as exc:
                 last_error = str(exc)
                 if attempt < self._TX_MAX_RETRIES - 1:
@@ -13957,7 +13965,14 @@ class KoyebRPCNodule:
 
             if r is None:
                 last_error = "no_response"
-                break
+                if attempt < self._TX_MAX_RETRIES - 1:
+                    backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
+                    _EXP_LOG.warning(
+                        f"[TX-v4] No response attempt {attempt+1}/{self._TX_MAX_RETRIES} "
+                        f"— retry in {backoff:.1f}s"
+                    )
+                    _t2.sleep(backoff)
+                continue
 
             if isinstance(r, dict):
                 if "error" in r:
@@ -27178,9 +27193,13 @@ class QtclClientApp:
             print("  ❌ Cancelled")
             return
 
-        # ── Submit — v4.0 startup-resilient path via api.submit_transaction ──
-        # Polls /health first, retries transient errors, surfaces permanent ones.
-        result = self.api.submit_transaction(tx)
+        # ── Submit — v4.0 startup-resilient path via _submit_with_startup_retry ──
+        # Uses _raw_rpc_post directly, retries on None/network errors properly.
+        result = _submit_with_startup_retry(
+            tx, self.api.base_url,
+            session=self.api._get_session(),
+            print_fn=print,
+        )
 
         # ── Result display ────────────────────────────────────────────────────
         if result and result.get("accepted"):
