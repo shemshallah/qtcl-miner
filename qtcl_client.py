@@ -24237,9 +24237,10 @@ class QtclClientApp:
                                 result = _envelope
 
                             # ✅ SUCCESS: Block accepted (fresh or duplicate)
+                            # FIX: server returns "accepted_and_finalized", not "accepted"
                             if (
                                 isinstance(result, dict)
-                                and result.get("status") == "accepted"
+                                and result.get("status") in ("accepted", "accepted_and_finalized")
                             ):
                                 _persistence = result.get("persistence", "unknown")
                                 _proc_time = result.get("processing_time_ms", 0)
@@ -24377,7 +24378,7 @@ class QtclClientApp:
                             # No result - network issue, retry
                             last_error = "No response"
                             _EXP_LOG.warning(
-                                f"[SUBMIT] Attempt {attempt + 1}: No valid response"
+                                f"[SUBMIT] Attempt {attempt + 1}: No valid response — envelope={str(_envelope)[:200]}"
                             )
 
                         except Exception as e:
@@ -25628,10 +25629,9 @@ class QtclClientApp:
                         _local_ok = False
                         _koyeb_ok = False
 
-                        # Check 1: Local SQLite persistence
+                        # Check 1: Local SQLite persistence — reuse _local_db, don't re-init schema
                         try:
-                            _local_verify_db = LocalBlockchainDB(name="qtcl")
-                            _local_blk = _local_verify_db.get_block(target_height)
+                            _local_blk = _local_db.get_block(target_height)
                             if _local_blk:
                                 _local_ok = True
                                 _EXP_LOG.debug(
