@@ -26952,12 +26952,12 @@ class QtclClientApp:
             return "█" * filled + "░" * (width - filled)
 
         def _fetch_all():
-            """Fetch all metrics via JSON-RPC 2.0 (pure RPC, no REST).
+            """Fetch all metrics via LiveRPCOracleSnapshot (verbatim miner pipeline).
 
-            Always queries the Koyeb server directly FIRST — it is the authoritative
-            source for chain tip, oracle state, peer registry, and mempool.
-            Only queries the local P2P node (127.0.0.1:9091) when mining is active
-            and the local node has live data that supersedes server state.
+            Uses the SAME _LIVE_RPC_ORACLE.fetch_snapshot() call that the miner's
+            _run_bootstrap() uses — complete with SSE streaming, RPC fallback,
+            and full DM parsing. Also makes separate RPC calls for chain tip,
+            health, peers, and mempool.
 
             Returns: (tip, w_state, pq0, diag, snap, peers, mempool, local_stats, bh, errors)
             where errors is a list of (method, reason) strings for failed RPC calls.
@@ -26970,7 +26970,7 @@ class QtclClientApp:
             def _safe_rpc(method, params=None, label=None, retries=2):
                 """Call kapi._rpc with retry, log errors, return result or {}
 
-                Critical calls (dm_snapshot, quantum_metrics) get 3 retries.
+                Critical calls (block_height, get_block) get 3 retries.
                 Non-critical calls get 1 retry (default).
                 """
                 nonlocal _rpc_ok_count
@@ -26985,23 +26985,46 @@ class QtclClientApp:
                     else:
                         _last_err = kapi._last_error or "timeout"
                     if _attempt < retries - 1:
-                        _ta.sleep(0.5)  # Brief pause before retry
-                # All attempts failed
+                        _ta.sleep(0.5)
                 _rpc_errors.append((label or method, _last_err or "failed"))
                 logger.debug(
                     f"[ORACLE-MODE] RPC {method} failed after {retries} attempts: {_last_err}"
                 )
                 return {}
 
-            # Always query Koyeb server first (authoritative source)
-            # even when P2P node is not running yet
-            # Step 1: get latest block height (3 retries — critical)
+            # ── Step 1: Fetch LiveRPCOracleSnapshot (verbatim miner pipeline) ──
+            # Uses the EXACT same call as the miner's _run_bootstrap():
+            #   _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)  (line 23800)
+            # This tries SSE stream /rpc/oracle/snapshot FIRST, falls back to
+            # RPC get /rpc?method=qtcl_getQuantumMetrics. Also updates the
+            # internal oracle state cache with full DM + fidelity + purity + pq0.
+            _snap = {}
+            try:
+                _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=6.0) or {}
+                if _snap:
+                    _rpc_ok_count += 1
+            except Exception as _snape:
+                _rpc_errors.append(("oracle_snapshot", str(_snape)[:80]))
+                logger.debug(f"[ORACLE-MODE] fetch_snapshot failed: {_snape}")
+
+            # ── Step 2: Get oracle state from LiveRPCOracleSnapshot cache ──
+            # This is what the miner uses after fetch_snapshot() (e.g. lines 25041, 25246):
+            #   state = _LIVE_RPC_ORACLE.get_oracle_state()
+            # Contains: w_state_fidelity, coherence_l1, von_neumann_entropy,
+            # purity, cycle, consensus, mermin_test, block_height, density_matrix_hex,
+            # pq_curr, pq_last, latency_ms, pq0_oracle_fidelity, pq0_IV_fidelity, pq0_V_fidelity
+            _ora_state = {}
+            try:
+                _ora_state = _LIVE_RPC_ORACLE.get_oracle_state() or {}
+            except Exception:
+                _ora_state = {}
+
+            # ── Step 3: Chain tip (3 retries — critical) ──
             tip = {}
             _bh_resp = _safe_rpc("qtcl_getBlockHeight", [], "block_height", retries=3)
             if isinstance(_bh_resp, dict):
                 _latest_h = int(_bh_resp.get("height", 0) or 0)
                 if _latest_h > 0:
-                    # Step 2: fetch the full block at that height (2 retries)
                     _block_resp = _safe_rpc("qtcl_getBlock", [_latest_h], "get_block")
                     if isinstance(_block_resp, dict):
                         tip = _block_resp
@@ -27011,23 +27034,13 @@ class QtclClientApp:
                         tip.setdefault("block_height", _latest_h)
                         tip.setdefault("height", _latest_h)
 
-            # Quantum Metrics (W-state consensus + pq0 anchor from server) — 3 retries
-            metrics = _safe_rpc(
-                "qtcl_getQuantumMetrics", [], "quantum_metrics", retries=3
-            )
-
-            # Health / Diagnostics (non-critical, 1 retry)
+            # ── Step 4: Health / Diagnostics (non-critical, 1 retry) ──
             health = _safe_rpc("qtcl_getHealth", [], "health")
 
-            # Oracle snapshot — ALIAS: use quantum_metrics result directly for DM + fidelity
-            # (instead of separate qtcl_getLatestDMSnapshot call which may not exist on older servers)
-            snap = metrics or {}
-
-            # Server peer registry (2 retries)
+            # ── Step 5: Server peer registry (2 retries) ──
             server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
 
-            # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
-            # First resolve our external IP from the server's perspective
+            # ── Step 6: NAT-group peers ──
             nat_peers = {}
             _my_addr_resp = _safe_rpc("qtcl_getMyAddr", [], "get_my_addr")
             if isinstance(_my_addr_resp, dict):
@@ -27035,19 +27048,14 @@ class QtclClientApp:
                 if _my_ip:
                     nat_peers = _safe_rpc(
                         "qtcl_getPeersByNatGroup",
-                        [
-                            {
-                                "caller_ip": _my_ip,
-                                "mac_address": _get_mac_address(),
-                            }
-                        ],
+                        [{"caller_ip": _my_ip, "mac_address": _get_mac_address()}],
                         "nat_group",
                     )
 
-            # Mempool (1 retry — non-critical)
+            # ── Step 7: Mempool (1 retry — non-critical) ──
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
 
-            # Local P2P node (only query if running — use only for live peer state)
+            # ── Step 8: Local P2P node stats ──
             api_node = KoyebRPCNodule("http://127.0.0.1:9091")
             local_p2p_stats = {}
             try:
@@ -27057,14 +27065,14 @@ class QtclClientApp:
             except Exception:
                 pass
 
-            # Get block height for pq_curr/pq_last computation
+            # ── Step 9: Block height for pq_curr/pq_last ──
             _bh = tip.get("block_height") or tip.get("height") or 0
             try:
                 _bh = int(_bh)
             except (ValueError, TypeError):
                 _bh = 0
 
-            # Merge server peers + NAT-group peers for display
+            # Merge server peers + NAT-group peers
             _srv_peer_list = (
                 server_peers.get("peers", []) if isinstance(server_peers, dict) else []
             )
@@ -27080,108 +27088,149 @@ class QtclClientApp:
                 else "",
             }
 
-            # Merge snap into metrics for w_state / pq0 extraction
-            if snap and isinstance(snap, dict):
-                # Extract pq0 values — they live in aer_noise_state nested dict on the server
-                _aer = snap.get("aer_noise_state") or {}
-                if not isinstance(_aer, dict):
-                    _aer = {}
-                _bf = _aer.get("block_field") or {}
+            # ── Step 10: Build unified metrics from ALL sources ──
+            # Priority: _LIVE_RPC_ORACLE state (live SSE) > RPC snapshot > fallback
+            _snap_dm_hex = _snap.get("density_matrix_hex", "") or _snap.get(
+                "density_tensor_hex", ""
+            )
+            _ora_dm_hex = _ora_state.get("density_matrix_hex", "")
+            metrics = {}
 
-                if "w_state" not in metrics:
-                    metrics["w_state"] = {}
-                if isinstance(metrics.get("w_state"), dict):
-                    # Pull W-state values from snap top-level AND block_field
-                    metrics["w_state"].update(
-                        {
-                            k: v
-                            for k, v in snap.items()
-                            if k
-                            in (
-                                "fidelity",
-                                "w_state_fidelity",
-                                "coherence",
-                                "coherence_l1",
-                                "purity",
-                                "entropy",
-                                "von_neumann_entropy",
-                                "density_matrix_hex",
-                                "oracle_id",
-                                "oracle_role",
-                                "block_height",
-                                "mermin_test",
-                                "bell_test",
-                                "pq_curr",
-                                "pq_last",
+            # Merge oracle state into metrics (this is the authoritative source
+            # from _LIVE_RPC_ORACLE which processes the snapshot identically to the miner)
+            if _ora_state:
+                metrics["w_state"] = {
+                    "fidelity": _ora_state.get("w_state_fidelity", 0.0),
+                    "coherence": _ora_state.get("coherence_l1", 0.0),
+                    "coherence_l1": _ora_state.get("coherence_l1", 0.0),
+                    "von_neumann_entropy": _ora_state.get("von_neumann_entropy", 0.0),
+                    "entropy": _ora_state.get("von_neumann_entropy", 0.0),
+                    "purity": _ora_state.get("purity", 0.0),
+                    "cycle": _ora_state.get("cycle", 0),
+                    "consensus": _ora_state.get("consensus", False),
+                    "mermin_test": _ora_state.get("mermin_test", {}),
+                    "block_height": _ora_state.get("block_height", 0),
+                    "density_matrix_hex": _ora_dm_hex or _snap_dm_hex or "",
+                    "pq_curr": _ora_state.get("pq_curr", _bh + 1),
+                    "pq_last": _ora_state.get("pq_last", _bh),
+                    "pq0_oracle_fidelity": _ora_state.get("pq0_oracle_fidelity", 0.0),
+                    "pq0_IV_fidelity": _ora_state.get("pq0_IV_fidelity", 0.0),
+                    "pq0_V_fidelity": _ora_state.get("pq0_V_fidelity", 0.0),
+                    "latency_ms": _ora_state.get("latency_ms", 0.0),
+                }
+                metrics["pq0"] = {
+                    "pq_curr": _ora_state.get("pq_curr", _bh + 1),
+                    "pq_last": _ora_state.get("pq_last", _bh),
+                    "pq0_oracle_fidelity": _ora_state.get("pq0_oracle_fidelity", 0.0),
+                    "pq0_IV_fidelity": _ora_state.get("pq0_IV_fidelity", 0.0),
+                    "pq0_V_fidelity": _ora_state.get("pq0_V_fidelity", 0.0),
+                    "block_height": _ora_state.get("block_height", 0),
+                }
+                # Copy additional fields from raw snapshot
+                for _k in (
+                    "oracle_id", "oracle_role", "oracle_measurements", "per_node",
+                    "nodes", "theta", "phi", "bloch_x", "bloch_y", "bloch_z",
+                    "pq0_bloch_theta", "pq0_bloch_phi", "aer_noise_state",
+                    "client_fused_fidelity", "client_oracle_count",
+                    "w_state_hex", "tensor_dim", "_latency_ms",
+                    "bell_test", "mermin", "w_state_strength",
+                ):
+                    _v = _snap.get(_k) or _ora_state.get(_k)
+                    if _v is not None:
+                        metrics[_k] = _v
+                        if isinstance(metrics.get("w_state"), dict):
+                            metrics["w_state"][_k] = _v
+                        if isinstance(metrics.get("pq0"), dict) and _k in (
+                            "theta", "phi", "bloch_x", "bloch_y", "bloch_z",
+                            "pq0_bloch_theta", "pq0_bloch_phi",
+                        ):
+                            metrics["pq0"][_k] = _v
+
+                # Extract aer_noise_state if present in raw snapshot
+                _aer = _snap.get("aer_noise_state") or {}
+                if isinstance(_aer, dict):
+                    for _aerk in (
+                        "pq0_oracle_fidelity", "pq0_IV_fidelity", "pq0_V_fidelity",
+                        "block_field", "theta", "phi",
+                    ):
+                        _aerv = _aer.get(_aerk)
+                        if _aerv is not None:
+                            if isinstance(metrics.get("pq0"), dict):
+                                metrics["pq0"][_aerk] = _aerv
+                            if isinstance(metrics.get("w_state"), dict):
+                                metrics["w_state"][_aerk] = _aerv
+                    _bf = _aer.get("block_field") or {}
+                    if isinstance(_bf, dict) and isinstance(metrics.get("w_state"), dict):
+                        for _bfk in (
+                            "block_field_fidelity", "block_field_coherence",
+                            "block_field_entropy", "block_field_purity",
+                            "per_node",
+                        ):
+                            _bfv = _bf.get(_bfk)
+                            if _bfv is not None:
+                                metrics["w_state"][_bfk] = _bfv
+            else:
+                # Fallback: metrics from raw RPC snapshot only
+                metrics = dict(_snap) or {}
+                if isinstance(metrics, dict):
+                    _aer = metrics.get("aer_noise_state") or {}
+                    if not isinstance(_aer, dict):
+                        _aer = {}
+                    _bf = _aer.get("block_field") or {}
+
+                    if "w_state" not in metrics:
+                        metrics["w_state"] = {}
+                    if isinstance(metrics.get("w_state"), dict):
+                        metrics["w_state"].update({
+                            k: v for k, v in _snap.items()
+                            if k in (
+                                "fidelity", "w_state_fidelity", "coherence",
+                                "coherence_l1", "purity", "entropy",
+                                "von_neumann_entropy", "density_matrix_hex",
+                                "oracle_id", "oracle_role", "block_height",
+                                "mermin_test", "bell_test", "pq_curr", "pq_last",
                             )
-                        }
-                    )
-                    # Override with block_field values when metrics has None or missing
-                    # block_field_fidelity is the authoritative W-state fidelity
-                    # Use explicit None-check: setdefault doesn't override existing None
-                    if not metrics["w_state"].get("fidelity"):
-                        metrics["w_state"]["fidelity"] = _bf.get("block_field_fidelity")
-                    if not metrics["w_state"].get("coherence"):
-                        metrics["w_state"]["coherence"] = _bf.get(
-                            "block_field_coherence"
-                        )
-                    if not metrics["w_state"].get("entropy"):
-                        metrics["w_state"]["entropy"] = _bf.get("block_field_entropy")
-                    if not metrics["w_state"].get("purity"):
-                        metrics["w_state"]["purity"] = _bf.get("block_field_purity")
-                    # Per-node breakdown from block_field
-                    if _bf.get("per_node"):
-                        metrics["w_state"]["per_node"] = _bf.get("per_node")
-                    # pq0 from aer_noise_state
-                    metrics["w_state"].update(
-                        {
+                        })
+                        if not metrics["w_state"].get("fidelity"):
+                            metrics["w_state"]["fidelity"] = _bf.get("block_field_fidelity")
+                        if not metrics["w_state"].get("coherence"):
+                            metrics["w_state"]["coherence"] = _bf.get("block_field_coherence")
+                        if not metrics["w_state"].get("entropy"):
+                            metrics["w_state"]["entropy"] = _bf.get("block_field_entropy")
+                        if not metrics["w_state"].get("purity"):
+                            metrics["w_state"]["purity"] = _bf.get("block_field_purity")
+                        if _bf.get("per_node"):
+                            metrics["w_state"]["per_node"] = _bf.get("per_node")
+                        metrics["w_state"].update({
                             "pq0_oracle_fidelity": _aer.get("pq0_oracle_fidelity", 0.0),
                             "pq0_IV_fidelity": _aer.get("pq0_IV_fidelity", 0.0),
                             "pq0_V_fidelity": _aer.get("pq0_V_fidelity", 0.0),
-                        }
-                    )
-                if "pq0" not in metrics:
-                    metrics["pq0"] = {}
-                if isinstance(metrics.get("pq0"), dict):
-                    metrics["pq0"].update(
-                        {
-                            k: v
-                            for k, v in snap.items()
-                            if k
-                            in (
-                                "pq_curr",
-                                "pq_last",
-                                "pq0_oracle_fidelity",
-                                "pq0_IV_fidelity",
-                                "pq0_V_fidelity",
-                                "theta",
-                                "phi",
-                                "bloch_x",
-                                "bloch_y",
-                                "bloch_z",
-                                "pq0_bloch_theta",
-                                "pq0_bloch_phi",
+                        })
+                    if "pq0" not in metrics:
+                        metrics["pq0"] = {}
+                    if isinstance(metrics.get("pq0"), dict):
+                        metrics["pq0"].update({
+                            k: v for k, v in _snap.items()
+                            if k in (
+                                "pq_curr", "pq_last", "pq0_oracle_fidelity",
+                                "pq0_IV_fidelity", "pq0_V_fidelity",
+                                "theta", "phi", "bloch_x", "bloch_y", "bloch_z",
+                                "pq0_bloch_theta", "pq0_bloch_phi",
                             )
-                        }
-                    )
-                    # Also pull from aer_noise_state nested dict
-                    metrics["pq0"].update(
-                        {
+                        })
+                        metrics["pq0"].update({
                             "pq0_oracle_fidelity": _aer.get("pq0_oracle_fidelity", 0.0),
                             "pq0_IV_fidelity": _aer.get("pq0_IV_fidelity", 0.0),
                             "pq0_V_fidelity": _aer.get("pq0_V_fidelity", 0.0),
-                        }
-                    )
+                        })
 
-            # Extract w_state and pq0 from metrics (supports nested + flat schemas)
+            # Final extraction of w_state and pq0
             w_state = metrics.get("w_state", {}) if isinstance(metrics, dict) else {}
             pq0 = metrics.get("pq0", {}) if isinstance(metrics, dict) else {}
             if not w_state:
                 w_state = {
-                    k: v
-                    for k, v in metrics.items()
-                    if k
-                    not in ("peers", "blocks", "count", "server_count", "nat_count")
+                    k: v for k, v in metrics.items()
+                    if k not in ("peers", "blocks", "count", "server_count", "nat_count")
                 }
             if not pq0:
                 pq0 = {}
@@ -27192,7 +27241,7 @@ class QtclClientApp:
                 w_state,
                 pq0,
                 diag,
-                snap,
+                _snap,
                 _all_display_peers,
                 mempool,
                 local_p2p_stats,
@@ -27380,8 +27429,9 @@ class QtclClientApp:
             )
             # ── Density matrix — structured element display ─────────────────
             a(HR)
-            a("  DENSITY MATRIX  8×8 complex128  (IEEE754 LE, row-major)")
-            if dm_hex and dm_hex != "—" and len(dm_hex) == 2048:
+            _dm_len = len(dm_hex) if dm_hex and dm_hex != "—" else 0
+            if _dm_len == 2048:
+                a("  DENSITY MATRIX  8×8 complex128  (IEEE754 LE, row-major)")
                 import struct as _dst
 
                 _nz_rows = [
@@ -27405,9 +27455,37 @@ class QtclClientApp:
                             except Exception:
                                 _parts.append(f"[{_col}]={_eh[:8]}…")
                     a(f"  row[{_row}]  " + "  ".join(_parts))
+            elif _dm_len == 65536:
+                # 16³ complex64 = 4096 × 8 bytes = 32768 bytes = 65536 hex chars
+                a("  DENSITY MATRIX  16³ complex64  (4096 elements, IEEE754 BE)")
+                import struct as _dst16
+                _bdata = bytes.fromhex(dm_hex)
+                _nonzero = 0
+                _total = 4096
+                _sum_re = 0.0
+                for _i in range(_total):
+                    _re, _im = _dst16.unpack_from(">ff", _bdata, _i * 8)
+                    if abs(_re) > 1e-12 or abs(_im) > 1e-12:
+                        _nonzero += 1
+                        _sum_re += _re
+                _pct = 100.0 * _nonzero / _total if _total else 0.0
+                a(f"  Non-zero elements: {_nonzero}/{_total}  ({_pct:.1f}%)")
+                a(f"  Sum of real parts: {_sum_re:.4f}  (trace ≈ {_sum_re:.4f})")
+                # Show first 4 diagonal entries
+                _diag_parts = []
+                for _i in range(min(4, 16)):
+                    _re, _im = _dst16.unpack_from(">ff", _bdata, _i * (_i + 1) * 8)
+                    _diag_parts.append(f"ρ[{_i},{_i}]={_re:.4f}")
+                a("  Diag samples   : " + "  ".join(_diag_parts))
             elif dm_hex and dm_hex != "—":
-                a(f"  (unexpected length {len(dm_hex)}, expected 2048 — truncated)")
+                a(
+                    f"  DENSITY MATRIX  ({_dm_len} hex chars, "
+                    f"{_dm_len // 2} bytes — raw hex)"
+                )
+                _trunc = dm_hex[:min(128, _dm_len)]
+                a(f"  Preview: {_trunc}")
             else:
+                a("  DENSITY MATRIX")
                 a("  (not available — SSE oracle DM not yet received)")
             # ── Per-node breakdown ──────────────────────────────────
             nodes = (
@@ -30845,19 +30923,19 @@ def main() -> None:  # noqa: F811
         _sse_density_handlers.append(_default_density_handler)
         _sse_block_handlers.append(_default_block_handler)
 
-        # Start SSE streams (only in non-audit modes to avoid cluttering logs)
-        if not _is_oracle_audit:
-            try:
-                _density_thread = connect_density_stream(url, _default_density_handler)
-                globals()["_SSE_DENSITY_THREAD"] = _density_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
+        # Start SSE streams (always — audit mode uses _LIVE_RPC_ORACLE.fetch_snapshot()
+        # which benefits from SSE-connected oracle state cache, exactly like the miner)
+        try:
+            _density_thread = connect_density_stream(url, _default_density_handler)
+            globals()["_SSE_DENSITY_THREAD"] = _density_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
 
-            try:
-                _block_thread = connect_block_stream(url, _default_block_handler)
-                globals()["_SSE_BLOCK_THREAD"] = _block_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
+        try:
+            _block_thread = connect_block_stream(url, _default_block_handler)
+            globals()["_SSE_BLOCK_THREAD"] = _block_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
 
         # Make handler registration available globally
         globals()["_SSE_DENSITY_HANDLERS"] = _sse_density_handlers
