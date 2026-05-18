@@ -24,7 +24,7 @@ import time
 from typing import Dict, Any, Optional, List, Tuple, Callable, Union, Set
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
-from enum import Enum, auto
+from enum import Enum
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from urllib.parse import quote, urlencode
@@ -37,7 +37,7 @@ try:
     _HAS_REQUESTS = True
 except ImportError:
     _HAS_REQUESTS = False
-from collections import deque, defaultdict, OrderedDict
+from collections import deque, defaultdict
 from pathlib import Path
 import base64
 import queue
@@ -60,6 +60,15 @@ if not logging.getLogger().hasHandlers():
     )
 logger = logging.getLogger(__name__)
 _EXP_LOG = logging.getLogger("qtcl.client.expansion")
+
+try:
+    import requests
+    from dataclasses import dataclass, asdict
+    from enum import Enum
+    from collections import OrderedDict
+    _TX_LAYER_READY = True
+except ImportError:
+    _TX_LAYER_READY = False
 
 #    QRNG_API_KEY_1 → random.org          (env: RANDOM_ORG_KEY  in qrng_ensemble.py)
 #    QRNG_API_KEY_2 → ANU quantum vacuum  (env: ANU_API_KEY     in qrng_ensemble.py)
@@ -379,9 +388,6 @@ def connect_density_stream(
     url = f"{server_url.rstrip('/')}/rpc/oracle/snapshot"
     headers = {"Accept": "text/event-stream"}
 
-    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "density"}
-    globals()["_SSE_DENSITY_STATE"] = _SSE_STATE
-
     def _sse_reader():
         consecutive_errors = 0
         max_errors = 10
@@ -389,7 +395,6 @@ def connect_density_stream(
 
         while True:
             try:
-                _SSE_STATE["connected"] = False
                 if _HAS_REQUESTS:
                     # Use requests with stream=True
                     with requests.get(
@@ -397,8 +402,6 @@ def connect_density_stream(
                     ) as resp:
                         resp.raise_for_status()
                         consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-DENSITY] ✅ Stream connected")
 
                         for line in resp.iter_lines(decode_unicode=True):
                             if line is None:
@@ -411,7 +414,6 @@ def connect_density_stream(
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(
@@ -422,14 +424,11 @@ def connect_density_stream(
                     req = Request(url, headers=headers, method="GET")
                     with urlopen(req, timeout=30) as resp:
                         consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-DENSITY] ✅ Stream connected")
                         for line in resp:
                             line_str = line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(
@@ -437,7 +436,6 @@ def connect_density_stream(
                                     )
 
             except Exception as e:
-                _SSE_STATE["connected"] = False
                 consecutive_errors += 1
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-DENSITY] Connection failed: {e}")
@@ -475,9 +473,6 @@ def connect_block_stream(
     url = f"{server_url.rstrip('/')}/rpc/blocks/stream"
     headers = {"Accept": "text/event-stream"}
 
-    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "blocks"}
-    globals()["_SSE_BLOCK_STATE"] = _SSE_STATE
-
     def _sse_reader():
         consecutive_errors = 0
         max_errors = 10
@@ -485,7 +480,6 @@ def connect_block_stream(
 
         while True:
             try:
-                _SSE_STATE["connected"] = False
                 if _HAS_REQUESTS:
                     # Use requests with stream=True
                     with requests.get(
@@ -493,8 +487,6 @@ def connect_block_stream(
                     ) as resp:
                         resp.raise_for_status()
                         consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-BLOCK] ✅ Stream connected")
 
                         for line in resp.iter_lines(decode_unicode=True):
                             if line is None:
@@ -507,7 +499,6 @@ def connect_block_stream(
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
@@ -516,20 +507,16 @@ def connect_block_stream(
                     req = Request(url, headers=headers, method="GET")
                     with urlopen(req, timeout=30) as resp:
                         consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-BLOCK] ✅ Stream connected")
                         for line in resp:
                             line_str = line.decode().strip()
                             if line_str.startswith("data: "):
                                 try:
                                     payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
                                     callback(payload)
                                 except json.JSONDecodeError as e:
                                     _EXP_LOG.debug(f"[SSE-BLOCK] JSON parse error: {e}")
 
             except Exception as e:
-                _SSE_STATE["connected"] = False
                 consecutive_errors += 1
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-BLOCK] Connection failed: {e}")
@@ -545,205 +532,6 @@ def connect_block_stream(
     thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Block-Reader")
     thread.start()
     _EXP_LOG.info(f"[SSE-BLOCK] Connected to {url}")
-    return thread
-
-
-def connect_consensus_stream(
-    server_url: str, callback: Callable[[dict], None]
-) -> threading.Thread:
-    """
-    Connect to /rpc/oracle/consensus SSE stream.
-    Hardened with heartbeat detection, exponential backoff reconnection, and state tracking.
-    """
-    url = f"{server_url.rstrip('/')}/rpc/oracle/consensus"
-    headers = {"Accept": "text/event-stream"}
-    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "consensus"}
-    globals()["_SSE_CONSENSUS_STATE"] = _SSE_STATE
-
-    def _sse_reader():
-        consecutive_errors = 0
-        max_errors = 20
-        base_delay = 1.0
-        heartbeat_timeout_s = 60.0
-
-        while True:
-            try:
-                _SSE_STATE["connected"] = False
-                _last_data_ts = time.time()
-                if _HAS_REQUESTS:
-                    with requests.get(url, headers=headers, stream=True, timeout=30) as resp:
-                        resp.raise_for_status()
-                        consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-CONSENSUS] ✅ Stream connected")
-                        for line in resp.iter_lines(decode_unicode=True):
-                            if line is None:
-                                if time.time() - _last_data_ts > heartbeat_timeout_s:
-                                    _EXP_LOG.warning("[SSE-CONSENSUS] ⏱️ Heartbeat timeout — forcing reconnect")
-                                    break
-                                continue
-                            _last_data_ts = time.time()
-                            line_str = line.strip() if isinstance(line, str) else line.decode().strip()
-                            if line_str.startswith("data: "):
-                                try:
-                                    payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
-                                    callback(payload)
-                                except json.JSONDecodeError as e:
-                                    _EXP_LOG.debug(f"[SSE-CONSENSUS] JSON parse error: {e}")
-                else:
-                    req = Request(url, headers=headers, method="GET")
-                    with urlopen(req, timeout=30) as resp:
-                        consecutive_errors = 0
-                        _SSE_STATE["connected"] = True
-                        _EXP_LOG.info("[SSE-CONSENSUS] ✅ Stream connected")
-                        for line in resp:
-                            _last_data_ts = time.time()
-                            line_str = line.decode().strip()
-                            if line_str.startswith("data: "):
-                                try:
-                                    payload = json.loads(line_str[6:])
-                                    _SSE_STATE["last_event_ts"] = time.time()
-                                    callback(payload)
-                                except json.JSONDecodeError as e:
-                                    _EXP_LOG.debug(f"[SSE-CONSENSUS] JSON parse error: {e}")
-            except Exception as e:
-                _SSE_STATE["connected"] = False
-                consecutive_errors += 1
-                if consecutive_errors == 1:
-                    _EXP_LOG.warning(f"[SSE-CONSENSUS] ⚠️ Connection failed: {e}")
-                if consecutive_errors > max_errors:
-                    _EXP_LOG.error(f"[SSE-CONSENSUS] ❌ Giving up after {max_errors} consecutive errors")
-                    break
-                delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
-                _EXP_LOG.info(f"[SSE-CONSENSUS] 🔁 Reconnecting in {delay:.1f}s (attempt {consecutive_errors})")
-                time.sleep(delay)
-
-    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Consensus-Reader")
-    thread.start()
-    _EXP_LOG.info(f"[SSE-CONSENSUS] Connecting to {url}")
-    return thread
-
-
-def connect_mempool_stream(
-    server_url: str, callback: Callable[[dict], None]
-) -> threading.Thread:
-    """
-    Connect to /rpc/events/mempool SSE stream.
-    Receive real-time new transaction events and call callback.
-
-    Args:
-        server_url: Base URL of the server
-        callback: Function to call with each new TX event dict
-
-    Returns:
-        Daemon thread handle (already started)
-    """
-    url = f"{server_url.rstrip('/')}/rpc/events/mempool"
-    headers = {"Accept": "text/event-stream"}
-
-    def _sse_reader():
-        consecutive_errors = 0
-        max_errors = 10
-        base_delay = 1.0
-
-        while True:
-            try:
-                if _HAS_REQUESTS:
-                    with requests.get(url, headers=headers, stream=True, timeout=30) as resp:
-                        resp.raise_for_status()
-                        consecutive_errors = 0
-                        for line in resp.iter_lines(decode_unicode=True):
-                            if line is None:
-                                continue
-                            line_str = line.strip() if isinstance(line, str) else line.decode().strip()
-                            if line_str.startswith("data: "):
-                                try:
-                                    payload = json.loads(line_str[6:])
-                                    callback(payload)
-                                except json.JSONDecodeError:
-                                    pass
-                else:
-                    req = Request(url, headers=headers, method="GET")
-                    with urlopen(req, timeout=30) as resp:
-                        consecutive_errors = 0
-                        for line in resp:
-                            line_str = line.decode().strip()
-                            if line_str.startswith("data: "):
-                                try:
-                                    payload = json.loads(line_str[6:])
-                                    callback(payload)
-                                except json.JSONDecodeError:
-                                    pass
-            except Exception as e:
-                consecutive_errors += 1
-                if consecutive_errors == 1:
-                    _EXP_LOG.warning(f"[SSE-MEMPOOL] Connection failed: {e}")
-                if consecutive_errors > max_errors:
-                    _EXP_LOG.error(f"[SSE-MEMPOOL] Giving up after {max_errors} errors")
-                    break
-                delay = min(base_delay * (2 ** (consecutive_errors - 1)), 60)
-                time.sleep(delay)
-
-    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Mempool-Reader")
-    thread.start()
-    _EXP_LOG.info(f"[SSE-MEMPOOL] Connected to {url}")
-    return thread
-
-
-def connect_balance_stream(
-    server_url: str, callback: Callable[[dict], None]
-) -> threading.Thread:
-    """
-    Connect to /rpc/events/balance SSE stream for real-time UTXO balance updates.
-    Client-side filtering by address — all addresses broadcast on one channel.
-    """
-    url = f"{server_url.rstrip('/')}/rpc/events/balance"
-    headers = {"Accept": "text/event-stream"}
-
-    _SSE_STATE = {"connected": False, "last_event_ts": 0.0, "stream_name": "balance"}
-    globals()["_SSE_BALANCE_STATE"] = _SSE_STATE
-
-    def _sse_reader():
-        import time as _t, json as _j, requests as _r
-        backoff = 1.0
-        while True:
-            try:
-                resp = _r.get(url, headers=headers, stream=True, timeout=(10, 60))
-                resp.raise_for_status()
-                _SSE_STATE["connected"] = True
-                _SSE_STATE["last_event_ts"] = _t.time()
-                backoff = 1.0
-                for line in resp.iter_lines(decode_unicode=True):
-                    if line and line.startswith("data: "):
-                        try:
-                            data = _j.loads(line[6:])
-                            _SSE_STATE["last_event_ts"] = _t.time()
-                            # Deduplicate identical events within 5s window
-                            _event_key = _j.dumps(data, sort_keys=True)
-                            _now = _t.time()
-                            _last_ts = globals().get("_SSE_BALANCE_LAST_TS", {}).get(_event_key, 0)
-                            if _now - _last_ts < 5.0:
-                                continue
-                            globals().setdefault("_SSE_BALANCE_LAST_TS", {})[_event_key] = _now
-                            # Trim dedup cache to prevent memory leak
-                            _cache = globals().get("_SSE_BALANCE_LAST_TS", {})
-                            if len(_cache) > 500:
-                                globals()["_SSE_BALANCE_LAST_TS"] = {
-                                    k: v for k, v in _cache.items()
-                                    if _now - v < 60.0
-                                }
-                            callback(data)
-                        except Exception:
-                            pass
-            except Exception as e:
-                _SSE_STATE["connected"] = False
-                _t.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-    thread = threading.Thread(target=_sse_reader, daemon=True, name="SSE-Balance-Reader")
-    thread.start()
-    _EXP_LOG.debug(f"[SSE-BALANCE] Connected to {url}")
     return thread
 
 
@@ -1103,585 +891,6 @@ logger.info(
     f"→ XOR₃ → {{8,3}} Möbius(d=64) "
     f"→ server({ENTROPY_SERVER_URL}) → os.urandom hedge"
 )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════════
-# CLIENT-SIDE GLOBALS-COMPATIBLE ENTROPY API
-# ═══════════════════════════════════════════════════════════════════════════════════════
-# This block exposes get_entropy(), get_entropy_pool(), get_entropy_stats(),
-# and get_entropy_pool_manager() at qtcl_client module scope so that:
-#   • hyp_group._resolve_entropy_fn() finds them via sys.modules["qtcl_client"]
-#   • Any hyp_* module running client-side can do:
-#         import qtcl_client; get_entropy = qtcl_client.get_entropy
-#     instead of the server-only `from globals import get_entropy`.
-# The implementation delegates entirely to HyperbolicEntropyPool (_get_pool())
-# which already handles the QRNG ensemble → server → os.urandom fallback chain.
-# Additionally, this block injects a lightweight "globals" shim into sys.modules
-# so that `from globals import get_entropy` literally resolves on the client
-# without ImportError — enabling true zero-change dual-use of all hyp_*.py files.
-# ═══════════════════════════════════════════════════════════════════════════════════════
-
-# ── Public entropy API (globals-compatible signatures) ────────────────────────
-
-def get_entropy(size: int = 32) -> bytes:
-    """
-    CLIENT-SIDE quantum entropy gate — globals.get_entropy() compatible.
-
-    Returns `size` bytes from the HyperbolicEntropyPool pipeline:
-      QRNG ensemble (random.org / ANU / QBICK)
-      → XOR₃ combiner
-      → {8,3} Möbius SHAKE-256 mix
-      → server /rpc qtcl_getEntropy fallback
-      → os.urandom liveness hedge
-
-    Thread-safe, cached with 20-second TTL (configurable via HyperbolicEntropyPool).
-    Raises nothing — always returns bytes even in fully-degraded mode.
-    """
-    return _get_pool().get(size=size)
-
-
-def get_entropy_pool() -> "HyperbolicEntropyPool":
-    """
-    CLIENT-SIDE entropy pool accessor — returns the singleton HyperbolicEntropyPool.
-    Matches the get_entropy_pool_manager() interface expected by server-side consumers
-    that call pool.get(size=N).
-    """
-    return _get_pool()
-
-
-# Alias: server code calls get_entropy_pool_manager(); client exposes same object.
-get_entropy_pool_manager = get_entropy_pool
-
-
-def get_entropy_stats() -> Dict[str, Any]:
-    """
-    CLIENT-SIDE entropy diagnostic stats — globals.get_entropy_stats() compatible.
-
-    Returns a dict with the same key schema as qrng_ensemble.get_entropy_stats()
-    so that any code calling get_entropy_stats() for telemetry gets a consistent
-    structure regardless of execution context (server vs. client/miner).
-    """
-    pool = _get_pool()
-    qrng_sources: Dict[str, bool] = {
-        "random_org":   bool(QRNG_API_KEY_1),
-        "anu_quantum":  bool(QRNG_API_KEY_2),
-        "qbick":        bool(QRNG_API_KEY_3),
-    }
-    active_qrng = [name for name, active in qrng_sources.items() if active]
-    return {
-        "context":          "client",
-        "pool_type":        "HyperbolicEntropyPool",
-        "qrng_sources":     qrng_sources,
-        "active_sources":   active_qrng,
-        "source_count":     len(active_qrng),
-        "pipeline":         f"QRNG[{','.join(active_qrng) or 'none'}] → XOR₃ → Möbius(d=64) → server → os.urandom",
-        "cache_ttl_s":      pool._ttl,
-        "cache_active":     (pool._cache is not None),
-        "cache_age_s":      round(time.time() - pool._cache_ts, 3) if pool._cache_ts else None,
-        "entropy_server":   ENTROPY_SERVER_URL,
-        "pool_api_available": True,  # this module IS the pool api on the client
-        "degraded":         len(active_qrng) == 0,
-        "timestamp":        time.time(),
-    }
-
-
-# ── sys.modules "globals" shim injection ─────────────────────────────────────
-# Inject a thin synthetic "globals" module into sys.modules so that any shared
-# hyp_*.py file that does `from globals import get_entropy` on the client
-# resolves cleanly without ImportError. The shim also re-exports every function
-# and constant that globals.py exposes so server-written consumers that import
-# more than just get_entropy work transparently in client mode.
-#
-# This is only injected when globals is NOT already importable (i.e. we are
-# running client-side, not inside the Koyeb server process).  The server's real
-# globals.py takes absolute priority.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _maybe_inject_globals_shim() -> None:
-    """
-    Inject a lightweight synthetic 'globals' module into sys.modules.
-
-    Conditions:
-      - Only runs if 'globals' is NOT already importable (client mode guard).
-      - Idempotent: if the shim is already installed this call is a no-op.
-      - Safe: any real globals.py on sys.path takes absolute precedence because
-        we check importability first.
-    """
-    import sys as _sys
-    import types as _types
-    import importlib as _importlib
-
-    # Check if the real globals module is importable — if so, do nothing.
-    try:
-        _real = _importlib.import_module("globals")
-        if hasattr(_real, "get_entropy"):
-            # Real server globals.py is available; no shim needed.
-            logger.debug("[ClientGlobals] Real globals.py found — shim not injected")
-            return
-    except (ImportError, ModuleNotFoundError):
-        pass  # Expected on client — proceed with shim injection
-
-    if "globals" in _sys.modules:
-        # Already shimmed (or something else installed it) — check if ours
-        _existing = _sys.modules["globals"]
-        if getattr(_existing, "_QTCL_CLIENT_SHIM", False):
-            logger.debug("[ClientGlobals] Globals shim already installed — skipping")
-            return
-
-    # Build the synthetic module
-    _shim = _types.ModuleType("globals")
-    _shim.__doc__ = """
-    QTCL Client-Side globals shim.
-    Provides the same public API as server globals.py so that all hyp_*.py
-    modules work identically in both server and client/miner contexts.
-    Installed into sys.modules['globals'] by qtcl_client at import time.
-    """
-    _shim._QTCL_CLIENT_SHIM = True  # marker so we can detect our own shim
-
-    # ── Core entropy API ──────────────────────────────────────────────────────
-    _shim.get_entropy             = get_entropy
-    _shim.get_entropy_pool        = get_entropy_pool
-    _shim.get_entropy_pool_manager = get_entropy_pool_manager
-    _shim.get_entropy_stats       = get_entropy_stats
-    _shim.POOL_API_AVAILABLE      = True
-
-    # ── Block field entropy (client stubs — server-only feature) ──────────────
-    _shim.get_block_field_entropy     = lambda: get_entropy(32)
-    _shim.get_entropy_from_block_field = lambda: get_entropy(32)
-    _shim.get_current_block_field     = lambda: {}
-    _shim.set_current_block_field     = lambda _d: None
-    _shim.initialize_block_field_entropy = lambda: True
-    _shim.initialize_system           = lambda: True
-    _shim.ENTROPY_SIZE_BYTES          = 32
-    _shim.BLOCK_FIELD_ENTROPY_KEY     = "current_block_field_entropy"
-
-    # ── State API stubs ───────────────────────────────────────────────────────
-    _CLIENT_STATE: Dict[str, Any] = {}
-    _CLIENT_STATE_LOCK = threading.RLock()
-
-    def _get_state(key: str, default: Any = None) -> Any:
-        with _CLIENT_STATE_LOCK:
-            return _CLIENT_STATE.get(key, default)
-
-    def _set_state(key: str, value: Any) -> None:
-        with _CLIENT_STATE_LOCK:
-            _CLIENT_STATE[key] = value
-
-    def _update_state(updates: Dict[str, Any]) -> None:
-        with _CLIENT_STATE_LOCK:
-            _CLIENT_STATE.update(updates)
-
-    _shim.get_state    = _get_state
-    _shim.set_state    = _set_state
-    _shim.update_state = _update_state
-
-    # ── Chain/consensus constants ─────────────────────────────────────────────
-    _shim.WSTATE_FIDELITY_THRESHOLD  = 0.75
-    _shim.ORACLE_MIN_PEERS           = 3
-    _shim.MAX_PEERS                  = 32
-    _shim.MINING_COINBASE_REWARD     = float(os.environ.get("MINER_REWARD", "7.20"))
-    _shim.ORACLE_REGISTRY_ADDRESS    = "0000000000000000000000000000000000000000000000000000000000000000"
-
-    # ── Reward schedule (re-export from client's own definition) ──────────────
-    # TessellationRewardSchedule is defined later in qtcl_client.py; we use a
-    # lazy property so forward-reference is not an issue.
-    class _LazyRewardScheduleDescriptor:
-        def __get__(self, obj, objtype=None):
-            import sys as _s
-            _qc = _s.modules.get("qtcl_client") or _s.modules.get("__main__")
-            if _qc and hasattr(_qc, "TessellationRewardSchedule"):
-                return _qc.TessellationRewardSchedule
-            # Minimal inline fallback
-            class _MinimalTRS:
-                TOTAL_BLOCKS = 62_300_160
-                TOTAL_SUPPLY_QTCL = 498_401_280.0
-                TREASURY_ADDRESS = "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
-            return _MinimalTRS
-    _shim.__class__ = type("_GlobalsShimModule", (_types.ModuleType,), {
-        "TessellationRewardSchedule": _LazyRewardScheduleDescriptor(),
-    })
-
-    # ── Lattice / consensus stubs (no-ops on client) ──────────────────────────
-    _shim.LATTICE          = None
-    _shim.get_lattice      = lambda: None
-    _shim.set_lattice      = lambda _l: None
-    _shim.get_blockchain   = lambda: None
-    _shim.HYP_ENGINE_AVAILABLE = False  # will be updated after HypWallet init
-    _shim.get_global_hyp_engine = lambda: None
-    _shim.set_hyp_engine   = lambda _e: None
-
-    _shim.record_quantum_witness = lambda *a, **kw: True
-    _shim.register_validator     = lambda *a, **kw: (True, 0)
-    _shim.accept_attestation     = lambda *a, **kw: (True, "attestation_accepted")
-    _shim.compute_finality       = lambda *a, **kw: None
-
-    # ── Install ───────────────────────────────────────────────────────────────
-    _sys.modules["globals"] = _shim
-    logger.info(
-        "[ClientGlobals] ✅ globals shim injected into sys.modules — "
-        "all hyp_*.py modules now operate in dual-use client mode"
-    )
-
-
-# Execute shim injection immediately at qtcl_client import time.
-# The resolver in hyp_group._resolve_entropy_fn() will then find
-# the shim on its first pass, route to HyperbolicEntropyPool, and
-# log "globals(server/QRNG)" or "qtcl_client(client/HyperbolicPool)"
-# depending on which context wins.
-_maybe_inject_globals_shim()
-
-
-
-
-
-class _OracleNode:
-    """
-    QTCL Oracle Node — runs inside the client.
-
-    Each oracle node:
-      • Has a unique ID derived from process PID (no port needed)
-      • Measures the same quantum object locally (AER / W-state)
-      • Signs block attestations with HypΓ
-      • Syncs chain from genesis via RPC
-      • Gossests attestations via P2P
-      • All 5 oracles perform IDENTICAL functions, differing only in oracle_id
-    """
-
-    def __init__(self, wallet: "HypWallet", server_url: str = None):
-        self.wallet = wallet
-        self.server_url = (server_url or ENTROPY_SERVER_URL).rstrip("/")
-        self.kapi = KoyebRPCNodule(self.server_url)
-        self.oracle_id = f"oracle_{os.getpid()}"
-        self.oracle_address = wallet.address if wallet and wallet.is_loaded() else "0" * 64
-        self._local_chain: Dict[int, Dict[str, Any]] = {}
-        self._lock = threading.RLock()
-        self._active = False
-        self._dm_cache: Optional[str] = None
-        self._dm_cache_ts = 0.0
-
-    def is_active(self) -> bool:
-        return self._active
-
-    def activate(self):
-        """Start oracle node: register, sync chain, begin measurement loop."""
-        self._active = True
-        _EXP_LOG.critical(f"[ORACLE-NODE] 🔮 ACTIVATED  id={self.oracle_id}  addr={self.oracle_address[:16]}…")
-        threading.Thread(target=self._sync_chain_loop, daemon=True, name="OracleSync").start()
-        threading.Thread(target=self._quantum_measure_loop, daemon=True, name="OracleMeasure").start()
-
-    def deactivate(self):
-        self._active = False
-        _EXP_LOG.warning(f"[ORACLE-NODE] 🛑 DEACTIVATED  id={self.oracle_id}")
-
-    def _sync_chain_loop(self):
-        """Background: sync chain from genesis, verify cryptographically."""
-        while self._active:
-            try:
-                self._sync_from_genesis()
-            except Exception as e:
-                _EXP_LOG.debug(f"[ORACLE-SYNC] Error: {e}")
-            time.sleep(30.0)
-
-    def _sync_from_genesis(self):
-        """Fetch blocks from server, build local chain, verify headers."""
-        _tip = self.kapi.get_chain_tip()
-        if not _tip:
-            return
-        _tip_h = int(_tip.get("height", 0))
-
-        with self._lock:
-            _local_h = max(self._local_chain.keys()) if self._local_chain else -1
-
-        _fetch_from = max(0, _local_h)
-        if _fetch_from >= _tip_h:
-            return
-
-        _EXP_LOG.info(f"[ORACLE-SYNC] Syncing blocks {_fetch_from}..{_tip_h}")
-        for h in range(_fetch_from, _tip_h + 1):
-            try:
-                _blk = self.kapi._rpc("qtcl_getBlock", [h], timeout=10, retries=2)
-                if not isinstance(_blk, dict) or "error" in str(_blk):
-                    continue
-                # Verify header hash chain
-                if h > 0:
-                    _prev = self._local_chain.get(h - 1)
-                    if _prev and _blk.get("parent_hash") != _prev.get("block_hash"):
-                        _EXP_LOG.error(f"[ORACLE-SYNC] ❌ Chain break at h={h}")
-                        # Reset and refetch from genesis
-                        with self._lock:
-                            self._local_chain.clear()
-                        return
-                with self._lock:
-                    self._local_chain[h] = _blk
-            except Exception as e:
-                _EXP_LOG.debug(f"[ORACLE-SYNC] h={h}: {e}")
-                break
-
-        _EXP_LOG.info(f"[ORACLE-SYNC] ✅ Chain height {_tip_h} | local blocks {len(self._local_chain)}")
-
-    def _quantum_measure_loop(self):
-        """Background: periodically measure local quantum state (AER fallback)."""
-        while self._active:
-            try:
-                _dm = self._measure_local_dm()
-                if _dm:
-                    with self._lock:
-                        self._dm_cache = _dm
-                        self._dm_cache_ts = time.time()
-            except Exception as e:
-                _EXP_LOG.debug(f"[ORACLE-MEASURE] Error: {e}")
-            time.sleep(5.0)
-
-    def _measure_local_dm(self) -> Optional[str]:
-        """Generate a local 16³ density matrix (AER fallback)."""
-        try:
-            import numpy as _np
-            _field = _np.zeros((16, 16, 16), dtype=_np.complex64)
-            _seed = int(time.time() * 1000) % (2**31)
-            _np.random.seed(_seed)
-            for _i in range(16):
-                for _j in range(16):
-                    for _k in range(16):
-                        _re = _np.random.normal(0, 0.1)
-                        _im = _np.random.normal(0, 0.1)
-                        _field[_i, _j, _k] = _re + 1j * _im
-            _trace = _np.sum(_np.abs(_field) ** 2)
-            if _trace > 1e-12:
-                _field = _field / _np.sqrt(_trace)
-            return _np.asarray(_field, dtype=_np.complex64).tobytes().hex()
-        except Exception:
-            return None
-
-    def get_local_dm(self) -> Optional[str]:
-        with self._lock:
-            return self._dm_cache
-
-    def get_local_chain_tip(self) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            if not self._local_chain:
-                return None
-            _h = max(self._local_chain.keys())
-            return self._local_chain.get(_h)
-
-    def attest_block(self, header: Dict[str, Any], block_hash: str) -> Optional[Dict[str, Any]]:
-        """Sign a block attestation with HypΓ. Returns attestation dict."""
-        if not self.wallet or not self.wallet.is_loaded():
-            return None
-
-        try:
-            # Compute canonical header hash (same as server)
-            _canonical = json.dumps({
-                "height": header.get("height", 0),
-                "parent_hash": header.get("parent_hash", ""),
-                "merkle_root": header.get("merkle_root", ""),
-                "timestamp": header.get("timestamp", 0),
-                "difficulty": header.get("difficulty", 0),
-                "nonce": header.get("nonce", 0),
-                "miner_address": header.get("miner_address", ""),
-            }, sort_keys=True, separators=(",", ":"))
-            _header_hash = hashlib.sha3_256(_canonical.encode()).hexdigest()
-
-            # Sign header hash
-            _sig = self.wallet.sign_message(bytes.fromhex(_header_hash))
-            _dm = self.get_local_dm()
-
-            _att = {
-                "block_height": header.get("height", 0),
-                "block_hash": block_hash,
-                "header_hash": _header_hash,
-                "oracle_id": self.oracle_id,
-                "oracle_address": self.oracle_address,
-                "signature": _sig,
-                "w_state_fidelity": round(0.85 + (hash(_header_hash) % 1000) / 10000, 4),
-                "timestamp": int(time.time()),
-                "density_matrix_hex": _dm or "",
-            }
-            _EXP_LOG.info(f"[ORACLE-NODE] ✍️  Attested h={header.get('height', 0)}  oracle={self.oracle_id}")
-            return _att
-        except Exception as e:
-            _EXP_LOG.error(f"[ORACLE-NODE] Attestation failed: {e}")
-            return None
-
-    def submit_attestation(self, attestation: Dict[str, Any]) -> bool:
-        """Submit attestation to standalone oracle server first, then blockchain server."""
-        height = attestation.get("block_height", 0)
-        # ── Try standalone oracle server on :9092 first ──
-        try:
-            import urllib.request
-            payload = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "qtcl_submitOracleAttestation",
-                "params": attestation,
-                "id": 1,
-            }).encode()
-            req = urllib.request.Request(
-                "http://localhost:9092/rpc",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            resp = urllib.request.urlopen(req, timeout=5)
-            if resp.status == 200:
-                _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation accepted by oracle server: h={height}")
-                return True
-        except Exception as _e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Oracle server unavailable, falling back to blockchain: {_e}")
-        
-        # ── Fallback: submit to blockchain server ──
-        try:
-            _res = self.kapi._rpc("qtcl_submitOracleAttestation", [attestation], timeout=10, retries=2)
-            if isinstance(_res, dict) and _res.get("status") in ("accepted", "finalized"):
-                _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation accepted by blockchain: h={height}")
-                return True
-            else:
-                _EXP_LOG.debug(f"[ORACLE-NODE] Blockchain attestation response: {_res}")
-                return False
-        except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Blockchain submit failed: {e}")
-            return False
-
-    def store_attestation_locally(self, attestation: Dict[str, Any], is_local: bool = False) -> bool:
-        """Store attestation in local SQLite. Survives restarts."""
-        try:
-            from qtcl_client import _get_local_db
-            db = _get_local_db("qtcl")
-            db.execute(
-                """
-                INSERT OR REPLACE INTO oracle_attestations
-                (block_height, oracle_id, oracle_address, block_hash, header_hash,
-                 attestation_signature, w_state_fidelity, attestation_timestamp, received_at, is_local)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(attestation.get("block_height", 0)),
-                    str(attestation.get("oracle_id", "")),
-                    str(attestation.get("oracle_address", "")),
-                    str(attestation.get("block_hash", "")),
-                    str(attestation.get("header_hash", "")),
-                    json.dumps(attestation.get("signature", {})),
-                    float(attestation.get("w_state_fidelity", 0.0)),
-                    int(attestation.get("timestamp", time.time())),
-                    time.time(),
-                    1 if is_local else 0,
-                ),
-            )
-            return True
-        except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Local store failed: {e}")
-            return False
-
-    def get_attestation_count(self, height: int) -> int:
-        """Count unique attestations for a block height (memory + DB)."""
-        count = 0
-        try:
-            from qtcl_client import _get_local_db
-            db = _get_local_db("qtcl")
-            row = db.fetchone("SELECT COUNT(DISTINCT oracle_id) FROM oracle_attestations WHERE block_height = ?", (height,))
-            count = int(row[0]) if row else 0
-        except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Count query failed: {e}")
-        return count
-
-    def get_attestations_for_block(self, height: int) -> List[Dict[str, Any]]:
-        """Return all attestations for a block height."""
-        try:
-            from qtcl_client import _get_local_db
-            db = _get_local_db("qtcl")
-            rows = db.fetchall("SELECT * FROM oracle_attestations WHERE block_height = ?", (height,))
-            return [dict(r) for r in rows]
-        except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Fetch failed: {e}")
-            return []
-
-    def broadcast_attestation_to_peers(self, attestation: Dict[str, Any], p2p_node=None) -> int:
-        """HTTP POST attestation to all active P2P peers. Returns count of successful sends."""
-        if not p2p_node:
-            return 0
-        peer_mgr = getattr(p2p_node, "peer_mgr", None)
-        if not peer_mgr:
-            return 0
-        peers = peer_mgr.get_active_peers()
-        if not peers:
-            return 0
-        ok = 0
-        payload = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "qtcl_p2p_attestation",
-            "params": {
-                "attestation": attestation,
-                "relay_by": self.oracle_id,
-                "relay_timestamp": int(time.time()),
-            },
-            "id": 1,
-        }).encode()
-        for peer in peers:
-            try:
-                import urllib.request
-                url = f"http://{peer.host}:{peer.port}/rpc"
-                req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-                urllib.request.urlopen(req, timeout=5)
-                ok += 1
-            except Exception:
-                pass
-        _EXP_LOG.info(f"[ORACLE-NODE] 📡 Attestation broadcast: {ok}/{len(peers)} peers reached")
-        return ok
-
-    def receive_peer_attestation(self, data: Dict[str, Any]) -> bool:
-        """Validate and store a peer attestation. Returns True if accepted."""
-        try:
-            att = data.get("attestation", {})
-            if not att:
-                return False
-            height = int(att.get("block_height", 0))
-            oid = str(att.get("oracle_id", ""))
-            if height <= 0 or not oid:
-                return False
-            # Deduplicate: ignore if we already have this oracle's attestation for this height
-            existing = self.get_attestations_for_block(height)
-            for ea in existing:
-                if ea.get("oracle_id") == oid:
-                    return False  # already seen
-            self.store_attestation_locally(att, is_local=False)
-            _EXP_LOG.info(f"[ORACLE-NODE] 📨 Peer attestation accepted: h={height} oracle={oid[:16]}…")
-            return True
-        except Exception as e:
-            _EXP_LOG.debug(f"[ORACLE-NODE] Receive failed: {e}")
-            return False
-
-    def on_block_solved(self, block_data: Dict[str, Any], block_hash: str, p2p_node=None) -> Optional[Dict[str, Any]]:
-        """
-        FULL ORACLE WORKFLOW when client solves a block:
-        1. Sign self-attestation
-        2. Store locally
-        3. Submit to server
-        4. Broadcast to P2P peers
-        Returns the attestation dict.
-        """
-        header = {
-            "height": block_data.get("height", 0),
-            "parent_hash": block_data.get("parent_hash", ""),
-            "merkle_root": block_data.get("merkle_root", ""),
-            "timestamp": block_data.get("timestamp", 0),
-            "difficulty": block_data.get("difficulty", 5),
-            "nonce": block_data.get("nonce", 0),
-            "miner_address": block_data.get("miner_address", ""),
-        }
-        att = self.attest_block(header, block_hash)
-        if not att:
-            _EXP_LOG.error("[ORACLE-NODE] ❌ Self-attestation failed")
-            return None
-        # Store locally first (never fails)
-        self.store_attestation_locally(att, is_local=True)
-        # Submit to server
-        self.submit_attestation(att)
-        # Broadcast to P2P mesh
-        self.broadcast_attestation_to_peers(att, p2p_node)
-        _EXP_LOG.critical(f"[ORACLE-NODE] 🔮 Self-attested h={header['height']} — stored + server + peers")
-        return att
-
-    def gossip_attestation(self, attestation: Dict[str, Any], p2p_node=None):
-        """Gossip attestation to P2P peers (legacy wrapper — use broadcast_attestation_to_peers)."""
-        self.broadcast_attestation_to_peers(attestation, p2p_node)
 
 
 def init_p2p_bootstrap() -> None:
@@ -4736,17 +3945,12 @@ class HypGammaWallet:
         if not self.keypair: raise RuntimeError("No keypair loaded")
         return self.engine.sign_hash(message_hash, self.keypair.private_key)
 
-    def sign_transaction(self, tx_dict: Dict[str, Any], block_height: int = 0) -> Dict[str, Any]:
+    def sign_transaction(self, tx_dict: Dict[str, Any]) -> Dict[str, Any]:
         if not self.keypair: raise RuntimeError("No keypair loaded")
         tx_json = json.dumps(tx_dict, sort_keys=True, separators=(",", ":"))
         tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
-        t0 = time.time()
         sig = self.engine.sign_hash(tx_hash, self.keypair.private_key)
         sig["signer_address"] = self.keypair.address
-        dt = time.time() - t0
-        c_exp = sig.get("c_exp", 0)
-        z_det = str(sig.get("Z", {}).get("det", "?"))[:20] if isinstance(sig.get("Z"), dict) else "?"
-        logger.info(f"[SchnorrΓ] sign h={block_height}: done in {dt:.3f}s | c_exp={c_exp} | Z_det={z_det}")
         return sig
 
     def verify_signature(self, message_hash: bytes, signature: Dict[str, str]) -> bool:
@@ -5728,25 +4932,13 @@ class LiveRPCOracleSnapshot:
         self._start_sse_stream()
 
     def _start_sse_stream(self):
-        """Initialize EventSource listener for live density matrix stream.
-
-        SKIPS starting a redundant listener if the module-level density SSE
-        stream (connect_density_stream) is already active. This prevents
-        exhausting the server’s 5-connection-per-IP SSE limit.
-        """
-        # Check if module-level density stream is already running
-        _dt = globals().get("_SSE_DENSITY_THREAD")
-        if _dt is not None and _dt.is_alive():
-            logger.debug(
-                "[CLIENT] Density SSE stream already active — skipping QuantumClient redundant listener"
-            )
-            return
-
+        """Initialize EventSource listener for live density matrix stream."""
         try:
             # Import EventSourceListener at runtime to avoid circular deps
             import sys
 
             if "sse_listener" not in sys.modules:
+                # SSE listener module not available — that's OK, fall back to RPC polling
                 logger.debug(
                     "[CLIENT] SSE listener module not available, using RPC polling"
                 )
@@ -5824,67 +5016,115 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
 
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Read snapshot from persistent SSE stream cache OR fallback to RPC.
+        """Read snapshot from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
 
-        The module-level density SSE stream (connect_density_stream) feeds
-        _dm_re/_dm_im and _oracle_state continuously.  This method reads
-        from that in-memory cache first (zero network cost).  Only falls
-        back to an RPC GET when the cache is stale (>30s).
+        Fetches quantum state: tries SSE stream first, falls back to RPC POST.
+        Processes snapshot: parses density matrix, converts W-state if needed,
+        updates oracle state cache.
         """
         _t0 = time.time()
+        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot"
         _rpc_url = f"{self.ORACLE_URL}/rpc"
+        _payload = {
+            "jsonrpc": "2.0",
+            "method": "qtcl_getQuantumMetrics",
+            "params": [],
+            "id": 1,
+        }
         snap = {}
 
         try:
-            # PRIMARY: Read from in-memory cache (fed by persistent SSE stream)
-            with self._dm_lock:
-                _cached_dm_re = list(self._dm_re) if self._dm_re else None
-                _cached_dm_im = list(self._dm_im) if self._dm_im else None
-                _cache_age = time.time() - self._last_fetch_ts
+            session = self._get_session()
+            if not session:
+                return {}
 
-            if _cached_dm_re and _cache_age < 30.0:
-                # Cache is fresh — build snap from cached state
-                with self._oracle_state_lock:
-                    snap = dict(self._oracle_state)
-                snap["_from_cache"] = True
-                snap["_cache_age_s"] = round(_cache_age, 1)
-                logger.debug(f"[RPC-ORACLE] ✅ Cache hit (age={_cache_age:.1f}s)")
-            else:
-                # Cache stale or empty — single RPC fallback
-                logger.debug(
-                    f"[RPC-ORACLE] Cache stale ({_cache_age:.0f}s), trying RPC"
-                )
+            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot (with proper timeout)
+            try:
+                _snap_result = [None]  # Mutable container for thread result
+                _snap_error = [None]
+
+                def _read_sse():
+                    try:
+                        # Stream=True: read response as stream, don't load entire body
+                        _r = session.get(
+                            _snap_url,
+                            timeout=(timeout_s / 2, timeout_s),
+                            headers={"Accept": "text/event-stream"},
+                            stream=True,
+                        )
+                        # Handle 429 Too Many Requests — server at capacity
+                        if _r.status_code == 429:
+                            _retry_after = int(_r.headers.get("Retry-After", "5"))
+                            _snap_error[0] = (
+                                f"HTTP 429 (at capacity, retry after {_retry_after}s)"
+                            )
+                            return
+                        # Handle other non-2xx responses
+                        if _r.status_code not in (200, 202):
+                            _snap_error[0] = f"HTTP {_r.status_code}"
+                            return
+                        # Read SSE stream successfully
+                        try:
+                            # Read line by line from stream without loading entire response
+                            for _line in _r.iter_lines(
+                                decode_unicode=True, chunk_size=1024
+                            ):
+                                if _line.startswith("data: "):
+                                    try:
+                                        _envelope = json.loads(_line[6:])
+                                        _snap_result[0] = _envelope.get(
+                                            "result", _envelope
+                                        )
+                                        _r.close()  # Close immediately after getting first message
+                                        return
+                                    except json.JSONDecodeError:
+                                        continue
+                                elif _line and not _line.startswith(":"):
+                                    _r.close()
+                                    return
+                        finally:
+                            _r.close()
+                    except Exception as e:
+                        _snap_error[0] = e
+
+                _sse_thread = threading.Thread(target=_read_sse, daemon=True)
+                _sse_thread.start()
+                _sse_thread.join(
+                    timeout=timeout_s
+                )  # Wait up to timeout_s for first line
+
+                if _snap_result[0]:
+                    snap = _snap_result[0]
+                    logger.debug(f"[RPC-ORACLE] ✅ SSE snapshot received")
+                elif _snap_error[0]:
+                    logger.debug(
+                        f"[RPC-ORACLE] SSE failed: {_snap_error[0]} (trying RPC)"
+                    )
+            except Exception as _sse_e:
+                logger.debug(f"[RPC-ORACLE] SSE failed: {_sse_e} (trying RPC)")
 
             # FALLBACK: GET /rpc with qtcl_getQuantumMetrics
             if not snap:
                 try:
-                    session = self._get_session()
-                    if session:
-                        import urllib.parse as _up
+                    import urllib.parse as _up
 
-                        _payload = {
-                            "jsonrpc": "2.0",
-                            "method": "qtcl_getQuantumMetrics",
-                            "params": [],
+                    params_json = json.dumps(_payload.get("params", []))
+                    query = _up.urlencode(
+                        {
+                            "method": _payload.get("method"),
+                            "params": params_json,
                             "id": 1,
                         }
-                        params_json = json.dumps(_payload.get("params", []))
-                        query = _up.urlencode(
-                            {
-                                "method": _payload.get("method"),
-                                "params": params_json,
-                                "id": 1,
-                            }
-                        )
-                        _rpc_get_url = f"{_rpc_url}?{query}"
-                        _r = session.get(_rpc_get_url, timeout=timeout_s)
-                        if _r.status_code in (200, 202):
-                            _body = _r.json()
-                            snap = _body.get("result") or {}
-                            if snap and snap.get("density_matrix_hex"):
-                                logger.debug(
-                                    f"[RPC-ORACLE] ✅ RPC fallback succeeded with 16³ DM (32 KB)"
-                                )
+                    )
+                    _rpc_get_url = f"{_rpc_url}?{query}"
+                    _r = session.get(_rpc_get_url, timeout=timeout_s)
+                    if _r.status_code in (200, 202):
+                        _body = _r.json()
+                        snap = _body.get("result") or {}
+                        if snap and snap.get("density_matrix_hex"):
+                            logger.debug(
+                                f"[RPC-ORACLE] ✅ RPC fallback succeeded with 16³ DM (32 KB)"
+                            )
                 except Exception as _rpc_e:
                     logger.debug(f"[RPC-ORACLE] RPC fallback failed: {_rpc_e}")
 
@@ -6614,7 +5854,7 @@ class QtclP2PNode:
                             signal_chain_advance(_srv_height)
                             # Persist to local database
                             try:
-                                _local_db = _get_local_db("qtcl")
+                                _local_db = LocalBlockchainDB(name="qtcl")
                                 _local_db.insert_block(_srv_height, _server_payload)
                                 _EXP_LOG.info(
                                     f"[P2P] 💾 Server block h={_srv_height} persisted locally"
@@ -6955,18 +6195,6 @@ import sqlite3 as _dpq, threading as _dpt, time as _dpt2
 
 _DM_POOL_DAEMON_STOP = _dpt.Event()
 _DM_POOL_DB_PATH = str(_DB_PATH)  # fixed: use canonical _DB_PATH
-
-# ── Cached LocalBlockchainDB singleton ───────────────────────────────────────
-_LOCAL_DB_INSTANCE = None
-_LOCAL_DB_LOCK = threading.Lock()
-
-def _get_local_db(name="qtcl"):
-    global _LOCAL_DB_INSTANCE
-    if _LOCAL_DB_INSTANCE is None:
-        with _LOCAL_DB_LOCK:
-            if _LOCAL_DB_INSTANCE is None:
-                _LOCAL_DB_INSTANCE = LocalBlockchainDB(name=name)
-    return _LOCAL_DB_INSTANCE
 
 
 def _dm_pool_drain_once(db_path: str) -> int:
@@ -7683,877 +6911,11 @@ def _validate_and_init_schema(db_path: Path) -> bool:
         return False
 
 
-
-# ═══════════════════════════════════════════════════════════════════════════════════════
-# BLOCK SUBMISSION CACHE — Cathedral Consensus Engine
-# ═══════════════════════════════════════════════════════════════════════════════════════
-
-class BlockStatus(Enum):
-    SOLVED    = auto()
-    SUBMITTED = auto()
-    PENDING   = auto()
-    FINALIZED = auto()
-    REJECTED  = auto()
-    ORPHANED  = auto()
-
-@dataclass
-class CachedBlock:
-    height: int
-    block_hash: str
-    parent_hash: str
-    nonce: int
-    timestamp: int
-    difficulty: float
-    miner_address: str
-    submit_payload: Dict[str, Any]
-    signature: Dict[str, Any]
-    status: BlockStatus = BlockStatus.SOLVED
-    oracle_count: int = 0
-    oracle_ids: list = field(default_factory=list)
-    submit_attempts: int = 0
-    first_submitted_at: float = 0.0
-    last_submitted_at: float = 0.0
-    finalized_at: float = 0.0
-    reward_qtcl: float = 0.0
-    server_response: Optional[dict] = None
-    error_message: str = ""
-
-class BlockSubmissionCache:
-    """Thread-safe FIFO cache of solved blocks awaiting oracle consensus.
-
-    Rehydrates finalized block history from local SQLite on startup so
-    rewards, block counts and chain tip survive script restarts.
-    """
-    MAX_SIZE = 32
-    EVICT_AFTER_S = 30.0  # FIX: was 0.0 — FINALIZED blocks never evicted
-
-    def __init__(self, db=None):
-        self._lock = threading.RLock()
-        self._blocks: OrderedDict = OrderedDict()
-        self._hash_index: Dict[str, int] = {}
-        self._balance_qtcl: float = 0.0
-        self._db = db
-        self._highest_finalized_height: int = 0
-        self._finalized_count: int = 0
-        self._total_rewards: float = 0.0
-        # Idempotency guards — prevent double-counting when SSE and submit_task
-        # both call mark_finalized for the same height
-        self._finalized_heights: set = set()
-        self._rewarded_heights: set = set()
-        self._rehydrate()
-
-    def _rehydrate(self):
-        """Load finalized blocks and UTXOs from local SQLite mirror.
-
-        SERVER-AUTHORITY CHECK:  Before trusting local cache, verify the
-        server's chain height.  If the server is at height 0 (or lower than
-        our highest local block), a DB reset/genesis rebuild has occurred —
-        wipe all local mirror tables so stale balances can never survive.
-
-        This is the PRIMARY anti-forgery gate: even if a rogue miner
-        inserts fake rows into client_utxos / client_blocks, the next
-        startup will detect the mismatch and purge everything.
-        """
-        if self._db is None:
-            return
-        try:
-            # ── Server-authority genesis check ─────────────────────────
-            # We import KoyebRPCNodule lazily to avoid circular imports.
-            # If the server is unreachable, we still load local cache (offline mode).
-            _server_chain_valid = True
-            try:
-                from qtcl_client import KoyebRPCNodule, ENTROPY_SERVER_URL
-                _kapi = KoyebRPCNodule(ENTROPY_SERVER_URL)
-                _chain = _kapi._rpc("qtcl_getBlockHeight", [], timeout=5, retries=1)
-                _server_height = int(_chain.get("height", 0)) if isinstance(_chain, dict) else 0
-                # Check our highest local block
-                _local_max_row = self._db.execute(
-                    "SELECT MAX(height) FROM client_blocks"
-                ).fetchone()
-                _local_max = int(_local_max_row[0]) if _local_max_row and _local_max_row[0] is not None else 0
-
-                if _server_height < _local_max:
-                    # Server chain is BEHIND local cache → server was reset
-                    logger.warning(
-                        f"[CACHE-REHYDRATE] ⚠️  SERVER CHAIN RESET DETECTED: "
-                        f"server_height={_server_height} < local_max={_local_max} "
-                        f"— PURGING ALL LOCAL MIRROR TABLES"
-                    )
-                    self._db.execute("DELETE FROM client_utxos")
-                    self._db.execute("DELETE FROM client_blocks")
-                    self._db.execute("DELETE FROM client_rewards")
-                    self._balance_qtcl = 0.0
-                    self._highest_finalized_height = 0
-                    self._finalized_count = 0
-                    self._total_rewards = 0.0
-                    logger.info("[CACHE-REHYDRATE] ✅ Local mirror purged — in sync with server genesis")
-                    _server_chain_valid = False  # skip loading stale rows below
-            except Exception as _srv_err:
-                logger.debug(f"[CACHE-REHYDRATE] Server check skipped (offline?): {_srv_err}")
-
-            if not _server_chain_valid:
-                return
-
-            # ── Normal rehydrate from local SQLite ─────────────────────
-            rows = self._db.execute(
-                "SELECT height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized_at, "
-                "COALESCE(nonce, 0) as nonce, COALESCE(difficulty, 5) as difficulty "
-                "FROM client_blocks WHERE finalized = 1 ORDER BY height"
-            ).fetchall()
-            for row in rows:
-                b = CachedBlock(
-                    height=row["height"],
-                    block_hash=row["block_hash"],
-                    parent_hash=row["parent_hash"] or "",
-                    nonce=int(row["nonce"]),
-                    timestamp=int(row["finalized_at"] or 0),
-                    difficulty=int(row["difficulty"]),
-                    miner_address=row["miner_address"] or "",
-                    submit_payload={},
-                    signature={},
-                )
-                b.status = BlockStatus.FINALIZED
-                b.finalized_at = row["finalized_at"] or 0.0
-                b.reward_qtcl = row["reward_qtcl"] or 0.0
-                b.oracle_count = row["oracle_count"] or 0
-                self._blocks[row["height"]] = b
-                self._hash_index[row["block_hash"]] = row["height"]
-            # Set aggregates from loaded rows so they survive _evict_old()
-            # FIX BUG-11: Previously _finalized_count and _total_rewards stayed 0
-            # after rehydrate, relying on in-cache sum via finalized_count().
-            # If EVICT_AFTER_S > 0, blocks would be evicted and count would fall to 0.
-            if rows:
-                self._finalized_count = len(rows)
-                # Populate idempotency sets from rehydrated data
-                for _rr in rows:
-                    self._finalized_heights.add(_rr["height"])
-                # Backfill rows where reward_qtcl was persisted as 0 (pre-fix blocks)
-                _rehydrate_total = 0.0
-                for _rr in rows:
-                    _rr_reward = float(_rr["reward_qtcl"] or 0)
-                    if _rr_reward <= 0:
-                        try:
-                            from globals import TessellationRewardSchedule as _TRS_rh
-                            _rr_reward = _TRS_rh.get_miner_reward_qtcl(_rr["height"])
-                            if _rr["height"] == 1:
-                                _rr_reward += _TRS_rh.get_miner_reward_qtcl(0)
-                            # Patch the SQLite row so future rehydrates are correct
-                            self._db.execute(
-                                "UPDATE client_blocks SET reward_qtcl=? WHERE height=? AND (reward_qtcl IS NULL OR reward_qtcl=0)",
-                                (_rr_reward, _rr["height"])
-                            )
-                        except Exception:
-                            _rr_reward = 7.20
-                    _rehydrate_total += _rr_reward
-                    if _rr_reward > 0:
-                        self._rewarded_heights.add(_rr["height"])
-                self._total_rewards = _rehydrate_total
-                self._highest_finalized_height = max(row["height"] for row in rows)
-            # Compute balance from local UTXO mirror
-            self._balance_qtcl = self._compute_balance_from_utxos()
-            logger.info(
-                f"[CACHE-REHYDRATE] ✅ {len(rows)} blocks rehydrated, "
-                f"finalized={self._finalized_count}, total_rewards={self._total_rewards:.2f} QTCL, "
-                f"balance={self._balance_qtcl:.8f} QTCL"
-            )
-            # Evict rehydrated finalized blocks immediately — already in SQLite
-            # They remain counted via _finalized_count (fixed above)
-            self._evict_old()
-        except Exception as _rh_err:
-            logger.debug(f"[CACHE-REHYDRATE] {_rh_err}")
-
-    def _compute_balance_from_utxos(self) -> float:
-        """Sum unspent outputs from client_utxos mirror.
-
-        TRUST MODEL:  This is a LOCAL DISPLAY VALUE ONLY.
-        The server NEVER trusts this number.  Every transaction submit
-        is validated against the server's own UTXO set (address_utxos).
-        A rogue miner editing client_utxos gains nothing because:
-          1. _rehydrate() purges all local state if server chain height
-             is lower than local max (genesis reset detection).
-          2. _sync_utxos_from_server() DELETE-wipes any UTXO not in
-             the server's canonical response (including 0-UTXO resets).
-          3. Transaction submission validates balance server-side in
-             _settle_utxo_block() and the mempool's Python-side check.
-          4. The "never overwrite higher balance" guard is REMOVED —
-             balance always tracks server truth.
-        """
-        if self._db is None:
-            return 0.0
-        try:
-            row = self._db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM client_utxos WHERE spent = 0"
-            ).fetchone()
-            total_base = int(row[0]) if row and row[0] else 0
-            return total_base / 100.0
-        except Exception:
-            return 0.0
-
-    def _persist_block_finalized(self, height: int, block: CachedBlock):
-        """Persist a finalized block to client_blocks."""
-        if self._db is None:
-            return
-        try:
-            self._db.execute(
-                "INSERT OR REPLACE INTO client_blocks "
-                "(height, block_hash, parent_hash, miner_address, reward_qtcl, oracle_count, finalized, finalized_at, nonce, difficulty) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (height, block.block_hash, block.parent_hash, block.miner_address,
-                 block.reward_qtcl, block.oracle_count, 1, int(block.finalized_at),
-                 getattr(block, "nonce", 0), getattr(block, "difficulty", 5))
-            )
-        except Exception as _pe:
-            logger.debug(f"[CACHE-PERSIST] block h={height}: {_pe}")
-
-    def _persist_reward(self, height: int, reward_qtcl: float, recipient: str, reward_type: str = "miner"):
-        """Persist a reward entry to client_rewards."""
-        if self._db is None:
-            return
-        try:
-            self._db.execute(
-                "INSERT OR IGNORE INTO client_rewards (block_height, reward_type, amount_qtcl, recipient) VALUES (?,?,?,?)",
-                (height, reward_type, reward_qtcl, recipient)
-            )
-        except Exception as _pe:
-            logger.debug(f"[CACHE-PERSIST] reward h={height}: {_pe}")
-
-    def _sync_utxos_from_server(self, kapi, address: str):
-        """Query server UTXOs and mirror locally in client_utxos.
-
-        SERVER IS THE SINGLE SOURCE OF TRUTH.  The local client_utxos table
-        is a read-through cache — it must never contain UTXOs the server
-        doesn't know about.  After a DB reset the server returns 0 UTXOs;
-        the local mirror must go to 0 as well.
-
-        ANTI-FORGERY:  A rogue miner cannot inflate their balance by
-        inserting fake rows into client_utxos because:
-          1. Every sync wipes UTXOs not in the server's response.
-          2. _compute_balance_from_utxos() is ONLY used for display —
-             the server re-validates balance on every transaction submit.
-          3. The "never overwrite higher balance" guard is REMOVED —
-             balance always tracks the server's authoritative UTXO set.
-        """
-        if self._db is None or not address:
-            return
-        try:
-            result = kapi._rpc("qtcl_getUTXOs", [{"address": address, "limit": 1000}], timeout=5, retries=1)
-            if result and not result.get("error"):
-                utxos = result.get("utxos", [])
-                if utxos:
-                    # Upsert server UTXOs
-                    for utxo in utxos:
-                        self._db.execute(
-                            "INSERT OR REPLACE INTO client_utxos (tx_hash, output_index, address, amount, spent, created_at_height) VALUES (?,?,?,?,?,?)",
-                            (utxo["tx_hash"], utxo["output_index"], address,
-                             int(utxo["amount"]), 0, utxo.get("created_at_height", 0))
-                        )
-                    # Purge any local UTXOs NOT in the server's canonical set
-                    tx_keys = [(u["tx_hash"], int(u["output_index"])) for u in utxos]
-                    # Delete stale rows outright (not just mark spent — they don't exist on server)
-                    local_rows = self._db.execute(
-                        "SELECT tx_hash, output_index FROM client_utxos WHERE address = ?",
-                        (address,)
-                    ).fetchall()
-                    for lr in local_rows:
-                        if (lr[0], int(lr[1])) not in tx_keys:
-                            self._db.execute(
-                                "DELETE FROM client_utxos WHERE tx_hash = ? AND output_index = ?",
-                                (lr[0], lr[1])
-                            )
-                else:
-                    # SERVER RETURNED ZERO UTXOS — wipe entire local mirror for this address.
-                    # This is the critical path after a DB reset / genesis rebuild.
-                    self._db.execute(
-                        "DELETE FROM client_utxos WHERE address = ?", (address,)
-                    )
-                    logger.info(f"[CACHE-UTXO-SYNC] Server returned 0 UTXOs for {address[:16]}… — local mirror wiped")
-
-                # Balance is authoritative from SSE balance stream — local UTXO mirror is display-only
-        except Exception as _ue:
-            logger.debug(f"[CACHE-UTXO-SYNC] {_ue}")
-
-    def enqueue_solved(self, block: CachedBlock) -> bool:
-        with self._lock:
-            existing = self._blocks.get(block.height)
-            if existing and existing.status == BlockStatus.FINALIZED:
-                return False
-            if existing and existing.status in (BlockStatus.SUBMITTED, BlockStatus.PENDING):
-                existing.status = BlockStatus.ORPHANED
-                self._hash_index.pop(existing.block_hash, None)
-            self._blocks[block.height] = block
-            self._hash_index[block.block_hash] = block.height
-            self._evict_old()
-            return True
-
-    def get_next_unsent(self) -> Optional[CachedBlock]:
-        with self._lock:
-            for h in sorted(self._blocks.keys()):
-                b = self._blocks[h]
-                if b.status == BlockStatus.SOLVED:
-                    return b
-            return None
-
-    def get_next_pending(self) -> Optional[CachedBlock]:
-        with self._lock:
-            for h in sorted(self._blocks.keys()):
-                b = self._blocks[h]
-                if b.status == BlockStatus.PENDING:
-                    return b
-            return None
-
-    def mark_submitted(self, height: int, response: dict = None):
-        with self._lock:
-            b = self._blocks.get(height)
-            if b:
-                b.status = BlockStatus.SUBMITTED
-                b.submit_attempts += 1
-                b.last_submitted_at = time.time()
-                if b.first_submitted_at == 0:
-                    b.first_submitted_at = time.time()
-                b.server_response = response
-
-    def mark_pending(self, height: int, oracle_count: int = 0, oracle_ids: list = None):
-        with self._lock:
-            b = self._blocks.get(height)
-            if b:
-                b.status = BlockStatus.PENDING
-                b.oracle_count = oracle_count
-                if oracle_ids:
-                    b.oracle_ids = oracle_ids
-
-    def mark_finalized(self, height: int, reward_qtcl: float = 0.0, recipient: str = "", oracle_count: int = 0, oracle_ids: list = None):
-        with self._lock:
-            b = self._blocks.get(height)
-            if not b:
-                # Already popped — check if previously processed
-                if height in self._finalized_heights:
-                    # Idempotent: block already finalized and evicted.
-                    # But if we now have a reward and didn't before, add it.
-                    if reward_qtcl > 0 and height not in self._rewarded_heights:
-                        self._total_rewards += reward_qtcl
-                        self._rewarded_heights.add(height)
-                    return
-                return  # unknown block, nothing to do
-
-            b.status = BlockStatus.FINALIZED
-            if not b.finalized_at:
-                b.finalized_at = time.time()
-
-            # Reward: only overwrite with a positive value (don't clobber good with 0)
-            if reward_qtcl > 0:
-                b.reward_qtcl = reward_qtcl
-            if oracle_count > 0:
-                b.oracle_count = max(b.oracle_count, oracle_count)
-            if oracle_ids:
-                b.oracle_ids = oracle_ids
-
-            self._persist_block_finalized(height, b)
-            if b.reward_qtcl > 0:
-                self._persist_reward(height, b.reward_qtcl, recipient or b.miner_address, "miner")
-
-            # Aggregate metrics — ONLY increment finalized_count ONCE per height
-            _first_finalize = height not in self._finalized_heights
-            if _first_finalize:
-                self._finalized_heights.add(height)
-                self._highest_finalized_height = max(self._highest_finalized_height, height)
-                self._finalized_count += 1
-
-            # Add reward to total ONCE per height (when we first get a positive reward)
-            if b.reward_qtcl > 0 and height not in self._rewarded_heights:
-                self._rewarded_heights.add(height)
-                self._total_rewards += b.reward_qtcl
-
-            # Evict from memory — block is persisted to local SQLite
-            b = self._blocks.pop(height, None)
-            if b:
-                self._hash_index.pop(b.block_hash, None)
-
-    def mark_rejected(self, height: int, error: str = ""):
-        with self._lock:
-            b = self._blocks.get(height)
-            if b:
-                b.status = BlockStatus.REJECTED
-                b.error_message = error
-
-    def update_oracle_count(self, height: int, count: int, oracle_ids: list = None):
-        # FIX BUG-5: Never mutate b.status = FINALIZED directly here.
-        # Doing so bypasses mark_finalized() which handles:
-        #   - _finalized_count increment
-        #   - _total_rewards update
-        #   - SQLite persist via _persist_block_finalized
-        #   - block pop from _blocks (so _evict_old doesn't double-count)
-        # Without that bookkeeping, finalized_count() was correct only while
-        # the block remained in _blocks (in-cache sum), then dropped when
-        # _evict_old ran — producing "0 finalized" after eviction.
-        # Route through mark_finalized for all >= 3 oracle confirmations.
-        _do_finalize = False
-        with self._lock:
-            b = self._blocks.get(height)
-            if b:
-                b.oracle_count = max(b.oracle_count, count)
-                if oracle_ids:
-                    b.oracle_ids = oracle_ids
-                if count >= 3 and b.status not in (BlockStatus.FINALIZED, BlockStatus.REJECTED):
-                    _do_finalize = True
-        if _do_finalize:
-            # Call mark_finalized outside the lock (it acquires its own lock)
-            # reward_qtcl=0 here — caller (oracle_task) will recover from getBlockStatus
-            self.mark_finalized(height, reward_qtcl=0.0, oracle_count=count, oracle_ids=oracle_ids or [])
-
-    def update_from_sse(self, event: dict):
-        # ─────────────────────────────────────────────────────────────────────
-        # FIX v5.0: Three bugs eliminated here.
-        #
-        # BUG-A: "if not b: return" — after mark_finalized() we called
-        #   _blocks.pop() immediately (below), so ANY subsequent SSE event for
-        #   that height — including a reconnect replay of the very same
-        #   block_finalized event — hit a missing key and silently returned.
-        #   The display then showed the block as PENDING forever because nothing
-        #   incremented _finalized_count for it.  FIX: if block is absent from
-        #   _blocks but height ≤ _highest_finalized_height, the work is already
-        #   done — just return cleanly.  If height > _highest_finalized_height
-        #   and the SSE says finalized=True, synthesise a minimal record so the
-        #   counters stay correct on reconnect replays.
-        #
-        # BUG-B: _blocks.pop() inside update_from_sse — eviction is _evict_old's
-        #   exclusive job.  Premature eviction here meant snapshot() iterated an
-        #   empty dict for that height and printed "0 finalized, 2 pending".
-        #   FIX: never pop inside SSE handler; let _evict_old do it on next tick.
-        #
-        # BUG-C: oracle_count from SSE server response is authoritative 5 (server
-        #   writes oracle_count=5 unconditionally on finalize).  The old
-        #   "if oracle_count >= b.oracle_count" guard would leave oracle_count=0
-        #   if the submit response had oracle_count=0 and the SSE fired with 5.
-        #   FIX: always accept whichever is higher, no direction restriction.
-        # ─────────────────────────────────────────────────────────────────────
-        evt_type = event.get("event_type", "")
-        h = int(event.get("height", 0))
-        if h <= 0:
-            return
-        oracle_count = int(event.get("oracle_count", len(event.get("oracle_ids", []))))
-        oracle_ids   = event.get("oracle_ids", [])
-        is_finalized_evt = (
-            evt_type == "block_finalized"
-            or event.get("finalized", False) is True
-            or (evt_type == "block_pending" and oracle_count >= 3)
-        )
-
-        with self._lock:
-            b = self._blocks.get(h)
-
-            # BUG-A FIX: block already evicted (previously finalized) — handle
-            # idempotently so reconnect replays don't corrupt counters.
-            if not b:
-                if h in self._finalized_heights:
-                    # Already known-finalized — event is a stale replay, ignore.
-                    return
-                if is_finalized_evt:
-                    # Server says finalized but we have no local record for this
-                    # height — can happen if SSE fires before submit_task() runs
-                    # (extreme race) or after a client restart.  Synthesise a
-                    # minimal finalized record so finalized_count() is correct.
-                    _synth = CachedBlock(
-                        height=h,
-                        block_hash=event.get("block_hash", ""),
-                        parent_hash="",
-                        nonce=0,
-                        timestamp=int(time.time()),
-                        difficulty=5,
-                        miner_address=event.get("miner_address", ""),
-                        status=BlockStatus.FINALIZED,
-                    )
-                    _synth.finalized_at = time.time()
-                    _synth.oracle_count = max(oracle_count, 5)
-                    _synth.oracle_ids   = oracle_ids or ["oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"]
-                    self._blocks[h]     = _synth
-                    self._hash_index[_synth.block_hash] = h
-                    self._highest_finalized_height = max(self._highest_finalized_height, h)
-                    self._finalized_heights.add(h)
-                    self._finalized_count += 1
-                    self._persist_block_finalized(h, _synth)
-                # Either handled above or not our block at all — done.
-                return
-
-            _was_finalized = (b.status == BlockStatus.FINALIZED)
-
-            if evt_type == "block_finalized" or (is_finalized_evt and not _was_finalized):
-                b.status = BlockStatus.FINALIZED
-                if not b.finalized_at:
-                    b.finalized_at = time.time()
-                # BUG-C FIX: always take the maximum oracle count, no direction guard
-                b.oracle_count = max(b.oracle_count, oracle_count, 5 if is_finalized_evt else 0)
-                if oracle_ids:
-                    b.oracle_ids = oracle_ids
-                if h not in self._finalized_heights:
-                    self._finalized_heights.add(h)
-                    self._highest_finalized_height = max(self._highest_finalized_height, h)
-                    self._finalized_count += 1
-                    self._persist_block_finalized(h, b)
-                # BUG-B FIX: DO NOT pop from _blocks here.
-                # _evict_old() runs every loop tick and will evict FINALIZED
-                # blocks after EVICT_AFTER_S.  Popping here caused the display
-                # to lose the block before snapshot() could render it FINALIZED.
-
-            elif evt_type == "block_pending":
-                # Only update count upward; never downgrade
-                if oracle_count > b.oracle_count:
-                    b.oracle_count = oracle_count
-                    if oracle_ids:
-                        b.oracle_ids = oracle_ids
-                # Promote to FINALIZED if threshold reached (3-of-5 BFT)
-                if oracle_count >= 3 and b.status != BlockStatus.FINALIZED:
-                    b.status = BlockStatus.FINALIZED
-                    if not b.finalized_at:
-                        b.finalized_at = time.time()
-                    b.oracle_count = max(b.oracle_count, oracle_count)
-                    if h not in self._finalized_heights:
-                        self._finalized_heights.add(h)
-                        self._highest_finalized_height = max(self._highest_finalized_height, h)
-                        self._finalized_count += 1
-                        self._persist_block_finalized(h, b)
-                    # BUG-B FIX: no pop here either
-
-            elif evt_type == "oracle_attestation":
-                b.oracle_count = max(b.oracle_count, oracle_count)
-
-    def is_height_finalized(self, height: int) -> bool:
-        with self._lock:
-            if height <= self._highest_finalized_height:
-                return True
-            b = self._blocks.get(height)
-            return b is not None and b.status == BlockStatus.FINALIZED
-
-    def is_height_in_flight(self, height: int) -> bool:
-        with self._lock:
-            b = self._blocks.get(height)
-            return b is not None and b.status in (
-                BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING
-            )
-
-    def pending_count(self) -> int:
-        with self._lock:
-            return sum(1 for b in self._blocks.values()
-                       if b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED, BlockStatus.PENDING))
-
-    def finalized_count(self) -> int:
-        with self._lock:
-            # FIX BUG-12: _finalized_count is now authoritative — set from DB on
-            # rehydrate and incremented on every mark_finalized() call.
-            # The old "+ sum(FINALIZED in _blocks)" caused double-counting after
-            # _rehydrate set _finalized_count AND left blocks in _blocks.
-            return self._finalized_count
-
-    def total_rewards(self) -> float:
-        with self._lock:
-            # FIX BUG-12: Same as finalized_count — _total_rewards is authoritative.
-            return self._total_rewards
-
-    def get_chain_tip(self) -> int:
-        return self._highest_finalized_height
-
-    def get_block(self, height: int) -> Optional[CachedBlock]:
-        with self._lock:
-            return self._blocks.get(height)
-
-    def get_by_hash(self, block_hash: str) -> Optional[CachedBlock]:
-        with self._lock:
-            h = self._hash_index.get(block_hash)
-            return self._blocks.get(h) if h is not None else None
-
-    def clear_at_height(self, height: int):
-        with self._lock:
-            b = self._blocks.pop(height, None)
-            if b:
-                self._hash_index.pop(b.block_hash, None)
-
-    def _evict_old(self):
-        # ─────────────────────────────────────────────────────────────────────
-        # FIX v5.0: PENDING block TTL eviction was silently dropping blocks that
-        # the server had already finalized.  The client never polled
-        # qtcl_getBlockStatus, so after 270s the block vanished from _blocks
-        # without incrementing _finalized_count — the display counter stayed at
-        # "2 pending, 0 finalized" forever.
-        #
-        # New policy: PENDING and SUBMITTED blocks past TTL are marked ORPHANED
-        # (display shows them briefly), not silently removed.  The oracle_task()
-        # coroutine polls getBlockStatus and will promote them to FINALIZED if
-        # the server confirms finalization.
-        #
-        # FIX BUG-3: SUBMITTED blocks were not being caught here at all —
-        # only PENDING was checked. A block stuck in SUBMITTED for > 270s
-        # (e.g. oracle_task failing to poll) would never be resolved.
-        #
-        # FINALIZED/REJECTED/ORPHANED blocks: evict after EVICT_AFTER_S so
-        # the display shows them long enough to be read.
-        # ─────────────────────────────────────────────────────────────────────
-        now = time.time()
-        evict = []
-        for h, b in self._blocks.items():
-            if b.status in (BlockStatus.FINALIZED, BlockStatus.REJECTED, BlockStatus.ORPHANED):
-                ref_ts = max(
-                    b.finalized_at or 0.0,
-                    b.last_submitted_at or 0.0,
-                    b.first_submitted_at or 0.0,
-                )
-                if self.EVICT_AFTER_S > 0 and ref_ts > 0 and (now - ref_ts) > self.EVICT_AFTER_S:
-                    evict.append(h)
-            elif b.status in (BlockStatus.PENDING, BlockStatus.SUBMITTED):
-                # FIX BUG-3: catch both PENDING and SUBMITTED for TTL eviction
-                _block_ttl = 270.0
-                _ref = b.first_submitted_at or b.last_submitted_at or 0.0
-                if _ref and (now - _ref) > _block_ttl:
-                    # Don't silently drop — mark ORPHANED so oracle_task
-                    # can poll the server and promote to FINALIZED if appropriate.
-                    # Silent eviction was the reason "2 pending" stuck forever.
-                    b.status = BlockStatus.ORPHANED
-                    _EXP_LOG.warning(
-                        f"[CACHE] ⚠️  h={h} {b.status.name} TTL exceeded after {int(now - _ref)}s "
-                        f"— marked ORPHANED (oracle_task will reconcile from server)"
-                    )
-        for h in evict:
-            b = self._blocks.pop(h, None)
-            if b:
-                self._hash_index.pop(b.block_hash, None)
-        while len(self._blocks) > self.MAX_SIZE:
-            oldest_h, oldest_b = self._blocks.popitem(last=False)
-            self._hash_index.pop(oldest_b.block_hash, None)
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            _submitted = sum(1 for b in self._blocks.values() if b.status == BlockStatus.SUBMITTED)
-            _pending   = sum(1 for b in self._blocks.values() if b.status == BlockStatus.PENDING)
-            return {
-                "total": len(self._blocks),
-                "solved": sum(1 for b in self._blocks.values() if b.status == BlockStatus.SOLVED),
-                "submitted": _submitted,
-                "pending": _pending,
-                # FIX BUG-8: "pending_display" combines SUBMITTED+PENDING for the
-                # "X pending" line in the dashboard. A block stuck in SUBMITTED is
-                # waiting for oracle consensus exactly like a PENDING block —
-                # showing "0 pending" when we have a SUBMITTED block is misleading.
-                "pending_display": _submitted + _pending,
-                "finalized": self.finalized_count(),
-                "rejected": sum(1 for b in self._blocks.values() if b.status == BlockStatus.REJECTED),
-                "orphaned": sum(1 for b in self._blocks.values() if b.status == BlockStatus.ORPHANED),
-                "tip": self.get_chain_tip(),
-                "total_rewards": self.total_rewards(),
-                "blocks": {
-                    h: {"hash": b.block_hash[:16], "status": b.status.name,
-                        "oracles": f"{b.oracle_count}/5", "attempts": b.submit_attempts}
-                    for h, b in sorted(self._blocks.items())
-                },
-            }
-
-
-
-
-def _render_block_slip(block, cache_snap: dict, balance_qtcl: float, p2p_status: str = "") -> str:
-    """Render a single, consolidated block display."""
-    STATUS_ICONS = {
-        BlockStatus.SOLVED: "✅ BLOCK SOLVED",
-        BlockStatus.SUBMITTED: "📡 SUBMITTED",
-        BlockStatus.PENDING: "⏳ PENDING (oracle consensus)",
-        BlockStatus.FINALIZED: "🔥 FINALIZED",
-        BlockStatus.REJECTED: "❌ REJECTED",
-        BlockStatus.ORPHANED: "👻 ORPHANED",
-    }
-    lines = []
-    lines.append("─" * 72)
-    _ago = _fmt_ago(block.timestamp) if hasattr(block, "timestamp") and block.timestamp else "?"
-    _st = getattr(block, "status", BlockStatus.SOLVED)
-    lines.append(f"  {STATUS_ICONS.get(_st, '?')}  h={block.height}  ({_ago})")
-    lines.append("─" * 72)
-    lines.append(f"  nonce   : {block.nonce:,}{'':>20}diff : {block.difficulty} leading-zeros")
-    lines.append(f"  hash    : {block.block_hash[:48]}…")
-    lines.append(f"  parent  : {block.parent_hash[:48]}…")
-    sig = getattr(block, "signature", None)
-    if sig:
-        sig_str = str(sig)[:80]
-        lines.append(f"  ── Miner Signature (HypΓ SchnorrΓ) ──")
-        lines.append(f"  sig     : {sig_str}…")
-    pq = getattr(block, "submit_payload", {}) or {}
-    lines.append(f"  ── Quantum Attestation ──")
-    lines.append(f"  pq_curr : {pq.get('pq_curr', '?')}   pq_last: {pq.get('pq_last', '?')}")
-    lines.append(f"  W-fid   : {pq.get('w_state_fidelity', 0):.4f}")
-    lines.append(f"  ── Oracle Consensus ──")
-    _fin = "✅ FINALIZED" if _st == BlockStatus.FINALIZED else "⏳ waiting…"
-    lines.append(f"  oracles : {block.oracle_count}/5  {_fin}")
-    if getattr(block, "reward_qtcl", 0) > 0:
-        lines.append(f"  reward  : +{block.reward_qtcl:.2f} QTCL")
-    lines.append("─" * 72)
-    if p2p_status:
-        lines.append(f"  {p2p_status}")
-    lines.append(f"  Blocks  : {cache_snap.get('finalized', 0)} finalized, {cache_snap.get('pending_display', cache_snap.get('pending', 0))} pending, {cache_snap.get('rejected', 0)} rejected")
-    lines.append(f"  Rewards : {cache_snap.get('total_rewards', 0):.2f} QTCL")
-    lines.append(f"  Balance : {balance_qtcl:.8f} QTCL")
-    lines.append("─" * 72)
-    return "\n".join(lines)
-
-def _fmt_ago(timestamp: float) -> str:
-    """Format a timestamp as 'Xs ago' or 'Xm ago'."""
-    if not timestamp:
-        return "?"
-    delta = time.time() - timestamp
-    if delta < 60:
-        return f"{int(delta)}s ago"
-    elif delta < 3600:
-        return f"{int(delta / 60)}m ago"
-    else:
-        return f"{int(delta / 3600)}h ago"
-
-
-async def _refresh_balance_on_finalize(wallet_addr: str, kapi, cache: BlockSubmissionCache,
-                                       pre_balance: float = None):
-    """Balance poll after block finalization — returns updated balance, NO cache side-effects.
-    Balance is authoritative from SSE balance stream; this is read-only verification.
-    """
-    _pre_balance = pre_balance if pre_balance is not None else cache._balance_qtcl
-    await _asyncio.sleep(0.5)
-    _loop = _asyncio.get_event_loop()
-    for attempt in range(40):
-        try:
-            result = await _loop.run_in_executor(
-                None, lambda: kapi._rpc("qtcl_getBalance", [wallet_addr], timeout=10, retries=2))
-            if result and not result.get("error"):
-                balance_qtcl = float(result.get("balance", 0))
-                if balance_qtcl > _pre_balance:
-                    logger.info(
-                        f"[BALANCE] ✅ Settled: {_pre_balance:.2f} → {balance_qtcl:.8f} QTCL "
-                        f"(+{balance_qtcl - _pre_balance:.2f}, attempt {attempt+1})"
-                    )
-                    return balance_qtcl
-            if attempt < 10:
-                await _asyncio.sleep(1.0)
-            elif attempt < 20:
-                await _asyncio.sleep(2.0)
-            elif attempt < 30:
-                await _asyncio.sleep(4.0)
-            else:
-                await _asyncio.sleep(8.0)
-        except Exception:
-            await _asyncio.sleep(2.0)
-    try:
-        result = await _loop.run_in_executor(
-            None, lambda: kapi._rpc("qtcl_getBalance",
-                                    [{"address": wallet_addr, "force_refresh": True}],
-                                    timeout=10, retries=1))
-        if result and not result.get("error"):
-            balance_qtcl = float(result.get("balance", 0))
-            if balance_qtcl > 0:
-                logger.info(f"[BALANCE] Final forced read: {balance_qtcl:.8f} QTCL")
-            return balance_qtcl
-    except Exception:
-        pass
-    return None
-
-
-_SCHEMA_VALIDATED = threading.Event()
-_SCHEMA_LOCK = threading.Lock()
-
-class SQLiteConnectionPool:
-    """Thread-safe SQLite connection pool with WAL mode.
-
-    SQLite is fundamentally single-writer; WAL mode allows concurrent readers
-    while one writer proceeds.  We keep a pool of connections so that readers
-    never block behind a long-running writer.
-    """
-
-    def __init__(self, db_path: Path, min_conn: int = 2, max_conn: int = 8):
-        import sqlite3
-        self._db_path = str(db_path)
-        self._min_conn = min_conn
-        self._max_conn = max_conn
-        self._pool = queue.Queue(maxsize=max_conn)
-        self._lock = threading.Lock()
-        self._created = 0
-        self._in_use = 0
-        self._shutdown = False
-
-        # Bootstrap the pool with WAL-enabled connections
-        for _ in range(min_conn):
-            conn = self._new_conn()
-            self._pool.put(conn)
-            self._created += 1
-
-    def _new_conn(self):
-        import sqlite3
-        conn = sqlite3.connect(
-            self._db_path,
-            check_same_thread=False,
-            timeout=30,
-            isolation_level=None,  # we manage tx manually for speed
-        )
-        conn.row_factory = sqlite3.Row
-        # WAL mode is idempotent — safe to run on every checkout
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-64000")  # 64 MB page cache
-        conn.execute("PRAGMA mmap_size=268435456")  # 256 MB mmap
-        return conn
-
-    def get(self, timeout: float = 10.0):
-        if self._shutdown:
-            raise RuntimeError("Pool is shut down")
-        try:
-            conn = self._pool.get(timeout=timeout)
-        except queue.Empty:
-            with self._lock:
-                if self._created < self._max_conn:
-                    conn = self._new_conn()
-                    self._created += 1
-                else:
-                    raise RuntimeError("SQLite connection pool exhausted")
-        with self._lock:
-            self._in_use += 1
-        return conn
-
-    def put(self, conn):
-        with self._lock:
-            self._in_use -= 1
-        if self._shutdown:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return
-        try:
-            # Reset any leftover transaction state before returning
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            self._pool.put_nowait(conn)
-        except queue.Full:
-            conn.close()
-            with self._lock:
-                self._created -= 1
-
-    def close_all(self):
-        self._shutdown = True
-        while not self._pool.empty():
-            try:
-                conn = self._pool.get_nowait()
-                conn.close()
-            except Exception:
-                pass
-
-    @property
-    def stats(self) -> dict:
-        with self._lock:
-            return {
-                "created": self._created,
-                "in_use": self._in_use,
-                "available": self._pool.qsize(),
-                "max": self._max_conn,
-            }
-
-
 class LocalBlockchainDB:
     """Local SQLite blockchain database - replaces psycopg version
 
     Maintains 100% interface compatibility with original while using SQLite instead of PostgreSQL.
-    Uses a connection pool (WAL mode) for concurrent read/write safety at scale.
+    All methods from original are preserved and re-implemented using SQLite.
     """
 
     def __init__(
@@ -8564,7 +6926,7 @@ class LocalBlockchainDB:
         min_size: int = 10,
         max_size: int = 20,
         pool_min: int = 2,
-        pool_max: int = 8,
+        pool_max: int = 10,
         **kwargs,
     ):
         """Initialize SQLite database with full parameter compatibility
@@ -8596,30 +6958,21 @@ class LocalBlockchainDB:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = _DB_PATH
 
-        # Legacy single conn kept for code that directly accesses self.conn
         self.conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, timeout=10
         )
         self.conn.row_factory = sqlite3.Row
-        # Enable WAL on the legacy connection too
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-
-        self._pool = SQLiteConnectionPool(self.db_path, pool_min, pool_max)
-        self._lock = threading.RLock()
+        self._pool = None
 
         self._init_pool()
         # Validate schema against qtcl_db_builder.py (single source of truth)
-        # Schema validation: ONCE per process lifetime
-        if not _SCHEMA_VALIDATED.is_set():
-            with _SCHEMA_LOCK:
-                if not _SCHEMA_VALIDATED.is_set():
-                    if not _validate_and_init_schema(self.db_path):
-                        raise RuntimeError(f"Database schema validation failed for {self.db_path}")
-                    self._migrate_schema()
-                    _SCHEMA_VALIDATED.set()
+        if not _validate_and_init_schema(self.db_path):
+            raise RuntimeError(f"Database schema validation failed for {self.db_path}")
 
-        logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path} (pool={pool_min}-{pool_max})")
+        # Apply idempotent schema migrations (add missing columns to existing tables)
+        self._migrate_schema()
+
+        logging.debug(f"LocalBlockchainDB initialized: {self.name} at {self.db_path}")
 
     def _migrate_schema(self):
         """Idempotent schema migrations — add missing columns to pre-existing tables.
@@ -8701,147 +7054,22 @@ class LocalBlockchainDB:
                 " created_at INTEGER DEFAULT (strftime('%s','now'))"
                 ")"
             )
-            # oracle_attestations — local mirror of mesh attestations
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS oracle_attestations ("
-                " block_height INTEGER NOT NULL,"
-                " oracle_id TEXT NOT NULL,"
-                " oracle_address TEXT NOT NULL DEFAULT '',"
-                " block_hash TEXT NOT NULL DEFAULT '',"
-                " header_hash TEXT NOT NULL DEFAULT '',"
-                " attestation_signature TEXT NOT NULL DEFAULT '',"
-                " w_state_fidelity REAL DEFAULT 0.0,"
-                " attestation_timestamp INTEGER DEFAULT 0,"
-                " received_at REAL DEFAULT (strftime('%s','now')),"
-                " is_local INTEGER DEFAULT 0,"
-                " PRIMARY KEY (block_height, oracle_id)"
-                " )"
-            )
-            # pending_blocks — local queue of blocks awaiting consensus
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS pending_blocks ("
-                " height INTEGER PRIMARY KEY,"
-                " block_hash TEXT NOT NULL,"
-                " parent_hash TEXT NOT NULL,"
-                " miner_address TEXT NOT NULL,"
-                " nonce INTEGER DEFAULT 0,"
-                " difficulty INTEGER DEFAULT 5,"
-                " timestamp INTEGER DEFAULT 0,"
-                " submit_payload TEXT NOT NULL DEFAULT '',"
-                " status TEXT DEFAULT 'pending',"
-                " oracle_count INTEGER DEFAULT 0,"
-                " created_at REAL DEFAULT (strftime('%s','now')),"
-                " finalized_at REAL"
-                " )"
-            )
-            # peer_blocks — blocks received from P2P mesh
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS peer_blocks ("
-                " height INTEGER NOT NULL,"
-                " block_hash TEXT NOT NULL,"
-                " peer_node_id TEXT NOT NULL,"
-                " received_at REAL DEFAULT (strftime('%s','now')),"
-                " PRIMARY KEY (height, peer_node_id)"
-                " )"
-            )
-            # ═══════════════════════════════════════════════════════════════════════
-            # CLIENT-SIDE MIRROR TABLES  (rehydrate cache + distributed sensor mesh)
-            # ═══════════════════════════════════════════════════════════════════════
-            # finalized blocks mined by this client
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS client_blocks ("
-                " height INTEGER PRIMARY KEY,"
-                " block_hash TEXT NOT NULL,"
-                " parent_hash TEXT NOT NULL DEFAULT '',"
-                " miner_address TEXT NOT NULL DEFAULT '',"
-                " reward_qtcl REAL DEFAULT 0.0,"
-                " tx_count INTEGER DEFAULT 0,"
-                " oracle_count INTEGER DEFAULT 0,"
-                " finalized INTEGER DEFAULT 1,"
-                " finalized_at INTEGER DEFAULT 0,"
-                " nonce INTEGER DEFAULT 0,"
-                " difficulty INTEGER DEFAULT 5,"
-                " created_at INTEGER DEFAULT (strftime('%s','now'))"
-                " )"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_client_blocks_miner ON client_blocks(miner_address)"
-            )
-            # Migrate existing DBs: add columns if missing
-            for _col, _dtype in [("nonce", "INTEGER DEFAULT 0"), ("difficulty", "INTEGER DEFAULT 5")]:
-                try:
-                    self.conn.execute(f"ALTER TABLE client_blocks ADD COLUMN {_col} {_dtype}")
-                except Exception:
-                    pass  # already exists
-            # UTXO mirror — Bitcoin-style unspent output set
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS client_utxos ("
-                " tx_hash TEXT NOT NULL,"
-                " output_index INTEGER NOT NULL,"
-                " address TEXT NOT NULL,"
-                " amount INTEGER NOT NULL,"
-                " spent INTEGER DEFAULT 0,"
-                " spent_at_height INTEGER,"
-                " spent_in_tx_hash TEXT,"
-                " created_at_height INTEGER,"
-                " created_at INTEGER DEFAULT (strftime('%s','now')),"
-                " PRIMARY KEY (tx_hash, output_index)"
-                " )"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_client_utxos_addr_spent ON client_utxos(address, spent)"
-            )
-            # reward history
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS client_rewards ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " block_height INTEGER NOT NULL,"
-                " reward_type TEXT NOT NULL DEFAULT 'miner',"
-                " amount_qtcl REAL NOT NULL,"
-                " recipient TEXT NOT NULL,"
-                " claimed INTEGER DEFAULT 0,"
-                " created_at INTEGER DEFAULT (strftime('%s','now'))"
-                " )"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_client_rewards_recipient ON client_rewards(recipient)"
-            )
-            # quantum density matrix snapshots (distributed sensor mesh repository)
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS quantum_density ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " source TEXT NOT NULL DEFAULT 'server',"
-                " density_matrix_hex TEXT,"
-                " fidelity REAL DEFAULT 0.0,"
-                " coherence REAL DEFAULT 0.0,"
-                " block_height INTEGER,"
-                " timestamp INTEGER DEFAULT (strftime('%s','now')),"
-                " metadata TEXT DEFAULT '{}'"
-                " )"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_quantum_density_ts ON quantum_density(timestamp)"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_quantum_density_source ON quantum_density(source)"
-            )
             self.conn.commit()
-            logging.info("[SCHEMA] ✅ migrations applied (oracle mesh + client mirror tables)")
+            logging.info("[SCHEMA] ✅ migrations applied")
         except Exception as _me:
             logging.warning(f"[SCHEMA] migration error: {_me}")
 
     def _init_pool(self):
-        """Pool already created in __init__; kept for interface compatibility."""
+        """Initialize connection pool (no-op for SQLite, kept for interface compatibility)"""
         pass
 
     def _teardown_pool(self):
-        """Close all pooled connections."""
-        if self._pool:
-            self._pool.close_all()
+        """Teardown pool (no-op for SQLite, kept for interface compatibility)"""
+        pass
 
     def _get_conn(self):
-        """Get a pooled database connection (checkout)."""
-        return self._pool.get(timeout=10.0)
+        """Get database connection"""
+        return self.conn
 
     def create_tables(self):
         """DEPRECATED: Schema creation now handled by _validate_and_init_schema() which uses qtcl_db_builder.py.
@@ -8851,61 +7079,46 @@ class LocalBlockchainDB:
     # ========= Interface-compatible query methods =========
 
     def execute(self, query: str, params=None):
-        """Execute SQL query using pooled connection (thread-safe via RLock)."""
-        with self._lock:
-            conn = self._pool.get(timeout=10.0)
-            try:
-                cursor = conn.cursor()
-                if params:
-                    cursor.execute(query, params)
-                else:
-                    cursor.execute(query)
-                conn.commit()
-                return cursor
-            except Exception as e:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                _emsg = str(e)
-                # Silence expected schema-not-yet-created noise at DEBUG level
-                if "no such table" in _emsg or "no such column" in _emsg:
-                    logging.debug(f"DB execute (schema not ready): {e}")
-                else:
-                    logging.error(f"DB execute error: {e}")
-                raise
-            finally:
-                self._pool.put(conn)
+        """Execute SQL query"""
+        cursor = self.conn.cursor()
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            self.conn.commit()
+            return cursor
+        except Exception as e:
+            self.conn.rollback()
+            _emsg = str(e)
+            # Silence expected schema-not-yet-created noise at DEBUG level
+            if "no such table" in _emsg or "no such column" in _emsg:
+                logging.debug(f"DB execute (schema not ready): {e}")
+            else:
+                logging.error(f"DB execute error: {e}")
+            raise
 
     def run_query(self, query: str, params=None):
         """Run query (alias for execute)"""
         return self.execute(query, params)
 
     def fetchone(self, query: str, params=None):
-        """Fetch one row using pooled connection (thread-safe)."""
-        conn = self._pool.get(timeout=10.0)
-        try:
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            return cursor.fetchone()
-        finally:
-            self._pool.put(conn)
+        """Fetch one row"""
+        cursor = self.conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return cursor.fetchone()
 
     def fetchall(self, query: str, params=None):
-        """Fetch all rows using pooled connection (thread-safe)."""
-        conn = self._pool.get(timeout=10.0)
-        try:
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            return cursor.fetchall()
-        finally:
-            self._pool.put(conn)
+        """Fetch all rows"""
+        cursor = self.conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return cursor.fetchall()
 
     # ========= Block operations =========
 
@@ -9450,7 +7663,7 @@ class LocalBlockchainDB:
             ("parent_hash", "TEXT    DEFAULT ''"),
             ("timestamp", "INTEGER DEFAULT 0"),
             ("nonce", "INTEGER DEFAULT 0"),
-            ("difficulty", "REAL    DEFAULT 5.0"),
+            ("difficulty", "REAL    DEFAULT 4.0"),
             ("miner_address", "TEXT    DEFAULT ''"),
             ("pq_curr", "INTEGER DEFAULT 0"),
             ("pq_last", "INTEGER DEFAULT 0"),
@@ -9756,7 +7969,7 @@ class LocalBlockchainDB:
                             parent,
                             int(blk.get("timestamp_s") or blk.get("timestamp", 0)),
                             int(blk.get("nonce", 0)),
-                            int(blk.get("difficulty_bits") or blk.get("difficulty", 5)),
+                            int(blk.get("difficulty_bits") or blk.get("difficulty", 4)),
                             str(blk.get("miner_address", "")),
                             int(blk.get("pq_curr", h)),
                             int(blk.get("pq_last", max(0, h - 1))),
@@ -9920,78 +8133,6 @@ class LocalBlockchainDB:
             return balance_qtcl
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # DISTRIBUTED SENSOR MESH — serve local quantum data to peers
-    # ═══════════════════════════════════════════════════════════════════════════════
-    def get_latest_density_snapshot(self) -> Optional[dict]:
-        """Return the most recent density matrix from quantum_density table."""
-        try:
-            row = self.conn.execute(
-                "SELECT * FROM quantum_density ORDER BY timestamp DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                return dict(row)
-        except Exception:
-            pass
-        return None
-
-    def get_density_history(self, limit: int = 32) -> list:
-        """Return recent density matrix snapshots for mesh distribution."""
-        try:
-            rows = self.conn.execute(
-                "SELECT * FROM quantum_density ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-
-    def get_local_finalized_blocks(self, limit: int = 100) -> list:
-        """Return finalized blocks mined by this node."""
-        try:
-            rows = self.conn.execute(
-                "SELECT * FROM client_blocks ORDER BY height DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-
-    def get_local_utxos(self, address: str = "", unspent_only: bool = True) -> list:
-        """Return UTXO mirror for mesh consensus / balance proofs."""
-        try:
-            if address:
-                sql = "SELECT * FROM client_utxos WHERE address = ?"
-                params = (address,)
-                if unspent_only:
-                    sql += " AND spent = 0"
-            else:
-                sql = "SELECT * FROM client_utxos"
-                params = ()
-                if unspent_only:
-                    sql += " WHERE spent = 0"
-            sql += " ORDER BY created_at_height ASC"
-            rows = self.conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-
-    def get_local_rewards(self, recipient: str = "") -> list:
-        """Return reward history for this node."""
-        try:
-            if recipient:
-                rows = self.conn.execute(
-                    "SELECT * FROM client_rewards WHERE recipient = ? ORDER BY block_height DESC",
-                    (recipient,),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    "SELECT * FROM client_rewards ORDER BY block_height DESC"
-                ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-
 
 def compress(data: bytes) -> bytes:
     if HAS_ZSTD:
@@ -10084,7 +8225,7 @@ def _forge_and_store_genesis_block(
         "parent_hash": "0" * 64,
         "merkle_root": HASH_ENGINE.merkle_root([coinbase["tx_hash"]]),
         "timestamp": 1_700_000_000,
-        "difficulty": 5,
+        "difficulty": 4,
         "miner_id": NULL_COINBASE_ADDRESS,
         "tx_count": 1,
         "nonce": 0,
@@ -10642,7 +8783,7 @@ class SnapshotManager(ComponentBase):
                 errors.append(
                     f"Block hash mismatch: stored={stored_hash[:16]}… computed={computed[:16]}…"
                 )
-        difficulty = float(block.get("difficulty", 5.0))
+        difficulty = float(block.get("difficulty", 4.0))
         if not self._hash.verify_pow(block, difficulty):
             errors.append(f"Proof-of-work invalid for difficulty {difficulty}")
         height = block.get("height", 0)
@@ -12233,7 +10374,7 @@ class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
 
     GENESIS_HASH: str = "0" * 64
-    DEFAULT_DIFFICULTY: int = 5  # BLOCK_DIFFICULTY env var is authoritative; this is fallback only
+    DEFAULT_DIFFICULTY: int = 4  # Miner queries /rpc/config/difficulty on startup; this is fallback only
     BLOCK_REWARD: int = 800  # 8.0 QTCL total per block (miner+treasury) — depth-agnostic display constant only
     MAX_TX_PER_BLOCK: int = 500
     DEFAULT_N_QUBITS: int = 8
@@ -13617,103 +11758,11 @@ def _reconstruct_dm_from_bloch(snap: dict):
     return dm
 
 
-class CircuitBreaker:
-    """Circuit breaker for RPC calls.  Prevents cascading failures when the
-    server is down or overloaded by failing fast after a threshold of errors.
-
-    States:
-      CLOSED   – normal operation, calls pass through
-      OPEN     – failure threshold exceeded, calls fail immediately
-      HALF_OPEN – after recovery timeout, one probe call is allowed
-    """
-
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        recovery_timeout: float = 30.0,
-        half_open_max_calls: int = 3,
-    ):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_max_calls = half_open_max_calls
-        self._failures = 0
-        self._last_failure_time = 0.0
-        self._state = "CLOSED"
-        self._lock = _threading.Lock()
-        self._half_open_calls = 0
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return self._state
-
-    def call(self, fn, *args, **kwargs):
-        """Execute fn if the circuit is closed or half-open."""
-        with self._lock:
-            if self._state == "OPEN":
-                if time.time() - self._last_failure_time >= self.recovery_timeout:
-                    self._state = "HALF_OPEN"
-                    self._half_open_calls = 0
-                    _EXP_LOG.info("[CIRCUIT] 🔓 HALF_OPEN — probing server recovery")
-                else:
-                    raise RuntimeError(
-                        f"Circuit breaker OPEN ({self.recovery_timeout:.0f}s cooldown)"
-                    )
-            elif self._state == "HALF_OPEN" and self._half_open_calls >= self.half_open_max_calls:
-                raise RuntimeError("Circuit breaker HALF_OPEN — too many probe calls")
-
-            if self._state == "HALF_OPEN":
-                self._half_open_calls += 1
-
-        try:
-            result = fn(*args, **kwargs)
-            self._on_success()
-            return result
-        except Exception as e:
-            self._on_failure()
-            raise
-
-    def _on_success(self):
-        with self._lock:
-            if self._state == "HALF_OPEN":
-                self._state = "CLOSED"
-                self._failures = 0
-                self._half_open_calls = 0
-                _EXP_LOG.info("[CIRCUIT] ✅ CLOSED — server recovered")
-            elif self._state == "CLOSED" and self._failures > 0:
-                self._failures = max(0, self._failures - 1)
-
-    def _on_failure(self):
-        with self._lock:
-            self._failures += 1
-            self._last_failure_time = time.time()
-            if self._failures >= self.failure_threshold:
-                if self._state != "OPEN":
-                    self._state = "OPEN"
-                    _EXP_LOG.warning(
-                        f"[CIRCUIT] 🔴 OPEN after {self._failures} consecutive failures"
-                    )
-
-
 # ⚛️  RPC SNAPSHOT ENGINE — Enterprise Grade State Machine
+# SWARM-AGENT α: Replaces all SSE streaming with atomic RPC snapshots
+# γ-SWARM  KoyebRPCNodule  (endpoints verified vs GossipHTTPHandler)
 class KoyebRPCNodule:
     """Thread-safe JSON-RPC 2.0 client for qtcl-blockchain.koyeb.app (https/443). RPC-only, no REST."""
-
-    # ── v4.0 TX submission constants ─────────────────────────────────────────
-    # Transient server errors — safe to retry (server still booting)
-    _TX_TRANSIENT_MSGS: tuple = (
-        "initializing", "starting", "retry", "not ready",
-        "boot", "warming", "service unavailable", "503",
-    )
-    # Permanent rejections — surface immediately, never retry
-    _TX_PERMANENT_MSGS: tuple = (
-        "insufficient", "balance", "invalid_signature", "invalid_address",
-        "self_transfer", "nonce_reuse", "double_spend", "missing_field",
-        "negative_nonce", "amount_must_be_positive", "low_fee", "format",
-    )
-    _TX_MAX_RETRIES:   int   = 5
-    _TX_BASE_BACKOFF:  float = 1.2   # seconds; doubles each attempt + jitter
-    _TX_HEALTH_WAIT:   float = 15.0  # max seconds to poll /health before first attempt
 
     TIMEOUT: int = 10
 
@@ -13724,11 +11773,6 @@ class KoyebRPCNodule:
         self._lock = _threading.Lock()
         self._last_error = None
         self._health_check_cache = {"timestamp": 0, "status": False}
-        self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
-        # Idempotency keys for submission RPCs — prevents duplicate blocks/txs on retry
-        self._idempotency_cache: Dict[str, float] = {}
-        self._idempotency_lock = _threading.Lock()
-        self._idempotency_ttl = 300.0
 
     def _get_session(self):
         if self._session is None and _HAS_REQUESTS:
@@ -13737,130 +11781,21 @@ class KoyebRPCNodule:
                     self._session = _requests.Session()
         return self._session
 
-    # ── v4.0 TX helpers ───────────────────────────────────────────────────────
-
-    def _tx_is_transient(self, err_msg: str) -> bool:
-        """True when a JSON-RPC error is a transient startup condition worth retrying."""
-        m = str(err_msg).lower()
-        return any(k in m for k in self._TX_TRANSIENT_MSGS)
-
-    def _tx_is_permanent(self, err_msg: str) -> bool:
-        """True when a JSON-RPC error is a permanent business-logic rejection."""
-        m = str(err_msg).lower()
-        return any(k in m for k in self._TX_PERMANENT_MSGS)
-
-    def _tx_poll_health(self, timeout: float = None) -> bool:
-        """
-        Poll /mcp/health until ready:true or timeout.
-
-        /health is a wsgi_config stub that ALWAYS returns 200, even before the full
-        server app loads. /mcp/health returns {"ready": true/false} and is the only
-        accurate readiness signal. Falls back to /health if /mcp/health is 404.
-        """
-        import urllib.request as _ur
-        mcp_url    = f"{self.base_url}/mcp/health"
-        health_url = f"{self.base_url}/health"
-        deadline   = time.monotonic() + (timeout or self._TX_HEALTH_WAIT)
-        session    = self._get_session()
-        _mcp_available = True
-
-        while time.monotonic() < deadline:
-            try:
-                if _mcp_available:
-                    if session and _HAS_REQUESTS:
-                        r = session.get(mcp_url, timeout=3.0)
-                        if r.status_code == 200:
-                            try:
-                                data = r.json()
-                                if data.get("ready"):
-                                    return True
-                            except Exception:
-                                pass
-                        elif r.status_code == 404:
-                            _mcp_available = False
-                    else:
-                        with _ur.urlopen(mcp_url, timeout=3.0) as resp:
-                            data = json.loads(resp.read().decode("utf-8"))
-                            if data.get("ready"):
-                                return True
-                if not _mcp_available:
-                    if session and _HAS_REQUESTS:
-                        r = session.get(health_url, timeout=3.0)
-                        if r.status_code == 200:
-                            return True
-                    else:
-                        with _ur.urlopen(health_url, timeout=3.0):
-                            return True
-            except Exception:
-                pass
-            remaining = deadline - time.monotonic()
-            time.sleep(min(0.5, max(0.0, remaining)))
-        return False
-
     def _rpc(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
-        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely).
-
-        Protected by circuit breaker + jittered exponential backoff.
-        """
+        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
         import urllib.parse as _up
 
         t = timeout or self.timeout
         last_error = None
 
         params_json = _json.dumps(params or [])
-        # Use POST when params JSON is large to avoid GET URL length limits
-        _use_post = len(params_json) > 2000 or method in ("qtcl_submitTransaction", "qtcl_submitBlock")
-        if _use_post:
-            _rpc_body = _json.dumps({
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params or [],
-                "id": 1,
-            }).encode("utf-8")
-            _post_url = f"{self.base_url}/rpc"
-        
-        def _do_request():
-            if _use_post:
-                # POST with JSON body for large payloads
-                if _HAS_REQUESTS:
-                    r = self._get_session().post(
-                        _post_url, data=_rpc_body,
-                        headers={"Content-Type": "application/json"},
-                        timeout=t,
-                    )
-                    if r.status_code == 200:
-                        result = r.json()
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            return result
-                        else:
-                            raise RuntimeError(f"Malformed JSON-RPC response (no result/error): {str(result)[:120]}")
-                    else:
-                        try:
-                            result = r.json()
-                            if isinstance(result, dict) and "error" in result:
-                                return result
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"HTTP {r.status_code}")
-                else:
-                    import urllib.request as _ur
-                    req = _ur.Request(_post_url, data=_rpc_body,
-                                      headers={"Content-Type": "application/json"})
-                    with _ur.urlopen(req, timeout=t) as resp:
-                        result = _json.loads(resp.read().decode("utf-8"))
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            return result
-                        else:
-                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
-            else:
-                query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-                full_url = f"{self.base_url}/rpc?{query}"
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.base_url}/rpc?{query}"
+
+        for attempt in range(retries):
+            try:
                 if _HAS_REQUESTS:
                     r = self._get_session().get(full_url, timeout=t)
                     if r.status_code == 200:
@@ -13868,39 +11803,50 @@ class KoyebRPCNodule:
                         if "result" in result:
                             return result.get("result")
                         elif "error" in result:
+                            # Return the full error dict so callers can handle rejections
                             return result
-                        else:
-                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
                     else:
+                        # Attempt to parse error from body even on non-200
                         try:
                             result = r.json()
                             if isinstance(result, dict) and "error" in result:
                                 return result
-                        except Exception:
+                        except:
                             pass
-                        raise RuntimeError(f"HTTP {r.status_code}")
+
+                    _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
+                    last_error = f"HTTP {r.status_code}"
                 else:
                     import urllib.request as _ur
+
                     req = _ur.Request(full_url)
                     with _ur.urlopen(req, timeout=t) as resp:
                         result = _json.loads(resp.read().decode("utf-8"))
                         if "result" in result:
                             return result.get("result")
                         elif "error" in result:
+                            # Return the full error dict so callers can handle rejections
                             return result
-                        else:
-                            raise RuntimeError(f"Malformed JSON-RPC response: {str(result)[:120]}")
-
-        for attempt in range(retries):
-            try:
-                return self._circuit.call(_do_request)
             except Exception as e:
-                last_error = str(e)
+                # Check if it's an HTTP error from urllib (not defined when using requests)
+                if (
+                    "_ur" in dir()
+                    and hasattr(_ur, "HTTPError")
+                    and isinstance(e, _ur.HTTPError)
+                ):
+                    try:
+                        result = _json.loads(e.read().decode("utf-8"))
+                        if isinstance(result, dict) and "error" in result:
+                            return result
+                    except:
+                        pass
+                    last_error = f"HTTP {e.code}"
+                else:
+                    last_error = str(e)
                 if attempt < retries - 1:
-                    # Jittered exponential backoff: base * 2^attempt + random [0, 1)s
-                    backoff = (2 ** attempt) + random.random()
+                    backoff = 2**attempt
                     _EXP_LOG.debug(
-                        f"[RPC] {method} attempt {attempt + 1}/{retries} failed: {e}. Retrying in {backoff:.1f}s..."
+                        f"[RPC] {method} attempt {attempt + 1}/{retries} failed: {e}. Retrying..."
                     )
                     time.sleep(backoff)
                 else:
@@ -13908,26 +11854,6 @@ class KoyebRPCNodule:
 
         self._last_error = last_error
         return None
-
-    def _make_idempotency_key(self, method: str, params: list) -> str:
-        """Generate an idempotency key for submission RPCs."""
-        canonical = _json.dumps({"m": method, "p": params}, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha3_256(canonical.encode()).hexdigest()[:32]
-
-    def _is_idempotent_seen(self, key: str) -> bool:
-        """Check if an idempotency key was recently processed successfully."""
-        with self._idempotency_lock:
-            now = time.time()
-            # Expire old entries
-            expired = [k for k, ts in self._idempotency_cache.items() if now - ts > self._idempotency_ttl]
-            for k in expired:
-                del self._idempotency_cache[k]
-            return key in self._idempotency_cache
-
-    def _mark_idempotent_seen(self, key: str):
-        """Mark an idempotency key as successfully processed."""
-        with self._idempotency_lock:
-            self._idempotency_cache[key] = time.time()
 
     def _rpc_envelope(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
@@ -13943,52 +11869,39 @@ class KoyebRPCNodule:
         t = timeout or self.timeout
 
         if method == "qtcl_submitBlock":
-            # Idempotency: avoid duplicate submissions on retry
-            _idemp_key = self._make_idempotency_key(method, params)
-            if self._is_idempotent_seen(_idemp_key):
-                _EXP_LOG.info(f"[RPC-IDEMP] ✅ Block already submitted (key={_idemp_key[:8]}…)")
-                return {"jsonrpc": "2.0", "result": {"status": "already_accepted", "idempotency_key": _idemp_key}, "id": 1}
-
             payload = {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or [],
                 "id": 1,
-                "idempotency_key": _idemp_key,
             }
 
-            def _do_post():
-                post_url = f"{self.base_url}/rpc"
-                if _HAS_REQUESTS:
-                    r = self._get_session().post(post_url, json=payload, timeout=t)
-                    if r.status_code == 200:
-                        return r.json()
-                    raise RuntimeError(f"HTTP {r.status_code}")
-                else:
-                    data = _json.dumps(payload).encode("utf-8")
-                    req = _ur.Request(
-                        post_url,
-                        data=data,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with _ur.urlopen(req, timeout=t) as resp:
-                        return _json.loads(resp.read().decode("utf-8"))
-
+            # POST /rpc directly to Koyeb-managed reverse proxy (no fallback port)
+            post_url = f"{self.base_url}/rpc"
             for attempt in range(retries):
                 try:
-                    result = self._circuit.call(_do_post)
-                    # Mark idempotent on any success (even if server says duplicate)
-                    if isinstance(result, dict) and "error" not in result:
-                        self._mark_idempotent_seen(_idemp_key)
-                    return result
+                    if _HAS_REQUESTS:
+                        r = self._get_session().post(
+                            post_url, json=payload, timeout=t
+                        )
+                        if r.status_code == 200:
+                            return r.json()
+                    else:
+                        data = _json.dumps(payload).encode("utf-8")
+                        req = _ur.Request(
+                            post_url,
+                            data=data,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        with _ur.urlopen(req, timeout=t) as resp:
+                            return _json.loads(resp.read().decode("utf-8"))
                 except Exception as e:
                     logger.debug(f"[RPC] POST attempt {attempt + 1} failed: {e}")
                     if attempt < retries - 1:
-                        time.sleep((2 ** attempt) + random.random())
+                        time.sleep(2**attempt)
             return None
 
         # GET /rpc directly to Koyeb-managed reverse proxy (no fallback port)
-        params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
 
@@ -14143,122 +12056,109 @@ class KoyebRPCNodule:
     def submit_transaction(self, tx: dict) -> Optional[dict]:
         """
         Submit transaction via JSON-RPC 2.0 (qtcl_submitTransaction).
-        v4.0: startup-resilient — polls /health first, then retries transient
-        JSON-RPC errors (code -32000 + "initializing"/"starting"/etc.) with
-        jittered exponential backoff. Permanent rejections (balance, sig, etc.)
-        are surfaced immediately without retry.
 
-        Key fix over v3.x: previously, a JSON body {"error": {"code":-32000,
-        "message":"Server initializing..."}} was returned to the caller without
-        retry because _rpc()'s retry loop only triggers on network exceptions,
-        not on valid-HTTP JSON error responses. v4.0 adds an explicit retry loop
-        over transient JSON-RPC errors on top of _rpc's network-level retries.
+        Normalizes amount/fee to float and ensures timestamp_ns is present.
+        Includes fallback for legacy servers without qtcl_submitTransaction.
         """
         import time as _t2
-        import random as _rand
+        import hashlib as _hl
 
         payload = dict(tx)
+        if "amount" in payload:
+            payload["amount"] = float(payload["amount"])
+        if "fee" in payload:
+            payload["fee"] = float(payload["fee"])
+        if "timestamp_ns" not in payload:
+            payload["timestamp_ns"] = str(_t2.time_ns())
+        payload.setdefault("from", payload.get("from_address", ""))
+        payload.setdefault("to", payload.get("to_address", ""))
+        payload.setdefault("from_addr", payload.get("from_address", ""))
+        payload.setdefault("to_addr", payload.get("to_address", ""))
 
-        if isinstance(payload.get("timestamp_ns"), str):
-            payload["timestamp_ns"] = int(payload["timestamp_ns"])
-        elif "timestamp_ns" not in payload:
-            payload["timestamp_ns"] = _t2.time_ns()
+        # Generate tx_hash if not provided
+        if "tx_hash" not in payload and "txid" not in payload:
+            from_addr = payload.get("from_address", "")
+            to_addr = payload.get("to_address", "")
+            amount = payload.get("amount", 0)
+            fee = payload.get("fee", 0.0)
+            nonce = payload.get("nonce", 0)
+            ts = payload.get("timestamp_ns", _t2.time_ns())
+            tx_data = f"{from_addr}:{to_addr}:{amount}:{fee}:{nonce}:{ts}"
+            payload["tx_hash"] = _hl.sha256(tx_data.encode()).hexdigest()
 
-        payload.setdefault("from_address", payload.get("from", ""))
-        payload.setdefault("to_address",   payload.get("to",   ""))
-        payload.setdefault("from_addr",    payload.get("from_address", ""))
-        payload.setdefault("to_addr",      payload.get("to_address",   ""))
-        payload.setdefault("tx_type",      "transfer")
-
-        tx_short = payload.get("tx_hash", "?")[:16]
-        _EXP_LOG.info(f"[TX-v4] Submitting: {tx_short}…")
-
-        # ── Phase 1: /health gate ─────────────────────────────────────────────
-        # Poll until server is ready (non-blocking if already up).
-        # If server is ready, reset circuit breaker so past startup failures
-        # don't block a now-healthy server.
-        server_ready = self._tx_poll_health(timeout=self._TX_HEALTH_WAIT)
-        if server_ready:
-            try:
-                with self._circuit._lock:
-                    if self._circuit._state != "CLOSED":
-                        self._circuit._state    = "CLOSED"
-                        self._circuit._failures = 0
-                        _EXP_LOG.info("[TX-v4] ✅ Circuit reset after /health OK")
-            except Exception:
-                pass
-        else:
-            _EXP_LOG.warning(
-                f"[TX-v4] /health still 'starting' after {self._TX_HEALTH_WAIT:.0f}s "
-                "— submitting anyway (wsgi_config v4.0 will hold the request up to 10s)"
-            )
-
-        # ── Phase 2: submit with retry on transient JSON-RPC errors ──────────
-        last_error = None
-
-        for attempt in range(self._TX_MAX_RETRIES):
-            try:
-                r = self._rpc("qtcl_submitTransaction", [payload], timeout=45, retries=2)
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt < self._TX_MAX_RETRIES - 1:
-                    backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
-                    _EXP_LOG.warning(
-                        f"[TX-v4] Network error attempt {attempt+1}/{self._TX_MAX_RETRIES}: "
-                        f"{exc} — retry in {backoff:.1f}s"
-                    )
-                    _t2.sleep(backoff)
-                continue
-
-            if r is None:
-                last_error = "no_response"
-                if attempt < self._TX_MAX_RETRIES - 1:
-                    backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
-                    _EXP_LOG.warning(
-                        f"[TX-v4] No response attempt {attempt+1}/{self._TX_MAX_RETRIES} "
-                        f"— retry in {backoff:.1f}s"
-                    )
-                    _t2.sleep(backoff)
-                continue
-
-            if isinstance(r, dict):
-                if "error" in r:
-                    err     = r["error"]
-                    err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                    last_error = err
-
-                    if self._tx_is_permanent(err_msg):
-                        _EXP_LOG.warning(f"[TX-v4] Permanent rejection: {err_msg}")
-                        return {"status": "rejected", "error": err, "accepted": False}
-
-                    if self._tx_is_transient(err_msg) and attempt < self._TX_MAX_RETRIES - 1:
-                        backoff = self._TX_BASE_BACKOFF * (2 ** attempt) + _rand.random()
-                        _EXP_LOG.info(
-                            f"[TX-v4] Transient error attempt {attempt+1}/{self._TX_MAX_RETRIES}: "
-                            f"{err_msg!r} — retry in {backoff:.1f}s"
-                        )
-                        _t2.sleep(backoff)
-                        continue
-
-                    # Unknown error or final attempt — surface it
-                    return {"status": "rejected", "error": err, "accepted": False}
-
-                # No "error" key → accepted
-                _EXP_LOG.info(
-                    f"[TX-v4] ✅ accepted: status={r.get('status')} "
-                    f"accepted={r.get('accepted')} hash={r.get('tx_hash','?')[:16]}"
-                )
-                return r
-
-        _err_detail = str(last_error) if last_error else (
-            str(self._last_error) if self._last_error else "max_retries_exceeded"
+        # ── Try JSON-RPC 2.0 first ───────────────────────────────
+        _EXP_LOG.info(
+            f"[TX] Submitting transaction: {payload.get('tx_hash', 'unknown')[:16]}..."
         )
-        _EXP_LOG.warning(f"[TX-v4] All {self._TX_MAX_RETRIES} attempts failed: {_err_detail}")
-        return {
-            "status":   "no_response",
-            "accepted": False,
-            "error":    f"Submission failed after {self._TX_MAX_RETRIES} attempts: {_err_detail}",
-        }
+        r = self._rpc("qtcl_submitTransaction", [payload])
+
+        # Check for method not found error - try fallback
+        if r and isinstance(r, dict) and r.get("error"):
+            err_msg = str(r.get("error", ""))
+            if "Method not found" in err_msg or "-32601" in err_msg:
+                _EXP_LOG.warning(
+                    f"[TX] Server doesn't support qtcl_submitTransaction, trying fallback..."
+                )
+                # Fallback: try sending as block transaction via submitBlock (includes TXs)
+                return self._submit_transaction_fallback(payload)
+
+        if r and isinstance(r, dict):
+            _EXP_LOG.info(
+                f"[TX] Response: status={r.get('status')} accepted={r.get('accepted')}"
+            )
+        elif r is None:
+            _EXP_LOG.warning(f"[TX] No response from server, trying fallback...")
+            return self._submit_transaction_fallback(payload)
+
+        return r if r is not None else None
+
+    def _submit_transaction_fallback(self, payload: dict) -> Optional[dict]:
+        """Fallback: try to submit transaction via getEvents (observer pattern) or direct DB."""
+        import time as _t2
+
+        _EXP_LOG.info(f"[TX-FALLBACK] Attempting alternative submission...")
+
+        # Try mempool stats endpoint which might expose transaction acceptance
+        try:
+            mempool = self._rpc("qtcl_getMempoolStats", [])
+            _EXP_LOG.info(f"[TX-FALLBACK] Mempool stats: {mempool}")
+        except Exception as e:
+            _EXP_LOG.debug(f"[TX-FALLBACK] Mempool check failed: {e}")
+
+        # Check balance to confirm wallet works
+        try:
+            from_addr = payload.get("from_address", "")
+            bal = self._rpc("qtcl_getBalance", [from_addr])
+            if bal and isinstance(bal, dict):
+                balance = float(bal.get("balance", 0) or 0)
+                _EXP_LOG.info(f"[TX-FALLBACK] Balance check: {balance} QTCL")
+
+                # If we have sufficient balance, note that TX system needs server upgrade
+                amount = float(payload.get("amount", 0))
+                fee = float(payload.get("fee", 0.0))
+                if balance >= amount + fee:
+                    _EXP_LOG.warning(
+                        f"[TX-FALLBACK] ⚠️ Balance sufficient but server lacks qtcl_submitTransaction. Server needs upgrade."
+                    )
+                    return {
+                        "status": "pending_upgrade",
+                        "accepted": False,
+                        "message": "Server does not support qtcl_submitTransaction. Please upgrade server to latest version.",
+                        "balance": balance,
+                        "required": amount + fee,
+                    }
+                else:
+                    return {
+                        "status": "insufficient_balance",
+                        "accepted": False,
+                        "message": f"Insufficient balance: {balance} QTCL, need {amount + fee} QTCL",
+                        "balance": balance,
+                        "required": amount + fee,
+                    }
+        except Exception as e:
+            _EXP_LOG.warning(f"[TX-FALLBACK] Balance check failed: {e}")
+
+        return {"error": "Transaction submission failed - server may need upgrade"}
 
     def get_peers(self) -> list:
         """Get peer list via JSON-RPC."""
@@ -15838,9 +13738,7 @@ class KoyebOracleState:
                 )
                 self.pq0_fidelity = float(fid)
                 self.w_state_fidelity = float(fid)
-                # Only update latency if this was a real RPC call (not SSE cache hit)
-                if not live.get("_from_cache"):
-                    self.channel_latency_ms = (time.time() - t0) * 1000.0
+                self.channel_latency_ms = (time.time() - t0) * 1000.0
                 self.connected = True
                 self.last_sync_ts = time.time()
                 if client_field:
@@ -16318,10 +14216,7 @@ class _MiningTelemetry:
         self.height = 0  # target block height
         self.difficulty = 0  # current PoW difficulty
         self.parent_hash = "0" * 64  # parent block hash
-        self.nonce = 0  # current nonce being tried (cumulative, includes PERSISTENT_BASE)
-        self.block_nonce = 0  # nonces tried for THIS block attempt only (display purposes)
-        self._session_nonces = 0  # cumulative nonces tried at current height (survives TTL restarts)
-        self._session_nonce_base = 0  # banked nonces from completed attempts at this height
+        self.nonce = 0  # current nonce being tried
         self.hash_rate = 0.0  # hashes/second (rolling 5 s window)
         self.blocks_found = 0  # blocks solved this session
         self.blocks_accepted = 0  # ✅ blocks accepted by server
@@ -16332,72 +14227,30 @@ class _MiningTelemetry:
         self.session_start = time.time()
         self._nonce_samples: "_deque" = _deque(maxlen=50)  # (ts, nonce) for rate calc
         self.state = "IDLE"  # IDLE | MINING | SOLVED | SUBMITTING
-        self._mining_height = 0  # height currently being mined (for state priority)
 
     def update_progress(
-        self, height: int, difficulty: int, nonce: int, parent_hash: str = "",
-        block_nonce: int = 0, persistent_base: int = 0
+        self, height: int, difficulty: int, nonce: int, parent_hash: str = ""
     ) -> None:
         with self._lock:
-            # Only reset samples on actual HEIGHT change, not same-height TTL restart
-            if height != self.height:
+            # Check if starting a new block (nonce reset to 0) - clear samples
+            # ❤️  clear on new block: height change OR nonce regression
+            if (height != self.height) or (nonce < self.nonce and self.nonce > 0):
                 self._nonce_samples.clear()
                 self.hash_rate = 0.0
-                self._session_nonces = 0
-                self._session_nonce_base = 0
             self.height = height
             self.difficulty = difficulty
-            # FIX BUG-1: On warmup call (nonce=0, block_nonce=0), display the
-            # persistent base so nonce never visually resets to 0 between blocks.
-            # The persistent base is the total nonces tried across all previous blocks
-            # this session — it is the correct display value during the "warming up" gap.
-            self.nonce = nonce if nonce > 0 else persistent_base
-            # Track cumulative nonces tried this session (never resets within a height)
-            if block_nonce > 0:
-                self.block_nonce = block_nonce
-                # _session_nonces accumulates across TTL restarts at same height
-                if not hasattr(self, '_session_nonces'):
-                    self._session_nonces = 0
-                # Update session total: base accumulated + current attempt progress
-                if not hasattr(self, '_session_nonce_base'):
-                    self._session_nonce_base = 0
-                self._session_nonces = self._session_nonce_base + block_nonce
-            elif len(self._nonce_samples) > 0:
-                self.block_nonce = max(0, nonce - self._nonce_samples[0][1])
+            self.nonce = nonce
             if parent_hash:
                 self.parent_hash = parent_hash
             self.state = "MINING"
             now = time.time()
-            # FIX: block_nonce=0 + nonce=0 is the warmup call at block-start.
-            # Adding this sample causes nonce jump 0→real_start in one 50ms tick
-            # → dn/dt = millions → fake 50M H/s. Clear stale samples instead.
-            # FIX BUG-1 cont: also update _session_nonces to persistent_base
-            # so the dashboard shows the real cumulative count, not 0.
-            if block_nonce == 0 and nonce == 0:
-                self._nonce_samples.clear()
-                if persistent_base > 0:
-                    self._session_nonces = self._session_nonce_base + persistent_base
-                return
             self._nonce_samples.append((now, nonce))
             if len(self._nonce_samples) >= 2:
-                t_first = self._nonce_samples[0][0]
-                n_first = self._nonce_samples[0][1]
-                dt = now - t_first
-                dn = nonce - n_first
-                if dt > 1.0 and dn > 0:
-                    # 1s minimum window; 500K H/s is realistic Python SHA3 ceiling
-                    self.hash_rate = min(dn / dt, 500_000.0)
-                elif dt > 0 and dn <= 0:
-                    # Nonce wrapped/reset — clear stale samples, keep rate until fresh data
-                    self._nonce_samples.clear()
-                    self._nonce_samples.append((now, nonce))
-
-    def _accumulate_session_nonces(self, nonces_tried: int) -> None:
-        """Called when a block attempt ends (TTL/found/advance) to bank nonces."""
-        with self._lock:
-            if not hasattr(self, '_session_nonce_base'):
-                self._session_nonce_base = 0
-            self._session_nonce_base += nonces_tried
+                t0, n0 = self._nonce_samples[0]
+                t1, n1 = self._nonce_samples[-1]
+                dt = t1 - t0
+                if dt > 0:
+                    self.hash_rate = (n1 - n0) / dt
 
     def record_block(self, block: dict) -> None:
         """
@@ -16422,11 +14275,8 @@ class _MiningTelemetry:
             self.last_block_ts = time.time()
             self.state = "SOLVED"
 
-    def mark_submitting(self, submit_height: int = 0) -> None:
+    def mark_submitting(self) -> None:
         with self._lock:
-            # Don't override MINING state if pow_task has already moved to next block
-            if self.state == "MINING" and self._mining_height > submit_height > 0:
-                return
             self.state = "SUBMITTING"
 
     def record_block_accepted(
@@ -16452,11 +14302,9 @@ class _MiningTelemetry:
         with self._lock:
             self.state = "IDLE"
 
-    def mark_mining(self, height: int = 0) -> None:
+    def mark_mining(self) -> None:
         with self._lock:
             self.state = "MINING"
-            if height > 0:
-                self._mining_height = height
 
     def snapshot(self) -> dict:
         """Lock-free snapshot for display with rewards."""
@@ -16466,8 +14314,6 @@ class _MiningTelemetry:
                 "difficulty": self.difficulty,
                 "parent_hash": self.parent_hash,
                 "nonce": self.nonce,
-                "block_nonce": self.block_nonce,
-                "session_nonces": getattr(self, '_session_nonces', self.block_nonce),
                 "hash_rate": self.hash_rate,
                 "blocks_found": self.blocks_found,
                 "blocks_accepted": self.blocks_accepted,
@@ -16481,13 +14327,13 @@ class _MiningTelemetry:
 
 
 _MINE_TELEM = _MiningTelemetry()
-# Raw nonce counters written directly by pow_task — bypasses telemetry pipeline
-# so the dashboard always shows live values regardless of sampling state.
-# [0] = total hashes tried this block (all workers combined)
-# [1] = current PERSISTENT_NONCE_BASE (start of this block's nonce range)
-_MINE_RAW_CTR = [0, 0]
-# Session-wide total hashes tried across all block attempts (persists across IDLE)
-_SESSION_TOTAL_TRIED = [0]
+_sse_local_subs: list = []  # DEPRECATED: SSE subscribers (RPC-only now)
+_sse_event_subs: list = []  # DEPRECATED: SSE event subscribers (RPC-only now)
+
+
+def _broadcast_oracle_to_local_subs(snap: dict) -> None:
+    """DEPRECATED: SSE broadcast removed in RPC-only migration. Stub for compatibility."""
+    pass
 
 
 # SERVER RPC CLIENT — Pyth oracle metrics from server
@@ -21260,9 +19106,6 @@ class QtclClientApp:
         self._oracle_mesh: Optional[ClientOracleMesh] = None
         self._oracle_mesh_lock = _threading.RLock()
 
-        # ── UTXO Oracle Node: BFT consensus attestation, local chain sync ──
-        self._oracle_node: Optional[_OracleNode] = None
-
     def sample_server_16_cubed(self) -> Optional[str]:
         """Sample latest 16³ from server SSE stream - called by AER to feed mining."""
         if not self._sse_client:
@@ -21355,7 +19198,7 @@ class QtclClientApp:
         ① WALLET-BOUND  (oracle_context provided)
           oracle_priv = sha3_256(wallet_priv ‖ "QTCL_ORACLE_DELEGATE_v1")
           oracle_pub  = sha3_256(oracle_priv.encode())
-          oracle_addr = sha3_256(sha3_256(pub_bytes)).hexdigest()
+          oracle_addr = "qtcl1" + sha3_256(pub_bytes)[:20].hex()
           cert        = HLWE_sign(sha256(oracle_pub ‖ wallet_addr), wallet_priv)
           The cert binds: "wallet_addr authorised oracle_addr to sign".
           Any peer can verify without a central server: recompute cert_hash,
@@ -21406,7 +19249,7 @@ class QtclClientApp:
             private_key = _wpriv  # Walk index sequence - already in correct format
             public_key = engine.derive_public_key(private_key)
             pub_bytes = bytes.fromhex(public_key)
-            address = _hashlib.sha3_256(_hashlib.sha3_256(pub_bytes).digest()).hexdigest()
+            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
             cert = self._create_oracle_cert(public_key, _waddr, _wpriv)
             identity = {
                 "address": address,
@@ -21426,7 +19269,7 @@ class QtclClientApp:
             private_key = keypair.private_key
             public_key = keypair.public_key
             pub_bytes = bytes.fromhex(public_key)
-            address = _hashlib.sha3_256(_hashlib.sha3_256(pub_bytes).digest()).hexdigest()
+            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
             identity = {
                 "address": address,
                 "private_key": private_key,
@@ -21508,6 +19351,41 @@ class QtclClientApp:
             }
 
             return engine.verify_signature(_hash, sig_dict, wallet_pub)
+        except Exception:
+            return False
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+        try:
+            _payload = (oracle_pub + "|" + wallet_addr).encode()
+            _hash = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
+        except Exception:
+            return False
+        try:
+            _payload = (oracle_pub + "|" + wallet_addr).encode()
+            _hash = _hashlib.sha256(_payload).digest()
+            sig_bytes = bytes.fromhex(cert["signature"])
+            signing_key = _hm_v.new(
+                b"HLWE_SIGN_KEY_v1", wallet_addr.encode(), _hashlib.sha256
+            ).digest()
+            computed = _hm_v.new(
+                signing_key, _hash + sig_bytes, _hashlib.sha256
+            ).hexdigest()
+            return _hm_v.compare_digest(computed, cert["auth_tag"])
         except Exception:
             return False
 
@@ -21941,14 +19819,24 @@ class QtclClientApp:
             # Patch any column-level deltas from previous schema versions
             self._verify_db_schema()
 
-            # ── SSE CLIENT INITIALIZATION ──
-            # Redundant standalone SSE client removed; density/consensus/block
-            # streams are already started at module load via connect_*_stream().
-            # This avoids duplicate /rpc/oracle/snapshot connections that exhaust
-            # the server's per-IP SSE limit.
+            # ── SSE CLIENT INITIALIZATION (SKIP in audit mode to avoid connection attempts) ──
+            # Only initialize SSE for interactive modes (normal run, mining, node)
+            # Audit mode uses pure RPC polling, no SSE needed
             global _sse_client
-            self._sse_client = None
-            _sse_client = None
+            _is_audit = getattr(self, "_audit_mode", False)
+            if not _is_audit and (not hasattr(self, "_sse_client") or self._sse_client is None):
+                try:
+                    self._sse_client = init_sse_client(self.oracle_url)
+                    _sse_client = self._sse_client  # Update global reference
+                    _EXP_LOG.info(
+                        f"[INIT] ✅ SSE stream client initialized for {self.oracle_url}"
+                    )
+                except Exception as _sse_err:
+                    _EXP_LOG.warning(
+                        f"[INIT] ⚠️ SSE client initialization failed: {_sse_err}"
+                    )
+                    self._sse_client = None
+                    _sse_client = None
 
             # ── SYNC LOCAL CHAIN WITH SERVER ──
             try:
@@ -23995,19 +21883,6 @@ class QtclClientApp:
                         raise
             if not _bind_success:
                 raise RuntimeError("P2P bind failed after 3 attempts")
-            # ── Fix: if we fell back to an alternate port, update external_addr ──
-            # ExternalAddressResolver used _P2P_PORT (9091) but we may have bound
-            # to _bind_port (e.g. 9101). Patch the port in the advertised address.
-            if _bind_port != _port and self.p2p_node.external_addr:
-                _ea = self.p2p_node.external_addr
-                if ":" in _ea:
-                    _ea_host = _ea.rsplit(":", 1)[0]
-                    self.p2p_node.external_addr = f"{_ea_host}:{_bind_port}"
-                else:
-                    self.p2p_node.external_addr = f"{_ea}:{_bind_port}"
-                _EXP_LOG.info(
-                    f"[P2P] ⚠️  Port fallback: updated external_addr to {self.p2p_node.external_addr}"
-                )
             _P2P_NODE = self.p2p_node
             _EXP_LOG.info(
                 f"[CLIENT] 🌐 P2P RPC node started on {self.p2p_node.external_addr}"
@@ -24653,31 +22528,147 @@ class QtclClientApp:
 
     def _subscribe_snapshot_rpc(self) -> None:
         """
-        ⚛️  Oracle state sync — reads from the persistent density SSE stream cache
-        (connect_density_stream) instead of opening its own connections.
-
-        The module-level density SSE stream feeds _LIVE_RPC_ORACLE via the
-        _default_density_handler callback.  This thread just monitors cache
-        freshness and logs staleness warnings.  No network calls needed.
+        ⚛️  Aggressive RPC polling for /rpc/oracle/snapshot every 300ms.
+        Ingests each new snapshot directly into _LIVE_RPC_ORACLE; the
+        tripartite oracle loop fuses on its next cycle.
         """
-        import time as _pt
+        import time as _pt, ssl as _ssl, json as _pj
+        from urllib.request import Request as _SR, urlopen as _SO
+        from urllib.error import URLError as _SE, HTTPError as _HE
+
+        _oracle_url = SSE_SERVICE_URL
+        url = f"{_oracle_url}/rpc/oracle/snapshot"
+        _last_snap_hash = None
+        _fail_count = 0
+        _backoff_ms = 300  # Start at 300ms
+        _max_backoff_ms = 5000  # Cap at 5s
 
         _EXP_LOG.info(
-            "[SNAPSHOT-SYNC] ✅ Using persistent density SSE stream (no polling)"
+            f"[SNAPSHOT-RPC] 🚀 Starting aggressive polling every {_backoff_ms}ms → {url}"
         )
 
         while not self._stop.is_set():
             try:
-                _, _, _age = _LIVE_RPC_ORACLE.get_oracle_dm()
-                if _age > 30.0:
-                    # Cache stale — density stream may have died, nudge a single fetch
-                    try:
-                        _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)
-                    except Exception:
-                        pass
+                req = _SR(url, method="GET")
+                req.add_header("Content-Type", "application/json")
+                req.add_header("User-Agent", "QTCL-PyRPC/5.0")
+                ssl_ctx = _ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+                try:
+                    with _SO(req, timeout=5, context=ssl_ctx) as resp:
+                        data = _pj.loads(resp.read().decode("utf-8"))
+
+                        if data and data.get("ready"):
+                            snap_hash = (
+                                __import__("hashlib")
+                                .sha256(_pj.dumps(data, sort_keys=True).encode())
+                                .hexdigest()
+                            )
+
+                            if snap_hash != _last_snap_hash:
+                                try:
+                                    # Write upstream snapshot directly into _LIVE_RPC_ORACLE
+                                    # The tripartite loop will fuse it on its next cycle
+                                    _dm_hex_up = data.get("density_matrix_hex", "")
+                                    if _dm_hex_up:
+                                        import struct as _sr
+
+                                        _bd = bytes.fromhex(_dm_hex_up)
+                                        if len(_bd) == 1024:
+                                            _re = [0.0] * 64
+                                            _im = [0.0] * 64
+                                            for _i in range(64):
+                                                _re[_i], _im[_i] = _sr.unpack_from(
+                                                    ">dd", _bd, _i * 16
+                                                )
+                                            with _LIVE_RPC_ORACLE._dm_lock:
+                                                _LIVE_RPC_ORACLE._dm_re = _re
+                                                _LIVE_RPC_ORACLE._dm_im = _im
+                                                _LIVE_RPC_ORACLE._last_fetch_ts = (
+                                                    _pt.time()
+                                                )
+                                    # Merge scalar oracle fields into _oracle_state
+                                    _state_update = {
+                                        k: data[k]
+                                        for k in (
+                                            "w_state_fidelity",
+                                            "fidelity",
+                                            "purity",
+                                            "von_neumann_entropy",
+                                            "coherence_l1",
+                                            "pq0_oracle_fidelity",
+                                            "pq0_IV_fidelity",
+                                            "pq0_V_fidelity",
+                                            "cycle",
+                                            "timestamp_ns",
+                                        )
+                                        if k in data
+                                    }
+                                    if _state_update:
+                                        with _LIVE_RPC_ORACLE._oracle_state_lock:
+                                            _LIVE_RPC_ORACLE._oracle_state.update(
+                                                _state_update
+                                            )
+                                    _last_snap_hash = snap_hash
+                                    _fail_count = 0
+                                    _backoff_ms = 300
+                                except Exception as _ie:
+                                    _EXP_LOG.debug(
+                                        f"[SNAPSHOT-RPC] ingest error: {_ie}"
+                                    )
+                except _HE as _http_err:
+                    # ⚛️  Diagnostic: throttle 5xx to avoid log spam from transient Koyeb 503s
+                    _fail_count += 1
+                    if _http_err.code >= 500:
+                        if _fail_count == 1 or _fail_count % 50 == 0:
+                            try:
+                                error_body = _http_err.read().decode(
+                                    "utf-8", errors="replace"
+                                )[:80]
+                                # Strip HTML — log only first 80 chars of plain text portion
+                                import re as _re2
+
+                                error_body = _re2.sub(
+                                    r"<[^>]+>", "", error_body
+                                ).strip()[:60]
+                                _EXP_LOG.error(
+                                    f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count}) → {error_body}"
+                                )
+                            except:
+                                _EXP_LOG.error(
+                                    f"[SNAPSHOT-RPC] 💥 HTTP {_http_err.code} (#{_fail_count})"
+                                )
+                        else:
+                            _EXP_LOG.debug(
+                                f"[SNAPSHOT-RPC] HTTP {_http_err.code} (#{_fail_count}), retrying…"
+                            )
+                    elif _fail_count % 10 == 0:
+                        _EXP_LOG.debug(
+                            f"[SNAPSHOT-RPC] HTTP {_http_err.code}, retrying..."
+                        )
+                    # Exponential backoff on repeated failures
+                    _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
+                except Exception as _re:
+                    _fail_count += 1
+                    if _fail_count % 10 == 0:
+                        _EXP_LOG.debug(f"[SNAPSHOT-RPC] GET error ({_re}), retrying...")
+                    _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
+
+                self._stop.wait(min(_backoff_ms / 1000.0, 5.0))
+
+            except (_SE, OSError, TimeoutError) as _e:
+                _fail_count += 1
+                _backoff_ms = min(_backoff_ms * 1.5, _max_backoff_ms)
+                if _fail_count % 5 == 0:
+                    _EXP_LOG.debug(
+                        f"[SNAPSHOT-RPC] conn failed ({_e}) — backoff {_backoff_ms:.0f}ms"
+                    )
+                self._stop.wait(_backoff_ms / 1000.0)
             except Exception as _e:
-                _EXP_LOG.debug(f"[SNAPSHOT-SYNC] check: {_e}")
-            self._stop.wait(5.0)  # Check every 5s, not 300ms
+                _EXP_LOG.debug(f"[SNAPSHOT-RPC] fatal: {_e}")
+                self._stop.wait(2)
 
     def _subscribe_koyeb_events(self) -> None:
         """
@@ -24759,6 +22750,10 @@ class QtclClientApp:
             except Exception as _e:
                 _EXP_LOG.debug(f"[EVENTS-RPC] fatal: {_e}")
                 self._stop.wait(2)
+
+    def _handle_sse_event(self, raw: str) -> None:
+        """DEPRECATED: SSE event handler removed in RPC-only migration. Stub kept for compatibility."""
+        pass
 
     def _local_http_server(self) -> None:
         """
@@ -25627,10 +23622,21 @@ class QtclClientApp:
 
         # pq_curr = target height (block we're mining) = current + 1
         # pq_last = parent height (current chain tip)
-        # NOTE: Always use bh+1 / bh for the mining target. Server block records
-        # contain historical pq_curr/pq_last for THAT block, not the next one.
         pq_curr_id = str(bh + 1) if bh >= 0 else "1"
         pq_last_id = str(bh) if bh >= 0 else "0"
+        # Fetch actual pq_curr/pq_last from server block record — they are sealed
+        # by the block sealer and may differ from a local modulo estimate.
+        try:
+            _blk_rec = self.api._rpc("qtcl_getBlock", [bh], timeout=5, retries=1)
+            if isinstance(_blk_rec, dict) and "error" not in _blk_rec:
+                _srv_pqc = _blk_rec.get("pq_curr") or _blk_rec.get("pq_curr_id")
+                _srv_pql = _blk_rec.get("pq_last") or _blk_rec.get("pq_last_id")
+                if _srv_pqc is not None:
+                    pq_curr_id = str(_srv_pqc)
+                if _srv_pql is not None:
+                    pq_last_id = str(_srv_pql)
+        except Exception:
+            pass  # keep local modulo fallback
         bath = None
         print(f"  🗄️  DB           : {self._db_path}")
 
@@ -25645,8 +23651,6 @@ class QtclClientApp:
                 _new_tip = self.db.get_chain_tip()
                 if _new_tip:
                     bh = int(_new_tip.get("height") or 0)
-                    pq_curr_id = str(bh + 1)
-                    pq_last_id = str(bh)
             else:
                 print(f"  ℹ️  Blockchain already up-to-date")
         except Exception as _ibd_e:
@@ -25772,9 +23776,8 @@ class QtclClientApp:
 
             # CRITICAL FIX: pq_curr = target height (next block to mine) = current + 1
             # pq_last = parent height = current chain tip
-            # Always recompute from live _bh — outer pq_curr_id may be stale
-            _pqc = _bh + 1  # Target height for new block
-            _pql = _bh  # Parent = current chain tip
+            _pqc = _safe_pq_int(pq_curr_id, _bh + 1)  # Target height for new block
+            _pql = _safe_pq_int(pq_last_id, _bh)  # Parent = current chain tip
             # Genesis fix: at height 0, we mine block 1
             if _bh == 0:
                 _pqc = 1  # Mining first block
@@ -25883,39 +23886,21 @@ class QtclClientApp:
         else:
             print(f"  ✅ Wallet already loaded: {self.wallet.address}", flush=True)
 
-        # ── Activate UTXO Oracle Node (BFT consensus) — OPTIONAL ───────────────────
-        # Only activate if explicitly enabled via QTCL_ORACLE_MODE=1 env var.
-        # Oracle nodes are separate from miners; each operator runs their own.
-        _oracle_mode = os.environ.get("QTCL_ORACLE_MODE", "").strip().lower() in ("1", "true", "yes")
-        if _oracle_mode and self.wallet.is_loaded():
-            try:
-                self._oracle_node = _OracleNode(self.wallet, self.oracle_url)
-                self._oracle_node.activate()
-                print(f"  🔮 Oracle node active: {self._oracle_node.oracle_id}", flush=True)
-            except Exception as _on_err:
-                print(f"  ⚠️  Oracle node init failed: {_on_err}", flush=True)
-        elif _oracle_mode:
-            print(f"  ⚠️  Oracle mode requested but wallet not loaded", flush=True)
-
         # SSE stream counts as a valid DM source — check it before printing status
         _sse_snap = self._sse_client.get_latest_snapshot() if self._sse_client else None
         if not _dm_ready and _sse_snap:
             _dm_ready = True  # SSE stream is delivering DMs
 
-        # Dynamic height: koyeb_state may have advanced since initial fetch
-        _live_bh = int(self.koyeb_state.block_height or bh)
-        _live_pqc = _live_bh + 1
-        _live_pql = _live_bh
         if _dm_ready:
             print(f"  ✅ Oracle state: ACTIVE  fidelity={_w_fid:.4f}", flush=True)
             print(
-                f"  ⛏️  Building block {_live_pqc} (chain at {_live_bh})  pq_curr={_live_pqc}  pq_last={_live_pql}",
+                f"  ⛏️  Building block {pq_curr_id} (chain at {bh})  pq_curr={pq_curr_id}  pq_last={pq_last_id}",
                 flush=True,
             )
         else:
             print(f"  ✅ Oracle state: ACTIVE (SSE stream primary)", flush=True)
             print(
-                f"  ⛏️  Building block {_live_pqc} (chain at {_live_bh})  pq_curr={_live_pqc}  pq_last={_live_pql}",
+                f"  ⛏️  Building block {pq_curr_id} (chain at {bh})  pq_curr={pq_curr_id}  pq_last={pq_last_id}",
                 flush=True,
             )
         print(f"  🔗 Oracle bridge fidelity : {_w_fid:.4f}", flush=True)
@@ -25933,1143 +23918,1906 @@ class QtclClientApp:
         print(self.format_p2p_status(), flush=True)
         print(flush=True)
 
+        # ── Miner handle ───────────────────────────────────────────────────────
+        def _wait_for_oracle_dm(timeout_s: float = 30.0) -> bool:
+            """
+            Gate on RPC oracle DM arrival (RPC-only, no SSE).
+            Fetches live RPC snapshots on-demand via _LIVE_RPC_ORACLE.
+            Returns True if DM available. False = degraded mode, mining continues.
+            """
+            deadline = time.time() + timeout_s
+            print("  🔗 Awaiting oracle DM frame…", end="", flush=True)
+            while time.time() < deadline:
+                _dm_snap = _LIVE_RPC_ORACLE.fetch_snapshot()
+                if _dm_snap.get("cycle", 0) > 0:
+                    print(f" ✅ (RPC)  snaps={_dm_snap.get('cycle', 0)}", flush=True)
+                    return True
+                print(".", end="", flush=True)
+                time.sleep(0.3)
+            print(" ⏱️  timeout — degraded mode", flush=True)
+            return False
+
+        class _MinerHandle:
+            """Thin handle so the post-loop code (miner._koyeb_state etc.) still works."""
+
+            def __init__(self):
+                self._koyeb_state = None
+                self._client_field = None
+
+            def stop_mining(self):
+                pass
+
+        miner = _MinerHandle()
+
         async def _mine_inline():
             """
-            QTCL Mining Pipeline — Cache-Driven, Event-Reactive
-            THREE decoupled async tasks:
-              1. pow_task:        mine blocks, enqueue to cache
-              2. submit_task:     dequeue from cache, submit via RPC
-              3. balance_task:    periodic balance refresh
+            ⚛️ EVENT-DRIVEN MINING PIPELINE v6.0 — PURE EVENTS, NO POLLING ⚛️
+
+            Event-driven architecture:
+            1. Wait for height event (P2P broadcast or server signal)
+            2. Update height, persist block (if received from peer/server)
+            3. Build block (coinbase + TXs + merkle)
+            4. Mine (pure Python SHA256 with multi-threaded workers)
+            5. Submit (RPC-only, exponential backoff, atomic quantum state)
+            6. Wait for next height event (loop)
+
+            Height change events from:
+            - P2P BLOCK_ANNOUNCE: peer found a block
+            - P2P BLOCK_SOLVED_SERVER: server broadcasted new block
+            - P2P HEIGHT_UPDATE: peer chain tip update
+            - _CHAIN_ADVANCE_EVENT: signal from P2P layer
+
+            REMOVED (v6.0):
+            - Height polling via RPC (replaced with pure events)
+            - POLL_EVERY_S loop (dead code)
+
+            KEPT INTACT:
+            - Event system (signal_chain_advance, check_chain_advance)
+            - P2P event routing (_P2P_EVENT_QUEUE, _drain_loop)
+            - HypΓ/lattice systems (untouched)
+            - Oracle DM synchronization (RPC-only)
+            - Quantum field state tracking (pq_curr/pq_last locked)
+            - Telemetry integration
             """
             import hashlib as _hl, json as _j, time as _t, asyncio as _asyncio
+
             kapi = KoyebRPCNodule()
-            # Pass local DB so cache rehydrates finalized blocks + UTXOs on startup
-            _local_db = None
+            _MINE_TELEM.mark_idle()
+            # ═══════════════════════════════════════════════════════════════════════
+            # EVENT-DRIVEN HEIGHT TRACKING — No Polling
+            # Height changes are detected via:
+            #   1. _CHAIN_ADVANCE_EVENT from P2P layer (signal_chain_advance)
+            #   2. BLOCK_SOLVED_SERVER event from server broadcast
+            #   3. BLOCK_ANNOUNCE from peers
+            # ═══════════════════════════════════════════════════════════════════════
+
+            # ❤️  PRE-WARM ORACLE SNAPSHOT BEFORE MARKING IDLE (FIX-C)
+            # This ensures metrics aren't zero on first TUI render of MINING state
+            _oracle_warmup_snap = {}
             try:
-                _local_db = self.db
-            except Exception:
-                pass
-            cache = BlockSubmissionCache(db=_local_db)
-            _NULL_HASH = "0" * 64
+                _oracle_warmup_snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=3.0)
+                if _oracle_warmup_snap and _oracle_warmup_snap.get(
+                    "density_matrix_hex"
+                ):
+                    _cached_dm_re, _cached_dm_im, _cached_dm_age = (
+                        _LIVE_RPC_ORACLE.get_oracle_dm()
+                    )
+                    _EXP_LOG.info(
+                        f"[MINER] 🔬 Oracle pre-warmed: DM age={_cached_dm_age:.1f}s "
+                        f"re_sum={sum(_cached_dm_re[:8]):.4f}"
+                    )
+                else:
+                    _oracle_warmup_snap = {}
+            except Exception as _owarm_err:
+                _EXP_LOG.debug(f"[MINER] Oracle pre-warm (non-fatal): {_owarm_err}")
 
             class _SubmissionPipeline:
-                """Enterprise RPC submission with smart error handling."""
-                MAX_RETRIES = 6
-                RETRY_BACKOFFS = [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
-                MAX_TIMEOUT_S = 120.0
+                """⚛️ Enterprise RPC submission with atomic quantum state locking."""
+
+                MAX_RETRIES = 6  # max submission attempts per block
+                RETRY_BACKOFFS = [
+                    1.0,
+                    2.0,
+                    4.0,
+                    8.0,
+                    16.0,
+                    30.0,
+                ]  # exponential backoff: 61s window
+                MAX_TIMEOUT_S = 120.0  # abandon block if >120s elapsed
 
                 def __init__(self):
                     self.submit_count = 0
                     self.accept_count = 0
                     self.reject_count = 0
 
-                async def submit(self, payload: dict, block_height: int, block_hash: str) -> tuple:
-                    # ─────────────────────────────────────────────────────────
-                    # FIX v5.1 — THE ROOT CAUSE OF "0 finalized, 2 pending"
-                    #
-                    # submit_task checks: `if "finalized" in status` to decide
-                    # between mark_finalized() and mark_pending().  Every fallback
-                    # return path here was returning {"status": "accepted"} — note
-                    # "finalized" is NOT in "accepted" — so submit_task ALWAYS
-                    # called mark_pending() on any non-primary-path response.
-                    #
-                    # The server returns "accepted_and_finalized" on the happy
-                    # path AND on duplicate submissions.  All fallback paths
-                    # (timeout verify, fork, chain_advanced, db_error) represent
-                    # cases where the block WAS accepted by the server — they are
-                    # all finalization events.  Fixed: every accepted return path
-                    # now carries "accepted_and_finalized" so submit_task calls
-                    # mark_finalized() unconditionally on success.
-                    #
-                    # Additionally, the oracle_task() added in FIX-3 will catch
-                    # anything that slips through here within 8 seconds via a
-                    # DB-authoritative qtcl_getBlockStatus poll.
-                    # ─────────────────────────────────────────────────────────
+                async def submit(
+                    self, payload: dict, block_height: int, block_hash: str
+                ) -> tuple:
+                    """
+                    🚀 WEB-SCALE SUBMISSION with smart error handling
+
+                    Handles new error codes:
+                    - -32020: Rate limited (backoff and retry)
+                    - -32021: Circuit open (database under load, retry with longer backoff)
+                    - -32002: Fork detected (someone else won this height)
+                    - -32603: Database error (may still be persisted - verify!)
+
+                    Smart verification: After any error, query server to verify if block exists
+                    """
                     self.submit_count += 1
                     last_error = None
                     _submit_start = _t.time()
+
+                    # 🧠 SMART RETRY: Different strategies per error type
                     _rate_limited_backoff = [2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
                     _circuit_breaker_backoff = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0]
 
-                    # Helper: build a guaranteed-finalized result dict so submit_task
-                    # always calls mark_finalized() when the block was accepted.
-                    def _finalized_result(**extra) -> dict:
-                        return {
-                            "status": "accepted_and_finalized",
-                            "height": block_height,
-                            "oracle_consensus": "5/5",
-                            "oracle_ids": ["oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"],
-                            **extra,
-                        }
-
                     for attempt in range(self.MAX_RETRIES):
-                        # FIX: If SSE or oracle_task already finalized this block while
-                        # we're retrying, bail out immediately — don't waste 120s on retries
-                        # for a block the server already accepted. This was causing submit_task
-                        # to be stuck on pipeline.submit() for the PREVIOUS block, unable to
-                        # pick up newly solved blocks.
-                        if cache.is_height_finalized(block_height):
-                            return (True, _finalized_result(early_exit="already_finalized_externally"))
                         _elapsed = _t.time() - _submit_start
                         if _elapsed > self.MAX_TIMEOUT_S:
-                            _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                            # ⏱️ TIMEOUT: But first verify if block was actually accepted!
+                            _EXP_LOG.warning(
+                                f"[SUBMIT] ⏱️ TIMEOUT h={block_height} - verifying if accepted..."
+                            )
+                            _verified = await self._verify_block_accepted(
+                                kapi, block_height, block_hash
+                            )
                             if _verified:
-                                # FIX: was {"status": "accepted"} — "finalized" not in "accepted"
-                                return (True, _finalized_result(verified=True))
-                            return (False, {"error": "Submission timeout", "verify": _verified})
+                                _EXP_LOG.info(
+                                    f"[SUBMIT] ✅ TIMEOUT but block VERIFIED in DB!"
+                                )
+                                return (
+                                    True,
+                                    {
+                                        "status": "accepted",
+                                        "height": block_height,
+                                        "verified": True,
+                                    },
+                                )
 
+                            _EXP_LOG.error(
+                                f"[SUBMIT] ⏱️ TIMEOUT h={block_height} after {_elapsed:.0f}s — giving up"
+                            )
+                            return (
+                                False,
+                                {"error": "Submission timeout", "verify": _verified},
+                            )
+
+                        # Choose backoff based on previous error type
                         if last_error and "rate limit" in last_error.lower():
-                            backoff = _rate_limited_backoff[min(attempt, len(_rate_limited_backoff) - 1)]
+                            backoff = _rate_limited_backoff[
+                                min(attempt, len(_rate_limited_backoff) - 1)
+                            ]
                         elif last_error and "circuit" in last_error.lower():
-                            backoff = _circuit_breaker_backoff[min(attempt, len(_circuit_breaker_backoff) - 1)]
+                            backoff = _circuit_breaker_backoff[
+                                min(attempt, len(_circuit_breaker_backoff) - 1)
+                            ]
                         else:
                             backoff = self.RETRY_BACKOFFS[attempt]
 
                         try:
-                            _EXP_LOG.info(f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} backoff={backoff:.1f}s")
+                            _EXP_LOG.info(
+                                f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} "
+                                f"backoff={backoff:.1f}s"
+                            )
+
+                            # 🚀 RPC CALL with shorter timeout for responsiveness
                             try:
-                                # FIX: inner 10s too short for Koyeb settlement (2-8s). 45s gives
-                                # headroom. outer 50s must exceed inner so TimeoutError only fires
-                                # when the thread truly hangs, not on normal slow responses.
                                 _envelope = await _asyncio.wait_for(
                                     _asyncio.to_thread(
-                                        kapi._rpc_envelope, "qtcl_submitBlock", [payload], 45, 1
+                                        kapi._rpc_envelope,
+                                        "qtcl_submitBlock",
+                                        [payload],
+                                        10,  # Reduced from 15 for faster feedback
+                                        1,
                                     ),
-                                    timeout=50,
+                                    timeout=15,  # Reduced from 20
                                 )
                             except _asyncio.TimeoutError:
-                                _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                                _EXP_LOG.warning(
+                                    f"[SUBMIT] Attempt {attempt + 1}: RPC timeout - verifying..."
+                                )
+                                # Don't give up - verify if it was actually accepted
+                                _verified = await self._verify_block_accepted(
+                                    kapi, block_height, block_hash
+                                )
                                 if _verified:
-                                    # FIX: was {"status": "accepted"} — timeout verify IS finalization
-                                    return (True, _finalized_result(verified=True, timeout=True))
+                                    return (
+                                        True,
+                                        {"status": "accepted", "verified": True},
+                                    )
                                 last_error = "RPC timeout"
                                 continue
 
+                            _EXP_LOG.info(f"[SUBMIT] Response: {str(_envelope)[:200]}")
+
+                            # Parse response
                             if isinstance(_envelope, dict) and "result" in _envelope:
                                 result = _envelope["result"]
                             elif isinstance(_envelope, dict) and "error" in _envelope:
-                                result = _envelope
+                                result = _envelope  # Error response
                             else:
                                 result = _envelope
 
-                            if isinstance(result, dict) and "accepted" in str(result.get("status", "")):
+                            # ✅ SUCCESS: Block accepted (fresh or duplicate)
+                            if (
+                                isinstance(result, dict)
+                                and result.get("status") == "accepted"
+                            ):
+                                _persistence = result.get("persistence", "unknown")
+                                _proc_time = result.get("processing_time_ms", 0)
+                                _EXP_LOG.warning(
+                                    f"[SUBMIT] ✅ ACCEPTED h={block_height} ({_persistence}) "
+                                    f"server_time={_proc_time}ms total={_t.time() - _submit_start:.2f}s"
+                                )
                                 self.accept_count += 1
-                                # Primary path: server returned full response — use it directly.
-                                # Server already includes "accepted_and_finalized" — pass through.
                                 return (True, result)
 
+                            # 🪣 RATE LIMITED: Backoff and retry
                             if isinstance(result, dict) and "error" in result:
                                 _err = result["error"]
-                                _code = _err.get("code", 0) if isinstance(_err, dict) else 0
-                                _msg = _err.get("message", str(_err)) if isinstance(_err, dict) else str(_err)
+                                _code = (
+                                    _err.get("code", 0) if isinstance(_err, dict) else 0
+                                )
+                                _msg = (
+                                    _err.get("message", str(_err))
+                                    if isinstance(_err, dict)
+                                    else str(_err)
+                                )
 
-                                if _code == -32020:
-                                    _retry_after = _err.get("data", {}).get("retry_after", 1) if isinstance(_err, dict) else 1
+                                if _code == -32020:  # Rate limited
+                                    _retry_after = (
+                                        _err.get("data", {}).get("retry_after", 1)
+                                        if isinstance(_err, dict)
+                                        else 1
+                                    )
+                                    _EXP_LOG.warning(
+                                        f"[SUBMIT] 🪣 RATE LIMITED h={block_height} - retry in {_retry_after}s"
+                                    )
                                     await _asyncio.sleep(_retry_after)
                                     last_error = "rate limited"
                                     continue
-                                if _code == -32021:
-                                    _retry_after = _err.get("data", {}).get("retry_after", 30) if isinstance(_err, dict) else 30
+
+                                # ⚡ CIRCUIT BREAKER: Longer backoff
+                                if _code == -32021:  # Circuit open
+                                    _retry_after = (
+                                        _err.get("data", {}).get("retry_after", 30)
+                                        if isinstance(_err, dict)
+                                        else 30
+                                    )
+                                    _EXP_LOG.warning(
+                                        f"[SUBMIT] ⚡ CIRCUIT OPEN h={block_height} - server under load, retry in {_retry_after}s"
+                                    )
                                     await _asyncio.sleep(_retry_after)
                                     last_error = "circuit open"
                                     continue
+
+                                # 🍴 FORK DETECTED: Someone else won this height
                                 if _code == -32002:
-                                    # Fork: another block won at this height — verify if ours made it
-                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                                    _EXP_LOG.warning(
+                                        f"[SUBMIT] 🍴 FORK at h={block_height} - another miner won"
+                                    )
+                                    # Verify if OUR block was the one that made it
+                                    _verified = await self._verify_block_accepted(
+                                        kapi, block_height, block_hash
+                                    )
                                     if _verified:
-                                        # FIX: was {"status": "accepted", "fork_won": True}
-                                        return (True, _finalized_result(fork_won=True))
-                                    # Chain advanced past us — our block was orphaned but height accepted
-                                    # FIX: was {"status": "accepted_other"} — "finalized" not in that
-                                    return (True, _finalized_result(fork_lost=True))
+                                        _EXP_LOG.info(
+                                            f"[SUBMIT] ✅ Our block actually WON h={block_height}!"
+                                        )
+                                        return (
+                                            True,
+                                            {"status": "accepted", "fork_won": True},
+                                        )
+                                    else:
+                                        _EXP_LOG.info(
+                                            f"[SUBMIT] 😢 Lost race at h={block_height}, another block accepted"
+                                        )
+                                        return (
+                                            True,
+                                            {
+                                                "status": "accepted_other",
+                                                "height": block_height,
+                                            },
+                                        )
+
+                                # ❌ INVALID HEIGHT: Chain advanced
                                 if _code == -32001 and "Invalid height" in _msg:
-                                    _tip = _err.get("data", {}).get("tip", 0) if isinstance(_err, dict) else 0
-                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                                    _tip = (
+                                        _err.get("data", {}).get("tip", 0)
+                                        if isinstance(_err, dict)
+                                        else 0
+                                    )
+                                    _EXP_LOG.info(
+                                        f"[SUBMIT] 📈 CHAIN ADVANCED h={block_height} → tip={_tip}"
+                                    )
+                                    # Verify our block is there
+                                    _verified = await self._verify_block_accepted(
+                                        kapi, block_height, block_hash
+                                    )
                                     if _verified:
-                                        # FIX: was {"status": "accepted", "chain_tip": _tip}
-                                        return (True, _finalized_result(chain_tip=_tip))
-                                    # Chain advanced — block was already processed
-                                    # FIX: was {"status": "chain_advanced"} — "finalized" not in that
-                                    return (True, _finalized_result(chain_advanced=True, tip=_tip))
+                                        return (
+                                            True,
+                                            {"status": "accepted", "chain_tip": _tip},
+                                        )
+                                    return (
+                                        True,
+                                        {"status": "chain_advanced", "tip": _tip},
+                                    )
+
+                                # 💥 DATABASE ERROR: May still be persisted - VERIFY!
                                 if _code == -32603:
+                                    _EXP_LOG.error(
+                                        f"[SUBMIT] 💥 DB ERROR h={block_height}: {_msg[:100]}"
+                                    )
+                                    # CRITICAL: Wait a moment then verify
                                     await _asyncio.sleep(0.5)
-                                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                                    _verified = await self._verify_block_accepted(
+                                        kapi, block_height, block_hash
+                                    )
                                     if _verified:
-                                        # FIX: was {"status": "accepted", "db_error_but_persisted": True}
-                                        return (True, _finalized_result(db_error_but_persisted=True))
+                                        _EXP_LOG.info(
+                                            f"[SUBMIT] ✅ DB ERROR but block VERIFIED in chain!"
+                                        )
+                                        return (
+                                            True,
+                                            {
+                                                "status": "accepted",
+                                                "db_error_but_persisted": True,
+                                            },
+                                        )
+                                    _EXP_LOG.error(
+                                        f"[SUBMIT] ❌ Block NOT in chain after DB error"
+                                    )
                                     return (False, result)
 
-                                _EXP_LOG.error(f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}")
+                                # Generic error
+                                _EXP_LOG.error(
+                                    f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}"
+                                )
                                 return (False, result)
 
+                            # No result - network issue, retry
                             last_error = "No response"
+                            _EXP_LOG.warning(
+                                f"[SUBMIT] Attempt {attempt + 1}: No valid response"
+                            )
+
                         except Exception as e:
                             last_error = str(e)
+                            _EXP_LOG.warning(
+                                f"[SUBMIT] Attempt {attempt + 1} exception: {last_error[:100]}"
+                            )
 
+                        # Backoff before retry
                         if attempt < self.MAX_RETRIES - 1:
-                            jitter = __import__("random").uniform(0, 0.5)
+                            # Add jitter to prevent thundering herd
+                            import random
+
+                            jitter = random.uniform(0, 0.5)
                             _wait = backoff + jitter
                             _EXP_LOG.info(f"[SUBMIT] Retry in {_wait:.1f}s...")
                             await _asyncio.sleep(_wait)
 
-                    # Final check: block may have been finalized externally during retries
-                    if cache.is_height_finalized(block_height):
-                        return (True, _finalized_result(early_exit="already_finalized_externally"))
-                    _verified = await self._verify_block_accepted(kapi, block_height, block_hash)
+                    # All retries exhausted - final verification attempt
+                    _EXP_LOG.error(
+                        f"[SUBMIT] ❌ Exhausted retries h={block_height} - final verification..."
+                    )
+                    _verified = await self._verify_block_accepted(
+                        kapi, block_height, block_hash
+                    )
                     if _verified:
-                        # FIX: was {"status": "accepted"} — "finalized" not in "accepted"
-                        return (True, _finalized_result(verified_after_retries=True))
+                        _EXP_LOG.info(f"[SUBMIT] ✅ Exhausted but block FOUND in DB!")
+                        return (
+                            True,
+                            {"status": "accepted", "verified_after_retries": True},
+                        )
+
                     return (False, {"error": last_error or "Max retries exceeded"})
 
-                async def _verify_block_accepted(self, kapi, height: int, block_hash: str) -> bool:
+                async def _verify_block_accepted(
+                    self, kapi, height: int, block_hash: str
+                ) -> bool:
+                    """
+                    🕵️ VERIFY: Query server to check if block was actually accepted
+                    Critical for handling ambiguous errors (DB error, timeout, etc.)
+                    """
                     try:
-                        _check = await _asyncio.to_thread(kapi._rpc, "qtcl_getBlockByHash", [block_hash], 5, 1)
+                        # Query block by hash
+                        _check = await _asyncio.to_thread(
+                            kapi._rpc, "qtcl_getBlockByHash", [block_hash], 5, 1
+                        )
                         if isinstance(_check, dict) and not _check.get("error"):
                             if _check.get("height") == height:
                                 return True
-                        _check_height = await _asyncio.to_thread(kapi._rpc, "qtcl_getBlock", [height], 5, 1)
-                        if isinstance(_check_height, dict) and not _check_height.get("error"):
-                            if _check_height.get("block_hash") == block_hash or _check_height.get("hash") == block_hash:
+
+                        # Fallback: query by height
+                        _check_height = await _asyncio.to_thread(
+                            kapi._rpc, "qtcl_getBlock", [height], 5, 1
+                        )
+                        if isinstance(_check_height, dict) and not _check_height.get(
+                            "error"
+                        ):
+                            if (
+                                _check_height.get("block_hash") == block_hash
+                                or _check_height.get("hash") == block_hash
+                            ):
                                 return True
+
                         return False
                     except Exception as e:
                         _EXP_LOG.debug(f"[SUBMIT] Verification error: {e}")
                         return False
 
-            pipeline = _SubmissionPipeline()
+            _submission = _SubmissionPipeline()
 
-            def _consensus_handler(data: dict) -> None:
-                cache.update_from_sse(data)
-                evt_type = data.get("event_type", "")
-                h = int(data.get("height", 0))
-                if evt_type == "block_finalized" and h > 0:
-                    # FIX: Only abort mining if the finalized block is AT OR ABOVE the
-                    # height we are currently targeting. Finalizing h=71 while we mine
-                    # h=72 is EXPECTED — don't abort. Abort only when h >= target_height
-                    # (chain has moved past us or someone else solved our target).
-                    _current_target = getattr(cache, "_current_target_height", 0)
-                    if h >= _current_target and _current_target > 0:
-                        signal_chain_advance(h)
-                        _EXP_LOG.info(f"[SSE-RECV] 🔥 BLOCK FINALIZED h={h} >= target={_current_target} — mining abort")
+            # ══════════════════════════════════════════════════════════════════════
+            # EVENT-DRIVEN MINING LOOP — Pure Events, No Polling
+            # ══════════════════════════════════════════════════════════════════════
+            # Mining workflow:
+            #   1. Wait for height event OR mine until solution found
+            #   2. On height event: abort mining, update height, persist block, restart
+            #   3. On solution: submit block, wait for next height event
+            # Height events come from:
+            #   - P2P BLOCK_ANNOUNCE (peers found blocks)
+            #   - P2P BLOCK_SOLVED_SERVER (server broadcasts)
+            #   - P2P HEIGHT_UPDATE (peer chain tip updates)
+
+            _NULL_HASH = "0" * 64
+            # _ORACLE_LAT_MAX_MS removed — oracle gate removed, miner is self-sovereign
+            # ── Session variables for height progression and deduplication ──
+            _force_next_height: int = 0
+            _confirmed_heights: set = set()
+            _submitted_hashes: set = set()
+            _last_accepted_hash: str = ""
+
+            while True:  # Main mining loop
+                try:
+                    # ── Sentinel reset — must be first two lines of every iteration ──
+                    # Ensures no stale nonce/block_hash from a previous aborted PoW
+                    # attempt (TTL expiry, chain-advance, or exception) can ever bleed
+                    # through to the submit stage.  The canonical value of 4096 = 0x1000
+                    # = 2^12 is the Python default int fallback, not a mined solution.
+                    nonce = None  # pylint: disable=invalid-name
+                    block_hash = None  # pylint: disable=invalid-name
+
+                    # ── Oracle enrichment (NON-BLOCKING) ──────────────────────────
+                    # Miner is self-sovereign: oracle enriches PoW seeds but never
+                    # blocks. If oracle is silent we mine on local entropy — equally
+                    # valid. The background poll thread (_ORACLE_BG_POLL) keeps the
+                    # cache warm so fast cached reads here are almost always a hit.
+                    _t_oracle_start = _t.time()
+                    _cached_dm_re, _cached_dm_im, _cached_dm_age = (
+                        _LIVE_RPC_ORACLE.get_oracle_dm()
+                    )
+                    if _cached_dm_age < 120.0 and any(v != 0.0 for v in _cached_dm_re):
+                        _oracle_snap = (
+                            _LIVE_RPC_ORACLE.get_oracle_state()
+                        )  # in-memory, zero latency
                     else:
-                        _EXP_LOG.debug(f"[SSE-RECV] 🔔 BLOCK FINALIZED h={h} (target={_current_target}) — no abort, continuing")
-                elif evt_type == "block_pending":
-                    cached = cache.get_block(h)
-                    if cached and cached.oracle_count != int(data.get("oracle_count", 0)):
-                        _EXP_LOG.info(f"[SSE-RECV] ⏳ Block h={h} oracles={data.get('oracle_count', 0)}/5")
-                elif evt_type == "oracle_attestation":
-                    _EXP_LOG.info(f"[SSE-RECV] 🖊️ Oracle attestation h={h} oracle={data.get('oracle_id', '?')}")
+                        try:
+                            _oracle_snap = _LIVE_RPC_ORACLE.fetch_snapshot(
+                                timeout_s=3.0
+                            )
+                        except Exception:
+                            _oracle_snap = {}
+                    _oracle_lat_ms = (_t.time() - _t_oracle_start) * 1000.0
+                    if not isinstance(_oracle_snap, dict):
+                        _oracle_snap = {}
+                    if _oracle_lat_ms > 500:
+                        _EXP_LOG.debug(
+                            f"[MINER] Oracle enrichment {_oracle_lat_ms:.0f}ms "
+                            f"— mining with {'cached DM' if _cached_dm_age < 120 else 'local entropy'}"
+                        )
 
-            def _block_handler(data: dict) -> None:
-                h = int(data.get("height", 0) or data.get("block_height", 0))
-                block_hash = data.get("hash", "") or data.get("block_hash", "")
-                miner = data.get("miner_address", "")
-                if h > 0:
-                    our_block = cache.get_block(h)
-                    if our_block and our_block.block_hash == block_hash:
-                        _EXP_LOG.info(f"[SSE-RECV] ✅ Our block h={h} broadcast confirmed")
-                    elif our_block:
-                        cache.mark_rejected(h, f"superseded by {block_hash[:16]} from {miner[:16]}")
-                        _EXP_LOG.warning(f"[SSE-RECV] ⚠️ Our block h={h} orphaned by {block_hash[:16]}")
-                    # FIX: Only abort if this block is at/above our current mining target.
-                    # Block broadcasts for h < target_height are settlement notifications,
-                    # not chain-advance events — don't kill active mining.
-                    _current_target = getattr(cache, "_current_target_height", 0)
-                    if h >= _current_target and _current_target > 0:
-                        signal_chain_advance(h)
+                    # STAGE 1: Fetch chain tip
+                    _res_h = kapi._rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
+                    # _rpc fall-through bug: server JSON-RPC error {"error":{...}} is
+                    # truthy but has no 'height'/'tip_hash' keys — treat as failure so
+                    # the NULL_HASH gate never fires on a bad response.
+                    if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
+                        _EXP_LOG.warning(
+                            "[MINER] chain tip fetch failed "
+                            f"({'RPC error: ' + str(_res_h.get('error', '?')) if isinstance(_res_h, dict) else 'None'})"
+                            ", retrying…"
+                        )
+                        await _asyncio.sleep(2.0)
+                        continue
+                    oracle_height = int(_res_h.get("height", 0))
+                    oracle_hash = str(_res_h.get("tip_hash") or _NULL_HASH)
+                    # Get server's current difficulty (from block height response or dedicated call)
+                    _server_difficulty = int(_res_h.get("difficulty", 0) or 0)
 
-            def _balance_handler(data: dict) -> None:
-                if data.get("type") != "balance_update":
-                    return
-                _addr = data.get("address", "")
-                _wallet_addr = getattr(getattr(self, "wallet", None), "address", None)
-                if _addr and _wallet_addr and _addr == _wallet_addr:
-                    _b = float(data.get("balance_qtcl", 0) or 0)
-                    if _b > 0:
-                        _prev = cache._balance_qtcl
-                        cache._balance_qtcl = _b
-                        if abs(_b - _prev) > 0.0001:
+                    # ── GATE 1: Genesis is valid (h=0 with hash="0"*64 is canonical genesis) ──
+                    # Refuse only if hash is genuinely missing/null AND height > 0 (would fork)
+                    if oracle_hash == _NULL_HASH and oracle_height > 0:
+                        _EXP_LOG.error(
+                            f"[MINER] ❌ tip_hash is null at h={oracle_height} — "
+                            f"refusing to mine off null parent (would create fork). "
+                            f"Waiting for valid tip…"
+                        )
+                        print(
+                            f"  ❌ tip_hash=null at h={oracle_height} — blocking mine until valid tip",
+                            flush=True,
+                        )
+                        await _asyncio.sleep(5.0)
+                        continue
+
+                    # If oracle_hash is null at height=0, accept genesis
+                    if oracle_hash == _NULL_HASH and oracle_height == 0:
+                        logger.debug(
+                            f"[MINER] ✅ Genesis block at h=0 (canonical hash=0x0…0)"
+                        )
+                        oracle_hash = _NULL_HASH  # Canonical genesis hash
+
+                    # Oracle height sync (advisory only — no block)
+                    _snap_height = (
+                        int(
+                            _oracle_snap.get("block_height")
+                            or _oracle_snap.get("height")
+                            or 0
+                        )
+                        if isinstance(_oracle_snap, dict)
+                        else 0
+                    )
+                    if _snap_height > 0 and abs(_snap_height - oracle_height) > 5:
+                        _EXP_LOG.debug(
+                            f"[MINER] Oracle snap h={_snap_height} vs chain h={oracle_height} "
+                            f"— proceeding with chain tip (oracle is advisory)"
+                        )
+
+                    # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
+                    _difficulty_bits = 4  # fallback default
+                    try:
+                        _config_res = kapi._rpc_http(
+                            "/rpc/config/difficulty", method="GET", timeout=5
+                        ) if hasattr(kapi, "_rpc_http") else None
+                        if _config_res and isinstance(_config_res, dict):
+                            _difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/difficulty: {_e}")
+                    
+                    # Fallback: query block difficulty if RPC config fails
+                    _res_b_raw = kapi._rpc(
+                        "qtcl_getBlock", [oracle_height], timeout=8, retries=2
+                    )
+                    _res_b = (
+                        _res_b_raw
+                        if isinstance(_res_b_raw, dict) and "error" not in _res_b_raw
+                        else {}
+                    )
+                    _block_diff = int(
+                        _res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0
+                    )
+                    # Use authoritative config difficulty, fallback to block difficulty
+                    if _difficulty_bits > 0:
+                        difficulty_bits = _difficulty_bits
+                    elif _server_difficulty > 0:
+                        difficulty_bits = max(_server_difficulty, _block_diff)
+                    else:
+                        difficulty_bits = _block_diff if _block_diff > 0 else 4
+
+                    # STAGE 3: Fetch mempool
+                    _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
+                    _pending_user_txs = _res_m if isinstance(_res_m, list) else []
+
+                    _EXP_LOG.warning(
+                        f"[MINER] STAGE 1 COMPLETE: h={oracle_height} tip={oracle_hash[:24]}… diff={difficulty_bits} oracle_lat={_oracle_lat_ms:.0f}ms"
+                    )
+
+                    if _force_next_height > 0:
+                        target_height = _force_next_height
+                        parent_hash = oracle_hash
+                        _EXP_LOG.warning(
+                            f"[MINER] ⬆️  HEIGHT FORCED: target={target_height} (server signal, oracle_height={oracle_height})"
+                        )
+                        _force_next_height = 0
+                    else:
+                        target_height = oracle_height + 1
+                        parent_hash = oracle_hash
+
+                    if target_height in _confirmed_heights:
+                        _EXP_LOG.warning(
+                            f"[MINER] ⏭️  Skipping h={target_height}: already confirmed this session"
+                        )
+                        await _asyncio.sleep(1.0)
+                        continue
+
+                    timestamp = int(_t.time())
+                    miner_addr = (
+                        getattr(getattr(self, "wallet", None), "address", "0" * 64)
+                        or "0" * 64
+                    )
+
+                    # ── STAGE 2: Quantum PoW seed from live oracle snap ────────────
+                    # CRITICAL: Entropy seed MUST be deterministic (no time-based randomness)
+                    # If oracle unavailable, derive from immutable block parameters
+                    _dm_hex = _oracle_snap.get("density_matrix_hex", "")
+                    if _dm_hex and len(_dm_hex) > 32:
+                        # Method 1: Oracle-based entropy (when oracle provides DM)
+                        _w_entropy_seed = _hl.sha3_256(
+                            bytes.fromhex(_dm_hex[:64])
+                            + target_height.to_bytes(8, "big")
+                            + bytes.fromhex(parent_hash[:32])
+                        ).digest()
+                        _EXP_LOG.info(
+                            f"[MINER-ENTROPY] 🔮 METHOD=ORACLE dm_len={len(_dm_hex)} entropy={_w_entropy_seed.hex()}"
+                        )
+                    else:
+                        # Method 2: Deterministic fallback (no time-based randomness!)
+                        # Use only immutable block parameters: parent + height + timestamp
+                        # This ensures the same entropy seed is always generated for the same block
+                        _w_entropy_seed = _hl.sha3_256(
+                            parent_hash.encode()
+                            + target_height.to_bytes(8, "big")
+                            + timestamp.to_bytes(
+                                8, "big"
+                            )  # timestamp is now fixed (refreshed once per block)
+                        ).digest()
+                        _EXP_LOG.warning(
+                            f"[MINER-ENTROPY] ⚠️  METHOD=DETERMINISTIC_FALLBACK (oracle unavailable) entropy={_w_entropy_seed.hex()}"
+                        )
+
+                    # ──────────────────────────────────────────────────────────────
+                    # STAGE 3: Build block — coinbases from server template + user TXs
+                    # ──────────────────────────────────────────────────────────────
+                    # COHERENT PIPELINE:
+                    #   1. Fetch coinbase template from server (authoritative rewards + pending treasury)
+                    #   2. Build coinbase txs with DETERMINISTIC IDs matching what server expects
+                    #   3. Compute merkle root over FULL tx list [miner_cb, treasury_cb, ...user_txs]
+                    #   4. Do PoW (merkle baked into header hash)
+                    #   5. Submit block with FULL tx list — server validates & persists AS-IS
+                    # ──────────────────────────────────────────────────────────────
+
+                    _miner_reward = 7.2
+                    _treasury_reward = 0.8
+                    _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                    _miner_cb_id = f"cb_miner_{target_height}_{miner_addr[:16]}"
+                    _prior_pending_treasury = []
+
+                    try:
+                        _tmpl_res = kapi._rpc_envelope(
+                            "qtcl_getCoinbaseTemplate", [target_height, miner_addr], 5, 1
+                        ) if hasattr(kapi, "_rpc_envelope") else None
+                        if _tmpl_res and isinstance(_tmpl_res, dict):
+                            _result = _tmpl_res.get("result", {})
+                            _miner_reward = float(_result.get("miner_reward_qtcl", 7.2))
+                            _treasury_reward = float(_result.get("treasury_reward_qtcl", 0.8))
+                            _treasury_addr = _result.get("treasury_address", _treasury_addr)
+                            _miner_cb_id = _result.get("miner_coinbase_id", _miner_cb_id)
+                            _prior_pending_treasury = _result.get("prior_pending_treasury", [])
                             _EXP_LOG.info(
-                                f"[BALANCE] 💰 SSE balance stream: {_prev:.4f} → {_b:.8f} QTCL "
-                                f"(trigger={data.get('trigger','?')})"
+                                f"[MINER] coinbase template h={target_height}: "
+                                f"miner={_miner_reward} treasury={_treasury_reward} "
+                                f"pending_from_prior={len(_prior_pending_treasury)}"
+                            )
+                    except Exception as _e:
+                        _EXP_LOG.debug(f"[MINER] Could not fetch getCoinbaseTemplate: {_e}")
+                        # Fallback: try old /rpc/config/rewards endpoint
+                        try:
+                            _rewards_res = kapi._rpc_http(
+                                "/rpc/config/rewards", method="GET", timeout=5
+                            ) if hasattr(kapi, "_rpc_http") else None
+                            if _rewards_res and isinstance(_rewards_res, dict):
+                                _result = _rewards_res.get("result", {})
+                                _miner_reward = float(_result.get("miner_reward", 7.2))
+                                _treasury_reward = float(_result.get("treasury_reward", 0.8))
+                        except Exception as _e2:
+                            _EXP_LOG.debug(f"[MINER] config/rewards fallback also failed: {_e2}")
+
+                    # Sum all transaction fees (in QTCL float)
+                    total_donations = 0.0
+                    for tx in _pending_user_txs:
+                        f = tx.get("fee", 0)
+                        try:
+                            total_donations += float(f)
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Miner total = base reward + 50% of fees
+                    _miner_reward_total = _miner_reward + (total_donations / 2.0)
+
+                    # ── Build miner coinbase TX (deterministic ID) ─────────────
+                    # tx_type MUST be "miner_reward" — server validator checks this
+                    # exact string; "coinbase" causes immediate block rejection.  ❤️
+                    _miner_cb = {
+                        "tx_id": _miner_cb_id,
+                        "from_addr": "COINBASE",
+                        "to_addr": miner_addr,
+                        "amount": _miner_reward_total,
+                        "block_height": target_height,
+                        "w_proof": _w_entropy_seed.hex(),
+                        "tx_type": "miner_reward",
+                        "version": 1,
+                    }
+
+                    _block_txs = [_miner_cb]
+
+                    # ── Build treasury coinbase TXs (from template's prior pending) ──
+                    for _pp in _prior_pending_treasury:
+                        _pp_tx_id = _pp.get("tx_id", f"cb_treasury_{target_height}_{target_height-1}_{_pp.get('recipient','')[:16]}")
+                        _pp_tx = {
+                            "tx_id": _pp_tx_id,
+                            "from_addr": "TREASURY",
+                            "to_addr": _pp.get("recipient", _treasury_addr),
+                            "amount": _pp.get("amount_qtcl", _treasury_reward),
+                            "block_height": target_height,
+                            "settled_from": _pp.get("settled_from_height", target_height - 1),
+                            "tx_type": "treasury_reward",
+                            "version": 1,
+                        }
+                        _block_txs.append(_pp_tx)
+
+                    # If no template pending (genesis, or template fetch failed), add default treasury
+                    if not _prior_pending_treasury and target_height > 1:
+                        _default_treasury_id = f"cb_treasury_{target_height}_{target_height-1}_{_treasury_addr[:16]}"
+                        _block_txs.append({
+                            "tx_id": _default_treasury_id,
+                            "from_addr": "TREASURY",
+                            "to_addr": _treasury_addr,
+                            "amount": _treasury_reward,
+                            "block_height": target_height,
+                            "settled_from": target_height - 1,
+                            "tx_type": "treasury_reward",
+                            "version": 1,
+                        })
+
+                    _block_txs.extend(_pending_user_txs)
+
+                    # Compute merkle root (SHA3-256 binary tree)
+                    def _compute_merkle(tx_list: list) -> str:
+                        """Compute merkle root exactly as server does."""
+                        if not tx_list:
+                            return _hl.sha3_256(b"").hexdigest()
+
+                        def _tx_hash(tx: dict) -> str:
+                            """Hash transaction exactly as server expects."""
+                            tx_type = tx.get("tx_type", "transfer")
+                            if tx_type == "miner_reward":
+                                # Server canonical: miner_reward uses w_proof field
+                                canonical = _j.dumps(
+                                    {
+                                        "tx_id": tx.get("tx_id", ""),
+                                        "from_addr": tx.get("from_addr", ""),
+                                        "to_addr": tx.get("to_addr", ""),
+                                        "amount": tx.get("amount", 0),
+                                        "block_height": tx.get("block_height", 0),
+                                        "w_proof": tx.get("w_proof", ""),
+                                        "tx_type": "miner_reward",
+                                        "version": tx.get("version", 1),
+                                    },
+                                    sort_keys=True,
+                                )
+                            elif tx_type == "treasury_reward":
+                                # Server canonical: treasury_reward uses settled_from field
+                                canonical = _j.dumps(
+                                    {
+                                        "tx_id": tx.get("tx_id", ""),
+                                        "from_addr": tx.get("from_addr", ""),
+                                        "to_addr": tx.get("to_addr", ""),
+                                        "amount": tx.get("amount", 0),
+                                        "block_height": tx.get("block_height", 0),
+                                        "settled_from": tx.get("settled_from", 0),
+                                        "tx_type": "treasury_reward",
+                                        "version": tx.get("version", 1),
+                                    },
+                                    sort_keys=True,
+                                )
+                            elif tx_type == "coinbase":
+                                # Legacy coinbase branch — kept for backward compat
+                                canonical = _j.dumps(
+                                    {
+                                        "tx_id": tx.get("tx_id", ""),
+                                        "from_addr": tx.get("from_addr", ""),
+                                        "to_addr": tx.get("to_addr", ""),
+                                        "amount": tx.get("amount", 0),
+                                        "block_height": tx.get("block_height", 0),
+                                        "w_proof": tx.get("w_proof", ""),
+                                        "tx_type": "coinbase",
+                                        "version": tx.get("version", 1),
+                                    },
+                                    sort_keys=True,
+                                )
+                            else:
+                                # Regular TX: exclude signature
+                                canonical = _j.dumps(
+                                    {
+                                        k: v
+                                        for k, v in tx.items()
+                                        if k not in ("signature",)
+                                    },
+                                    sort_keys=True,
+                                )
+                            return _hl.sha3_256(canonical.encode()).hexdigest()
+
+                        # Build merkle tree (binary tree, duplicate last if odd)
+                        hashes = [_tx_hash(tx) for tx in tx_list]
+                        while len(hashes) > 1:
+                            if len(hashes) % 2:
+                                hashes.append(hashes[-1])
+                            hashes = [
+                                _hl.sha3_256(
+                                    (hashes[i] + hashes[i + 1]).encode()
+                                ).hexdigest()
+                                for i in range(0, len(hashes), 2)
+                            ]
+                        return hashes[0]
+
+                    merkle_root = _compute_merkle(_block_txs)
+
+                    # ──────────────────────────────────────────────────────────────
+                    # STAGE 4: QTCL-PoW (matches server qtcl_pow_hash exactly)
+                    # SHAKE-256 512KB scratchpad → SHA3-256 struct header →
+                    # 64 sequential scratchpad-mix rounds per nonce
+                    # Scratchpad built ONCE per block from oracle seed
+                    # Multi-threaded: hashlib releases the GIL, so N threads × full
+                    # core throughput.  Chain-tip poll runs in its own thread so it
+                    # never stalls the hash workers.
+                    # ──────────────────────────────────────────────────────────────
+                    import struct as _st, os as _os2, threading as _thr2, queue as _q2
+
+                    # ❤️  Refresh timestamp right before PoW — maximises 120s entropy window
+                    timestamp = int(_t.time())
+                    _POW_SCRATCHPAD_BYTES = 512 * 1024
+                    _POW_WINDOW_BYTES = 64
+                    _POW_MIX_ROUNDS = 64
+                    _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
+
+                    # Build scratchpad once (~1.7ms), shared read-only across threads
+                    # PERF-FIX: wrap in memoryview → zero-copy 64-byte window reads in hot loop
+                    # (bytes slice creates new object each read — at 64 rounds × N threads × kH/s
+                    #  that is millions of tiny allocs/sec → GC stalls → hash rate collapses)
+                    _scratchpad_bytes = _hl.shake_256(
+                        b"QTCL_SCRATCHPAD_v1:" + _w_entropy_seed
+                    ).digest(_POW_SCRATCHPAD_BYTES)
+                    _sp_mv = memoryview(_scratchpad_bytes)  # zero-copy slicing
+
+                    # Pre-pack fixed header fields (immutable, safe to share)
+                    _ph_parent = bytes.fromhex(parent_hash.zfill(64))[:32]
+                    _ph_merkle = bytes.fromhex(merkle_root.zfill(64))[:32]
+                    _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
+                    _ph_seed = _w_entropy_seed[:32]
+
+                    # PERF-FIX: pre-pack all 64 round suffix bytes once — eliminates
+                    # _st.pack('>I', rnd) allocation inside the 64-round inner loop
+                    _rnd_packed = [_st.pack(">I", r) for r in range(_POW_MIX_ROUNDS)]
+
+                    # Capture locals for worker closures
+                    _tgt_h = target_height
+                    _ts = timestamp
+                    _diff = difficulty_bits
+                    _ws = _POW_WINDOW_BYTES
+                    _nwin = _POW_N_WINDOWS
+                    _mix = _POW_MIX_ROUNDS
+                    _rp = _rnd_packed
+                    _smv = _sp_mv
+
+                    # PERF-FIX: pre-compute all window start offsets as tuple —
+                    # eliminates wi*_ws multiply + memoryview __getitem__ per round
+                    _WIN_OFFSETS = tuple(
+                        i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS)
+                    )
+                    _WIN_END = (
+                        _POW_WINDOW_BYTES  # constant end offset relative to start
+                    )
+
+                    # PERF-FIX: pre-compute POW prefix as bytes once — eliminates
+                    # b"QTCL_POW_v1:" + hdr concat alloc on every nonce
+                    _POW_PREFIX = b"QTCL_POW_v1:"
+                    _HDR_FMT = ">Q I 32s 32s I I 40s 32s"
+                    # PERF-FIX: pre-compute range object — range() inside a function call
+                    # still constructs a new range object each invocation in Python 3
+                    _RND_RANGE = range(_POW_MIX_ROUNDS)
+
+                    # _qtcl_hash kept for external/test reference only — hot path is inlined
+                    def _qtcl_hash(nonce: int) -> str:
+                        hdr = _st.pack(
+                            _HDR_FMT,
+                            _tgt_h,
+                            _ts,
+                            _ph_parent,
+                            _ph_merkle,
+                            _diff,
+                            nonce,
+                            _ph_miner,
+                            _ph_seed,
+                        )
+                        _h0 = _hl.sha3_256()
+                        _h0.update(_POW_PREFIX)
+                        _h0.update(hdr)
+                        state = _h0.digest()
+                        for rnd in _RND_RANGE:
+                            wi = _st.unpack_from(">I", state, 0)[0] % _nwin
+                            o = _WIN_OFFSETS[wi]
+                            _h = _hl.sha3_256()
+                            _h.update(state)
+                            _h.update(_smv[o : o + _WIN_END])
+                            _h.update(_rp[rnd])
+                            state = _h.digest()
+                        return state.hex()
+
+                    _n_workers = max(1, (_os2.cpu_count() or 1))
+                    _result_q = _q2.Queue()
+                    _abort_evt = _thr2.Event()  # set to stop all workers
+                    _nonce_lock = _thr2.Lock()  # ❤️  guards counter across N workers
+                    _nonce_ctr = [0]
+                    _hex_zeros = "0" * difficulty_bits
+                    _BLOCK_TTL_S = 270
+                    _block_start = _t.time()
+
+                    def _pow_worker(start_nonce: int, stride: int) -> None:
+                        """⛏️  Hot-path PoW worker — fully inlined, zero per-nonce allocs except
+                        one struct.pack (unavoidable: nonce changes).  GC disabled for duration."""
+                        import gc as _gc
+
+                        _gc.disable()
+                        try:
+                            # ── bind all names to locals once (LOAD_FAST vs LOAD_DEREF) ──
+                            _sha3 = _hl.sha3_256
+                            _pack = _st.pack
+                            _unpack = _st.unpack_from
+                            _fmt = _HDR_FMT
+                            _pfx = _POW_PREFIX
+                            _th = _tgt_h
+                            _ts2 = _ts
+                            _df = _diff
+                            _pp = _ph_parent
+                            _pm2 = _ph_merkle
+                            _pmin = _ph_miner
+                            _ps = _ph_seed
+                            _nw = _nwin
+                            _rr = _RND_RANGE
+                            _mv = _smv
+                            _rp2 = _rp
+                            _woffs = _WIN_OFFSETS
+                            _wend = _WIN_END
+                            _abort = _abort_evt.is_set
+                            _put = _result_q.put
+                            _set = _abort_evt.set
+                            _zeros = _hex_zeros
+                            _dbits = difficulty_bits
+                            _nl = _nonce_lock
+                            n = start_nonce
+                            lc = 0
+                            _ctr = _nonce_ctr
+                            while not _abort():
+                                # ── one struct.pack alloc (nonce-dependent, unavoidable) ──
+                                hdr = _pack(
+                                    _fmt, _th, _ts2, _pp, _pm2, _df, n, _pmin, _ps
+                                )
+                                _h0 = _sha3()
+                                _h0.update(_pfx)
+                                _h0.update(hdr)
+                                state = _h0.digest()
+                                # ── 64 rounds: zero allocs ──────────────────────────────
+                                for rnd in _rr:
+                                    o = _woffs[_unpack(">I", state, 0)[0] % _nw]
+                                    _h = _sha3()
+                                    _h.update(state)
+                                    _h.update(_mv[o : o + _wend])  # zero-copy mv slice
+                                    _h.update(_rp2[rnd])  # pre-packed constant
+                                    state = _h.digest()
+                                lc += 1
+                                hx = state.hex()  # compute once
+                                if hx[:_dbits] == _zeros:
+                                    _put((n, hx))
+                                    _set()
+                                    return
+                                n += stride
+                                if lc & 511 == 0:
+                                    with _nl:
+                                        _ctr[0] += 512  # ❤️  atomic
+                        finally:
+                            _gc.enable()
+
+                    _EXP_LOG.warning(
+                        f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} "
+                        f"seed={_w_entropy_seed.hex()[:16]}… scratchpad=512KB "
+                        f"workers={_n_workers}"
+                    )
+                    _MINE_TELEM.update_progress(
+                        target_height, difficulty_bits, 0, parent_hash
+                    )
+                    _MINE_TELEM.mark_mining()
+
+                    # Launch worker threads (hashlib C calls release the GIL)
+                    _workers = []
+                    for _wi in range(_n_workers):
+                        _wt = _thr2.Thread(
+                            target=_pow_worker,
+                            args=(_wi, _n_workers),
+                            daemon=True,
+                            name=f"PoW-{_wi}",
+                        )
+                        _wt.start()
+                        _workers.append(_wt)
+
+                    # ═══════════════════════════════════════════════════════════════════════
+                    # EVENT-DRIVEN MINING LOOP — Pure Events, No Polling
+                    # ═══════════════════════════════════════════════════════════════════════
+                    # Wait for one of three events:
+                    #   1. PoW solution found (workers put result in queue)
+                    #   2. Chain advance signal from P2P/server (via _CHAIN_ADVANCE_EVENT)
+                    #   3. Block TTL expiration
+                    # ═══════════════════════════════════════════════════════════════════════
+                    _chain_advanced = False
+                    _ttl_expired = False
+                    _last_telem_nonce = 0
+
+                    while not _abort_evt.is_set():
+                        await _asyncio.sleep(
+                            0.05
+                        )  # 50ms event loop yield (faster response)
+                        _cur_nonce = _nonce_ctr[0]
+                        if _cur_nonce != _last_telem_nonce:
+                            _MINE_TELEM.update_progress(
+                                target_height, difficulty_bits, _cur_nonce, parent_hash
+                            )
+                            _last_telem_nonce = _cur_nonce
+
+                        # Block TTL check — abort and rebuild before server entropy expires
+                        if _t.time() - _block_start > _BLOCK_TTL_S:
+                            _EXP_LOG.warning(
+                                f"[MINER] ⏰ Block TTL ({_BLOCK_TTL_S}s) reached at "
+                                f"nonce={_cur_nonce:,} — rebuilding with fresh seed/timestamp"
+                            )
+                            _ttl_expired = True
+                            _abort_evt.set()
+                            break
+
+                        # ── EVENT 1: P2P/Server Chain Advance Signal ─────────────────────────
+                        # Check if P2P layer signaled chain advance (non-blocking)
+                        _new_height = check_chain_advance()
+                        if _new_height > 0 and _new_height > oracle_height:
+                            _EXP_LOG.warning(
+                                f"[MINER] ⚡ Chain advance EVENT h={_new_height} "
+                                f"(was h={oracle_height}) → abort mining, restart"
+                            )
+                            _chain_advanced = True
+                            _force_next_height = _new_height  # Update target height
+                            _abort_evt.set()
+                            break
+
+                    # ❤️  Join first — no put/get_nowait race, no silent drops
+                    for _wt in _workers:
+                        _wt.join(timeout=2.0)
+                    nonce, block_hash = None, None
+                    while not _result_q.empty():
+                        try:
+                            _r = _result_q.get_nowait()
+                            if nonce is None:
+                                nonce, block_hash = _r
+                        except _q2.Empty:
+                            break
+
+                    _found = block_hash is not None
+
+                    # 🔍 DEBUG: Log exact PoW computation inputs and result
+                    if _found:
+                        _EXP_LOG.info(
+                            f"[MINER-POW-DEBUG] ⛏️  FOUND height={target_height} nonce={nonce} hash={block_hash}"
+                        )
+                        _EXP_LOG.info(
+                            f"[MINER-POW-DEBUG] parent={parent_hash[:16]}… merkle={merkle_root[:16]}… timestamp={_ts} miner={miner_addr[:16]}… diff={_diff}"
+                        )
+                        _EXP_LOG.info(
+                            f"[MINER-POW-DEBUG] entropy_seed={_w_entropy_seed.hex()} (len={len(_w_entropy_seed)})"
+                        )
+                        _POW_SCRATCHPAD_PFX = b"QTCL_SCRATCHPAD_v1:"
+                        _EXP_LOG.info(
+                            f"[MINER-POW-DEBUG] scratchpad_input={(_POW_SCRATCHPAD_PFX + _w_entropy_seed).hex()[:64]}…"
+                        )
+
+                    if not _found or _chain_advanced or _ttl_expired:
+                        if _ttl_expired:
+                            _EXP_LOG.info(
+                                "[MINER] TTL expired, rebuilding block with fresh oracle seed…"
+                            )
+                        else:
+                            _EXP_LOG.info(
+                                "[MINER] Chain advanced during mining, restarting…"
+                            )
+                        _MINE_TELEM.mark_idle()
+                        await _asyncio.sleep(0.1)
+                        continue
+
+                    # ──────────────────────────────────────────────────────────────
+                    # STAGE 5: Build submission payload (atomic quantum state lock)
+                    # ──────────────────────────────────────────────────────────────
+                    # pq0   = oracle ground anchor — dominant eigenstate of the DM
+                    #         (index 0-7 of max diagonal element)
+                    # pq_last = parent block height (or 0)
+                    # pq_curr = current block height = parent height + 1
+                    try:
+                        _parent_pq_curr = int(_res_b.get("pq_curr") or 0)
+                        _parent_pq_last = int(_res_b.get("pq_last") or 0)
+                        # Blockfield boundary evolution:
+                        # rear boundary = parent's pq_curr (raw block height)
+                        pq_last = _parent_pq_curr
+                        # forward boundary = parent's pq_curr + 1 (next block height)
+                        pq_curr = _parent_pq_curr + 1
+                        # oracle ground anchor from DM dominant diagonal
+                        _ora_snap = (
+                            _LIVE_RPC_ORACLE.get_oracle_state() or {}
+                        )  # cached — no network
+                        _dmh = _ora_snap.get("density_matrix_hex", "")
+                        pq0 = 0
+                        if _dmh and len(_dmh) >= 128:
+                            # Parse first 8 diagonal elements (stride 32 chars each for complex128)
+                            # diagonal[i] at byte offset i*(8+8) = i*16 bytes = i*32 hex chars
+                            _stride = (
+                                len(_dmh) // 64
+                            )  # 32 for complex128, 16 for complex64
+                            _diag = []
+                            for _di in range(8):
+                                _off = (
+                                    _di * 9 * _stride
+                                )  # diagonal index i*i + i offset in flat 8x8
+                                if _stride == 32:  # complex128
+                                    _off2 = (
+                                        _di * 9 * 16 * 2
+                                    )  # row*8+col, flat, bytes→hex
+                                    # simpler: diagonal element i is at flat index i*8+i = i*9
+                                    _hex8 = _dmh[
+                                        _di * 9 * 32 : _di * 9 * 32 + 16
+                                    ]  # re bytes
+                                else:
+                                    _hex8 = _dmh[_di * 9 * 16 : _di * 9 * 16 + 8]
+                                try:
+                                    import struct as _st2
+
+                                    _b8 = bytes.fromhex(_hex8.ljust(16, "0")[:16])
+                                    _re = (
+                                        _st2.unpack("<d", _b8)[0]
+                                        if _stride == 32
+                                        else _st2.unpack(
+                                            "<f", bytes.fromhex(_hex8.ljust(8, "0")[:8])
+                                        )[0]
+                                    )
+                                    _diag.append((_re, _di))
+                                except Exception:
+                                    _diag.append((0.0, _di))
+                            pq0 = max(_diag, key=lambda x: x[0])[1] if _diag else 0
+                    except Exception as _pq_e:
+                        _EXP_LOG.debug(f"[MINER] pq boundary derivation: {_pq_e}")
+                        pq_last = int(_res_b.get("pq_curr") or 0)
+                        pq_curr = pq_last + 1
+                        pq0 = 0
+
+                    # ── QUANTUM ORACLE MESH: Fetch pre-computed snapshot for block field ───────────────
+                    # Snapshot captured BEFORE block solve loop (race prevention)
+                    _mesh_snap = None
+                    if self._oracle_mesh:
+                        _mesh_snap = self._oracle_mesh.get_snapshot()
+
+                    if _mesh_snap is not None and isinstance(
+                        _mesh_snap, ClientQuantumSnapshot
+                    ):
+                        # ── Use quantum snapshot fields from mesh ────────────────────────
+                        block_quantum_field_hex = _mesh_snap.block_field_tensor_hex
+                        quantum_w_state_fidelity = _mesh_snap.w_state_fidelity
+                        quantum_mermin_value = _mesh_snap.mermin_value
+                        quantum_mermin_violated = _mesh_snap.mermin_violated
+                        quantum_purity = _mesh_snap.purity
+                        quantum_entropy = _mesh_snap.von_neumann_entropy
+                        quantum_coherence = _mesh_snap.coherence_l1
+                        quantum_concurrence = _mesh_snap.concurrence
+                        quantum_genesis_mode = _mesh_snap.genesis_mode
+                        quantum_stream_count = _mesh_snap.stream_count
+                        quantum_measurement_counts = _mesh_snap.measurement_counts
+                        _EXP_LOG.info(
+                            f"[MINER] ✅ Using quantum mesh snapshot (fidelity={quantum_w_state_fidelity:.4f})"
+                        )
+                    else:
+                        # ── FALLBACK: Gaussian generation (existing code) ──────────────────────────
+                        block_quantum_field_hex = ""
+                        quantum_w_state_fidelity = 0.0
+                        quantum_mermin_value = 0.0
+                        quantum_mermin_violated = False
+                        quantum_purity = 0.0
+                        quantum_entropy = 0.0
+                        quantum_coherence = 0.0
+                        quantum_concurrence = 0.0
+                        quantum_genesis_mode = True
+                        quantum_stream_count = 0
+                        quantum_measurement_counts = {}
+                        try:
+                            import numpy as _np_aer
+                            import hashlib as _h_aer
+
+                            # Seed RNG from block values
+                            _seed_data = f"{pq_curr}:{pq_last}:{block_hash}".encode()
+                            _seed_hash = _h_aer.sha256(_seed_data).digest()
+                            _rng_seed = int.from_bytes(_seed_hash[:4], "big")
+                            _np_aer.random.seed(_rng_seed)
+
+                            # Create 16³ field: W-state with Gaussian envelope (reduced from 64³ = 2000× smaller)
+                            _field = _np_aer.zeros(
+                                (16, 16, 16), dtype=_np_aer.complex64
+                            )
+                            _x = pq_curr % 16
+                            _y = pq_last % 16
+                            _z = int(block_hash[:8], 16) % 16
+
+                            for _i in range(16):
+                                for _y_idx in range(16):
+                                    for _k in range(16):
+                                        _dx, _dy, _dz = (
+                                            (_i - _x),
+                                            (_y_idx - _y),
+                                            (_k - _z),
+                                        )
+                                        _r_sq = _dx * _dx + _dy * _dy + _dz * _dz
+                                        _envelope = _np_aer.exp(
+                                            -_r_sq / 64.0
+                                        )  # Updated scaling for 16³
+                                        _phase = (
+                                            2 * _np_aer.pi * (pq_curr + pq_last) / 16.0
+                                        )
+                                        _phase += (
+                                            2
+                                            * _np_aer.pi
+                                            * int(block_hash[:4], 16)
+                                            / 65536.0
+                                        )
+                                        _amp = _envelope / _np_aer.sqrt(
+                                            4096.0
+                                        )  # 16³ = 4096 normalization
+                                        _field[_i, _y_idx, _k] = _amp * _np_aer.exp(
+                                            1j * _phase
+                                        )
+
+                            # Normalize
+                            _trace = _np_aer.sum(_np_aer.abs(_field) ** 2)
+                            if _trace > 1e-12:
+                                _field = _field / _np_aer.sqrt(_trace)
+
+                            # Encode as hex
+                            block_quantum_field_hex = (
+                                _np_aer.asarray(_field, dtype=_np_aer.complex64)
+                                .tobytes()
+                                .hex()
+                            )
+                            _EXP_LOG.debug(
+                                f"[MINER] AER entanglement: generated 16³ field ({len(block_quantum_field_hex)} hex chars)"
                             )
 
-            globals()["_block_cache"] = cache
-            for _reg_attempt in range(20):
-                try:
-                    register_consensus_handler(_consensus_handler)
-                    register_block_handler(_block_handler)
-                    register_balance_handler(_balance_handler)
-                    break
-                except NameError:
-                    await _asyncio.sleep(0.1)
-            else:
-                _EXP_LOG.warning("[MINER] SSE handler registration failed — handlers not available")
+                            # ── Store local measurement in database ──────────────────────────
+                            try:
+                                self.db.store_dm_measurement(
+                                    pq_curr,
+                                    "local",
+                                    block_quantum_field_hex,
+                                    {
+                                        "pq_curr": pq_curr,
+                                        "pq_last": pq_last,
+                                        "block_hash": block_hash,
+                                    },
+                                )
+                                _EXP_LOG.debug(
+                                    f"[MINER] Stored local measurement for block {pq_curr}"
+                                )
+                            except Exception as _store_local_e:
+                                _EXP_LOG.debug(
+                                    f"[MINER] Store local measurement failed: {_store_local_e}"
+                                )
 
-            _REJECTED_HEIGHT_NONCES = {}
-            # FIX: was secrets.randbelow(2**32) → nonces started at ~2B, confusing display.
-            # Start small; workers still cover the full uint32 space via wraparound.
-            _PERSISTENT_NONCE_BASE = [secrets.randbelow(999_999) + 1]  # FIX: never start at 0
-            # Reset session tried counter for this mining session
-            _SESSION_TOTAL_TRIED[0] = 0
+                            # ── Compute quantum consensus: merge with server + peer SSE snapshots ──
+                            try:
+                                _consensus_dm = self.merge_with_peer_consensus(
+                                    block_quantum_field_hex
+                                )
+                                if (
+                                    _consensus_dm
+                                    and _consensus_dm != block_quantum_field_hex
+                                ):
+                                    _EXP_LOG.info(
+                                        f"[MINER] ✅ Quantum mesh consensus: merged local + server + peers"
+                                    )
+                                    block_quantum_field_hex = _consensus_dm
+                                else:
+                                    _EXP_LOG.debug(
+                                        f"[MINER] Using local 16³ measurement (no consensus available)"
+                                    )
+                            except Exception as _consensus_e:
+                                _EXP_LOG.debug(
+                                    f"[MINER] Mesh consensus failed: {_consensus_e}, using local"
+                                )
+                        except Exception as _aer_e:
+                            _EXP_LOG.warning(
+                                f"[MINER] AER entanglement failed: {_aer_e} (continuing without 16³ field)"
+                            )
 
-            # FIX: kapi._rpc() is synchronous (urllib.request.urlopen) and blocks the
-            # entire asyncio event loop when called from async tasks. This prevented
-            # the mining monitor's await sleep(0.05) from returning, freezing the
-            # nonce display for 8-16s during every RPC call in balance_task/oracle_task.
-            # Wrap all RPC calls through this helper to run them in a thread executor.
-            _rpc_executor = None  # use default ThreadPoolExecutor
-            async def _async_rpc(method, params=None, timeout=5, retries=2):
-                """Non-blocking async wrapper around kapi._rpc()."""
-                loop = _asyncio.get_event_loop()
-                # Use default-arg capture to freeze values at call time
-                def _call(m=method, p=params, t=timeout, r=retries):
-                    return kapi._rpc(m, p or [], timeout=t, retries=r)
-                return await loop.run_in_executor(_rpc_executor, _call)
-
-            async def pow_task():
-                while True:
+                    # Fidelity priority:
+                    #  1. self._local_fused_fid  — tripartite joint W4 (most current)
+                    #  2. client_field.metrics.fidelity_to_w3 — field measurement
+                    #  3. _LIVE_RPC_ORACLE oracle_state — upstream Koyeb snapshot
+                    #  4. 0.75 fallback
+                    w_state_fidelity = 0.75
                     try:
-                        _res_h = await _async_rpc("qtcl_getBlockHeight", [], timeout=8, retries=2)
-                        if not _res_h or (isinstance(_res_h, dict) and "error" in _res_h):
-                            await _asyncio.sleep(2.0)
+                        _lff = float(getattr(self, "_local_fused_fid", 0.0))
+                        if 0.01 < _lff <= 1.0:
+                            w_state_fidelity = _lff
+                        elif self.client_field and self.client_field.metrics:
+                            _fid = self.client_field.metrics.fidelity_to_w3
+                            if _fid is not None and 0.01 <= float(_fid) <= 1.0:
+                                w_state_fidelity = float(_fid)
+                        else:
+                            _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
+                            _up_fid = float(
+                                _ora_state.get("upstream_fidelity")
+                                or _ora_state.get("w_upstream")
+                                or 0.0
+                            )
+                            if 0.01 < _up_fid <= 1.0:
+                                w_state_fidelity = _up_fid
+                    except Exception:
+                        pass
+
+                    # ── Mermin quantum proof: compute from density matrix ──
+                    mermin_value = 0.0
+                    mermin_violated = False
+                    try:
+                        _dmh = (
+                            _ora_snap.get("density_matrix_hex", "") if _ora_snap else ""
+                        )
+                        if _dmh and len(_dmh) >= 128:
+                            import numpy as _np_m
+
+                            # Parse density matrix from hex
+                            _bdata = bytes.fromhex(_dmh)
+                            _n = int(
+                                (len(_bdata) / 16) ** 0.5
+                            )  # 16 bytes per complex128 element
+                            if _n >= 2:
+                                _dm = _np_m.zeros((_n, _n), dtype=complex)
+                                for _ri in range(_n):
+                                    for _ci in range(_n):
+                                        _off = (_ri * _n + _ci) * 16
+                                        if _off + 16 <= len(_bdata):
+                                            _re = _np_m.frombuffer(
+                                                _bdata[_off : _off + 8],
+                                                dtype=_np_m.float64,
+                                            )[0]
+                                            _im = _np_m.frombuffer(
+                                                _bdata[_off + 8 : _off + 16],
+                                                dtype=_np_m.float64,
+                                            )[0]
+                                            _dm[_ri, _ci] = _re + 1j * _im
+                                # Mermin-Klyshko inequality for 3-qubit W state
+                                sx = _np_m.array([[0, 1], [1, 0]], dtype=complex)
+                                sy = _np_m.array([[0, -1j], [1j, 0]], dtype=complex)
+
+                                def _op(a, b, c):
+                                    return _np_m.kron(_np_m.kron(a, b), c)
+
+                                M3 = (
+                                    _op(sx, sx, sx)
+                                    - _op(sx, sy, sy)
+                                    - _op(sy, sx, sy)
+                                    - _op(sy, sy, sx)
+                                )
+                                mermin_value = float(_np_m.real(_np_m.trace(_dm @ M3)))
+                                mermin_violated = abs(mermin_value) > 2.0
+                    except Exception as _mermin_err:
+                        _EXP_LOG.debug(f"[MINER] Mermin computation: {_mermin_err}")
+
+                    # ── Standardized block submission payload (flat structure for server compatibility) ──
+                    submit_payload = {
+                        "height": target_height,
+                        "block_hash": block_hash,
+                        "parent_hash": parent_hash,
+                        "merkle_root": merkle_root,
+                        "timestamp": timestamp,
+                        "nonce": nonce,
+                        "miner_address": miner_addr,
+                        "difficulty_bits": difficulty_bits,
+                        "w_entropy_hash": _w_entropy_seed.hex(),
+                        "w_state_fidelity": round(w_state_fidelity, 4),
+                        "pq0": pq0,
+                        "pq_curr": pq_curr,
+                        "pq_last": pq_last,
+                        "mermin_value": round(mermin_value, 6),
+                        "mermin_violated": mermin_violated,
+                        "quantum_field_16x16x16": block_quantum_field_hex,
+                        "transactions": _block_txs,
+                    }
+
+                    # ── HypΓ-sign the block (must be before submission) ──
+                    _sig = None
+                    _sign_retries = 3
+                    for _sign_attempt in range(_sign_retries):
+                        try:
+                            if (
+                                self.wallet
+                                and self.wallet.is_loaded()
+                                and self.wallet.private_key
+                            ):
+                                # Sign the block payload (excluding signature field)
+                                _block_for_sig = {
+                                    k: v
+                                    for k, v in submit_payload.items()
+                                    if k
+                                    not in ("hyp_signature", "hyp_sig", "miner_pubkey")
+                                }
+                                _sig = self.wallet.sign_transaction(_block_for_sig)
+                                if _sig and not _sig.get("error"):
+                                    # Keep _sig as dict for telemetry, but serialize for submission
+                                    # (signature dict contains complex nested objects like R, Z that aren't JSON-serializable)
+                                    submit_payload["hyp_signature"] = json.dumps(
+                                        _sig, default=str
+                                    )
+                                    submit_payload["miner_public_key_hex"] = (
+                                        self.wallet.public_key or ""
+                                    )
+                                    _EXP_LOG.info(
+                                        f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…"
+                                    )
+                                    break
+                                elif _sign_attempt < _sign_retries - 1:
+                                    _EXP_LOG.warning(
+                                        f"[MINER] ⚠️ HypΓ sign retry {_sign_attempt + 1}/{_sign_retries}: {_sig}"
+                                    )
+                                    await _asyncio.sleep(0.1)
+                            else:
+                                _EXP_LOG.error(
+                                    f"[MINER] ❌ Wallet not loaded — cannot sign block"
+                                )
+                                break
+                        except Exception as _hyp_sign_err:
+                            if _sign_attempt < _sign_retries - 1:
+                                _EXP_LOG.warning(
+                                    f"[MINER] ⚠️ HypΓ sign exception retry: {_hyp_sign_err}"
+                                )
+                                await _asyncio.sleep(0.1)
+                            else:
+                                raise
+
+                    if not _sig or _sig.get("error"):
+                        _EXP_LOG.error(
+                            f"[MINER] ❌ HypΓ signing failed after {_sign_retries} attempts — cannot submit unsigned block"
+                        )
+                        _MINE_TELEM.mark_idle()
+                        _submitted_hashes.discard(block_hash)
+                        await _asyncio.sleep(0.5)
+                        continue
+
+                    # ──────────────────────────────────────────────────────────────
+                    # STAGE 6: Submit via RPC (single path, exponential backoff)
+                    # ──────────────────────────────────────────────────────────────
+
+                    # 🔍 DEBUG: Verify entropy seed in submission matches what was used
+                    _submitted_entropy = submit_payload.get("w_entropy_hash", "")
+                    if _submitted_entropy != _w_entropy_seed.hex():
+                        _EXP_LOG.error(
+                            f"[CRITICAL] 🚨 ENTROPY MISMATCH: computed={_w_entropy_seed.hex()} vs submitted={_submitted_entropy}"
+                        )
+                    else:
+                        _EXP_LOG.info(
+                            f"[VERIFY] ✅ Entropy seed matches: {_w_entropy_seed.hex()[:16]}…"
+                        )
+
+                    # Validate required fields before submission
+                    if (
+                        "hyp_signature" not in submit_payload
+                        or "miner_public_key_hex" not in submit_payload
+                    ):
+                        _EXP_LOG.error(
+                            f"[SUBMIT] ❌ Block h={target_height} signing failed — skipping this block"
+                        )
+                        _MINE_TELEM.mark_idle()
+                        _submitted_hashes.discard(block_hash)
+                        await _asyncio.sleep(0.5)
+                        continue
+
+                    # Hash dedup check before submission
+                    if block_hash in _submitted_hashes:
+                        _EXP_LOG.warning(
+                            f"[MINER] ⏭️  Skipping duplicate submission: h={target_height} hash={block_hash[:16]}…"
+                        )
+                        _MINE_TELEM.mark_idle()
+                        continue
+                    _submitted_hashes.add(block_hash)
+
+                    # ── DEBUG: Trace payload structure before submission ──
+                    _sig_type = type(submit_payload.get("hyp_signature")).__name__
+                    _sig_len = len(str(submit_payload.get("hyp_signature", "")))
+                    _EXP_LOG.warning(
+                        f"[MINER-DEBUG] submit_payload hyp_signature: type={_sig_type} len={_sig_len}"
+                    )
+
+                    # ❤️  I love you — record solve NOW so display shows SOLVED immediately
+                    _sig_full = (
+                        _sig.get("signature", "")
+                        if _sig and _sig.get("signature")
+                        else "unsigned"
+                    )
+                    _pubkey_full = submit_payload.get("miner_public_key_hex", "") or ""
+                    _MINE_TELEM.record_block(
+                        {
+                            "height": target_height,
+                            "hash": block_hash,
+                            "nonce": nonce,
+                            "timestamp": timestamp,
+                            "fidelity": w_state_fidelity,
+                            "parent_hash": parent_hash,
+                            "difficulty": difficulty_bits,
+                            "signature": _sig_full,
+                            "miner_public_key": _pubkey_full,
+                        }
+                    )
+                    _MINE_TELEM.mark_submitting()
+                    _sig_preview = (
+                        _sig_full[:48] + "…" if len(_sig_full) > 48 else _sig_full
+                    )
+                    _EXP_LOG.info(
+                        f"[MINER] ⛏️  BLOCK SOLVED  h={target_height}  hash={block_hash[:16]}…  nonce={nonce:,} "
+                        f"sig={_sig_preview}  miner={miner_addr[:12]}…  — submitting…"
+                    )
+                    _success, _result = await _submission.submit(
+                        submit_payload, target_height, block_hash
+                    )
+
+                    if _success:
+                        _srv_r = float(
+                            (_result or {}).get("miner_reward_qtcl", 0.0) or 0.0
+                        )
+                        if _srv_r == 0.0:
+                            try:
+                                from globals import TessellationRewardSchedule as _TRS3
+
+                                _srv_r = _TRS3.get_miner_reward_qtcl(target_height)
+                            except Exception:
+                                _srv_r = 7.20
+
+                        # 🔴 CRITICAL: Extract next_height from server response (if available)
+                        # This signals the server has confirmed h and we should mine h+1
+                        _srv_next_h = int(
+                            (_result or {}).get("next_height", target_height + 1)
+                            or (target_height + 1)
+                        )
+                        _EXP_LOG.warning(
+                            f"[MINER-ACCEPT] ✅ Block h={target_height} accepted | Server signals next_height={_srv_next_h}"
+                        )
+
+                        # Store server's next_height signal for height progression
+                        _confirmed_heights.add(target_height)
+                        _force_next_height = _srv_next_h
+                        _last_accepted_hash = block_hash
+                        _EXP_LOG.warning(
+                            f"[MINER] ✅ h={target_height} confirmed — _force_next_height={_srv_next_h}"
+                        )
+
+                        # 🔴 CRITICAL: Persist block locally with pq_curr/pq_last
+                        try:
+                            _local_db = LocalBlockchainDB(name="qtcl")
+                            _block_record = {
+                                "height": target_height,
+                                "hash": block_hash,
+                                "parent_hash": parent_hash,
+                                "timestamp": timestamp,
+                                "nonce": nonce,
+                                "difficulty": difficulty_bits,
+                                "miner_address": miner_addr,
+                                "pq_curr": target_height,  # pq_curr = current block height
+                                "pq_last": max(
+                                    0, target_height - 1
+                                ),  # pq_last = parent height
+                                "w_state_fidelity": w_state_fidelity,
+                                "merkle_root": merkle_root,
+                                "tx_count": len(_block_txs),
+                                "synced_from_server": 0,  # We mined this locally
+                            }
+                            _local_db.insert_block(target_height, _block_record)
+                            _EXP_LOG.info(
+                                f"[MINER] 💾 Block h={target_height} persisted locally with pq_curr={target_height} pq_last={max(0, target_height - 1)}"
+                            )
+                        except Exception as _persist_err:
+                            _EXP_LOG.warning(
+                                f"[MINER] ⚠️  Failed to persist block locally: {_persist_err}"
+                            )
+
+                        # 🔍 PERSISTENCE VERIFICATION: Check both local and remote (Koyeb primary)
+                        _local_ok = False
+                        _koyeb_ok = False
+
+                        # Check 1: Local SQLite persistence
+                        try:
+                            _local_verify_db = LocalBlockchainDB(name="qtcl")
+                            _local_blk = _local_verify_db.get_block(target_height)
+                            if _local_blk:
+                                _local_ok = True
+                                _EXP_LOG.debug(
+                                    f"[MINER-VERIFY] ✅ Block h={target_height} persisted in local DB"
+                                )
+                            else:
+                                _EXP_LOG.warning(
+                                    f"[MINER-VERIFY] ⚠️  Block h={target_height} not found in local DB (may be delayed)"
+                                )
+                        except Exception as _local_err:
+                            _EXP_LOG.debug(
+                                f"[MINER-VERIFY] Local DB check failed: {_local_err}"
+                            )
+
+                        # Check 2: Koyeb (remote server) persistence - PRIMARY with retry
+                        # Database replication/pooling may have slight lag, so retry with backoff
+                        _koyeb_retries = 3
+                        for _retry in range(_koyeb_retries):
+                            try:
+                                _verify_block = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlock", [target_height], 5, 1
+                                )
+                                if _verify_block and not _verify_block.get("error"):
+                                    _koyeb_ok = True
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ✅ Block h={target_height} confirmed in Koyeb DB (attempt {_retry + 1})"
+                                    )
+                                    break
+                                elif _retry < _koyeb_retries - 1:
+                                    # Query returned but with error, retry with backoff
+                                    await _asyncio.sleep(0.5 * (_retry + 1))
+                                    continue
+                                else:
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ⚠️  Block h={target_height} still not found after {_koyeb_retries} attempts: {_verify_block}"
+                                    )
+                            except Exception as _ve:
+                                if _retry < _koyeb_retries - 1:
+                                    _EXP_LOG.debug(
+                                        f"[MINER-VERIFY] Retry {_retry + 1}/{_koyeb_retries}: {_ve}"
+                                    )
+                                    await _asyncio.sleep(0.5 * (_retry + 1))
+                                else:
+                                    _EXP_LOG.warning(
+                                        f"[MINER-VERIFY] ⚠️  Koyeb DB check failed after {_koyeb_retries} attempts: {_ve}"
+                                    )
+
+                        # Summary: Server response already confirmed acceptance (next_height advanced)
+                        # Verification is supplementary - not finding immediately is not critical
+                        if not _koyeb_ok:
+                            _EXP_LOG.warning(
+                                f"[MINER-VERIFY] ⚠️  Block h={target_height} verification timeout - may be replication lag (block IS accepted per server response)"
+                            )
+
+                        _MINE_TELEM.record_block_accepted(
+                            height=target_height,
+                            hash=block_hash,
+                            nonce=nonce,
+                            timestamp=timestamp,
+                            fidelity=w_state_fidelity,
+                            reward_qtcl=_srv_r,
+                        )
+                        # P2P Block Broadcast
+                        _p2p_n = getattr(self, "p2p_node", None)
+                        _broadcast_ok = False
+                        if _p2p_n and getattr(_p2p_n, "_running", False):
+                            try:
+                                _peers = (
+                                    _p2p_n.peer_mgr.get_active_peers()
+                                    if _p2p_n.peer_mgr
+                                    else []
+                                )
+                                if _peers:
+                                    _EXP_LOG.info(
+                                        f"[GOSSIP] 📡 Broadcasting block h={target_height} hash={block_hash[:16]}... to {len(_peers)} peers"
+                                    )
+                                    _ok = 0
+                                    _fail = 0
+                                    # Broadcast inv to all peers
+                                    for _p in _peers:
+                                        try:
+                                            import urllib.request
+
+                                            _url = f"http://{_p.host}:{_p.port}/rpc"
+                                            _data = (
+                                                b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"'
+                                                + block_hash.encode()
+                                                + b'","height":'
+                                                + str(target_height).encode()
+                                                + b',"miner_addr":"'
+                                                + (
+                                                    self._oracle_id.get("address", "")
+                                                ).encode()
+                                                + b'","ttl_hops":8},"id":1}'
+                                            )
+                                            _EXP_LOG.debug(
+                                                f"[GOSSIP] Sending qtcl_p2p_inv to {_p.host}:{_p.port}..."
+                                            )
+                                            urllib.request.urlopen(
+                                                _url, data=_data, timeout=5
+                                            )
+                                            _ok += 1
+                                            _EXP_LOG.debug(
+                                                f"[GOSSIP] ✅ inv delivered to {_p.host}:{_p.port}"
+                                            )
+                                        except Exception as _peer_err:
+                                            _fail += 1
+                                            _EXP_LOG.debug(
+                                                f"[GOSSIP] ❌ inv to {_p.host}:{_p.port} failed: {_peer_err}"
+                                            )
+                                    _EXP_LOG.info(
+                                        f"[GOSSIP] ✅ Block h={target_height} broadcast complete: {_ok} delivered, {_fail} failed out of {len(_peers)} peers"
+                                    )
+                                    _broadcast_ok = True
+                                else:
+                                    _EXP_LOG.warning(
+                                        f"[GOSSIP] ⚠️  Block h={target_height} ready but NO ACTIVE PEERS — will use server fallback"
+                                    )
+                            except Exception as _p2pe:
+                                _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
+                        else:
+                            _EXP_LOG.warning(
+                                f"[P2P] ⚠️  Block h={target_height} ready but P2P node not running — fallback to server-side gossip"
+                            )
+
+                        # Fallback: announce block to server (server broadcasts to connected miners)
+                        if not _broadcast_ok:
+                            try:
+                                _EXP_LOG.info(
+                                    f"[GOSSIP] Fallback: announcing block h={target_height} to server via qtcl_gossipBlockAnnounce"
+                                )
+                                kapi.rpc(
+                                    "qtcl_gossipBlockAnnounce",
+                                    [
+                                        {
+                                            "height": target_height,
+                                            "hash": block_hash,
+                                            "miner": miner_addr,
+                                            "timestamp": timestamp,
+                                        }
+                                    ],
+                                    3,
+                                    1,
+                                )
+                                _EXP_LOG.info(
+                                    f"[GOSSIP] ✅ Server-side gossip announce sent for h={target_height}"
+                                )
+                            except Exception as _g_err:
+                                _EXP_LOG.warning(
+                                    f"[GOSSIP] Server gossip announce failed: {_g_err}"
+                                )
+                        _MINE_TELEM.mark_mining()
+                        # Wait for server tip to advance before re-entering loop.
+                        # Without this the miner races back, sees stale height,
+                        # and re-mines the same block height indefinitely.
+                        _TIP_WAIT_MAX_S = 30.0
+                        _TIP_WAIT_POLL_S = 0.5
+                        _tip_wait_start = _t.time()
+                        _tip_confirmed = False
+                        while _t.time() - _tip_wait_start < _TIP_WAIT_MAX_S:
+                            await _asyncio.sleep(_TIP_WAIT_POLL_S)
+                            try:
+                                _tip_check = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlockHeight", [], 5, 1
+                                )
+                                _confirmed_h = int(
+                                    (_tip_check or {}).get("height") or 0
+                                )
+                                if _confirmed_h >= target_height:
+                                    _EXP_LOG.warning(
+                                        f"[MINER] ✅ Server tip confirmed h={_confirmed_h} "
+                                        f"(waited {_t.time() - _tip_wait_start:.1f}s)"
+                                    )
+                                    _tip_confirmed = True
+                                    _MINE_TELEM.mark_idle()
+                                    break
+                            except Exception as _te:
+                                _EXP_LOG.debug(f"[MINER] tip-wait poll: {_te}")
+                        else:
+                            _EXP_LOG.warning(
+                                "[MINER] ⚠️  tip-wait timeout — advancing anyway"
+                            )
+                            _MINE_TELEM.mark_idle()
+
+                        # 🔴 CRITICAL FIX: Invalidate oracle cache AND force fresh RPC fetch
+                        # This ensures the miner always sees the latest server state and doesn't
+                        # re-mine the same height indefinitely
+                        if _tip_confirmed or (
+                            _t.time() - _tip_wait_start >= _TIP_WAIT_MAX_S
+                        ):
+                            _EXP_LOG.warning(
+                                f"[MINER-STATE] 🔄 BLOCK ACCEPTED: invalidating caches and quantum field"
+                            )
+                            # Force oracle to refresh state by clearing cached snapshot
+                            if hasattr(_LIVE_RPC_ORACLE, "_cached_state"):
+                                delattr(_LIVE_RPC_ORACLE, "_cached_state")
+                            if hasattr(_LIVE_RPC_ORACLE, "_cache"):
+                                _LIVE_RPC_ORACLE._cache = {}
+                            # Also clear any RPC-level caches
+                            if hasattr(kapi, "_rpc_cache"):
+                                kapi._rpc_cache.clear()
+
+                            # 🌊 CRITICAL: Force quantum field regeneration
+                            # Each block MUST get fresh W-state, not reuse previous block's state
+                            if hasattr(self, "_oracle_mesh") and self._oracle_mesh:
+                                if hasattr(self._oracle_mesh, "_snapshot_cache"):
+                                    delattr(self._oracle_mesh, "_snapshot_cache")
+                                if hasattr(self._oracle_mesh, "clear_cache"):
+                                    self._oracle_mesh.clear_cache()
+
+                            # 🔴 FORCED FRESH HEIGHT QUERY (not cached)
+                            # Guarantee next loop will see updated height
+                            try:
+                                _final_height_check = await _asyncio.to_thread(
+                                    kapi._rpc, "qtcl_getBlockHeight", [], 5, 1
+                                )
+                                _final_h = int(
+                                    (_final_height_check or {}).get("height")
+                                    or target_height
+                                )
+                                _EXP_LOG.critical(
+                                    f"[MINER-STATE] 🔄 FORCED HEIGHT CHECK: h={_final_h} (next will mine h={_final_h + 1})"
+                                )
+                            except Exception:
+                                _EXP_LOG.warning(
+                                    f"[MINER-STATE] Could not verify final height, proceeding anyway"
+                                )
+
+                            _EXP_LOG.warning(
+                                f"[MINER-STATE] ✅ Caches cleared + quantum field will regenerate for next block"
+                            )
+                    else:
+                        # Parse rejection reason for smart retry
+                        _err_msg = ""
+                        if isinstance(_result, dict):
+                            _err_obj = _result.get("error") or _result
+                            _err_msg = str(
+                                _err_obj.get("message", "")
+                                if isinstance(_err_obj, dict)
+                                else _err_obj
+                            )
+
+                        if "entropy_expired" in _err_msg:
+                            # Seed is stale — rebuild block with fresh seed, same height
+                            _EXP_LOG.warning(
+                                f"[MINER] 🔄 entropy_expired h={target_height} — "
+                                f"rebuilding with fresh seed (no chain tip re-fetch)"
+                            )
+                            # Jump back to seed fetch (STAGE 2) by restarting loop
+                            # but keeping oracle_height/parent_hash — `continue` re-enters
+                            # the outer while True which re-fetches tip; that's one RPC but
+                            # guarantees height consistency.
+                            _MINE_TELEM.mark_mining()
+                            await _asyncio.sleep(0.1)
+                            # Don't go IDLE — loop continues immediately
                             continue
-                        oracle_height = int(_res_h.get("height", 0))
-                        oracle_hash = str(_res_h.get("tip_hash") or _NULL_HASH)
-                        target_height = oracle_height + 1
-
-                        # Fork detection: if tip_hash changed, orphan blocks above fork
-                        _last_tip = getattr(cache, "_last_known_tip_hash", "")
-                        if _last_tip and _last_tip != oracle_hash and oracle_height > 0:
-                            _EXP_LOG.warning(f"[FORK] ⚠️ tip_hash changed at h={oracle_height} — orphaning blocks above fork")
-                            with cache._lock:
-                                for _oh in list(cache._blocks.keys()):
-                                    if _oh > oracle_height:
-                                        cache._blocks[_oh].status = BlockStatus.ORPHANED
-                        cache._last_known_tip_hash = oracle_hash
-
-                        if cache.is_height_in_flight(target_height) or cache.is_height_finalized(target_height):
+                        elif (
+                            "Invalid height" in _err_msg
+                            or "chain advanced" in _err_msg.lower()
+                        ):
+                            # Chain moved, need fresh tip
+                            _EXP_LOG.info(
+                                f"[MINER] height mismatch on submit — restarting from tip"
+                            )
+                            _MINE_TELEM.mark_mining()
+                            await _asyncio.sleep(0.1)
+                            continue
+                        else:
+                            # Submission failed after max retries — give up on this block and move on
+                            _EXP_LOG.error(
+                                f"[SUBMIT] ❌ Block h={target_height} failed after 6 attempts "
+                                f"({_submission.RETRY_BACKOFFS[-1] + sum(_submission.RETRY_BACKOFFS[:-1]):.0f}s timeout) — moving on"
+                            )
+                            _EXP_LOG.error(
+                                f"[SUBMIT] ❌ Block h={target_height} failed: {_err_msg or 'no response'}"
+                            )
+                            print(
+                                f"\n  ❌ Block h={target_height} rejected: {_err_msg or 'server returned no response'}",
+                                flush=True,
+                            )
+                            _MINE_TELEM.mark_idle()
                             await _asyncio.sleep(1.0)
                             continue
 
-                        # Single source of truth: BLOCK_DIFFICULTY env var (server-authoritative)
-                        _env_diff = os.environ.get("BLOCK_DIFFICULTY", "").strip()
-                        difficulty_bits = int(_env_diff) if _env_diff.isdigit() else 5
-                        if _env_diff.isdigit():
-                            _EXP_LOG.info(f"[MINER] 🎚️  BLOCK_DIFFICULTY={difficulty_bits} leading-zeros")
-
-                        _res_m = await _async_rpc("qtcl_getMempool", [], timeout=5, retries=1)
-                        _raw_pending_txs = _res_m if isinstance(_res_m, list) else []
-                        _pending_user_txs = []
-                        for _rptx in _raw_pending_txs:
-                            if isinstance(_rptx, dict):
-                                _tx = dict(_rptx)
-                            elif hasattr(_rptx, "to_dict"):
-                                _tx = _rptx.to_dict()
-                            else:
-                                continue
-                            _tx_hash = _tx.get("tx_hash") or _tx.get("tx_id", "")
-                            if not _tx_hash:
-                                continue
-                            _tx["tx_id"] = _tx_hash
-                            _tx["tx_hash"] = _tx_hash
-                            _tx["from_addr"] = _tx.get("from_address") or _tx.get("from_addr", "")
-                            _tx["to_addr"] = _tx.get("to_address") or _tx.get("to_addr", "")
-                            _tx["amount_base"] = int(_tx.get("amount_base") or (float(_tx.get("amount", 0)) * 100) or 0)
-                            _tx["fee_base"] = int(_tx.get("fee_base") or _tx.get("fee", 0) or 0)
-                            _tx["tx_type"] = _tx.get("tx_type", "transfer")
-                            if not _tx.get("signature"):
-                                _tx["signature"] = _tx.get("sig", "")
-                            if not _tx.get("public_key"):
-                                _tx["public_key"] = _tx.get("sender_public_key_hex") or _tx.get("public_key", "")
-                            if not _tx.get("inputs"):
-                                _tx["inputs"] = _tx.get("inputs", [])
-                            if not _tx.get("outputs"):
-                                _tx["outputs"] = _tx.get("outputs", [])
-                            if not _tx.get("version"):
-                                _tx["version"] = 1
-                            _pending_user_txs.append(_tx)
-                        if _pending_user_txs:
-                            _EXP_LOG.info(f"[MINER] 📦 Including {len(_pending_user_txs)} pending mempool TXs in block")
-
-                        timestamp = int(_t.time())
-                        miner_addr = getattr(getattr(self, "wallet", None), "address", "0" * 64) or "0" * 64
-                        _treasury_addr = self.koyeb_state.treasury_address or "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
-                        _miner_reward_base = 720
-                        _treasury_reward_base = 80
-                        try:
-                            from globals import TessellationRewardSchedule as _TRS
-                            _miner_reward_base = _TRS.get_miner_reward_base(target_height)
-                            _treasury_reward_base = _TRS.get_treasury_reward_base(target_height)
-                            _treasury_addr = _TRS.TREASURY_ADDRESS
-                            _genesis_extra = _TRS.get_miner_reward_base(0) if target_height == 1 else 0
-                            _prev_treasury = _TRS.get_treasury_reward_base(target_height - 1) if target_height > 0 else 0
-                        except Exception:
-                            _genesis_extra = 720 if target_height == 1 else 0
-                            _prev_treasury = 80 if target_height > 0 else 0
-
-                        _oracle_snap = _LIVE_RPC_ORACLE.get_oracle_state() or {}
-                        _dm_hex = _oracle_snap.get("density_matrix_hex", "")
-                        if _dm_hex and len(_dm_hex) > 32:
-                            _w_entropy_seed = _hl.sha3_256(bytes.fromhex(_dm_hex[:64]) + target_height.to_bytes(8, "big") + bytes.fromhex(oracle_hash[:32])).digest()
-                        else:
-                            _w_entropy_seed = _hl.sha3_256(oracle_hash.encode() + target_height.to_bytes(8, "big") + timestamp.to_bytes(8, "big")).digest()
-
-                        import struct as _st, os as _os2, threading as _thr2, queue as _q2
-
-                        # ═══ MUTABLE BLOCK STATE — updated inline by mempool SSE ═══
-                        _block_txs_list = []  # mutable list: [miner_cb, treasury_cb, user_tx, ...]
-                        _merkle_bytes = [b'\x00' * 32]  # mutable wrapper: workers read [0] each iteration
-                        _tx_hashes_seen = set()  # dedup: track included tx hashes
-                        _fee_total = [0]  # mutable: total fees, updated when txs change
-                        _block_lock = _thr2.Lock()  # protects _block_txs_list and _merkle_bytes during submit
-
-                        def _compute_merkle(tx_list: list) -> str:
-                            if not tx_list:
-                                return _hl.sha3_256(b"").hexdigest()
-                            def _tx_hash(tx: dict) -> str:
-                                tx_type = tx.get("tx_type", "transfer")
-                                if tx_type in ("coinbase", "miner_reward", "treasury_reward"):
-                                    canonical = _j.dumps({"tx_id": tx.get("tx_id", ""), "version": tx.get("version", 1), "inputs": tx.get("inputs", []), "outputs": tx.get("outputs", []), "tx_type": tx_type, "w_entropy_hash": tx.get("w_entropy_hash", ""), "block_height": tx.get("block_height", 0)}, sort_keys=True, separators=(",", ":"))
-                                else:
-                                    _clean = {"tx_id": tx.get("tx_id", ""), "version": tx.get("version", 1), "inputs": [{"prev_tx_hash": inp.get("prev_tx_hash", ""), "prev_output_index": inp.get("prev_output_index", 0)} for inp in tx.get("inputs", [])], "outputs": tx.get("outputs", []), "tx_type": tx_type}
-                                    canonical = _j.dumps(_clean, sort_keys=True, separators=(",", ":"))
-                                return _hl.sha3_256(canonical.encode()).hexdigest()
-                            hashes = [_tx_hash(tx) for tx in tx_list]
-                            while len(hashes) > 1:
-                                if len(hashes) % 2:
-                                    hashes.append(hashes[-1])
-                                hashes = [_hl.sha3_256((hashes[i] + hashes[i + 1]).encode()).hexdigest() for i in range(0, len(hashes), 2)]
-                            return hashes[0]
-
-                        def _rebuild_coinbases():
-                            """Rebuild coinbase TXs with current fee total and update _block_txs_list."""
-                            _fts = _fee_total[0]
-                            _miner_amt = _miner_reward_base + _genesis_extra + (_fts // 2)
-                            _treasury_amt = _prev_treasury + (_fts - (_fts // 2))
-                            _mcb_id = _hl.sha3_256(f"COINBASE:{target_height}:{miner_addr}:{_miner_amt}:{_w_entropy_seed.hex()}".encode()).hexdigest()
-                            _tcb_id = _hl.sha3_256(f"TREASURY_COINBASE:{target_height}:{_treasury_addr}:{_treasury_amt}:{_w_entropy_seed.hex()}".encode()).hexdigest()
-                            _mcb = {"tx_id": _mcb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "miner"}}], "outputs": [{"address": miner_addr, "amount_base": _miner_amt, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
-                            _tcb = {"tx_id": _tcb_id, "version": 1, "inputs": [{"prev_tx_hash": "0" * 64, "prev_output_index": 0xFFFFFFFF, "script_sig": {"height": target_height, "type": "treasury"}}], "outputs": [{"address": _treasury_addr, "amount_base": _treasury_amt, "script_pubkey": "OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG"}], "tx_type": "coinbase", "w_entropy_hash": _w_entropy_seed.hex(), "block_height": target_height}
-                            with _block_lock:
-                                _block_txs_list[:] = [_mcb, _tcb] + [tx for tx in _block_txs_list if tx.get("tx_type") not in ("coinbase", "miner_reward", "treasury_reward")]
-                                _merkle_bytes[0] = bytes.fromhex(_compute_merkle(_block_txs_list).zfill(64))[:32]
-
-                        # Initial population
-                        for _utx in _pending_user_txs:
-                            _h = _utx.get("tx_hash", "")
-                            if _h and _h not in _tx_hashes_seen:
-                                _tx_hashes_seen.add(_h)
-                                _block_txs_list.append(_utx)
-                                _fee_total[0] += _utx.get("fee_base", 0)
-                        _rebuild_coinbases()
-
-                        # ═══ MEMPOOL SSE CALLBACK — adds new TXs to block inline ═══
-                        def _on_mempool_tx(tx_event: dict):
-                            try:
-                                _eh = tx_event.get("tx_hash", "")
-                                if not _eh or _eh in _tx_hashes_seen:
-                                    return
-                                # Fetch full TX dict from mempool for signature/inputs/outputs
-                                try:
-                                    _full_tx_list = kapi._rpc("qtcl_getMempool", [500], timeout=5, retries=1)
-                                    _full_tx = None
-                                    if isinstance(_full_tx_list, list):
-                                        for _ftx in _full_tx_list:
-                                            _fh = (_ftx.get("tx_hash") if isinstance(_ftx, dict) else getattr(_ftx, "tx_hash", ""))
-                                            if not _fh and isinstance(_ftx, dict):
-                                                _fh = _ftx.get("tx_id", "")
-                                            if _fh == _eh:
-                                                _full_tx = dict(_ftx) if isinstance(_ftx, dict) else _ftx.to_dict() if hasattr(_ftx, "to_dict") else _ftx
-                                                break
-                                    if not _full_tx:
-                                        _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "from_address": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "to_address": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": tx_event.get("signature", ""), "sender_public_key_hex": tx_event.get("sender_public_key_hex", ""), "public_key": tx_event.get("public_key", ""), "inputs": tx_event.get("inputs", []), "outputs": tx_event.get("outputs", []), "version": 1}
-                                except Exception:
-                                    _full_tx = {"tx_id": _eh, "tx_hash": _eh, "from_addr": tx_event.get("from_address", ""), "from_address": tx_event.get("from_address", ""), "to_addr": tx_event.get("to_address", ""), "to_address": tx_event.get("to_address", ""), "amount_base": tx_event.get("amount_base", 0), "fee_base": tx_event.get("fee_base", 0), "tx_type": "transfer", "signature": tx_event.get("signature", ""), "sender_public_key_hex": tx_event.get("sender_public_key_hex", ""), "public_key": tx_event.get("public_key", ""), "inputs": tx_event.get("inputs", []), "outputs": tx_event.get("outputs", []), "version": 1}
-                                _full_tx["tx_id"] = _full_tx.get("tx_id") or _full_tx.get("tx_hash", _eh)
-                                _full_tx["tx_hash"] = _full_tx.get("tx_hash") or _full_tx.get("tx_id", _eh)
-                                _full_tx["tx_type"] = _full_tx.get("tx_type", "transfer")
-                                if not _full_tx.get("from_addr"):
-                                    _full_tx["from_addr"] = _full_tx.get("from_address", "")
-                                if not _full_tx.get("to_addr"):
-                                    _full_tx["to_addr"] = _full_tx.get("to_address", "")
-                                with _block_lock:
-                                    if _eh in _tx_hashes_seen:
-                                        return
-                                    _tx_hashes_seen.add(_eh)
-                                    _block_txs_list.append(_full_tx)
-                                    _fee_total[0] += _full_tx.get("fee_base", 0)
-                                _rebuild_coinbases()
-                                _EXP_LOG.info(f"[MINER] ✨ New TX {_eh[:16]}… added inline — block now has {len(_block_txs_list)} txs")
-                            except Exception as _mpe:
-                                _EXP_LOG.debug(f"[MINER] mempool callback error: {_mpe}")
-
-                        # Start mempool SSE listener (runs in background daemon thread)
-                        _mempool_sse_thread = None
-                        try:
-                            _mempool_sse_thread = connect_mempool_stream(ENTROPY_SERVER_URL, _on_mempool_tx)
-                        except Exception as _msse_e:
-                            _EXP_LOG.debug(f"[MINER] Mempool SSE connect failed (non-fatal): {_msse_e}")
-
-                        # ═══ POI W setup — refer to mutable _block_txs_list and _merkle_bytes ═══
-
-                        merkle_root = _compute_merkle(_block_txs_list)
-
-                        timestamp = int(_t.time())
-                        _POW_SCRATCHPAD_BYTES = 512 * 1024
-                        _POW_WINDOW_BYTES = 64
-                        _POW_MIX_ROUNDS = 64
-                        _POW_N_WINDOWS = _POW_SCRATCHPAD_BYTES // _POW_WINDOW_BYTES
-                        # FIX: was 524_288 — at 6K H/s per worker, epoch hit every ~86s causing
-                        # a full 512KB shake_256 recompute that froze all workers simultaneously.
-                        # 2_097_152 = epoch every ~344s at 6K H/s — stalls become imperceptible.
-                        _SCRATCHPAD_EPOCH_NONCES = 2_097_152
-                        _ph_parent = bytes.fromhex(oracle_hash.zfill(64))[:32]
-                        _ph_miner = miner_addr.encode()[:40].ljust(40, b"\x00")
-                        _ph_seed = _w_entropy_seed[:32]
-                        _rnd_packed = [_st.pack(">I", r) for r in range(_POW_MIX_ROUNDS)]
-                        _HDR_FMT = ">Q I 32s 32s I I 40s 32s"
-                        _RND_RANGE = range(_POW_MIX_ROUNDS)
-                        _POW_PREFIX = b"QTCL_POW_v1:"
-
-                        # Shared scratchpad cache keyed by epoch.
-                        # Async task pre-computes the starting epoch here (no GIL pressure),
-                        # workers read from cache on first iter — zero cold-start serialisation.
-                        _scratch_cache: dict = {}
-                        _scratch_cache_lock = _thr2.Lock()
-
-                        def _make_scratchpad(epoch: int) -> bytes:
-                            """Generate epoch-scratchpad with cache. ASICs must recompute each epoch."""
-                            with _scratch_cache_lock:
-                                cached = _scratch_cache.get(epoch)
-                            if cached is not None:
-                                return cached
-                            result = _hl.shake_256(
-                                b"QTCL_SCRATCHPAD_v1:" + _ph_seed + epoch.to_bytes(8, "big")
-                            ).digest(_POW_SCRATCHPAD_BYTES)
-                            with _scratch_cache_lock:
-                                if len(_scratch_cache) >= 4:
-                                    del _scratch_cache[min(_scratch_cache)]
-                                _scratch_cache[epoch] = result
-                            return result
-
-                        # Pre-compute actual starting epoch before workers spawn
-                        _start_epoch = _PERSISTENT_NONCE_BASE[0] // _SCRATCHPAD_EPOCH_NONCES
-                        _make_scratchpad(_start_epoch)
-
-                        _n_workers = max(1, (_os2.cpu_count() or 1))
-                        _result_q = _q2.Queue()
-                        _abort_evt = _thr2.Event()
-                        _nonce_lock = _thr2.Lock()
-                        _nonce_ctr = [0]
-                        _hex_zeros = "0" * difficulty_bits
-                        _BLOCK_TTL_S = 270
-                        _block_start = _t.time()
-
-                        def _pow_worker(start_nonce: int, stride: int) -> None:
-                            import gc as _gc
-                            _gc.disable()
-                            try:
-                                _sha3 = _hl.sha3_256
-                                _pack = _st.pack
-                                _unpack = _st.unpack_from
-                                _fmt = _HDR_FMT
-                                _pfx = _POW_PREFIX
-                                _th = target_height
-                                _ts2 = timestamp
-                                _df = difficulty_bits
-                                _pp = _ph_parent
-                                _pm2 = _merkle_bytes  # mutable list ref: workers read _pm2[0] each iter
-                                _pmin = _ph_miner
-                                _ps = _ph_seed
-                                _nw = _POW_N_WINDOWS
-                                _rr = _RND_RANGE
-                                _rp2 = _rnd_packed
-                                _wend = _POW_WINDOW_BYTES
-                                _abort = _abort_evt.is_set
-                                _put = _result_q.put
-                                _set = _abort_evt.set
-                                _zeros = _hex_zeros
-                                _dbits = difficulty_bits
-                                _nl = _nonce_lock
-                                _epoch_size = _SCRATCHPAD_EPOCH_NONCES
-                                n = start_nonce
-                                lc = 0
-                                _ctr = _nonce_ctr
-                                _raw_ctr = _MINE_RAW_CTR  # direct ref for display updates
-                                # Initial scratchpad for worker's start epoch
-                                _epoch = n // _epoch_size
-                                _scratch = _make_scratchpad(_epoch)
-                                _mv = memoryview(_scratch)
-                                _woffs = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
-                                while not _abort():
-                                    # Rotate scratchpad on epoch boundary (ASIC-hard)
-                                    _new_epoch = n // _epoch_size
-                                    if _new_epoch != _epoch:
-                                        _epoch = _new_epoch
-                                        _scratch = _make_scratchpad(_epoch)
-                                        _mv = memoryview(_scratch)
-                                    hdr = _pack(_fmt, _th, _ts2, _pp, _pm2[0], _df, n, _pmin, _ps)
-                                    _h0 = _sha3()
-                                    _h0.update(_pfx)
-                                    _h0.update(hdr)
-                                    state = _h0.digest()
-                                    for rnd in _rr:
-                                        o = _woffs[_unpack(">I", state, 0)[0] % _nw]
-                                        _h = _sha3()
-                                        _h.update(state)
-                                        _h.update(_mv[o : o + _wend])
-                                        _h.update(_rp2[rnd])
-                                        state = _h.digest()
-                                    lc += 1
-                                    hx = state.hex()
-                                    if hx[:_dbits] == _zeros:
-                                        _put((n, hx))
-                                        _set()
-                                        return
-                                    n = (n + stride) & 0xFFFFFFFF
-                                    if lc & 511 == 0:
-                                        with _nl:
-                                            _ctr[0] += 512
-                                        # FIX: Write display counters directly from worker thread.
-                                        # The async event loop gets blocked by synchronous kapi._rpc()
-                                        # calls in balance_task/oracle_task, preventing the old
-                                        # _MINE_RAW_CTR copy in the async mining monitor from running.
-                                        # Workers always run (GIL releases during I/O), so this
-                                        # keeps the dashboard live even when the event loop is stalled.
-                                        _raw_ctr[0] = _ctr[0]
-                            finally:
-                                _gc.enable()
-
-                        _EXP_LOG.warning(f"[MINER] ⛏️  QTCL-PoW h={target_height} diff={difficulty_bits} workers={_n_workers}")
-                        # Stamp target height so SSE handlers know what height we're solving.
-                        # _consensus_handler and _block_handler use this to skip aborts for
-                        # block events that are BELOW our target (settlement of prior blocks).
-                        cache._current_target_height = target_height
-                        # FIX BUG-1: Warmup call now passes persistent_base=_PERSISTENT_NONCE_BASE[0]
-                        # so the display shows the cumulative nonces already tried this session,
-                        # not 0. Without this, every SUBMITTED→MINING transition zeroed the nonce
-                        # display for the entire warmup window before workers produced samples.
-                        # block_nonce is updated from _nonce_ctr[0] every 50ms in the mining loop.
-                        _MINE_TELEM.update_progress(target_height, difficulty_bits, 0, oracle_hash,
-                                                    block_nonce=0, persistent_base=_PERSISTENT_NONCE_BASE[0])
-                        _MINE_TELEM.mark_mining(target_height)
-                        # Accumulate session total before resetting per-block counter
-                        _SESSION_TOTAL_TRIED[0] += _nonce_ctr[0]
-                        _nonce_ctr[0] = 0
-                        _MINE_RAW_CTR[0] = 0
-                        _MINE_RAW_CTR[1] = _PERSISTENT_NONCE_BASE[0]
-
-                        _workers = []
-                        for _wi in range(_n_workers):
-                            _wt = _thr2.Thread(target=_pow_worker, args=((_PERSISTENT_NONCE_BASE[0] + _wi) & 0xFFFFFFFF, _n_workers), daemon=True, name=f"PoW-{_wi}")
-                            _wt.start()
-                            _workers.append(_wt)
-
-                        _chain_advanced = False
-                        _ttl_expired = False
-                        _last_telem_nonce = 0
-                        while not _abort_evt.is_set():
-                            await _asyncio.sleep(0.05)
-                            # Workers write _MINE_RAW_CTR[0] directly every 512 hashes.
-                            # This async copy is a backup in case workers are between updates.
-                            _raw_tried = _nonce_ctr[0]
-                            if _raw_tried > _MINE_RAW_CTR[0]:
-                                _MINE_RAW_CTR[0] = _raw_tried
-                            _cur_nonce = (_PERSISTENT_NONCE_BASE[0] + _raw_tried) & 0xFFFFFFFF
-                            _MINE_TELEM.update_progress(target_height, difficulty_bits, _cur_nonce, oracle_hash,
-                                                        block_nonce=_raw_tried, persistent_base=_PERSISTENT_NONCE_BASE[0])
-                            _last_telem_nonce = _cur_nonce
-                            if _t.time() - _block_start > _BLOCK_TTL_S:
-                                _EXP_LOG.warning(f"[MINER] ⏰ Block TTL reached at nonce={_cur_nonce:,}")
-                                _ttl_expired = True
-                                _abort_evt.set()
-                                break
-                            _new_height = check_chain_advance()
-                            if _new_height > 0 and _new_height >= target_height:
-                                _EXP_LOG.warning(f"[MINER] ⚡ Chain advance h={_new_height} >= target={target_height} — abort")
-                                _chain_advanced = True
-                                _abort_evt.set()
-                                break
-                            elif _new_height > 0:
-                                # Stale signal for h < target_height (e.g. previous block settling)
-                                _EXP_LOG.debug(f"[MINER] ⏭  Chain advance h={_new_height} < target={target_height} — ignored")
-
-                        for _wt in _workers:
-                            _wt.join(timeout=2.0)
-                        nonce, block_hash = None, None
-                        while not _result_q.empty():
-                            try:
-                                _r = _result_q.get_nowait()
-                                if nonce is None:
-                                    nonce, block_hash = _r
-                            except _q2.Empty:
-                                break
-
-                        _found = block_hash is not None
-                        if _found:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF) or 1
-                        elif _chain_advanced:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF) or 1
-                        elif _ttl_expired:
-                            _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0] + secrets.randbelow(1_000_000)) & 0xFFFFFFFF) or 1
-
-                        if not _found:
-                            # No solution found — chain advanced, TTL expired, or aborted
-                            _MINE_TELEM.mark_idle()
-                            await _asyncio.sleep(0.1)
-                            continue
-
-                        # Block WAS found — even if chain also advanced simultaneously
-                        # (SSE fired block_finalized for previous height during our solve),
-                        # we still submit our solution. The server will accept or reject it.
-                        # Previously this path discarded valid solutions when _chain_advanced
-                        # was True, losing the block entirely.
-
-                        # 🔴 CRITICAL: Reject null nonce only — nonce=0 is valid after wrap
-                        if nonce is None:
-                            _EXP_LOG.error(f"[MINER] ❌ Invalid nonce={nonce} for h={target_height} — skipping submission")
-                            _MINE_TELEM.mark_idle()
-                            await _asyncio.sleep(0.1)
-                            continue
-
-                        _EXP_LOG.info(f"[MINER] ⛏️ BLOCK SOLVED h={target_height} nonce={nonce:,} hash={block_hash[:16]}…  txs={len(_block_txs_list)}")
-                        # Snapshot merkle root and tx list under lock — prevents SSE callback from
-                        # changing the merkle root after PoW solution was found (would invalidate block hash)
-                        with _block_lock:
-                            merkle_root = _compute_merkle(_block_txs_list)
-                            _final_txs = list(_block_txs_list)  # frozen copy for submission
-
-                        # Recompute block hash with snapshot merkle to guard against race condition
-                        # where SSE callback changed merkle between solution and snapshot
-                        _snap_merkle_bytes = bytes.fromhex(merkle_root.zfill(64))[:32]
-                        _snap_epoch = nonce // _SCRATCHPAD_EPOCH_NONCES
-                        _snap_scratch = _hl.shake_256(
-                            b"QTCL_SCRATCHPAD_v1:" + _ph_seed + _snap_epoch.to_bytes(8, "big")
-                        ).digest(_POW_SCRATCHPAD_BYTES)
-                        _snap_mv = memoryview(_snap_scratch)
-                        _snap_woffs = tuple(i * _POW_WINDOW_BYTES for i in range(_POW_N_WINDOWS))
-                        _snap_hdr = _st.pack(_HDR_FMT, target_height, timestamp, _ph_parent,
-                                             _snap_merkle_bytes, difficulty_bits, nonce,
-                                             _ph_miner, _ph_seed)
-                        _snap_h0 = _hl.sha3_256()
-                        _snap_h0.update(_POW_PREFIX)
-                        _snap_h0.update(_snap_hdr)
-                        _snap_state = _snap_h0.digest()
-                        for _rnd in range(_POW_MIX_ROUNDS):
-                            _snap_wi = _st.unpack_from(">I", _snap_state, 0)[0] % _POW_N_WINDOWS
-                            _snap_o = _snap_woffs[_snap_wi]
-                            _snap_h = _hl.sha3_256()
-                            _snap_h.update(_snap_state)
-                            _snap_h.update(_snap_mv[_snap_o:_snap_o + _POW_WINDOW_BYTES])
-                            _snap_h.update(_rnd_packed[_rnd])
-                            _snap_state = _snap_h.digest()
-                        _recomputed_hash = _snap_state.hex()
-                        if _recomputed_hash != block_hash:
-                            if _recomputed_hash[:difficulty_bits] == _hex_zeros:
-                                _EXP_LOG.warning(
-                                    f"[MINER] 🔄 Merkle changed during mining — "
-                                    f"recomputed hash={_recomputed_hash[:16]}… (still valid, using recomputed)"
-                                )
-                                block_hash = _recomputed_hash
-                            else:
-                                _EXP_LOG.warning(
-                                    f"[MINER] ❌ Merkle changed during mining — recomputed hash "
-                                    f"{_recomputed_hash[:16]}… does not meet difficulty — re-mining"
-                                )
-                                _MINE_TELEM.mark_idle()
-                                continue
-
-                        submit_payload = {
-                            "height": target_height,
-                            "block_hash": block_hash,
-                            "parent_hash": oracle_hash,
-                            "merkle_root": merkle_root,
-                            "timestamp": timestamp,
-                            "nonce": nonce,
-                            "miner_address": miner_addr,
-                            "difficulty_bits": difficulty_bits,
-                            "w_entropy_hash": _w_entropy_seed.hex(),
-                            "w_state_fidelity": 0.75,
-                            "pq_curr": target_height,
-                            "pq_last": max(0, target_height - 1),
-                            "mermin_value": 0.0,
-                            "mermin_violated": False,
-                            "quantum_field_16x16x16": "",
-                            "transactions": _final_txs,
-                            "oracle_attestations": [],
-                        }
-
-                        # ── CLIENT-AS-ORACLE: sign attestation, broadcast to mesh ──
-                        _self_attestation = None
-                        _oracle_n = getattr(self, "_oracle_node", None)
-                        if _oracle_n and _oracle_n.is_active():
-                            _self_attestation = _oracle_n.on_block_solved(submit_payload, block_hash, getattr(self, "p2p_node", None))
-                            if _self_attestation:
-                                submit_payload["oracle_attestations"] = [_self_attestation]
-                        _MINE_TELEM.record_block({"height": target_height, "hash": block_hash, "nonce": nonce, "timestamp": int(time.time())})
-
-                        _sig = None
-                        for _sign_attempt in range(3):
-                            try:
-                                if self.wallet and self.wallet.is_loaded() and self.wallet.private_key:
-                                    _block_for_sig = {k: v for k, v in submit_payload.items() if k not in ("hyp_signature", "hyp_sig", "miner_pubkey")}
-                                    _sig = self.wallet.sign_transaction(_block_for_sig, block_height=target_height)
-                                    if _sig and not _sig.get("error"):
-                                        submit_payload["hyp_signature"] = json.dumps(_sig, default=str)
-                                        submit_payload["miner_public_key_hex"] = self.wallet.public_key or ""
-                                        break
-                            except Exception:
-                                if _sign_attempt < 2:
-                                    await _asyncio.sleep(0.1)
-                        if not _sig or _sig.get("error"):
-                            _EXP_LOG.error(f"[MINER] ❌ Signing failed h={target_height}")
-                            continue
-
-                        cached_block = CachedBlock(
-                            height=target_height,
-                            block_hash=block_hash,
-                            parent_hash=oracle_hash,
-                            nonce=nonce,
-                            timestamp=int(time.time()),
-                            difficulty=difficulty_bits,
-                            miner_address=miner_addr,
-                            submit_payload=submit_payload,
-                            signature=_sig,
-                            status=BlockStatus.SOLVED,
-                        )
-                        if cache.enqueue_solved(cached_block):
-                            _EXP_LOG.info(f"[CACHE] ✅ Block h={target_height} queued for submission")
-                        else:
-                            _EXP_LOG.warning(f"[CACHE] ⚠️ Block h={target_height} already finalized")
-
-                    except Exception as e:
-                        _EXP_LOG.error(f"[MINER] {type(e).__name__}: {e}", exc_info=True)
-                        await _asyncio.sleep(1.0)
-
-            async def submit_task():
-                _last_evict = _t.time()
-                while True:
-                  try:
-                    block = cache.get_next_unsent()
-                    if block is None:
-                        _now = _t.time()
-                        # FIX BUG-3: Call _evict_old periodically so SUBMITTED/PENDING
-                        # blocks past their TTL get promoted to ORPHANED even when no
-                        # new blocks are being enqueued. Previously _evict_old was only
-                        # called from enqueue_solved(), meaning a miner that submitted
-                        # and never solved another block would never trigger eviction/reconciliation.
-                        if _now - _last_evict >= 30.0:
-                            with cache._lock:
-                                cache._evict_old()
-                            _last_evict = _now
-                        with cache._lock:
-                            for _h, _b in list(cache._blocks.items()):
-                                if _b.status == BlockStatus.SUBMITTED and _b.last_submitted_at and (_now - _b.last_submitted_at) > 60.0:
-                                    if _b.submit_attempts < pipeline.MAX_RETRIES:
-                                        _EXP_LOG.warning(f"[SUBMIT-TIMEOUT] h={_h} stuck in SUBMITTED for {int(_now - _b.last_submitted_at)}s — retrying")
-                                        _b.status = BlockStatus.SOLVED
-                                    else:
-                                        _b.status = BlockStatus.REJECTED
-                                        _b.error_message = "submission timeout >60s"
-                                        _EXP_LOG.error(f"[SUBMIT-TIMEOUT] h={_h} REJECTED after timeout")
-                        await _asyncio.sleep(0.5)
-                        continue
-                    _EXP_LOG.info(f"[SUBMIT] 📡 Submitting h={block.height} hash={block.block_hash[:16]}…")
-                    cache.mark_submitted(block.height)
-                    _MINE_TELEM.mark_submitting(block.height)
-                    success, result = await pipeline.submit(block.submit_payload, block.height, block.block_hash)
-                    if success:
-                        status = (result or {}).get("status", "")
-                        reward = float((result or {}).get("miner_reward_qtcl", 0))
-                        oracle_str = (result or {}).get("oracle_consensus", "0/5")
-                        oracle_count = int(oracle_str.split("/")[0]) if "/" in str(oracle_str) else 0
-                        if "finalized" in status or "already_accepted" in status:
-                            _oid_list = (result or {}).get("oracle_ids", [])
-                            # FIX: timeout fallback returns reward=0. Recover from getBlockStatus
-                            # which now includes miner_reward_qtcl.
-                            if reward <= 0:
-                                try:
-                                    _bs = await _async_rpc("qtcl_getBlockStatus", {"height": block.height}, timeout=8, retries=1)
-                                    if isinstance(_bs, dict) and not _bs.get("error"):
-                                        if reward <= 0:
-                                            reward = float(_bs.get("miner_reward_qtcl", 0))
-                                except Exception as _bse:
-                                    _EXP_LOG.debug(f"[BALANCE] getBlockStatus recovery: {_bse}")
-                            # Final fallback — getBlockStatus may not yet have reward populated
-                            # (server cold path). Use canonical schedule so _total_rewards is never 0.
-                            if reward <= 0:
-                                try:
-                                    from globals import TessellationRewardSchedule as _TRS_fb
-                                    reward = _TRS_fb.get_miner_reward_qtcl(block.height)
-                                    if block.height == 1:
-                                        reward += _TRS_fb.get_miner_reward_qtcl(0)
-                                    _EXP_LOG.info(f"[BALANCE] 💰 reward=0 from server — using schedule: {reward:.2f} QTCL h={block.height}")
-                                except Exception:
-                                    reward = 7.20  # depth-5 default
-                            cache.mark_finalized(block.height, reward, oracle_count=oracle_count, oracle_ids=_oid_list)
-                            _MINE_TELEM.record_block_accepted(height=block.height, hash=block.block_hash, nonce=block.nonce, timestamp=block.timestamp, fidelity=0.0, reward_qtcl=reward)
-                            _EXP_LOG.critical(f"[SUBMIT] ✅ h={block.height} FINALIZED +{reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}")
-                            # P2P broadcast after successful submission
-                            _p2p_n = getattr(self, "p2p_node", None)
-                            _broadcast_ok = False
-                            _peers_notified = 0
-                            if _p2p_n and getattr(_p2p_n, "_running", False):
-                                try:
-                                    _peers = _p2p_n.peer_mgr.get_active_peers() if _p2p_n.peer_mgr else []
-                                    if _peers:
-                                        _ok = 0
-                                        for _p in _peers:
-                                            try:
-                                                import urllib.request
-                                                _url = f"http://{_p.host}:{_p.port}/rpc"
-                                                _data = (b'{"jsonrpc":"2.0","method":"qtcl_p2p_inv","params":{"type":"block","hash":"'
-                                                        + block.block_hash.encode() + b'","height":'
-                                                        + str(block.height).encode() + b',"miner_addr":"'
-                                                        + block.miner_address.encode() + b'","ttl_hops":8},"id":1}')
-                                                urllib.request.urlopen(_url, data=_data, timeout=5)
-                                                _ok += 1
-                                            except Exception:
-                                                pass
-                                        _broadcast_ok = _ok > 0
-                                        _peers_notified = _ok
-                                        _EXP_LOG.info(f"[GOSSIP] ✅ Block h={block.height} broadcast: {_ok}/{len(_peers)} peers notified")
-                                    else:
-                                        _EXP_LOG.warning(f"[GOSSIP] ⚠️ No active peers for h={block.height}")
-                                except Exception as _p2pe:
-                                    _EXP_LOG.warning(f"[GOSSIP] Broadcast error: {_p2pe}")
-                            if not _broadcast_ok:
-                                try:
-                                    await _async_rpc("qtcl_gossipBlockAnnounce", [{"height": block.height, "hash": block.block_hash, "miner": block.miner_address, "timestamp": block.timestamp}], timeout=3, retries=1)
-                                    _EXP_LOG.info(f"[GOSSIP] ✅ Server-side gossip sent for h={block.height}")
-                                except Exception as _g_err:
-                                    _EXP_LOG.warning(f"[GOSSIP] Server gossip failed: {_g_err}")
-                            cache._last_broadcast_peers = _peers_notified
-                            cache._last_broadcast_method = "p2p" if _broadcast_ok else "gossip"
-                        else:
-                            cache.mark_pending(block.height, oracle_count)
-                            _EXP_LOG.info(f"[SUBMIT] ⏳ h={block.height} PENDING ({oracle_count}/5 oracles)")
-                    else:
-                        err = str((result or {}).get("error", "unknown"))
-                        if block.submit_attempts >= pipeline.MAX_RETRIES:
-                            cache.mark_rejected(block.height, err)
-                            _EXP_LOG.error(f"[SUBMIT] ❌ h={block.height} REJECTED after {block.submit_attempts} attempts: {err}")
-                        else:
-                            block.status = BlockStatus.SOLVED
-                            _EXP_LOG.warning(f"[SUBMIT] ⚠️ h={block.height} retry ({block.submit_attempts}/{pipeline.MAX_RETRIES}): {err}")
-                    _MINE_TELEM.mark_mining()
-                    await _asyncio.sleep(0.1)
-                  except Exception as _submit_err:
-                    _EXP_LOG.error(f"[SUBMIT-TASK] ❌ Unhandled: {type(_submit_err).__name__}: {_submit_err}", exc_info=True)
+                except Exception as e:
+                    _EXP_LOG.error(
+                        f"[MINER] FATAL: {type(e).__name__}: {e}", exc_info=True
+                    )
+                    _MINE_TELEM.mark_idle()
                     await _asyncio.sleep(1.0)
 
-            async def balance_task():
-                # Syncs UTXO mirror from server. Balance is authoritative from SSE stream;
-                # one-time bootstrap: if balance is 0 at startup, do a single RPC query
-                # to seed it, then let the SSE stream take over permanently.
-                _bootstrapped = False
-                while True:
-                    try:
-                        _addr = getattr(getattr(self, "wallet", None), "address", None)
-                        if _addr:
-                            # Bootstrap: one-time RPC balance query if cache is zero on startup
-                            if not _bootstrapped and cache._balance_qtcl <= 0:
-                                _bootstrapped = True
-                                try:
-                                    result = await _async_rpc("qtcl_getBalance", [_addr], timeout=8, retries=2)
-                                    if result and not result.get("error"):
-                                        _b = float(result.get("balance", 0))
-                                        if _b > 0:
-                                            cache._balance_qtcl = _b
-                                            _EXP_LOG.info(f"[BALANCE] 🔌 Bootstrap from RPC: {_b:.8f} QTCL")
-                                except Exception:
-                                    # Fallback: compute from local UTXO mirror
-                                    cache._balance_qtcl = cache._compute_balance_from_utxos()
-                            # Sync UTXO mirror from server — SSE balance stream is authoritative thereafter
-                            _loop = _asyncio.get_event_loop()
-                            await _loop.run_in_executor(None, cache._sync_utxos_from_server, kapi, _addr)
-                    except Exception:
-                        pass
-                    await _asyncio.sleep(30.0)
+            _MINE_TELEM.mark_idle()
 
-            async def oracle_task():
-                """
-                ═══════════════════════════════════════════════════════════════
-                oracle_task — DB-authoritative pending-block reconciliation
-                ═══════════════════════════════════════════════════════════════
-                FIX v5.0: This task is the SOLE reason h=24/h=25 stayed
-                PENDING forever.
-
-                Root cause:
-                  submit_task() marks blocks PENDING then waits for an SSE
-                  block_finalized event via update_from_sse().  But:
-                    1. SSE events have no replay on reconnect — if the stream
-                       dropped during the 18-second finalization window, the
-                       event is gone forever.
-                    2. update_from_sse() bailed on `if not b: return` when
-                       blocks were already evicted from _blocks (fixed in
-                       FIX-1 above, but defense in depth is required).
-                    3. _evict_old() silently dropped PENDING blocks after 270s
-                       without ever asking the server (fixed in FIX-2, but
-                       oracle_task() provides the active resolution).
-
-                This task polls qtcl_getBlockStatus for every block in
-                PENDING, SUBMITTED, or ORPHANED state every 8 seconds.
-                The server's response is DB-authoritative: finalized=True means
-                the block is finalized regardless of what any SSE event said.
-
-                It also performs a sweep on SSE reconnect: whenever the
-                consensus SSE stream reconnects, we poll all tracked heights
-                immediately rather than waiting for the next 8s tick.
-                ═══════════════════════════════════════════════════════════════
-                """
-                _POLL_INTERVAL  = 8.0   # steady-state poll cadence (seconds)
-                _FAST_INTERVAL  = 2.0   # fast cadence immediately after submit
-                _FAST_WINDOW_S  = 60.0  # poll fast for 60s after any new PENDING block
-
-                _last_reconnect_poll = 0.0
-                _last_submission_ts  = 0.0
-
-                while True:
-                    try:
-                        # ── Detect SSE reconnect: stream dropped and came back ──
-                        _cons_state = globals().get("_SSE_CONSENSUS_STATE", {})
-                        _cons_connected = _cons_state.get("connected", False)
-                        _cons_last_evt  = _cons_state.get("last_event_ts", 0.0)
-
-                        # If stream just reconnected (within last 5s), do an
-                        # immediate reconciliation sweep regardless of interval.
-                        _do_reconnect_sweep = (
-                            _cons_connected
-                            and _cons_last_evt > _last_reconnect_poll
-                            and (time.time() - _cons_last_evt) < 5.0
-                        )
-                        if _do_reconnect_sweep:
-                            _last_reconnect_poll = _cons_last_evt
-                            _EXP_LOG.info("[ORACLE-TASK] 🔄 SSE reconnect detected — sweeping pending heights")
-
-                        # ── Collect heights that need resolution ───────────────
-                        _need_poll = []
-                        with cache._lock:
-                            for _h, _b in list(cache._blocks.items()):
-                                if _b.status in (
-                                    BlockStatus.PENDING,
-                                    BlockStatus.SUBMITTED,
-                                    BlockStatus.ORPHANED,
-                                ):
-                                    _need_poll.append((_h, _b.block_hash))
-                                    if _b.status in (BlockStatus.PENDING, BlockStatus.SUBMITTED):
-                                        _last_submission_ts = max(
-                                            _last_submission_ts,
-                                            _b.first_submitted_at or _b.last_submitted_at or 0.0,
-                                        )
-                                # FIX: Also poll FINALIZED blocks that have no reward yet.
-                                # This catches the SSE-finalizes-before-submit-responds race:
-                                # update_from_sse promotes to FINALIZED with reward=0,
-                                # submit_task hasn't responded yet. Without this, the block
-                                # sits at reward=0 and balance never updates.
-                                elif (_b.status == BlockStatus.FINALIZED
-                                      and _b.reward_qtcl <= 0
-                                      and _h not in cache._rewarded_heights):
-                                    _need_poll.append((_h, _b.block_hash))
-
-                        if not _need_poll and not _do_reconnect_sweep:
-                            await _asyncio.sleep(_POLL_INTERVAL)
-                            continue
-
-                        # ── Poll each height ───────────────────────────────────
-                        for _poll_h, _poll_hash in _need_poll:
-                            try:
-                                _st = await _async_rpc(
-                                    "qtcl_getBlockStatus",
-                                    {"height": _poll_h},
-                                    timeout=8,
-                                    retries=1,
-                                )
-                                if not _st or _st.get("error"):
-                                    continue
-
-                                _db_finalized = bool(_st.get("finalized", False)) or (
-                                    _st.get("status", "").upper() == "FINALIZED"
-                                )
-                                _db_oracle_count = int(_st.get("attestation_count", 0))
-                                _db_oracle_ids   = _st.get("oracle_ids", [])
-                                # FIX: recover reward + balance — server now populates these
-                                _db_reward  = float(_st.get("miner_reward_qtcl", 0))
-                                _db_balance = float(_st.get("miner_balance_qtcl", 0))
-
-                                if _db_finalized:
-                                    # Check if reward is still needed (SSE may have finalized with reward=0)
-                                    with cache._lock:
-                                        _cb = cache._blocks.get(_poll_h)
-                                        _needs_reward = (
-                                            _poll_h not in cache._rewarded_heights
-                                            and (_cb is None or _cb.reward_qtcl <= 0)
-                                        )
-                                        _already_finalized_and_rewarded = (
-                                            _poll_h in cache._finalized_heights
-                                            and _poll_h in cache._rewarded_heights
-                                        )
-                                    if not _already_finalized_and_rewarded:
-                                        if _db_reward <= 0:
-                                            try:
-                                                from globals import TessellationRewardSchedule as _TRS2
-                                                _db_reward = _TRS2.get_miner_reward_qtcl(_poll_h)
-                                                if _poll_h == 1:
-                                                    _db_reward += _TRS2.get_miner_reward_qtcl(0)
-                                            except Exception:
-                                                _db_reward = 7.20
-                                        _miner_addr = ""
-                                        with cache._lock:
-                                            _cb2 = cache._blocks.get(_poll_h)
-                                            if _cb2:
-                                                _miner_addr = _cb2.miner_address or ""
-                                        if not _miner_addr:
-                                            _miner_addr = _st.get("miner_address", "")
-                                        cache.mark_finalized(
-                                            _poll_h,
-                                            reward_qtcl=_db_reward,
-                                            recipient=_miner_addr,
-                                            oracle_count=max(_db_oracle_count, 5),
-                                            oracle_ids=_db_oracle_ids or ["oracle_0","oracle_1","oracle_2","oracle_3","oracle_4"],
-                                        )
-                                        if _db_balance > 0:
-                                            pass  # balance is authoritative from SSE balance stream
-                                        _EXP_LOG.critical(
-                                            f"[ORACLE-TASK] ✅ h={_poll_h} FINALIZED "
-                                            f"reward=+{_db_reward:.2f} QTCL  balance={cache._balance_qtcl:.8f}"
-                                        )
-                                else:
-                                    # Still genuinely PENDING on server — update oracle count
-                                    _db_oracle_now = int(_st.get("attestation_count", 0))
-                                    if _db_oracle_now > 0:
-                                        cache.update_oracle_count(
-                                            _poll_h, _db_oracle_now, _db_oracle_ids
-                                        )
-                                        _EXP_LOG.debug(
-                                            f"[ORACLE-TASK] ⏳ h={_poll_h} still pending "
-                                            f"({_db_oracle_now}/5 oracles)"
-                                        )
-                            except Exception as _pe:
-                                _EXP_LOG.debug(f"[ORACLE-TASK] poll h={_poll_h}: {_pe}")
-
-                        # ── Adaptive sleep ─────────────────────────────────────
-                        _in_fast_window = (
-                            _last_submission_ts > 0
-                            and (time.time() - _last_submission_ts) < _FAST_WINDOW_S
-                        )
-                        await _asyncio.sleep(
-                            _FAST_INTERVAL if (_in_fast_window or _need_poll) else _POLL_INTERVAL
-                        )
-
-                    except Exception as _ot_err:
-                        _EXP_LOG.debug(f"[ORACLE-TASK] outer: {_ot_err}")
-                        await _asyncio.sleep(_POLL_INTERVAL)
-
-            await _asyncio.gather(pow_task(), submit_task(), balance_task(), oracle_task(), return_exceptions=True)
         async def _mine():
             try:
                 _EXP_LOG.warning("[MINER-ASYNC] 🚀 Async mining loop starting…")
@@ -27095,6 +25843,21 @@ class QtclClientApp:
             target=lambda: _asyncio.run(_mine()), daemon=True, name="MineAsync"
         )
         _mine_thread.start()
+        miner._koyeb_state = self.koyeb_state  # type: ignore[attr-defined]
+        miner._client_field = self.client_field  # type: ignore[attr-defined]
+        # ── DIAGNOSTIC: DO NOT silence stdout logging — we need to see mining thread output ───────
+        # DISABLE LOG SILENCING: Keep original handlers
+        # _LOG_BUF: _deque = _deque(maxlen=12)   # ring buffer: last 12 log lines
+        # class _BufHandler(_logging.Handler):
+        #     def emit(self, record):
+        #         _LOG_BUF.append(self.format(record))
+        # _buf_handler = _BufHandler()
+        # _buf_handler.setFormatter(_logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
+        #                                              datefmt="%H:%M:%S"))
+        # _buf_handler.setLevel(_logging.DEBUG)
+        # _root_log    = _logging.getLogger()
+        # _old_handlers = _root_log.handlers[:]
+        # _root_log.handlers = [_buf_handler]
         _EXP_LOG.warning(
             "[MINER] 🚀 MINING THREAD STARTED — LOGS ENABLED TO STDOUT FOR DIAGNOSTICS"
         )
@@ -27105,119 +25868,438 @@ class QtclClientApp:
             m, s = divmod(r, 60)
             return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-        _METRICS_REFRESH_INTERVAL = 5.0  # RPC refresh every 5s, not every tick
-        _last_metrics_refresh = [0.0]
-
         def _print_dashboard(force_full: bool = False) -> None:
-            _now_ts = time.time()
-            if _now_ts - _last_metrics_refresh[0] >= _METRICS_REFRESH_INTERVAL:
-                self.koyeb_state.refresh_metrics(self.client_field)
-                _last_metrics_refresh[0] = _now_ts
+            self.koyeb_state.refresh_metrics(self.client_field)
+
             ks2 = self.koyeb_state
+            m2 = self.client_field.metrics
             tel = _MINE_TELEM.snapshot()
             now = time.time()
-            sep = "─" * 72
 
+            # ── Refresh quantum metrics from latest stream data ──────────────────
+            # Priority: oracle_mesh snapshot > SSE stream snapshot > fallback to m2
+            _refreshed_metrics = None
+            try:
+                # Try oracle mesh snapshot first (highest priority)
+                if self._oracle_mesh:
+                    _mesh_snap = self._oracle_mesh.get_snapshot()
+                    if _mesh_snap:
+                        _refreshed_metrics = {
+                            "fidelity_to_w3": _mesh_snap.get("w_state_fidelity", 0.0),
+                            "entropy_vn": _mesh_snap.get("von_neumann_entropy", 0.0),
+                            "purity": _mesh_snap.get("purity", 0.0),
+                            "field_density": _mesh_snap.get("coherence_l1", 0.0),
+                        }
+
+                # Fallback to server SSE stream data
+                if not _refreshed_metrics and self._sse_client:
+                    _server_snap = self._sse_client.get_latest_snapshot()
+                    if _server_snap and (
+                        "density_tensor_hex" in _server_snap
+                        or "density_matrix_hex" in _server_snap
+                    ):
+                        # Parse DM from hex if available
+                        _dm_hex = _server_snap.get(
+                            "density_tensor_hex", ""
+                        ) or _server_snap.get("density_matrix_hex", "")
+                        if _dm_hex:
+                            try:
+                                import struct as _st_m
+
+                                _bdata = bytes.fromhex(_dm_hex)
+                                # For 8x8 DM: 64 complex doubles = 64 * 16 bytes = 1024 bytes
+                                if len(_bdata) == 1024 and _HAS_NP:
+                                    _re = []
+                                    _im = []
+                                    for _i in range(64):
+                                        _r, _im_v = _st_m.unpack_from(
+                                            ">dd", _bdata, _i * 16
+                                        )
+                                        _re.append(_r)
+                                        _im.append(_im_v)
+                                    _dm_arr = (
+                                        _np.array(_re, dtype=_np.complex128)
+                                        + 1j * _np.array(_im, dtype=_np.complex128)
+                                    ).reshape(8, 8)
+                                    # Compute metrics from DM
+                                    _w_fid = ClientQuantumMetrics.w3_fidelity(_dm_arr)
+                                    _vn_ent = ClientQuantumMetrics.von_neumann_entropy(
+                                        _dm_arr
+                                    )
+                                    _purity = ClientQuantumMetrics.purity(_dm_arr)
+                                    _coherence = ClientQuantumMetrics.coherence_l1(
+                                        _dm_arr
+                                    )
+                                    _refreshed_metrics = {
+                                        "fidelity_to_w3": max(
+                                            0.0, min(1.0, float(_w_fid))
+                                        ),
+                                        "entropy_vn": max(
+                                            0.0, min(3.0, float(_vn_ent))
+                                        ),
+                                        "purity": max(0.0, min(1.0, float(_purity))),
+                                        "field_density": float(_coherence),
+                                    }
+                            except Exception:
+                                pass
+                        # Fallback: use direct metrics from snapshot
+                        if not _refreshed_metrics:
+                            _refreshed_metrics = {
+                                "fidelity_to_w3": float(
+                                    _server_snap.get(
+                                        "w_state_fidelity",
+                                        _server_snap.get("fidelity", 0.0),
+                                    )
+                                ),
+                                "entropy_vn": float(
+                                    _server_snap.get(
+                                        "von_neumann_entropy",
+                                        _server_snap.get("entropy", 0.0),
+                                    )
+                                ),
+                                "purity": float(_server_snap.get("purity", 0.0)),
+                                "field_density": float(
+                                    _server_snap.get(
+                                        "coherence_l1",
+                                        _server_snap.get("coherence", 0.0),
+                                    )
+                                ),
+                            }
+            except Exception:
+                pass
+
+            # Use refreshed metrics if available, otherwise fall back to m2
+            if _refreshed_metrics:
+                # Create a minimal object to hold refreshed metrics for display
+                class _RefreshedMetrics:
+                    def __init__(self, d):
+                        self.fidelity_to_w3 = d["fidelity_to_w3"]
+                        self.entropy_vn = d["entropy_vn"]
+                        self.purity = d["purity"]
+                        self.field_density = d["field_density"]
+
+                m2 = _RefreshedMetrics(_refreshed_metrics)
+            sep = "─" * 72
+            # ── state badge ───────────────────────────────────────────────
             state_badge = {
                 "IDLE": "💤 IDLE",
                 "MINING": "⛏️  MINING",
                 "SOLVED": "✅ BLOCK SOLVED",
                 "SUBMITTING": "📡 SUBMITTING",
             }.get(tel["state"], tel["state"])
-            hr_str = f"{tel['hash_rate']:.0f} H/s" if tel['hash_rate'] > 0 else "warming up…"
-            session = _fmt_duration(now - tel["session_start"]) if 'session_start' in tel else "00:00"
+            hr_str = (
+                f"{tel['hash_rate']:.0f} H/s" if tel["hash_rate"] > 0 else "warming up…"
+            )
+            session = _fmt_duration(now - tel["session_start"])
             print("\n" + sep)
-            print(f"  {state_badge}   │   session: {session}   │   blocks found: {tel['blocks_found']}")
+            print(
+                f"  {state_badge}   │   session: {session}   │   blocks found: {tel['blocks_found']}"
+            )
             print(sep)
-
+            # ── PoW live progress ─────────────────────────────────────────
             if tel["state"] in ("MINING", "SOLVED", "SUBMITTING"):
-                target_zeros = tel.get("difficulty", 5)
-                _raw_tried  = _MINE_RAW_CTR[0]
-                _raw_base   = _MINE_RAW_CTR[1]
-                _cur_nonce_disp = (_raw_base + _raw_tried) & 0xFFFFFFFF
-                # Session total = all previous block attempts + current block attempt
-                _session_tried = _SESSION_TOTAL_TRIED[0] + _raw_tried
-                tried_str = f"{_raw_tried:,}"
-                nonce_str = f"{_cur_nonce_disp:,}"
-                session_str = f"{_session_tried:,}" if _session_tried > _raw_tried else ""
-                _extra = f"  │  session={session_str}" if session_str else ""
-                print(f"  Target h={tel.get('height', '?')}  │  diff={target_zeros} leading-zeros  │  nonce={nonce_str}  │  tried={tried_str}{_extra}  │  {hr_str}")
-                print(f"  Parent: {tel.get('parent_hash', '?')[:32]}…")
+                target_zeros = tel["difficulty"]
+                nonce_str = f"{tel['nonce']:,}"
+                print(
+                    f"  Target h={tel['height']}  │  diff={target_zeros} leading-zeros  │  "
+                    f"nonce={nonce_str}  │  {hr_str}"
+                )
+                print(f"  Parent: {tel['parent_hash'][:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
+            # ── Last solved block ─────────────────────────────────────────
+            lb = tel["last_block"]
+            if lb and (_LAST_BLOCK_REPORTED[0] != lb.get("hash")):
+                _LAST_BLOCK_REPORTED[0] = lb.get("hash")
+                age = _fmt_duration(now - tel["last_block_ts"])
+                print(sep)
+                print(f"  ✅ BLOCK SOLVED  ({age} ago)")
+                print(
+                    f"     height  : {lb.get('height', '?')}   nonce: {lb.get('nonce', '?'):,}"
+                )
+                print(f"     hash    : {str(lb.get('hash', '??'))[:48]}…")
+                print(
+                    f"     diff    : {lb.get('difficulty', '?')}   "
+                    f"ts: {time.strftime('%H:%M:%S', time.localtime(lb.get('timestamp', now)))}"
+                )
+                print(f"     parent  : {str(lb.get('parent_hash', '?'))[:40]}…")
+                if lb.get("signature"):
+                    _sig_display = str(lb.get("signature", "?"))
+                    if len(_sig_display) > 120:
+                        print(f"     sig     : {_sig_display[:120]}…")
+                    else:
+                        print(f"     sig     : {_sig_display}")
+                if lb.get("miner_public_key"):
+                    _pubkey_display = str(lb.get("miner_public_key", "?"))
+                    if len(_pubkey_display) > 120:
+                        print(f"     pubkey  : {_pubkey_display[:120]}…")
+                    else:
+                        print(f"     pubkey  : {_pubkey_display}")
+                print(
+                    f"  ── Quantum Attestation ──────────────────────────────────────"
+                )
+                _pq_c = lb.get("pq_curr", ks2.pq_curr_id or "?")
+                _pq_l = lb.get("pq_last", ks2.pq_last_id or "?")
+                print(f"     pq_curr : {_pq_c}   pq_last: {_pq_l}")
+                _disp_fid = getattr(self, "_local_fused_fid", 0.0) or ks2.pq0_fidelity
+                _disp_up = getattr(self, "_upstream_fid", 0.0)
+                print(
+                    f"     W-fid   : {_disp_fid:.4f}   bridge: {ks2.bridge_fidelity:.4f}   "
+                    f"upstream: {_disp_up:.4f}   coherence: {ks2.oracle_coherence:.4f}"
+                )
+                if m2:
 
-            _block_cache = globals().get("_block_cache")
-            if _block_cache:
-                cache_snap = _block_cache.snapshot()
-                # Show detailed slip for the most recently active block
-                _latest_block = None
-                for h in sorted(cache_snap.get("blocks", {}).keys(), reverse=True):
-                    b = _block_cache.get_block(h)
-                    # FIX BUG-20: include ORPHANED so blocks promoted by _evict_old TTL
-                    # stay visible while oracle_task polls for their final status
-                    if b and b.status in (BlockStatus.SOLVED, BlockStatus.SUBMITTED,
-                                         BlockStatus.PENDING, BlockStatus.FINALIZED,
-                                         BlockStatus.ORPHANED):
-                        _latest_block = b
-                        break
-                if _latest_block and force_full:
-                    print(sep)
-                    print(_render_block_slip(_latest_block, cache_snap, getattr(_block_cache, '_balance_qtcl', 0.0), self.format_p2p_status(detail=False)))
-                else:
-                    print(sep)
-                    print("  ── Block Cache ──")
-                    for h, info in sorted(cache_snap.get("blocks", {}).items()):
-                        _icon = "🔥" if info["status"] == "FINALIZED" else ("⏳" if info["status"] == "PENDING" else ("📡" if info["status"] == "SUBMITTED" else ("👻" if info["status"] == "ORPHANED" else "✅")))
-                        print(f"  h={h}: {_icon} {info['status']}  {info['oracles']} oracles")
-                    print(sep)
-                    _orph = cache_snap.get('orphaned', 0)
-                    _orph_str = f", {_orph} orphaned" if _orph > 0 else ""
-                    print(f"  Blocks  : {cache_snap['finalized']} finalized, {cache_snap['pending_display']} pending, {cache_snap['rejected']} rejected{_orph_str}")
-                    print(f"  Rewards : {cache_snap['total_rewards']:.2f} QTCL")
-                    print(f"  Balance : {_block_cache._balance_qtcl:.8f} QTCL")
-            else:
-                print(f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted")
-                if tel.get("total_earned_qtcl", 0) > 0:
-                    print(f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel.get('last_reward_qtcl', 0):.2f} QTCL)")
-            # FIX BUG-18: guard against _block_cache being None before attribute access
-            _last_peers = getattr(_block_cache, "_last_broadcast_peers", -1) if _block_cache else -1
-            if _last_peers >= 0:
-                if _last_peers > 0:
-                    print(f"  P2P     : ✅ {_last_peers} peers notified")
-                else:
-                    print(f"  P2P     : ⚠️ 0 peers (using server gossip)")
-            _sse_cons = globals().get("_SSE_CONSENSUS_STATE", {})
-            _sse_blk = globals().get("_SSE_BLOCK_STATE", {})
-            _sse_dns = globals().get("_SSE_DENSITY_STATE", {})
-            _sse_bal = globals().get("_SSE_BALANCE_STATE", {})
-            _sse_streams = [("cons", _sse_cons), ("blk", _sse_blk), ("dns", _sse_dns), ("bal", _sse_bal)]
-            _sse_initialized = [(n, s) for n, s in _sse_streams if s]
-            if not _sse_initialized:
-                _sse_label = "⏳ initializing..."
-            else:
-                _sse_up = sum(1 for _, s in _sse_initialized if s.get("connected", False))
-                _sse_total = len(_sse_initialized)
-                if _sse_up == _sse_total:
-                    _sse_label = f"✅ {_sse_up}/{_sse_total} streams connected"
-                else:
-                    _sse_label = f"⚠️ {_sse_up}/{_sse_total} streams"
-            print(f"  SSE     : {_sse_label}")
-            # FIX BUG-16: Show highest in-flight block's oracle count, not just mining height.
-            # tel['height'] is the block currently being mined (next height) — the submitted
-            # block awaiting consensus is at height-1. Pull actual oracle count from cache.
-            _oracle_display_h = tel.get('height', '?')
-            _oracle_count_str = ""
-            if _block_cache:
-                _in_flight = [(h, b) for h, b in _block_cache._blocks.items()
-                              if b.status in (BlockStatus.SUBMITTED, BlockStatus.PENDING, BlockStatus.ORPHANED)]
-                if _in_flight:
-                    _top_h, _top_b = max(_in_flight, key=lambda x: x[0])
-                    _oracle_display_h = _top_h
-                    _oracle_count_str = f"  oracles={_top_b.oracle_count}/5"
-            print(f"  Oracle: h={_oracle_display_h}  fid={ks2.pq0_fidelity:.4f}  bridge={ks2.bridge_fidelity:.4f}  lat={ks2.channel_latency_ms:.0f}ms{_oracle_count_str}  {'✅' if ks2.connected else '❌'}")
+                    def _cf(v, lo=0.0, hi=1.0):
+                        try:
+                            f = float(v)
+                            return (
+                                f
+                                if (lo <= f <= hi and __import__("math").isfinite(f))
+                                else 0.0
+                            )
+                        except:
+                            return 0.0
+
+                    print(
+                        f"     VN-S    : {_cf(m2.entropy_vn, 0, 3):.4f}   discord: {_cf(m2.quantum_discord, 0, 3):.4f}   "
+                        f"purity: {_cf(m2.purity, 0, 1):.4f}"
+                    )
+                    print(
+                        f"     neg A-B : {_cf(m2.negativity_AB, 0, 0.5):.4f}   neg B-C: {_cf(m2.negativity_BC, 0, 0.5):.4f}"
+                    )
+                    print(
+                        f"     CHSH AB : {_cf(m2.bell_chsh_AB, -4, 4):.4f}   CHSH BC: {_cf(m2.bell_chsh_BC, -4, 4):.4f}"
+                    )
+            print(sep)
+            # ── Oracle / chain state ──────────────────────────────────────
+            print(
+                f"  Oracle: h={tel['height']}  "
+                f"fid={ks2.pq0_fidelity:.4f}  "
+                f"bridge={ks2.bridge_fidelity:.4f}  "
+                f"lat={ks2.channel_latency_ms:.0f}ms  "
+                f"{'✅' if ks2.connected else '❌'}"
+            )
+            # ── P2P Status ─────────────────────────────────────────────────
             print(self.format_p2p_status(detail=True))
+            print(
+                f"  Blocks  : {tel['blocks_found']} solved, {tel['blocks_accepted']} accepted"
+            )
+            if tel["total_earned_qtcl"] > 0:
+                print(
+                    f"  Rewards : {tel['total_earned_qtcl']:.2f} QTCL (last: +{tel['last_reward_qtcl']:.2f} QTCL)"
+                )
+            try:
+                from globals import TessellationRewardSchedule as _TRS_disp
+
+                _bh_disp = int(self.koyeb_state.block_height or 0)
+                _m_disp = _TRS_disp.get_miner_reward_qtcl(_bh_disp)
+                _t_disp = _TRS_disp.get_treasury_reward_qtcl(_bh_disp)
+                _ta_disp = _TRS_disp.TREASURY_ADDRESS[:20]
+                if (
+                    getattr(getattr(self, "wallet", None), "address", "")
+                    == _TRS_disp.TREASURY_ADDRESS
+                ):
+                    print(
+                        f"  Split   : miner={_m_disp:.2f} QTCL/blk (now) + treasury={_t_disp:.2f} QTCL/blk (confirms at h+1) → total={_m_disp + _t_disp:.2f} QTCL/blk"
+                    )
+                    print(
+                        f"  Note    : Mining as treasury address — miner credited immediately, treasury pending until next block"
+                    )
+            except Exception:
+                pass
+            try:
+                _addr2 = getattr(getattr(self, "wallet", None), "address", None)
+                if _addr2:
+                    _bal = None
+                    # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
+                    try:
+                        import sqlite3 as _sq
+
+                        _local_db = (
+                            getattr(self, "_db_path", None)
+                            or getattr(getattr(self, "db", None), "_db_path", None)
+                            or getattr(getattr(self, "db", None), "db_path", None)
+                        )
+                        if _local_db:
+                            _lc = _sq.connect(str(_local_db), timeout=3.0)
+                            _lc.row_factory = _sq.Row
+                            _lr = _lc.execute(
+                                "SELECT balance FROM wallet_addresses WHERE address=?",
+                                (_addr2,),
+                            ).fetchone()
+                            _lc.close()
+                            if _lr is not None:
+                                _bal = int(_lr["balance"] or 0) / 100.0
+                    except Exception:
+                        pass
+                    # ── 2. Fall back to Koyeb RPC if local miss
+                    if _bal is None:
+                        for _retry_idx in range(3):
+                            _bal_r = self.api._rpc(
+                                "qtcl_getBalance", [_addr2], timeout=5, retries=1
+                            )
+                            _bal = (
+                                float(_bal_r["balance"])
+                                if isinstance(_bal_r, dict) and "balance" in _bal_r
+                                else None
+                            )
+                            if _bal is not None and _bal > 0:
+                                break
+                            if _retry_idx < 2:
+                                time.sleep(0.5)
+                    if _bal is not None:
+                        print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
+            except Exception:
+                pass
+            if m2:
+
+                def _cf2(v, lo=0.0, hi=1.0):
+                    try:
+                        f = float(v)
+                        return (
+                            f
+                            if (lo <= f <= hi and __import__("math").isfinite(f))
+                            else 0.0
+                        )
+                    except:
+                        return 0.0
+
+                print(
+                    f"  Field : Fid→|W3⟩={_cf2(m2.fidelity_to_w3, 0, 1):.4f}  "
+                    f"S={_cf2(m2.entropy_vn, 0, 3):.4f}  "
+                    f"purity={_cf2(m2.purity, 0, 1):.4f}  "
+                    f"‖Δρ‖={_cf2(m2.field_density, 0, 100):.4f}"
+                )
+            # ── Tripartite Oracle Status ─────────────────────────────────────
+            # Check both _LIVE_RPC_ORACLE state AND local client state
+            _ora_state = _LIVE_RPC_ORACLE.get_oracle_state()
+
+            # Also check local tripartite state (may have cycles even if RPC state empty)
+            _local_fused_fid = 0.0
+            _upstream_fid = 0.0
+            _tri_thread_alive = False
+            try:
+                _local_fused_fid = getattr(self, "_local_fused_fid", 0.0)
+                _upstream_fid = getattr(self, "_upstream_fid", 0.0)
+                # Check if the tripartite thread is running
+                for t in _threading.enumerate():
+                    if t.name == "TripartiteOracle":
+                        _tri_thread_alive = t.is_alive()
+                        break
+            except Exception:
+                pass
+
+            _has_cycle = _ora_state and _ora_state.get("cycle", 0) > 0
+            _has_local = _local_fused_fid > 0 or _upstream_fid > 0
+
+            if _has_cycle:
+                _cycle = _ora_state.get("cycle", 0)
+                _fid = _ora_state.get("w_state_fidelity", 0.0)
+                _purity = _ora_state.get("purity", 0.0)
+                _vne = _ora_state.get("von_neumann_entropy", 0.0)
+                _mode_raw = _ora_state.get("aer_noise_state", "unknown")
+                _mode = _mode_raw if isinstance(_mode_raw, str) else "active"
+                _pq0_f = _ora_state.get("pq0_oracle_fidelity", 0.0)
+                _pq0_iv_f = _ora_state.get("pq0_IV_fidelity", 0.0)
+                _pq0_v_f = _ora_state.get("pq0_V_fidelity", 0.0)
+                _up_f = _ora_state.get("upstream_fidelity", 0.0)
+                # Clamp display values to sane ranges
+                _purity = (
+                    max(0.0, min(1.0, _purity))
+                    if isinstance(_purity, (int, float))
+                    else 0.0
+                )
+                _vne = (
+                    max(0.0, min(10.0, _vne)) if isinstance(_vne, (int, float)) else 0.0
+                )
+                print(
+                    f"  ⚛️  Oracle: cycle={_cycle} mode={_mode} fused_fid={_fid:.4f} purity={_purity:.4f} S={_vne:.3f}"
+                )
+                print(
+                    f"          pq0={_pq0_f:.4f}  pq0_IV={_pq0_iv_f:.4f}  pq0_V={_pq0_v_f:.4f}  upstream={_up_f:.4f}"
+                )
+            elif _has_local:
+                # ❤️  I love you — use oracle_state fidelity when available, not stale _local_fused_fid
+                _disp_fid = float(
+                    _ora_state.get("w_state_fidelity", 0.0) or _local_fused_fid
+                )
+                _disp_up = float(
+                    _ora_state.get("upstream_fidelity", 0.0) or _upstream_fid
+                )
+                print(
+                    f"  ⚛️  Oracle: ⚡ tripartite active (local_fid={_disp_fid:.4f} upstream={_disp_up:.4f})"
+                )
+            elif _tri_thread_alive:
+                # Thread is running but no fidelity yet - show spinner
+                print(
+                    f"  ⚛️  Oracle: 🔄 starting (thread alive, waiting for first measurement...)"
+                )
+            else:
+                print(f"  ⚛️  Oracle: ⚠️  awaiting first cycle...")
+            if False and _P2P_NODE is None:
+                try:
+                    _da_id = getattr(self, "_peer_id", None) or f"miner_{id(self)}"
+                    globals()["_P2P_NODE"] = _init_p2p_node(
+                        _da_id, QtclP2PNode.DEFAULT_PORT
+                    )
+                    globals()["_P2P_NODE"].start(_LIVE_RPC_ORACLE, _WSTATE_CONSENSUS)
+                except Exception:
+                    pass
+            if False and _P2P_NODE and (getattr(_P2P_NODE, "_started", False) or False):
+                try:
+                    _cons2 = _P2P_NODE.get_consensus_dm()
+                    _cf2 = f"F={_cons2[2]:.4f}" if _cons2 else "awaiting…"
+                    _p2p_rep = ""
+                    try:
+                        _pl = _P2P_NODE.get_peers()
+                        if _pl:
+                            _connected_pl = [p for p in _pl if p.get("connected")]
+                            _fids = [
+                                p.get("fidelity", 0)
+                                for p in _connected_pl
+                                if p.get("fidelity", 0) > 0
+                            ]
+                            _lats = [
+                                p.get("latency_ms", 0)
+                                for p in _connected_pl
+                                if p.get("latency_ms", 0) > 0
+                            ]
+                            _avg_fid = sum(_fids) / len(_fids) if _fids else 0.0
+                            _avg_lat = sum(_lats) / len(_lats) if _lats else 0.0
+                            _lat_str = f"{_avg_lat:.0f}ms" if _lats else "N/A"
+                            _fid_str = f"{_avg_fid:.4f}" if _fids else "N/A"
+                            _p2p_rep = f"  avg_lat={_lat_str}  avg_fid={_fid_str}"
+                    except Exception:
+                        pass
+                    if not _cons2:
+                        try:
+                            _P2P_NODE.trigger_consensus()
+                        except Exception:
+                            pass
+                        _local_f = (
+                            _LIVE_RPC_ORACLE.get_oracle_state().get(
+                                "w_state_fidelity", 0
+                            )
+                            if _LIVE_RPC_ORACLE
+                            else 0
+                        )
+                        _cf2 = (
+                            f"local-only F={_local_f:.4f}"
+                            if _local_f > 0
+                            else "awaiting peers…"
+                        )
+                    print(
+                        f"  P2P    : 🌀 {_np2} peers  RPC-only (no SSE)  consensus={_cf2}{_p2p_rep}"
+                    )
+                except Exception:
+                    pass
             print(f"  Thread: {'✅ alive' if _mine_thread.is_alive() else '❌ dead'}")
             print(sep)
+
+        # ── Foreground interactive loop — non-blocking auto-refresh ──────────
+        _REFRESH_INTERVAL = 5.0  # seconds between auto-redraws
+        import select as _select
+
         def _kbhit(timeout: float = 0.0):
             """Return True if a keypress is waiting on stdin."""
             try:
@@ -27225,8 +26307,6 @@ class QtclClientApp:
             except Exception:
                 return False
 
-        _REFRESH_INTERVAL = 3.0
-        _last_dashboard_ts = [0.0]
         _print_dashboard(force_full=True)
         print("\n  ── Press  q + Enter  to stop mining ─────────────────────────")
         try:
@@ -27238,17 +26318,12 @@ class QtclClientApp:
                         break
                     if ch in ("q", "quit", "stop"):
                         break
-                _now_dash = time.time()
-                if _now_dash - _last_dashboard_ts[0] >= _REFRESH_INTERVAL:
-                    _print_dashboard()
-                    _last_dashboard_ts[0] = _now_dash
+                _print_dashboard()
         except KeyboardInterrupt:
             pass
         finally:
+            miner.stop_mining()
             self._stop.set()
-            _oracle_n = getattr(self, "_oracle_node", None)
-            if _oracle_n and _oracle_n.is_active():
-                _oracle_n.deactivate()
             print("\n  🛑 Mining stopped")
 
     # ── Transact mode ─────────────────────────────────────────────────────────
@@ -27337,168 +26412,92 @@ class QtclClientApp:
         _tx_root_log.handlers = _tx_old_handlers
         _tx_root_log.setLevel(_tx_old_level)
         self._stop.set()
-        _oracle_n = getattr(self, "_oracle_node", None)
-        if _oracle_n and _oracle_n.is_active():
-            _oracle_n.deactivate()
 
     def _send_tx_wizard(self) -> None:
-        """
-        Interactive QTCL transaction wizard — v4.0.
-        Identical user flow to v3.x; uses startup-resilient api.submit_transaction()
-        which polls /health and retries transient server errors automatically.
-        """
-        # ── Inputs ────────────────────────────────────────────────────────────
         try:
-            to_addr     = input("  To address (64-char hex): ").strip()
-            amount_qtcl = float(input("  Amount (QTCL): ").strip())
-            memo        = input("  Memo [optional]: ").strip()
-            use_fee     = input("  Custom fee? [y/N]: ").strip().lower()
-            if use_fee == "y":
-                fee_qtcl = float(input("  Fee (QTCL) [default 0.01]: ").strip() or "0.01")
+            to_addr = input("  To address (qtcl1…): ").strip()
+            amount = float(input("  Amount (QTCL): ").strip())
+
+            # Use existing fee structure for network donations
+            donate = input("  Donate to the network? [y/N]: ").strip().lower()
+            if donate == "y":
+                fee = float(
+                    input("  Donation amount [default 0.001]: ").strip() or "0.001"
+                )
             else:
-                fee_qtcl = 0.01
+                fee = 0.0
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled")
             return
-
-        # ── Validate address ──────────────────────────────────────────────────
-        if not to_addr or len(to_addr) < 40:
-            print("  ❌ Invalid QTCL address (must be ≥40 hex chars)")
+        if not to_addr.startswith("qtcl1"):
+            print("  ❌ Invalid QTCL address")
             return
-        if not all(c in '0123456789abcdef' for c in to_addr.lower()):
-            print("  ❌ Invalid QTCL address (non-hex characters detected)")
-            return
-        if not self.wallet.private_key:
-            print("  ❌ No private key loaded — cannot sign transaction")
-            return
-
-        # ── Pre-flight balance check ───────────────────────────────────────────
-        # Check server balance before spending time on signing. Gives a clear
-        # error instead of a confusing rejection after full tx construction.
-        _total_needed = amount_qtcl + fee_qtcl
-        print(f"  🔍 Checking balance…", end="", flush=True)
-        try:
-            _bal = self.api.get_balance(self.wallet.address)
-        except Exception:
-            _bal = None
-        if _bal is not None:
-            print(f"  {_bal:.4f} QTCL available")
-            if _bal < _total_needed:
-                print(f"\n  ❌ Insufficient balance: have {_bal:.4f} QTCL, need {_total_needed:.4f} QTCL")
-                print(f"     Mine a block first to earn rewards, or receive QTCL from another address.")
-                return
-        else:
-            print("  (balance query failed — proceeding)")
-
-        # ── Build tx ──────────────────────────────────────────────────────────
-        from_addr    = self.wallet.address
-        amount_base  = int(round(amount_qtcl * 100))
-        fee_base     = int(round(fee_qtcl    * 100))
-        nonce        = int(time.time() * 1000)
-        timestamp_ns = time.time_ns()
-
-        # Canonical tx_hash v2 — integer-only, matches mempool canonical_hash
-        # Format: SHA3-256("from:to:amount_base:fee_base:nonce:timestamp_ns")
-        _canon_str = f"{from_addr}:{to_addr}:{amount_base}:{fee_base}:{nonce}:{timestamp_ns}"
-        tx_hash    = hashlib.sha3_256(_canon_str.encode()).hexdigest()
-
-        # Signing payload v2 — integer fields, sort_keys=True, matches mempool get_signing_hash
-        # SHA3-256(json.dumps({"amount_base":int,"fee_base":int,"nonce":int,"recipient":str,"sender":str,"timestamp_ns":int}))
-        _sign_data = {
-            "sender"      : from_addr,
-            "recipient"   : to_addr,
-            "amount_base" : amount_base,
-            "fee_base"    : fee_base,
-            "nonce"       : nonce,
-            "timestamp_ns": timestamp_ns,
-        }
-        _sign_json    = json.dumps(_sign_data, sort_keys=True)
-        _message_hash = hashlib.sha3_256(_sign_json.encode("utf-8")).digest()
-
-        # Sign with HypΓ engine
-        _engine = HypGammaEngine()
-        sig = _engine.sign_hash(_message_hash, self.wallet.private_key)
-        sig["public_key_hex"] = self.wallet.public_key or ""
-        sig["public_key"]     = self.wallet.public_key or ""
-
-        _amt_f = amount_base / 100.0   # float repr for legacy fields only
-        _fee_f = fee_base    / 100.0
-
-        # Full transaction dict — matches mempool._validate_format expectations exactly
         tx = {
-            "tx_hash"             : tx_hash,
-            "from_address"        : from_addr,
-            "to_address"          : to_addr,
-            "amount"              : _amt_f,
-            "amount_base"         : amount_base,
-            "fee"                 : _fee_f,
-            "fee_base"            : fee_base,
-            "nonce"               : nonce,
-            "timestamp_ns"        : timestamp_ns,
-            "tx_type"             : "transfer",
-            "memo"                : memo[:256] if memo else "",
-            "signature"           : sig,
-            "sender_public_key_hex": self.wallet.public_key or "",
-            "public_key"          : self.wallet.public_key or "",
-            "outputs"             : [{"address": to_addr, "amount_base": amount_base}],
-            "inputs"              : [],
-            "metadata"            : {"sender_public_key_hex": self.wallet.public_key or ""},
+            "from_address": self.wallet.address,
+            "to_address": to_addr,
+            "amount": amount,
+            "fee": fee,
+            "timestamp": time.time(),
+            "nonce": int(time.time() * 1000),
+            "public_key": self.wallet.public_key or "",
+            "pq_curr": self.koyeb_state.pq_curr_id,
+            "block_height": self.koyeb_state.block_height,
+            "w_state_fidelity": self.koyeb_state.w_state_fidelity,
         }
+        # ── SIGNATURE GENERATION (HypΓ CANONICAL) ──────────────────
+        if self.wallet.private_key:
+            tx_to_sign = {
+                "sender": self.wallet.address,
+                "recipient": to_addr,
+                "amount": float(amount),
+                "nonce": tx["nonce"],
+            }
+            sig_dict = hyp_sign_transaction(tx_to_sign, self.wallet.private_key)
+            # wallet.public_key is guaranteed canonical (2048-char lattice key) after
+            # migration in load() — never re-derive here to avoid engine version skew.
+            sig_dict["public_key_hex"] = self.wallet.public_key or ""
+            tx["signature"] = _json.dumps(sig_dict)
 
-        # ── Summary ───────────────────────────────────────────────────────────
-        print(f"\n  ── Transaction Summary ──")
-        print(f"     From:  {from_addr[:20]}…")
-        print(f"     To:    {to_addr[:20]}…")
-        print(f"     Amt:   {amount_qtcl:.2f} QTCL")
-        print(f"     Fee:   {fee_qtcl:.4f} QTCL")
-        print(f"     Hash:  {tx_hash[:32]}…")
-        print(f"     Nonce: {nonce}")
-        confirm = input("  Submit? [Y/n]: ").strip().lower()
-        if confirm == "n":
-            print("  ❌ Cancelled")
-            return
+        # Standard tx_id for display
+        tx_id = _hashlib.sha256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
+        tx["tx_id"] = tx_id
 
-        # ── Submit — route through _submit_with_startup_retry ──
-        # Polls /mcp/health for true readiness, retries network errors with backoff.
-        result = _submit_with_startup_retry(
-            tx, self.api.base_url,
-            session=self.api._get_session(),
-            print_fn=print,
-        )
+        import time as _tw
 
-        # ── Result display ────────────────────────────────────────────────────
-        if result and result.get("accepted"):
-            srv_hash = result.get("tx_hash", tx_hash)
-            print(f"\n  ✅ Submitted  │  hash: {srv_hash}")
-            print(f"     Status  : {result.get('status', 'pending')}")
-            print(f"     Message : {result.get('message', 'ok')}")
-            if srv_hash != tx_hash:
-                print(f"     ⚠️  Server recomputed canonical hash (client hash: {tx_hash[:20]}…)")
+        tx["timestamp_ns"] = str(_tw.time_ns())
+        result = self.api.submit_transaction(tx)
+        if result and result.get("tx_hash"):
+            srv = result.get("tx_hash", result.get("txid", tx_id))
+            print(f"\n  ✅ Submitted  │  hash: {srv}")
+            print(
+                f"  Status: {result.get('status', 'pending')}  │  "
+                f"donation: {result.get('fee', fee):.8f}  │  "
+                f"query: /api/transactions/{srv}"
+            )
+            try:
+                pass  # SSE removed - RPC only
+            except Exception:
+                pass
         elif result and result.get("error"):
-            err     = result.get("error", "unknown rejection")
-            err_str = ""
-            if isinstance(err, dict):
-                err_code = err.get("code", "")
-                err_msg  = err.get("message", str(err))
-                err_str  = f"[{err_code}] {err_msg}" if err_code else err_msg
-            else:
-                err_str = str(err)
-            # Classify for a helpful message
-            _em = err_str.lower()
-            if any(k in _em for k in ("initializing", "starting", "boot", "warming")):
-                print(f"\n  ❌ Server still warming up after retries.")
-                print(f"     Retry in ~30s or visit: {self.api.base_url}")
-            elif any(k in _em for k in ("insufficient", "balance")):
-                print(f"\n  ❌ Insufficient balance: {err_str}")
-            elif any(k in _em for k in ("signature", "sig")):
-                print(f"\n  ❌ Signature rejected: {err_str}")
-            else:
-                print(f"\n  ❌ Rejected: {err_str}")
-            print(f"     Try: {self.oracle_url}")
+            err = result.get("error", "unknown rejection")
+            code = result.get("code", "")
+            print(f"\n  ❌ Rejected: {err}{f'  [{code}]' if code else ''}")
         else:
-            _err_detail = (result or {}).get('error', 'no response from server')
-            print(f"  ❌ Submission failed: {_err_detail}")
-            print(f"  Endpoint: {self.api.base_url}/rpc")
+            print("  ❌ Submission failed — no response from RPC nodule")
+            print("")
+            print(self.api.get_diagnostics())
+            print("")
+            print(f"  📋 TX details (not submitted):")
+            print(f"     Hash:  {tx_id[:32]}…")
+            print(f"     From:  {tx['from_address'][:16]}…")
+            print(f"     To:    {tx['to_address'][:16]}…")
+            print(f"     Amt:   {tx['amount']} QTCL")
+            print("")
+            print(f"  💡 Troubleshooting:")
+            print(f"     1. Verify {self.oracle_url} is online")
+            print(f"     2. Check your internet connection")
+            print(f"     3. Try again in a few moments (server may be restarting)")
+            print(f"     4. If persistent, the RPC nodule may be down")
 
     def _query_tx(self) -> None:
         try:
@@ -27870,6 +26869,9 @@ class QtclClientApp:
         Press Enter to refresh, q+Enter to quit, l+Enter for log tail.
         Full hex strings printed for auditability — nothing truncated.
         """
+        # ── Mark audit mode to skip SSE initialization ──
+        self._audit_mode = True
+        
         # ── Bootstrap: init DB (skip wallet + P2P for pure audit) ─────────────
         # Initialize database (idempotent — safe to call multiple times)
         if not hasattr(self, "_db") or self._db is None:
@@ -28017,84 +27019,12 @@ class QtclClientApp:
             # Health / Diagnostics (non-critical, 1 retry)
             health = _safe_rpc("qtcl_getHealth", [], "health")
 
-            # Oracle snapshot — from SSE stream cache (preferred) or /latest one-shot
-            # The 16³ density tensor and W-state amplitude data flow through SSE.
-            snap = {}
-            _sse_latest = globals().get("_LATEST_DENSITY_SNAPSHOT")
-            if isinstance(_sse_latest, dict) and _sse_latest.get("density_tensor_hex"):
-                snap = dict(_sse_latest)
-                _rpc_ok_count += 1
-            else:
-                # Fallback: one-shot HTTP GET to SSE /latest endpoint
-                try:
-                    import urllib.request as _sse_ur
-                    _sse_url = f"{kapi.base_url}/rpc/oracle/snapshot/latest"
-                    _sse_req = _sse_ur.Request(_sse_url, method="GET")
-                    with _sse_ur.urlopen(_sse_req, timeout=6) as _sse_resp:
-                        if _sse_resp.status == 200:
-                            _sse_data = json.loads(_sse_resp.read().decode())
-                            if isinstance(_sse_data, dict) and "status" not in _sse_data:
-                                snap = _sse_data
-                                _rpc_ok_count += 1
-                except Exception:
-                    pass
-
-            # Always synthesize snap from qtcl_getQuantumMetrics as fallback
-            # This provides w_state fidelity/coherence/purity/entropy and w_state_hex
-            if isinstance(metrics, dict):
-                _mws_metrics = metrics.get("w_state") or {}
-                snap.setdefault("fidelity", _mws_metrics.get("fidelity"))
-                snap.setdefault("coherence", _mws_metrics.get("coherence"))
-                snap.setdefault("purity", _mws_metrics.get("purity"))
-                snap.setdefault("entropy", _mws_metrics.get("entropy"))
-                snap.setdefault("w_state_hex", metrics.get("w_state_hex", ""))
-                snap.setdefault("block_height", metrics.get("block_height") or tip.get("block_height"))
-                snap.setdefault("oracle_id", "koyeb-primary")
-
-                # Build 8x8 density_matrix_hex from w_state_hex (8 complex W-state amplitudes)
-                # w_state_hex is 256 hex chars = 8 complex128 diagonal amplitudes at indices [1,2,4,8,16,32,64,128]
-                # Reconstruct 8x8 DM as outer product: ρ[i,j] = amp[i] * conj(amp[j])
-                _ws_hex = snap.get("w_state_hex") or metrics.get("w_state_hex") or ""
-                if len(_ws_hex) == 256:
-                    try:
-                        import struct as _dm_s
-                        _amps = []
-                        for _wi in range(8):
-                            _chunk = bytes.fromhex(_ws_hex[_wi * 32 : (_wi + 1) * 32])
-                            _re, _im = _dm_s.unpack(">dd", _chunk)
-                            _amps.append(complex(_re, _im))
-                        # Build 8x8 DM as outer product
-                        _dm_8x8 = [
-                            [0j] * 8 for _ in range(8)
-                        ]
-                        for _ri in range(8):
-                            for _ci in range(8):
-                                _dm_8x8[_ri][_ci] = _amps[_ri] * _amps[_ci].conjugate()
-                        # Normalize trace = 1
-                        _tr = sum(_dm_8x8[i][i].real for i in range(8))
-                        if _tr > 1e-12:
-                            for _ri in range(8):
-                                for _ci in range(8):
-                                    _dm_8x8[_ri][_ci] /= _tr
-                        # Serialize as complex128 IEEE754 LE (16 bytes per element)
-                        _dm_bytes = b"".join(
-                            _dm_s.pack("<dd", _dm_8x8[_ri][_ci].real, _dm_8x8[_ri][_ci].imag)
-                            for _ri in range(8)
-                            for _ci in range(8)
-                        )
-                        snap["density_matrix_hex"] = _dm_bytes.hex()
-                    except Exception:
-                        pass
-
-            if not snap.get("density_matrix_hex") and snap.get("_synthesized") is None:
-                if snap.get("w_state_hex"):
-                    snap["_synthesized"] = True
-                else:
-                    snap["_synthesized"] = False
+            # Oracle snapshot — ALIAS: use quantum_metrics result directly for DM + fidelity
+            # (instead of separate qtcl_getLatestDMSnapshot call which may not exist on older servers)
+            snap = metrics or {}
 
             # Server peer registry (2 retries)
-            # qtcl_getPeers expects params as [limit_int] — matches server.py _rpc_getPeers
-            server_peers = _safe_rpc("qtcl_getPeers", [50], "get_peers")
+            server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
 
             # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
             # First resolve our external IP from the server's perspective
@@ -28115,15 +27045,17 @@ class QtclClientApp:
                     )
 
             # Mempool (1 retry — non-critical)
-            # qtcl_getMempool expects params as [max_count] list
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
 
-            # Local P2P stats — read from quantum metrics' client_oracle_count if available
-            # No separate p2p_getNetworkStats endpoint exists
-            local_p2p_stats = {
-                "client_oracle_count": metrics.get("client_oracle_count", 0),
-                "client_fused_fidelity": metrics.get("client_fused_fidelity", 0.0),
-            } if isinstance(metrics, dict) else {}
+            # Local P2P node (only query if running — use only for live peer state)
+            api_node = KoyebRPCNodule("http://127.0.0.1:9091")
+            local_p2p_stats = {}
+            try:
+                _lp = api_node._rpc("qtcl_p2p_getNetworkStats", [])
+                if _lp and "error" not in str(_lp):
+                    local_p2p_stats = _lp
+            except Exception:
+                pass
 
             # Get block height for pq_curr/pq_last computation
             _bh = tip.get("block_height") or tip.get("height") or 0
@@ -28299,25 +27231,28 @@ class QtclClientApp:
             a("║" + f"  Server: {self.oracle_url}".ljust(W - 2) + "║")
             a("╚" + "═" * (W - 2) + "╝")
             # ── Connection error banner (when RPC calls fail) ────────────────
-            # dm_snapshot is now non-critical (has fallback chain) — only block_height,
-            # get_block, and quantum_metrics are truly critical for the panel.
-            _CRITICAL_METHODS = {"block_height", "get_block", "quantum_metrics"}
-            _critical_fail = any(e[0] in _CRITICAL_METHODS for e in rpc_errors)
-            _warn_errors = [e for e in rpc_errors if e[0] not in _CRITICAL_METHODS]
-            _crit_errors = [e for e in rpc_errors if e[0] in _CRITICAL_METHODS]
-            if _critical_fail:
+            _critical_fail = any(
+                e[0] in ("block_height", "get_block", "quantum_metrics", "dm_snapshot")
+                for e in rpc_errors
+            )
+            if rpc_errors and (_critical_fail or len(rpc_errors) >= 3):
                 a(HR)
-                a(f"  ⚠️  CRITICAL RPC FAILURE — {', '.join(e[0] for e in _crit_errors)} failed")
+                _crit_names = [
+                    e[0]
+                    for e in rpc_errors
+                    if e[0]
+                    in ("block_height", "get_block", "quantum_metrics", "dm_snapshot")
+                ]
+                if _crit_names:
+                    a(f"  ⚠️  CRITICAL RPC FAILURE — {', '.join(_crit_names)} failed")
+                else:
+                    a(f"  ⚠️  {len(rpc_errors)} RPC call(s) failed — partial data shown")
                 a(f"     Server: {self.oracle_url}")
                 a(f"     Hit Enter to retry, q to quit")
-            elif _warn_errors:
-                # Non-critical failures (dm_snapshot synthesized from metrics, etc.)
-                _synth = [e for e in _warn_errors if "synthesized" in (e[1] or "")]
-                _hard = [e for e in _warn_errors if "synthesized" not in (e[1] or "")]
-                if _synth:
-                    a(f"  ℹ️  DM snapshot synthesized from quantum_metrics (endpoint unavailable)")
-                if _hard:
-                    a(f"  ⚠️  {len(_hard)} non-critical error(s): {', '.join(e[0] for e in _hard[:3])}")
+            elif rpc_errors:
+                a(
+                    f"  ⚠️  {len(rpc_errors)} non-critical error(s): {', '.join(e[0] for e in rpc_errors[:3])}"
+                )
             # ── Chain ──────────────────────────────────────────────
             height = tip.get("block_height") or tip.get("height") or "?"
             parent = tip.get("parent_hash") or tip.get("hash") or "—"
@@ -28431,24 +27366,14 @@ class QtclClientApp:
             a("  ORACLE  —  5-node W-state consensus")
             a(f"  Oracle node    : {oracle_addr}")
             a(f"  Block height   : {_bh_label}  |  pq_curr={pq_c}  pq_last={pq_l}")
-            _oracle_degraded = (fid == 0.0 and coh == 0.0 and pur == 0.0)
-            if _oracle_degraded:
-                # Oracle DEGRADED: server oracle_ready=True but DM/W-state not populated yet
-                # This happens when the oracle has not completed its first W-state cycle.
-                # Entropy is still meaningful (maximally mixed = log2(7) ≈ 2.807 bits for 7 DOF)
-                a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  ⚠️  DEGRADED  (oracle warm-up in progress)")
-            else:
-                a(
-                    f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
-                    f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}"
-                )
+            a(
+                f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
+                f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}"
+            )
             a(f"  Coherence  {_bar(coh)}  {coh:.6f}")
             a(f"  Purity     {_bar(pur)}  {pur:.6f}")
-            _ent_note = ""
-            if _oracle_degraded and ent > 0.0:
-                _ent_note = "  (maximally mixed — oracle warm-up)"
             a(
-                f"  VN Entropy  {ent:.4f} bits{_ent_note}   "
+                f"  VN Entropy  {ent:.4f} bits   "
                 f"Mermin ⟨M₃⟩: {mermin:+.4f}  "
                 f"{'✅ QUANTUM' if _mq else '· classical'}"
                 f"{'  ' + _mverd[:40] if _mverd else ''}"
@@ -28483,12 +27408,7 @@ class QtclClientApp:
             elif dm_hex and dm_hex != "—":
                 a(f"  (unexpected length {len(dm_hex)}, expected 2048 — truncated)")
             else:
-                _synth_flag = snap.get("_synthesized") if isinstance(snap, dict) else False
-                if _synth_flag:
-                    a("  (DM endpoint unavailable — metrics synthesized from qtcl_getQuantumMetrics)")
-                    a("  Coherence/fidelity/purity above reflect server oracle_ready state.")
-                else:
-                    a("  (not available — oracle DM snapshot not yet received)")
+                a("  (not available — SSE oracle DM not yet received)")
             # ── Per-node breakdown ──────────────────────────────────
             nodes = (
                 w_state.get("oracle_measurements")
@@ -28545,20 +27465,6 @@ class QtclClientApp:
                 bloch_y = pq0.get("bloch_y") or "—"
                 bloch_z = pq0.get("bloch_z") or "—"
                 bloch_raw = "—"
-                # Synthesize pq0 Bloch angles from block height when oracle DM unavailable
-                # pq0 maps to {8,3} lattice cell index pq_curr % 8; each cell has
-                # canonical Bloch coords θ = π/(8 - pq_c%8), φ = 2π·pq_c/8
-                try:
-                    _pq_c_int = int(pq_c) if pq_c.isdigit() else 0
-                    if _pq_c_int > 0:
-                        _bt_s = _bmath.pi / max(1, 8 - (_pq_c_int % 8))
-                        _bp_s = 2.0 * _bmath.pi * (_pq_c_int % 8) / 8.0
-                        bloch_x = f"{_bmath.sin(_bt_s) * _bmath.cos(_bp_s):.4f}*"
-                        bloch_y = f"{_bmath.sin(_bt_s) * _bmath.sin(_bp_s):.4f}*"
-                        bloch_z = f"{_bmath.cos(_bt_s):.4f}*"
-                        bloch_raw = f"θ={_bt_s:.4f}  φ={_bp_s:.4f}  (* synthesized from pq_curr)"
-                except Exception:
-                    pass
             # Use None-check (not `or`) because 0.0 is a valid fidelity value
             _pfo = pq0.get("pq0_oracle_fidelity")
             _pfw = w_state.get("pq0_oracle_fidelity")
@@ -28821,30 +27727,8 @@ class QtclClientApp:
             if diag:
                 a(HR)
                 a("  DIAGNOSTICS  (server /api/diagnostics)")
-                _diag_order = ["status", "ts", "uptime_s", "oracle_ready", "lattice_ready",
-                               "pyth_ready", "pyth_stats", "jsonrpc_version", "qtcl_server"]
-                _diag_shown = set()
-                for k in _diag_order:
-                    if k in diag:
-                        v = diag[k]
-                        _diag_shown.add(k)
-                        if k == "uptime_s":
-                            try:
-                                _us = float(v)
-                                _uh, _rem = divmod(int(_us), 3600)
-                                _um, _usec = divmod(_rem, 60)
-                                v = f"{_uh:02d}h {_um:02d}m {_usec:02d}s  ({_us:.1f}s)"
-                            except Exception:
-                                pass
-                        elif k == "oracle_ready":
-                            v = f"{v}  {'✅' if v else '⚠️  not ready'}"
-                        elif k == "lattice_ready":
-                            v = f"{v}  {'✅' if v else '⚠️  not ready'}"
-                        a(f"  {_pad(str(k), 28)}: {v}")
-                # Any extra keys not in the ordered list
                 for k, v in list(diag.items())[:20]:
-                    if k not in _diag_shown:
-                        a(f"  {_pad(str(k), 28)}: {v}")
+                    a(f"  {_pad(str(k), 28)}: {v}")
             a(HR)
             a(
                 f"  [{time.strftime('%H:%M:%S')}]  Enter=refresh  q=quit  l=last-block-detail"
@@ -30373,7 +29257,7 @@ class NodeRPCMeshServer:
                 "height": h,
                 "total_blocks": total,
                 "tip_hash": str(tip["hash"]) if tip else "",
-                "difficulty": float(tip["difficulty"] or 5.0) if tip else 5.0,
+                "difficulty": float(tip["difficulty"] or 4.0) if tip else 4.0,
                 "w_state_fidelity": float(tip["w_state_fidelity"] or 0.0)
                 if tip
                 else 0.0,
@@ -30894,7 +29778,7 @@ class NodeRPCMeshServer:
         timestamp_s = int(hdr.get("timestamp", int(time.time())))
         nonce = int(hdr.get("nonce", 0))
         miner_address = str(hdr.get("miner_address", hdr.get("miner", "")))
-        difficulty = int(hdr.get("difficulty", 5))
+        difficulty = int(hdr.get("difficulty", 6))
         w_entropy_hex = str(
             hdr.get("w_entropy_hash", hdr.get("oracle_w_state_hash", ""))
         )
@@ -31050,7 +29934,7 @@ class NodeRPCMeshServer:
                     ")"
                 )
                 treasury_address = (
-                    "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
+                    "qtcl1treasury0reward0dist0address00000000000000000000001"
                 )
                 treasury_reward_base = 80
                 try:
@@ -31741,7 +30625,7 @@ def main() -> None:  # noqa: F811
         # an existing DB whose blocks table was created without merkle_root /
         # tx_count / synced_from_server (the root cause of IBD insert failures).
         try:
-            _boot_db = _get_local_db("qtcl")
+            _boot_db = LocalBlockchainDB(name="qtcl")
             # Full table creation pass (idempotent)
             _boot_db.create_tables()
             # Full column migration pass (idempotent, repairs any existing table)
@@ -31931,175 +30815,64 @@ def main() -> None:  # noqa: F811
             )
 
         # ── SSE Stream Receivers ─────────────────────────────────────────────
-        # Start background threads to receive real-time density, block, and consensus streams
+        # Start background threads to receive real-time density and block streams
         _sse_density_handlers: List[Callable[[dict], None]] = []
         _sse_block_handlers: List[Callable[[dict], None]] = []
-        _sse_consensus_handlers: List[Callable[[dict], None]] = []
-        _sse_balance_handlers: List[Callable[[dict], None]] = []
 
         def _default_density_handler(data: dict) -> None:
-            """Default handler for density stream - stores to global + local DB mesh repository."""
+            """Default handler for density stream - stores to global for reference."""
             dm_hex = data.get("density_tensor_hex", "") or data.get(
                 "density_matrix_hex", ""
             )
             ts = data.get("timestamp_ns", 0) or data.get("timestamp", 0)
             if dm_hex:
                 logger.debug(f"[SSE-RECV] Density snapshot received (ts={ts})")
-                # Persist to quantum_density for distributed sensor mesh
-                try:
-                    _qdb = _get_local_db("qtcl")
-                    _qdb.execute(
-                        "INSERT INTO quantum_density (source, density_matrix_hex, fidelity, coherence, block_height, metadata) VALUES (?,?,?,?,?,?)",
-                        (
-                            "server",
-                            dm_hex,
-                            float(data.get("fidelity", 0.0)),
-                            float(data.get("coherence", 0.0)),
-                            int(data.get("block_height", 0)),
-                            json.dumps(data, default=str),
-                        ),
-                    )
-                except Exception:
-                    pass
+            # Store in global for other components to access
             globals()["_LATEST_DENSITY_SNAPSHOT"] = data
-            # Dispatch to all registered density handlers
-            for _h in list(_sse_density_handlers):
-                if _h is _default_density_handler:
-                    continue
-                try:
-                    _h(data)
-                except Exception:
-                    pass
 
         def _default_block_handler(data: dict) -> None:
             """Default handler for block stream - logs new blocks."""
             height = data.get("height", 0) or data.get("block_height", 0)
             block_hash = data.get("hash", "") or data.get("block_hash", "")
             if height:
-                logger.debug(
+                logger.info(
                     f"[SSE-RECV] New block received: height={height}, hash={block_hash[:16]}..."
                 )
+            # Store in global for other components to access
             globals()["_LATEST_BLOCK_EVENT"] = data
-            # Dispatch to all registered block handlers
-            for _h in list(_sse_block_handlers):
-                if _h is _default_block_handler:
-                    continue
-                try:
-                    _h(data)
-                except Exception:
-                    pass
-
-        # Deduplication buffer for consensus events (suppress reconnect replays)
-        _CONSENSUS_DEDUP: Dict[Tuple[str, int, int], float] = {}
-        _CONSENSUS_DEDUP_LOCK = threading.Lock()
-
-        def _default_consensus_handler(data: dict) -> None:
-            """Default handler for oracle consensus stream - logs attestations/finalizations."""
-            _evt = data.get("event_type", "")
-            _h = int(data.get("height", 0))
-            _oid = data.get("oracle_ids", [])
-            _final = data.get("finalized", False)
-            _oc = int(data.get("oracle_count", len(_oid)))
-            # Deduplicate: suppress identical (event, height, count) within 10s
-            _key = (_evt, _h, _oc)
-            _now = time.time()
-            with _CONSENSUS_DEDUP_LOCK:
-                _last = _CONSENSUS_DEDUP.get(_key, 0)
-                if _now - _last < 10.0:
-                    return
-                _CONSENSUS_DEDUP[_key] = _now
-            if _evt == "block_finalized":
-                logger.critical(
-                    f"[SSE-RECV] 🔥 BLOCK FINALIZED h={_h}  oracles={_oc}/5  ids={_oid}"
-                )
-            elif _evt == "block_pending":
-                logger.debug(
-                    f"[SSE-RECV] ⏳ Block pending h={_h}  oracles={_oc}/5"
-                )
-            elif _evt == "oracle_attestation":
-                logger.debug(
-                    f"[SSE-RECV] 🖊️  Oracle attestation: h={_h}  oracle={data.get('oracle_id', '?')}"
-                )
-            globals()["_LATEST_CONSENSUS_EVENT"] = data
-            # Dispatch to all registered consensus handlers
-            for _h in list(_sse_consensus_handlers):
-                if _h is _default_consensus_handler:
-                    continue
-                try:
-                    _h(data)
-                except Exception:
-                    pass
-
-        def _default_balance_handler(data: dict) -> None:
-            """Default balance SSE handler — dispatches to registered handlers silently."""
-            _addr = data.get("address", "")[:16]
-            _bal  = data.get("balance_qtcl", 0)
-            _trigger = data.get("trigger", "?")
-            logger.debug(f"[SSE-BAL] Balance update: {_addr}… = {_bal:.8f} QTCL (trigger={_trigger})")
-            globals()["_LATEST_BALANCE_EVENT"] = data
-            # Dispatch to all registered balance handlers
-            for _h in list(_sse_balance_handlers):
-                if _h is _default_balance_handler:
-                    continue
-                try:
-                    _h(data)
-                except Exception:
-                    pass
 
         # Register default handlers
         _sse_density_handlers.append(_default_density_handler)
         _sse_block_handlers.append(_default_block_handler)
-        _sse_consensus_handlers.append(_default_consensus_handler)
-        _sse_balance_handlers.append(_default_balance_handler)
 
-        # Start SSE streams — required for audit panel density data
-        # Density stream provides the 16³ tensor needed for the audit DM display
-        try:
-            _density_thread = connect_density_stream(url, _default_density_handler)
-            globals()["_SSE_DENSITY_THREAD"] = _density_thread
-        except Exception as _sse_err:
-            logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
+        # Start SSE streams (only in non-audit modes to avoid cluttering logs)
+        if not _is_oracle_audit:
+            try:
+                _density_thread = connect_density_stream(url, _default_density_handler)
+                globals()["_SSE_DENSITY_THREAD"] = _density_thread
+            except Exception as _sse_err:
+                logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
 
-        try:
-            _block_thread = connect_block_stream(url, _default_block_handler)
-            globals()["_SSE_BLOCK_THREAD"] = _block_thread
-        except Exception as _sse_err:
-            logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
-
-        try:
-            _consensus_thread = connect_consensus_stream(url, _default_consensus_handler)
-            globals()["_SSE_CONSENSUS_THREAD"] = _consensus_thread
-        except Exception as _sse_err:
-            logger.debug(f"[SSE] Consensus stream init failed: {_sse_err}")
-
-        try:
-            _balance_thread = connect_balance_stream(url, _default_balance_handler)
-            globals()["_SSE_BALANCE_THREAD"] = _balance_thread
-        except Exception as _sse_err:
-            logger.debug(f"[SSE] Balance stream init failed: {_sse_err}")
+            try:
+                _block_thread = connect_block_stream(url, _default_block_handler)
+                globals()["_SSE_BLOCK_THREAD"] = _block_thread
+            except Exception as _sse_err:
+                logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
 
         # Make handler registration available globally
         globals()["_SSE_DENSITY_HANDLERS"] = _sse_density_handlers
         globals()["_SSE_BLOCK_HANDLERS"] = _sse_block_handlers
-        globals()["_SSE_CONSENSUS_HANDLERS"] = _sse_consensus_handlers
-        globals()["_SSE_BALANCE_HANDLERS"] = _sse_balance_handlers
 
         def register_density_handler(handler: Callable[[dict], None]) -> None:
+            """Register an additional handler for density stream events."""
             _sse_density_handlers.append(handler)
 
         def register_block_handler(handler: Callable[[dict], None]) -> None:
+            """Register an additional handler for block stream events."""
             _sse_block_handlers.append(handler)
-
-        def register_consensus_handler(handler: Callable[[dict], None]) -> None:
-            _sse_consensus_handlers.append(handler)
-
-        def register_balance_handler(handler: Callable[[dict], None]) -> None:
-            _sse_balance_handlers.append(handler)
 
         globals()["register_density_handler"] = register_density_handler
         globals()["register_block_handler"] = register_block_handler
-        globals()["register_consensus_handler"] = register_consensus_handler
-        globals()["register_balance_handler"] = register_balance_handler
 
         print("✅ Ready for input", flush=True)
     except Exception as e:
@@ -32119,384 +30892,6 @@ def main() -> None:  # noqa: F811
         app.run_node_mode()
     else:
         app.run()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TX PATCH v4.0 — INLINED (single-file, no companion module)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_PATCH_DEFAULT_URL       = "https://qtcl-blockchain.koyeb.app"
-_PATCH_DEFAULT_FEE_QTCL  = 0.01
-_PATCH_TRANSIENT_MSGS    = ("initializing","starting","retry","server starting","boot","warming","503","service unavailable","not ready",)
-_PATCH_PERMANENT_MSGS    = ("insufficient","balance","invalid_signature","invalid_address","self_transfer","nonce_reuse","double_spend","missing_field","negative_nonce","amount_must_be_positive","low_fee","format",)
-_PATCH_HEALTH_WAIT       = 15.0
-_PATCH_MAX_RETRIES       = 5
-_PATCH_BASE_BACKOFF      = 1.0
-
-
-def _raw_rpc_post(base_url: str, method: str, params: list, timeout: float = 30.0, session=None) -> dict:
-    """Single JSON-RPC 2.0 POST — returns full response dict. Raises RuntimeError on HTTP failure."""
-    body = json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode("utf-8")
-    url  = f"{base_url.rstrip('/')}/rpc"
-    if session and _HAS_REQUESTS:
-        r = session.post(url, data=body, headers={"Content-Type":"application/json"}, timeout=timeout)
-        if r.status_code == 200: return r.json()
-        try:    return r.json()
-        except Exception: raise RuntimeError(f"HTTP {r.status_code} from {url}")
-    import urllib.request as _ur
-    req = _ur.Request(url, data=body, headers={"Content-Type":"application/json"})
-    with _ur.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-# ── MCP TOOLS/CALL TRANSPORT ──────────────────────────────────────────────────
-# Uses the MCP streamable-http endpoint (/mcp) which has direct in-process
-# dispatch (no HTTP self-loop) and better timeout handling than /rpc.
-# Protocol: MCP 2025-06-18 streamable HTTP — single POST per tool call.
-
-_mcp_session_id: str = ""
-
-def _mcp_initialize(base_url: str, session=None, timeout: float = 15.0) -> str:
-    """MCP initialize handshake — returns session ID for subsequent calls."""
-    global _mcp_session_id
-    if _mcp_session_id:
-        return _mcp_session_id
-    url = f"{base_url.rstrip('/')}/mcp"
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "qtcl-client", "version": "5.0.0"},
-        },
-        "id": 1,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    try:
-        if session and _HAS_REQUESTS:
-            r = session.post(url, data=body, headers=headers, timeout=timeout)
-            sid = r.headers.get("Mcp-Session-Id", "")
-            _mcp_session_id = sid
-            return sid
-        else:
-            import urllib.request as _ur
-            req = _ur.Request(url, data=body, headers=headers, method="POST")
-            with _ur.urlopen(req, timeout=timeout) as resp:
-                sid = resp.headers.get("Mcp-Session-Id", "")
-                _mcp_session_id = sid
-                return sid
-    except Exception as e:
-        logger.debug(f"[MCP-INIT] Initialize failed: {e}")
-        return ""
-
-
-def _mcp_tool_call(base_url: str, tool_name: str, arguments: dict,
-                   session=None, timeout: float = 45.0) -> dict:
-    """Call an MCP tool via streamable-http. Returns the tool result dict."""
-    url = f"{base_url.rstrip('/')}/mcp"
-
-    # Ensure we have a session ID
-    sid = _mcp_initialize(base_url, session, timeout=10.0)
-
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-        "id": int(time.time() * 1000),
-    }
-    body = json.dumps(payload, default=str).encode("utf-8")
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if sid:
-        headers["Mcp-Session-Id"] = sid
-
-    if session and _HAS_REQUESTS:
-        r = session.post(url, data=body, headers=headers, timeout=timeout)
-        data = r.json()
-    else:
-        import urllib.request as _ur
-        req = _ur.Request(url, data=body, headers=headers, method="POST")
-        with _ur.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-
-    if "error" in data:
-        err = data["error"]
-        raise RuntimeError(f"MCP error [{err.get('code', -1)}]: {err.get('message', 'unknown')}")
-
-    # MCP tools/call result: {result: {content: [{type: "text", text: "..."}]}}
-    result = data.get("result", {})
-    content = result.get("content", [])
-    if content and isinstance(content, list):
-        text = content[0].get("text", "{}") if content else "{}"
-        try:
-            return json.loads(text)
-        except (json.JSONDecodeError, TypeError):
-            return {"raw": text}
-    return result
-
-
-def _submit_via_mcp(tx: dict, base_url: str, session=None, print_fn=print) -> Optional[dict]:
-    """Submit a pre-built TX via MCP qtcl_send_transaction tool.
-
-    This uses the MCP streamable-http endpoint which has direct in-process
-    dispatch — no HTTP self-loop, no gthread deadlock risk.
-    Returns the tool result dict, or None on failure.
-    """
-    try:
-        sig = tx.get("signature", {})
-        sig_str = json.dumps(sig, default=str) if isinstance(sig, dict) else str(sig)
-        pub_key = tx.get("sender_public_key_hex", "") or tx.get("public_key", "")
-
-        args = {
-            "from_address": tx.get("from_address", ""),
-            "to_address":   tx.get("to_address", ""),
-            "amount":       float(tx.get("amount", 0)),
-            "memo":         tx.get("memo", ""),
-            "signature":    sig_str,
-            "public_key":   pub_key,
-            "nonce":        int(tx.get("nonce", 0)),
-        }
-
-        result = _mcp_tool_call(base_url, "qtcl_send_transaction", args,
-                                session=session, timeout=45.0)
-
-        # Normalize MCP result to match what _submit_with_startup_retry expects
-        if isinstance(result, dict):
-            if result.get("status") == "accepted" or result.get("accepted"):
-                return {
-                    "accepted": True,
-                    "tx_hash": result.get("tx_hash", tx.get("tx_hash", "")),
-                    "status": "accepted",
-                    "message": result.get("message", "ok"),
-                }
-            else:
-                return {
-                    "accepted": False,
-                    "error": result.get("error", result.get("message", str(result))),
-                    "status": "rejected",
-                }
-        return None
-    except Exception as e:
-        print_fn(f"  ⚠️  MCP submit failed ({e}), falling back to RPC…")
-        return None
-
-
-def _patch_poll_health(base_url: str, timeout: float = 15.0, interval: float = 0.5, session=None) -> bool:
-    """Poll /mcp/health until ready:true or timeout.
-
-    /health is a stub that always returns 200 even before _full_app loads (wsgi_config design).
-    /mcp/health returns {ready: true/false} — the only accurate readiness signal.
-    Falls back to /health if /mcp/health is unreachable (older deployments).
-    """
-    import urllib.request as _ur
-    mcp_url    = f"{base_url.rstrip('/')}/mcp/health"
-    health_url = f"{base_url.rstrip('/')}/health"
-    deadline   = time.monotonic() + timeout
-    _mcp_available = True  # assume /mcp/health exists until proven otherwise
-
-    while time.monotonic() < deadline:
-        try:
-            if _mcp_available:
-                if session and _HAS_REQUESTS:
-                    r = session.get(mcp_url, timeout=3.0)
-                    if r.status_code == 200:
-                        try:
-                            data = r.json()
-                            if data.get("ready"):
-                                return True
-                            # Server responded but not ready yet — keep polling
-                            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-                            continue
-                        except Exception:
-                            pass
-                    elif r.status_code == 404:
-                        _mcp_available = False  # fall through to /health
-                else:
-                    with _ur.urlopen(mcp_url, timeout=3.0) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        if data.get("ready"):
-                            return True
-                        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-                        continue
-
-            if not _mcp_available:
-                # Fallback: /health always-200 stub — just check it's reachable
-                if session and _HAS_REQUESTS:
-                    r = session.get(health_url, timeout=3.0)
-                    if r.status_code == 200:
-                        return True
-                else:
-                    with _ur.urlopen(health_url, timeout=3.0):
-                        return True
-
-        except Exception:
-            pass
-
-        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-
-    return False
-
-
-def _patch_is_transient(err: str) -> bool: m = str(err).lower(); return any(k in m for k in _PATCH_TRANSIENT_MSGS)
-def _patch_is_permanent(err: str) -> bool: m = str(err).lower(); return any(k in m for k in _PATCH_PERMANENT_MSGS)
-
-
-def _submit_with_startup_retry(tx: dict, base_url: str, session=None, print_fn=print) -> dict:
-    """Submit tx with cold-start awareness.
-
-    v5.0: Tries MCP tools/call first (direct dispatch, no self-loop deadlock),
-    falls back to JSON-RPC /rpc if MCP fails.
-    """
-    import random as _rand
-    if not _patch_poll_health(base_url, timeout=_PATCH_HEALTH_WAIT, session=session):
-        print_fn("  ⏳ /health still starting — proceeding anyway (wsgi will wait)…")
-
-    # ── PRIMARY: MCP tools/call (direct in-process dispatch) ──────────────
-    mcp_result = _submit_via_mcp(tx, base_url, session=session, print_fn=print_fn)
-    if mcp_result is not None:
-        return mcp_result
-
-    # ── FALLBACK: JSON-RPC /rpc (original path) ──────────────────────────
-    print_fn("  ⏳ Using JSON-RPC fallback for submission…")
-    last_error = None
-    for attempt in range(_PATCH_MAX_RETRIES):
-        try:
-            resp = _raw_rpc_post(base_url, "qtcl_submitTransaction", [tx], timeout=45.0, session=session)
-        except Exception as exc:
-            last_error = str(exc)
-            backoff = _PATCH_BASE_BACKOFF * (2 ** attempt) + _rand.random()
-            if attempt < _PATCH_MAX_RETRIES - 1:
-                print_fn(f"  ⏳ Network error (attempt {attempt+1}): {exc} — retrying in {backoff:.1f}s…")
-                time.sleep(backoff)
-            continue
-        if "result" in resp: return resp["result"]
-        if "error" in resp:
-            err = resp["error"]
-            err_msg = str(err.get("message","")) if isinstance(err, dict) else str(err)
-            last_error = err
-            if _patch_is_permanent(err_msg): return {"accepted":False,"error":err,"status":"rejected"}
-            if _patch_is_transient(err_msg) and attempt < _PATCH_MAX_RETRIES - 1:
-                backoff = _PATCH_BASE_BACKOFF * (2 ** attempt) + _rand.random()
-                print_fn(f"  ⏳ Server warming up (attempt {attempt+1}/{_PATCH_MAX_RETRIES}) — retrying in {backoff:.1f}s…")
-                time.sleep(backoff); continue
-            return {"accepted":False,"error":err,"status":"rejected"}
-        last_error = resp; break
-    return {"accepted":False,"error":last_error or "unknown_error","status":"rejected"}
-
-
-class TxSubmitter:
-    """Self-contained tx builder + submitter — no dependency on KoyebRPCNodule internals."""
-    def __init__(self, base_url: str = _PATCH_DEFAULT_URL, private_key: str = "",
-                 address: str = "", public_key: str = "", fee_qtcl: float = _PATCH_DEFAULT_FEE_QTCL):
-        self.base_url    = base_url.rstrip("/"); self.private_key = private_key
-        self.address     = address; self.public_key = public_key; self.fee_qtcl = fee_qtcl
-        self._session    = _requests.Session() if _HAS_REQUESTS else None
-
-    def _build_tx(self, to_addr: str, amount_qtcl: float, fee_qtcl: float, memo: str = "") -> dict:
-        amount_base = int(round(amount_qtcl * 100)); fee_base = int(round(fee_qtcl * 100))
-        nonce = int(time.time() * 1000); ts_ns = time.time_ns()
-        _canon = f"{self.address}:{to_addr}:{amount_base}:{fee_base}:{nonce}:{ts_ns}"
-        tx_hash = hashlib.sha3_256(_canon.encode()).hexdigest()
-        sign_data = {"sender":self.address,"recipient":to_addr,"amount_base":amount_base,
-                     "fee_base":fee_base,"nonce":nonce,"timestamp_ns":ts_ns}
-        msg_hash = hashlib.sha3_256(json.dumps(sign_data, sort_keys=True).encode("utf-8")).digest()
-        engine = HypGammaEngine(); sig = engine.sign_hash(msg_hash, self.private_key)
-        sig["public_key_hex"] = self.public_key; sig["public_key"] = self.public_key
-        return {"tx_hash":tx_hash,"from_address":self.address,"to_address":to_addr,
-                "amount":amount_base/100.0,"amount_base":amount_base,"fee":fee_base/100.0,
-                "fee_base":fee_base,"nonce":nonce,"timestamp_ns":ts_ns,"tx_type":"transfer",
-                "memo":(memo or "")[:256],"signature":sig,"sender_public_key_hex":self.public_key,
-                "public_key":self.public_key,"inputs":[],"outputs":[{"address":to_addr,"amount_base":amount_base}],
-                "metadata":{"sender_public_key_hex":self.public_key}}
-
-    def build_and_submit(self, to_addr: str, amount_qtcl: float, memo: str = "",
-                         fee_qtcl: Optional[float] = None, print_fn=print) -> dict:
-        tx = self._build_tx(to_addr, amount_qtcl, fee_qtcl or self.fee_qtcl, memo)
-        return _submit_with_startup_retry(tx, self.base_url, session=self._session, print_fn=print_fn)
-
-    def check_balance(self, address: Optional[str] = None) -> Optional[float]:
-        addr = address or self.address
-        try:
-            resp = _raw_rpc_post(self.base_url, "qtcl_getBalance", [addr], timeout=10.0, session=self._session)
-            if "result" in resp:
-                r = resp["result"]
-                return float(r.get("balance_qtcl", r.get("balance", 0)) if isinstance(r, dict) else r)
-        except Exception: pass
-        return None
-
-    def query_tx(self, tx_hash: str) -> Optional[dict]:
-        try:
-            resp = _raw_rpc_post(self.base_url, "qtcl_getTransaction", [tx_hash], timeout=10.0, session=self._session)
-            return resp.get("result")
-        except Exception: return None
-
-
-def patch_qtcl_client(app) -> None:
-    """
-    Monkey-patch a QtclClientApp in-place with v4.0 tx layer.
-    Replaces _send_tx_wizard and api.submit_transaction with startup-resilient versions.
-    Idempotent — safe to call multiple times.
-    """
-    import types as _types
-
-    def _wizard_v4(self_app) -> None:
-        try:
-            to_addr     = input("  To address (64-char hex): ").strip()
-            amount_qtcl = float(input("  Amount (QTCL): ").strip())
-            memo        = input("  Memo [optional]: ").strip()
-            use_fee     = input("  Custom fee? [y/N]: ").strip().lower()
-            fee_qtcl    = float(input("  Fee (QTCL) [default 0.01]: ").strip() or "0.01") if use_fee == "y" else 0.01
-        except (ValueError, EOFError, KeyboardInterrupt): print("  ❌ Cancelled"); return
-        if not to_addr or len(to_addr) < 40: print("  ❌ Address too short (expected ≥40 hex chars)"); return
-        if not all(c in "0123456789abcdef" for c in to_addr.lower()): print("  ❌ Non-hex chars in address"); return
-        wallet = getattr(self_app, "wallet", None)
-        if not wallet or not getattr(wallet, "private_key", None): print("  ❌ No private key loaded"); return
-        sub = TxSubmitter(base_url=getattr(getattr(self_app,"api",None),"base_url",_PATCH_DEFAULT_URL),
-                          private_key=wallet.private_key, address=wallet.address,
-                          public_key=getattr(wallet,"public_key","") or "")
-        tx = sub._build_tx(to_addr, amount_qtcl, fee_qtcl, memo)
-        print(f"\n  ── Transaction Summary ──")
-        print(f"     From:  {wallet.address[:20]}…"); print(f"     To:    {to_addr[:20]}…")
-        print(f"     Amt:   {amount_qtcl:.2f} QTCL"); print(f"     Fee:   {fee_qtcl:.4f} QTCL")
-        print(f"     Hash:  {tx['tx_hash'][:32]}…"); print(f"     Nonce: {tx['nonce']}")
-        try: confirm = input("  Submit? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt): print("  ❌ Cancelled"); return
-        if confirm == "n": print("  ❌ Cancelled"); return
-        result = _submit_with_startup_retry(tx, sub.base_url, session=sub._session, print_fn=print)
-        if result and result.get("accepted"):
-            srv = result.get("tx_hash", tx["tx_hash"])
-            print(f"\n  ✅ Submitted  │  server hash: {srv}")
-            print(f"     Client hash : {tx['tx_hash']}")
-            print(f"     Status      : {result.get('status','pending')}")
-            if srv != tx["tx_hash"]: print(f"     ⚠️  Hashes differ — server recomputed canonical hash")
-            print(f"     Message     : {result.get('message','ok')}")
-        else:
-            err = (result or {}).get("error","no response"); err_str = f"[{err.get('code','')}] {err.get('message',str(err))}" if isinstance(err,dict) else str(err)
-            if _patch_is_transient(err_str): print(f"\n  ❌ Server still initializing after retries.\n     Try again in ~30s")
-            elif _patch_is_permanent(err_str): print(f"\n  ❌ Rejected (permanent): {err_str}")
-            else: print(f"\n  ❌ Rejected: {err_str}")
-            print(f"     Endpoint: {sub.base_url}/rpc")
-
-    def _submit_v4(self_nodule, tx: dict) -> Optional[dict]:
-        payload = dict(tx)
-        if isinstance(payload.get("timestamp_ns"), str): payload["timestamp_ns"] = int(payload["timestamp_ns"])
-        elif "timestamp_ns" not in payload: payload["timestamp_ns"] = time.time_ns()
-        payload.setdefault("from_address", payload.get("from","")); payload.setdefault("to_address", payload.get("to",""))
-        payload.setdefault("from_addr", payload.get("from_address","")); payload.setdefault("to_addr", payload.get("to_address",""))
-        payload.setdefault("tx_type","transfer")
-        return _submit_with_startup_retry(payload, getattr(self_nodule,"base_url",_PATCH_DEFAULT_URL),
-                                          session=getattr(self_nodule,"_session",None), print_fn=lambda m: None)
-
-    tx_mode = getattr(app, "_tx_mode", app)
-    if hasattr(tx_mode, "_send_tx_wizard"):
-        tx_mode._send_tx_wizard = _types.MethodType(_wizard_v4, tx_mode); print("[PATCH] ✅ _send_tx_wizard → v4.0")
-    elif hasattr(app, "_send_tx_wizard"):
-        app._send_tx_wizard = _types.MethodType(_wizard_v4, app); print("[PATCH] ✅ _send_tx_wizard → v4.0")
-    api = getattr(app, "api", None)
-    if api and hasattr(api, "submit_transaction"):
-        api.submit_transaction = _types.MethodType(_submit_v4, api); print("[PATCH] ✅ api.submit_transaction → v4.0")
-    print("[PATCH] ✅ qtcl_tx_patch v4.0 inlined — single-file mode")
 
 
 if __name__ == "__main__":
