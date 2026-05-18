@@ -296,7 +296,8 @@ try:
     from mpmath import mp, mpf, mpc, matrix as mpmatrix, eye as mpeye
     from mpmath import (cos, sin, cosh, sinh, tanh, atanh, sqrt, pi, exp, log,
                         fabs, acos, atan2, nstr, almosteq, acosh, re, im, conj,
-                        mpjii, fmod, ceil, floor)
+                        fmod, ceil, floor)
+    from mpmath import j as mpj  # imaginary unit — mpjii doesn't exist in mpmath
     arctanh = atanh
     MPMATH_AVAILABLE = True
 except ImportError:
@@ -334,7 +335,7 @@ except ImportError:
     mpmatrix = None
     mpeye = None
     arctanh = atanh
-    mpjii = None
+    mpj = 1j  # Python native imaginary unit fallback
     pi = 3.14159265358979
     atan2 = None
 
