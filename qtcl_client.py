@@ -24943,11 +24943,14 @@ class QtclClientApp:
                     # Randomize start nonce — avoids always scanning from 0 which
                     # causes suspiciously fast solves when small nonces happen to hit.
                     # Uses entropy seed mixed with block context for unpredictability.
+                    # FIX: use 24-bit random offset (max ~16M) so display stays readable
+                    # and nonces have the full 32-bit search space ahead before wraparound.
+                    # (was 31-bit → average start of ~1.07B, looked "insanely big")
                     _nonce_base = int.from_bytes(
                         _hl.sha3_256(
                             _w_entropy_seed + str(target_height).encode() + str(_t.time()).encode()
-                        ).digest()[:4], "big"
-                    ) & 0x7FFFFFFF  # 31-bit random start — leaves headroom before wraparound
+                        ).digest()[:3], "big"
+                    )  # 24-bit: 0 – 16,777,215 random start
                     _nonce_ctr = [_nonce_base]
                     _hex_zeros = "0" * difficulty_bits
                     _BLOCK_TTL_S = 270
