@@ -5272,50 +5272,92 @@ class LiveRPCOracleSnapshot:
     ):
         """Generic JSON-RPC 2.0 call to server /rpc endpoint.
 
+        Thread-based hard timeout — CANNOT hang (thread.join() always returns).
         Used for health checks and metrics during bootstrap.
         Returns result dict or None on failure.
-        IMPORTANT: Use POST for submitBlock to avoid GET 204 empty response issues.
         """
         import urllib.parse as _up
         import urllib.request as _ur
-        import socket
+        import socket as _sock
+        import threading as _thr
 
-        # Use POST for block submission to avoid GET 204 empty response
+        params_json = json.dumps(params or [])
+        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+        full_url = f"{self.ORACLE_URL}/rpc?{query}"
+        t = timeout or 5
+
+        def _req_worker(
+            url: str, data: bytes, tout: float, result_container: list, error_container: list
+        ) -> None:
+            """Run HTTP request in daemon thread."""
+            try:
+                _sock.setdefaulttimeout(tout)
+                req = _ur.Request(url, headers={"Accept": "application/json"})
+                if data:
+                    req.data = data
+                    req.add_header("Content-Type", "application/json")
+                with _ur.urlopen(req, timeout=tout) as resp:
+                    result_container.append(json.loads(resp.read().decode("utf-8")))
+            except _ur.HTTPError as _he:
+                try:
+                    result_container.append(json.loads(_he.read().decode("utf-8")))
+                except:
+                    error_container.append(f"HTTP {_he.code}")
+            except Exception as _e:
+                error_container.append(str(_e))
+            finally:
+                try:
+                    _sock.setdefaulttimeout(None)
+                except Exception:
+                    pass
+
+        # Build POST body for submitBlock, None for GET
+        post_data = None
+        req_url = full_url
         if method == "qtcl_submitBlock":
-            post_url = f"{self.ORACLE_URL}/rpc"
             payload = {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params or [],
                 "id": 1,
             }
-            for attempt in range(retries):
-                try:
-                    socket.setdefaulttimeout(timeout)
-                    data = json.dumps(payload).encode("utf-8")
-                    req = _ur.Request(
-                        post_url,
-                        data=data,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Accept": "application/json",
-                        },
-                    )
-                    with _ur.urlopen(req, timeout=timeout) as resp:
-                        result = json.loads(resp.read().decode("utf-8"))
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            return result
-                except Exception as e:
-                    logger.debug(
-                        f"[RPC-ORACLE] {method} POST attempt {attempt + 1}/{retries} failed: {e}"
-                    )
-                    if attempt < retries - 1:
-                        time.sleep(min(2**attempt, 5))
-                finally:
-                    socket.setdefaulttimeout(None)
-            return None
+            post_data = json.dumps(payload).encode("utf-8")
+            req_url = f"{self.ORACLE_URL}/rpc"
+
+        for attempt in range(retries):
+            _result_box: list = []
+            _error_box: list = []
+
+            _worker = _thr.Thread(
+                target=_req_worker,
+                args=(req_url, post_data, t, _result_box, _error_box),
+                daemon=True,
+                name=f"RPC-O-{method[:12]}",
+            )
+            _worker.start()
+            _worker.join(timeout=t + 2)
+
+            if _result_box:
+                result = _result_box[0]
+                if isinstance(result, dict):
+                    if "result" in result:
+                        return result.get("result")
+                    elif "error" in result:
+                        return result
+                return result
+            elif _error_box:
+                logger.debug(
+                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries}: {_error_box[0]}"
+                )
+            else:
+                logger.debug(
+                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries}: timeout ({t}s)"
+                )
+
+            if attempt < retries - 1:
+                time.sleep(min(2**attempt, 5))
+
+        return None
 
         # Use GET for other methods
         params_json = json.dumps(params or [])
@@ -11784,8 +11826,16 @@ class KoyebRPCNodule:
     def _rpc(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
-        """Make JSON-RPC 2.0 call to /rpc endpoint (replaces REST entirely)."""
+        """Make JSON-RPC 2.0 call to /rpc endpoint.
+
+        Uses a thread-based hard timeout (CANNOT hang — thread.join() always returns).
+        urllib's timeout parameter and socket.setdefaulttimeout are unreliable over SSL
+        in Python 3.12 — they can block forever in ssl.read() behind slow load balancers.
+        """
         import urllib.parse as _up
+        import threading as _thr
+        import urllib.request as _ur
+        import socket as _sock
 
         t = timeout or self.timeout
         last_error = None
@@ -11794,46 +11844,66 @@ class KoyebRPCNodule:
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
 
-        for attempt in range(retries):
-            import urllib.request as _ur
-            import socket as _sock
+        def _req_worker(
+            url: str, tout: float, result_container: list, error_container: list
+        ) -> None:
+            """Run the HTTP request in a daemon thread.
 
+            socket.setdefaulttimeout is called INSIDE the thread before urlopen,
+            so it's safe — only affects this thread's socket operations.
+            """
             try:
-                # Use urllib + socket.setdefaulttimeout for reliable timeouts.
-                # The requests library's timeout parameter is NOT guaranteed over SSL —
-                # it can hang in http.client._read_status() behind a slow load balancer.
-                # socket.setdefaulttimeout() enforces at the OS socket layer — always works.
-                _sock.setdefaulttimeout(t)
-                req = _ur.Request(full_url, headers={"Accept": "application/json"})
-                with _ur.urlopen(req, timeout=t) as resp:
-                    result = _json.loads(resp.read().decode("utf-8"))
+                _sock.setdefaulttimeout(tout)
+                req = _ur.Request(url, headers={"Accept": "application/json"})
+                with _ur.urlopen(req, timeout=tout) as resp:
+                    data = _json.loads(resp.read().decode("utf-8"))
+                    result_container.append(data)
+            except _ur.HTTPError as _he:
+                try:
+                    data = _json.loads(_he.read().decode("utf-8"))
+                    result_container.append(data)
+                except:
+                    error_container.append(f"HTTP {_he.code}")
+            except Exception as _e:
+                error_container.append(str(_e))
+            finally:
+                try:
+                    _sock.setdefaulttimeout(None)
+                except Exception:
+                    pass
+
+        for attempt in range(retries):
+            _result_box: list = []
+            _error_box: list = []
+
+            _worker = _thr.Thread(
+                target=_req_worker,
+                args=(full_url, t, _result_box, _error_box),
+                daemon=True,
+                name=f"RPC-{method[:16]}",
+            )
+            _worker.start()
+            _worker.join(timeout=t + 2)  # Hard timeout — ALWAYS returns
+
+            if _result_box:
+                result = _result_box[0]
+                if isinstance(result, dict):
                     if "result" in result:
                         return result.get("result")
                     elif "error" in result:
                         return result
-            except _ur.HTTPError as he:
-                try:
-                    result = _json.loads(he.read().decode("utf-8"))
-                    if isinstance(result, dict) and "error" in result:
-                        return result
-                except:
-                    pass
-                last_error = f"HTTP {he.code}"
-                _EXP_LOG.debug(f"[RPC] {method} → HTTP {he.code}")
-            except _ur.URLError as ue:
-                last_error = str(ue)
-                _EXP_LOG.debug(f"[RPC] {method} URLError: {ue}")
-            except Exception as e:
-                last_error = str(e)
-                _EXP_LOG.debug(f"[RPC] {method} Exception: {e}")
-            finally:
-                _sock.setdefaulttimeout(None)
+                # dict-like but no rpc fields — return raw
+                return result
+            elif _error_box:
+                last_error = _error_box[0]
+                _EXP_LOG.debug(f"[RPC] {method} attempt {attempt + 1}: {last_error}")
+            else:
+                # Thread did not complete within timeout
+                last_error = f"timeout ({t}s)"
+                _EXP_LOG.debug(f"[RPC] {method} attempt {attempt + 1}: timed out after {t}s")
 
             if attempt < retries - 1:
                 time.sleep(2**attempt)
-                continue
-            else:
-                break
 
         self._last_error = last_error
         return None
