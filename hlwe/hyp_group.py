@@ -192,28 +192,43 @@ class PSLMatrix:
         """
         Verify det=1 and absence of overflow.
         Raises PSLGroupError if invariants are violated.
+
+        C-5 FIX (RED TEAM): Use mp.workdps(150) to ensure determinant
+        computation always happens at canonical precision, regardless
+        of what other threads may have set via mp.workdps() contexts.
+
+        L-2 NOTE (RED TEAM): This function is NOT constant-time.
+        mpmath's fabs, comparison, and almosteq execute in variable time
+        depending on entry magnitudes. In a signing oracle scenario where
+        an attacker can measure validation timing, this is a potential
+        side channel. Full mitigation requires constant-time mpmath
+        operations or moving to a fixed-point representation, which is
+        beyond the current architecture. The risk is LOW because:
+        - The entries being validated are PUBLIC (commitment R, response Z)
+        - Private key walks are never passed through this function directly
         """
-        det = self.a * self.d - self.b * self.c
-        det_err = fabs(det - mpf("1"))
+        with mp.workdps(150):
+            det = self.a * self.d - self.b * self.c
+            det_err = fabs(det - mpf("1"))
 
-        if det_err > DET_TOLERANCE:
-            raise PSLGroupError(
-                f"PSLMatrix determinant violation: det={nstr(det, 20)}, "
-                f"error={nstr(det_err, 10)} > tolerance={nstr(DET_TOLERANCE, 5)}"
-            )
-
-        # Overflow check — entries growing unboundedly indicate accumulated error
-        for entry_name, entry_val in [
-            ("a", self.a),
-            ("b", self.b),
-            ("c", self.c),
-            ("d", self.d),
-        ]:
-            if fabs(entry_val) > ENTRY_OVERFLOW_BOUND:
+            if det_err > DET_TOLERANCE:
                 raise PSLGroupError(
-                    f"PSLMatrix overflow: entry {entry_name}={nstr(entry_val, 10)} "
-                    f"exceeds bound {nstr(ENTRY_OVERFLOW_BOUND, 5)}"
+                    f"PSLMatrix determinant violation: det={nstr(det, 20)}, "
+                    f"error={nstr(det_err, 10)} > tolerance={nstr(DET_TOLERANCE, 5)}"
                 )
+
+            # Overflow check — entries growing unboundedly indicate accumulated error
+            for entry_name, entry_val in [
+                ("a", self.a),
+                ("b", self.b),
+                ("c", self.c),
+                ("d", self.d),
+            ]:
+                if fabs(entry_val) > ENTRY_OVERFLOW_BOUND:
+                    raise PSLGroupError(
+                        f"PSLMatrix overflow: entry {entry_name}={nstr(entry_val, 10)} "
+                        f"exceeds bound {nstr(ENTRY_OVERFLOW_BOUND, 5)}"
+                    )
 
         self._validated = True
 
@@ -794,10 +809,15 @@ def random_walk(
 
     Notes
     -----
-    Entropy: 2 bits per step → length steps require length/4 bytes minimum.
-    For WALK_LENGTH=512: exactly 128 bytes of entropy consumed.
-    The walk is cryptographically random — each step is independently and
-    uniformly drawn from the 4 generators (3 in reduced case).
+    Entropy (C-4 RED TEAM corrected):
+      - Unreduced walk: 2 bits per step → 512 × 2 = 1024 bits
+      - Reduced walk (default): log₂(3) ≈ 1.585 bits per step (Markov chain
+        with restricted transitions: after index i, index CANCEL[i] is
+        forbidden). Total entropy: 512 × 1.585 ≈ 810 bits.
+      - 810 bits >> 256 bits (security parameter), so this is safe.
+      - The walk uses QRNG when available (globals.get_entropy); falls back
+        to secrets.token_bytes (OS CSPRNG) with a warning log.
+    For WALK_LENGTH=512: 128 bytes of entropy consumed.
     """
     # Cancellation pairs: index i cancels index CANCEL[i]
     CANCEL = {0: 1, 1: 0, 2: 3, 3: 2}
@@ -809,7 +829,13 @@ def random_walk(
 
             entropy_source = get_entropy((length + 3) // 4 * 4)
         except (ImportError, RuntimeError):
-            # Fallback to OS CSPRNG if QRNG unavailable (e.g., offline mode)
+            # C-4 FIX (RED TEAM): Log when falling back to OS CSPRNG.
+            # QRNG unavailability should be visible in operational logs.
+            logger.warning(
+                "[SECURITY] QRNG unavailable — falling back to OS CSPRNG "
+                "(secrets.token_bytes). This is still cryptographically secure "
+                "but lacks quantum entropy source verification."
+            )
             entropy_source = secrets.token_bytes((length + 3) // 4 * 4)
 
     walk: List[int] = []

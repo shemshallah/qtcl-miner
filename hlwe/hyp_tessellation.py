@@ -194,11 +194,15 @@ class HypTessellation:
             return 0
         try:
             cur = self.neon_conn.cursor()
-            cur.execute(f"""
+            # Q-4 FIX (RED TEAM): Use parameterized query instead of f-string.
+            # TILING_DEPTH is a constant int so the old code wasn't exploitable,
+            # but parameterized queries prevent future injection if this pattern
+            # is copy-pasted with user-controlled values.
+            cur.execute("""
                 SELECT triangle_id, depth, parent_id, v0_x, v0_y, v0_name,
                        v1_x, v1_y, v1_name, v2_x, v2_y, v2_name, area, perimeter
-                FROM hyperbolic_triangles WHERE depth = {TILING_DEPTH}
-            """)
+                FROM hyperbolic_triangles WHERE depth = %s
+            """, (TILING_DEPTH,))
             rows = cur.fetchall()
             cur.close()
             count = 0
@@ -422,9 +426,13 @@ def triangle_area(v0: mpc, v1: mpc, v2: mpc) -> mpf:
     d12 = hyp_metric(v1, v2)
     d20 = hyp_metric(v2, v0)
 
-    cosh_d01 = mpf('1') + (d01 ** 2) / 2
-    cosh_d12 = mpf('1') + (d12 ** 2) / 2
-    cosh_d20 = mpf('1') + (d20 ** 2) / 2
+    # I-4 FIX (RED TEAM): Use exact mpmath.cosh(), not Taylor approximation.
+    # OLD (BROKEN): cosh_d01 = mpf('1') + (d01 ** 2) / 2
+    #   → Only valid for small d; systematically incorrect for depth-8 triangles
+    # NEW (FIXED): cosh_d01 = mpmath.cosh(d01)
+    cosh_d01 = mpmath.cosh(d01)
+    cosh_d12 = mpmath.cosh(d12)
+    cosh_d20 = mpmath.cosh(d20)
 
     denom01 = mpmath.sqrt(cosh_d01 ** 2 - 1) * mpmath.sqrt(cosh_d20 ** 2 - 1) + mpf('1e-100')
     cos_angle_0 = (cosh_d01 * cosh_d20 - cosh_d12) / denom01

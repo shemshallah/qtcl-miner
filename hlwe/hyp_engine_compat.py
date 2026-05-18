@@ -43,9 +43,13 @@ def _patch_hyp_group():
     try:
         import hyp_group
         if not hasattr(hyp_group, 'serialize_matrix'):
-            def serialize_matrix(matrix: 'hyp_group.PSLMatrix') -> bytes:
-                """Serialize PSLMatrix to bytes using serialize_canonical method."""
-                return matrix.serialize_canonical()
+            def serialize_matrix(matrix: 'hyp_group.PSLMatrix') -> str:
+                """Serialize PSLMatrix to hex string.
+                M-2 FIX (RED TEAM): Returns str (hex) matching hyp_group's
+                canonical serialize_matrix → to_hex() return type.
+                The old shim returned bytes via serialize_canonical(),
+                causing type mismatches depending on import order."""
+                return matrix.to_hex()
             hyp_group.serialize_matrix = staticmethod(serialize_matrix)
             logger.debug("[HYP-COMPAT] Injected serialize_matrix shim into hyp_group")
     except Exception as e:

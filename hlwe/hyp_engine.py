@@ -475,6 +475,10 @@ class HypGammaEngine:
 
         On subsequent instantiations: returns singleton instance.
 
+        M-1 FIX (RED TEAM): __init__ is now protected by _instance_lock
+        to prevent race condition where two threads both see _initialized=False
+        and both attempt full initialization concurrently.
+
         Raises:
             HypEngineError: If any critical module is missing or initialization fails.
         """
@@ -482,62 +486,65 @@ class HypGammaEngine:
         if HypGammaEngine._initialized:
             return
 
-        logger.info("HypGammaEngine initializing...")
+        # M-1 FIX: Acquire class-level lock for the entire init body
+        with HypGammaEngine._instance_lock:
+            # Double-check after acquiring lock
+            if HypGammaEngine._initialized:
+                return
 
-        # Check all modules are available
-        missing = [k for k, v in _MODULES_AVAILABLE.items() if not v]
-        if missing:
-            msg = f"Missing critical modules: {', '.join(missing)}"
-            diagnostics = {}
-            if 'hyp_group' in missing:
-                diagnostics['hyp_group_error'] = str(_HYPER_GROUP_ERROR)
-            if 'hyp_tessellation' in missing:
-                diagnostics['hyp_tessellation_error'] = str(_TESSELLATION_ERROR)
-            if 'hyp_ldpc' in missing:
-                diagnostics['hyp_ldpc_error'] = str(_LDPC_ERROR)
-            if 'hyp_schnorr' in missing:
-                diagnostics['hyp_schnorr_error'] = str(_SCHNORR_ERROR)
-            if 'hyp_lwe' in missing:
-                diagnostics['hyp_lwe_error'] = str(_LWE_ERROR)
-            raise HypEngineError(msg, diagnostics)
+            logger.info("HypGammaEngine initializing...")
 
-        self._lock = threading.RLock()
-        self._tessellation: Optional[HypTessellation] = None
-        self._ldpc_code: Optional[LDPCCode] = None
-        self._schnorr: Optional[SchnorrGamma] = None
-        self._lwe: Optional[GeodesicLWE] = None
+            # Check all modules are available
+            missing = [k for k, v in _MODULES_AVAILABLE.items() if not v]
+            if missing:
+                msg = f"Missing critical modules: {', '.join(missing)}"
+                diagnostics = {}
+                if 'hyp_group' in missing:
+                    diagnostics['hyp_group_error'] = str(_HYPER_GROUP_ERROR)
+                if 'hyp_tessellation' in missing:
+                    diagnostics['hyp_tessellation_error'] = str(_TESSELLATION_ERROR)
+                if 'hyp_ldpc' in missing:
+                    diagnostics['hyp_ldpc_error'] = str(_LDPC_ERROR)
+                if 'hyp_schnorr' in missing:
+                    diagnostics['hyp_schnorr_error'] = str(_SCHNORR_ERROR)
+                if 'hyp_lwe' in missing:
+                    diagnostics['hyp_lwe_error'] = str(_LWE_ERROR)
+                raise HypEngineError(msg, diagnostics)
 
-        try:
-            # Load tessellation (may query Supabase)
-            logger.debug("Loading HypTessellation...")
-            self._tessellation = HypTessellation()
-            logger.debug("✓ HypTessellation loaded")
+            self._lock = threading.RLock()
+            self._tessellation: Optional[HypTessellation] = None
+            self._ldpc_code: Optional[LDPCCode] = None
+            self._schnorr: Optional[SchnorrGamma] = None
+            self._lwe: Optional[GeodesicLWE] = None
 
-            # Load LDPC code
-            logger.debug("Loading LDPC code...")
-            self._ldpc_code = get_ldpc_code()
-            logger.debug("✓ LDPC code loaded")
+            try:
+                # A-2 FIX (RED TEAM): Signing does NOT need tessellation or LWE.
+                # Load Schnorr immediately (required for signing).
+                # Tessellation, LDPC, and LWE are lazy-loaded on first encrypt call.
+                # This prevents signing from failing due to DB unavailability.
 
-            # Initialize Schnorr context
-            logger.debug("Initializing Schnorr-Γ context...")
-            self._schnorr = SchnorrGamma()
-            logger.debug("✓ Schnorr-Γ ready")
+                # Initialize Schnorr context (required for signing)
+                logger.debug("Initializing Schnorr-Γ context...")
+                self._schnorr = SchnorrGamma()
+                logger.debug("✓ Schnorr-Γ ready")
 
-            # Initialize GeodesicLWE context (encryption)
-            logger.debug("Initializing GeodesicLWE context...")
-            self._lwe = GeodesicLWE(self._tessellation, self._ldpc_code)
-            logger.debug("✓ GeodesicLWE ready")
+                # Lazy-load tessellation, LDPC, and LWE on first encrypt/keygen call
+                # These are NOT loaded here to avoid hard DB dependency for signing.
+                self._tessellation_loaded = False
+                self._lwe_loaded = False
 
-            logger.info("HypGammaEngine initialized successfully")
-            HypGammaEngine._initialized = True
+                logger.info("HypGammaEngine initialized (signing ready; encryption lazy)")
+                HypGammaEngine._initialized = True
 
-        except Exception as e:
-            logger.error(f"Failed to initialize HypGammaEngine: {e}")
-            logger.error(traceback.format_exc())
-            raise HypEngineError(
-                f"Engine initialization failed: {str(e)}",
-                {'traceback': traceback.format_exc()}
-            )
+            except Exception as e:
+                logger.error(f"Failed to initialize HypGammaEngine: {e}")
+                logger.error(traceback.format_exc())
+                # M-1 FIX: Clear _instance on failure so retry is possible
+                HypGammaEngine._instance = None
+                raise HypEngineError(
+                    f"Engine initialization failed: {str(e)}",
+                    {'traceback': traceback.format_exc()}
+                )
 
     @classmethod
     def get_instance(cls) -> HypGammaEngine:
@@ -563,7 +570,8 @@ class HypGammaEngine:
 
     @property
     def lwe(self) -> "GeodesicLWE":
-        """Public accessor for the GeodesicLWE instance."""
+        """Public accessor for the GeodesicLWE instance. Lazy-loads on first access."""
+        self._ensure_encryption_subsystem()
         if self._lwe is None:
             raise HypEngineError("GeodesicLWE not initialized", {})
         return self._lwe
@@ -577,17 +585,54 @@ class HypGammaEngine:
 
     @property
     def tessellation(self) -> "HypTessellation":
-        """Public accessor for the HypTessellation instance."""
+        """Public accessor for the HypTessellation instance. Lazy-loads on first access."""
+        self._ensure_encryption_subsystem()
         if self._tessellation is None:
             raise HypEngineError("HypTessellation not initialized", {})
         return self._tessellation
 
     @property
     def ldpc(self) -> "LDPCCode":
-        """Public accessor for the LDPCCode instance."""
+        """Public accessor for the LDPCCode instance. Lazy-loads on first access."""
+        self._ensure_encryption_subsystem()
         if self._ldpc_code is None:
             raise HypEngineError("LDPCCode not initialized", {})
         return self._ldpc_code
+
+    def _ensure_encryption_subsystem(self):
+        """
+        A-2 FIX (RED TEAM): Lazy-load tessellation, LDPC, and LWE.
+        These are only needed for encryption, not signing.
+        Signing works without DB access; encryption requires Supabase.
+        """
+        if getattr(self, '_lwe_loaded', False):
+            return
+        with self._lock:
+            if getattr(self, '_lwe_loaded', False):
+                return
+            try:
+                if self._tessellation is None:
+                    logger.debug("Lazy-loading HypTessellation...")
+                    self._tessellation = HypTessellation()
+                    logger.debug("✓ HypTessellation loaded")
+
+                if self._ldpc_code is None:
+                    logger.debug("Lazy-loading LDPC code...")
+                    self._ldpc_code = get_ldpc_code()
+                    logger.debug("✓ LDPC code loaded")
+
+                if self._lwe is None:
+                    logger.debug("Lazy-loading GeodesicLWE...")
+                    self._lwe = GeodesicLWE(self._tessellation, self._ldpc_code)
+                    logger.debug("✓ GeodesicLWE ready")
+
+                self._lwe_loaded = True
+            except Exception as e:
+                logger.error(f"Failed to load encryption subsystem: {e}")
+                raise HypEngineError(
+                    f"Encryption subsystem initialization failed: {str(e)}",
+                    {'note': 'Signing still works. Encryption requires DB access.'}
+                )
 
     # ─────────────────────────────────────────────────────────────────────────────
     # §2a  KEY GENERATION
@@ -619,8 +664,13 @@ class HypGammaEngine:
 
             # Sample private key (512 random walk indices)
             walk_indices = [secrets.randbelow(N_GENERATORS) for _ in range(WALK_LENGTH)]
-            # Encode as single hex digits (0,1,2,3) for compact storage
-            private_key_hex = ''.join(str(idx) for idx in walk_indices)
+
+            # I-1 FIX (RED TEAM): Use binary-packed encoding via walk_to_hex()
+            # which packs 4 indices per byte (2 bits each). The old decimal-string
+            # encoding ('0123010232...') was incompatible with hyp_group's
+            # hex_to_walk() which expects binary-packed hex.
+            from hyp_group import walk_to_hex
+            private_key_hex = walk_to_hex(walk_indices)
 
             # Evaluate walk to PSL(2,ℝ) matrix (uses module-level generators internally)
             public_matrix = evaluate_walk(walk_indices)
@@ -688,12 +738,17 @@ class HypGammaEngine:
             # Deserialize private key
             walk_indices = self._deserialize_walk_indices(private_key)
 
+            # Q-3 FIX (RED TEAM): Derive the PSLMatrix public key ONCE here
+            # and pass it to sign_hash, avoiding redundant 512-step walk evaluation.
+            with self._lock:
+                public_matrix = evaluate_walk(walk_indices)
+
             # Sign using Schnorr-Γ
             with self._lock:
                 if self._schnorr is None:
                     raise RuntimeError("Schnorr context not initialized")
                 sig = self._schnorr.sign_hash(
-                    message_hash, walk_indices, generators
+                    message_hash, walk_indices, public_matrix
                 )
 
             # Format output — include ALL canonical fields for verification pipeline
@@ -717,10 +772,13 @@ class HypGammaEngine:
             return result
 
         except Exception as e:
-            logger.error(f"Sign failed: {e}")
+            logger.error(f"Sign failed: {type(e).__name__}")
+            # L-3 FIX (RED TEAM): Don't include raw error string in context —
+            # upstream exceptions may contain partial matrix entries that leak
+            # private key information when logged.
             raise HypEngineError(
-                f"Could not sign hash: {str(e)}",
-                {'message_hash': message_hash.hex(), 'error': str(e)}
+                f"Could not sign hash: {type(e).__name__}",
+                {'message_hash': message_hash.hex(), 'error_type': type(e).__name__}
             )
 
     def verify_signature(self, message_hash: bytes, sig: Dict[str, str],
@@ -826,12 +884,15 @@ class HypGammaEngine:
             # Sign
             sig_dict = self.sign_hash(block_hash, private_key)
 
-            # Add signer address for convenience
+            # H-1 FIX (RED TEAM): Derive signer_address from the ACTUAL private key,
+            # not a fresh random keypair. The old code called generate_keypair() which
+            # creates a completely unrelated key, making signer_address meaningless.
             try:
-                keypair = self.generate_keypair()  # Re-derive for consistency check
-                sig_dict['signer_address'] = keypair.address
-            except:
-                pass  # Best-effort; signer_address is optional
+                pub_key_hex = self.derive_public_key(private_key)
+                sig_dict['signer_address'] = self._derive_address_from_public_key(pub_key_hex)
+            except Exception as e:
+                logger.warning(f"Could not derive signer_address: {e}")
+                # signer_address is optional metadata, don't fail the signing
 
             logger.debug("✓ Block signed")
             return sig_dict
@@ -1174,21 +1235,32 @@ class HypGammaEngine:
     @staticmethod
     def _deserialize_walk_indices(hex_str: str) -> List[int]:
         """
-        Deserialize hex string back to walk indices.
+        Deserialize private key string back to walk indices.
+
+        I-1 FIX (RED TEAM): Supports BOTH encoding formats:
+          - New (binary-packed): hex string from walk_to_hex() — 128 hex chars for 512 steps
+            Each byte packs 4 indices at 2 bits each.
+          - Legacy (decimal-string): '01230132...' — 512 chars, each '0'-'3'
+            Detected by length (512 chars = decimal, 256 chars = hex for 512 steps).
 
         Parameters:
-            hex_str (str): Hex string of concatenated single hex digits.
+            hex_str (str): Private key in either encoding format.
 
         Returns:
             list: Walk indices in range [0, 3].
         """
-        indices = []
-        for char in hex_str:
-            if char in '0123':
-                indices.append(int(char))
-            else:
-                raise ValueError(f"Invalid walk index: {char}")
-        return indices
+        # Heuristic: if all chars are in '0123' and length matches walk length,
+        # it's the old decimal encoding. Binary-packed hex for 512 steps is
+        # 128 bytes = 256 hex chars, which would contain 'a'-'f' in general.
+        is_decimal = len(hex_str) == WALK_LENGTH and all(c in '0123' for c in hex_str)
+
+        if is_decimal:
+            # Legacy decimal-string format
+            return [int(c) for c in hex_str]
+        else:
+            # New binary-packed format via hex_to_walk
+            from hyp_group import hex_to_walk
+            return hex_to_walk(hex_str, length=WALK_LENGTH)
 
     @staticmethod
     def _derive_address_from_public_key(public_key_hex: str) -> str:
