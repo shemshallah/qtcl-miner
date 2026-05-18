@@ -11950,44 +11950,57 @@ class KoyebRPCNodule:
 
         t = timeout or self.timeout
 
-        if method == "qtcl_submitBlock":
-            payload = {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params or [],
-                "id": 1,
-            }
-
-            # POST /rpc directly to Koyeb-managed reverse proxy (no fallback port)
+        if method in ("qtcl_submitBlock", "qtcl_signAndSubmitBlock"):
+            # UNIFIED BLOCK SUBMISSION: try qtcl_signAndSubmitBlock first (server v5+),
+            # fall back to qtcl_submitBlock for older server instances.
+            _submit_methods = (
+                ["qtcl_signAndSubmitBlock", "qtcl_submitBlock"]
+                if method == "qtcl_submitBlock"
+                else ["qtcl_signAndSubmitBlock"]
+            )
             post_url = f"{self.base_url}/rpc"
-            for attempt in range(retries):
-                try:
-                    if _HAS_REQUESTS:
-                        r = self._get_session().post(
-                            post_url, json=payload, timeout=t
-                        )
-                        # FIX: return body for ANY status — server may send JSON-RPC error
-                        # with non-200 HTTP (503, 429, 500). Only skip truly empty responses.
-                        try:
-                            _body = r.json()
-                            return _body
-                        except Exception:
-                            if r.status_code == 200:
-                                return {}  # 200 with no JSON body = unexpected but not None
-                            logger.debug(f"[RPC] POST {r.status_code} with non-JSON body")
-                    else:
-                        data = _json.dumps(payload).encode("utf-8")
-                        req = _ur.Request(
-                            post_url,
-                            data=data,
-                            headers={"Content-Type": "application/json"},
-                        )
-                        with _ur.urlopen(req, timeout=t) as resp:
-                            return _json.loads(resp.read().decode("utf-8"))
-                except Exception as e:
-                    logger.debug(f"[RPC] POST attempt {attempt + 1} failed: {e}")
-                    if attempt < retries - 1:
-                        time.sleep(2**attempt)
+            for _sm in _submit_methods:
+                _payload = {"jsonrpc": "2.0", "method": _sm, "params": params or [], "id": 1}
+                _last_err = None
+                for attempt in range(retries):
+                    try:
+                        if _HAS_REQUESTS:
+                            r = self._get_session().post(post_url, json=_payload, timeout=t)
+                            try:
+                                _body = r.json()
+                                if (
+                                    _sm == "qtcl_signAndSubmitBlock"
+                                    and isinstance(_body, dict)
+                                    and isinstance(_body.get("error"), dict)
+                                    and _body["error"].get("code") == -32601
+                                ):
+                                    logger.debug("[RPC] signAndSubmitBlock missing on server, fallback")
+                                    break  # next _sm
+                                return _body
+                            except Exception:
+                                if r.status_code == 200:
+                                    return {}
+                                logger.debug(f"[RPC] POST {r.status_code} non-JSON body")
+                        else:
+                            _data = _json.dumps(_payload).encode("utf-8")
+                            _req = _ur.Request(post_url, data=_data,
+                                               headers={"Content-Type": "application/json"})
+                            with _ur.urlopen(_req, timeout=t) as resp:
+                                _body = _json.loads(resp.read().decode("utf-8"))
+                                if (
+                                    _sm == "qtcl_signAndSubmitBlock"
+                                    and isinstance(_body, dict)
+                                    and isinstance(_body.get("error"), dict)
+                                    and _body["error"].get("code") == -32601
+                                ):
+                                    logger.debug("[RPC] signAndSubmitBlock missing, fallback")
+                                    break
+                                return _body
+                    except Exception as e:
+                        _last_err = e
+                        logger.debug(f"[RPC] POST {_sm} attempt {attempt + 1} failed: {e}")
+                        if attempt < retries - 1:
+                            time.sleep(2 ** attempt)
             return None
 
         # GET /rpc directly to Koyeb-managed reverse proxy (no fallback port)
@@ -24193,22 +24206,21 @@ class QtclClientApp:
                             backoff = self.RETRY_BACKOFFS[attempt]
 
                         try:
-                            _EXP_LOG.info(
-                                f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} "
-                                f"backoff={backoff:.1f}s"
-                            )
+                            _EXP_LOG.info(f"[SUBMIT] Attempt {attempt + 1}/{self.MAX_RETRIES}: h={block_height} "
+                                          f"backoff={backoff:.1f}s")
 
-                            # 🚀 RPC CALL with shorter timeout for responsiveness
+                            # 🚀 RPC CALL — qtcl_signAndSubmitBlock (new unified path) with
+                            # automatic fallback to qtcl_submitBlock via _rpc_envelope routing
                             try:
                                 _envelope = await _asyncio.wait_for(
                                     _asyncio.to_thread(
                                         kapi._rpc_envelope,
-                                        "qtcl_submitBlock",
+                                        "qtcl_signAndSubmitBlock",
                                         [payload],
-                                        20,  # FIX: was 10, server can be slow under load
-                                        2,   # FIX: was 1, allow one internal retry
+                                        20,
+                                        2,
                                     ),
-                                    timeout=25,  # FIX: was 15, outer asyncio guard
+                                    timeout=25,
                                 )
                             except _asyncio.TimeoutError:
                                 _EXP_LOG.warning(
@@ -24238,6 +24250,7 @@ class QtclClientApp:
 
                             # ✅ SUCCESS: Block accepted (fresh or duplicate)
                             # FIX: server returns "accepted_and_finalized", not "accepted"
+                            # NEW: signAndSubmitBlock path also tags method="signAndSubmitBlock"
                             if (
                                 isinstance(result, dict)
                                 and result.get("status") in ("accepted", "accepted_and_finalized")
