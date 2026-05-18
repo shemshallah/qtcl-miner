@@ -11966,8 +11966,15 @@ class KoyebRPCNodule:
                         r = self._get_session().post(
                             post_url, json=payload, timeout=t
                         )
-                        if r.status_code == 200:
-                            return r.json()
+                        # FIX: return body for ANY status — server may send JSON-RPC error
+                        # with non-200 HTTP (503, 429, 500). Only skip truly empty responses.
+                        try:
+                            _body = r.json()
+                            return _body
+                        except Exception:
+                            if r.status_code == 200:
+                                return {}  # 200 with no JSON body = unexpected but not None
+                            logger.debug(f"[RPC] POST {r.status_code} with non-JSON body")
                     else:
                         data = _json.dumps(payload).encode("utf-8")
                         req = _ur.Request(
@@ -24104,15 +24111,15 @@ class QtclClientApp:
             class _SubmissionPipeline:
                 """⚛️ Enterprise RPC submission with atomic quantum state locking."""
 
-                MAX_RETRIES = 6  # max submission attempts per block
+                MAX_RETRIES = 4  # FIX: was 6 (61s window); 4 retries ~15s for network errors
                 RETRY_BACKOFFS = [
                     1.0,
                     2.0,
                     4.0,
                     8.0,
-                    16.0,
-                    30.0,
-                ]  # exponential backoff: 61s window
+                    8.0,   # unused padding (MAX_RETRIES=4)
+                    8.0,   # unused padding
+                ]  # FIX: reduced window ~15s; exponential only for real errors
                 MAX_TIMEOUT_S = 120.0  # abandon block if >120s elapsed
 
                 def __init__(self):
@@ -24559,23 +24566,15 @@ class QtclClientApp:
                     # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
                     _difficulty_bits = 5  # FIX: fallback matches server default (was 4, server enforces 5)
                     try:
-                        # FIX: use _rpc() with qtcl_getConfig method — _rpc_http() does not exist
-                        _config_res = kapi._rpc(
-                            "qtcl_getConfig", [], timeout=5, retries=1
-                        )
-                        if _config_res and isinstance(_config_res, dict) and "error" not in _config_res:
-                            _difficulty_bits = int(_config_res.get("difficulty", 5))
-                        else:
-                            # Fallback: hit /rpc/config/difficulty via requests directly
-                            import requests as _req
-                            _base = getattr(kapi, "base_url", getattr(kapi, "_base_url", "https://qtcl-blockchain.koyeb.app"))
-                            _r = _req.get(f"{_base}/rpc/config/difficulty", timeout=5)
-                            if _r.ok:
-                                _cd = _r.json()
-                                _difficulty_bits = int(_cd.get("result", {}).get("difficulty", 5))
+                        import requests as _req
+                        _base = getattr(kapi, "base_url", getattr(kapi, "_base_url", "https://qtcl-blockchain.koyeb.app"))
+                        _r = _req.get(f"{_base}/rpc/config/difficulty", timeout=5)
+                        if _r.ok:
+                            _cd = _r.json()
+                            _difficulty_bits = int(_cd.get("result", {}).get("difficulty", 5))
                     except Exception as _e:
                         _EXP_LOG.warning(f"[MINER] Could not fetch /rpc/config/difficulty: {_e} — using fallback {_difficulty_bits}")
-
+                    
                     # Fallback: query block difficulty if RPC config fails
                     _res_b_raw = kapi._rpc(
                         "qtcl_getBlock", [oracle_height], timeout=8, retries=2
@@ -26413,7 +26412,7 @@ class QtclClientApp:
             print(sep)
 
         # ── Foreground interactive loop — non-blocking auto-refresh ──────────
-        _REFRESH_INTERVAL = 5.0  # seconds between auto-redraws
+        _REFRESH_INTERVAL = 3.0  # seconds between auto-redraws (was 5.0)
         import select as _select
 
         def _kbhit(timeout: float = 0.0):
