@@ -26992,24 +26992,9 @@ class QtclClientApp:
                 )
                 return {}
 
-            # ── Step 1: Fetch LiveRPCOracleSnapshot (verbatim miner pipeline) ──
-            # Uses the EXACT same call as the miner's _run_bootstrap():
-            #   _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=4.0)  (line 23800)
-            # This tries SSE stream /rpc/oracle/snapshot FIRST, falls back to
-            # RPC get /rpc?method=qtcl_getQuantumMetrics. Also updates the
-            # internal oracle state cache with full DM + fidelity + purity + pq0.
-            _snap = {}
-            try:
-                _snap = _LIVE_RPC_ORACLE.fetch_snapshot(timeout_s=6.0) or {}
-                if _snap:
-                    _rpc_ok_count += 1
-            except Exception as _snape:
-                _rpc_errors.append(("oracle_snapshot", str(_snape)[:80]))
-                logger.debug(f"[ORACLE-MODE] fetch_snapshot failed: {_snape}")
-
-            # ── Step 2: Get oracle state from LiveRPCOracleSnapshot cache ──
-            # This is what the miner uses after fetch_snapshot() (e.g. lines 25041, 25246):
-            #   state = _LIVE_RPC_ORACLE.get_oracle_state()
+            # ── Step 1: Get oracle state cache (always safe, never blocks) ──
+            # This is what the miner uses throughout the mining loop:
+            #   state = _LIVE_RPC_ORACLE.get_oracle_state()  (lines 25041, 25246)
             # Contains: w_state_fidelity, coherence_l1, von_neumann_entropy,
             # purity, cycle, consensus, mermin_test, block_height, density_matrix_hex,
             # pq_curr, pq_last, latency_ms, pq0_oracle_fidelity, pq0_IV_fidelity, pq0_V_fidelity
@@ -27019,7 +27004,46 @@ class QtclClientApp:
             except Exception:
                 _ora_state = {}
 
-            # ── Step 3: Chain tip (3 retries — critical) ──
+            # ── Step 2: Get live SSE snapshot (from connect_density_stream global) ──
+            # The SSE handler fills _LATEST_DENSITY_SNAPSHOT in real-time with
+            # density_tensor_hex, w_state_hex, w_state_fidelity, purity, etc.
+            # This is the same data the miner sees in its SSE callback.
+            _sse_snap = globals().get("_LATEST_DENSITY_SNAPSHOT") or {}
+
+            # ── Step 3: Fetch fresh snapshot via RPC (never hangs — uses
+            #            socket.setdefaulttimeout like the miner's polling)
+            # Uses _LIVE_RPC_ORACLE._rpc() with urllib + socket.setdefaulttimeout
+            # (lines 5270-5345) instead of fetch_snapshot() which opens SSE streams.
+            # The miner uses fetch_snapshot() for bootstrap (one-shot),
+            # but _rpc() for all subsequent polling (lines 23467, 23513).
+            _rpc_snap = {}
+            try:
+                _rpc_resp = _LIVE_RPC_ORACLE._rpc(
+                    "qtcl_getQuantumMetrics", [], timeout=5, retries=2
+                )
+                if isinstance(_rpc_resp, dict) and "error" not in _rpc_resp:
+                    _rpc_snap = _rpc_resp
+                    _rpc_ok_count += 1
+            except Exception as _snape:
+                _rpc_errors.append(("oracle_snapshot", str(_snape)[:80]))
+                logger.debug(f"[ORACLE-MODE] _rpc(qtcl_getQuantumMetrics) failed: {_snape}")
+
+            # Merge SSE + RPC snapshots, SSE takes priority for DM fields
+            _snap = dict(_rpc_snap)
+            for _k in (
+                "density_tensor_hex", "density_matrix_hex", "w_state_hex",
+                "tensor_dim", "timestamp_ns",
+            ):
+                _v = _sse_snap.get(_k)
+                if _v:
+                    _snap[_k] = _v
+            # Also copy fidelity/purity/coherence if SSE has them and RPC doesn't
+            for _k in ("w_state_fidelity", "purity", "coherence_l1"):
+                _sse_v = _sse_snap.get(_k)
+                if _sse_v is not None and not _snap.get(_k):
+                    _snap[_k] = _sse_v
+
+            # ── Step 4: Chain tip (3 retries — critical) ──
             tip = {}
             _bh_resp = _safe_rpc("qtcl_getBlockHeight", [], "block_height", retries=3)
             if isinstance(_bh_resp, dict):
@@ -27034,13 +27058,13 @@ class QtclClientApp:
                         tip.setdefault("block_height", _latest_h)
                         tip.setdefault("height", _latest_h)
 
-            # ── Step 4: Health / Diagnostics (non-critical, 1 retry) ──
+            # ── Step 5: Health / Diagnostics (non-critical, 1 retry) ──
             health = _safe_rpc("qtcl_getHealth", [], "health")
 
-            # ── Step 5: Server peer registry (2 retries) ──
+            # ── Step 6: Server peer registry (2 retries) ──
             server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
 
-            # ── Step 6: NAT-group peers ──
+            # ── Step 7: NAT-group peers ──
             nat_peers = {}
             _my_addr_resp = _safe_rpc("qtcl_getMyAddr", [], "get_my_addr")
             if isinstance(_my_addr_resp, dict):
@@ -27052,10 +27076,10 @@ class QtclClientApp:
                         "nat_group",
                     )
 
-            # ── Step 7: Mempool (1 retry — non-critical) ──
+            # ── Step 8: Mempool (1 retry — non-critical) ──
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
 
-            # ── Step 8: Local P2P node stats ──
+            # ── Step 9: Local P2P node stats ──
             api_node = KoyebRPCNodule("http://127.0.0.1:9091")
             local_p2p_stats = {}
             try:
@@ -27065,7 +27089,7 @@ class QtclClientApp:
             except Exception:
                 pass
 
-            # ── Step 9: Block height for pq_curr/pq_last ──
+            # ── Step 10: Block height for pq_curr/pq_last ──
             _bh = tip.get("block_height") or tip.get("height") or 0
             try:
                 _bh = int(_bh)
@@ -27088,7 +27112,7 @@ class QtclClientApp:
                 else "",
             }
 
-            # ── Step 10: Build unified metrics from ALL sources ──
+            # ── Step 11: Build unified metrics from ALL sources ──
             # Priority: _LIVE_RPC_ORACLE state (live SSE) > RPC snapshot > fallback
             _snap_dm_hex = _snap.get("density_matrix_hex", "") or _snap.get(
                 "density_tensor_hex", ""
