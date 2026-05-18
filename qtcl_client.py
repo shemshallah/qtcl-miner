@@ -24552,16 +24552,25 @@ class QtclClientApp:
                         )
 
                     # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
-                    _difficulty_bits = 4  # fallback default
+                    _difficulty_bits = 5  # FIX: fallback matches server default (was 4, server enforces 5)
                     try:
-                        _config_res = kapi._rpc_http(
-                            "/rpc/config/difficulty", method="GET", timeout=5
-                        ) if hasattr(kapi, "_rpc_http") else None
-                        if _config_res and isinstance(_config_res, dict):
-                            _difficulty_bits = int(_config_res.get("result", {}).get("difficulty", 4))
+                        # FIX: use _rpc() with qtcl_getConfig method — _rpc_http() does not exist
+                        _config_res = kapi._rpc(
+                            "qtcl_getConfig", [], timeout=5, retries=1
+                        )
+                        if _config_res and isinstance(_config_res, dict) and "error" not in _config_res:
+                            _difficulty_bits = int(_config_res.get("difficulty", 5))
+                        else:
+                            # Fallback: hit /rpc/config/difficulty via requests directly
+                            import requests as _req
+                            _base = getattr(kapi, "base_url", getattr(kapi, "_base_url", "https://qtcl-blockchain.koyeb.app"))
+                            _r = _req.get(f"{_base}/rpc/config/difficulty", timeout=5)
+                            if _r.ok:
+                                _cd = _r.json()
+                                _difficulty_bits = int(_cd.get("result", {}).get("difficulty", 5))
                     except Exception as _e:
-                        _EXP_LOG.debug(f"[MINER] Could not fetch /rpc/config/difficulty: {_e}")
-                    
+                        _EXP_LOG.warning(f"[MINER] Could not fetch /rpc/config/difficulty: {_e} — using fallback {_difficulty_bits}")
+
                     # Fallback: query block difficulty if RPC config fails
                     _res_b_raw = kapi._rpc(
                         "qtcl_getBlock", [oracle_height], timeout=8, retries=2
@@ -24575,12 +24584,13 @@ class QtclClientApp:
                         _res_b.get("difficulty_bits", _res_b.get("difficulty", 0)) or 0
                     )
                     # Use authoritative config difficulty, fallback to block difficulty
+                    # FIX: always enforce minimum 5 to match server
                     if _difficulty_bits > 0:
-                        difficulty_bits = _difficulty_bits
+                        difficulty_bits = max(_difficulty_bits, 5)
                     elif _server_difficulty > 0:
-                        difficulty_bits = max(_server_difficulty, _block_diff)
+                        difficulty_bits = max(_server_difficulty, _block_diff, 5)
                     else:
-                        difficulty_bits = _block_diff if _block_diff > 0 else 4
+                        difficulty_bits = max(_block_diff, 5) if _block_diff > 0 else 5
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
@@ -24680,11 +24690,11 @@ class QtclClientApp:
                         _EXP_LOG.debug(f"[MINER] Could not fetch getCoinbaseTemplate: {_e}")
                         # Fallback: try old /rpc/config/rewards endpoint
                         try:
-                            _rewards_res = kapi._rpc_http(
-                                "/rpc/config/rewards", method="GET", timeout=5
-                            ) if hasattr(kapi, "_rpc_http") else None
-                            if _rewards_res and isinstance(_rewards_res, dict):
-                                _result = _rewards_res.get("result", {})
+                            import requests as _req2
+                            _base2 = getattr(kapi, "base_url", getattr(kapi, "_base_url", "https://qtcl-blockchain.koyeb.app"))
+                            _rr = _req2.get(f"{_base2}/rpc/config/rewards", timeout=5)
+                            if _rr.ok:
+                                _result = _rr.json().get("result", {})
                                 _miner_reward = float(_result.get("miner_reward", 7.2))
                                 _treasury_reward = float(_result.get("treasury_reward", 0.8))
                         except Exception as _e2:
