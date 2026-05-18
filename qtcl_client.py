@@ -27106,11 +27106,12 @@ class QtclClientApp:
                 "density_tensor_hex", "density_matrix_hex", "w_state_hex",
                 "tensor_dim", "timestamp_ns", "aer_noise_state",
                 "w_state_fidelity", "purity", "coherence_l1",
+                "mermin_test", "oracle_measurements",
+                "pq0_oracle_fidelity", "theta", "phi",
             ):
                 _v = _sse_snap.get(_k)
                 if _v is not None:
                     _snap[_k] = _v
-                    _snap[_k] = _sse_v
 
             # ── Step 5: Chain tip ──
             tip = {}
@@ -27308,8 +27309,8 @@ class QtclClientApp:
                 "cycle": _first_not_none(_snap.get("cycle"), _ora_state.get("cycle") if _ora_state else None) or 0,
                 "consensus": _snap.get("consensus", False) or (_ora_state.get("consensus", False) if _ora_state else False),
                 "block_height": _first_not_none(_snap.get("block_height"), _snap.get("height"), _ora_state.get("block_height") if _ora_state else None) or 0,
-                # DENSITY MATRIX: oracle state is the only source (SSE-only field)
-                "density_matrix_hex": _first_not_none(_ora_dm, _snap_dm_hex) or "",
+                # DENSITY MATRIX: prefer RPC response, fall back to oracle state cache
+                "density_matrix_hex": _first_not_none(_snap_dm_hex, _ora_dm) or "",
                 "density_tensor_hex": _first_not_none(_snap.get("density_tensor_hex"), _ora_state.get("density_tensor_hex") if _ora_state else None) or "",
                 # PQ CURR/LAST: prefer RPC, fall back to oracle state
                 "pq_curr": _first_not_none(_snap.get("pq_curr"), _snap.get("pq_curr_id"), _ora_state.get("pq_curr") if _ora_state else None) or (_bh + 1),
@@ -27322,6 +27323,12 @@ class QtclClientApp:
                 "client_fused_fidelity": _first_not_none(_snap.get("client_fused_fidelity"), _ora_state.get("client_fused_fidelity") if _ora_state else None) or 0.0,
                 "client_oracle_count": _first_not_none(_snap.get("client_oracle_count"), _ora_state.get("client_oracle_count") if _ora_state else None) or 0,
                 "latency_ms": _first_not_none(_snap.get("_latency_ms"), _snap.get("latency_ms"), _ora_state.get("latency_ms") if _ora_state else None) or 0.0,
+                # PER-NODE MEASUREMENTS: from RPC oracle_measurements or w_state.oracle_measurements
+                "oracle_measurements": _first_not_none(
+                    _snap.get("oracle_measurements"),
+                    _snap_w_state.get("oracle_measurements"),
+                    _ora_state.get("oracle_measurements") if _ora_state else None,
+                ) or [],
             }
             # Copy raw SSE aer_noise_state fields into w_state
             for _aerk, _aerv in _snap_aer.items():
@@ -27526,6 +27533,8 @@ class QtclClientApp:
                 _mq = mermin > 2.0
                 _mverd = ""
             if mermin > 4.0:
+                # Sanity check: W-state witness M_W ∈ [-1, +2], GHZ Mermin ∈ [-4, +4]
+                # Values > 4 indicate a field mapping error
                 mermin = 0.0
                 _mq = False
                 _mverd = "(field error — check M_value key)"
@@ -27584,7 +27593,7 @@ class QtclClientApp:
             a(f"  Purity     {_bar(pur)}  {pur:.6f}")
             a(
                 f"  VN Entropy  {ent:.4f} bits   "
-                f"Mermin ⟨M₃⟩: {mermin:+.4f}  "
+                f"W-witness ⟨M_W⟩: {mermin:+.4f}  "
                 f"{'✅ QUANTUM' if _mq else '· classical'}"
                 f"{'  ' + _mverd[:40] if _mverd else ''}"
             )
