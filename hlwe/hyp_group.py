@@ -49,6 +49,127 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 from dataclasses import dataclass, field
 from functools import lru_cache
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# §0  DUAL-CONTEXT ENTROPY RESOLVER
+# ═══════════════════════════════════════════════════════════════════════════════
+# hyp_group.py is intentionally shared verbatim between the QTCL server
+# (where globals.py + qrng_ensemble.py live on sys.path) and the QTCL client
+# (qtcl_client.py, which has its own HyperbolicEntropyPool and exposes
+# get_entropy() / get_entropy_stats() at module scope).
+#
+# Resolution order — first hit wins, no RuntimeError propagation:
+#   1. globals.get_entropy          ← server path (full QRNG ensemble)
+#   2. qtcl_client.get_entropy      ← client path (HyperbolicEntropyPool)
+#   3. qrng_ensemble.get_entropy    ← direct qrng_ensemble import
+#   4. secrets.token_bytes          ← hardened OS CSPRNG — always available
+#
+# The resolver is computed once at module-load time and stored as
+# _ENTROPY_FN. Every call site in this file uses _get_hyp_entropy()
+# instead of the brittle inline `from globals import get_entropy` pattern.
+# No WARNING is emitted on a simple ModuleNotFoundError (expected on client);
+# a WARNING is emitted ONLY when an unexpected RuntimeError fires (QRNG pool
+# exhausted / network error) so that genuine anomalies stay visible.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ENTROPY_LOGGER = logging.getLogger(__name__)
+_ENTROPY_FN = None           # resolved once, see _resolve_entropy_fn()
+_ENTROPY_SOURCE_TAG = "?"    # human-readable tag for log lines
+
+def _resolve_entropy_fn():
+    """Walk the resolution chain and lock in the best available entropy fn."""
+    global _ENTROPY_FN, _ENTROPY_SOURCE_TAG
+
+    # 1 — server path: globals module
+    try:
+        import globals as _globals_mod
+        _fn = _globals_mod.get_entropy
+        # Smoke-test: must return bytes of the right length
+        _test = _fn(4)
+        if isinstance(_test, bytes) and len(_test) == 4:
+            _ENTROPY_FN = _fn
+            _ENTROPY_SOURCE_TAG = "globals(server/QRNG)"
+            _ENTROPY_LOGGER.debug("[HypGroup] entropy resolver: globals.get_entropy (server mode)")
+            return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    except Exception as _exc:
+        _ENTROPY_LOGGER.warning(f"[HypGroup] globals.get_entropy smoke-test failed: {_exc}")
+
+    # 2 — client path: qtcl_client module already loaded in sys.modules
+    try:
+        import sys as _sys
+        _qc = _sys.modules.get("__main__") or _sys.modules.get("qtcl_client")
+        if _qc is None:
+            # try direct import (works when running from client directory)
+            import qtcl_client as _qc
+        _fn = getattr(_qc, "get_entropy", None)
+        if callable(_fn):
+            _test = _fn(4)
+            if isinstance(_test, bytes) and len(_test) == 4:
+                _ENTROPY_FN = _fn
+                _ENTROPY_SOURCE_TAG = "qtcl_client(client/HyperbolicPool)"
+                _ENTROPY_LOGGER.debug("[HypGroup] entropy resolver: qtcl_client.get_entropy (client mode)")
+                return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    except Exception as _exc:
+        _ENTROPY_LOGGER.debug(f"[HypGroup] qtcl_client.get_entropy probe: {_exc}")
+
+    # 3 — direct qrng_ensemble
+    try:
+        from qrng_ensemble import get_entropy as _qrng_fn
+        _test = _qrng_fn(4)
+        if isinstance(_test, bytes) and len(_test) == 4:
+            _ENTROPY_FN = _qrng_fn
+            _ENTROPY_SOURCE_TAG = "qrng_ensemble(direct)"
+            _ENTROPY_LOGGER.debug("[HypGroup] entropy resolver: qrng_ensemble.get_entropy (direct)")
+            return
+    except (ImportError, ModuleNotFoundError):
+        pass
+    except Exception as _exc:
+        _ENTROPY_LOGGER.debug(f"[HypGroup] qrng_ensemble probe: {_exc}")
+
+    # 4 — hardened OS CSPRNG fallback (cryptographically secure, no quantum)
+    _ENTROPY_FN = secrets.token_bytes
+    _ENTROPY_SOURCE_TAG = "secrets.token_bytes(OS-CSPRNG)"
+    _ENTROPY_LOGGER.info(
+        "[HypGroup] entropy resolver: secrets.token_bytes — "
+        "OS CSPRNG active (no quantum source found on this context). "
+        "Set RANDOM_ORG_KEY / ANU_API_KEY / QRNG_API_KEY for quantum entropy."
+    )
+
+# Resolve immediately at module import — cheap, one-time cost.
+_resolve_entropy_fn()
+
+
+def _get_hyp_entropy(size: int) -> bytes:
+    """
+    Retrieve `size` bytes of entropy from the best available source.
+    Thread-safe. On RuntimeError from the resolved source, re-resolves
+    and falls back to secrets to ensure the walk never blocks.
+    """
+    global _ENTROPY_FN, _ENTROPY_SOURCE_TAG
+    try:
+        result = _ENTROPY_FN(size)
+        if isinstance(result, bytes) and len(result) >= size:
+            return result[:size]
+        # Wrong type / size — treat as source failure and re-resolve
+        raise ValueError(f"entropy fn returned {type(result)} len={len(result) if isinstance(result, bytes) else '?'}")
+    except Exception as _exc:
+        # Source degraded mid-run — re-probe and fall all the way to secrets
+        _ENTROPY_LOGGER.warning(
+            f"[HypGroup] entropy source '{_ENTROPY_SOURCE_TAG}' raised {_exc!r} — "
+            "re-resolving; using secrets.token_bytes this call"
+        )
+        try:
+            _resolve_entropy_fn()
+            result = _ENTROPY_FN(size)
+            if isinstance(result, bytes) and len(result) >= size:
+                return result[:size]
+        except Exception:
+            pass
+        return secrets.token_bytes(size)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CRITICAL DEPENDENCY: mpmath at 150 decimal places
 # This is the precision bedrock. Everything else rests on it.
@@ -823,20 +944,10 @@ def random_walk(
     CANCEL = {0: 1, 1: 0, 2: 3, 3: 2}
 
     if entropy_source is None:
-        # Try QRNG first; fallback to secrets if unavailable
-        try:
-            from globals import get_entropy
-
-            entropy_source = get_entropy((length + 3) // 4 * 4)
-        except (ImportError, RuntimeError):
-            # C-4 FIX (RED TEAM): Log when falling back to OS CSPRNG.
-            # QRNG unavailability should be visible in operational logs.
-            logger.warning(
-                "[SECURITY] QRNG unavailable — falling back to OS CSPRNG "
-                "(secrets.token_bytes). This is still cryptographically secure "
-                "but lacks quantum entropy source verification."
-            )
-            entropy_source = secrets.token_bytes((length + 3) // 4 * 4)
+        # Dual-context entropy resolver: works on server (globals/QRNG ensemble)
+        # and on client (qtcl_client.HyperbolicEntropyPool) without any import
+        # errors or WARNING spam. _get_hyp_entropy() resolves at module-load time.
+        entropy_source = _get_hyp_entropy((length + 3) // 4 * 4)
 
     walk: List[int] = []
     entropy_idx = 0
@@ -845,13 +956,8 @@ def random_walk(
     for step in range(length):
         # Draw one byte of entropy and use it to select a generator
         if entropy_idx >= len(entropy_source):
-            # Exhaust — top up entropy from QRNG if available
-            try:
-                from globals import get_entropy
-
-                entropy_source = get_entropy(64)
-            except (ImportError, RuntimeError):
-                entropy_source = secrets.token_bytes(64)
+            # Entropy exhausted mid-walk — refill via dual-context resolver
+            entropy_source = _get_hyp_entropy(64)
             entropy_idx = 0
 
         byte = entropy_source[entropy_idx]
