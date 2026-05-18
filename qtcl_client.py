@@ -24205,10 +24205,10 @@ class QtclClientApp:
                                         kapi._rpc_envelope,
                                         "qtcl_submitBlock",
                                         [payload],
-                                        10,  # Reduced from 15 for faster feedback
-                                        1,
+                                        20,  # FIX: was 10, server can be slow under load
+                                        2,   # FIX: was 1, allow one internal retry
                                     ),
-                                    timeout=15,  # Reduced from 20
+                                    timeout=25,  # FIX: was 15, outer asyncio guard
                                 )
                             except _asyncio.TimeoutError:
                                 _EXP_LOG.warning(
@@ -24369,16 +24369,19 @@ class QtclClientApp:
                                     )
                                     return (False, result)
 
-                                # Generic error
+                                # Generic error — log full result for diagnosis
                                 _EXP_LOG.error(
-                                    f"[SUBMIT] ❌ ERROR h={block_height}: {_msg}"
+                                    f"[SUBMIT] ❌ ERROR h={block_height}: code={_code} msg={_msg} "
+                                    f"full_result={str(result)[:300]}"
                                 )
                                 return (False, result)
 
                             # No result - network issue, retry
                             last_error = "No response"
-                            _EXP_LOG.warning(
-                                f"[SUBMIT] Attempt {attempt + 1}: No valid response — envelope={str(_envelope)[:200]}"
+                            _EXP_LOG.error(
+                                f"[SUBMIT] Attempt {attempt + 1}: No valid response — "
+                                f"envelope type={type(_envelope).__name__} "
+                                f"value={str(_envelope)[:300]}"
                             )
 
                         except Exception as e:
@@ -25905,8 +25908,7 @@ class QtclClientApp:
                         else:
                             # Submission failed after max retries — give up on this block and move on
                             _EXP_LOG.error(
-                                f"[SUBMIT] ❌ Block h={target_height} failed after 6 attempts "
-                                f"({_submission.RETRY_BACKOFFS[-1] + sum(_submission.RETRY_BACKOFFS[:-1]):.0f}s timeout) — moving on"
+                                f"[SUBMIT] ❌ Block h={target_height} failed after {_submission.MAX_RETRIES} attempts — moving on"
                             )
                             _EXP_LOG.error(
                                 f"[SUBMIT] ❌ Block h={target_height} failed: {_err_msg or 'no response'}"
