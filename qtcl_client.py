@@ -7026,9 +7026,10 @@ class LocalBlockchainDB:
         self.db_path = _DB_PATH
 
         self.conn = sqlite3.connect(
-            str(self.db_path), check_same_thread=False, timeout=10
+            str(self.db_path), check_same_thread=False, timeout=30
         )
         self.conn.row_factory = sqlite3.Row
+        self._conn_lock = __import__("threading").Lock()  # serialize all cursor ops
         self._pool = None
 
         self._init_pool()
@@ -7146,46 +7147,49 @@ class LocalBlockchainDB:
     # ========= Interface-compatible query methods =========
 
     def execute(self, query: str, params=None):
-        """Execute SQL query"""
-        cursor = self.conn.cursor()
-        try:
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            self.conn.commit()
-            return cursor
-        except Exception as e:
-            self.conn.rollback()
-            _emsg = str(e)
-            # Silence expected schema-not-yet-created noise at DEBUG level
-            if "no such table" in _emsg or "no such column" in _emsg:
-                logging.debug(f"DB execute (schema not ready): {e}")
-            else:
-                logging.error(f"DB execute error: {e}")
-            raise
+        """Execute SQL query — serialized via _conn_lock to prevent 'returned NULL' crashes."""
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            try:
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                self.conn.commit()
+                return cursor
+            except Exception as e:
+                self.conn.rollback()
+                _emsg = str(e)
+                # Silence expected schema-not-yet-created noise at DEBUG level
+                if "no such table" in _emsg or "no such column" in _emsg:
+                    logging.debug(f"DB execute (schema not ready): {e}")
+                else:
+                    logging.error(f"DB execute error: {e}")
+                raise
 
     def run_query(self, query: str, params=None):
         """Run query (alias for execute)"""
         return self.execute(query, params)
 
     def fetchone(self, query: str, params=None):
-        """Fetch one row"""
-        cursor = self.conn.cursor()
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        return cursor.fetchone()
+        """Fetch one row — serialized via _conn_lock."""
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor.fetchone()
 
     def fetchall(self, query: str, params=None):
-        """Fetch all rows"""
-        cursor = self.conn.cursor()
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        return cursor.fetchall()
+        """Fetch all rows — serialized via _conn_lock."""
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor.fetchall()
 
     # ========= Block operations =========
 
@@ -12762,6 +12766,15 @@ class ClientQuantumMetrics:
             rho = _np.asarray(rho, dtype=_np.complex128)
             if rho.shape != (8, 8):
                 return 0.0
+            # Sanity-check: reject unphysical matrices (NaN, Inf, or trace ≫ 1)
+            if not _np.all(_np.isfinite(rho)):
+                return 0.0
+            trace = _np.real(_np.trace(rho))
+            if trace <= 0.0 or not _np.isfinite(trace):
+                return 0.0
+            # Normalize to unit trace so fidelity is always in [0,1]
+            if abs(trace - 1.0) > 1e-6:
+                rho = rho / trace
             # W3 indices: {1, 2, 4}
             indices = [1, 2, 4]
             fid = 0.0
@@ -12769,14 +12782,6 @@ class ClientQuantumMetrics:
                 for j in indices:
                     fid += _np.real(rho[i, j])
             fid_normalized = fid / 3.0
-            # Clamp to [0,1] range and warn if clamping occurred
-            if fid_normalized > 1.0:
-                import warnings
-
-                warnings.warn(
-                    f"W3 fidelity exceeded 1.0: {fid_normalized}, clamping to 1.0",
-                    stacklevel=2,
-                )
             return float(max(0.0, min(1.0, fid_normalized)))
         except Exception:
             return 0.0
