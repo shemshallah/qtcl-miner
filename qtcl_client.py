@@ -1095,7 +1095,244 @@ _qrng_active = (
             ("QBICK", QRNG_API_KEY_3),
         ]
         if k
-    )\n    or "none"\n)\nlogger.info(\n    f"[HypEnt] Pipeline: QRNG[{_qrng_active}] "\n    f"→ XOR₃ → {{8,3}} Möbius(d=64) "\n    f"→ server({ENTROPY_SERVER_URL}) → os.urandom hedge"\n)\n\n\n# ═══════════════════════════════════════════════════════════════════════════════════════\n# CLIENT-SIDE GLOBALS-COMPATIBLE ENTROPY API\n# ═══════════════════════════════════════════════════════════════════════════════════════\n# This block exposes get_entropy(), get_entropy_pool(), get_entropy_stats(),\n# and get_entropy_pool_manager() at qtcl_client module scope so that:\n#   • hyp_group._resolve_entropy_fn() finds them via sys.modules["qtcl_client"]\n#   • Any hyp_* module running client-side can do:\n#         import qtcl_client; get_entropy = qtcl_client.get_entropy\n#     instead of the server-only `from globals import get_entropy`.\n# The implementation delegates entirely to HyperbolicEntropyPool (_get_pool())\n# which already handles the QRNG ensemble → server → os.urandom fallback chain.\n# Additionally, this block injects a lightweight "globals" shim into sys.modules\n# so that `from globals import get_entropy` literally resolves on the client\n# without ImportError — enabling true zero-change dual-use of all hyp_*.py files.\n# ═══════════════════════════════════════════════════════════════════════════════════════\n\n# ── Public entropy API (globals-compatible signatures) ────────────────────────\n\ndef get_entropy(size: int = 32) -> bytes:\n    """\n    CLIENT-SIDE quantum entropy gate — globals.get_entropy() compatible.\n\n    Returns `size` bytes from the HyperbolicEntropyPool pipeline:\n      QRNG ensemble (random.org / ANU / QBICK)\n      → XOR₃ combiner\n      → {8,3} Möbius SHAKE-256 mix\n      → server /rpc qtcl_getEntropy fallback\n      → os.urandom liveness hedge\n\n    Thread-safe, cached with 20-second TTL (configurable via HyperbolicEntropyPool).\n    Raises nothing — always returns bytes even in fully-degraded mode.\n    """\n    return _get_pool().get(size=size)\n\n\ndef get_entropy_pool() -> "HyperbolicEntropyPool":\n    """\n    CLIENT-SIDE entropy pool accessor — returns the singleton HyperbolicEntropyPool.\n    Matches the get_entropy_pool_manager() interface expected by server-side consumers\n    that call pool.get(size=N).\n    """\n    return _get_pool()\n\n\n# Alias: server code calls get_entropy_pool_manager(); client exposes same object.\nget_entropy_pool_manager = get_entropy_pool\n\n\ndef get_entropy_stats() -> Dict[str, Any]:\n    """\n    CLIENT-SIDE entropy diagnostic stats — globals.get_entropy_stats() compatible.\n\n    Returns a dict with the same key schema as qrng_ensemble.get_entropy_stats()\n    so that any code calling get_entropy_stats() for telemetry gets a consistent\n    structure regardless of execution context (server vs. client/miner).\n    """\n    pool = _get_pool()\n    qrng_sources: Dict[str, bool] = {\n        "random_org":   bool(QRNG_API_KEY_1),\n        "anu_quantum":  bool(QRNG_API_KEY_2),\n        "qbick":        bool(QRNG_API_KEY_3),\n    }\n    active_qrng = [name for name, active in qrng_sources.items() if active]\n    return {\n        "context":          "client",\n        "pool_type":        "HyperbolicEntropyPool",\n        "qrng_sources":     qrng_sources,\n        "active_sources":   active_qrng,\n        "source_count":     len(active_qrng),\n        "pipeline":         f"QRNG[{','.join(active_qrng) or 'none'}] → XOR₃ → Möbius(d=64) → server → os.urandom",\n        "cache_ttl_s":      pool._ttl,\n        "cache_active":     (pool._cache is not None),\n        "cache_age_s":      round(time.time() - pool._cache_ts, 3) if pool._cache_ts else None,\n        "entropy_server":   ENTROPY_SERVER_URL,\n        "pool_api_available": True,  # this module IS the pool api on the client\n        "degraded":         len(active_qrng) == 0,\n        "timestamp":        time.time(),\n    }\n\n\n# ── sys.modules "globals" shim injection ─────────────────────────────────────\n# Inject a thin synthetic "globals" module into sys.modules so that any shared\n# hyp_*.py file that does `from globals import get_entropy` on the client\n# resolves cleanly without ImportError. The shim also re-exports every function\n# and constant that globals.py exposes so server-written consumers that import\n# more than just get_entropy work transparently in client mode.\n#\n# This is only injected when globals is NOT already importable (i.e. we are\n# running client-side, not inside the Koyeb server process).  The server's real\n# globals.py takes absolute priority.\n# ─────────────────────────────────────────────────────────────────────────────\n\ndef _maybe_inject_globals_shim() -> None:\n    """\n    Inject a lightweight synthetic 'globals' module into sys.modules.\n\n    Conditions:\n      - Only runs if 'globals' is NOT already importable (client mode guard).\n      - Idempotent: if the shim is already installed this call is a no-op.\n      - Safe: any real globals.py on sys.path takes absolute precedence because\n        we check importability first.\n    """\n    import sys as _sys\n    import types as _types\n    import importlib as _importlib\n\n    # Check if the real globals module is importable — if so, do nothing.\n    try:\n        _real = _importlib.import_module("globals")\n        if hasattr(_real, "get_entropy"):\n            # Real server globals.py is available; no shim needed.\n            logger.debug("[ClientGlobals] Real globals.py found — shim not injected")\n            return\n    except (ImportError, ModuleNotFoundError):\n        pass  # Expected on client — proceed with shim injection\n\n    if "globals" in _sys.modules:\n        # Already shimmed (or something else installed it) — check if ours\n        _existing = _sys.modules["globals"]\n        if getattr(_existing, "_QTCL_CLIENT_SHIM", False):\n            logger.debug("[ClientGlobals] Globals shim already installed — skipping")\n            return\n\n    # Build the synthetic module\n    _shim = _types.ModuleType("globals")\n    _shim.__doc__ = """\n    QTCL Client-Side globals shim.\n    Provides the same public API as server globals.py so that all hyp_*.py\n    modules work identically in both server and client/miner contexts.\n    Installed into sys.modules['globals'] by qtcl_client at import time.\n    """\n    _shim._QTCL_CLIENT_SHIM = True  # marker so we can detect our own shim\n\n    # ── Core entropy API ──────────────────────────────────────────────────────\n    _shim.get_entropy             = get_entropy\n    _shim.get_entropy_pool        = get_entropy_pool\n    _shim.get_entropy_pool_manager = get_entropy_pool_manager\n    _shim.get_entropy_stats       = get_entropy_stats\n    _shim.POOL_API_AVAILABLE      = True\n\n    # ── Block field entropy (client stubs — server-only feature) ──────────────\n    _shim.get_block_field_entropy     = lambda: get_entropy(32)\n    _shim.get_entropy_from_block_field = lambda: get_entropy(32)\n    _shim.get_current_block_field     = lambda: {}\n    _shim.set_current_block_field     = lambda _d: None\n    _shim.initialize_block_field_entropy = lambda: True\n    _shim.initialize_system           = lambda: True\n    _shim.ENTROPY_SIZE_BYTES          = 32\n    _shim.BLOCK_FIELD_ENTROPY_KEY     = "current_block_field_entropy"\n\n    # ── State API stubs ───────────────────────────────────────────────────────\n    _CLIENT_STATE: Dict[str, Any] = {}\n    _CLIENT_STATE_LOCK = threading.RLock()\n\n    def _get_state(key: str, default: Any = None) -> Any:\n        with _CLIENT_STATE_LOCK:\n            return _CLIENT_STATE.get(key, default)\n\n    def _set_state(key: str, value: Any) -> None:\n        with _CLIENT_STATE_LOCK:\n            _CLIENT_STATE[key] = value\n\n    def _update_state(updates: Dict[str, Any]) -> None:\n        with _CLIENT_STATE_LOCK:\n            _CLIENT_STATE.update(updates)\n\n    _shim.get_state    = _get_state\n    _shim.set_state    = _set_state\n    _shim.update_state = _update_state\n\n    # ── Chain/consensus constants ─────────────────────────────────────────────\n    _shim.WSTATE_FIDELITY_THRESHOLD  = 0.75\n    _shim.ORACLE_MIN_PEERS           = 3\n    _shim.MAX_PEERS                  = 32\n    _shim.MINING_COINBASE_REWARD     = float(os.environ.get("MINER_REWARD", "7.20"))\n    _shim.ORACLE_REGISTRY_ADDRESS    = "0000000000000000000000000000000000000000000000000000000000000000"\n\n    # ── Reward schedule (re-export from client's own definition) ──────────────\n    # TessellationRewardSchedule is defined later in qtcl_client.py; we use a\n    # lazy property so forward-reference is not an issue.\n    class _LazyRewardScheduleDescriptor:\n        def __get__(self, obj, objtype=None):\n            import sys as _s\n            _qc = _s.modules.get("qtcl_client") or _s.modules.get("__main__")\n            if _qc and hasattr(_qc, "TessellationRewardSchedule"):\n                return _qc.TessellationRewardSchedule\n            # Minimal inline fallback\n            class _MinimalTRS:\n                TOTAL_BLOCKS = 62_300_160\n                TOTAL_SUPPLY_QTCL = 498_401_280.0\n                TREASURY_ADDRESS = "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"\n            return _MinimalTRS\n    _shim.__class__ = type("_GlobalsShimModule", (_types.ModuleType,), {\n        "TessellationRewardSchedule": _LazyRewardScheduleDescriptor(),\n    })\n\n    # ── Lattice / consensus stubs (no-ops on client) ──────────────────────────\n    _shim.LATTICE          = None\n    _shim.get_lattice      = lambda: None\n    _shim.set_lattice      = lambda _l: None\n    _shim.get_blockchain   = lambda: None\n    _shim.HYP_ENGINE_AVAILABLE = False  # will be updated after HypWallet init\n    _shim.get_global_hyp_engine = lambda: None\n    _shim.set_hyp_engine   = lambda _e: None\n\n    _shim.record_quantum_witness = lambda *a, **kw: True\n    _shim.register_validator     = lambda *a, **kw: (True, 0)\n    _shim.accept_attestation     = lambda *a, **kw: (True, "attestation_accepted")\n    _shim.compute_finality       = lambda *a, **kw: None\n\n    # ── Install ───────────────────────────────────────────────────────────────\n    _sys.modules["globals"] = _shim\n    logger.info(\n        "[ClientGlobals] ✅ globals shim injected into sys.modules — "\n        "all hyp_*.py modules now operate in dual-use client mode"\n    )\n\n\n# Execute shim injection immediately at qtcl_client import time.\n# The resolver in hyp_group._resolve_entropy_fn() will then find\n# the shim on its first pass, route to HyperbolicEntropyPool, and\n# log "globals(server/QRNG)" or "qtcl_client(client/HyperbolicPool)"\n# depending on which context wins.\n_maybe_inject_globals_shim()\n\n\n
+    )
+    or "none"
+)
+logger.info(
+    f"[HypEnt] Pipeline: QRNG[{_qrng_active}] "
+    f"→ XOR₃ → {{8,3}} Möbius(d=64) "
+    f"→ server({ENTROPY_SERVER_URL}) → os.urandom hedge"
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# CLIENT-SIDE GLOBALS-COMPATIBLE ENTROPY API
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# This block exposes get_entropy(), get_entropy_pool(), get_entropy_stats(),
+# and get_entropy_pool_manager() at qtcl_client module scope so that:
+#   • hyp_group._resolve_entropy_fn() finds them via sys.modules["qtcl_client"]
+#   • Any hyp_* module running client-side can do:
+#         import qtcl_client; get_entropy = qtcl_client.get_entropy
+#     instead of the server-only `from globals import get_entropy`.
+# The implementation delegates entirely to HyperbolicEntropyPool (_get_pool())
+# which already handles the QRNG ensemble → server → os.urandom fallback chain.
+# Additionally, this block injects a lightweight "globals" shim into sys.modules
+# so that `from globals import get_entropy` literally resolves on the client
+# without ImportError — enabling true zero-change dual-use of all hyp_*.py files.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# ── Public entropy API (globals-compatible signatures) ────────────────────────
+
+def get_entropy(size: int = 32) -> bytes:
+    """
+    CLIENT-SIDE quantum entropy gate — globals.get_entropy() compatible.
+
+    Returns `size` bytes from the HyperbolicEntropyPool pipeline:
+      QRNG ensemble (random.org / ANU / QBICK)
+      → XOR₃ combiner
+      → {8,3} Möbius SHAKE-256 mix
+      → server /rpc qtcl_getEntropy fallback
+      → os.urandom liveness hedge
+
+    Thread-safe, cached with 20-second TTL (configurable via HyperbolicEntropyPool).
+    Raises nothing — always returns bytes even in fully-degraded mode.
+    """
+    return _get_pool().get(size=size)
+
+
+def get_entropy_pool() -> "HyperbolicEntropyPool":
+    """
+    CLIENT-SIDE entropy pool accessor — returns the singleton HyperbolicEntropyPool.
+    Matches the get_entropy_pool_manager() interface expected by server-side consumers
+    that call pool.get(size=N).
+    """
+    return _get_pool()
+
+
+# Alias: server code calls get_entropy_pool_manager(); client exposes same object.
+get_entropy_pool_manager = get_entropy_pool
+
+
+def get_entropy_stats() -> Dict[str, Any]:
+    """
+    CLIENT-SIDE entropy diagnostic stats — globals.get_entropy_stats() compatible.
+
+    Returns a dict with the same key schema as qrng_ensemble.get_entropy_stats()
+    so that any code calling get_entropy_stats() for telemetry gets a consistent
+    structure regardless of execution context (server vs. client/miner).
+    """
+    pool = _get_pool()
+    qrng_sources: Dict[str, bool] = {
+        "random_org":   bool(QRNG_API_KEY_1),
+        "anu_quantum":  bool(QRNG_API_KEY_2),
+        "qbick":        bool(QRNG_API_KEY_3),
+    }
+    active_qrng = [name for name, active in qrng_sources.items() if active]
+    return {
+        "context":          "client",
+        "pool_type":        "HyperbolicEntropyPool",
+        "qrng_sources":     qrng_sources,
+        "active_sources":   active_qrng,
+        "source_count":     len(active_qrng),
+        "pipeline":         f"QRNG[{','.join(active_qrng) or 'none'}] → XOR₃ → Möbius(d=64) → server → os.urandom",
+        "cache_ttl_s":      pool._ttl,
+        "cache_active":     (pool._cache is not None),
+        "cache_age_s":      round(time.time() - pool._cache_ts, 3) if pool._cache_ts else None,
+        "entropy_server":   ENTROPY_SERVER_URL,
+        "pool_api_available": True,  # this module IS the pool api on the client
+        "degraded":         len(active_qrng) == 0,
+        "timestamp":        time.time(),
+    }
+
+
+# ── sys.modules "globals" shim injection ─────────────────────────────────────
+# Inject a thin synthetic "globals" module into sys.modules so that any shared
+# hyp_*.py file that does `from globals import get_entropy` on the client
+# resolves cleanly without ImportError. The shim also re-exports every function
+# and constant that globals.py exposes so server-written consumers that import
+# more than just get_entropy work transparently in client mode.
+#
+# This is only injected when globals is NOT already importable (i.e. we are
+# running client-side, not inside the Koyeb server process).  The server's real
+# globals.py takes absolute priority.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _maybe_inject_globals_shim() -> None:
+    """
+    Inject a lightweight synthetic 'globals' module into sys.modules.
+
+    Conditions:
+      - Only runs if 'globals' is NOT already importable (client mode guard).
+      - Idempotent: if the shim is already installed this call is a no-op.
+      - Safe: any real globals.py on sys.path takes absolute precedence because
+        we check importability first.
+    """
+    import sys as _sys
+    import types as _types
+    import importlib as _importlib
+
+    # Check if the real globals module is importable — if so, do nothing.
+    try:
+        _real = _importlib.import_module("globals")
+        if hasattr(_real, "get_entropy"):
+            # Real server globals.py is available; no shim needed.
+            logger.debug("[ClientGlobals] Real globals.py found — shim not injected")
+            return
+    except (ImportError, ModuleNotFoundError):
+        pass  # Expected on client — proceed with shim injection
+
+    if "globals" in _sys.modules:
+        # Already shimmed (or something else installed it) — check if ours
+        _existing = _sys.modules["globals"]
+        if getattr(_existing, "_QTCL_CLIENT_SHIM", False):
+            logger.debug("[ClientGlobals] Globals shim already installed — skipping")
+            return
+
+    # Build the synthetic module
+    _shim = _types.ModuleType("globals")
+    _shim.__doc__ = """
+    QTCL Client-Side globals shim.
+    Provides the same public API as server globals.py so that all hyp_*.py
+    modules work identically in both server and client/miner contexts.
+    Installed into sys.modules['globals'] by qtcl_client at import time.
+    """
+    _shim._QTCL_CLIENT_SHIM = True  # marker so we can detect our own shim
+
+    # ── Core entropy API ──────────────────────────────────────────────────────
+    _shim.get_entropy             = get_entropy
+    _shim.get_entropy_pool        = get_entropy_pool
+    _shim.get_entropy_pool_manager = get_entropy_pool_manager
+    _shim.get_entropy_stats       = get_entropy_stats
+    _shim.POOL_API_AVAILABLE      = True
+
+    # ── Block field entropy (client stubs — server-only feature) ──────────────
+    _shim.get_block_field_entropy     = lambda: get_entropy(32)
+    _shim.get_entropy_from_block_field = lambda: get_entropy(32)
+    _shim.get_current_block_field     = lambda: {}
+    _shim.set_current_block_field     = lambda _d: None
+    _shim.initialize_block_field_entropy = lambda: True
+    _shim.initialize_system           = lambda: True
+    _shim.ENTROPY_SIZE_BYTES          = 32
+    _shim.BLOCK_FIELD_ENTROPY_KEY     = "current_block_field_entropy"
+
+    # ── State API stubs ───────────────────────────────────────────────────────
+    _CLIENT_STATE: Dict[str, Any] = {}
+    _CLIENT_STATE_LOCK = threading.RLock()
+
+    def _get_state(key: str, default: Any = None) -> Any:
+        with _CLIENT_STATE_LOCK:
+            return _CLIENT_STATE.get(key, default)
+
+    def _set_state(key: str, value: Any) -> None:
+        with _CLIENT_STATE_LOCK:
+            _CLIENT_STATE[key] = value
+
+    def _update_state(updates: Dict[str, Any]) -> None:
+        with _CLIENT_STATE_LOCK:
+            _CLIENT_STATE.update(updates)
+
+    _shim.get_state    = _get_state
+    _shim.set_state    = _set_state
+    _shim.update_state = _update_state
+
+    # ── Chain/consensus constants ─────────────────────────────────────────────
+    _shim.WSTATE_FIDELITY_THRESHOLD  = 0.75
+    _shim.ORACLE_MIN_PEERS           = 3
+    _shim.MAX_PEERS                  = 32
+    _shim.MINING_COINBASE_REWARD     = float(os.environ.get("MINER_REWARD", "7.20"))
+    _shim.ORACLE_REGISTRY_ADDRESS    = "0000000000000000000000000000000000000000000000000000000000000000"
+
+    # ── Reward schedule (re-export from client's own definition) ──────────────
+    # TessellationRewardSchedule is defined later in qtcl_client.py; we use a
+    # lazy property so forward-reference is not an issue.
+    class _LazyRewardScheduleDescriptor:
+        def __get__(self, obj, objtype=None):
+            import sys as _s
+            _qc = _s.modules.get("qtcl_client") or _s.modules.get("__main__")
+            if _qc and hasattr(_qc, "TessellationRewardSchedule"):
+                return _qc.TessellationRewardSchedule
+            # Minimal inline fallback
+            class _MinimalTRS:
+                TOTAL_BLOCKS = 62_300_160
+                TOTAL_SUPPLY_QTCL = 498_401_280.0
+                TREASURY_ADDRESS = "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
+            return _MinimalTRS
+    _shim.__class__ = type("_GlobalsShimModule", (_types.ModuleType,), {
+        "TessellationRewardSchedule": _LazyRewardScheduleDescriptor(),
+    })
+
+    # ── Lattice / consensus stubs (no-ops on client) ──────────────────────────
+    _shim.LATTICE          = None
+    _shim.get_lattice      = lambda: None
+    _shim.set_lattice      = lambda _l: None
+    _shim.get_blockchain   = lambda: None
+    _shim.HYP_ENGINE_AVAILABLE = False  # will be updated after HypWallet init
+    _shim.get_global_hyp_engine = lambda: None
+    _shim.set_hyp_engine   = lambda _e: None
+
+    _shim.record_quantum_witness = lambda *a, **kw: True
+    _shim.register_validator     = lambda *a, **kw: (True, 0)
+    _shim.accept_attestation     = lambda *a, **kw: (True, "attestation_accepted")
+    _shim.compute_finality       = lambda *a, **kw: None
+
+    # ── Install ───────────────────────────────────────────────────────────────
+    _sys.modules["globals"] = _shim
+    logger.info(
+        "[ClientGlobals] ✅ globals shim injected into sys.modules — "
+        "all hyp_*.py modules now operate in dual-use client mode"
+    )
+
+
+# Execute shim injection immediately at qtcl_client import time.
+# The resolver in hyp_group._resolve_entropy_fn() will then find
+# the shim on its first pass, route to HyperbolicEntropyPool, and
+# log "globals(server/QRNG)" or "qtcl_client(client/HyperbolicPool)"
+# depending on which context wins.
+_maybe_inject_globals_shim()
+
+
+
+
 
 class _OracleNode:
     """
