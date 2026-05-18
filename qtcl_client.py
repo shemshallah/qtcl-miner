@@ -10441,7 +10441,7 @@ class QtclConstants:
     """Module-level constants replacing scattered magic numbers in globals.py."""
 
     GENESIS_HASH: str = "0" * 64
-    DEFAULT_DIFFICULTY: int = 4  # Miner queries /rpc/config/difficulty on startup; this is fallback only
+    DEFAULT_DIFFICULTY: int = 5  # FIX: was 4; server minimum is 5. Miner queries /rpc/config/difficulty on startup; this is fallback only
     BLOCK_REWARD: int = 800  # 8.0 QTCL total per block (miner+treasury) — depth-agnostic display constant only
     MAX_TX_PER_BLOCK: int = 500
     DEFAULT_N_QUBITS: int = 8
@@ -24545,7 +24545,7 @@ class QtclClientApp:
                         )
 
                     # STAGE 2: Fetch difficulty from RPC config endpoint (authoritative)
-                    _difficulty_bits = 4  # fallback default
+                    _difficulty_bits = 5  # FIX: fallback 5 matches server minimum; was 4 → caused rejected blocks
                     try:
                         _config_res = kapi._rpc_http(
                             "/rpc/config/difficulty", method="GET", timeout=5
@@ -24573,7 +24573,7 @@ class QtclClientApp:
                     elif _server_difficulty > 0:
                         difficulty_bits = max(_server_difficulty, _block_diff)
                     else:
-                        difficulty_bits = _block_diff if _block_diff > 0 else 4
+                        difficulty_bits = _block_diff if _block_diff > 0 else 5  # FIX: was 4
 
                     # STAGE 3: Fetch mempool
                     _res_m = kapi._rpc("qtcl_getMempool", [], timeout=5, retries=1)
@@ -25940,6 +25940,7 @@ class QtclClientApp:
             "[MINER] 🚀 MINING THREAD STARTED — LOGS ENABLED TO STDOUT FOR DIAGNOSTICS"
         )
         _LAST_BLOCK_REPORTED = [None]  # mutable cell so inner closure can write
+        _CACHED_BALANCE = [None, 0.0]  # [balance_float_or_None, last_fetch_ts]
 
         def _fmt_duration(secs: float) -> str:
             h, r = divmod(int(secs), 3600)
@@ -26085,10 +26086,10 @@ class QtclClientApp:
                 print(f"  Parent: {tel['parent_hash'][:32]}…")
             else:
                 print(f"  {hr_str}   │   waiting for chain tip…")
-            # ── Last solved block ─────────────────────────────────────────
+            # ── Last solved block — always shown while SUBMITTING/SOLVED ──
             lb = tel["last_block"]
-            if lb and (_LAST_BLOCK_REPORTED[0] != lb.get("hash")):
-                _LAST_BLOCK_REPORTED[0] = lb.get("hash")
+            _lb_shown_now = lb and tel["state"] in ("SUBMITTING", "SOLVED", "MINING")
+            if _lb_shown_now:
                 age = _fmt_duration(now - tel["last_block_ts"])
                 print(sep)
                 print(f"  ✅ BLOCK SOLVED  ({age} ago)")
@@ -26188,45 +26189,46 @@ class QtclClientApp:
             try:
                 _addr2 = getattr(getattr(self, "wallet", None), "address", None)
                 if _addr2:
-                    _bal = None
-                    # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
-                    try:
-                        import sqlite3 as _sq
-
-                        _local_db = (
-                            getattr(self, "_db_path", None)
-                            or getattr(getattr(self, "db", None), "_db_path", None)
-                            or getattr(getattr(self, "db", None), "db_path", None)
-                        )
-                        if _local_db:
-                            _lc = _sq.connect(str(_local_db), timeout=3.0)
-                            _lc.row_factory = _sq.Row
-                            _lr = _lc.execute(
-                                "SELECT balance FROM wallet_addresses WHERE address=?",
-                                (_addr2,),
-                            ).fetchone()
-                            _lc.close()
-                            if _lr is not None:
-                                _bal = int(_lr["balance"] or 0) / 100.0
-                    except Exception:
-                        pass
-                    # ── 2. Fall back to Koyeb RPC if local miss
-                    if _bal is None:
-                        for _retry_idx in range(3):
-                            _bal_r = self.api._rpc(
-                                "qtcl_getBalance", [_addr2], timeout=5, retries=1
+                    # ── Cached balance: refresh every 30s to avoid stalling dashboard ──
+                    _bal_age = now - _CACHED_BALANCE[1]
+                    if _CACHED_BALANCE[0] is None or _bal_age > 30.0:
+                        _bal = None
+                        # 1. Try local SQLite (fastest, zero network)
+                        try:
+                            import sqlite3 as _sq
+                            _local_db = (
+                                getattr(self, "_db_path", None)
+                                or getattr(getattr(self, "db", None), "_db_path", None)
+                                or getattr(getattr(self, "db", None), "db_path", None)
                             )
-                            _bal = (
-                                float(_bal_r["balance"])
-                                if isinstance(_bal_r, dict) and "balance" in _bal_r
-                                else None
-                            )
-                            if _bal is not None and _bal > 0:
-                                break
-                            if _retry_idx < 2:
-                                time.sleep(0.5)
-                    if _bal is not None:
-                        print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
+                            if _local_db:
+                                _lc = _sq.connect(str(_local_db), timeout=2.0, check_same_thread=False)
+                                _lc.row_factory = _sq.Row
+                                try:
+                                    _lr = _lc.execute(
+                                        "SELECT balance FROM wallet_addresses WHERE address=?",
+                                        (_addr2,),
+                                    ).fetchone()
+                                    if _lr is not None:
+                                        _bal = int(_lr["balance"] or 0) / 100.0
+                                finally:
+                                    _lc.close()
+                        except Exception:
+                            pass
+                        # 2. Fall back to Koyeb RPC — single attempt, no retry loop to avoid stall
+                        if _bal is None:
+                            try:
+                                _bal_r = self.api._rpc("qtcl_getBalance", [_addr2], timeout=4, retries=1)
+                                _bal = float(_bal_r["balance"]) if isinstance(_bal_r, dict) and "balance" in _bal_r else None
+                            except Exception:
+                                pass
+                        if _bal is not None:
+                            _CACHED_BALANCE[0] = _bal
+                            _CACHED_BALANCE[1] = now
+                    # Always print balance line — use cached value if fresh fetch failed
+                    _disp_bal = _CACHED_BALANCE[0]
+                    if _disp_bal is not None:
+                        print(f"  Balance : {_disp_bal:.8f} QTCL  ({_addr2[:24]}…)")
             except Exception:
                 pass
             if m2:
