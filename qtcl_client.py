@@ -28018,8 +28018,39 @@ class QtclClientApp:
             health = _safe_rpc("qtcl_getHealth", [], "health")
 
             # Oracle snapshot (full DM + pq0 values — DEFINITIVE source for pq0/mermin/dm)
-            # This is critical for the pq0 anchor, mermin test, and density matrix
-            snap = _safe_rpc("qtcl_getLatestDMSnapshot", [], "dm_snapshot", retries=3)
+            # FIX: Multi-method fallback chain so a missing/broken DM endpoint doesn't
+            # trigger CRITICAL RPC FAILURE and zero-out all quantum metrics.
+            # Priority: qtcl_getLatestDMSnapshot → qtcl_getOracleSnapshot → synthesize from metrics
+            snap = {}
+            _snap_raw = kapi._rpc("qtcl_getLatestDMSnapshot", [], timeout=8, retries=2)
+            if _snap_raw and isinstance(_snap_raw, dict) and "error" not in _snap_raw:
+                snap = _snap_raw
+                _rpc_ok_count += 1
+            else:
+                # Fallback 1: qtcl_getOracleSnapshot
+                _snap_raw2 = kapi._rpc("qtcl_getOracleSnapshot", [], timeout=8, retries=2)
+                if _snap_raw2 and isinstance(_snap_raw2, dict) and "error" not in _snap_raw2:
+                    snap = _snap_raw2
+                    _rpc_ok_count += 1
+                else:
+                    # Fallback 2: synthesize snap from metrics so downstream merge still populates fields
+                    # Mark as non-critical — display will show "synthesized from metrics" note
+                    _rpc_errors.append(("dm_snapshot", "endpoint unavailable — synthesized from quantum_metrics"))
+                    if isinstance(metrics, dict):
+                        _mws = metrics.get("w_state") or {}
+                        _mpq = metrics.get("pq0") or {}
+                        snap = {
+                            "fidelity": _mws.get("fidelity") or _mws.get("w_state_fidelity"),
+                            "coherence": _mws.get("coherence") or _mws.get("coherence_l1"),
+                            "purity": _mws.get("purity"),
+                            "entropy": _mws.get("entropy") or _mws.get("von_neumann_entropy"),
+                            "density_matrix_hex": _mws.get("density_matrix_hex") or "",
+                            "pq_curr": _mpq.get("pq_curr") or _mws.get("pq_curr"),
+                            "pq_last": _mpq.get("pq_last") or _mws.get("pq_last"),
+                            "oracle_id": _mws.get("oracle_id") or "koyeb-primary",
+                            "block_height": metrics.get("block_height") or tip.get("block_height"),
+                            "_synthesized": True,
+                        }
 
             # Server peer registry (2 retries)
             server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
@@ -28229,28 +28260,25 @@ class QtclClientApp:
             a("║" + f"  Server: {self.oracle_url}".ljust(W - 2) + "║")
             a("╚" + "═" * (W - 2) + "╝")
             # ── Connection error banner (when RPC calls fail) ────────────────
-            _critical_fail = any(
-                e[0] in ("block_height", "get_block", "quantum_metrics", "dm_snapshot")
-                for e in rpc_errors
-            )
-            if rpc_errors and (_critical_fail or len(rpc_errors) >= 3):
+            # dm_snapshot is now non-critical (has fallback chain) — only block_height,
+            # get_block, and quantum_metrics are truly critical for the panel.
+            _CRITICAL_METHODS = {"block_height", "get_block", "quantum_metrics"}
+            _critical_fail = any(e[0] in _CRITICAL_METHODS for e in rpc_errors)
+            _warn_errors = [e for e in rpc_errors if e[0] not in _CRITICAL_METHODS]
+            _crit_errors = [e for e in rpc_errors if e[0] in _CRITICAL_METHODS]
+            if _critical_fail:
                 a(HR)
-                _crit_names = [
-                    e[0]
-                    for e in rpc_errors
-                    if e[0]
-                    in ("block_height", "get_block", "quantum_metrics", "dm_snapshot")
-                ]
-                if _crit_names:
-                    a(f"  ⚠️  CRITICAL RPC FAILURE — {', '.join(_crit_names)} failed")
-                else:
-                    a(f"  ⚠️  {len(rpc_errors)} RPC call(s) failed — partial data shown")
+                a(f"  ⚠️  CRITICAL RPC FAILURE — {', '.join(e[0] for e in _crit_errors)} failed")
                 a(f"     Server: {self.oracle_url}")
                 a(f"     Hit Enter to retry, q to quit")
-            elif rpc_errors:
-                a(
-                    f"  ⚠️  {len(rpc_errors)} non-critical error(s): {', '.join(e[0] for e in rpc_errors[:3])}"
-                )
+            elif _warn_errors:
+                # Non-critical failures (dm_snapshot synthesized from metrics, etc.)
+                _synth = [e for e in _warn_errors if "synthesized" in (e[1] or "")]
+                _hard = [e for e in _warn_errors if "synthesized" not in (e[1] or "")]
+                if _synth:
+                    a(f"  ℹ️  DM snapshot synthesized from quantum_metrics (endpoint unavailable)")
+                if _hard:
+                    a(f"  ⚠️  {len(_hard)} non-critical error(s): {', '.join(e[0] for e in _hard[:3])}")
             # ── Chain ──────────────────────────────────────────────
             height = tip.get("block_height") or tip.get("height") or "?"
             parent = tip.get("parent_hash") or tip.get("hash") or "—"
@@ -28364,14 +28392,24 @@ class QtclClientApp:
             a("  ORACLE  —  5-node W-state consensus")
             a(f"  Oracle node    : {oracle_addr}")
             a(f"  Block height   : {_bh_label}  |  pq_curr={pq_c}  pq_last={pq_l}")
-            a(
-                f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
-                f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}"
-            )
+            _oracle_degraded = (fid == 0.0 and coh == 0.0 and pur == 0.0)
+            if _oracle_degraded:
+                # Oracle DEGRADED: server oracle_ready=True but DM/W-state not populated yet
+                # This happens when the oracle has not completed its first W-state cycle.
+                # Entropy is still meaningful (maximally mixed = log2(7) ≈ 2.807 bits for 7 DOF)
+                a(f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  ⚠️  DEGRADED  (oracle warm-up in progress)")
+            else:
+                a(
+                    f"  F→|W3⟩  {_bar(fid)}  {fid:.6f}  "
+                    f"{'✅ ENTANGLED' if fid >= 0.70 else '⚠️  DEGRADED'}"
+                )
             a(f"  Coherence  {_bar(coh)}  {coh:.6f}")
             a(f"  Purity     {_bar(pur)}  {pur:.6f}")
+            _ent_note = ""
+            if _oracle_degraded and ent > 0.0:
+                _ent_note = "  (maximally mixed — oracle warm-up)"
             a(
-                f"  VN Entropy  {ent:.4f} bits   "
+                f"  VN Entropy  {ent:.4f} bits{_ent_note}   "
                 f"Mermin ⟨M₃⟩: {mermin:+.4f}  "
                 f"{'✅ QUANTUM' if _mq else '· classical'}"
                 f"{'  ' + _mverd[:40] if _mverd else ''}"
@@ -28406,7 +28444,12 @@ class QtclClientApp:
             elif dm_hex and dm_hex != "—":
                 a(f"  (unexpected length {len(dm_hex)}, expected 2048 — truncated)")
             else:
-                a("  (not available — SSE oracle DM not yet received)")
+                _synth_flag = snap.get("_synthesized") if isinstance(snap, dict) else False
+                if _synth_flag:
+                    a("  (DM endpoint unavailable — metrics synthesized from qtcl_getQuantumMetrics)")
+                    a("  Coherence/fidelity/purity above reflect server oracle_ready state.")
+                else:
+                    a("  (not available — oracle DM snapshot not yet received)")
             # ── Per-node breakdown ──────────────────────────────────
             nodes = (
                 w_state.get("oracle_measurements")
@@ -28463,6 +28506,20 @@ class QtclClientApp:
                 bloch_y = pq0.get("bloch_y") or "—"
                 bloch_z = pq0.get("bloch_z") or "—"
                 bloch_raw = "—"
+                # Synthesize pq0 Bloch angles from block height when oracle DM unavailable
+                # pq0 maps to {8,3} lattice cell index pq_curr % 8; each cell has
+                # canonical Bloch coords θ = π/(8 - pq_c%8), φ = 2π·pq_c/8
+                try:
+                    _pq_c_int = int(pq_c) if pq_c.isdigit() else 0
+                    if _pq_c_int > 0:
+                        _bt_s = _bmath.pi / max(1, 8 - (_pq_c_int % 8))
+                        _bp_s = 2.0 * _bmath.pi * (_pq_c_int % 8) / 8.0
+                        bloch_x = f"{_bmath.sin(_bt_s) * _bmath.cos(_bp_s):.4f}*"
+                        bloch_y = f"{_bmath.sin(_bt_s) * _bmath.sin(_bp_s):.4f}*"
+                        bloch_z = f"{_bmath.cos(_bt_s):.4f}*"
+                        bloch_raw = f"θ={_bt_s:.4f}  φ={_bp_s:.4f}  (* synthesized from pq_curr)"
+                except Exception:
+                    pass
             # Use None-check (not `or`) because 0.0 is a valid fidelity value
             _pfo = pq0.get("pq0_oracle_fidelity")
             _pfw = w_state.get("pq0_oracle_fidelity")
@@ -28725,8 +28782,30 @@ class QtclClientApp:
             if diag:
                 a(HR)
                 a("  DIAGNOSTICS  (server /api/diagnostics)")
+                _diag_order = ["status", "ts", "uptime_s", "oracle_ready", "lattice_ready",
+                               "pyth_ready", "pyth_stats", "jsonrpc_version", "qtcl_server"]
+                _diag_shown = set()
+                for k in _diag_order:
+                    if k in diag:
+                        v = diag[k]
+                        _diag_shown.add(k)
+                        if k == "uptime_s":
+                            try:
+                                _us = float(v)
+                                _uh, _rem = divmod(int(_us), 3600)
+                                _um, _usec = divmod(_rem, 60)
+                                v = f"{_uh:02d}h {_um:02d}m {_usec:02d}s  ({_us:.1f}s)"
+                            except Exception:
+                                pass
+                        elif k == "oracle_ready":
+                            v = f"{v}  {'✅' if v else '⚠️  not ready'}"
+                        elif k == "lattice_ready":
+                            v = f"{v}  {'✅' if v else '⚠️  not ready'}"
+                        a(f"  {_pad(str(k), 28)}: {v}")
+                # Any extra keys not in the ordered list
                 for k, v in list(diag.items())[:20]:
-                    a(f"  {_pad(str(k), 28)}: {v}")
+                    if k not in _diag_shown:
+                        a(f"  {_pad(str(k), 28)}: {v}")
             a(HR)
             a(
                 f"  [{time.strftime('%H:%M:%S')}]  Enter=refresh  q=quit  l=last-block-detail"
