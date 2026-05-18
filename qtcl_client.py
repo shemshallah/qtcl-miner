@@ -25985,7 +25985,7 @@ class QtclClientApp:
             _REJECTED_HEIGHT_NONCES = {}
             # FIX: was secrets.randbelow(2**32) → nonces started at ~2B, confusing display.
             # Start small; workers still cover the full uint32 space via wraparound.
-            _PERSISTENT_NONCE_BASE = [secrets.randbelow(1_000_000)]
+            _PERSISTENT_NONCE_BASE = [secrets.randbelow(999_999) + 1]  # FIX: never start at 0
             # Reset session tried counter for this mining session
             _SESSION_TOTAL_TRIED[0] = 0
 
@@ -26385,13 +26385,13 @@ class QtclClientApp:
                         _found = block_hash is not None
                         if _found:
                             _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
+                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF) or 1
                         elif _chain_advanced:
                             _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF
+                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0]) & 0xFFFFFFFF) or 1
                         elif _ttl_expired:
                             _MINE_TELEM._accumulate_session_nonces(_nonce_ctr[0])
-                            _PERSISTENT_NONCE_BASE[0] = (_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0] + secrets.randbelow(1_000_000)) & 0xFFFFFFFF
+                            _PERSISTENT_NONCE_BASE[0] = ((_PERSISTENT_NONCE_BASE[0] + _nonce_ctr[0] + secrets.randbelow(1_000_000)) & 0xFFFFFFFF) or 1
 
                         if not _found:
                             # No solution found — chain advanced, TTL expired, or aborted
@@ -26405,8 +26405,8 @@ class QtclClientApp:
                         # Previously this path discarded valid solutions when _chain_advanced
                         # was True, losing the block entirely.
 
-                        # 🔴 CRITICAL: Reject nonce=0 — server will reject it for non-genesis blocks
-                        if nonce is None or nonce == 0:
+                        # 🔴 CRITICAL: Reject null nonce only — nonce=0 is valid after wrap
+                        if nonce is None:
                             _EXP_LOG.error(f"[MINER] ❌ Invalid nonce={nonce} for h={target_height} — skipping submission")
                             _MINE_TELEM.mark_idle()
                             await _asyncio.sleep(0.1)
