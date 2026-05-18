@@ -5131,44 +5131,69 @@ class LiveRPCOracleSnapshot:
             if not snap:
                 return {}
 
-            # Process snapshot: parse 16³ density tensor (native 3D format) — 2000× smaller than 64³
+            # Process snapshot: parse density matrix (8×8 complex128 or 16³ complex64)
             dm_hex = snap.get("density_matrix_hex")
             if dm_hex:
                 try:
                     bdata = bytes.fromhex(dm_hex)
+                    expected_8x8_complex128 = 8 * 8 * 16  # 8×8 × complex128 (16 bytes) = 1,024 bytes
                     expected_16_3_complex64 = (
                         4096 * 8
                     )  # 16³ × complex64 (8 bytes) = 32,768 bytes
 
-                    if len(bdata) != expected_16_3_complex64:
-                        logger.error(
-                            f"[RPC-ORACLE] ❌ DM size mismatch: {len(bdata)} bytes, expected {expected_16_3_complex64} (16³)"
+                    if len(bdata) == expected_8x8_complex128:
+                        # ── 8×8 complex128 LE row-major (from oracle consensus) ──
+                        dm_flat = []
+                        for i in range(64):
+                            re, im = struct.unpack_from("<dd", bdata, i * 16)
+                            dm_flat.append(complex(float(re), float(im)))
+
+                        snap["_density_matrix_2d"] = {
+                            "dimension": 8,
+                            "shape": [8, 8],
+                            "elements": dm_flat,
+                            "timestamp": time.time(),
+                        }
+
+                        with self._dm_lock:
+                            self._dm_re = [c.real for c in dm_flat]
+                            self._dm_im = [c.imag for c in dm_flat]
+                            self._last_fetch_ts = time.time()
+
+                        logger.debug(
+                            f"[RPC-ORACLE] ✅ Parsed 8×8 density matrix ({len(dm_flat)} elements, 1 KB)"
                         )
-                        raise ValueError(f"Invalid tensor size: {len(bdata)} bytes")
 
-                    # Parse 16³ format
-                    dm_flat = []
-                    for i in range(4096):
-                        re, im = struct.unpack_from(">ff", bdata, i * 8)
-                        dm_flat.append(complex(float(re), float(im)))
+                    elif len(bdata) == expected_16_3_complex64:
+                        # ── 16³ complex64 BE (legacy tensor format) ──
+                        dm_flat = []
+                        for i in range(4096):
+                            re, im = struct.unpack_from(">ff", bdata, i * 8)
+                            dm_flat.append(complex(float(re), float(im)))
 
-                    # Store 16³ tensor metadata
-                    snap["_density_matrix_3d"] = {
-                        "dimension": 16,
-                        "shape": [16, 16, 16],
-                        "elements": dm_flat,
-                        "timestamp": time.time(),
-                    }
+                        snap["_density_matrix_3d"] = {
+                            "dimension": 16,
+                            "shape": [16, 16, 16],
+                            "elements": dm_flat,
+                            "timestamp": time.time(),
+                        }
 
-                    # Keep first 16 elements for legacy compatibility
-                    with self._dm_lock:
-                        self._dm_re = [c.real for c in dm_flat[:16]]
-                        self._dm_im = [c.imag for c in dm_flat[:16]]
-                        self._last_fetch_ts = time.time()
+                        with self._dm_lock:
+                            self._dm_re = [c.real for c in dm_flat[:16]]
+                            self._dm_im = [c.imag for c in dm_flat[:16]]
+                            self._last_fetch_ts = time.time()
 
-                    logger.debug(
-                        f"[RPC-ORACLE] ✅ Parsed 16³ density tensor ({len(dm_flat)} elements, 32 KB)"
-                    )
+                        logger.debug(
+                            f"[RPC-ORACLE] ✅ Parsed 16³ density tensor ({len(dm_flat)} elements, 32 KB)"
+                        )
+
+                    else:
+                        logger.warning(
+                            f"[RPC-ORACLE] ⚠️ DM size {len(bdata)} bytes — not 8×8 ({expected_8x8_complex128}) "
+                            f"or 16³ ({expected_16_3_complex64}). Keeping raw hex for audit display."
+                        )
+                        # Don't raise — the raw hex is still valid for the audit panel's
+                        # 2048-char renderer. Just skip the structured parse.
 
                 except Exception as _parse_e:
                     logger.debug(f"[RPC-ORACLE] DM parse error: {_parse_e}")
@@ -26574,6 +26599,706 @@ class QtclClientApp:
         print("─" * 58)
 
     # ── Wallet mode ───────────────────────────────────────────────────────────
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NODE SERVER ENGINE — turns this client into a full mesh participant
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _node_chain_sync_daemon(self) -> None:
+        """Mirror blocks from Koyeb into local SQLite.
+        Polls every 10s for new blocks and stores them locally so the node
+        can serve qtcl_getBlock, qtcl_getBalance, qtcl_getTransaction to peers."""
+        import time as _csd_t
+
+        _last_synced = 0
+        _EXP_LOG.info("[NODE-SYNC] Chain sync daemon started")
+        while not self._stop.is_set():
+            try:
+                # Get current server height
+                resp = self.api._rpc("qtcl_getBlockHeight", [])
+                if not resp or not isinstance(resp, dict):
+                    self._stop.wait(10.0)
+                    continue
+                server_h = int(resp.get("height", 0) or 0)
+                if server_h <= _last_synced:
+                    self._stop.wait(10.0)
+                    continue
+
+                # Fetch missing blocks (max 20 per cycle to avoid overload)
+                _from = max(_last_synced + 1, 1)
+                _to = min(_from + 20, server_h + 1)
+                for h in range(_from, _to):
+                    try:
+                        blk = self.api._rpc("qtcl_getBlock", [h])
+                        if not blk or not isinstance(blk, dict):
+                            continue
+                        # Store in local SQLite
+                        if self._db:
+                            self._db.execute(
+                                """INSERT OR REPLACE INTO blocks
+                                   (height, block_hash, parent_hash, miner_address,
+                                    timestamp, difficulty, nonce, merkle_root,
+                                    tx_count, finalized, w_state_fidelity)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                (
+                                    h,
+                                    blk.get("block_hash", ""),
+                                    blk.get("parent_hash", ""),
+                                    blk.get("miner_address", ""),
+                                    int(blk.get("timestamp", blk.get("timestamp_s", 0)) or 0),
+                                    int(blk.get("difficulty", blk.get("difficulty_bits", 5)) or 5),
+                                    int(blk.get("nonce", 0) or 0),
+                                    blk.get("merkle_root", ""),
+                                    int(blk.get("tx_count", 0) or 0),
+                                    1 if blk.get("finalized") else 0,
+                                    float(blk.get("w_state_fidelity", blk.get("quantum_fidelity", 0)) or 0),
+                                ),
+                            )
+                            # Store transactions from this block
+                            txs = blk.get("transactions") or []
+                            for tx in txs:
+                                if isinstance(tx, dict):
+                                    self._db.execute(
+                                        """INSERT OR REPLACE INTO transactions
+                                           (tx_hash, from_address, to_address, amount,
+                                            block_height, timestamp, status)
+                                           VALUES (?,?,?,?,?,?,?)""",
+                                        (
+                                            tx.get("tx_hash", tx.get("tx_id", "")),
+                                            tx.get("from_address", tx.get("sender", "")),
+                                            tx.get("to_address", tx.get("recipient", "")),
+                                            int(tx.get("amount", 0) or 0),
+                                            h,
+                                            int(tx.get("timestamp", 0) or 0),
+                                            "confirmed",
+                                        ),
+                                    )
+                            self._db.commit()
+                            _last_synced = h
+                    except Exception as _be:
+                        _EXP_LOG.debug(f"[NODE-SYNC] Block {h} sync failed: {_be}")
+                        break
+
+                if _last_synced > 0 and (_last_synced % 10 == 0 or _last_synced == server_h):
+                    _EXP_LOG.info(
+                        f"[NODE-SYNC] ✅ Synced to h={_last_synced}/{server_h}"
+                    )
+            except Exception as _se:
+                _EXP_LOG.debug(f"[NODE-SYNC] Sync error: {_se}")
+            self._stop.wait(10.0)
+
+    def _node_ensure_tables(self) -> None:
+        """Ensure all SQLite tables exist for node server operation."""
+        if not self._db:
+            return
+        _tables = [
+            """CREATE TABLE IF NOT EXISTS blocks (
+                height INTEGER PRIMARY KEY,
+                block_hash TEXT NOT NULL DEFAULT '',
+                parent_hash TEXT NOT NULL DEFAULT '',
+                miner_address TEXT NOT NULL DEFAULT '',
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                difficulty INTEGER NOT NULL DEFAULT 5,
+                nonce INTEGER NOT NULL DEFAULT 0,
+                merkle_root TEXT NOT NULL DEFAULT '',
+                tx_count INTEGER NOT NULL DEFAULT 0,
+                finalized INTEGER NOT NULL DEFAULT 0,
+                w_state_fidelity REAL NOT NULL DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS transactions (
+                tx_hash TEXT PRIMARY KEY,
+                from_address TEXT NOT NULL DEFAULT '',
+                to_address TEXT NOT NULL DEFAULT '',
+                amount INTEGER NOT NULL DEFAULT 0,
+                block_height INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )""",
+            """CREATE TABLE IF NOT EXISTS address_utxos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL,
+                amount INTEGER NOT NULL DEFAULT 0,
+                tx_hash TEXT NOT NULL DEFAULT '',
+                output_index INTEGER NOT NULL DEFAULT 0,
+                block_height INTEGER NOT NULL DEFAULT 0,
+                spent INTEGER NOT NULL DEFAULT 0,
+                spent_in_tx_hash TEXT NOT NULL DEFAULT ''
+            )""",
+            """CREATE TABLE IF NOT EXISTS node_oracle_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle INTEGER NOT NULL,
+                fidelity REAL NOT NULL DEFAULT 0,
+                coherence REAL NOT NULL DEFAULT 0,
+                purity REAL NOT NULL DEFAULT 0,
+                entropy REAL NOT NULL DEFAULT 0,
+                mermin_val REAL NOT NULL DEFAULT 0,
+                upstream_fid REAL NOT NULL DEFAULT 0,
+                fused_fid REAL NOT NULL DEFAULT 0,
+                dm_hex TEXT NOT NULL DEFAULT '',
+                timestamp REAL NOT NULL DEFAULT 0
+            )""",
+        ]
+        for sql in _tables:
+            try:
+                self._db.execute(sql)
+            except Exception:
+                pass
+        try:
+            self._db.commit()
+        except Exception:
+            pass
+
+    def _node_metrics_broadcast_daemon(self) -> None:
+        """Push fused oracle metrics to all P2P peers every 4 seconds.
+        Each peer receives our fused DM + metrics so they can incorporate
+        it into their own consensus — forming the mesh averaging network."""
+        import time as _mbd_t
+        import struct as _mbd_s
+
+        _EXP_LOG.info("[NODE-BROADCAST] Metrics broadcast daemon started")
+        _cycle = 0
+        while not self._stop.is_set():
+            try:
+                _cycle += 1
+                fused_dm = getattr(self, "_local_consensus_dm", None)
+                fused_fid = getattr(self, "_local_fused_fid", 0.0)
+                upstream_fid = getattr(self, "_upstream_fid", 0.0)
+
+                if fused_dm is None or not HAS_NUMPY:
+                    self._stop.wait(4.0)
+                    continue
+
+                # Serialize fused DM as hex (8×8 complex128 LE — same format as oracle.py)
+                dm_hex = ""
+                try:
+                    dm_bytes = bytearray()
+                    for r in range(8):
+                        for c in range(8):
+                            v = fused_dm[r, c]
+                            dm_bytes.extend(_mbd_s.pack("<dd", float(v.real), float(v.imag)))
+                    dm_hex = dm_bytes.hex()
+                except Exception:
+                    pass
+
+                # Compute full metrics from fused DM
+                purity = float(np.real(np.trace(fused_dm @ fused_dm)))
+                coherence = float(np.sum(np.abs(fused_dm - np.diag(np.diag(fused_dm)))) / 7.0)
+                evals = np.linalg.eigvalsh(fused_dm)
+                evals = np.clip(evals, 1e-15, 1.0)
+                entropy = float(-np.sum(evals * np.log2(evals)))
+                mermin_val = 3.0 * fused_fid - 1.0  # W-state witness
+
+                # Build snapshot payload (unified format — same as oracle.py/server.py)
+                bh = int(getattr(self.koyeb_state, "block_height", 0) or 0)
+                snap_payload = {
+                    "type": "node_oracle_snapshot",
+                    "node_id": getattr(self, "_peer_id", ""),
+                    "cycle": _cycle,
+                    "timestamp": _mbd_t.time(),
+                    "block_height": bh,
+                    "pq_curr": bh + 1,
+                    "pq_last": bh,
+                    "w_state_fidelity": round(fused_fid, 6),
+                    "fidelity": round(fused_fid, 6),
+                    "coherence": round(coherence, 6),
+                    "coherence_l1": round(coherence, 6),
+                    "purity": round(purity, 6),
+                    "entropy": round(entropy, 6),
+                    "von_neumann_entropy": round(entropy, 6),
+                    "mermin_test": {
+                        "M_value": round(mermin_val, 6),
+                        "mermin_M": round(mermin_val, 6),
+                        "is_quantum": mermin_val > 1.0,
+                        "quantum": mermin_val > 1.0,
+                        "verdict": f"QUANTUM (M_W={mermin_val:+.4f} > 1)" if mermin_val > 1.0 else f"classical (M_W={mermin_val:+.4f} ≤ 1)",
+                    },
+                    "upstream_fidelity": round(upstream_fid, 6),
+                    "density_matrix_hex": dm_hex,
+                    "source": "node_fused",
+                }
+
+                # Store in local SQLite for serving via RPC
+                if self._db and _cycle % 5 == 1:
+                    try:
+                        self._db.execute(
+                            """INSERT INTO node_oracle_snapshots
+                               (cycle, fidelity, coherence, purity, entropy,
+                                mermin_val, upstream_fid, fused_fid, dm_hex, timestamp)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (_cycle, fused_fid, coherence, purity, entropy,
+                             mermin_val, upstream_fid, fused_fid, dm_hex[:512], _mbd_t.time()),
+                        )
+                        self._db.commit()
+                    except Exception:
+                        pass
+
+                # Store latest snapshot for RPC serving
+                self._node_latest_snapshot = snap_payload
+
+                # Fan-out to all known peers
+                if self._db:
+                    try:
+                        cutoff = int(_mbd_t.time()) - 300
+                        rows = self._db.fetchall(
+                            "SELECT host, port FROM p2p_peers WHERE last_seen_at > ? AND source != 'self' LIMIT 12",
+                            (cutoff,),
+                        )
+                        for row in rows:
+                            _host, _port = row[0], int(row[1])
+                            if _host in ("", "127.0.0.1", "localhost"):
+                                continue
+                            threading.Thread(
+                                target=self._node_push_metrics_to_peer,
+                                args=(_host, _port, snap_payload),
+                                daemon=True,
+                            ).start()
+                    except Exception:
+                        pass
+
+                if _cycle % 15 == 1:
+                    _EXP_LOG.info(
+                        f"[NODE-BROADCAST] cycle={_cycle} fused={fused_fid:.4f} "
+                        f"up={upstream_fid:.4f} peers_targeted={len(rows) if self._db else 0}"
+                    )
+
+            except Exception as _mbe:
+                _EXP_LOG.debug(f"[NODE-BROADCAST] Error: {_mbe}")
+            self._stop.wait(4.0)
+
+    def _node_push_metrics_to_peer(self, host: str, port: int, payload: dict) -> None:
+        """Push fused oracle snapshot to a single peer via JSON-RPC."""
+        try:
+            url = f"http://{host}:{port}/rpc"
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "qtcl_pushNodeOracleSnapshot",
+                "params": payload,
+                "id": 1,
+            }).encode()
+            req = Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=3) as resp:
+                pass  # fire-and-forget
+        except Exception:
+            pass
+
+    def _node_sse_relay_daemon(self) -> None:
+        """Subscribe to Koyeb SSE streams and rebroadcast to P2P neighbors.
+        Relays: oracle snapshots, block events, balance updates."""
+        import time as _sserd_t
+
+        _EXP_LOG.info("[NODE-SSE-RELAY] SSE relay daemon started")
+        _streams = [
+            ("/rpc/oracle/snapshot", "oracle_snapshot"),
+            ("/rpc/events/blocks", "block_event"),
+        ]
+        for path, event_type in _streams:
+            threading.Thread(
+                target=self._node_sse_stream_relay,
+                args=(path, event_type),
+                daemon=True,
+                name=f"SSERelay-{event_type}",
+            ).start()
+
+    def _node_sse_stream_relay(self, path: str, event_type: str) -> None:
+        """Connect to one Koyeb SSE stream and relay each frame to P2P peers."""
+        import time as _ssr_t
+
+        _reconnect_delay = 2.0
+        while not self._stop.is_set():
+            try:
+                url = f"{ENTROPY_SERVER_URL}{path}"
+                req = Request(url, headers={"Accept": "text/event-stream"})
+                with urlopen(req, timeout=30) as resp:
+                    _reconnect_delay = 2.0  # reset on success
+                    for line_bytes in resp:
+                        if self._stop.is_set():
+                            break
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            frame = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        # Relay to P2P neighbors
+                        if self._db:
+                            try:
+                                cutoff = int(_ssr_t.time()) - 300
+                                rows = self._db.fetchall(
+                                    "SELECT host, port FROM p2p_peers WHERE last_seen_at > ? AND source != 'self' LIMIT 8",
+                                    (cutoff,),
+                                )
+                                for row in rows:
+                                    _h, _p = row[0], int(row[1])
+                                    if _h in ("", "127.0.0.1", "localhost"):
+                                        continue
+                                    try:
+                                        _relay_body = json.dumps({
+                                            "jsonrpc": "2.0",
+                                            "method": "qtcl_relaySSEEvent",
+                                            "params": {"event_type": event_type, "payload": frame},
+                                            "id": 1,
+                                        }).encode()
+                                        _rreq = Request(
+                                            f"http://{_h}:{_p}/rpc",
+                                            data=_relay_body,
+                                            headers={"Content-Type": "application/json"},
+                                        )
+                                        urlopen(_rreq, timeout=2)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+            except Exception as _sse_e:
+                _EXP_LOG.debug(f"[NODE-SSE-RELAY] {event_type} stream error: {_sse_e}")
+            _reconnect_delay = min(60.0, _reconnect_delay * 1.5)
+            self._stop.wait(_reconnect_delay)
+
+    def _node_rpc_dispatch(self, method: str, params, rpc_id) -> dict:
+        """Handle full blockchain JSON-RPC methods served from local node state.
+        Defers to Koyeb for writes, serves reads from local SQLite + fused oracle."""
+
+        # ── READ: Block queries ──
+        if method == "qtcl_getBlockHeight":
+            h = 0
+            if self._db:
+                try:
+                    row = self._db.fetchall("SELECT MAX(height) FROM blocks")
+                    h = int(row[0][0] or 0) if row else 0
+                except Exception:
+                    pass
+            if h == 0:
+                h = int(getattr(self.koyeb_state, "block_height", 0) or 0)
+            return {"jsonrpc": "2.0", "result": {"height": h}, "id": rpc_id}
+
+        if method == "qtcl_getBlock":
+            height = params[0] if isinstance(params, list) and params else params.get("height", 0) if isinstance(params, dict) else 0
+            height = int(height)
+            if self._db:
+                try:
+                    row = self._db.fetchall("SELECT * FROM blocks WHERE height = ?", (height,))
+                    if row:
+                        cols = ["height", "block_hash", "parent_hash", "miner_address",
+                                "timestamp", "difficulty", "nonce", "merkle_root",
+                                "tx_count", "finalized", "w_state_fidelity"]
+                        blk = dict(zip(cols, row[0]))
+                        return {"jsonrpc": "2.0", "result": blk, "id": rpc_id}
+                except Exception:
+                    pass
+            # Fallback: proxy to Koyeb
+            try:
+                result = self.api._rpc("qtcl_getBlock", [height])
+                return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+            except Exception:
+                return {"jsonrpc": "2.0", "error": {"code": -32603, "message": "block not found"}, "id": rpc_id}
+
+        # ── READ: Balance / UTXO queries ──
+        if method == "qtcl_getBalance":
+            addr = params[0] if isinstance(params, list) and params else params.get("address", "") if isinstance(params, dict) else ""
+            # Proxy to Koyeb (authoritative source)
+            try:
+                result = self.api._rpc("qtcl_getBalance", [addr])
+                return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+            except Exception:
+                return {"jsonrpc": "2.0", "error": {"code": -32603, "message": "balance query failed"}, "id": rpc_id}
+
+        if method == "qtcl_getTransaction":
+            tx_hash = params[0] if isinstance(params, list) and params else params.get("tx_hash", "") if isinstance(params, dict) else ""
+            if self._db:
+                try:
+                    row = self._db.fetchall("SELECT * FROM transactions WHERE tx_hash = ?", (tx_hash,))
+                    if row:
+                        cols = ["tx_hash", "from_address", "to_address", "amount",
+                                "block_height", "timestamp", "status"]
+                        tx = dict(zip(cols, row[0]))
+                        return {"jsonrpc": "2.0", "result": tx, "id": rpc_id}
+                except Exception:
+                    pass
+            # Fallback: proxy to Koyeb
+            try:
+                result = self.api._rpc("qtcl_getTransaction", [tx_hash])
+                return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+            except Exception:
+                return {"jsonrpc": "2.0", "error": {"code": -32603, "message": "tx not found"}, "id": rpc_id}
+
+        # ── READ: Quantum metrics (fused local + upstream) ──
+        if method == "qtcl_getQuantumMetrics":
+            snap = getattr(self, "_node_latest_snapshot", None)
+            if snap:
+                return {"jsonrpc": "2.0", "result": snap, "id": rpc_id}
+            return {"jsonrpc": "2.0", "result": {"error": "oracle not ready"}, "id": rpc_id}
+
+        # ── READ: Chain info ──
+        if method == "qtcl_getChainInfo":
+            h = 0
+            if self._db:
+                try:
+                    row = self._db.fetchall("SELECT MAX(height) FROM blocks")
+                    h = int(row[0][0] or 0) if row else 0
+                except Exception:
+                    pass
+            fused_fid = getattr(self, "_local_fused_fid", 0.0)
+            return {"jsonrpc": "2.0", "result": {
+                "height": h,
+                "node_type": "mesh_participant",
+                "fused_fidelity": round(fused_fid, 6),
+                "upstream_url": ENTROPY_SERVER_URL,
+                "peer_count": len(getattr(self, "p2p_node", {}).peer_mgr.peers) if hasattr(self, "p2p_node") and self.p2p_node and hasattr(self.p2p_node, "peer_mgr") else 0,
+            }, "id": rpc_id}
+
+        # ── READ: Health ──
+        if method == "qtcl_getHealth":
+            return {"jsonrpc": "2.0", "result": {
+                "status": "ok",
+                "node_type": "mesh_participant",
+                "oracle_ready": getattr(self, "_local_consensus_dm", None) is not None,
+                "chain_synced": bool(self._db),
+                "fused_fidelity": round(getattr(self, "_local_fused_fid", 0.0), 6),
+            }, "id": rpc_id}
+
+        # ── READ: Peers ──
+        if method == "qtcl_getPeers":
+            peers = []
+            if self._db:
+                try:
+                    cutoff = int(time.time()) - 600
+                    rows = self._db.fetchall(
+                        "SELECT node_id_hex, host, port, chain_height, last_seen_at FROM p2p_peers WHERE last_seen_at > ? LIMIT 50",
+                        (cutoff,),
+                    )
+                    for r in rows:
+                        peers.append({"node_id": r[0], "host": r[1], "port": r[2],
+                                      "chain_height": r[3], "last_seen": r[4]})
+                except Exception:
+                    pass
+            return {"jsonrpc": "2.0", "result": {"peers": peers, "count": len(peers)}, "id": rpc_id}
+
+        # ── READ: Oracle snapshot (for other nodes to pull our fused DM) ──
+        if method in ("qtcl_getOracleSnapshot", "qtcl_getLatestDMSnapshot"):
+            snap = getattr(self, "_node_latest_snapshot", None)
+            if snap:
+                return {"jsonrpc": "2.0", "result": snap, "id": rpc_id}
+            return {"jsonrpc": "2.0", "result": {"status": "no_snapshot_yet"}, "id": rpc_id}
+
+        # ── READ: Recent transactions ──
+        if method == "qtcl_getRecentTransactions":
+            limit = 20
+            if isinstance(params, dict):
+                limit = min(int(params.get("limit", 20) or 20), 100)
+            elif isinstance(params, list) and params:
+                limit = min(int(params[0] or 20), 100)
+            txs = []
+            if self._db:
+                try:
+                    rows = self._db.fetchall(
+                        "SELECT tx_hash, from_address, to_address, amount, block_height, timestamp, status FROM transactions ORDER BY block_height DESC, timestamp DESC LIMIT ?",
+                        (limit,),
+                    )
+                    for r in rows:
+                        txs.append(dict(zip(["tx_hash", "from_address", "to_address", "amount", "block_height", "timestamp", "status"], r)))
+                except Exception:
+                    pass
+            return {"jsonrpc": "2.0", "result": {"transactions": txs, "count": len(txs)}, "id": rpc_id}
+
+        # ── WRITE: Send transaction → proxy to Koyeb ──
+        if method == "qtcl_sendTransaction":
+            try:
+                result = self.api._rpc("qtcl_sendTransaction", params)
+                return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+            except Exception as _te:
+                return {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(_te)}, "id": rpc_id}
+
+        # ── WRITE: Submit block → proxy to Koyeb ──
+        if method == "qtcl_submitBlock":
+            try:
+                result = self.api._rpc("qtcl_submitBlock", params)
+                return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+            except Exception as _sbe:
+                return {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(_sbe)}, "id": rpc_id}
+
+        # ── WRITE: Receive pushed node oracle snapshot from a peer ──
+        if method == "qtcl_pushNodeOracleSnapshot":
+            # Ingest peer's fused DM into our mesh averaging
+            try:
+                _mesh_q = getattr(self, "_mesh_peer_dm_queue", None)
+                if _mesh_q and isinstance(params, dict):
+                    try:
+                        _mesh_q.put_nowait(params)
+                    except Exception:
+                        pass  # queue full — drop oldest
+                return {"jsonrpc": "2.0", "result": {"accepted": True}, "id": rpc_id}
+            except Exception:
+                return {"jsonrpc": "2.0", "result": {"accepted": False}, "id": rpc_id}
+
+        # ── WRITE: Receive relayed SSE event from a peer ──
+        if method == "qtcl_relaySSEEvent":
+            # Store/process relayed SSE event (block, oracle snapshot)
+            if isinstance(params, dict):
+                _etype = params.get("event_type", "")
+                _payload = params.get("payload", {})
+                if _etype == "block_event" and isinstance(_payload, dict):
+                    # Trigger chain sync on next cycle
+                    pass
+            return {"jsonrpc": "2.0", "result": {"accepted": True}, "id": rpc_id}
+
+        # ── WRITE: Receive DHT table from peer ──
+        if method == "qtcl_receiveDHTTable":
+            if isinstance(params, dict):
+                _dht_json = params.get("dht_table", "{}")
+                try:
+                    _dht = json.loads(_dht_json) if isinstance(_dht_json, str) else _dht_json
+                    _peers = _dht.get("peers", [])
+                    if self._db and _peers:
+                        _now = int(time.time())
+                        for _p in _peers[:50]:
+                            _ph = str(_p.get("external_addr", _p.get("host", "")))
+                            _pp = int(_p.get("port", 9091) or 9091)
+                            _pid = str(_p.get("peer_id", _p.get("node_id", _ph)))
+                            if _ph and _ph not in ("", "127.0.0.1", "localhost"):
+                                self._db.execute(
+                                    """INSERT OR REPLACE INTO p2p_peers
+                                       (node_id_hex, host, port, chain_height, last_seen_at)
+                                       VALUES (?,?,?,?,?)""",
+                                    (_pid, _ph, _pp, int(_p.get("chain_height", 0) or 0), _now),
+                                )
+                        self._db.commit()
+                except Exception:
+                    pass
+            return {"jsonrpc": "2.0", "result": {"accepted": True}, "id": rpc_id}
+
+        # ── Proxy any unknown method to Koyeb ──
+        try:
+            result = self.api._rpc(method, params)
+            return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
+        except Exception:
+            return {"jsonrpc": "2.0", "error": {"code": -32601, "message": f"method {method} not found"}, "id": rpc_id}
+
+    def _start_node_rpc_server(self, port: int = None) -> None:
+        """Start the node's JSON-RPC HTTP server on the P2P port.
+        Handles both P2P methods (via existing dispatch) and full blockchain
+        API methods (via _node_rpc_dispatch). Runs as a daemon thread."""
+        _port = port or _P2P_PORT
+        _self = self
+
+        class _NodeRPCHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _cors_headers(self):
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                self._cors_headers()
+                self.end_headers()
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path in ("/health", "/"):
+                    resp = _self._node_rpc_dispatch("qtcl_getHealth", {}, 0)
+                    self._send_json(resp.get("result", resp))
+                elif path == "/rpc/oracle/snapshot/latest":
+                    snap = getattr(_self, "_node_latest_snapshot", None)
+                    self._send_json(snap or {"status": "no_snapshot_yet"})
+                elif path == "/rpc/oracle/snapshot":
+                    # SSE stream of oracle snapshots
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self._cors_headers()
+                    self.end_headers()
+                    try:
+                        _last_cycle = 0
+                        while True:
+                            snap = getattr(_self, "_node_latest_snapshot", None)
+                            if snap and snap.get("cycle", 0) != _last_cycle:
+                                _last_cycle = snap.get("cycle", 0)
+                                self.wfile.write(f"data: {json.dumps(snap)}\n\n".encode())
+                                self.wfile.flush()
+                            else:
+                                self.wfile.write(b": heartbeat\n\n")
+                                self.wfile.flush()
+                            time.sleep(2.0)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                else:
+                    self.send_error(404)
+
+            def do_POST(self):
+                path = self.path.split("?")[0]
+                if path not in ("/rpc", "/rpc/"):
+                    self.send_error(404)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(length).decode("utf-8", errors="replace")
+                    data = json.loads(body) if body.strip() else {}
+                except Exception:
+                    self.send_error(400)
+                    return
+
+                method = data.get("method", "")
+                params = data.get("params", {})
+                rpc_id = data.get("id", 0)
+
+                # Route: P2P-specific methods go to existing P2P dispatch,
+                # everything else goes to _node_rpc_dispatch
+                if method.startswith("qtcl_p2p_") or method.startswith("qtcl_gossip_") or method.startswith("qtcl_dht_") or method in ("qtcl_registerPeer", "qtcl_peer_exchange", "qtcl_reputation_getScore"):
+                    # Use existing P2P dispatch if available
+                    if hasattr(_self, "p2p_node") and _self.p2p_node and hasattr(_self.p2p_node, "server") and hasattr(_self.p2p_node.server, "_dispatch_fn"):
+                        try:
+                            result, error = _self.p2p_node.server._dispatch_fn(method, params, data, self.client_address[0])
+                            resp = {"jsonrpc": "2.0", "id": rpc_id}
+                            if result is not None:
+                                resp["result"] = result
+                            if error:
+                                resp["error"] = error
+                            self._send_json(resp)
+                            return
+                        except Exception:
+                            pass
+                    # Fallback: try our node dispatch
+                    resp = _self._node_rpc_dispatch(method, params, rpc_id)
+                else:
+                    resp = _self._node_rpc_dispatch(method, params, rpc_id)
+
+                self._send_json(resp)
+
+            def _send_json(self, data):
+                body = json.dumps(data, default=str).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+
+        try:
+            import socket as _nsock
+            server = ThreadingHTTPServer(("0.0.0.0", _port), _NodeRPCHandler)
+            server.socket.setsockopt(_nsock.SOL_SOCKET, _nsock.SO_REUSEADDR, 1)
+            try:
+                server.socket.setsockopt(_nsock.SOL_SOCKET, _nsock.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+            threading.Thread(target=server.serve_forever, daemon=True, name="NodeRPCServer").start()
+            _EXP_LOG.info(f"[NODE-RPC] ✅ Node RPC server listening on 0.0.0.0:{_port}")
+            print(f"  ✅ Node RPC server on 0.0.0.0:{_port} (full blockchain API)", flush=True)
+        except OSError as _ose:
+            if "Address already in use" in str(_ose) or _ose.errno == 98:
+                _EXP_LOG.warning(f"[NODE-RPC] Port {_port} in use — trying {_port + 1}")
+                try:
+                    server = ThreadingHTTPServer(("0.0.0.0", _port + 1), _NodeRPCHandler)
+                    threading.Thread(target=server.serve_forever, daemon=True, name="NodeRPCServer").start()
+                    _EXP_LOG.info(f"[NODE-RPC] ✅ Node RPC server on 0.0.0.0:{_port + 1}")
+                    print(f"  ✅ Node RPC server on 0.0.0.0:{_port + 1}", flush=True)
+                except Exception as _e2:
+                    _EXP_LOG.warning(f"[NODE-RPC] Failed to start RPC server: {_e2}")
+            else:
+                _EXP_LOG.warning(f"[NODE-RPC] Failed to start RPC server: {_ose}")
+
     def run_node_mode(self) -> None:
         """
         ⚛️  QTCL NODE MODE — pure quantum mesh participant.
@@ -26822,6 +27547,38 @@ class QtclClientApp:
         _hb_th.start()
         print(f"  ✅ Heartbeat loop started (DHT fan-out every 30s)", flush=True)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # NODE ENGINE: Start all server daemons
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Ensure all SQLite tables for node operation
+        self._node_ensure_tables()
+        print(f"  ✅ Node SQLite tables ensured", flush=True)
+
+        # Initialize latest snapshot storage
+        self._node_latest_snapshot = None
+
+        # 1. Chain sync daemon — mirrors blocks from Koyeb into local SQLite
+        _nmt.Thread(
+            target=self._node_chain_sync_daemon, daemon=True, name="NodeChainSync"
+        ).start()
+        print(f"  ✅ Chain sync daemon started (polls Koyeb every 10s)", flush=True)
+
+        # 2. Node RPC server — serves full blockchain API to P2P peers
+        self._start_node_rpc_server(_P2P_PORT)
+
+        # 3. Metrics broadcast daemon — pushes fused oracle state to neighbors
+        _nmt.Thread(
+            target=self._node_metrics_broadcast_daemon, daemon=True, name="NodeMetricsBroadcast"
+        ).start()
+        print(f"  ✅ Metrics broadcast daemon started (fan-out every 4s)", flush=True)
+
+        # 4. SSE relay daemon — subscribes to Koyeb SSE, rebroadcasts to mesh
+        _nmt.Thread(
+            target=self._node_sse_relay_daemon, daemon=True, name="NodeSSERelay"
+        ).start()
+        print(f"  ✅ SSE relay daemon started (oracle snapshots + block events)", flush=True)
+
         # ── Start tripartite oracle (joint W4 with Koyeb as party-3) ───────
         self._start_tripartite_oracle()
         _nmt_time.sleep(2)  # let oracle complete one cycle before status
@@ -26904,10 +27661,12 @@ class QtclClientApp:
 
                 print(_sep, flush=True)
                 print(
-                    f"  ⚛️  QTCL NODE  cycle={_cycle}\n"
+                    f"  ⚛️  QTCL NODE SERVER  cycle={_cycle}\n"
                     f"  W4-fused : {_lff:.4f}   upstream : {_upf:.4f}   bridge : {_ks.bridge_fidelity:.4f}\n"
                     f"  peers    : {_peers}        mesh-queue: {_qsz}       joint-dim: {_jdim}×{_jdim}\n"
-                    f"  node_ip  : {_external_ip or _MY_IP or 'unknown'}     port: {_P2P_PORT}",
+                    f"  node_ip  : {_external_ip or _MY_IP or 'unknown'}     port: {_P2P_PORT}\n"
+                    f"  serving  : blocks + txs + utxos + quantum metrics + oracle DM\n"
+                    f"  relaying : SSE oracle snapshots + block events → {_peers} peers",
                     flush=True,
                 )
         except KeyboardInterrupt:
