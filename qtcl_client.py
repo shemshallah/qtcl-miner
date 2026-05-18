@@ -11795,62 +11795,45 @@ class KoyebRPCNodule:
         full_url = f"{self.base_url}/rpc?{query}"
 
         for attempt in range(retries):
+            import urllib.request as _ur
+            import socket as _sock
+
             try:
-                if _HAS_REQUESTS:
-                    r = self._get_session().get(full_url, timeout=t)
-                    if r.status_code == 200:
-                        result = r.json()
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            # Return the full error dict so callers can handle rejections
-                            return result
-                    else:
-                        # Attempt to parse error from body even on non-200
-                        try:
-                            result = r.json()
-                            if isinstance(result, dict) and "error" in result:
-                                return result
-                        except:
-                            pass
-
-                    _EXP_LOG.debug(f"[RPC] {method} → HTTP {r.status_code}")
-                    last_error = f"HTTP {r.status_code}"
-                else:
-                    import urllib.request as _ur
-
-                    req = _ur.Request(full_url)
-                    with _ur.urlopen(req, timeout=t) as resp:
-                        result = _json.loads(resp.read().decode("utf-8"))
-                        if "result" in result:
-                            return result.get("result")
-                        elif "error" in result:
-                            # Return the full error dict so callers can handle rejections
-                            return result
+                # Use urllib + socket.setdefaulttimeout for reliable timeouts.
+                # The requests library's timeout parameter is NOT guaranteed over SSL —
+                # it can hang in http.client._read_status() behind a slow load balancer.
+                # socket.setdefaulttimeout() enforces at the OS socket layer — always works.
+                _sock.setdefaulttimeout(t)
+                req = _ur.Request(full_url, headers={"Accept": "application/json"})
+                with _ur.urlopen(req, timeout=t) as resp:
+                    result = _json.loads(resp.read().decode("utf-8"))
+                    if "result" in result:
+                        return result.get("result")
+                    elif "error" in result:
+                        return result
+            except _ur.HTTPError as he:
+                try:
+                    result = _json.loads(he.read().decode("utf-8"))
+                    if isinstance(result, dict) and "error" in result:
+                        return result
+                except:
+                    pass
+                last_error = f"HTTP {he.code}"
+                _EXP_LOG.debug(f"[RPC] {method} → HTTP {he.code}")
+            except _ur.URLError as ue:
+                last_error = str(ue)
+                _EXP_LOG.debug(f"[RPC] {method} URLError: {ue}")
             except Exception as e:
-                # Check if it's an HTTP error from urllib (not defined when using requests)
-                if (
-                    "_ur" in dir()
-                    and hasattr(_ur, "HTTPError")
-                    and isinstance(e, _ur.HTTPError)
-                ):
-                    try:
-                        result = _json.loads(e.read().decode("utf-8"))
-                        if isinstance(result, dict) and "error" in result:
-                            return result
-                    except:
-                        pass
-                    last_error = f"HTTP {e.code}"
-                else:
-                    last_error = str(e)
-                if attempt < retries - 1:
-                    backoff = 2**attempt
-                    _EXP_LOG.debug(
-                        f"[RPC] {method} attempt {attempt + 1}/{retries} failed: {e}. Retrying..."
-                    )
-                    time.sleep(backoff)
-                else:
-                    _EXP_LOG.debug(f"[RPC] {method}: {e} (final)")
+                last_error = str(e)
+                _EXP_LOG.debug(f"[RPC] {method} Exception: {e}")
+            finally:
+                _sock.setdefaulttimeout(None)
+
+            if attempt < retries - 1:
+                time.sleep(2**attempt)
+                continue
+            else:
+                break
 
         self._last_error = last_error
         return None
