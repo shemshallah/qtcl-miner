@@ -27020,28 +27020,26 @@ class QtclClientApp:
             _rpc_errors = []  # Track which calls failed for display
             _rpc_ok_count = 0  # Track successful calls for status
 
-            def _safe_rpc(method, params=None, label=None, retries=2):
-                """Call kapi._rpc with retry, log errors, return result or {}
+            def _safe_rpc(method, params=None, label=None, retries=1):
+                """Single-attempt RPC call with 3s thread-based hard timeout.
 
-                Critical calls (block_height, get_block) get 3 retries.
-                Non-critical calls get 1 retry (default).
+                Uses retries=1 internally (no compounding).  Each call completes
+                in max ~5 seconds (3s timeout + 2s thread-join margin).
+                If the server is unreachable, we show cached data and the user
+                presses Enter to retry.  Stale-but-fast beats fresh-but-hung.
                 """
                 nonlocal _rpc_ok_count
-                _last_err = None
-                for _attempt in range(retries):
-                    _r = kapi._rpc(method, params)
-                    if _r is not None:
-                        if not (isinstance(_r, dict) and "error" in _r):
-                            _rpc_ok_count += 1
-                            return _r
-                        _last_err = str(_r.get("error", ""))[:80]
-                    else:
-                        _last_err = kapi._last_error or "timeout"
-                    if _attempt < retries - 1:
-                        _ta.sleep(0.5)
+                _r = kapi._rpc(method, params, retries=1, timeout=3)
+                if _r is not None:
+                    if not (isinstance(_r, dict) and "error" in _r):
+                        _rpc_ok_count += 1
+                        return _r
+                    _last_err = str(_r.get("error", ""))[:80]
+                else:
+                    _last_err = kapi._last_error or "timeout"
                 _rpc_errors.append((label or method, _last_err or "failed"))
                 logger.debug(
-                    f"[ORACLE-MODE] RPC {method} failed after {retries} attempts: {_last_err}"
+                    f"[ORACLE-MODE] RPC {method} failed: {_last_err}"
                 )
                 return {}
 
