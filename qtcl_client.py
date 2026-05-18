@@ -28017,43 +28017,84 @@ class QtclClientApp:
             # Health / Diagnostics (non-critical, 1 retry)
             health = _safe_rpc("qtcl_getHealth", [], "health")
 
-            # Oracle snapshot (full DM + pq0 values — DEFINITIVE source for pq0/mermin/dm)
-            # FIX: Multi-method fallback chain so a missing/broken DM endpoint doesn't
-            # trigger CRITICAL RPC FAILURE and zero-out all quantum metrics.
-            # Priority: qtcl_getLatestDMSnapshot → qtcl_getOracleSnapshot → synthesize from metrics
+            # Oracle snapshot — from SSE stream cache (preferred) or /latest one-shot
+            # The 16³ density tensor and W-state amplitude data flow through SSE.
             snap = {}
-            _snap_raw = kapi._rpc("qtcl_getLatestDMSnapshot", [], timeout=8, retries=2)
-            if _snap_raw and isinstance(_snap_raw, dict) and "error" not in _snap_raw:
-                snap = _snap_raw
+            _sse_latest = globals().get("_LATEST_DENSITY_SNAPSHOT")
+            if isinstance(_sse_latest, dict) and _sse_latest.get("density_tensor_hex"):
+                snap = dict(_sse_latest)
                 _rpc_ok_count += 1
             else:
-                # Fallback 1: qtcl_getOracleSnapshot
-                _snap_raw2 = kapi._rpc("qtcl_getOracleSnapshot", [], timeout=8, retries=2)
-                if _snap_raw2 and isinstance(_snap_raw2, dict) and "error" not in _snap_raw2:
-                    snap = _snap_raw2
-                    _rpc_ok_count += 1
+                # Fallback: one-shot HTTP GET to SSE /latest endpoint
+                try:
+                    import urllib.request as _sse_ur
+                    _sse_url = f"{kapi.base_url}/rpc/oracle/snapshot/latest"
+                    _sse_req = _sse_ur.Request(_sse_url, method="GET")
+                    with _sse_ur.urlopen(_sse_req, timeout=6) as _sse_resp:
+                        if _sse_resp.status == 200:
+                            _sse_data = json.loads(_sse_resp.read().decode())
+                            if isinstance(_sse_data, dict) and "status" not in _sse_data:
+                                snap = _sse_data
+                                _rpc_ok_count += 1
+                except Exception:
+                    pass
+
+            # Always synthesize snap from qtcl_getQuantumMetrics as fallback
+            # This provides w_state fidelity/coherence/purity/entropy and w_state_hex
+            if isinstance(metrics, dict):
+                _mws_metrics = metrics.get("w_state") or {}
+                snap.setdefault("fidelity", _mws_metrics.get("fidelity"))
+                snap.setdefault("coherence", _mws_metrics.get("coherence"))
+                snap.setdefault("purity", _mws_metrics.get("purity"))
+                snap.setdefault("entropy", _mws_metrics.get("entropy"))
+                snap.setdefault("w_state_hex", metrics.get("w_state_hex", ""))
+                snap.setdefault("block_height", metrics.get("block_height") or tip.get("block_height"))
+                snap.setdefault("oracle_id", "koyeb-primary")
+
+                # Build 8x8 density_matrix_hex from w_state_hex (8 complex W-state amplitudes)
+                # w_state_hex is 256 hex chars = 8 complex128 diagonal amplitudes at indices [1,2,4,8,16,32,64,128]
+                # Reconstruct 8x8 DM as outer product: ρ[i,j] = amp[i] * conj(amp[j])
+                _ws_hex = snap.get("w_state_hex") or metrics.get("w_state_hex") or ""
+                if len(_ws_hex) == 256:
+                    try:
+                        import struct as _dm_s
+                        _amps = []
+                        for _wi in range(8):
+                            _chunk = bytes.fromhex(_ws_hex[_wi * 32 : (_wi + 1) * 32])
+                            _re, _im = _dm_s.unpack(">dd", _chunk)
+                            _amps.append(complex(_re, _im))
+                        # Build 8x8 DM as outer product
+                        _dm_8x8 = [
+                            [0j] * 8 for _ in range(8)
+                        ]
+                        for _ri in range(8):
+                            for _ci in range(8):
+                                _dm_8x8[_ri][_ci] = _amps[_ri] * _amps[_ci].conjugate()
+                        # Normalize trace = 1
+                        _tr = sum(_dm_8x8[i][i].real for i in range(8))
+                        if _tr > 1e-12:
+                            for _ri in range(8):
+                                for _ci in range(8):
+                                    _dm_8x8[_ri][_ci] /= _tr
+                        # Serialize as complex128 IEEE754 LE (16 bytes per element)
+                        _dm_bytes = b"".join(
+                            _dm_s.pack("<dd", _dm_8x8[_ri][_ci].real, _dm_8x8[_ri][_ci].imag)
+                            for _ri in range(8)
+                            for _ci in range(8)
+                        )
+                        snap["density_matrix_hex"] = _dm_bytes.hex()
+                    except Exception:
+                        pass
+
+            if not snap.get("density_matrix_hex") and snap.get("_synthesized") is None:
+                if snap.get("w_state_hex"):
+                    snap["_synthesized"] = True
                 else:
-                    # Fallback 2: synthesize snap from metrics so downstream merge still populates fields
-                    # Mark as non-critical — display will show "synthesized from metrics" note
-                    _rpc_errors.append(("dm_snapshot", "endpoint unavailable — synthesized from quantum_metrics"))
-                    if isinstance(metrics, dict):
-                        _mws = metrics.get("w_state") or {}
-                        _mpq = metrics.get("pq0") or {}
-                        snap = {
-                            "fidelity": _mws.get("fidelity") or _mws.get("w_state_fidelity"),
-                            "coherence": _mws.get("coherence") or _mws.get("coherence_l1"),
-                            "purity": _mws.get("purity"),
-                            "entropy": _mws.get("entropy") or _mws.get("von_neumann_entropy"),
-                            "density_matrix_hex": _mws.get("density_matrix_hex") or "",
-                            "pq_curr": _mpq.get("pq_curr") or _mws.get("pq_curr"),
-                            "pq_last": _mpq.get("pq_last") or _mws.get("pq_last"),
-                            "oracle_id": _mws.get("oracle_id") or "koyeb-primary",
-                            "block_height": metrics.get("block_height") or tip.get("block_height"),
-                            "_synthesized": True,
-                        }
+                    snap["_synthesized"] = False
 
             # Server peer registry (2 retries)
-            server_peers = _safe_rpc("qtcl_getPeers", [{"limit": 50}], "get_peers")
+            # qtcl_getPeers expects params as [limit_int] — matches server.py _rpc_getPeers
+            server_peers = _safe_rpc("qtcl_getPeers", [50], "get_peers")
 
             # NAT-group peers (same WAN IP, different MAC — for multi-device awareness)
             # First resolve our external IP from the server's perspective
@@ -28074,17 +28115,15 @@ class QtclClientApp:
                     )
 
             # Mempool (1 retry — non-critical)
+            # qtcl_getMempool expects params as [max_count] list
             mempool = _safe_rpc("qtcl_getMempool", [100], "get_mempool")
 
-            # Local P2P node (only query if running — use only for live peer state)
-            api_node = KoyebRPCNodule("http://127.0.0.1:9091")
-            local_p2p_stats = {}
-            try:
-                _lp = api_node._rpc("qtcl_p2p_getNetworkStats", [])
-                if _lp and "error" not in str(_lp):
-                    local_p2p_stats = _lp
-            except Exception:
-                pass
+            # Local P2P stats — read from quantum metrics' client_oracle_count if available
+            # No separate p2p_getNetworkStats endpoint exists
+            local_p2p_stats = {
+                "client_oracle_count": metrics.get("client_oracle_count", 0),
+                "client_fused_fidelity": metrics.get("client_fused_fidelity", 0.0),
+            } if isinstance(metrics, dict) else {}
 
             # Get block height for pq_curr/pq_last computation
             _bh = tip.get("block_height") or tip.get("height") or 0
@@ -32013,31 +32052,31 @@ def main() -> None:  # noqa: F811
         _sse_consensus_handlers.append(_default_consensus_handler)
         _sse_balance_handlers.append(_default_balance_handler)
 
-        # Start SSE streams (only in non-audit modes to avoid cluttering logs)
-        if not _is_oracle_audit:
-            try:
-                _density_thread = connect_density_stream(url, _default_density_handler)
-                globals()["_SSE_DENSITY_THREAD"] = _density_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
+        # Start SSE streams — required for audit panel density data
+        # Density stream provides the 16³ tensor needed for the audit DM display
+        try:
+            _density_thread = connect_density_stream(url, _default_density_handler)
+            globals()["_SSE_DENSITY_THREAD"] = _density_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Density stream init failed: {_sse_err}")
 
-            try:
-                _block_thread = connect_block_stream(url, _default_block_handler)
-                globals()["_SSE_BLOCK_THREAD"] = _block_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
+        try:
+            _block_thread = connect_block_stream(url, _default_block_handler)
+            globals()["_SSE_BLOCK_THREAD"] = _block_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Block stream init failed: {_sse_err}")
 
-            try:
-                _consensus_thread = connect_consensus_stream(url, _default_consensus_handler)
-                globals()["_SSE_CONSENSUS_THREAD"] = _consensus_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Consensus stream init failed: {_sse_err}")
+        try:
+            _consensus_thread = connect_consensus_stream(url, _default_consensus_handler)
+            globals()["_SSE_CONSENSUS_THREAD"] = _consensus_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Consensus stream init failed: {_sse_err}")
 
-            try:
-                _balance_thread = connect_balance_stream(url, _default_balance_handler)
-                globals()["_SSE_BALANCE_THREAD"] = _balance_thread
-            except Exception as _sse_err:
-                logger.debug(f"[SSE] Balance stream init failed: {_sse_err}")
+        try:
+            _balance_thread = connect_balance_stream(url, _default_balance_handler)
+            globals()["_SSE_BALANCE_THREAD"] = _balance_thread
+        except Exception as _sse_err:
+            logger.debug(f"[SSE] Balance stream init failed: {_sse_err}")
 
         # Make handler registration available globally
         globals()["_SSE_DENSITY_HANDLERS"] = _sse_density_handlers
