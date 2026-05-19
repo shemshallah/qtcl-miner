@@ -24736,8 +24736,9 @@ class QtclClientApp:
                         except (ValueError, TypeError):
                             pass
 
-                    # Miner total = base reward + 50% of fees
-                    _miner_reward_total = _miner_reward + (total_donations / 2.0)
+                    # Miner total = base reward + genesis_extra (h=1) + 50% of fees
+                    _genesis_extra = _miner_reward if target_height == 1 else 0.0
+                    _miner_reward_total = _miner_reward + _genesis_extra + (total_donations / 2.0)
 
                     # ── Build miner coinbase TX (deterministic ID) ─────────────
                     # tx_type MUST be "miner_reward" — server validator checks this
@@ -30965,8 +30966,9 @@ class NodeRPCMeshServer:
                             f"[SUBMIT-BLOCK] local tx insert {tx_id[:16]}: {_txe}"
                         )
 
-                # Credit miner 7.2 QTCL NOW (embedded in this block) — EXACTLY ONCE
-                miner_reward_base = 720
+                # Credit miner reward NOW (embedded in this block) — EXACTLY ONCE
+                # h=1 includes genesis_extra (720 base units for h=0 deferred reward)
+                miner_reward_base = 1440 if height == 1 else 720
                 # Check if address already exists
                 existing = conn.execute(
                     "SELECT balance FROM wallet_addresses WHERE address=?",
