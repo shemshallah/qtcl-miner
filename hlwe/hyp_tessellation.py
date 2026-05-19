@@ -246,7 +246,9 @@ class HypTessellation:
             conn = sqlite3.connect(str(path))
             cursor = conn.cursor()
             
-            cursor.execute(f"SELECT * FROM hyperbolic_triangles WHERE depth = {TILING_DEPTH}")
+            cursor.execute("""
+                SELECT * FROM hyperbolic_triangles WHERE depth = ?
+            """, (TILING_DEPTH,))
             rows = cursor.fetchall()
             
             count = 0
