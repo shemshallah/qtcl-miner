@@ -279,16 +279,17 @@ class SSEStreamClient:
         _EXP_LOG.info(f"[SSE-CLIENT] 📡 Subscribed to {self.stream_endpoint}")
 
     def _subscribe_loop(self):
-        """Continuously subscribe to SSE stream and process snapshots."""
+        """Continuously subscribe to SSE stream and process snapshots.
+        Never gives up — resets error counter after a long backoff so the client
+        reconnects indefinitely even after extended server downtime.
+        """
         consecutive_errors = 0
         while self.running:
             try:
                 import urllib.request as _ur
-
                 req = _ur.Request(self.stream_endpoint)
                 req.add_header("Accept", "text/event-stream")
-                consecutive_errors = 0
-
+                consecutive_errors = 0  # reset on successful connect
                 with _ur.urlopen(req, timeout=30) as resp:
                     for line in resp:
                         if not self.running:
@@ -304,11 +305,14 @@ class SSEStreamClient:
                 consecutive_errors += 1
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-CLIENT] Connection failed: {e}")
+                # After 10 errors, log degraded but DO NOT break — reset counter and
+                # keep retrying with max backoff (30s). Server may come back online.
                 if consecutive_errors > 10:
-                    _EXP_LOG.error(
-                        f"[SSE-CLIENT] ❌ Giving up after 10 consecutive errors"
+                    _EXP_LOG.warning(
+                        f"[SSE-CLIENT] ⚠️ {consecutive_errors} consecutive errors — "
+                        f"retrying every 30s (server={self.stream_endpoint})"
                     )
-                    break
+                    consecutive_errors = 5  # reset to avoid int overflow, keep backoff at 30s
                 time.sleep(min(2**consecutive_errors, 30))
 
     def _process_snapshot(self, payload: dict) -> None:
@@ -11949,6 +11953,8 @@ class KoyebRPCNodule:
         import urllib.request as _ur
 
         t = timeout or self.timeout
+        # params_json must be defined before the POST branch so the GET fallback path always has it
+        params_json = _json.dumps(params or [])
 
         if method in ("qtcl_submitBlock", "qtcl_signAndSubmitBlock"):
             # UNIFIED BLOCK SUBMISSION: try qtcl_signAndSubmitBlock first (server v5+),
