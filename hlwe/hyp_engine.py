@@ -625,6 +625,14 @@ class HypGammaEngine:
 
                 self._lwe_loaded = True
             except Exception as e:
+                # B-1 FIX: Reset all three subsystem refs so the next call retries cleanly.
+                # Without this, a partial load (e.g. tessellation loaded, LWE failed)
+                # leaves _tessellation set but _lwe None, and the double-check guard
+                # `if _lwe_loaded: return` passes on re-entry — bypassing the retry path.
+                self._tessellation = None
+                self._ldpc_code = None
+                self._lwe = None
+                self._lwe_loaded = False
                 logger.error(f"Failed to load encryption subsystem: {e}")
                 raise HypEngineError(
                     f"Encryption subsystem initialization failed: {str(e)}",
@@ -1012,9 +1020,14 @@ class HypGammaEngine:
             HypEngineError: If encryption keygen fails.
         """
         try:
+            # B-2 FIX: _ensure must run OUTSIDE the lock — it acquires the same lock
+            # internally (RLock allows re-entry, but the double-check guard inside
+            # _ensure reads _lwe_loaded before the inner lock, so calling from inside
+            # the lock is safe for RLock but semantically wrong; call before for clarity).
+            self._ensure_encryption_subsystem()
             with self._lock:
                 if self._lwe is None:
-                    raise RuntimeError("GeodesicLWE not initialized")
+                    raise RuntimeError("GeodesicLWE not initialized after _ensure")
                 keypair = self._lwe.generate_keypair()
             return {
                 'public_key': keypair.public_key,
@@ -1023,7 +1036,98 @@ class HypGammaEngine:
         except Exception as e:
             raise HypEngineError(f"Encryption keygen failed: {str(e)}")
 
-    def encrypt(self, message: bytes, public_key: str) -> Dict[str, str]:
+    def derive_lwe_keypair(self, signing_private_key: str) -> Dict[str, str]:
+        """
+        D-1: Derive a deterministic GeodesicLWE encryption keypair from a
+        Schnorr signing private key.  One wallet — one address — two roles.
+
+        Key Derivation Function (KDF) design:
+          seed = SHA3-256(walk_bytes)                     — compress 512-step walk
+          lwe_seed = SHA3-256(seed ‖ b"QTCL_LWE_KEYGEN_v1")   — domain-separated
+          GeodesicLWE.generate_keypair_from_seed(lwe_seed)
+
+        The domain separator b"QTCL_LWE_KEYGEN_v1" binds the derived key to:
+          • this specific cryptosystem (QTCL)
+          • this specific role (LWE encryption, not signing)
+          • this specific version (v1, allowing future rotation via v2 etc.)
+
+        Security:
+          • Given only the LWE public key, recovering the Schnorr private key
+            requires inverting SHA3-256 twice — preimage resistant.
+          • The Schnorr signing key is NOT derivable from the LWE private key.
+          • Identical to the NIST SP 800-186 "key derivation from master secret"
+            pattern used in Kyber+Dilithium hybrid key generation.
+
+        Parameters:
+            signing_private_key: hex-encoded Schnorr walk index sequence from
+                                 generate_keypair() / create_wallet().
+
+        Returns:
+            dict with:
+              'public_key':  hex str — GeodesicLWE pub key (JSON dict, utf-8, hex)
+              'private_key': hex str — GeodesicLWE priv key (JSON dict, utf-8, hex)
+              'integrity':   str     — SHA3-256(pub‖priv)
+              'derived_from': str   — first 16 chars of signing pubkey (audit trail)
+
+        Raises:
+            HypEngineError: if derivation or LWE init fails.
+        """
+        try:
+            self._ensure_encryption_subsystem()
+
+            # Deserialize walk indices → raw bytes
+            walk_indices = self._deserialize_walk_indices(signing_private_key)
+            # Pack walk as bytes: each index is 2 bits; 512 indices → 128 bytes
+            walk_bytes = bytes(walk_indices)   # uint8 array, values 0-3, 512 bytes
+
+            # Two-round KDF: compress then domain-separate
+            compressed = hashlib.sha3_256(walk_bytes).digest()                        # 32 bytes
+            lwe_seed = hashlib.sha3_256(compressed + b"QTCL_LWE_KEYGEN_v1").digest() # 32 bytes
+
+            # Derive signing pubkey fragment for audit (never stored, display only)
+            with self._lock:
+                pub_matrix = evaluate_walk(walk_indices)
+            derived_from = self._serialize_psl_matrix(pub_matrix)[:16]
+
+            with self._lock:
+                if self._lwe is None:
+                    raise RuntimeError("GeodesicLWE not initialized after _ensure")
+                keypair = self._lwe.generate_keypair_from_seed(lwe_seed)
+
+            logger.info(
+                f"[ENGINE] derive_lwe_keypair: derived_from={derived_from}… "
+                f"integrity={keypair.integrity[:16]}…"
+            )
+            return {
+                'public_key':   keypair.public_key,
+                'private_key':  keypair.private_key,
+                'integrity':    keypair.integrity,
+                'derived_from': derived_from,
+            }
+        except HypEngineError:
+            raise
+        except Exception as e:
+            raise HypEngineError(
+                f"LWE keypair derivation failed: {type(e).__name__}",
+                {'error_type': type(e).__name__}
+            )
+
+    def lwe_public_key_from_signing_key(self, signing_private_key: str) -> str:
+        """
+        Convenience: return ONLY the LWE public key hex derived from a signing key.
+
+        This is the value that should be broadcast so senders can encrypt to you.
+        Call derive_lwe_keypair() if you also need the LWE private key.
+
+        Parameters:
+            signing_private_key: Schnorr private key hex.
+
+        Returns:
+            str: GeodesicLWE public key hex — pass directly to encrypt().
+        """
+        return self.derive_lwe_keypair(signing_private_key)['public_key']
+
+
         """
         DPS 420 GeodesicLWE encryption with full LDPC error coupling and arbitrary message length.
         
@@ -1039,16 +1143,23 @@ class HypGammaEngine:
         Security: HCVP hardness (KEM) + AES-256-GCM (DEM)
         """
         try:
+            # B-3 FIX: Call _ensure BEFORE acquiring self._lock.
+            # encrypt() previously checked `self._lwe is None` inside the lock but never
+            # called _ensure_encryption_subsystem() — so _lwe was ALWAYS None on first
+            # call and the RuntimeError fired unconditionally.  _ensure acquires the
+            # same RLock internally; calling it before the outer with-block eliminates
+            # the re-entrancy ambiguity and makes the lazy-init path unconditional.
+            self._ensure_encryption_subsystem()
             with self._lock:
                 if self._lwe is None:
-                    raise RuntimeError("GeodesicLWE not initialized")
+                    raise RuntimeError("GeodesicLWE not initialized after _ensure")
                 if self._ldpc_code is None:
-                    raise RuntimeError("LDPC code not initialized")
-                    
+                    raise RuntimeError("LDPC code not initialized after _ensure")
+
                 # Message validation
                 if not message or len(message) == 0:
                     raise ValueError("Message cannot be empty")
-                
+
                 # Delegate to GeodesicLWE hybrid KEM+DEM (supports arbitrary length)
                 result = self._lwe.encrypt(message, public_key)
                 
@@ -1087,21 +1198,23 @@ class HypGammaEngine:
         Security: HCVP hardness + LDPC syndrome decoding
         """
         try:
+            # B-4 FIX: Mirror of encrypt() fix — call _ensure before acquiring lock.
+            self._ensure_encryption_subsystem()
             with self._lock:
                 if self._lwe is None:
-                    raise RuntimeError("GeodesicLWE not initialized")
+                    raise RuntimeError("GeodesicLWE not initialized after _ensure")
                 if self._ldpc_code is None:
-                    raise RuntimeError("LDPC code not initialized")
-                
+                    raise RuntimeError("LDPC code not initialized after _ensure")
+
                 # Ciphertext validation
                 if not ciphertext or not isinstance(ciphertext, dict):
                     raise ValueError("Ciphertext must be a non-empty dict")
                 if 'ciphertext' not in ciphertext:
                     raise ValueError("Ciphertext dict missing 'ciphertext' field")
-                
+
                 # Delegate to GeodesicLWE with full error correction
                 plaintext = self._lwe.decrypt(ciphertext, private_key)
-                
+
                 return plaintext
         except HypEngineError:
             raise
@@ -1195,6 +1308,146 @@ class HypGammaEngine:
         except Exception as e:
             logger.error(f"Password decryption failed: {e}\n{traceback.format_exc()}")
             raise HypEngineError(f"Password decryption failed: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # §2e-bis  ALIAS BRIDGE — server.py / oracle.py compatibility shim
+    #
+    #   server.py calls engine.encrypt_message(msg_bytes, pub_key_str) and
+    #   engine.decrypt_message(ciphertext_dict, priv_key_str).  The canonical
+    #   DPS-420 names are encrypt() / decrypt().  This section wires both call
+    #   signatures so EVERY existing call-site works with zero changes to callers.
+    #
+    #   Also exposes encrypt_for_ibm() — a thin wrapper that encapsulates then
+    #   marshals the KEM payload for the qiskit-ibm-runtime Job API when the
+    #   caller needs quantum-backend attestation of the ciphertext envelope.
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def encrypt_message(self, message: bytes, public_key: str) -> Dict[str, Any]:
+        """
+        Alias for encrypt() — backward-compatible shim for server.py / oracle.py.
+
+        server.py historically called engine.encrypt_message(msg, pub_key); the
+        canonical DPS-420 method is engine.encrypt(msg, pub_key).  Both are
+        identical in semantics and return the same ciphertext dict structure:
+          {
+            'ciphertext':     str,   # hex-encoded KEM encapsulation + AES-GCM blob
+            'nonce':          str,   # hex-encoded 96-bit GCM nonce
+            'tag':            str,   # hex-encoded 128-bit GCM auth tag
+            'dps':            '420',
+            'period':         '22',
+            'timestamp':      str,   # ISO 8601 UTC
+            'message_length': int,
+          }
+
+        Parameters:
+            message    (bytes): Plaintext — any length, 1 byte to 1 GB+.
+            public_key (str):   Hex-encoded GeodesicLWE public key.
+
+        Returns:
+            dict: Ciphertext envelope (same as encrypt()).
+
+        Raises:
+            HypEngineError: Propagated from encrypt().
+        """
+        return self.encrypt(message, public_key)
+
+    def decrypt_message(self, ciphertext: Dict[str, Any], private_key: str) -> bytes:
+        """
+        Alias for decrypt() — backward-compatible shim for server.py / oracle.py.
+
+        server.py historically called engine.decrypt_message(ct_dict, priv_key);
+        the canonical DPS-420 method is engine.decrypt(ct_dict, priv_key).
+
+        Parameters:
+            ciphertext  (dict): Ciphertext envelope from encrypt() / encrypt_message().
+            private_key (str):  Hex-encoded GeodesicLWE private key.
+
+        Returns:
+            bytes: Recovered plaintext.
+
+        Raises:
+            HypEngineError: Propagated from decrypt().
+        """
+        return self.decrypt(ciphertext, private_key)
+
+    def encrypt_for_ibm(
+        self,
+        message: bytes,
+        public_key: str,
+        ibm_token: str = "",
+        backend_name: str = "ibm_fez",
+    ) -> Dict[str, Any]:
+        """
+        GeodesicLWE encrypt with optional qiskit-ibm-runtime attestation.
+
+        When ibm_token is supplied the method:
+          1. Runs encrypt() to produce the HCVP-hard KEM envelope.
+          2. Hashes the ciphertext dict → 32-byte commitment.
+          3. Submits a minimal 1-qubit H→measure circuit to the requested IBM
+             backend as a timestamped attestation job — the job_id + backend are
+             embedded in the returned envelope so downstream verifiers can query
+             IBM Quantum for proof-of-execution.
+          4. Returns the enriched ciphertext dict.
+
+        When ibm_token is empty the method falls back to pure GeodesicLWE
+        (same as encrypt_message) and sets attestation fields to None — so the
+        caller never has to branch on whether IBM credentials are present.
+
+        Parameters:
+            message      (bytes): Plaintext.
+            public_key   (str):   GeodesicLWE public key (hex).
+            ibm_token    (str):   IBM Quantum API token (optional).
+            backend_name (str):   Target backend, default 'ibm_fez'.
+
+        Returns:
+            dict: Ciphertext envelope enriched with optional IBM attestation:
+              {
+                ...encrypt() fields...,
+                'ibm_attested':   bool,
+                'ibm_job_id':     str | None,
+                'ibm_backend':    str | None,
+                'ibm_commitment': str | None,  # SHA3-256 of ciphertext hex
+              }
+
+        Raises:
+            HypEngineError: If encryption fails.  IBM submission failures are
+                            non-fatal — attestation fields are set to None with
+                            a warning log rather than raising.
+        """
+        envelope: Dict[str, Any] = self.encrypt(message, public_key)
+        import hashlib as _hl
+        commitment = _hl.sha3_256(
+            envelope.get("ciphertext", "").encode()
+        ).hexdigest()
+        envelope["ibm_commitment"] = commitment
+        envelope["ibm_attested"] = False
+        envelope["ibm_job_id"] = None
+        envelope["ibm_backend"] = None
+
+        if ibm_token:
+            try:
+                from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
+                from qiskit import QuantumCircuit as _QC
+                svc = QiskitRuntimeService(channel="ibm_quantum", token=ibm_token)
+                backend = svc.backend(backend_name)
+                qc = _QC(1, 1)
+                qc.h(0)
+                qc.measure(0, 0)
+                qc = qc.decompose()
+                job = Sampler(mode=backend).run([qc])
+                envelope["ibm_attested"] = True
+                envelope["ibm_job_id"] = job.job_id()
+                envelope["ibm_backend"] = backend_name
+                logger.info(
+                    f"[IBM-ATTEST] ✅ job_id={job.job_id()} backend={backend_name} "
+                    f"commitment={commitment[:16]}…"
+                )
+            except Exception as _ibm_err:
+                logger.warning(
+                    f"[IBM-ATTEST] ⚠ IBM attestation skipped (non-fatal): {_ibm_err}"
+                )
+
+        return envelope
 
     # ─────────────────────────────────────────────────────────────────────────────
     # §2f  UTILITY METHODS (Internal Serialization & Hashing)

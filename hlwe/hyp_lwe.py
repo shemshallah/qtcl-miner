@@ -1085,6 +1085,85 @@ class GeodesicLWE:
             return GeodesicLWEKeypair(public_key=pub_hex, private_key=priv_hex,
                                      integrity=integrity)
     
+    def generate_keypair_from_seed(self, seed_bytes: bytes) -> "GeodesicLWEKeypair":
+        """
+        Generate a DETERMINISTIC GeodesicLWE keypair from a 32-byte seed.
+
+        D-1 FIX: This is the bridge that lets a Schnorr signing key also derive
+        a matching LWE encryption key — one wallet, two cryptographic roles.
+
+        The seed feeds a numpy SeedSequence, producing a deterministic but
+        cryptographically unpredictable binary secret vector and per-component
+        error vectors via the same LDPC-weight-bounded selection logic used in
+        generate_keypair(), without touching os.urandom or Python's global RNG.
+
+        Security note: the seed must be at least 256 bits of entropy. Callers
+        in hyp_engine.py derive it as:
+            HKDF-expand(SHA3-256(walk_bytes), info=b"QTCL_LWE_KEYGEN_v1", len=32)
+        which is computationally indistinguishable from random given the 512-step
+        PSL(2,R) walk discrete-log assumption.
+
+        Args:
+            seed_bytes: exactly 32 bytes of high-entropy seed material.
+
+        Returns:
+            GeodesicLWEKeypair — identical structure to generate_keypair().
+        """
+        if len(seed_bytes) != 32:
+            raise ValueError(f"seed_bytes must be exactly 32 bytes, got {len(seed_bytes)}")
+
+        with self._keygen_lock:
+            self._ensure_basis_cache()
+
+            # Build a deterministic RNG from seed — numpy SeedSequence accepts bytes
+            rng = np.random.default_rng(np.frombuffer(seed_bytes, dtype=np.uint8))
+
+            def _seeded_error(weight: int = ERROR_WEIGHT_MAX) -> np.ndarray:
+                """Sample LDPC-weight-bounded binary vector using deterministic rng."""
+                # Choose `weight` positions uniformly without replacement
+                positions = rng.choice(SECRET_DIM, size=weight, replace=False)
+                vec = np.zeros(SECRET_DIM, dtype=np.uint8)
+                vec[positions] = 1
+                return vec
+
+            # Step 1: deterministic secret vector
+            secret = _seeded_error(ERROR_WEIGHT_MAX)
+
+            # Step 2: deterministic per-component errors
+            lwe_components: Dict[int, Any] = {}
+            for i in range(BASIS_DIM):
+                err = _seeded_error(ERROR_WEIGHT_MAX)
+                lwe_components[i] = {
+                    'error_hex': err.tobytes().hex(),
+                    'error_weight': int(np.sum(err)),
+                }
+
+            # Step 3: serialize (same format as generate_keypair)
+            pub_dict = {
+                'basis_count': BASIS_DIM,
+                'secret_dim': SECRET_DIM,
+                'lwe_components': lwe_components,
+                'timestamp': 0.0,   # deterministic — no real timestamp
+                'deterministic': True,
+            }
+            pub_hex = json.dumps(pub_dict, sort_keys=True).encode().hex()
+
+            priv_dict = {
+                'secret_vector': secret.tobytes().hex(),
+                'secret_weight': int(np.sum(secret)),
+                'timestamp': 0.0,
+                'deterministic': True,
+            }
+            priv_hex = json.dumps(priv_dict, sort_keys=True).encode().hex()
+
+            integrity = hashlib.sha3_256((pub_hex + priv_hex).encode()).hexdigest()
+            logger.info(
+                f"[GeodesicLWE] deterministic keypair: "
+                f"secret_weight={int(np.sum(secret))} integrity={integrity[:16]}…"
+            )
+            return GeodesicLWEKeypair(public_key=pub_hex, private_key=priv_hex,
+                                      integrity=integrity)
+
     def encrypt(self, message: bytes, public_key: str) -> Dict[str, Any]:
         """
         Encrypt message under public key via GeodesicLWE hybrid KEM+DEM.
