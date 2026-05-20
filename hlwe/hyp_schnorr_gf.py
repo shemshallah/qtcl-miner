@@ -76,11 +76,12 @@ class SchnorrKeyPair(NamedTuple):
 
 
 class SchnorrSignature(NamedTuple):
-    """Schnorr-Γ signature over GF(p)."""
+    """Schnorr-Γ signature over SL(2,p) — scalar construction."""
     R: GFMatrix
     Z: GFMatrix
     c_full: int
     c_exp: int           # always 0 in GF(p) version (full exponent used)
+    s_scalar: int        # scalar response s = (r + c·x) mod SL2_ORDER
     nonce_walk: List[int]
     R_canonical_hex: str = ""
 
@@ -100,23 +101,34 @@ class VerifyResult(NamedTuple):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def keygen() -> SchnorrKeyPair:
-    """Generate a Schnorr-Γ keypair over GF(p)."""
+    """Generate a Schnorr-Γ keypair over GF(p).
+    
+    CRIT-A FIX: Uses scalar-based key from fixed generator g_schnorr.
+    """
+    from hyp_finite_field import gf_generate_keypair
     kp = gf_generate_keypair()
     private_walk = hex_to_walk(kp.private_key_hex)
-    pub = evaluate_walk(private_walk)
+    pub = GFMatrix.from_hex(kp.public_key_hex)
     return SchnorrKeyPair(private_walk=private_walk, public_key=pub,
-                          address=kp.address)
+                           address=kp.address)
 
 
 def keygen_from_walk(private_walk: List[int]) -> SchnorrKeyPair:
-    """Reconstruct keypair from existing walk."""
-    pub = evaluate_walk(private_walk)
+    """Reconstruct keypair from existing walk.
+    
+    Public key is y = g ^ x where g is the fixed Schnorr generator
+    and x = walk_to_private_scalar(walk).
+    """
+    from hyp_finite_field import get_schnorr_generator, walk_to_private_scalar
+    g = get_schnorr_generator()
+    x = walk_to_private_scalar(private_walk)
+    pub = g ** x
     pub_bytes = pub.serialize()
     addr = hashlib.sha3_256(
         hashlib.sha3_256(pub_bytes).digest()
     ).hexdigest()
     return SchnorrKeyPair(private_walk=private_walk, public_key=pub,
-                          address=addr)
+                           address=addr)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -126,18 +138,10 @@ def keygen_from_walk(private_walk: List[int]) -> SchnorrKeyPair:
 def sign(message: bytes, private_walk: List[int],
          public_key: GFMatrix) -> SchnorrSignature:
     """
-    Sign a message with Schnorr-Γ over GF(p).
-
-    Protocol:
-        r_walk = random_walk(512)              — fresh nonce
-        R = evaluate_walk(r_walk)              — commitment
-        c = H(R ‖ m)                            — Fiat-Shamir (256-bit)
-        y_c = public_key ** c                   — exact via binary exponentiation
-        Z = R @ y_c                             — response
-        σ = (R, Z, c)
-
-    Uses the FULL 256-bit challenge — no exponent reduction needed because
-    matrix exponentiation over GF(p) is exact and O(log c) cost.
+    Sign a message with scalar Schnorr-Γ over SL(2,p).
+    
+    The private key is a scalar x derived from the walk. Response s = (r + c·x) mod SL2_ORDER.
+    C-1: ~70-bit classical DLP security. For PQ resistance, add hybrid PQC layer.
     """
     if not isinstance(message, bytes):
         raise TypeError(f"message must be bytes, got {type(message).__name__}")
@@ -153,7 +157,8 @@ def sign(message: bytes, private_walk: List[int],
 
     return SchnorrSignature(
         R=sig.R, Z=sig.Z, c_full=sig.c_full, c_exp=0,
-        nonce_walk=[],  # not needed for wire format
+        s_scalar=sig.s_scalar,
+        nonce_walk=[],
         R_canonical_hex=sig.R_hex)
 
 
@@ -163,13 +168,14 @@ def sign(message: bytes, private_walk: List[int],
 
 def verify(sig: SchnorrSignature, message: bytes,
            public_key: GFMatrix) -> VerifyResult:
-    """Verify a Schnorr-Γ signature over GF(p)."""
+    """Verify a scalar Schnorr-Γ signature over SL(2,p)."""
     t0 = time.perf_counter()
 
     try:
         valid = gf_verify_full(
             GFSchnorrSignature(R=sig.R, Z=sig.Z, c_full=sig.c_full,
-                              R_hex=sig.R_canonical_hex),
+                               s_scalar=sig.s_scalar,
+                               R_hex=sig.R_canonical_hex),
             message, public_key)
 
         dt = time.perf_counter() - t0
@@ -192,7 +198,7 @@ def verify(sig: SchnorrSignature, message: bytes,
 # DICT INTERFACE — QTCL Block Integration
 # ═══════════════════════════════════════════════════════════════════════════
 
-WIRE_VERSION: str = "schnorr_gamma_gf_v2"
+WIRE_VERSION: str = "schnorr_gamma_gf_v3"
 
 
 def signature_to_dict(sig: SchnorrSignature) -> Dict[str, Any]:
@@ -202,6 +208,7 @@ def signature_to_dict(sig: SchnorrSignature) -> Dict[str, Any]:
         "R": sig.R.hex(),
         "Z": sig.Z.hex(),
         "c_full": format(sig.c_full, "064x"),
+        "s_scalar": format(sig.s_scalar, "064x") if hasattr(sig, 's_scalar') and sig.s_scalar else "0",
         "R_canonical_hex": sig.R_canonical_hex or sig.R.hex(),
     }
 
@@ -216,9 +223,12 @@ def signature_from_dict(d: Dict[str, Any]) -> SchnorrSignature:
         R = GFMatrix.from_hex(d["R"])
         Z = GFMatrix.from_hex(d["Z"])
         c_full = int(d["c_full"], 16)
+        s_scalar_str = d.get("s_scalar", "0")
+        s_scalar = int(s_scalar_str, 16) if s_scalar_str else 0
         r_hex = d.get("R_canonical_hex", d["R"])
         return SchnorrSignature(R=R, Z=Z, c_full=c_full, c_exp=0,
-                                nonce_walk=[], R_canonical_hex=r_hex)
+                                nonce_walk=[], R_canonical_hex=r_hex,
+                                s_scalar=s_scalar)
 
     raise ValueError(f"Unrecognized signature format. Keys: {list(d.keys())}")
 
@@ -254,7 +264,7 @@ def sign_hash(message_hash: bytes, private_walk: List[int],
     timestamp = datetime.now(timezone.utc).isoformat()
 
     return {
-        "signature": sig_dict["R"],
+        "signature": sig_dict["R"] + sig_dict["Z"],
         "challenge": challenge_hex,
         "timestamp": timestamp,
         "auth_tag": challenge_hex,
@@ -263,6 +273,7 @@ def sign_hash(message_hash: bytes, private_walk: List[int],
         "Z": sig_dict["Z"],
         "c_full": challenge_hex,
         "c_exp": 0,
+        "s_scalar": format(sig.s_scalar, "064x") if sig.s_scalar else "0",
     }
 
 

@@ -233,8 +233,17 @@ def _shake_ctr_process(key: bytes, nonce: bytes, data: bytes) -> bytes:
 
 
 def _compute_mac(mac_key: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
-    """SHA3-256 MAC over (mac_key ‖ nonce ‖ ciphertext)."""
-    return hashlib.sha3_256(mac_key + nonce + ciphertext).digest()
+    """KMAC256-style MAC over (nonce ‖ ciphertext).
+
+    M-4 FIX (RED TEAM): HMAC is defined for Merkle-Damgård hashes. SHA-3 uses
+    the sponge construction. NIST SP 800-185 defines KMAC as the correct MAC
+    for SHA-3 family. We use SHAKE-256 with a domain-separated key+data input,
+    which is functionally equivalent to KMAC256 without requiring the `cryptography`
+    package (Termux compatibility).
+    """
+    return hashlib.shake_256(
+        b"QTCL_KMAC256\x00" + mac_key + nonce + ciphertext
+    ).digest(32)
 
 
 def _aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes = None) -> bytes:
@@ -919,6 +928,14 @@ class GeodesicLWE:
             self.ldpc_code = None
             return
         
+        # MED-1 FIX (RED TEAM): If mpmath is absent, the stubs produce garbage
+        # (cosh=1, sinh=0) which silently corrupts all key material. Guard here.
+        if not MPMATH_AVAILABLE:
+            raise ImportError(
+                "mpmath is required for GeodesicLWE. Install with: pip install mpmath\n"
+                "Do not run in degraded mode — stubs produce incorrect hyperbolic geometry."
+            )
+        
         self.sigma = sigma
         self.lock = threading.RLock()
         self._basis_cache: Optional[Dict[str, Any]] = None
@@ -1008,106 +1025,64 @@ class GeodesicLWE:
     def generate_keypair(self) -> GeodesicLWEKeypair:
         """
         Generate encryption keypair.
-        
-        Algorithm:
-          1. Sample secret s⃗ ∈ {0,1}¹⁰²⁴ LDPC-constrained
-          2. Compute basis vectors {h₁,...,h₈} from tessellation
-          3. For each i:
-               - Embed hᵢ into Poincaré disk
-               - Sample LDPC error eᵢ
-               - Compute LWE component: bᵢ = distance(hᵢ, s·hᵢ) + eᵢ
-          4. Public key: (h₁,...,h₈, b₁,...,b₈)
-             Private key: s⃗
-        
-        Thread Safety:
-          - Uses separate lock to prevent race during keygen
-          - Basis cache is shared but read-only after first initialization
-        
-        Returns:
-            GeodesicLWEKeypair: (public_key_hex, private_key_hex, integrity_hash)
-        
-        Raises:
-            RuntimeError: if basis computation fails repeatedly
+
+        CRIT-B FIX (RED TEAM): Uses ElGamal-style KEM in cyclic subgroup
+        of SL(2,p). The private key is a 256-bit scalar x; the public key
+        is y = g_enc ^ x where g_enc is a fixed generator. Encryption
+        computes shared secret via DH: encryptor computes y^r, decryptor
+        computes R^x. Without x, the ciphertext cannot be decrypted.
         """
         with self._keygen_lock:
             self._ensure_basis_cache()
-            cache = self._basis_cache
-            
-            # Step 1: Sample LDPC-constrained secret
-            # Secret is a 1024-bit binary vector satisfying H·s = 0 (mod 2)
-            secret = sample_lwe_error(self.ldpc_code, sigma=0.0,
-                                      max_weight=ERROR_WEIGHT_MAX)
-            
-            # Step 2: Compute LWE components for each basis vector
-            lwe_components = {}
-            
-            for i in range(BASIS_DIM):
-                try:
-                    # Sample error for this component
-                    error = sample_lwe_error(self.ldpc_code, self.sigma,
-                                           max_weight=ERROR_WEIGHT_MAX)
-                    
-                    # For now: lwe_component is just the error (simplified)
-                    # Full implementation would compute: dₕ(embed(hᵢ), encode(s·hᵢ)) + error
-                    lwe_components[i] = {
-                        'error_hex': error.tobytes().hex(),
-                        'error_weight': int(np.sum(error))
-                    }
-                
-                except Exception as e:
-                    logger.warning(f"Error sampling for component {i}: {e}")
-                    lwe_components[i] = {'error_hex': '00' * (SECRET_DIM // 8),
-                                        'error_weight': 0}
-            
-            # Step 3: Serialize public and private keys
+
+            # Generate random walk → derive encryption scalar
+            from hyp_finite_field import (
+                random_walk as ff_random_walk, walk_to_hex,
+                get_encryption_generator, walk_to_encryption_scalar,
+            )
+            walk = ff_random_walk(SECRET_DIM, reduced=True) if SECRET_DIM >= 512 else ff_random_walk(512, reduced=True)
+            x_enc = walk_to_encryption_scalar(walk)
+            g_enc = get_encryption_generator()
+            y_enc = g_enc ** x_enc
+
             pub_dict = {
-                'basis_count': BASIS_DIM,
-                'secret_dim': SECRET_DIM,
-                'lwe_components': lwe_components,
-                'timestamp': time.time()
+                'kem_public_hex': y_enc.hex(),
+                'version': 3,
             }
-            pub_hex = json.dumps(pub_dict).encode().hex()
-            
+            pub_hex = json.dumps(pub_dict, sort_keys=True).encode().hex()
+
+            # M-1 FIX (RED TEAM): Do NOT persist kem_secret_hex in the private key blob.
+            # The scalar x_enc is derived on-demand at decrypt time via walk_to_encryption_scalar.
+            # This prevents accidental scalar leakage through API responses, debug logs, or test output.
             priv_dict = {
-                'secret_vector': secret.tobytes().hex(),
-                'secret_weight': int(np.sum(secret)),
-                'timestamp': time.time()
+                'kem_public_hex': y_enc.hex(),
+                'walk_hex': walk_to_hex(walk),
+                'version': 3,
             }
-            priv_hex = json.dumps(priv_dict).encode().hex()
-            
-            # Step 4: Compute integrity hash
-            combined = pub_hex + priv_hex
-            integrity = hashlib.sha3_256(combined.encode()).hexdigest()
-            
-            logger.info(f"Generated keypair: secret_weight={int(np.sum(secret))}, "
-                       f"pub_size={len(pub_hex)}, integrity={integrity[:16]}...")
-            
+            priv_hex = json.dumps(priv_dict, sort_keys=True).encode().hex()
+
+            # M-3 FIX (RED TEAM): Hash raw key bytes, not hex-of-hex representation.
+            # The old code hashed pub_hex + priv_hex (double-hex encoded), making the
+            # integrity check unreproducible without the exact same encoding pipeline.
+            integrity = hashlib.sha3_256(y_enc.serialize() + bytes.fromhex(priv_hex)).hexdigest()
+
+            logger.info(f"Generated KEM keypair: integrity={integrity[:16]}...")
             return GeodesicLWEKeypair(public_key=pub_hex, private_key=priv_hex,
-                                     integrity=integrity)
+                                      integrity=integrity)
     
     def generate_keypair_from_seed(self, seed_bytes: bytes) -> "GeodesicLWEKeypair":
         """
-        Generate a DETERMINISTIC GeodesicLWE keypair from a 32-byte seed.
+        Generate a DETERMINISTIC encryption keypair from a 32-byte seed.
 
-        D-1 FIX: This is the bridge that lets a Schnorr signing key also derive
-        a matching LWE encryption key — one wallet, two cryptographic roles.
-
-        The seed feeds a numpy SeedSequence, producing a deterministic but
-        cryptographically unpredictable binary secret vector and per-component
-        error vectors via the same LDPC-weight-bounded selection logic used in
-        generate_keypair(), without touching os.urandom or Python's global RNG.
-
-        Security note: the seed must be at least 256 bits of entropy. Callers
-        in hyp_engine.py derive it as:
-            HKDF-expand(SHA3-256(walk_bytes), info=b"QTCL_LWE_KEYGEN_v1", len=32)
-        which is computationally indistinguishable from random given the 512-step
-        PSL(2,R) walk discrete-log assumption.
+        CRIT-B FIX: Uses ElGamal KEM — deterministic rng generates the walk,
+        from which the encryption scalar x_enc is derived via SHA3-256.
+        Public key y = g_enc ^ x_enc.
 
         Args:
             seed_bytes: exactly 32 bytes of high-entropy seed material.
 
         Returns:
-            GeodesicLWEKeypair — identical structure to generate_keypair().
+            GeodesicLWEKeypair
         """
         if len(seed_bytes) != 32:
             raise ValueError(f"seed_bytes must be exactly 32 bytes, got {len(seed_bytes)}")
@@ -1115,204 +1090,206 @@ class GeodesicLWE:
         with self._keygen_lock:
             self._ensure_basis_cache()
 
-            # Build a deterministic RNG from seed — numpy SeedSequence accepts bytes
-            rng = np.random.default_rng(np.frombuffer(seed_bytes, dtype=np.uint8))
+            from hyp_finite_field import (
+                random_walk as ff_random_walk, walk_to_hex,
+                get_encryption_generator, walk_to_encryption_scalar,
+            )
 
-            def _seeded_error(weight: int = ERROR_WEIGHT_MAX) -> np.ndarray:
-                """Sample LDPC-weight-bounded binary vector using deterministic rng."""
-                # Choose `weight` positions uniformly without replacement
-                positions = rng.choice(SECRET_DIM, size=weight, replace=False)
-                vec = np.zeros(SECRET_DIM, dtype=np.uint8)
-                vec[positions] = 1
-                return vec
+            # L-4 FIX (RED TEAM): Use SHAKE-256 XOF (cryptographic) instead of
+            # numpy.random.default_rng (PCG64, a non-cryptographic PRNG).
+            # The seed is 32 cryptographically random bytes, and SHAKE-256
+            # is a NIST-standardized XOF with provable security properties.
+            entropy = hashlib.shake_256(seed_bytes).digest(1024)
+            walk = ff_random_walk(512, reduced=True)
+            # Override with seeded walk using entropy
+            CANCEL = {0: 1, 1: 0, 2: 3, 3: 2}
+            walk = []
+            prev = None
+            ent_idx = 0
+            for i in range(512):
+                if prev is not None:
+                    choices = [j for j in range(4) if j != CANCEL[prev]]
+                    while True:
+                        if ent_idx >= len(entropy):
+                            # L-4 FIX: SHAKE-256 XOF for entropy refill
+                            entropy = hashlib.shake_256(
+                                seed_bytes + ent_idx.to_bytes(4, 'big')
+                            ).digest(64)
+                            ent_idx = 0
+                        byte = entropy[ent_idx]
+                        ent_idx += 1
+                        if byte < 252:
+                            walk.append(choices[byte % 3])
+                            break
+                else:
+                    if ent_idx >= len(entropy):
+                        entropy = hashlib.shake_256(
+                            seed_bytes + ent_idx.to_bytes(4, 'big')
+                        ).digest(64)
+                        ent_idx = 0
+                    walk.append(entropy[ent_idx] % 4)
+                    ent_idx += 1
+                prev = walk[-1]
 
-            # Step 1: deterministic secret vector
-            secret = _seeded_error(ERROR_WEIGHT_MAX)
+            x_enc = walk_to_encryption_scalar(walk)
+            g_enc = get_encryption_generator()
+            y_enc = g_enc ** x_enc
 
-            # Step 2: deterministic per-component errors
-            lwe_components: Dict[int, Any] = {}
-            for i in range(BASIS_DIM):
-                err = _seeded_error(ERROR_WEIGHT_MAX)
-                lwe_components[i] = {
-                    'error_hex': err.tobytes().hex(),
-                    'error_weight': int(np.sum(err)),
-                }
-
-            # Step 3: serialize (same format as generate_keypair)
             pub_dict = {
-                'basis_count': BASIS_DIM,
-                'secret_dim': SECRET_DIM,
-                'lwe_components': lwe_components,
-                'timestamp': 0.0,   # deterministic — no real timestamp
+                'kem_public_hex': y_enc.hex(),
+                'version': 3,
                 'deterministic': True,
             }
             pub_hex = json.dumps(pub_dict, sort_keys=True).encode().hex()
 
+            # M-1 FIX: Do NOT persist kem_secret_hex — derive on-demand via walk
             priv_dict = {
-                'secret_vector': secret.tobytes().hex(),
-                'secret_weight': int(np.sum(secret)),
-                'timestamp': 0.0,
+                'kem_public_hex': y_enc.hex(),
+                'walk_hex': walk_to_hex(walk),
+                'version': 3,
                 'deterministic': True,
             }
             priv_hex = json.dumps(priv_dict, sort_keys=True).encode().hex()
 
-            integrity = hashlib.sha3_256((pub_hex + priv_hex).encode()).hexdigest()
-            logger.info(
-                f"[GeodesicLWE] deterministic keypair: "
-                f"secret_weight={int(np.sum(secret))} integrity={integrity[:16]}…"
-            )
+            # M-3 FIX: Hash raw key bytes, not hex-of-hex
+            integrity = hashlib.sha3_256(y_enc.serialize() + bytes.fromhex(priv_hex)).hexdigest()
+            logger.info(f"[GeodesicLWE] deterministic KEM keypair: integrity={integrity[:16]}…")
             return GeodesicLWEKeypair(public_key=pub_hex, private_key=priv_hex,
                                       integrity=integrity)
 
     def encrypt(self, message: bytes, public_key: str) -> Dict[str, Any]:
         """
-        Encrypt message under public key via GeodesicLWE hybrid KEM+DEM.
-        
-        HYBRID CONSTRUCTION:
-          Key Encapsulation Mechanism (KEM):
-            1. Parse public_key to extract lwe_components (basis error vectors)
-            2. Compute kem_seed = SHA3-256(QTCL_KEM_BINDING || public_key_bytes)
-            3. Sample LDPC-constrained kem_error e ∈ C_hyp
-            4. Mask kem_error: kem_ciphertext = e XOR SHAKE-256(kem_seed || nonce)
-            5. symmetric_key = SHA3-256(e || public_key_bytes)
-        
-          Data Encapsulation Mechanism (DEM):
-            1. Use symmetric key with SHAKE-256-CTR + SHA3-256 MAC
-            2. Return (kem_ciphertext, ciphertext, tag, public_key_hex)
-        
-        CRIT-1 FIX (RED TEAM): The kem_error is NOT transmitted in cleartext.
-        It is masked using a derivation from the public key. The decryptor
-        recovers kem_error using the same public key and verifies binding
-        via the private key's secret_vector inner product.
-        
+        Encrypt message via ElGamal KEM + AEAD (CRIT-B FIX).
+
+        KEM (CRIT-B FIX): ElGamal-style DH in cyclic subgroup of SL(2,p).
+          1. Parse public key → y = g_enc ^ x  (matrix)
+          2. Pick random scalar r
+          3. Compute R = g_enc ^ r           (ephemeral public key)
+          4. Compute shared = y ^ r          (shared secret)
+          5. symmetric_key = SHA3-256(R.serialize())
+
+        DEM: AEAD-encrypt message with symmetric_key.
+        Only the holder of x (private key) can compute shared = R ^ x.
+
         Args:
-            message: bytes to encrypt (arbitrary length)
-            public_key: hex-encoded public key from generate_keypair()
-        
+            message: bytes to encrypt
+            public_key: hex-encoded public key JSON from generate_keypair()
+
         Returns:
-            dict: {
-              'kem_ciphertext_hex': str (masked kem_error, hex),
-              'public_key_hex': str (needed for unmasking by decryptor),
-              'nonce_hex': str,
-              'ciphertext_hex': str,
-              'tag_hex': str,
-              'timestamp': float
-            }
-        
-        Raises:
-            ValueError: if public_key malformed
+            dict with 'kem_R_hex', 'nonce_hex', 'ciphertext_hex', 'tag_hex', 'timestamp'
         """
         if not message:
             raise ValueError("Message must be non-empty")
-        
+
         try:
             pub_bytes = bytes.fromhex(public_key)
             pub_dict = json.loads(pub_bytes.decode())
+            y_hex = pub_dict['kem_public_hex']
         except Exception as e:
             raise ValueError(f"Malformed public key: {e}")
-        
-        self._ensure_basis_cache()
-        
-        # KEM: derive binding seed from public key
-        kem_seed = hashlib.sha3_256(b"QTCL_KEM_BINDING:" + pub_bytes).digest()
-        
-        # Sample LDPC-constrained error for KEM
-        kem_error = sample_lwe_error(self.ldpc_code, self.sigma,
-                                     max_weight=ERROR_WEIGHT_MAX)
-        kem_error_bytes = kem_error.tobytes()
-        
-        # Generate nonces
-        kem_nonce = os.urandom(AES_NONCE_BYTES)
-        msg_nonce = os.urandom(AES_NONCE_BYTES)
-        
-        # Mask kem_error using public-key-derived stream
-        kem_mask = hashlib.shake_256(kem_seed + kem_nonce).digest(len(kem_error_bytes))
-        kem_ciphertext_bytes = bytes(a ^ b for a, b in zip(kem_error_bytes, kem_mask))
-        
-        # Symmetric key derived from kem_error (NOT transmitted)
-        symmetric_key = hashlib.sha3_256(kem_error_bytes + pub_bytes).digest()[:AES_KEY_BYTES]
-        
-        # DEM: encrypt message
-        ciphertext_and_tag = _aead_encrypt(symmetric_key, msg_nonce, message)
+
+        from hyp_finite_field import GFMatrix, get_encryption_generator
+
+        g_enc = get_encryption_generator()
+        y_enc = GFMatrix.from_hex(y_hex)
+
+        # KEM: pick random r, compute R = g^r, shared = y^r
+        r = secrets.randbits(256)
+        R = g_enc ** r
+        shared = y_enc ** r
+
+        # Symmetric key from shared secret (NOT R — R is public in ciphertext)
+        symmetric_key = hashlib.sha3_256(shared.serialize()).digest()[:AES_KEY_BYTES]
+
+        # DEM: AEAD encrypt message
+        nonce = os.urandom(AES_NONCE_BYTES)
+        ciphertext_and_tag = _aead_encrypt(symmetric_key, nonce, message)
         ciphertext = ciphertext_and_tag[:-AES_TAG_BYTES]
         tag = ciphertext_and_tag[-AES_TAG_BYTES:]
-        
+
         return {
-            'kem_ciphertext_hex': kem_ciphertext_bytes.hex(),
-            'public_key_hex': public_key,
-            'kem_nonce_hex': kem_nonce.hex(),
-            'nonce_hex': msg_nonce.hex(),
+            'kem_R_hex': R.hex(),
+            'nonce_hex': nonce.hex(),
             'ciphertext_hex': ciphertext.hex(),
             'tag_hex': tag.hex(),
             'timestamp': time.time()
         }
-    
+
     def decrypt(self, ciphertext_dict: Dict[str, Any], private_key: str) -> bytes:
         """
-        Decrypt ciphertext via GeodesicLWE hybrid KEM+DEM.
-        
-        CRIT-1 FIX (RED TEAM): The decryptor uses the private key's secret_vector
-        to verify key binding and recover the symmetric key. The kem_error is NOT
-        read directly from the ciphertext — it is unmasked using the public key
-        (included in the ciphertext dict), then verified against the private key.
-        
+        Decrypt ciphertext via ElGamal KEM + AEAD (CRIT-B FIX).
+
+        CRIT-B FIX: The decryptor MUST hold the private scalar x_enc to compute
+        shared = R ^ x_enc = g_enc ^ (r * x_enc). The ciphertext contains only
+        R (the ephemeral public key) — without x_enc, the shared secret cannot
+        be recovered.
+
         Decryption steps:
-          1. Parse private key → secret_vector
-          2. Parse public_key_hex from ciphertext dict → derive kem_seed
-          3. Unmask kem_ciphertext using kem_seed + kem_nonce → kem_error
-          4. Derive symmetric_key = SHA3-256(kem_error || public_key_bytes)
-          5. AEAD decrypt the message ciphertext
-        
+          1. Parse private key → x_enc (scalar)
+          2. Parse R from kem_R_hex
+          3. Compute shared = R ^ x_enc
+          4. Derive symmetric_key = SHA3-256(shared.serialize())
+          5. AEAD decrypt the message
+
         Args:
             ciphertext_dict: dict from encrypt()
-            private_key: hex-encoded private key from generate_keypair()
-        
+            private_key: hex-encoded private key JSON from generate_keypair()
+
         Returns:
             bytes: Decrypted message
-        
+
         Raises:
-            ValueError: if keys malformed, tag verification fails, or ciphertext invalid
+            ValueError: if keys malformed, AEAD verification fails
         """
         try:
-            priv_dict = json.loads(bytes.fromhex(private_key).decode())
-            secret_bytes = bytes.fromhex(priv_dict['secret_vector'])
-            secret = np.frombuffer(secret_bytes, dtype=np.uint8)[:SECRET_DIM]
+            priv_bytes = bytes.fromhex(private_key)
+            priv_dict = json.loads(priv_bytes.decode())
+            # M-1 FIX: kem_secret_hex may not be in the blob — derive from walk_hex
+            if 'kem_secret_hex' in priv_dict:
+                x_enc = int(priv_dict['kem_secret_hex'], 16)
+            elif 'walk_hex' in priv_dict:
+                from hyp_finite_field import hex_to_walk, walk_to_encryption_scalar
+                # Don't truncate — use actual walk length from the hex encoding
+                walk_hex = priv_dict['walk_hex']
+                if walk_hex.startswith("GF1:"):
+                    walk_hex = walk_hex[4:]
+                data = bytes.fromhex(walk_hex)
+                walk = []
+                for byte in data:
+                    walk.append((byte >> 6) & 0x3)
+                    walk.append((byte >> 4) & 0x3)
+                    walk.append((byte >> 2) & 0x3)
+                    walk.append(byte & 0x3)
+                x_enc = walk_to_encryption_scalar(walk)
+            else:
+                raise ValueError("Private key missing both kem_secret_hex and walk_hex")
         except Exception as e:
             raise ValueError(f"Malformed private key: {e}")
-        
+
         try:
-            kem_ciphertext_bytes = bytes.fromhex(ciphertext_dict['kem_ciphertext_hex'])
-            public_key_hex = ciphertext_dict['public_key_hex']
-            pub_bytes = bytes.fromhex(public_key_hex)
-            kem_nonce = bytes.fromhex(ciphertext_dict['kem_nonce_hex'])
-            msg_nonce = bytes.fromhex(ciphertext_dict['nonce_hex'])
+            R_hex = ciphertext_dict['kem_R_hex']
+            nonce = bytes.fromhex(ciphertext_dict['nonce_hex'])
             ciphertext_b = bytes.fromhex(ciphertext_dict['ciphertext_hex'])
             tag = bytes.fromhex(ciphertext_dict['tag_hex'])
         except Exception as e:
             raise ValueError(f"Malformed ciphertext: {e}")
-        
-        # KDM: recover kem_error by unmasking with public-key-derived stream
-        kem_seed = hashlib.sha3_256(b"QTCL_KEM_BINDING:" + pub_bytes).digest()
-        kem_mask = hashlib.shake_256(kem_seed + kem_nonce).digest(len(kem_ciphertext_bytes))
-        kem_error_bytes = bytes(a ^ b for a, b in zip(kem_ciphertext_bytes, kem_mask))
-        
-        # Symmetric key derived from recovered kem_error + public key
-        symmetric_key = hashlib.sha3_256(kem_error_bytes + pub_bytes).digest()[:AES_KEY_BYTES]
-        
-        # Verify the recovered kem_error is consistent with the private key's
-        # secret_vector by checking that their inner product is within a reasonable
-        # range for an LDPC-constrained vector. A wrong private key would produce
-        # a valid kem_error unmasking but the AEAD tag verification will catch it.
-        
-        # DDM: Decrypt message with SHAKE-256-CTR + SHA3-256 MAC verification
+
+        from hyp_finite_field import GFMatrix
+
+        R = GFMatrix.from_hex(R_hex)
+
+        # KDM: shared = R ^ x_enc = (g_enc ^ r) ^ x_enc = g_enc ^ (r * x_enc)
+        shared = R ** x_enc
+        symmetric_key = hashlib.sha3_256(shared.serialize()).digest()[:AES_KEY_BYTES]
+
         try:
-            plaintext = _aead_decrypt(symmetric_key, msg_nonce, ciphertext_b + tag)
+            plaintext = _aead_decrypt(symmetric_key, nonce, ciphertext_b + tag)
         except ValueError as e:
             raise ValueError(
                 f"Authentication tag verification failed: "
                 f"ciphertext may be tampered or wrong private key: {e}"
             )
-        
+
         return plaintext
 
 
@@ -1393,10 +1370,9 @@ def test_hyp_lwe() -> bool:
         print("[TEST 5] Basic encryption")
         message = b"HelloWorld"
         ciphertext = lwe.encrypt(message, keypair1.public_key)
-        assert 'kem_ciphertext_hex' in ciphertext, "Missing kem_ciphertext_hex"
+        assert 'kem_R_hex' in ciphertext, "Missing kem_R_hex"
         assert 'ciphertext_hex' in ciphertext, "Missing ciphertext_hex"
         assert 'tag_hex' in ciphertext, "Missing tag_hex"
-        assert 'public_key_hex' in ciphertext, "Missing public_key_hex"
         print(f"  ✓ Encrypted {len(message)} bytes, includes KEM encapsulation")
         tests_passed += 1
     except Exception as e:
@@ -1606,11 +1582,9 @@ def test_hyp_lwe() -> bool:
     try:
         print("[TEST 20] Public key structure")
         pub_dict = json.loads(bytes.fromhex(keypair1.public_key).decode())
-        assert 'basis_count' in pub_dict
-        assert pub_dict['basis_count'] == BASIS_DIM
-        assert 'lwe_components' in pub_dict
-        assert len(pub_dict['lwe_components']) == BASIS_DIM
-        print(f"  ✓ Public key: {BASIS_DIM} basis vectors, {BASIS_DIM} LWE components")
+        assert 'kem_public_hex' in pub_dict
+        assert 'version' in pub_dict
+        print(f"  ✓ Public key: KEM v{pub_dict['version']}")
         tests_passed += 1
     except Exception as e:
         print(f"  ✗ FAILED: {e}")
@@ -1618,14 +1592,10 @@ def test_hyp_lwe() -> bool:
     try:
         print("[TEST 21] Private key structure")
         priv_dict = json.loads(bytes.fromhex(keypair1.private_key).decode())
-        assert 'secret_vector' in priv_dict
-        assert 'secret_weight' in priv_dict
-        secret_bytes = bytes.fromhex(priv_dict['secret_vector'])
-        # Secret is stored as uint8 array (SECRET_DIM bytes, each 0 or 1)
-        assert len(secret_bytes) == SECRET_DIM, \
-            f"Expected {SECRET_DIM} bytes, got {len(secret_bytes)}"
-        print(f"  ✓ Private key: secret vector {SECRET_DIM} elements, "
-              f"weight={priv_dict['secret_weight']}")
+        # M-1 FIX: kem_secret_hex removed from persisted blob; walk_hex present instead
+        assert 'walk_hex' in priv_dict or 'kem_secret_hex' in priv_dict
+        assert 'version' in priv_dict
+        print(f"  ✓ Private key: KEM v{priv_dict['version']}")
         tests_passed += 1
     except Exception as e:
         print(f"  ✗ FAILED: {e}")
@@ -1646,8 +1616,7 @@ def test_hyp_lwe() -> bool:
         print("[TEST 23] Malformed private key rejection")
         bad_privkey = "deadbeef" * 10
         try:
-            lwe.decrypt({'kem_ciphertext_hex': '00', 'public_key_hex': '00', 
-                         'kem_nonce_hex': '00'*12, 'nonce_hex': '00'*12,
+            lwe.decrypt({'kem_R_hex': '00'*8, 'nonce_hex': '00'*12,
                          'ciphertext_hex': '00', 'tag_hex': '00'*32}, bad_privkey)
             print("  ✗ FAILED: Should reject malformed private key")
         except ValueError:
@@ -1658,9 +1627,13 @@ def test_hyp_lwe() -> bool:
     
     try:
         print("[TEST 24] Integrity field validation")
-        pub_hex = keypair1.public_key
-        priv_hex = keypair1.private_key
-        expected_integrity = hashlib.sha3_256((pub_hex + priv_hex).encode()).hexdigest()
+        # M-3 FIX: Integrity now hashes raw key bytes, not hex-of-hex
+        from hyp_finite_field import GFMatrix
+        pub_dict = json.loads(bytes.fromhex(keypair1.public_key).decode())
+        y_enc = GFMatrix.from_hex(pub_dict['kem_public_hex'])
+        expected_integrity = hashlib.sha3_256(
+            y_enc.serialize() + bytes.fromhex(keypair1.private_key)
+        ).hexdigest()
         assert keypair1.integrity == expected_integrity
         print(f"  ✓ Keypair integrity: {keypair1.integrity[:16]}... verified")
         tests_passed += 1

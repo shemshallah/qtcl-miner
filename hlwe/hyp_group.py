@@ -965,9 +965,16 @@ def random_walk(
 
         # Map byte uniformly to {0,1,2,3} or {0,1,2,3} \ {cancel(prev)}
         if reduced and prev is not None:
-            # Choose from 3 generators, avoiding cancellation
-            # Valid choices: {0,1,2,3} \ {CANCEL[prev]}
+            # HIGH-1 FIX (RED TEAM): Use rejection sampling to avoid modulo bias.
             choices = [i for i in range(4) if i != CANCEL[prev]]
+            while True:
+                if entropy_idx >= len(entropy_source):
+                    entropy_source = _get_hyp_entropy(64)
+                    entropy_idx = 0
+                byte = entropy_source[entropy_idx]
+                entropy_idx += 1
+                if byte < 252:
+                    break
             idx = choices[byte % 3]
         else:
             idx = byte % 4

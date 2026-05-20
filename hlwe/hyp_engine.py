@@ -37,7 +37,7 @@
 ║      - signature: hex(R‖Z) — Schnorr commitment + response                                 ║
 ║      - challenge: hex(c) — 256-bit Fiat-Shamir challenge                                   ║
 ║      - timestamp: ISO 8601 string                                                           ║
-║      - auth_tag: hex(c) [backward compat field]                                            ║
+║      - auth_tag: hex(c) [alias of challenge]                                            ║
 ║                                                                                              ║
 ║   4. verify_signature(message_hash: bytes, sig: dict, public_key: str) → bool             ║
 ║      - Recomputes c' = H(serialize(Z·y^{-c})) from signature                               ║
@@ -57,25 +57,22 @@
 ║      - Unchanged from hlwe_engine.py (existing addresses remain valid)                     ║
 ║                                                                                              ║
 ║   ═══════════════════════════════════════════════════════════════════════════════════════  ║
-║   BACKWARD COMPATIBILITY WITH hlwe_engine.py                                               ║
+║   V3-ONLY — NO BACKWARD COMPATIBILITY                                                      ║
 ║   ═══════════════════════════════════════════════════════════════════════════════════════  ║
 ║                                                                                              ║
-║   All existing call sites in server.py, oracle.py, mempool.py, and                         ║
-║   blockchain_entropy_mining.py will work unchanged:                                        ║
+║   All existing call sites import from hyp_engine:                                          ║
 ║                                                                                              ║
-║     OLD:  from hlwe_engine import HypGammaEngine                                            ║
-║     NEW:  from hyp_engine import HypGammaEngine   ← Only change needed                     ║
+║     from hyp_engine import HypGammaEngine                                                   ║
 ║                                                                                              ║
-║   Signature output dict keys preserved:                                                    ║
+║   Signature output dict keys (v3 canonical):                                               ║
 ║     {                                                                                        ║
 ║       'signature': str,    # hex-encoded commitment‖response                               ║
 ║       'challenge': str,    # hex-encoded c (256 bits)                                      ║
-║       'auth_tag': str,     # hex(c) [for backward compat only]                             ║
+║       'auth_tag': str,     # hex(c) [alias of challenge]                             ║
 ║       'timestamp': str,    # ISO 8601                                                       ║
 ║     }                                                                                        ║
 ║                                                                                              ║
-║   Address derivation unchanged: SHA3-256² remains the standard.                            ║
-║   Existing wallets cannot use old keys (need regeneration), but addresses are valid.      ║
+║   Address derivation: SHA3-256². All wallets MUST be regenerated with v3 key format.      ║
 ║                                                                                              ║
 ║   ═══════════════════════════════════════════════════════════════════════════════════════  ║
 ║   INTEGRATION ARCHITECTURE                                                                  ║
@@ -88,7 +85,7 @@
 ║       ↓ ← hyp_schnorr.py (Schnorr-Γ sign/verify, Fiat-Shamir)                              ║
 ║       ↓ ← hyp_lwe.py (GeodesicLWE encryption, LDPC error coupling)                         ║
 ║       ↓                                                                                      ║
-║   hyp_engine.py (unified API, integration, backward compat)                                ║
+║   hyp_engine.py (unified API, integration, v3-only)                                ║
 ║                                                                                              ║
 ║   All module imports are guarded. If any dependency fails to load,                         ║
 ║   HypGammaEngine() raises HypEngineError with diagnostic information.                      ║
@@ -332,6 +329,25 @@ except ImportError as e:
     _MODULES_AVAILABLE['hyp_lwe'] = False
     _LWE_ERROR = e
 
+try:
+    from hyp_pqc import (
+        generate_hybrid_keypair as _pqc_generate_keypair,
+        hybrid_sign as _pqc_hybrid_sign,
+        hybrid_verify as _pqc_hybrid_verify,
+        hybrid_keypair_to_dict,
+        hybrid_public_key_to_dict,
+        hybrid_keypair_from_dict,
+        hybrid_signature_to_dict,
+        hybrid_signature_from_dict,
+        HybridKeypair,
+        HybridSignature,
+        pqc_status,
+        WIRE_VERSION as PQC_WIRE_VERSION,
+    )
+    _MODULES_AVAILABLE['hyp_pqc'] = True
+except ImportError:
+    _MODULES_AVAILABLE['hyp_pqc'] = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,13 +550,13 @@ class HypGammaEngine:
                 HypGammaEngine._initialized = True
 
             except Exception as e:
-                logger.error(f"Failed to initialize HypGammaEngine: {e}")
-                logger.error(traceback.format_exc())
+                _etype = type(e).__name__
+                logger.error(f"Failed to initialize HypGammaEngine: {_etype}")
                 # M-1 FIX: Clear _instance on failure so retry is possible
                 HypGammaEngine._instance = None
                 raise HypEngineError(
-                    f"Engine initialization failed: {str(e)}",
-                    {'traceback': traceback.format_exc()}
+                    f"Engine initialization failed: {_etype}",
+                    {'error_type': _etype}
                 )
 
     @classmethod
@@ -667,16 +683,21 @@ class HypGammaEngine:
         try:
             logger.debug("Generating keypair...")
 
-            # Sample private key (512 random walk indices)
-            walk_indices = [secrets.randbelow(N_GENERATORS) for _ in range(WALK_LENGTH)]
+            from hyp_finite_field import (
+                random_walk, walk_to_hex, evaluate_walk,
+                get_schnorr_generator, walk_to_private_scalar,
+                walk_to_encryption_scalar, get_encryption_generator,
+            )
 
-            # I-1 FIX (RED TEAM): Use binary-packed encoding via walk_to_hex()
+            # Sample private key (512 random walk indices)
             walk_indices = random_walk(WALK_LENGTH, reduced=True)
             private_key_hex = walk_to_hex(walk_indices)
-            public_matrix = evaluate_walk(walk_indices)
 
-            # Serialize and hash
-            public_key_hex = self._serialize_psl_matrix(public_matrix)
+            # CRIT-A FIX: public key y = g ^ x  where x = scalar derived from walk
+            g = get_schnorr_generator()
+            x = walk_to_private_scalar(walk_indices)
+            public_matrix = g ** x
+            public_key_hex = public_matrix.hex()
             address = self._derive_address_from_public_key(public_key_hex)
 
             keypair = HypKeyPair(
@@ -701,16 +722,17 @@ class HypGammaEngine:
 
     def sign_hash(self, message_hash: bytes, private_key: str) -> Dict[str, str]:
         """
-        Sign a message hash using Schnorr-Γ.
+        Sign a message hash using Schnorr-Γ over SL(2,p) (v3 scalar construction).
 
         The signature is computed as follows:
-          1. Sample nonce walk r (512 random steps)
-          2. Compute commitment R = evaluate_walk(r)
-          3. Challenge c = H(serialize(R) ‖ message_hash) mod 2^256
-          4. Response Z = R · y^c (matrix power using eigendecomposition)
-          5. Return (R, Z, c) as the signature
+          1. Derive scalar private key x = SHA3-256(walk || "SIGN")
+          2. Sample nonce r ← [0, 2^256)
+          3. Compute commitment R = g^r
+          4. Challenge c = SHA3-256(serialize(R) ‖ serialize(y) ‖ message_hash) mod 2^256
+          5. Response s = r + c·x mod p
+          6. Return (R, Z=g^s, c, s) as the signature
 
-        The signature is valid iff H(Z · y^{-c} ‖ message_hash) == c.
+        Verification: g^s == R @ y^c  (matrix equality in SL(2,p))
 
         Parameters:
             message_hash (bytes): SHA3-256 hash of the message (32 bytes).
@@ -720,7 +742,7 @@ class HypGammaEngine:
             dict with keys:
               'signature': hex(R‖Z) — commitment + response (≈4000 bits)
               'challenge': hex(c) — 256-bit Fiat-Shamir challenge
-              'auth_tag': hex(c) — backward compat (same as challenge)
+              'auth_tag': hex(c) — alias of challenge
               'timestamp': ISO 8601 creation time
 
         Raises:
@@ -739,8 +761,11 @@ class HypGammaEngine:
             walk_indices = self._deserialize_walk_indices(private_key)
 
             # Q-3 FIX (RED TEAM): Derive the public key ONCE here
-            with self._lock:
-                public_matrix = evaluate_walk(walk_indices)
+            # CRIT-A FIX: public key = g ^ x  where g is fixed generator, x = scalar from walk
+            from hyp_finite_field import get_schnorr_generator, walk_to_private_scalar
+            g = get_schnorr_generator()
+            x_sign = walk_to_private_scalar(walk_indices)
+            public_matrix = g ** x_sign
 
             # Sign using Schnorr-Γ
             with self._lock:
@@ -758,11 +783,12 @@ class HypGammaEngine:
                 'challenge': sig.get('challenge', ''),
                 'auth_tag': sig.get('auth_tag', sig.get('challenge', '')),
                 'timestamp': timestamp,
-                # Canonical fields — MUST survive serialization for signature_from_dict
+                # Canonical fields
                 'R': sig.get('R', {}),
                 'Z': sig.get('Z', {}),
                 'c_full': sig.get('c_full', sig.get('challenge', '')),
                 'c_exp': sig.get('c_exp', 0),
+                's_scalar': sig.get('s_scalar', 0),
                 'R_canonical_hex': sig.get('R_canonical_hex', ''),
                 'R_canonical': sig.get('R_canonical', sig.get('R_canonical_hex', '')),
             }
@@ -783,10 +809,9 @@ class HypGammaEngine:
     def verify_signature(self, message_hash: bytes, sig: Dict[str, str],
                          public_key: str) -> bool:
         """
-        Verify a Schnorr-Γ signature.
+        Verify a Schnorr-Γ signature (v3 scalar construction).
 
-        Verification recomputes R' = Z · y^{-c} and checks that
-        H(serialize(R') ‖ message_hash) == c.
+        Verification checks: g^s == R @ y^c  (matrix equality in SL(2,p)).
 
         Parameters:
             message_hash (bytes): SHA3-256 hash of the message (32 bytes).
@@ -806,13 +831,11 @@ class HypGammaEngine:
             if not isinstance(sig, dict):
                 raise ValueError("sig must be a dict")
 
-            # Accept canonical format (R, Z, c_full) OR legacy wire format (signature, challenge).
-            # Do NOT gate here on wire-only keys — signature_from_dict handles both paths.
-            _has_canonical = 'R' in sig and 'Z' in sig and 'c_full' in sig
-            _has_wire = 'signature' in sig and 'challenge' in sig
-            if not _has_canonical and not _has_wire:
+            # V3-ONLY: require canonical format (R, Z, c_full) — legacy wire format rejected
+            if not ('R' in sig and 'Z' in sig and 'c_full' in sig):
                 raise ValueError(
-                    "sig missing required keys: need (R, Z, c_full) or (signature, challenge)"
+                    "sig missing required canonical keys: need (R, Z, c_full). "
+                    "Legacy wire format (signature, challenge) is deprecated."
                 )
 
             logger.debug(f"Verifying signature: {sig.get('challenge', '?')[:16]}...")
@@ -970,10 +993,12 @@ class HypGammaEngine:
 
             walk_indices = self._deserialize_walk_indices(private_key)
 
-            with self._lock:
-                public_matrix = evaluate_walk(walk_indices)
+            from hyp_finite_field import get_schnorr_generator, walk_to_private_scalar
+            g = get_schnorr_generator()
+            x = walk_to_private_scalar(walk_indices)
+            public_matrix = g ** x
 
-            public_key_hex = self._serialize_psl_matrix(public_matrix)
+            public_key_hex = public_matrix.hex()
 
             logger.debug(f"✓ Public key derived")
             return public_key_hex
@@ -1004,6 +1029,135 @@ class HypGammaEngine:
             return self._derive_address_from_public_key(public_key)
         except Exception as e:
             raise HypEngineError(f"Could not derive address: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # §2g  HYBRID PQC OPERATIONS (Falcon-512 + SL(2,p))
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def generate_hybrid_keypair(self) -> Dict[str, Any]:
+        """
+        Generate a hybrid keypair: SL(2,p) scalar Schnorr + Falcon-512.
+
+        Returns dict with:
+          'sl2p': {private_key, public_key, address}
+          'falcon': {public_key_b64, secret_key_b64}
+          'version': 'hybrid_sl2p_falcon_v1'
+        """
+        if not _MODULES_AVAILABLE.get('hyp_pqc'):
+            raise HypEngineError(
+                "Hybrid PQC not available — install pqcrypto",
+                {'install': 'pip install pqcrypto'}
+            )
+        try:
+            kp = _pqc_generate_keypair()
+            return hybrid_keypair_to_dict(kp)
+        except Exception as e:
+            raise HypEngineError(
+                f"Hybrid keypair generation failed: {type(e).__name__}",
+                {'error_type': type(e).__name__}
+            )
+
+    def hybrid_sign(self, message_hash: bytes, private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sign with hybrid scheme: BOTH SL(2,p) and Falcon-512 must verify.
+
+        Parameters:
+            message_hash: 32-byte SHA3-256 hash
+            private_key_dict: dict from generate_hybrid_keypair() (includes secret keys)
+
+        Returns:
+            dict with hybrid signature (JSON-compatible)
+        """
+        if not _MODULES_AVAILABLE.get('hyp_pqc'):
+            raise HypEngineError("Hybrid PQC not available")
+        try:
+            if not isinstance(message_hash, bytes) or len(message_hash) != 32:
+                raise ValueError("message_hash must be 32 bytes")
+
+            kp = hybrid_keypair_from_dict(private_key_dict)
+            sig = _pqc_hybrid_sign(
+                message_hash,
+                kp.sl2p_private_hex,
+                kp.sl2p_public_hex,
+                kp.falcon_secret_key,
+            )
+            return hybrid_signature_to_dict(sig)
+        except HypEngineError:
+            raise
+        except Exception as e:
+            raise HypEngineError(
+                f"Hybrid sign failed: {type(e).__name__}",
+                {'error_type': type(e).__name__}
+            )
+
+    def hybrid_verify(
+        self,
+        message_hash: bytes,
+        sig_dict: Dict[str, Any],
+        public_key_dict: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Verify hybrid signature: BOTH SL(2,p) and Falcon-512 must be valid.
+
+        Parameters:
+            message_hash: 32-byte SHA3-256 hash
+            sig_dict: hybrid signature dict from hybrid_sign()
+            public_key_dict: public key dict (no secrets)
+
+        Returns:
+            (valid, reason) — valid=True only if BOTH signatures pass
+        """
+        if not _MODULES_AVAILABLE.get('hyp_pqc'):
+            return False, "hybrid_pqc_not_available"
+        try:
+            if not isinstance(message_hash, bytes) or len(message_hash) != 32:
+                return False, "invalid_message_hash"
+
+            sig = hybrid_signature_from_dict(sig_dict)
+            sl2p_pub_hex = public_key_dict["sl2p"]["public_hex"]
+            falcon_pk_b64 = public_key_dict["falcon"]["public_key"]
+            import base64
+            falcon_pk = base64.b64decode(falcon_pk_b64)
+
+            return _pqc_hybrid_verify(message_hash, sig, sl2p_pub_hex, falcon_pk)
+        except Exception as e:
+            return False, f"hybrid_verify_error:{type(e).__name__}"
+
+    def sign_block_hybrid(self, block_dict: Dict[str, Any], private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sign a block with hybrid PQC scheme.
+
+        Parameters:
+            block_dict: block data
+            private_key_dict: from generate_hybrid_keypair()
+
+        Returns:
+            hybrid signature dict with signer_address
+        """
+        canonical_json = json.dumps(block_dict, sort_keys=True, separators=(',', ':'))
+        block_hash = hashlib.sha3_256(canonical_json.encode()).digest()
+        sig_dict = self.hybrid_sign(block_hash, private_key_dict)
+        try:
+            sl2p_pub = private_key_dict["sl2p"]["public_hex"]
+            sig_dict['signer_address'] = self._derive_address_from_public_key(sl2p_pub)
+        except Exception:
+            pass
+        return sig_dict
+
+    def verify_block_hybrid(
+        self,
+        block_dict: Dict[str, Any],
+        sig_dict: Dict[str, Any],
+        public_key_dict: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Verify a block signed with hybrid PQC."""
+        canonical_json = json.dumps(block_dict, sort_keys=True, separators=(',', ':'))
+        block_hash = hashlib.sha3_256(canonical_json.encode()).digest()
+        return self.hybrid_verify(block_hash, sig_dict, public_key_dict)
+
+    def pqc_status(self) -> Dict[str, Any]:
+        """Return PQC module status."""
+        return pqc_status()
 
     # ─────────────────────────────────────────────────────────────────────────────
     # §2e  ENCRYPTION OPERATIONS (Optional, for full system integration)
@@ -1046,13 +1200,13 @@ class HypGammaEngine:
 
         Key Derivation Function (KDF) design:
           seed = SHA3-256(walk_bytes)                     — compress 512-step walk
-          lwe_seed = SHA3-256(seed ‖ b"QTCL_LWE_KEYGEN_v1")   — domain-separated
+          lwe_seed = SHA3-256(seed ‖ b"QTCL_LWE_KEYGEN_v3")   — domain-separated (v3-only)
           GeodesicLWE.generate_keypair_from_seed(lwe_seed)
 
-        The domain separator b"QTCL_LWE_KEYGEN_v1" binds the derived key to:
+        The domain separator b"QTCL_LWE_KEYGEN_v3" binds the derived key to:
           • this specific cryptosystem (QTCL)
           • this specific role (LWE encryption, not signing)
-          • this specific version (v1, allowing future rotation via v2 etc.)
+          • this specific version (v3 — ElGamal KEM in SL(2,p), no backward compat)
 
         Security:
           • Given only the LWE public key, recovering the Schnorr private key
@@ -1085,12 +1239,15 @@ class HypGammaEngine:
 
             # Two-round KDF: compress then domain-separate
             compressed = hashlib.sha3_256(walk_bytes).digest()                        # 32 bytes
-            lwe_seed = hashlib.sha3_256(compressed + b"QTCL_LWE_KEYGEN_v1").digest() # 32 bytes
+            lwe_seed = hashlib.sha3_256(compressed + b"QTCL_LWE_KEYGEN_v3").digest() # 32 bytes
 
             # Derive signing pubkey fragment for audit (never stored, display only)
             with self._lock:
-                pub_matrix = evaluate_walk(walk_indices)
-            derived_from = self._serialize_psl_matrix(pub_matrix)[:16]
+                from hyp_finite_field import get_schnorr_generator, walk_to_private_scalar
+                g = get_schnorr_generator()
+                x_sign = walk_to_private_scalar(walk_indices)
+                pub_matrix = g ** x_sign
+            derived_from = pub_matrix.hex()[:16]
 
             with self._lock:
                 if self._lwe is None:
@@ -1175,14 +1332,15 @@ class HypGammaEngine:
         except HypEngineError:
             raise
         except Exception as e:
-            logger.error(f"Encryption failed: {e}\n{traceback.format_exc()}")
+            _etype = type(e).__name__
+            logger.error(f"Encryption failed: {_etype}")
             raise HypEngineError(
-                f"Encryption failed: {str(e)}",
+                f"Encryption failed: {_etype}",
                 {
                     'operation': 'encrypt',
                     'public_key_len': len(public_key) if public_key else 0,
                     'message_len': len(message) if message else 0,
-                    'traceback': traceback.format_exc()
+                    'error_type': _etype
                 }
             )
 
@@ -1221,14 +1379,15 @@ class HypGammaEngine:
         except HypEngineError:
             raise
         except Exception as e:
-            logger.error(f"Decryption failed: {e}\n{traceback.format_exc()}")
+            _etype = type(e).__name__
+            logger.error(f"Decryption failed: {_etype}")
             raise HypEngineError(
-                f"Decryption failed: {str(e)}",
+                f"Decryption failed: {_etype}",
                 {
                     'operation': 'decrypt',
                     'private_key_len': len(private_key) if private_key else 0,
                     'ciphertext_keys': list(ciphertext.keys()) if ciphertext else [],
-                    'traceback': traceback.format_exc()
+                    'error_type': _etype
                 }
             )
 
@@ -1289,8 +1448,9 @@ class HypGammaEngine:
         except ImportError as e:
             raise HypEngineError(f"Password encryption unavailable: {e}")
         except Exception as e:
-            logger.error(f"Password encryption failed: {e}\n{traceback.format_exc()}")
-            raise HypEngineError(f"Password encryption failed: {str(e)}")
+            _etype = type(e).__name__
+            logger.error(f"Password encryption failed: {_etype}")
+            raise HypEngineError(f"Password encryption failed: {_etype}")
 
     def decrypt_with_password(self, encrypted_dict: Dict[str, str], password: str) -> bytes:
         """
@@ -1313,8 +1473,9 @@ class HypGammaEngine:
             # Password error - don't expose which field was invalid
             raise HypEngineError(f"Password verification failed: {str(e)}")
         except Exception as e:
-            logger.error(f"Password decryption failed: {e}\n{traceback.format_exc()}")
-            raise HypEngineError(f"Password decryption failed: {str(e)}")
+            _etype = type(e).__name__
+            logger.error(f"Password decryption failed: {_etype}")
+            raise HypEngineError(f"Password decryption failed: {_etype}")
 
     # ─────────────────────────────────────────────────────────────────────────────
     # §2e-bis  ALIAS BRIDGE — server.py / oracle.py compatibility shim
@@ -1331,7 +1492,7 @@ class HypGammaEngine:
 
     def encrypt_message(self, message: bytes, public_key: str) -> Dict[str, Any]:
         """
-        Alias for encrypt() — backward-compatible shim for server.py / oracle.py.
+        Alias for encrypt() — canonical name for server.py / oracle.py.
 
         server.py historically called engine.encrypt_message(msg, pub_key); the
         canonical DPS-420 method is engine.encrypt(msg, pub_key).  Both are
@@ -1362,7 +1523,7 @@ class HypGammaEngine:
 
     def decrypt_message(self, ciphertext: Dict[str, Any], private_key: str) -> bytes:
         """
-        Alias for decrypt() — backward-compatible shim for server.py / oracle.py.
+        Alias for decrypt() — canonical name for server.py / oracle.py.
 
         server.py historically called engine.decrypt_message(ct_dict, priv_key);
         the canonical DPS-420 method is engine.decrypt(ct_dict, priv_key).
@@ -1733,26 +1894,27 @@ def run_tests():
         failed += 1
 
     # ─────────────────────────────────────────────────────────────────────────────
-    # TEST 8: Backward compatibility (dict keys)
+    # TEST 8: V3 canonical signature dict keys
     # ─────────────────────────────────────────────────────────────────────────────
 
     try:
-        print("\n[TEST 8] Backward compatibility (signature dict keys)")
+        print("\n[TEST 8] V3 canonical signature dict keys")
         engine = HypGammaEngine()
         kp = engine.generate_keypair()
 
-        msg_hash = engine.hash_message(b"Compat test")
+        msg_hash = engine.hash_message(b"V3 canonical test")
         sig = engine.sign_hash(msg_hash, kp.private_key)
 
-        # Check all required keys for backward compat with hlwe_engine.py
-        required_keys = ['signature', 'challenge', 'auth_tag', 'timestamp']
+        # Check all required v3 canonical keys
+        required_keys = ['signature', 'challenge', 'auth_tag', 'timestamp',
+                         'R', 'Z', 'c_full', 's_scalar', 'R_canonical_hex']
         for key in required_keys:
             assert key in sig, f"Missing key: {key}"
 
-        # Check auth_tag == challenge (backward compat)
+        # Check auth_tag == challenge
         assert sig['auth_tag'] == sig['challenge'], "auth_tag != challenge"
 
-        print(f"  ✓ PASS: Backward compatibility maintained")
+        print(f"  ✓ PASS: V3 canonical keys present")
         print(f"    Keys: {', '.join(sig.keys())}")
         passed += 1
     except Exception as e:
