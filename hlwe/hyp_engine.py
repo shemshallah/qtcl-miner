@@ -900,8 +900,11 @@ class HypGammaEngine:
             return sig_dict
 
         except Exception as e:
-            logger.error(f"Block sign failed: {e}")
-            raise HypEngineError(f"Could not sign block: {str(e)}")
+            logger.error(f"Block sign failed: {type(e).__name__}")
+            raise HypEngineError(
+                f"Could not sign block: {type(e).__name__}",
+                {'error_type': type(e).__name__}
+            )
 
     def verify_block(self, block_dict: Dict[str, Any], sig: Dict[str, str],
                      public_key: str) -> Tuple[bool, str]:
@@ -1167,7 +1170,6 @@ class HypGammaEngine:
                 result['dps'] = '420'
                 result['period'] = '22'
                 result['timestamp'] = datetime.now(timezone.utc).isoformat()
-                result['message_length'] = len(message)  # Track actual message length
                 
             return result
         except HypEngineError:
@@ -1209,8 +1211,8 @@ class HypGammaEngine:
                 # Ciphertext validation
                 if not ciphertext or not isinstance(ciphertext, dict):
                     raise ValueError("Ciphertext must be a non-empty dict")
-                if 'ciphertext' not in ciphertext:
-                    raise ValueError("Ciphertext dict missing 'ciphertext' field")
+                if 'ciphertext_hex' not in ciphertext:
+                    raise ValueError("Ciphertext dict missing 'ciphertext_hex' field")
 
                 # Delegate to GeodesicLWE with full error correction
                 plaintext = self._lwe.decrypt(ciphertext, private_key)
@@ -1244,11 +1246,16 @@ class HypGammaEngine:
             dict with 'ciphertext', 'error_weight', 'ldpc_coupled', metadata
         """
         try:
+            # MED-4 FIX (RED TEAM): Ensure encryption subsystem BEFORE acquiring lock,
+            # consistent with encrypt()/decrypt() patterns.
+            if error_weight < 0 or error_weight > 8:
+                raise ValueError(f"error_weight must be in [0,8], got {error_weight}")
+            
+            self._ensure_encryption_subsystem()
             with self._lock:
-                if error_weight < 0 or error_weight > 8:
-                    raise ValueError(f"error_weight must be in [0,8], got {error_weight}")
-                
-                result = self.encrypt(message, public_key)
+                if self._lwe is None:
+                    raise RuntimeError("GeodesicLWE not initialized after _ensure")
+                result = self._lwe.encrypt(message, public_key)
                 result['error_weight'] = error_weight
                 result['ldpc_coupled'] = True
                 
@@ -1330,13 +1337,15 @@ class HypGammaEngine:
         canonical DPS-420 method is engine.encrypt(msg, pub_key).  Both are
         identical in semantics and return the same ciphertext dict structure:
           {
-            'ciphertext':     str,   # hex-encoded KEM encapsulation + AES-GCM blob
-            'nonce':          str,   # hex-encoded 96-bit GCM nonce
-            'tag':            str,   # hex-encoded 128-bit GCM auth tag
-            'dps':            '420',
-            'period':         '22',
-            'timestamp':      str,   # ISO 8601 UTC
-            'message_length': int,
+            'kem_ciphertext_hex': str,   # hex-encoded masked kem_error
+            'public_key_hex':     str,   # public key needed for unmasking
+            'kem_nonce_hex':      str,   # nonce for kem_unmasking
+            'nonce_hex':          str,   # nonce for message AEAD
+            'ciphertext_hex':     str,   # hex-encoded AEAD ciphertext
+            'tag_hex':            str,   # authentication tag
+            'dps':                '420',
+            'period':             '22',
+            'timestamp':          str,   # ISO 8601 UTC
           }
 
         Parameters:
@@ -1417,7 +1426,7 @@ class HypGammaEngine:
         envelope: Dict[str, Any] = self.encrypt(message, public_key)
         import hashlib as _hl
         commitment = _hl.sha3_256(
-            envelope.get("ciphertext", "").encode()
+            envelope.get("ciphertext_hex", "").encode()
         ).hexdigest()
         envelope["ibm_commitment"] = commitment
         envelope["ibm_attested"] = False
@@ -1470,21 +1479,18 @@ class HypGammaEngine:
         """
         Deserialize private key string back to walk indices.
 
-        I-1 FIX (RED TEAM): Supports BOTH encoding formats:
-          - New (binary-packed): hex string from walk_to_hex() — 128 hex chars for 512 steps
-            Each byte packs 4 indices at 2 bits each.
-          - Legacy (decimal-string): '01230132...' — 512 chars, each '0'-'3'
-            Detected by length (512 chars = decimal, 256 chars = hex for 512 steps).
-
-        Parameters:
-            hex_str (str): Private key in either encoding format.
-
-        Returns:
-            list: Walk indices in range [0, 3].
+        MED-5 FIX (RED TEAM): Prefix detection — "GF1:" prefix identifies
+        binary-packed format, unambiguous and forward-compatible.
+        
+        Fallback heuristic: if all chars are in '0123' and length matches,
+        it's the old decimal encoding. Otherwise treat as hex.
         """
+        # Explicit format prefix (MED-5 FIX)
+        if hex_str.startswith("GF1:"):
+            return hex_to_walk(hex_str[4:], length=WALK_LENGTH)
+        
         # Heuristic: if all chars are in '0123' and length matches walk length,
-        # it's the old decimal encoding. Binary-packed hex for 512 steps is
-        # 128 bytes = 256 hex chars, which would contain 'a'-'f' in general.
+        # it's the old decimal encoding.
         is_decimal = len(hex_str) == WALK_LENGTH and all(c in '0123' for c in hex_str)
 
         if is_decimal:

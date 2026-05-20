@@ -2,14 +2,14 @@
 """
 hyp_finite_field.py — Finite-Field Schnorr-Γ over GF(p)
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  Post-Quantum Secure: 2×2 matrices over GF(p) with the {8,3} triangle   ║
-║  group presentation.  Matrix exponentiation is EXACT (modular),          ║
+║  Post-Quantum Secure: 2×2 matrices over GF(p) with random generators     ║
+║  in SL(2,p).  Matrix exponentiation is EXACT (modular),                  ║
 ║  enabling the full 256-bit Fiat-Shamir challenge in the Schnorr-Γ       ║
 ║  signature protocol.                                                      ║
 ║                                                                           ║
 ║  Prime: p = 2^255 - 31  (≡ 1 mod 24, √2 and ω₃ both in GF(p))          ║
 ║  Group: SL(2,p) — 2×2 matrices mod p with det ≡ 1                       ║
-║  Generators: a (order 8), b (order 3), satisfying (ab)² = I            ║
+║  Generators: Two random SL(2,p) elements g₁, g₂ (deterministic from seed)║
 ║                                                                           ║
 ║  Hard Problem: Word Problem / Matrix DL in SL(2,p) — non-abelian HSP    ║
 ║  not known to be solvable by quantum algorithms (no abelian hidden       ║
@@ -217,7 +217,7 @@ class GFMatrix:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# {8,3} TRIANGLE GROUP GENERATORS OVER GF(p)
+# SL(2,p) WALK GENERATORS OVER GF(p)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _GENS_CACHE: Optional[dict] = None
@@ -339,18 +339,27 @@ def evaluate_walk(walk: list) -> GFMatrix:
 
 
 def walk_to_hex(walk: list) -> str:
-    """Pack walk indices (2 bits each, 4 per byte) into hex string."""
+    """Pack walk indices (2 bits each, 4 per byte) into hex string.
+    
+    MED-5 FIX (RED TEAM): Prefix with "GF1:" format marker to disambiguate
+    binary-packed encoding from legacy decimal-string encoding.
+    """
     padded = walk + [0] * ((-len(walk)) % 4)
     result = bytearray()
     for i in range(0, len(padded), 4):
         byte = ((padded[i] << 6) | (padded[i+1] << 4) |
                 (padded[i+2] << 2) | padded[i+3])
         result.append(byte)
-    return result.hex()
+    return "GF1:" + result.hex()
 
 
 def hex_to_walk(hex_str: str, length: int = WALK_LENGTH) -> list:
-    """Unpack hex string back to walk indices."""
+    """Unpack hex string back to walk indices.
+    
+    MED-5 FIX: Strip "GF1:" prefix if present; fall back to raw hex for legacy keys.
+    """
+    if hex_str.startswith("GF1:"):
+        hex_str = hex_str[4:]
     data = bytes.fromhex(hex_str)
     walk = []
     for byte in data:
@@ -375,7 +384,7 @@ def hash_to_walk(challenge: bytes, length: int = WALK_LENGTH) -> list:
 # SCHNORR-Γ OVER GF(p): SIGN AND VERIFY
 # ═══════════════════════════════════════════════════════════════════════════
 
-DOMAIN_TAG = b"HYPGAMMA_GF_SCHNORR_V1_FIAT_SHAMIR\x00"
+DOMAIN_TAG = b"HYPGAMMA_GF_SCHNORR_V2_FIAT_SHAMIR\x00"
 
 class GFSchnorrSignature(NamedTuple):
     R: GFMatrix
@@ -383,155 +392,31 @@ class GFSchnorrSignature(NamedTuple):
     c_full: int        # 256-bit Fiat-Shamir challenge
     R_hex: str         # canonical hex of R for exact binding
 
+# ═══════════════════════════════════════════════════════════════════════════
+# DEPRECATED: gf_sign / gf_verify (CRIT-2 FIX — RED TEAM)
+# These functions used a broken cut-and-choose interleaved walk construction
+# where the per-position consistency check was an empty pass, making verification
+# always succeed regardless of private key knowledge. They are replaced by
+# gf_sign_full / gf_verify_full which use standard Schnorr with full exponent.
+# ═══════════════════════════════════════════════════════════════════════════
+
 def gf_sign(message: bytes, private_walk: list,
             public_key: GFMatrix) -> GFSchnorrSignature:
-    """
-    Schnorr-Γ signature over GF(p).
-
-    Protocol:
-        r_walk = random_walk(512)
-        R = evaluate_walk(r_walk)
-        c_walk = hash_to_walk(SHA3-256(R.serialize() ‖ message))
-        Z_walk = r_walk ‖ c_walk ‖ private_walk (concatenation)
-        Z = evaluate_walk(Z_walk)
-        c_full = int.from_bytes(
-            SHA3-256(DOMAIN_TAG ‖ R.serialize() ‖ message ‖ Z.serialize()), 'big')
-        σ = (R, Z, c_full)
-
-    Note: Z = R · eval(c_walk) · y  (since y = eval(private_walk)).
-    The forger CANNOT compute Z from public info alone because:
-      Z = R @ C @ y  where C = eval(c_walk), y = eval(private_walk)
-    BUT the forger can compute R @ C @ y directly from public matrices!
-    
-    WAIT — the forger CAN compute this. So we use a DIFFERENT construction:
-    
-    z_walk = interleave(r_walk, c_walk, private_walk) using a pseudorandom
-    pattern derived from the challenge. This makes Z non-computable from
-    R, y, C alone, because interleaving ≠ concatenation in a non-abelian group.
-    
-    The verifier checks that Z's interleaved structure is consistent by
-    verifying a partial opening derived from c_full.
-    """
-    # Nonce walk and commitment
-    r_walk = random_walk(WALK_LENGTH, reduced=True)
-    R = evaluate_walk(r_walk)
-
-    # Challenge walk from hash
-    c_walk = hash_to_walk(
-        hashlib.sha3_256(DOMAIN_TAG + R.serialize() + message).digest(),
-        WALK_LENGTH)
-
-    # Response: interleave r_walk, c_walk, private_walk
-    # Pattern: for each position i, select walk from {r, c, x} based on hash
-    selector = hashlib.shake_256(
-        DOMAIN_TAG + R.serialize() + message + b"selector"
-    ).digest(WALK_LENGTH)
-
-    z_walk = []
-    for i in range(WALK_LENGTH):
-        sel = selector[i] % 3
-        if sel == 0:
-            z_walk.append(r_walk[i])
-        elif sel == 1:
-            z_walk.append(c_walk[i])
-        else:
-            z_walk.append(private_walk[i])
-
-    Z = evaluate_walk(z_walk)
-
-    # Full Fiat-Shamir challenge (256-bit, binds R, message, Z)
-    c_full = int.from_bytes(
-        hashlib.sha3_256(
-            DOMAIN_TAG + R.serialize() + message + Z.serialize()
-        ).digest(), "big")
-
-    return GFSchnorrSignature(R=R, Z=Z, c_full=c_full, R_hex=R.hex())
-
+    """DEPRECATED: Broken function removed per CRIT-2 red team finding.
+    Use gf_sign_full() instead."""
+    raise NotImplementedError(
+        "gf_sign removed (CRIT-2): broken cut-and-choose construction. "
+        "Use gf_sign_full() for standard Schnorr-Γ over GF(p)."
+    )
 
 def gf_verify(sig: GFSchnorrSignature, message: bytes,
               public_key: GFMatrix) -> bool:
-    """
-    Verify a Schnorr-Γ signature over GF(p).
-
-    The verifier cannot recompute Z from R, y, C alone (interleaving prevents
-    this). Instead, the verifier checks:
-    
-    1. Z is not trivially related to R (detects identity forgeries)
-    2. The Fiat-Shamir challenge matches: c_full == H(R ‖ m ‖ Z)
-    3. A ZK-style consistency check using the challenge bits to verify
-       that Z's interleaved structure is consistent with R, y, and the
-       challenge walk (derived from c_full).
-    
-    The consistency check:
-      - Recompute c_walk from H(R, m)
-      - For a random subset of positions (determined by c_full), verify
-        that Z's generators match either R's, C's, or y's contributions
-      - Since the forger doesn't know x_walk, they can't correctly answer
-        for positions where x_walk is selected
-    
-    This is a Fiat-Shamir transformed cut-and-choose proof.
-    """
-    R = sig.R
-    Z = sig.Z
-    c_full = sig.c_full
-
-    # Check 1: Z ≠ I and Z ≠ R (trivial forgeries)
-    if Z == GFMatrix.identity() or Z == R:
-        return False
-
-    # Check 2: Fiat-Shamir challenge binding
-    expected_c = int.from_bytes(
-        hashlib.sha3_256(
-            DOMAIN_TAG + R.serialize() + message + Z.serialize()
-        ).digest(), "big")
-    if c_full != expected_c:
-        return False
-
-    # Check 3: Consistency check via challenge-derived positions
-    # Re-derive the interleaving selector and challenge walk
-    c_walk = hash_to_walk(
-        hashlib.sha3_256(DOMAIN_TAG + R.serialize() + message).digest(),
-        WALK_LENGTH)
-    selector = hashlib.shake_256(
-        DOMAIN_TAG + R.serialize() + message + b"selector"
-    ).digest(WALK_LENGTH)
-
-    # Derive verification positions from c_full (first 64 bytes)
-    c_bytes = c_full.to_bytes(32, "big")
-    verify_selector = hashlib.shake_256(c_bytes + b"verify").digest(WALK_LENGTH)
-
-    gens = generator_list()
-
-    # For each verification position, check the walk step
-    for i in range(WALK_LENGTH):
-        if verify_selector[i] >= 192:  # ~25% of positions checked
-            sel = selector[i] % 3
-            # Z was built from: z_walk[i] = r_walk[i] if sel==0,
-            #                     c_walk[i] if sel==1, x_walk[i] if sel==2
-            # We need to verify Z's contribution at position i matches
-            # what it should be given the public key and nonce.
-            #
-            # We can't individually verify position i without knowing
-            # r_walk or x_walk. But we CAN check that the overall structure
-            # is consistent: if the forger replaced a position, the
-            # Z matrix would differ from the honestly-generated one.
-            #
-            # The key check: evaluate the walk formed by replacing position
-            # i in z_walk with each possibility, and verify Z doesn't match
-            # any of them. This is computationally expensive.
-            pass  # Full verification requires the interactive variant
-
-    # Basic consistency: Z ≠ R·y (concatenation would give this)
-    # Z ≠ R·C where C = eval(c_walk)
-    C = evaluate_walk(c_walk)
-    if Z == R @ C:
-        return False
-    if Z == R @ public_key:
-        return False
-    if Z == R @ C @ public_key:
-        return False
-
-    return True
+    """DEPRECATED: Broken function removed per CRIT-2 red team finding.
+    Use gf_verify_full() instead."""
+    raise NotImplementedError(
+        "gf_verify removed (CRIT-2): verification always passed. "
+        "Use gf_verify_full() for standard Schnorr-Γ over GF(p)."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -563,9 +448,13 @@ def gf_sign_full(message: bytes, private_walk: list,
     r_walk = random_walk(WALK_LENGTH, reduced=True)
     R = evaluate_walk(r_walk)
 
-    # Fiat-Shamir: c = H(R ‖ m) — full 256 bits
+    # Fiat-Shamir: c = H(R ‖ pk ‖ m) — full 256 bits
+    # HIGH-3 FIX (RED TEAM): Include public key in the challenge hash to
+    # prevent key-substitution attacks. Standard Schnorr (FIPS 186-5) binds pk.
     c_full = int.from_bytes(
-        hashlib.sha3_256(DOMAIN_TAG + R.serialize() + message).digest(), "big")
+        hashlib.sha3_256(
+            DOMAIN_TAG + R.serialize() + public_key.serialize() + message
+        ).digest(), "big")
 
     # y^c via binary exponentiation (exact modular arithmetic)
     y_c = public_key ** c_full
@@ -587,15 +476,16 @@ def gf_verify_full(sig: GFSchnorrSignature, message: bytes,
     Z = sig.Z
     c_full = sig.c_full
 
-    # Recompute challenge
+    # Recompute challenge (must match gf_sign_full)
+    # HIGH-3 FIX (RED TEAM): Include public key in challenge hash.
     expected_c = int.from_bytes(
-        hashlib.sha3_256(DOMAIN_TAG + R.serialize() + message).digest(), "big")
+        hashlib.sha3_256(
+            DOMAIN_TAG + R.serialize() + public_key.serialize() + message
+        ).digest(), "big")
     if c_full != expected_c:
         return False
 
-    # Compute y^{-c}
-    y_neg_c = public_key ** (-c_full % (P * P))  # negative exponent via modular inverse
-    # Actually: y^{-c} = (y^c)^{-1} = (y^{-1})^c
+    # Compute y^{-c} = (y^{-1})^{c} via modular binary exponentiation
     y_inv = public_key.inverse()
     y_neg_c = y_inv ** c_full
 

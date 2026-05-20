@@ -192,7 +192,7 @@ def verify(sig: SchnorrSignature, message: bytes,
 # DICT INTERFACE — QTCL Block Integration
 # ═══════════════════════════════════════════════════════════════════════════
 
-WIRE_VERSION: str = "schnorr_gamma_gf_v1"
+WIRE_VERSION: str = "schnorr_gamma_gf_v2"
 
 
 def signature_to_dict(sig: SchnorrSignature) -> Dict[str, Any]:
