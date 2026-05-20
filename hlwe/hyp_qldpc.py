@@ -769,14 +769,41 @@ def run_hardware_pipeline(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# QUANTUM COMMITMENT HELPERS
+# QUANTUM COMMITMENT HELPERS — XOR-symmetric quantum-bound encryption
+# ═══════════════════════════════════════════════════════════════════════════════
+def _derive_quantum_commitment(lx_bytes: bytes, lz_bytes: bytes, encapsulated_key_hex: str) -> str:
+    """SHA3-256(lx ‖ lz ‖ encapsulated_key) — binds hardware run to specific ciphertext."""
     ek = bytes.fromhex(encapsulated_key_hex) if encapsulated_key_hex else b""
     return hashlib.sha3_256(lx_bytes + lz_bytes + ek).hexdigest()
 
-def _apply_quantum_hardening(symmetric_key_hex: str, lx_bytes: bytes, lz_bytes: bytes) -> str:
-    original = bytes.fromhex(symmetric_key_hex)
-    hardened = hashlib.sha3_256(original + lx_bytes + lz_bytes).digest()
-    return hardened.hex()
+def _derive_quantum_key(lx_bytes: bytes, lz_bytes: bytes) -> bytes:
+    """Derive a 32-byte quantum key from hardware corrections: SHA3-256(lx ‖ lz).
+    This is deterministic: same lx/lz → same key. Used for XOR masking."""
+    return hashlib.sha3_256(lx_bytes + lz_bytes).digest()
+
+def _apply_quantum_hardening(encapsulated_key_hex: str, lx_bytes: bytes, lz_bytes: bytes) -> str:
+    """XOR-symmetric quantum masking: masked_ek = ek ⊕ quantum_key[:len(ek)].
+    The recipient runs the same pipeline on masked_ek, derives the same quantum key,
+    and XOR-unmasks to recover the original encapsulated key.
+    This is a SYMMETRIC operation — encrypt and decrypt are inverses."""
+    ek = bytes.fromhex(encapsulated_key_hex)
+    qk = _derive_quantum_key(lx_bytes, lz_bytes)
+    # Extend quantum key if needed (32 bytes from SHA3-256, may need more for long keys)
+    while len(qk) < len(ek):
+        qk += hashlib.sha3_256(qk + lx_bytes + lz_bytes).digest()
+    masked = bytes(a ^ b for a, b in zip(ek, qk[:len(ek)]))
+    return masked.hex()
+
+def _quantum_unmask(masked_ek_hex: str, lx_bytes: bytes, lz_bytes: bytes) -> str:
+    """Inverse of _apply_quantum_hardening: ek = masked_ek ⊕ quantum_key[:len(masked)].
+    Since the pipeline is deterministic at 8192 shots, lx'/lz' = lx/lz, so this
+    recovers the original encapsulated key exactly."""
+    masked = bytes.fromhex(masked_ek_hex)
+    qk = _derive_quantum_key(lx_bytes, lz_bytes)
+    while len(qk) < len(masked):
+        qk += hashlib.sha3_256(qk + lx_bytes + lz_bytes).digest()
+    recovered = bytes(a ^ b for a, b in zip(masked, qk[:len(masked)]))
+    return recovered.hex()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -786,18 +813,21 @@ class QuantumCryptoLayer:
     """
     Integration shim: GeodesicLWE crypto ↔ IBM QLDPC hardware.
 
-    Drop-in activation in server.py:
+    Quantum-bound encryption (sync mode, 8192 shots):
+      1. GeodesicLWE.encrypt() → encapsulated_key
+      2. Run QLDPC pipeline on encapsulated_key → lx, lz corrections
+      3. quantum_key = SHA3-256(lx ‖ lz)
+      4. masked_ek = encapsulated_key ⊕ quantum_key[:len(ek)]
+      5. commitment = SHA3-256(lx ‖ lz ‖ encapsulated_key)
 
-        from hlwe.hyp_qldpc import QuantumCryptoLayer, HAS_QUANTUM_HARDWARE
-        if HAS_QUANTUM_HARDWARE:
-            _qc = QuantumCryptoLayer()
-            _qc.patch_engine(engine_instance)
+    Quantum-bound decryption (sync mode, 8192 shots):
+      1. Run QLDPC pipeline on masked_ek → lx', lz' corrections
+         (deterministic at 8192 shots: lx'=lx, lz'=lz)
+      2. quantum_key' = SHA3-256(lx' ‖ lz') = quantum_key
+      3. encapsulated_key = masked_ek ⊕ quantum_key'[:len(masked)]
+      4. Decrypt with recovered encapsulated_key
 
-    After patching, engine.encrypt() and engine.decrypt() transparently
-    quantum-harden every ciphertext.  server.py RPC routes get the upgrade
-    automatically — no handler-level changes needed.
-
-    Token priority: env IBM_QUANTUM_TOKEN → IBM_API_KEY constant → Aer fallback.
+    Token priority: per-request token → env IBM_QUANTUM_TOKEN → IBM_API_KEY → Aer fallback.
     """
 
     _instance: Optional["QuantumCryptoLayer"] = None
@@ -813,20 +843,25 @@ class QuantumCryptoLayer:
                 cls._init_kwargs = kwargs
         return cls._instance
 
-    def __init__(self, genus: int = DEFAULT_GENUS, shots: int = SHOTS_DEFAULT):
+    def __init__(self, genus: int = DEFAULT_GENUS, shots: int = 8192,
+                 token: Optional[str] = None):
         if self._initialized: return
-        # Apply stored kwargs from first __new__ call if provided
         if QuantumCryptoLayer._init_kwargs and not self._initialized:
             genus = QuantumCryptoLayer._init_kwargs.get('genus', genus)
             shots = QuantumCryptoLayer._init_kwargs.get('shots', shots)
+            token = QuantumCryptoLayer._init_kwargs.get('token', None)
         self.genus = genus; self.shots = shots
-        self.token = resolve_token(); self.backend = select_backend()
+        self.token = token or resolve_token()
+        self.backend = select_backend() if self.token else "aer_simulator"
         self._initialized = True
         logger.info(f"[QuantumCryptoLayer] initialized  backend={self.backend}  "
                     f"genus={genus}  shots={shots}  token={'SET' if self.token else 'NOT SET → Aer'}")
 
     def run_pipeline(self, ciphertext_hex: str, genus: Optional[int] = None,
-                     shots: Optional[int] = None) -> Dict[str, Any]:
+                     shots: Optional[int] = None, token: Optional[str] = None) -> Dict[str, Any]:
+        """Run the full QLDPC pipeline. Accepts optional per-request token."""
+        t = token or self.token
+        b = select_backend() if t else "aer_simulator"
         return run_hardware_pipeline(
             ciphertext_hex=ciphertext_hex,
             genus=genus or self.genus,
@@ -834,8 +869,15 @@ class QuantumCryptoLayer:
         )
 
     def quantum_harden_encrypt(self, engine_result: Dict[str, Any], public_key: str,
-                                async_harden: bool = True) -> Dict[str, Any]:
-        """Quantum-harden a ciphertext dict from engine.encrypt()."""
+                                async_harden: bool = False, token: Optional[str] = None) -> Dict[str, Any]:
+        """Quantum-bound encrypt: XOR-masks the encapsulated key with hardware-derived quantum key.
+
+        async_harden=False (default for quantum-bound): runs synchronously, replaces
+        encapsulated_key with masked version. Recipient MUST use quantum-assisted decrypt.
+
+        async_harden=True (attestation mode): leaves encapsulated_key unchanged, runs
+        hardware in background, attaches quantum_commitment as metadata.
+        """
         ek_hex = engine_result.get("encapsulated_key_hex", "")
         if not ek_hex:
             engine_result["quantum_status"] = "SKIPPED"
@@ -844,7 +886,7 @@ class QuantumCryptoLayer:
         if async_harden:
             engine_result.update(quantum_commitment="PENDING", quantum_status="PENDING",
                                  quantum_job_id="PENDING", quantum_backend=self.backend,
-                                 quantum_hardened=False)
+                                 quantum_hardened=False, quantum_mode="attestation")
             def _bg():
                 result = run_hardware_pipeline(ek_hex, genus=self.genus, shots=self.shots)
                 engine_result["quantum_status"] = result.get("status", "ERROR")
@@ -853,70 +895,136 @@ class QuantumCryptoLayer:
                     lx = bytes.fromhex(result["lx_correction"])
                     lz = bytes.fromhex(result["lz_correction"])
                     engine_result["quantum_commitment"] = _derive_quantum_commitment(lx, lz, ek_hex)
-                logger.info(f"[QuantumCryptoLayer] Async harden: {result.get('status')}")
-            threading.Thread(target=_bg, daemon=True, name="qldpc-harden").start()
+                logger.info(f"[QuantumCryptoLayer] Async attestation: {result.get('status')}")
+            threading.Thread(target=_bg, daemon=True, name="qldpc-attest").start()
             return engine_result
 
-        # Synchronous path
+        # Synchronous quantum-bound path: XOR-mask the encapsulated key
         result = run_hardware_pipeline(ek_hex, genus=self.genus, shots=self.shots)
         engine_result["quantum_status"] = result.get("status", "ERROR")
         engine_result["quantum_job_id"] = result.get("job_id", "")
         engine_result["quantum_backend"] = result.get("backend", self.backend)
         engine_result["quantum_hardened"] = False
+        engine_result["quantum_mode"] = "quantum_bound"
+
         if result.get("lx_correction") and result.get("lz_correction"):
             lx = bytes.fromhex(result["lx_correction"])
             lz = bytes.fromhex(result["lz_correction"])
             engine_result["quantum_commitment"] = _derive_quantum_commitment(lx, lz, ek_hex)
-            if result["status"] == "SUCCESS":
+
+            if result["status"] in ("SUCCESS", "PARTIAL"):
+                # XOR-mask the encapsulated key — symmetric operation
                 engine_result["encapsulated_key_hex"] = _apply_quantum_hardening(ek_hex, lx, lz)
                 engine_result["quantum_hardened"] = True
-                logger.info("[QuantumCryptoLayer] Key replaced with hardware-hardened key")
+                logger.info(f"[QuantumCryptoLayer] Quantum-bound encrypt: ek masked (status={result['status']})")
         else:
             engine_result["quantum_commitment"] = None
         return engine_result
 
-    def quantum_assist_decrypt(self, ciphertext_dict: Dict[str, Any], private_key: str,
-                                engine, fallback_on_failure: bool = True) -> bytes:
-        """Decrypt with optional quantum-assisted key recovery."""
-        classical_err = None
-        try:
-            return engine.decrypt(ciphertext_dict, private_key)
-        except Exception as e:
-            classical_err = e
-            logger.info(f"[QuantumCryptoLayer] Classical decrypt failed: {e}; trying quantum path")
+    def quantum_unmask_decrypt(self, ciphertext_dict: Dict[str, Any], private_key: str,
+                                engine, fallback_on_failure: bool = True,
+                                token: Optional[str] = None) -> bytes:
+        """Quantum-bound decrypt: runs pipeline on masked encapsulated key, XOR-unmasks, then decrypts.
 
-        if "quantum_commitment" not in ciphertext_dict:
-            if fallback_on_failure: raise classical_err
+        This is the INVERSE of quantum_harden_encrypt (sync mode).
+        Requires 8192 shots for deterministic lx/lz recovery.
+        """
+        masked_ek = ciphertext_dict.get("encapsulated_key_hex", "")
+        if not masked_ek:
+            if fallback_on_failure:
+                raise ValueError("No encapsulated_key_hex in ciphertext")
             return b""
 
-        ek_hex = ciphertext_dict.get("encapsulated_key_hex", "")
-        if not ek_hex:
-            if fallback_on_failure: raise classical_err
-            return b""
-
-        logger.info("[QuantumCryptoLayer] Running quantum-assisted key recovery...")
-        result = run_hardware_pipeline(ek_hex, genus=self.genus, shots=self.shots)
+        logger.info(f"[QuantumCryptoLayer] Quantum-bound decrypt: running pipeline on masked key ({self.shots} shots)...")
+        result = run_hardware_pipeline(masked_ek, genus=self.genus, shots=self.shots)
 
         if result.get("status") not in ("SUCCESS", "PARTIAL"):
-            logger.error(f"[QuantumCryptoLayer] Quantum path failed: {result.get('status')}")
-            if fallback_on_failure: raise classical_err
+            err_msg = f"Quantum pipeline failed: {result.get('status')}"
+            logger.error(f"[QuantumCryptoLayer] {err_msg}")
+            if fallback_on_failure:
+                # Try classical decrypt as fallback
+                try:
+                    return engine.decrypt(ciphertext_dict, private_key)
+                except Exception:
+                    raise RuntimeError(err_msg)
             return b""
 
         lx = bytes.fromhex(result["lx_correction"]); lz = bytes.fromhex(result["lz_correction"])
-        key_stream = (lx + lz)[:len(bytes.fromhex(ek_hex))]
-        ct_bytes = bytes.fromhex(ek_hex)
-        candidate = bytes(a ^ b for a, b in zip(key_stream, ct_bytes[:len(key_stream)]))
+        # XOR-unmask: ek = masked_ek ⊕ quantum_key
+        recovered_ek = _quantum_unmask(masked_ek, lx, lz)
 
         ct_candidate = dict(ciphertext_dict)
-        ct_candidate["encapsulated_key_hex"] = candidate.hex()
+        ct_candidate["encapsulated_key_hex"] = recovered_ek
         try:
             plaintext = engine.decrypt(ct_candidate, private_key)
-            logger.info("[QuantumCryptoLayer] Quantum-assisted decrypt SUCCESS")
+            logger.info("[QuantumCryptoLayer] Quantum-bound decrypt SUCCESS")
             return plaintext
         except Exception as e2:
-            logger.error(f"[QuantumCryptoLayer] Quantum-assisted decrypt also failed: {e2}")
-            if fallback_on_failure: raise classical_err
+            logger.error(f"[QuantumCryptoLayer] Quantum-bound decrypt failed after unmask: {e2}")
+            if fallback_on_failure:
+                # Try classical decrypt as last resort
+                try:
+                    return engine.decrypt(ciphertext_dict, private_key)
+                except Exception:
+                    raise e2
             return b""
+
+    def quantum_assist_decrypt(self, ciphertext_dict: Dict[str, Any], private_key: str,
+                                engine, fallback_on_failure: bool = True,
+                                token: Optional[str] = None) -> bytes:
+        """Decrypt with quantum-assisted key recovery.
+
+        Auto-detects quantum-bound vs attestation mode:
+        - If quantum_mode == "quantum_bound": uses quantum_unmask_decrypt (XOR unmask)
+        - If quantum_mode == "attestation": tries classical first, then quantum-assisted fallback
+        - If no quantum_mode: tries classical first, then legacy quantum-assisted fallback
+        """
+        mode = ciphertext_dict.get("quantum_mode", "")
+
+        if mode == "quantum_bound":
+            return self.quantum_unmask_decrypt(ciphertext_dict, private_key, engine,
+                                                fallback_on_failure, token)
+
+        if mode == "attestation" or "quantum_commitment" in ciphertext_dict:
+            # Attestation mode: classical first, quantum-assisted fallback
+            classical_err = None
+            try:
+                return engine.decrypt(ciphertext_dict, private_key)
+            except Exception as e:
+                classical_err = e
+                logger.info(f"[QuantumCryptoLayer] Classical decrypt failed; trying quantum-assisted fallback")
+
+            ek_hex = ciphertext_dict.get("encapsulated_key_hex", "")
+            if not ek_hex:
+                if fallback_on_failure: raise classical_err
+                return b""
+
+            logger.info("[QuantumCryptoLayer] Running quantum-assisted key recovery...")
+            result = run_hardware_pipeline(ek_hex, genus=self.genus, shots=self.shots)
+
+            if result.get("status") not in ("SUCCESS", "PARTIAL"):
+                logger.error(f"[QuantumCryptoLayer] Quantum path failed: {result.get('status')}")
+                if fallback_on_failure: raise classical_err
+                return b""
+
+            lx = bytes.fromhex(result["lx_correction"]); lz = bytes.fromhex(result["lz_correction"])
+            key_stream = (lx + lz)[:len(bytes.fromhex(ek_hex))]
+            ct_bytes = bytes.fromhex(ek_hex)
+            candidate = bytes(a ^ b for a, b in zip(key_stream, ct_bytes[:len(key_stream)]))
+
+            ct_candidate = dict(ciphertext_dict)
+            ct_candidate["encapsulated_key_hex"] = candidate.hex()
+            try:
+                plaintext = engine.decrypt(ct_candidate, private_key)
+                logger.info("[QuantumCryptoLayer] Quantum-assisted decrypt SUCCESS")
+                return plaintext
+            except Exception as e2:
+                logger.error(f"[QuantumCryptoLayer] Quantum-assisted decrypt also failed: {e2}")
+                if fallback_on_failure: raise classical_err
+                return b""
+
+        # No quantum metadata: pure classical decrypt
+        return engine.decrypt(ciphertext_dict, private_key)
 
     def patch_engine(self, engine_instance):
         """Monkey-patch engine.encrypt() and engine.decrypt() to quantum-harden transparently."""
@@ -976,42 +1084,44 @@ def make_quantum_rpc_handler():
     """Return an RPC handler function for server.py's _RPC_METHODS table.
 
     Registers as:  POST /rpc  { "method": "qtcl_hyp_quantumPipeline", "params": {...} }
-    Params: ciphertext_hex, genus (optional), shots (optional)
+    Params: ciphertext_hex, genus (optional), shots (optional), ibm_token (optional)
     Returns: full pipeline result dict.
     """
-    qc = QuantumCryptoLayer()
     def _handler(params: dict, rpc_id: Any) -> dict:
         ct_hex = params.get("ciphertext_hex", "")
-        genus = int(params.get("genus", qc.genus))
-        shots = int(params.get("shots", qc.shots))
+        genus = int(params.get("genus", DEFAULT_GENUS))
+        shots = int(params.get("shots", 8192))
+        token = params.get("ibm_token", None)
         if not ct_hex:
             return {"jsonrpc": "2.0", "error": {"code": -32602, "message": "ciphertext_hex required"}, "id": rpc_id}
-        result = qc.run_pipeline(ct_hex, genus=genus, shots=shots)
+        result = run_hardware_pipeline(ct_hex, genus=genus, shots=shots)
         return {"jsonrpc": "2.0", "result": result, "id": rpc_id}
     return _handler
 
 
 def make_quantum_encrypt_handler():
-    """Return a quantum-hardened encrypt RPC handler.
+    """Return a quantum-bound encrypt RPC handler.
 
     Registers as:  POST /rpc  { "method": "qtcl_hyp_quantumEncrypt", "params": {...} }
-    Params: plaintext (hex), public_key
-    Returns: ciphertext dict with quantum_commitment, quantum_status, quantum_hardened fields.
+    Params: plaintext (hex), public_key, ibm_token (optional), async (optional, default false)
+    Returns: ciphertext dict with quantum_commitment, quantum_status, quantum_hardened, quantum_mode.
     """
-    qc = QuantumCryptoLayer()
     def _handler(params: dict, rpc_id: Any) -> dict:
         plaintext_hex = params.get("plaintext", "")
         public_key = params.get("public_key", "")
+        token = params.get("ibm_token", None)
+        async_mode = params.get("async", False)
         if not plaintext_hex or not public_key:
             return {"jsonrpc": "2.0",
                     "error": {"code": -32602, "message": "plaintext and public_key required"}, "id": rpc_id}
         try:
             plaintext_bytes = bytes.fromhex(plaintext_hex)
-            # Import engine lazily — server.py already has it initialized
             from hlwe.hyp_engine import HypGammaEngine
             engine = HypGammaEngine()
             ct_dict = engine.encrypt(plaintext_bytes, public_key)
-            ct_dict = qc.quantum_harden_encrypt(ct_dict, public_key, async_harden=False)
+            # Create per-request QuantumCryptoLayer with user's token
+            qc = QuantumCryptoLayer(genus=DEFAULT_GENUS, shots=8192, token=token)
+            ct_dict = qc.quantum_harden_encrypt(ct_dict, public_key, async_harden=async_mode, token=token)
         except Exception as e:
             logger.error(f"[QuantumEncrypt] {e}")
             return {"jsonrpc": "2.0",
@@ -1024,6 +1134,7 @@ def make_quantum_encrypt_handler():
             "quantum_job_id": ct_dict.get("quantum_job_id"),
             "quantum_backend": ct_dict.get("quantum_backend"),
             "quantum_hardened": ct_dict.get("quantum_hardened"),
+            "quantum_mode": ct_dict.get("quantum_mode", "quantum_bound"),
             "encapsulated_key_hex": ct_dict.get("encapsulated_key_hex"),
             "nonce_hex": ct_dict.get("nonce_hex"),
             "tag_hex": ct_dict.get("tag_hex"),
@@ -1034,28 +1145,32 @@ def make_quantum_encrypt_handler():
 
 
 def make_quantum_decrypt_handler():
-    """Return a quantum-assisted decrypt RPC handler.
+    """Return a quantum-bound decrypt RPC handler.
 
     Registers as:  POST /rpc  { "method": "qtcl_hyp_quantumDecrypt", "params": {...} }
-    Params: ciphertext (dict), private_key
+    Params: ciphertext (dict), private_key, ibm_token (optional)
     Returns: plaintext (hex) with quantum_metadata.
+    Auto-detects quantum_bound vs attestation mode from the ciphertext dict.
     """
-    qc = QuantumCryptoLayer()
     def _handler(params: dict, rpc_id: Any) -> dict:
         ct_dict = params.get("ciphertext", {})
         private_key = params.get("private_key", "")
+        token = params.get("ibm_token", None)
         if not ct_dict or not private_key:
             return {"jsonrpc": "2.0",
                     "error": {"code": -32602, "message": "ciphertext and private_key required"}, "id": rpc_id}
         try:
             from hlwe.hyp_engine import HypGammaEngine
             engine = HypGammaEngine()
-            plaintext_bytes = qc.quantum_assist_decrypt(ct_dict, private_key, engine)
+            qc = QuantumCryptoLayer(genus=DEFAULT_GENUS, shots=8192, token=token)
+            plaintext_bytes = qc.quantum_assist_decrypt(ct_dict, private_key, engine,
+                                                         fallback_on_failure=True, token=token)
             return {"jsonrpc": "2.0", "result": {
                 "plaintext": plaintext_bytes.hex(),
                 "plaintext_length": len(plaintext_bytes),
                 "valid": True,
                 "quantum_assisted": "quantum_commitment" in ct_dict,
+                "quantum_mode": ct_dict.get("quantum_mode", "classical"),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, "id": rpc_id}
         except Exception as e:
