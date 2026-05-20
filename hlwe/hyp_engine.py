@@ -1127,7 +1127,7 @@ class HypGammaEngine:
         """
         return self.derive_lwe_keypair(signing_private_key)['public_key']
 
-
+    def encrypt(self, message: bytes, public_key: str) -> Dict[str, Any]:
         """
         DPS 420 GeodesicLWE encryption with full LDPC error coupling and arbitrary message length.
         
