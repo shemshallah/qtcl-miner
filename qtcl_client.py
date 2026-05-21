@@ -3808,15 +3808,16 @@ class HypKeyPair:
 
 class HypGammaWallet:
     """
-    HypΓ wallet manager — Cathedral-Grade security. Singleton.
+    V3 Hybrid PQC wallet — Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr.
+    Singleton. ALL operations use hybrid signatures — no legacy paths.
 
     SECURITY INVARIANTS:
-      1. Private key NEVER written to disk as plaintext
-      2. Wrong password → hard ValueError (no fallback, no fresh keypair)
+      1. Private keys NEVER written to disk as plaintext
+      2. Wrong password → hard ValueError (no fallback)
       3. Wallet file requires vault_version — invalid files rejected
-      4. Shamir (k,n) secret sharing for peer-based decentralized recovery
-      5. Password verified via HMAC-SHA3 tag BEFORE attempting decryption
-      6. No silent key generation on ANY error path
+      4. Password verified via HMAC-SHA3 tag BEFORE attempting decryption
+      5. No silent key generation on ANY error path
+      6. Hybrid signatures: BOTH SL(2,p) and Falcon-512 must verify
     """
 
     _instance: Optional["HypGammaWallet"] = None
@@ -3836,11 +3837,10 @@ class HypGammaWallet:
             return
         self._initialized = True
         self.engine: Optional[Any] = None
-        self.keypair: Optional[HypKeyPair] = None
+        self.keypair: Optional[Dict[str, Any]] = None  # hybrid keypair dict
         self._loaded = False
         self._seed_hex = seed_hex
         self._password_verified = False
-        self._shamir_shares: Optional[list] = None
 
         wallet_file = Path("data") / "wallet.json"
         if wallet_file.exists():
@@ -3865,34 +3865,30 @@ class HypGammaWallet:
                 logger.critical(f"[HYP-WALLET] FATAL: HypΓ engine unavailable: {e}")
                 raise RuntimeError(f"HypΓ engine init failed: {e}") from e
 
-    def create(self, password: str, enable_shamir: bool = False,
-               shamir_threshold: int = 3, shamir_total: int = 5) -> str:
-        """Create new wallet — private key ENCRYPTED from birth. No plaintext on disk."""
+    def create(self, password: str) -> str:
+        """Create new V3 hybrid wallet — Falcon-512 + SL(2,p). Private keys ENCRYPTED from birth."""
         if not password:
             raise ValueError("[HYP-WALLET] Password REQUIRED")
         self._init_engine()
-        kp = self.engine.generate_keypair()
-        self.keypair = HypKeyPair(public_key=kp.public_key, private_key=kp.private_key, address=kp.address)
-        logger.info(f"[HYP-WALLET] ✅ Generated keypair — address: {self.keypair.address[:16]}...")
+        hk = self.engine.generate_hybrid_keypair()
+        self.keypair = hk
+        logger.info(f"[HYP-WALLET] ✅ Generated hybrid keypair — address: {hk['sl2p']['address'][:16]}...")
         data_dir = Path("data"); data_dir.mkdir(exist_ok=True)
         wallet_path = data_dir / "wallet.json"
         from hyp_lwe import create_wallet_file
-        sh_k = shamir_threshold if enable_shamir else 0
-        sh_n = shamir_total if enable_shamir else 0
-        wallet_dict, shamir_shares = create_wallet_file(
-            self.keypair.address, self.keypair.public_key, self.keypair.private_key,
-            password, sh_k, sh_n)
+        # Encrypt the entire hybrid keypair JSON as the "private key"
         import json as _j
+        full_private_json = _j.dumps(hk)
+        wallet_dict, _ = create_wallet_file(
+            hk['sl2p']['address'], hk['sl2p']['public_hex'], full_private_json,
+            password, 0, 0)
         wallet_path.write_text(_j.dumps(wallet_dict, indent=2))
-        logger.info(f"[HYP-WALLET] ✅ Encrypted wallet saved to {wallet_path}")
+        logger.info(f"[HYP-WALLET] ✅ Encrypted hybrid wallet saved to {wallet_path}")
         self._loaded = True; self._password_verified = True
-        if shamir_shares:
-            self._shamir_shares = shamir_shares
-            logger.info(f"[HYP-WALLET] ✅ Shamir ({shamir_threshold},{shamir_total}) shares generated")
-        return self.keypair.address
+        return hk['sl2p']['address']
 
     def load(self, password: str) -> bool:
-        """Load wallet from encrypted file. RAISES ValueError on wrong password. NO fallback."""
+        """Load hybrid wallet from encrypted file. RAISES ValueError on wrong password."""
         if self.is_loaded(): return True
         wallet_path = self.wallet_file
         if not wallet_path.exists():
@@ -3905,22 +3901,10 @@ class HypGammaWallet:
         self._init_engine()
         from hyp_lwe import load_wallet_file
         data = load_wallet_file(wallet_path, password)
-        self.keypair = HypKeyPair(public_key=data["public_key"],
-                                   private_key=data["private_key"], address=data["address"])
+        # The "private_key" field contains the full hybrid keypair JSON
+        self.keypair = _j.loads(data["private_key"])
         self._loaded = True; self._password_verified = True
-        logger.info(f"[HYP-WALLET] ✅ Wallet unlocked — address: {self.keypair.address[:16]}...")
-        return True
-
-    def load_from_shares(self, shares) -> bool:
-        """Reconstruct from Shamir shares (peer recovery, no password)."""
-        if self.is_loaded(): return True
-        self._init_engine()
-        from hyp_lwe import load_wallet_from_shares
-        data = load_wallet_from_shares(self.wallet_file, shares)
-        self.keypair = HypKeyPair(public_key=data["public_key"],
-                                   private_key=data["private_key"], address=data["address"])
-        self._loaded = True; self._password_verified = True
-        logger.info(f"[HYP-WALLET] ✅ Recovered via Shamir — address: {self.keypair.address[:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ Hybrid wallet unlocked — address: {self.keypair['sl2p']['address'][:16]}...")
         return True
 
     def verify_password(self, password: str) -> bool:
@@ -3942,64 +3926,74 @@ class HypGammaWallet:
         from hyp_lwe import change_wallet_password
         return change_wallet_password(self.wallet_file, old_password, new_password)
 
-    def get_shamir_shares(self): return self._shamir_shares
-    def clear_shamir_shares(self): self._shamir_shares = None
-
-    def sign_message(self, message_hash: bytes) -> Dict[str, str]:
+    def sign_message(self, message_hash: bytes) -> Dict[str, Any]:
+        """Sign with hybrid PQC — BOTH SL(2,p) and Falcon-512."""
         if not self.keypair: raise RuntimeError("No keypair loaded")
-        return self.engine.sign_hash(message_hash, self.keypair.private_key)
+        self._init_engine()
+        return self.engine.hybrid_sign(message_hash, self.keypair)
 
     def sign_transaction(self, tx_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Sign transaction with hybrid PQC."""
         if not self.keypair: raise RuntimeError("No keypair loaded")
         tx_json = json.dumps(tx_dict, sort_keys=True, separators=(",", ":"))
         tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
-        sig = self.engine.sign_hash(tx_hash, self.keypair.private_key)
-        sig["signer_address"] = self.keypair.address
+        sig = self.engine.hybrid_sign(tx_hash, self.keypair)
+        sig["signer_address"] = self.keypair['sl2p']['address']
         return sig
 
-    def verify_signature(self, message_hash: bytes, signature: Dict[str, str]) -> bool:
+    def verify_signature(self, message_hash: bytes, signature: Dict[str, Any], public_key_dict: Dict[str, Any]) -> bool:
+        """Verify hybrid signature — BOTH must pass."""
         if not self.keypair: raise RuntimeError("No keypair loaded")
         try:
-            return self.engine.verify_signature(message_hash, signature, self.keypair.public_key)
+            self._init_engine()
+            valid, _ = self.engine.hybrid_verify(message_hash, signature, public_key_dict)
+            return valid
         except Exception as e:
-            logger.warning(f"[HYP-WALLET] Sig verify failed: {e}")
+            logger.warning(f"[HYP-WALLET] Hybrid sig verify failed: {e}")
             return False
 
-    def get_address(self) -> str: return self.keypair.address if self.keypair else ""
-    def export_keypair(self) -> Dict[str, str]:
+    def get_address(self) -> str:
+        return self.keypair['sl2p']['address'] if self.keypair else ""
+
+    def export_keypair(self) -> Dict[str, Any]:
         if not self._password_verified: raise RuntimeError("Must unlock first")
-        return self.keypair.to_dict() if self.keypair else {}
+        return self.keypair if self.keypair else {}
 
     @property
-    def address(self) -> Optional[str]: return self.keypair.address if self.keypair else None
+    def address(self) -> Optional[str]:
+        return self.keypair['sl2p']['address'] if self.keypair else None
+
     @property
-    def public_key(self) -> Optional[str]: return self.keypair.public_key if self.keypair else None
+    def public_key(self) -> Optional[str]:
+        """Return SL(2,p) public key hex (for backward compat)."""
+        return self.keypair['sl2p']['public_hex'] if self.keypair else None
+
+    @property
+    def public_key_dict(self) -> Optional[Dict[str, Any]]:
+        """Return full hybrid public key dict (for hybrid verification)."""
+        if not self.keypair: return None
+        return {
+            'sl2p': {'public_hex': self.keypair['sl2p']['public_hex'], 'address': self.keypair['sl2p']['address']},
+            'falcon': {'public_key': self.keypair['falcon']['public_key']},
+        }
+
     @property
     def private_key(self) -> Optional[str]:
+        """Return SL(2,p) private walk hex (for backward compat with old signing paths)."""
         if not self._password_verified: return None
-        return self.keypair.private_key if self.keypair else None
+        return self.keypair['sl2p']['private_walk_hex'] if self.keypair else None
+
     @property
     def wallet_file(self) -> Path: return Path("data") / "wallet.json"
     def is_loaded(self) -> bool: return bool(self.keypair) and self._password_verified
 
-    def _decrypt_wallet_data(self, wallet_data: dict, password: str) -> Optional[dict]:
-        """DEPRECATED compat. Use verify_password() or load() instead."""
-        try:
-            enc_pk = wallet_data.get("encrypted_private_key")
-            if not enc_pk: return None
-            from hyp_lwe import verify_wallet_password
-            return wallet_data if verify_wallet_password(enc_pk, password) else None
-        except Exception:
-            return None
-
 class HypGammaEngine:
-    """HypΓ cryptosystem — post-quantum signatures and encryption."""
+    """V3 Hybrid PQC engine — Falcon-512 + SL(2,p). Singleton."""
 
     _instance: Optional["HypGammaEngine"] = None
     _lock = threading.Lock()
 
     def __new__(cls):
-        """Singleton pattern."""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -4008,54 +4002,42 @@ class HypGammaEngine:
         return cls._instance
 
     def _init_hyp(self):
-        """Initialize HypΓ engine."""
         try:
             from hyp_engine import HypGammaEngine as HypEngine
-
             self._hyp_engine = HypEngine()
-            logger.info(
-                "[HYP-ENGINE] ✅ HypΓ engine initialized — Schnorr-Γ + GeodesicLWE active"
-            )
+            logger.info("[HYP-ENGINE] ✅ V3 Hybrid PQC engine initialized — Falcon-512 + SL(2,p)")
         except ImportError as e:
             logger.critical(f"[HYP-ENGINE] FATAL: hyp_engine module not available: {e}")
             raise RuntimeError(f"HypΓ engine initialization failed: {e}") from e
 
-    def generate_keypair(self) -> HypKeyPair:
-        """Generate new HypΓ keypair."""
-        kp = self._hyp_engine.generate_keypair()
-        # kp is a NamedTuple from hyp_engine; convert to client's HypKeyPair
-        return HypKeyPair(
-            public_key=kp.public_key, private_key=kp.private_key, address=kp.address
-        )
+    def generate_keypair(self) -> Dict[str, Any]:
+        """Generate V3 hybrid keypair (Falcon-512 + SL(2,p))."""
+        return self._hyp_engine.generate_hybrid_keypair()
 
-    def sign_hash(self, message_hash: bytes, private_key: str) -> Dict[str, str]:
-        """Sign message hash with HypΓ."""
-        return self._hyp_engine.sign_hash(message_hash, private_key)
+    def sign_hash(self, message_hash: bytes, private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Sign with hybrid PQC."""
+        return self._hyp_engine.hybrid_sign(message_hash, private_key_dict)
 
-    def verify_signature(
-        self, message_hash: bytes, signature: Dict[str, str], public_key: str
-    ) -> bool:
-        """Verify HypΓ signature."""
-        return self._hyp_engine.verify_signature(message_hash, signature, public_key)
+    def verify_signature(self, message_hash: bytes, signature: Dict[str, Any], public_key_dict: Dict[str, Any]) -> bool:
+        """Verify hybrid signature."""
+        valid, _ = self._hyp_engine.hybrid_verify(message_hash, signature, public_key_dict)
+        return valid
 
-    def sign_block(
-        self, block_dict: Dict[str, Any], private_key: str
-    ) -> Dict[str, Any]:
-        """Sign block with HypΓ."""
-        return self._hyp_engine.sign_block(block_dict, private_key)
+    def sign_block(self, block_dict: Dict[str, Any], private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Sign block with hybrid PQC."""
+        return self._hyp_engine.sign_block_hybrid(block_dict, private_key_dict)
 
-    def verify_block(
-        self, block_dict: Dict[str, Any], signature: Dict[str, str], public_key: str
-    ) -> Tuple[bool, str]:
-        """Verify block signature."""
-        return self._hyp_engine.verify_block(block_dict, signature, public_key)
+    def verify_block(self, block_dict: Dict[str, Any], signature: Dict[str, Any], public_key_dict: Dict[str, Any]) -> Tuple[bool, str]:
+        """Verify block hybrid signature."""
+        return self._hyp_engine.verify_block_hybrid(block_dict, signature, public_key_dict)
 
-    def derive_address(self, public_key: str) -> str:
-        """Derive address from public key."""
-        return self._hyp_engine.derive_address(public_key)
+    def derive_address(self, public_key_hex: str) -> str:
+        """Derive address from SL(2,p) public key hex."""
+        return self._hyp_engine.derive_address(public_key_hex)
 
-    def derive_public_key(self, private_key: str) -> str:
-        """Derive public key from private key."""
+    def derive_public_key(self, private_key_hex: str) -> str:
+        """Derive SL(2,p) public key from private walk hex."""
+        return self._hyp_engine.derive_public_key(private_key_hex)
         return self._hyp_engine.derive_public_key(private_key)
 
 
@@ -4232,58 +4214,61 @@ def get_hyp_adapter() -> HypGammaWallet:
     return _HYP_ADAPTER
 
 
-# TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (Drop-in Replacements)
-def hyp_sign_block(block_dict: Dict[str, Any], private_key_hex: str) -> Dict[str, str]:
-    """Sign block (backward compatible) — USE IN blockchain_entropy_mining.py"""
+# TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (V3 Hybrid PQC)
+def hyp_sign_block(block_dict: Dict[str, Any], private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Sign block with V3 hybrid PQC (Falcon-512 + SL(2,p))."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.sign_block(block_dict, private_key_hex)
+        engine = HypGammaEngine()
+        return engine.sign_block(block_dict, private_key_dict)
     except Exception as e:
         logger.error(f"[HypΓ-API] Block signing failed: {e}")
         return {"signature": "", "auth_tag": "", "error": str(e)}
 
 
 def hyp_verify_block(
-    block_dict: Dict[str, Any], signature_dict: Dict[str, str], public_key_hex: str
+    block_dict: Dict[str, Any], signature_dict: Dict[str, Any], public_key_dict: Dict[str, Any]
 ) -> Tuple[bool, str]:
-    """Verify block signature (backward compatible) — USE IN server.py"""
+    """Verify hybrid block signature."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.verify_block(block_dict, signature_dict, public_key_hex)
+        engine = HypGammaEngine()
+        return engine.verify_block(block_dict, signature_dict, public_key_dict)
     except Exception as e:
         logger.error(f"[HypΓ-API] Block verification failed: {e}")
         return False, f"Error: {str(e)}"
 
 
 def hyp_sign_transaction(
-    tx_data: Dict[str, Any], private_key_hex: str
-) -> Dict[str, str]:
-    """Sign transaction (backward compatible) — USE IN mempool.py"""
+    tx_data: Dict[str, Any], private_key_dict: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Sign transaction with V3 hybrid PQC (Falcon-512 + SL(2,p))."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.sign_transaction(tx_data, private_key_hex)
+        wallet = get_wallet_manager()
+        return wallet.sign_transaction(tx_data)
     except Exception as e:
         logger.error(f"[HypΓ-API] TX signing failed: {e}")
         return {"signature": "", "auth_tag": "", "error": str(e)}
 
 
 def hyp_verify_transaction(
-    tx_data: Dict[str, Any], signature_dict: Dict[str, str], public_key_hex: str
+    tx_data: Dict[str, Any], signature_dict: Dict[str, Any], public_key_dict: Dict[str, Any]
 ) -> Tuple[bool, str]:
-    """Verify transaction signature (backward compatible) — USE IN mempool.py/server.py"""
+    """Verify hybrid transaction signature."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.verify_transaction(tx_data, signature_dict, public_key_hex)
+        wallet = get_wallet_manager()
+        tx_json = json.dumps(tx_data, sort_keys=True, separators=(",", ":"))
+        tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
+        valid = wallet.verify_signature(tx_hash, signature_dict, public_key_dict)
+        return (True, "valid") if valid else (False, "invalid_hybrid_signature")
     except Exception as e:
         logger.error(f"[HypΓ-API] TX verification failed: {e}")
         return False, f"Error: {str(e)}"
 
 
 def hyp_derive_address(public_key_hex: str) -> str:
-    """Derive address from public key (backward compatible)"""
+    """Derive address from SL(2,p) public key hex."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.derive_address(public_key_hex)
+        engine = HypGammaEngine()
+        return engine.derive_address(public_key_hex)
     except Exception as e:
         logger.error(f"[HypΓ-API] Address derivation failed: {e}")
         return ""
@@ -4292,10 +4277,16 @@ def hyp_derive_address(public_key_hex: str) -> str:
 def hyp_create_wallet(
     label: Optional[str] = None, passphrase: str = ""
 ) -> Dict[str, Any]:
-    """Create new wallet (backward compatible) — USE IN server.py API endpoint"""
+    """Create new V3 hybrid wallet (Falcon-512 + SL(2,p))."""
     try:
-        adapter = get_hyp_adapter()
-        return adapter.create_wallet(label, passphrase)
+        wallet = get_wallet_manager()
+        addr = wallet.create(passphrase)
+        return {
+            "address": addr,
+            "public_key": wallet.public_key,
+            "public_key_dict": wallet.public_key_dict,
+            "version": "hybrid_sl2p_falcon_v1",
+        }
     except Exception as e:
         logger.error(f"[HypΓ-API] Wallet creation failed: {e}")
         return {"error": str(e)}
@@ -4337,24 +4328,10 @@ def hyp_system_info() -> Dict[str, Any]:
         return {"error": str(e), "status": "unavailable"}
 
 
-# PUBLIC API
+# PUBLIC API — V3 Hybrid PQC ONLY
 __all__ = [
     "HypGammaEngine",
     "HypGammaWallet",
-    "HypKeyPair",
-    "BIP32KeyDerivation",
-    "BIP39Mnemonics",
-    "BIP38Encryption",
-    "LatticeMath",
-    "SupabaseAPI",
-    "BIP32DerivationPath",
-    "WalletMetadata",
-    "StoredAddress",
-    "MnemonicStrength",
-    "AddressType",
-    "LatticeParams",
-    "KeyDerivationParams",
-    "SupabaseConfig",
     "get_wallet_manager",
     "get_hyp_adapter",
     "hyp_sign_block",
@@ -4366,10 +4343,6 @@ __all__ = [
     "hyp_get_wallet_status",
     "hyp_health_check",
     "hyp_system_info",
-    "BIP39_WORDLIST",
-    "BIP39_ENGLISH",
-    "get_word_by_index",
-    "get_index_by_word",
 ]
 
 
@@ -20344,9 +20317,9 @@ class QtclClientApp:
         return result
 
     def _integrate_wallet_send(
-        self, to_address: str, amount: int, private_key: str = ""
+        self, to_address: str, amount: int, private_key_dict: Dict[str, Any] = None
     ) -> str:
-        """Send transaction and log wallet operation with HypΓ."""
+        """Send transaction and log wallet operation with V3 Hybrid PQC."""
         tx_data = {
             "sender": self.wallet.address,
             "recipient": to_address,
@@ -20359,9 +20332,9 @@ class QtclClientApp:
         sig_data = (
             {"signature": "", "auth_tag": ""}
             if not private_key
-            else hyp_sign_transaction(tx_data, private_key)
+            else self.wallet.sign_transaction(tx_data)
         )
-        sig_hex = sig_data.get("signature", "")
+        sig_hex = json.dumps(sig_data)
         self._log_wallet_operation(
             wallet_addr=self.wallet.address,
             op_type="send",
@@ -25484,8 +25457,16 @@ class QtclClientApp:
                                     submit_payload["miner_public_key_hex"] = (
                                         self.wallet.public_key or ""
                                     )
+                                    # v3 hybrid PQC: include full public key dict + flag
+                                    # so server can verify both Falcon-512 and SL(2,p)
+                                    if _sig.get("version") == "hybrid_sl2p_falcon_v1":
+                                        submit_payload["hybrid_pqc"] = True
+                                        _pub_dict = self.wallet.public_key_dict
+                                        if _pub_dict:
+                                            submit_payload["miner_public_key_dict"] = _pub_dict
                                     _EXP_LOG.info(
-                                        f"[MINER] ✅ HypΓ-signed block h={target_height} miner={miner_addr[:16]}…"
+                                        f"[MINER] ✅ {'Hybrid PQC' if _sig.get('version') == 'hybrid_sl2p_falcon_v1' else 'HypΓ'}-signed "
+                                        f"block h={target_height} miner={miner_addr[:16]}…"
                                     )
                                     break
                                 elif _sign_attempt < _sign_retries - 1:
@@ -25561,11 +25542,21 @@ class QtclClientApp:
                     )
 
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
-                    _sig_full = (
-                        _sig.get("signature", "")
-                        if _sig and _sig.get("signature")
-                        else "unsigned"
-                    )
+                    # Extract sig summary for display — hybrid sigs have 'version' + 'sl2p' + 'falcon',
+                    # NOT a top-level 'signature' string. Detect both formats.
+                    if _sig:
+                        if _sig.get("version") == "hybrid_sl2p_falcon_v1":
+                            # Hybrid PQC sig — show version tag + SL(2,p) R-hex prefix
+                            _sl2p_r = _sig.get("sl2p", {}).get("R", "")
+                            _sig_full = f"hybrid_v1:{str(_sl2p_r)[:40]}" if _sl2p_r else "hybrid_v1:signed"
+                        elif _sig.get("signature"):
+                            _sig_full = str(_sig["signature"])
+                        elif _sig.get("R") or _sig.get("R_canonical_hex"):
+                            _sig_full = _sig.get("R_canonical_hex", str(_sig.get("R", "")))[:64]
+                        else:
+                            _sig_full = json.dumps(_sig, default=str)[:64]
+                    else:
+                        _sig_full = "unsigned"
                     _pubkey_full = submit_payload.get("miner_public_key_hex", "") or ""
                     _MINE_TELEM.record_block(
                         {
@@ -26558,12 +26549,9 @@ class QtclClientApp:
             to_addr = input("  To address (qtcl1…): ").strip()
             amount = float(input("  Amount (QTCL): ").strip())
 
-            # Use existing fee structure for network donations
             donate = input("  Donate to the network? [y/N]: ").strip().lower()
             if donate == "y":
-                fee = float(
-                    input("  Donation amount [default 0.001]: ").strip() or "0.001"
-                )
+                fee = float(input("  Donation amount [default 0.001]: ").strip() or "0.001")
             else:
                 fee = 0.0
         except (ValueError, EOFError, KeyboardInterrupt):
@@ -26572,6 +26560,8 @@ class QtclClientApp:
         if not to_addr.startswith("qtcl1"):
             print("  ❌ Invalid QTCL address")
             return
+
+        # V3 HYBRID: build tx with hybrid public key dict
         tx = {
             "from_address": self.wallet.address,
             "to_address": to_addr,
@@ -26580,11 +26570,12 @@ class QtclClientApp:
             "timestamp": time.time(),
             "nonce": int(time.time() * 1000),
             "public_key": self.wallet.public_key or "",
+            "public_key_dict": self.wallet.public_key_dict or {},
             "pq_curr": self.koyeb_state.pq_curr_id,
             "block_height": self.koyeb_state.block_height,
             "w_state_fidelity": self.koyeb_state.w_state_fidelity,
         }
-        # ── SIGNATURE GENERATION (HypΓ CANONICAL) ──────────────────
+        # ── HYBRID SIGNATURE GENERATION (V3 Falcon-512 + SL(2,p)) ──
         if self.wallet.private_key:
             tx_to_sign = {
                 "sender": self.wallet.address,
@@ -26592,18 +26583,15 @@ class QtclClientApp:
                 "amount": float(amount),
                 "nonce": tx["nonce"],
             }
-            sig_dict = hyp_sign_transaction(tx_to_sign, self.wallet.private_key)
-            # wallet.public_key is guaranteed canonical (2048-char lattice key) after
-            # migration in load() — never re-derive here to avoid engine version skew.
-            sig_dict["public_key_hex"] = self.wallet.public_key or ""
+            sig_dict = self.wallet.sign_transaction(tx_to_sign)
             tx["signature"] = _json.dumps(sig_dict)
+            tx["public_key"] = self.wallet.public_key or ""
+            tx["public_key_dict"] = self.wallet.public_key_dict or {}
 
-        # Standard tx_id for display
         tx_id = _hashlib.sha256(_json.dumps(tx, sort_keys=True).encode()).hexdigest()
         tx["tx_id"] = tx_id
 
         import time as _tw
-
         tx["timestamp_ns"] = str(_tw.time_ns())
         result = self.api.submit_transaction(tx)
         if result and result.get("tx_hash"):
@@ -26614,10 +26602,6 @@ class QtclClientApp:
                 f"donation: {result.get('fee', fee):.8f}  │  "
                 f"query: /api/transactions/{srv}"
             )
-            try:
-                pass  # SSE removed - RPC only
-            except Exception:
-                pass
         elif result and result.get("error"):
             err = result.get("error", "unknown rejection")
             code = result.get("code", "")
@@ -28911,27 +28895,10 @@ class QtclClientApp:
                 if not pw:
                     print("  ❌ Password required")
                     continue
-                shamir = False
                 try:
-                    sh = input("  Enable peer recovery (Shamir 3-of-5)? [y/N]: ").strip().lower()
-                    shamir = sh in ("y", "yes")
-                except (EOFError, KeyboardInterrupt):
-                    pass
-                try:
-                    addr = HypGammaWallet().create(pw, enable_shamir=shamir)
-                    print(f"  ✅ Created: {addr}")
-                    if shamir:
-                        shares = HypGammaWallet().get_shamir_shares()
-                        if shares:
-                            print(f"\n  {'═' * 58}")
-                            print(f"  ⚠️   SHAMIR RECOVERY SHARES — distribute to 5 peers")
-                            print(f"  {'═' * 58}")
-                            print(f"  Threshold: 3 of 5 required to recover")
-                            for idx, share in shares:
-                                print(f"  Share {idx}: {share.hex()}")
-                            print(f"  {'═' * 58}")
-                            print(f"  ⚠️  SAVE THESE NOW — they won't be shown again!")
-                            HypGammaWallet().clear_shamir_shares()
+                    addr = HypGammaWallet().create(pw)
+                    print(f"  ✅ Created V3 hybrid wallet: {addr}")
+                    print(f"  🛡 Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
                 except Exception as e:
                     print(f"  ❌ {e}")
             elif ch == "3":
@@ -28942,8 +28909,8 @@ class QtclClientApp:
                 print()
                 print(f"  ── Storage ─────────────────────────────────────────────────")
                 print(f"  wallet.json       : {self.wallet.wallet_file}")
-                print(f"  Encryption        : HypΓ lattice cipher (post-quantum)")
-                print(f"  Threshold scheme  : Shamir (k,n) secret sharing enabled")
+                print(f"  Encryption        : PBKDF2-HMAC-SHA256 (600K) + SHAKE-256-CTR + SHA3-256 MAC")
+                print(f"  Signatures        : V3 Hybrid (Falcon-512 + SL(2,p))")
             elif ch == "4":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
@@ -28957,7 +28924,7 @@ class QtclClientApp:
                         print("\n" + "═" * 60)
                         print("  ⚠️   YOUR PRIVATE KEY — never share")
                         print("═" * 60)
-                        print(f"  {pk}")
+                        print(f"  SL(2,p) walk: {pk}")
                         print("═" * 60)
                         print("  ⚠️  Warning: Anyone with this key controls your funds!")
                     else:
@@ -28979,7 +28946,7 @@ class QtclClientApp:
                         print("\n" + "═" * 60)
                         print("  ⚠️   YOUR PRIVATE KEY — never share")
                         print("═" * 60)
-                        print(f"  {pk}")
+                        print(f"  SL(2,p) walk: {pk}")
                         print("═" * 60)
                         print("  ⚠️  Warning: Anyone with this key controls your funds!")
                     else:
@@ -28989,29 +28956,9 @@ class QtclClientApp:
             elif ch == "5":
                 break
             elif ch == "6":
-                print("\n  🔗 Shamir Peer Recovery")
-                print("  Enter shares from trusted peers. Format: index:hex")
-                shares = []
-                while True:
-                    try:
-                        s = input(f"  Share {len(shares)+1} (or 'done'): ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        break
-                    if s.lower() == "done":
-                        break
-                    try:
-                        idx_s, hex_s = s.split(":", 1)
-                        shares.append((int(idx_s), bytes.fromhex(hex_s)))
-                    except Exception:
-                        print("  ❌ Invalid. Use index:hex (e.g. 1:abcdef...)")
-                if len(shares) >= 2:
-                    try:
-                        HypGammaWallet().load_from_shares(shares)
-                        print(f"  ✅ Wallet recovered: {HypGammaWallet().address}")
-                    except Exception as e:
-                        print(f"  ❌ Recovery failed: {e}")
-                else:
-                    print("  ❌ Need at least 2 shares (typically 3)")
+                print("\n  🔐 V3 Hybrid PQC Wallet")
+                print("  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
+                print("  Shamir recovery removed — backup your wallet.json file securely.")
             elif ch == "0":
                 try:
                     old = getpass.getpass("  Current password: ").strip()
