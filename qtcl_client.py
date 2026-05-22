@@ -3732,13 +3732,14 @@ def _mobius_transport(z: complex, t: float) -> complex:
 
 
 class KeyDerivationParams:
-    """Parameters for hierarchical deterministic key derivation (HypΓ lattice-based)"""
+    """V3 key derivation parameters — PBKDF2-HMAC-SHA256 (600K) + SHAKE-256-CTR + SHA3-256 MAC."""
 
-    HMAC_KEY = b"QTCL HD seed v1"  # BIP32 HMAC key (unified — must match hyp_engine.py)
-    PBKDF2_ITERATIONS = 100_000  # BIP38/BIP39 iterations
-    PBKDF2_SALT_SIZE = 16  # Salt size for key derivation
-    PASSWORD_PROTECTION_ITERATIONS = 100_000  # BIP38 encryption iterations
-    MNEMONIC_ENTROPY_SIZES = [16, 20, 24, 28, 32]  # 128-256 bits (12-24 words)
+    # KDF parameters (must match hyp_lwe.py PBKDF2_ITERATIONS)
+    PBKDF2_ITERATIONS = 600_000   # OWASP 2023 minimum for SHA-256 KDF
+    PBKDF2_SALT_BYTES = 32        # 256-bit random salt
+    PBKDF2_KEY_LEN = 64           # 32 enc + 32 verifier key bytes
+    # Wallet vault version (must match hyp_lwe.VAULT_VERSION)
+    VAULT_VERSION = 2
 
 
 class SupabaseConfig:
@@ -3979,9 +3980,25 @@ class HypGammaWallet:
 
     @property
     def private_key(self) -> Optional[str]:
-        """Return SL(2,p) private walk hex (for backward compat with old signing paths)."""
+        """Return SL(2,p) private walk hex."""
         if not self._password_verified: return None
         return self.keypair['sl2p']['private_walk_hex'] if self.keypair else None
+
+    @property
+    def falcon_public_key(self) -> Optional[str]:
+        """Return Falcon-512 public key as base64 string."""
+        return self.keypair['falcon']['public_key'] if self.keypair else None
+
+    @property
+    def falcon_private_key(self) -> Optional[str]:
+        """Return Falcon-512 secret key as base64 string. Requires unlock."""
+        if not self._password_verified: return None
+        return self.keypair['falcon']['secret_key'] if self.keypair else None
+
+    @property
+    def wallet_version(self) -> Optional[str]:
+        """Return keypair wire version string."""
+        return self.keypair.get('version') if self.keypair else None
 
     @property
     def wallet_file(self) -> Path: return Path("data") / "wallet.json"
@@ -4038,7 +4055,6 @@ class HypGammaEngine:
     def derive_public_key(self, private_key_hex: str) -> str:
         """Derive SL(2,p) public key from private walk hex."""
         return self._hyp_engine.derive_public_key(private_key_hex)
-        return self._hyp_engine.derive_public_key(private_key)
 
 
 class CompactBlockSerializer:
@@ -4160,7 +4176,11 @@ class CompactBlockSerializer:
 
 
 def hyp_handshake_challenge(identity: "P2PIdentity", engine=None) -> dict:
-    """Create a challenge that proves we control the P2P identity's wallet key."""
+    """Create a challenge that proves we control the P2P identity's wallet key.
+
+    Uses the loaded wallet's hybrid keypair (Falcon-512 + SL(2,p)) for signing.
+    Falls back to unsigned challenge if wallet is not loaded.
+    """
     engine = engine or HypGammaEngine()
     nonce = secrets.token_hex(16)
     ts = int(time.time())
@@ -4169,29 +4189,36 @@ def hyp_handshake_challenge(identity: "P2PIdentity", engine=None) -> dict:
         "timestamp": ts,
         "node_id": identity.node_id,
     }
-    # Sign the challenge with a key derived from identity
-    priv_hex = identity.privkey_bytes.hex()
-    msg_hash = hashlib.sha256(json.dumps(challenge, sort_keys=True).encode()).digest()
-    sig = engine.sign_hash(msg_hash, priv_hex)
-    challenge["hyp_sig"] = sig
+    # Sign challenge with hybrid keypair from loaded wallet
+    wallet = HypGammaWallet()
+    if wallet.is_loaded() and wallet.keypair:
+        msg_hash = hashlib.sha3_256(json.dumps(challenge, sort_keys=True).encode()).digest()
+        try:
+            sig = engine.sign_hash(msg_hash, wallet.keypair)
+            challenge["hyp_sig"] = sig
+            challenge["signer_address"] = wallet.address
+        except Exception as _se:
+            logger.debug(f"[HANDSHAKE] Hybrid sign failed: {_se}")
+    else:
+        challenge["hyp_sig"] = None
     return challenge
 
 
 def hyp_verify_handshake_response(
     challenge: dict, response: dict, identity: "P2PIdentity", engine=None
 ) -> bool:
-    """Verify a peer's handshake challenge response."""
+    """Verify a peer's handshake challenge response (hybrid PQC)."""
     engine = engine or HypGammaEngine()
-    # Verify the response contains our original nonce
     if response.get("challenge_nonce") != challenge.get("challenge_nonce"):
         return False
-    # Verify timestamp freshness
     if abs(int(time.time()) - response.get("timestamp", 0)) > 60:
         return False
-    # Verify HypΓ signature
-    priv_hex = identity.privkey_bytes.hex()
-    msg_hash = hashlib.sha256(json.dumps(response, sort_keys=True).encode()).digest()
-    return engine.verify_signature(msg_hash, response.get("hyp_sig", {}), "")
+    sig = response.get("hyp_sig")
+    pub_key_dict = response.get("public_key_dict")
+    if not sig or not pub_key_dict:
+        return False
+    msg_hash = hashlib.sha3_256(json.dumps(response, sort_keys=True).encode()).digest()
+    return engine.verify_signature(msg_hash, sig, pub_key_dict)
 
 
 _HYP_WALLET: Optional[HypGammaWallet] = None
@@ -19308,68 +19335,75 @@ class QtclClientApp:
         try:
             if _id_path.exists():
                 raw = _json.loads(_id_path.read_text())
-                _has_keys = all(
-                    k in raw for k in ("address", "private_key", "public_key")
-                )
-                if _has_keys:
+                # v3: uses "keypair" dict; v2: used "private_key" str
+                _has_keys = ("address" in raw and "public_key" in raw and
+                             ("keypair" in raw or "private_key" in raw))
+                _is_v3 = raw.get("version", 2) >= 3 and "keypair" in raw
+                if _has_keys and _is_v3:
                     if _want_wallet:
                         if (
                             raw.get("mode") == "wallet_bound"
                             and raw.get("wallet_addr") == oracle_context["wallet_addr"]
                         ):
                             _EXP_LOG.info(
-                                f"[ORACLE-ID] wallet-bound loaded  {raw['address']}"
+                                f"[ORACLE-ID] wallet-bound V3 loaded  {raw['address']}"
                             )
                             return raw
                     else:
                         if raw.get("mode", "anonymous") == "anonymous":
                             _EXP_LOG.info(
-                                f"[ORACLE-ID] anonymous loaded  {raw['address']}"
+                                f"[ORACLE-ID] anonymous V3 loaded  {raw['address']}"
                             )
                             return raw
+                elif _has_keys:
+                    # v2 identity on disk — reject, will regenerate as v3
+                    _EXP_LOG.info("[ORACLE-ID] v2 identity on disk — regenerating as v3 hybrid")
         except Exception as _e:
             _EXP_LOG.warning(f"[ORACLE-ID] load failed ({_e}), regenerating")
         # ── Generate new identity ─────────────────────────────────────────────
         if _want_wallet:
-            _wpriv = oracle_context["wallet_priv"]
-            _waddr = oracle_context["wallet_addr"]
+            # Wallet-bound: use the loaded wallet's hybrid keypair directly
+            wallet = HypGammaWallet()
+            if wallet.is_loaded() and wallet.keypair:
+                _waddr = oracle_context["wallet_addr"]
+                public_key = wallet.public_key or ""
+                falcon_pub = wallet.falcon_public_key or ""
+                address = wallet.address or ""
+                cert = self._create_oracle_cert(public_key, _waddr, "")
+                identity = {
+                    "address": address,
+                    "keypair": wallet.keypair,   # full hybrid dict for signing
+                    "public_key": public_key,
+                    "falcon_public_key": falcon_pub,
+                    "wallet_addr": _waddr,
+                    "cert": cert,
+                    "mode": "wallet_bound",
+                    "created_ns": time.time_ns(),
+                    "version": 3,
+                }
+                _EXP_LOG.info(f"[ORACLE-ID] wallet-bound V3 hybrid  {address}  ← {_waddr}")
+            else:
+                _EXP_LOG.warning("[ORACLE-ID] wallet-bound requested but wallet not loaded — falling back to anonymous")
+                _want_wallet = False
+        if not _want_wallet:
+            # Anonymous oracle: generate fresh hybrid keypair for attestations
             engine = HypGammaEngine()
-            # Use wallet's private key directly for oracle (don't hash it - derive_public_key expects walk indices)
-            private_key = _wpriv  # Walk index sequence - already in correct format
-            public_key = engine.derive_public_key(private_key)
-            pub_bytes = bytes.fromhex(public_key)
-            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-            cert = self._create_oracle_cert(public_key, _waddr, _wpriv)
+            keypair_dict = engine.generate_keypair()  # returns hybrid dict
+            address = keypair_dict["sl2p"]["address"]
+            public_key = keypair_dict["sl2p"]["public_hex"]
+            falcon_pub = keypair_dict["falcon"]["public_key"]
             identity = {
                 "address": address,
-                "private_key": private_key,
+                "keypair": keypair_dict,   # full hybrid dict for signing
                 "public_key": public_key,
-                "wallet_addr": _waddr,
-                "cert": cert,
-                "mode": "wallet_bound",
-                "created_ns": time.time_ns(),
-                "version": 2,
-            }
-            _EXP_LOG.info(f"[ORACLE-ID] wallet-bound created  {address}  ← {_waddr}")
-        else:
-            # For anonymous oracle, generate a complete fresh keypair
-            engine = HypGammaEngine()
-            keypair = engine.generate_keypair()
-            private_key = keypair.private_key
-            public_key = keypair.public_key
-            pub_bytes = bytes.fromhex(public_key)
-            address = "qtcl1" + _hashlib.sha3_256(pub_bytes).digest()[:20].hex()
-            identity = {
-                "address": address,
-                "private_key": private_key,
-                "public_key": public_key,
+                "falcon_public_key": falcon_pub,
                 "wallet_addr": None,
                 "cert": None,
                 "mode": "anonymous",
                 "created_ns": time.time_ns(),
-                "version": 2,
+                "version": 3,
             }
-            _EXP_LOG.info(f"[ORACLE-ID] anonymous created  {address}")
+            _EXP_LOG.info(f"[ORACLE-ID] anonymous V3 hybrid created  {address}")
         try:
             _id_path.write_text(_json.dumps(identity, indent=2))
         except Exception as _e:
@@ -19381,33 +19415,38 @@ class QtclClientApp:
         self, oracle_pub: str, wallet_addr: str, wallet_priv: str
     ) -> dict:
         """
-        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr) using HypGamma.
-        Uses engine.sign_hash() for proper cryptographic signature.
-        Includes wallet_pub for verification.
+        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr) using V3 hybrid PQC.
+        wallet_priv is the SL(2,p) private walk hex (legacy compat param — wallet keypair
+        dict is loaded from the singleton HypGammaWallet for hybrid signing).
         """
         try:
             engine = HypGammaEngine()
-            # Derive wallet's public key for inclusion in certificate
-            wallet_pub = engine.derive_public_key(wallet_priv)
+            wallet = HypGammaWallet()
 
             # Certificate payload: oracle_pub | wallet_addr
             _payload = (oracle_pub + "|" + wallet_addr).encode()
             _hash = _hashlib.sha3_256(_payload).digest()
 
-            # Sign using HypGamma (proper child certificate)
-            sig_dict = engine.sign_hash(_hash, wallet_priv)
-
-            return {
-                "signature": sig_dict.get("signature", ""),
-                "challenge": sig_dict.get("challenge", ""),
-                "timestamp": sig_dict.get("timestamp", ""),
-                "auth_tag": sig_dict.get("auth_tag", ""),
-                "ts_iso": datetime.now(timezone.utc).isoformat(),
-                "cert_hash": _hash.hex(),
-                "wallet_addr": wallet_addr,
-                "wallet_pub": wallet_pub,
-                "oracle_pub": oracle_pub,
-            }
+            # Sign using V3 hybrid (requires loaded wallet keypair dict)
+            if wallet.is_loaded() and wallet.keypair:
+                sig_dict = engine.sign_hash(_hash, wallet.keypair)
+                wallet_pub = wallet.public_key or ""
+                return {
+                    "signature": sig_dict.get("signature", ""),
+                    "challenge": sig_dict.get("challenge", ""),
+                    "timestamp": sig_dict.get("timestamp", ""),
+                    "auth_tag": sig_dict.get("auth_tag", ""),
+                    "ts_iso": datetime.now(timezone.utc).isoformat(),
+                    "cert_hash": _hash.hex(),
+                    "wallet_addr": wallet_addr,
+                    "wallet_pub": wallet_pub,
+                    "falcon_pub": wallet.falcon_public_key or "",
+                    "oracle_pub": oracle_pub,
+                    "version": "hybrid_v3",
+                }
+            else:
+                _EXP_LOG.warning("[ORACLE-CERT] Wallet not loaded — cannot issue hybrid cert")
+                return {}
         except Exception as _e:
             _EXP_LOG.warning(f"[ORACLE-CERT] cert creation failed: {_e}")
             return {}
@@ -28904,13 +28943,17 @@ class QtclClientApp:
             elif ch == "3":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
-                print(f"  Address    : {self.wallet.address}")
-                print(f"  Public key : {self.wallet.public_key}")
+                print(f"\n  ── V3 Hybrid PQC Wallet ────────────────────────────────────")
+                print(f"  Address      : {self.wallet.address}")
+                print(f"  SL(2,p) pub  : {self.wallet.public_key}")
+                print(f"  Falcon-512   : {self.wallet.falcon_public_key}")
+                print(f"  Version      : {self.wallet.wallet_version}")
                 print()
                 print(f"  ── Storage ─────────────────────────────────────────────────")
                 print(f"  wallet.json       : {self.wallet.wallet_file}")
-                print(f"  Encryption        : PBKDF2-HMAC-SHA256 (600K) + SHAKE-256-CTR + SHA3-256 MAC")
-                print(f"  Signatures        : V3 Hybrid (Falcon-512 + SL(2,p))")
+                print(f"  KDF               : PBKDF2-HMAC-SHA256 (600K iter, 256-bit salt)")
+                print(f"  Cipher            : SHAKE-256-CTR + SHA3-256 Encrypt-then-MAC")
+                print(f"  Signatures        : V3 Hybrid (Falcon-512 NIST FIPS 206 + SL(2,p))")
             elif ch == "4":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
@@ -28919,38 +28962,29 @@ class QtclClientApp:
                 except (EOFError, KeyboardInterrupt):
                     continue
                 if self._verify_password(pw):
-                    pk = self.wallet.private_key
-                    if pk:
-                        print("\n" + "═" * 60)
-                        print("  ⚠️   YOUR PRIVATE KEY — never share")
-                        print("═" * 60)
-                        print(f"  SL(2,p) walk: {pk}")
-                        print("═" * 60)
-                        print("  ⚠️  Warning: Anyone with this key controls your funds!")
-                    else:
-                        print("  ❌ Private key not available")
-                else:
-                    print("  ❌ Incorrect password")
-            elif ch == "5":
-                break
-            elif ch == "6":
-                if not self.wallet.is_loaded() and not self._load_wallet():
-                    continue
-                try:
-                    pw = getpass.getpass("  Wallet password: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    continue
-                if self._verify_password(pw):
-                    pk = self.wallet.private_key
-                    if pk:
-                        print("\n" + "═" * 60)
-                        print("  ⚠️   YOUR PRIVATE KEY — never share")
-                        print("═" * 60)
-                        print(f"  SL(2,p) walk: {pk}")
-                        print("═" * 60)
-                        print("  ⚠️  Warning: Anyone with this key controls your funds!")
-                    else:
-                        print("  ❌ Private key not available")
+                    sl2p_priv = self.wallet.private_key
+                    falcon_priv = self.wallet.falcon_private_key
+                    falcon_pub = self.wallet.falcon_public_key
+                    sl2p_pub = self.wallet.public_key
+                    addr = self.wallet.address
+                    print("\n" + "═" * 72)
+                    print("  ⚠️   HYBRID PRIVATE KEY MATERIAL — NEVER SHARE")
+                    print("═" * 72)
+                    print(f"  Address         : {addr}")
+                    print()
+                    print(f"  SL(2,p) private walk hex:")
+                    print(f"  {sl2p_priv}")
+                    print()
+                    print(f"  SL(2,p) public hex:")
+                    print(f"  {sl2p_pub}")
+                    print()
+                    print(f"  Falcon-512 public key (base64):")
+                    print(f"  {falcon_pub}")
+                    print()
+                    print(f"  Falcon-512 secret key (base64):")
+                    print(f"  {falcon_priv}")
+                    print("═" * 72)
+                    print("  ⚠️  Warning: Anyone with these keys controls your funds!")
                 else:
                     print("  ❌ Incorrect password")
             elif ch == "5":
@@ -29128,12 +29162,12 @@ class QtclClientApp:
         sig_ts_iso: str = ""
         try:
             _oid = self._oracle_id
-            if _oid and _oid.get("private_key"):
+            if _oid and _oid.get("keypair"):
                 oracle_addr = _oid["address"]
                 _payload = (snap_id + "|" + str(fetch_ns)).encode()
-                _msg_hash = _hashlib.sha256(_payload).digest()
+                _msg_hash = _hashlib.sha3_256(_payload).digest()
                 _hlwe = HypGammaEngine()
-                _raw_sig = _hlwe.sign_hash(_msg_hash, _oid["private_key"])
+                _raw_sig = _hlwe.sign_hash(_msg_hash, _oid["keypair"])
                 oracle_sig = {
                     "address": oracle_addr,
                     "wallet_addr": _oid.get("wallet_addr"),
