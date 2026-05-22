@@ -280,50 +280,102 @@ class SSEStreamClient:
 
     def _subscribe_loop(self):
         """Continuously subscribe to SSE stream and process snapshots.
-        Never gives up — resets error counter after a long backoff so the client
-        reconnects indefinitely even after extended server downtime.
+
+        Uses requests.Session for persistent HTTP/1.1 keep-alive — one TCP connection
+        reused indefinitely. Handles ': heartbeat' comment lines without reconnecting.
+        Never gives up — exponential backoff capped at 30s, resets after success.
         """
         consecutive_errors = 0
+        _session = None
         while self.running:
             try:
-                import urllib.request as _ur
-                req = _ur.Request(self.stream_endpoint)
-                req.add_header("Accept", "text/event-stream")
-                consecutive_errors = 0  # reset on successful connect
-                with _ur.urlopen(req, timeout=30) as resp:
-                    for line in resp:
+                # Lazy-init requests Session (connection pool, keep-alive)
+                if _session is None:
+                    try:
+                        import requests as _req_mod
+                        _session = _req_mod.Session()
+                        _session.headers.update({
+                            "Accept": "text/event-stream",
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                        })
+                    except ImportError:
+                        _session = False  # flag: requests unavailable, use urllib fallback
+
+                if _session is False:
+                    # urllib fallback (no requests installed)
+                    import urllib.request as _ur
+                    req = _ur.Request(self.stream_endpoint)
+                    req.add_header("Accept", "text/event-stream")
+                    consecutive_errors = 0
+                    with _ur.urlopen(req, timeout=60) as resp:
+                        for _raw in resp:
+                            if not self.running:
+                                break
+                            _ls = _raw.decode("utf-8", errors="replace").strip()
+                            if _ls.startswith("data: "):
+                                try:
+                                    self._process_snapshot(json.loads(_ls[6:]))
+                                except json.JSONDecodeError:
+                                    pass
+                    continue
+
+                # requests streaming path — persistent connection, iter_lines handles chunking
+                with _session.get(
+                    self.stream_endpoint,
+                    stream=True,
+                    timeout=(10, 90),   # (connect_timeout, read_timeout) — 90s > heartbeat interval
+                ) as resp:
+                    if resp.status_code == 429:
+                        _retry = int(resp.headers.get("Retry-After", "10"))
+                        _EXP_LOG.warning(f"[SSE-CLIENT] 429 rate-limited, backing off {_retry}s")
+                        time.sleep(_retry)
+                        consecutive_errors += 1
+                        continue
+                    if resp.status_code not in (200, 202):
+                        raise IOError(f"HTTP {resp.status_code}")
+
+                    consecutive_errors = 0  # reset only after confirmed 2xx
+                    _EXP_LOG.info(f"[SSE-CLIENT] 📡 Connected to {self.stream_endpoint}")
+
+                    for _line in resp.iter_lines(decode_unicode=True, chunk_size=512):
                         if not self.running:
                             break
-                        line_str = line.decode().strip()
-                        if line_str.startswith("data: "):
+                        if not _line:
+                            continue  # blank line = SSE event separator, skip
+                        if _line.startswith(":"):
+                            continue  # heartbeat comment, keep-alive confirmed — do NOT reconnect
+                        if _line.startswith("data: "):
                             try:
-                                payload = json.loads(line_str[6:])
-                                self._process_snapshot(payload)
+                                self._process_snapshot(json.loads(_line[6:]))
                             except json.JSONDecodeError:
                                 pass
+
             except Exception as e:
                 consecutive_errors += 1
+                _session = None  # force new Session on next attempt (clears stale connection)
                 if consecutive_errors == 1:
                     _EXP_LOG.warning(f"[SSE-CLIENT] Connection failed: {e}")
-                # After 10 errors, log degraded but DO NOT break — reset counter and
-                # keep retrying with max backoff (30s). Server may come back online.
                 if consecutive_errors > 10:
                     _EXP_LOG.warning(
                         f"[SSE-CLIENT] ⚠️ {consecutive_errors} consecutive errors — "
                         f"retrying every 30s (server={self.stream_endpoint})"
                     )
-                    consecutive_errors = 5  # reset to avoid int overflow, keep backoff at 30s
-                time.sleep(min(2**consecutive_errors, 30))
+                    consecutive_errors = 5  # prevent int overflow, hold at 30s backoff
+                time.sleep(min(2 ** consecutive_errors, 30))
 
     def _process_snapshot(self, payload: dict) -> None:
-        """Process incoming 16³ server snapshot."""
+        """Process incoming server snapshot — accepts density_matrix_hex OR density_tensor_hex."""
         with self.lock:
             self.latest_server_snapshot = payload
-
-        dm_hex = payload.get("density_tensor_hex", "")
-        ts = payload.get("timestamp_ns", 0)
+        # Log on any valid DM hex field (server sends density_matrix_hex for 8x8 oracle snapshots)
+        dm_hex = payload.get("density_tensor_hex") or payload.get("density_matrix_hex") or ""
+        ts = payload.get("timestamp_ns") or payload.get("timestamp", 0)
         if dm_hex:
-            _EXP_LOG.debug(f"[SSE-CLIENT] ✅ Received 16³ snapshot (ts={ts})")
+            _EXP_LOG.debug(
+                f"[SSE-CLIENT] ✅ snapshot received dm_hex={len(dm_hex)} chars ts={ts} "
+                f"fid={payload.get('w_state_fidelity', 0):.4f}"
+            )
 
     def get_latest_snapshot(self) -> Optional[dict]:
         """Get the most recent snapshot from server."""
@@ -3867,29 +3919,46 @@ class HypGammaWallet:
                 raise RuntimeError(f"HypΓ engine init failed: {e}") from e
 
     def create(self, password: str) -> str:
-        """Create new V3 hybrid wallet — Falcon-512 + SL(2,p). Private keys ENCRYPTED from birth."""
+        """Create new V3 hybrid wallet — Falcon-512 + SL(2,p). Private keys ENCRYPTED from birth.
+
+        Always generates a fresh keypair regardless of singleton state.
+        Overwrites any existing wallet.json.
+        """
         if not password:
             raise ValueError("[HYP-WALLET] Password REQUIRED")
+        # Reset singleton state so create() always produces a fresh wallet
+        self.keypair = None
+        self._loaded = False
+        self._password_verified = False
         self._init_engine()
         hk = self.engine.generate_hybrid_keypair()
+        # Validate structure before touching disk
+        if not isinstance(hk, dict) or 'sl2p' not in hk or 'falcon' not in hk:
+            raise RuntimeError(f"[HYP-WALLET] generate_hybrid_keypair returned unexpected type: {type(hk)}")
+        if 'address' not in hk['sl2p'] or 'public_hex' not in hk['sl2p'] or 'private_walk_hex' not in hk['sl2p']:
+            raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required sl2p fields: {list(hk['sl2p'].keys())}")
+        if 'public_key' not in hk['falcon'] or 'secret_key' not in hk['falcon']:
+            raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required falcon fields: {list(hk['falcon'].keys())}")
         self.keypair = hk
-        logger.info(f"[HYP-WALLET] ✅ Generated hybrid keypair — address: {hk['sl2p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V3 hybrid keypair generated — address: {hk['sl2p']['address'][:16]}...")
         data_dir = Path("data"); data_dir.mkdir(exist_ok=True)
         wallet_path = data_dir / "wallet.json"
         from hyp_lwe import create_wallet_file
-        # Encrypt the entire hybrid keypair JSON as the "private key"
         import json as _j
+        # Encrypt the ENTIRE hybrid keypair dict as the vault private_key payload
         full_private_json = _j.dumps(hk)
         wallet_dict, _ = create_wallet_file(
             hk['sl2p']['address'], hk['sl2p']['public_hex'], full_private_json,
             password, 0, 0)
+        # Stamp wallet_type so load() can detect v3 hybrid format
+        wallet_dict["wallet_type"] = "hybrid_v3"
         wallet_path.write_text(_j.dumps(wallet_dict, indent=2))
-        logger.info(f"[HYP-WALLET] ✅ Encrypted hybrid wallet saved to {wallet_path}")
+        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet saved → {wallet_path}")
         self._loaded = True; self._password_verified = True
         return hk['sl2p']['address']
 
     def load(self, password: str) -> bool:
-        """Load hybrid wallet from encrypted file. RAISES ValueError on wrong password."""
+        """Load V3 hybrid wallet from encrypted file. Raises ValueError on wrong password or old format."""
         if self.is_loaded(): return True
         wallet_path = self.wallet_file
         if not wallet_path.exists():
@@ -3898,14 +3967,34 @@ class HypGammaWallet:
         import json as _j
         raw = _j.loads(wallet_path.read_text())
         if "vault_version" not in raw:
-            raise ValueError("[HYP-WALLET] Invalid wallet file — create a new wallet")
+            raise ValueError("[HYP-WALLET] Invalid wallet file — missing vault_version. Create a new wallet.")
+        # Detect old v2 SL(2,p)-only wallets before decrypting
+        wallet_type = raw.get("wallet_type", "")
+        if wallet_type and wallet_type != "hybrid_v3":
+            raise ValueError(
+                f"[HYP-WALLET] Wallet format '{wallet_type}' is not V3 hybrid. "
+                "Run Wallet → Create new wallet to generate a V3 hybrid (Falcon-512 + SL(2,p)) wallet."
+            )
         self._init_engine()
         from hyp_lwe import load_wallet_file
         data = load_wallet_file(wallet_path, password)
-        # The "private_key" field contains the full hybrid keypair JSON
-        self.keypair = _j.loads(data["private_key"])
+        # private_key payload must be a JSON dict, not a bare hex string
+        pk_payload = data["private_key"]
+        try:
+            keypair = _j.loads(pk_payload)
+        except (_j.JSONDecodeError, TypeError):
+            raise ValueError(
+                "[HYP-WALLET] Wallet contains old SL(2,p)-only private key (plain hex). "
+                "Create a new V3 hybrid wallet — Wallet → Create new wallet."
+            )
+        if not isinstance(keypair, dict) or 'sl2p' not in keypair or 'falcon' not in keypair:
+            raise ValueError(
+                "[HYP-WALLET] Wallet private key is not a V3 hybrid keypair dict. "
+                "Create a new wallet."
+            )
+        self.keypair = keypair
         self._loaded = True; self._password_verified = True
-        logger.info(f"[HYP-WALLET] ✅ Hybrid wallet unlocked — address: {self.keypair['sl2p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet unlocked — address: {self.keypair['sl2p']['address'][:16]}...")
         return True
 
     def verify_password(self, password: str) -> bool:
@@ -5020,21 +5109,18 @@ class LiveRPCOracleSnapshot:
         return self._session if self._session else None
 
     def fetch_snapshot(self, timeout_s=5.0) -> dict:
-        """Read snapshot from SSE stream /rpc/oracle/snapshot OR fallback to RPC.
+        """Fetch latest oracle snapshot without opening a competing SSE stream.
 
-        Fetches quantum state: tries SSE stream first, falls back to RPC POST.
-        Processes snapshot: parses density matrix, converts W-state if needed,
-        updates oracle state cache.
+        PRIMARY:  GET /rpc/oracle/snapshot/latest — one-shot JSON, no streaming,
+                  does NOT consume an SSE connection slot (SSEStreamClient owns those).
+        FALLBACK: GET /rpc?method=qtcl_getQuantumMetrics — direct RPC.
+
+        The persistent SSE subscription is handled exclusively by SSEStreamClient
+        (started in _init_db).  fetch_snapshot is used only for on-demand cache warm.
         """
         _t0 = time.time()
-        _snap_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot"
+        _latest_url = f"{SSE_SERVICE_URL}/rpc/oracle/snapshot/latest"
         _rpc_url = f"{self.ORACLE_URL}/rpc"
-        _payload = {
-            "jsonrpc": "2.0",
-            "method": "qtcl_getQuantumMetrics",
-            "params": [],
-            "id": 1,
-        }
         snap = {}
 
         try:
@@ -5042,70 +5128,23 @@ class LiveRPCOracleSnapshot:
             if not session:
                 return {}
 
-            # PRIMARY: Read from SSE stream /rpc/oracle/snapshot (with proper timeout)
+            # PRIMARY: one-shot JSON from /rpc/oracle/snapshot/latest (no streaming, no slot cost)
             try:
-                _snap_result = [None]  # Mutable container for thread result
-                _snap_error = [None]
-
-                def _read_sse():
-                    try:
-                        # Stream=True: read response as stream, don't load entire body
-                        _r = session.get(
-                            _snap_url,
-                            timeout=(timeout_s / 2, timeout_s),
-                            headers={"Accept": "text/event-stream"},
-                            stream=True,
+                _r = session.get(_latest_url, timeout=timeout_s)
+                if _r.status_code == 200:
+                    _body = _r.json()
+                    snap = _body.get("result", _body) if isinstance(_body, dict) else {}
+                    if snap and (snap.get("density_matrix_hex") or snap.get("density_tensor_hex")):
+                        logger.debug(
+                            f"[RPC-ORACLE] ✅ /latest snapshot dm_hex="
+                            f"{len(snap.get('density_matrix_hex') or snap.get('density_tensor_hex', ''))} chars"
                         )
-                        # Handle 429 Too Many Requests — server at capacity
-                        if _r.status_code == 429:
-                            _retry_after = int(_r.headers.get("Retry-After", "5"))
-                            _snap_error[0] = (
-                                f"HTTP 429 (at capacity, retry after {_retry_after}s)"
-                            )
-                            return
-                        # Handle other non-2xx responses
-                        if _r.status_code not in (200, 202):
-                            _snap_error[0] = f"HTTP {_r.status_code}"
-                            return
-                        # Read SSE stream successfully
-                        try:
-                            # Read line by line from stream without loading entire response
-                            for _line in _r.iter_lines(
-                                decode_unicode=True, chunk_size=1024
-                            ):
-                                if _line.startswith("data: "):
-                                    try:
-                                        _envelope = json.loads(_line[6:])
-                                        _snap_result[0] = _envelope.get(
-                                            "result", _envelope
-                                        )
-                                        _r.close()  # Close immediately after getting first message
-                                        return
-                                    except json.JSONDecodeError:
-                                        continue
-                                elif _line and not _line.startswith(":"):
-                                    _r.close()
-                                    return
-                        finally:
-                            _r.close()
-                    except Exception as e:
-                        _snap_error[0] = e
-
-                _sse_thread = threading.Thread(target=_read_sse, daemon=True)
-                _sse_thread.start()
-                _sse_thread.join(
-                    timeout=timeout_s
-                )  # Wait up to timeout_s for first line
-
-                if _snap_result[0]:
-                    snap = _snap_result[0]
-                    logger.debug(f"[RPC-ORACLE] ✅ SSE snapshot received")
-                elif _snap_error[0]:
-                    logger.debug(
-                        f"[RPC-ORACLE] SSE failed: {_snap_error[0]} (trying RPC)"
-                    )
-            except Exception as _sse_e:
-                logger.debug(f"[RPC-ORACLE] SSE failed: {_sse_e} (trying RPC)")
+                elif _r.status_code == 204:
+                    logger.debug("[RPC-ORACLE] /latest: no snapshot yet, trying RPC")
+                else:
+                    logger.debug(f"[RPC-ORACLE] /latest HTTP {_r.status_code}, trying RPC")
+            except Exception as _latest_e:
+                logger.debug(f"[RPC-ORACLE] /latest failed: {_latest_e} (trying RPC)")
 
             # FALLBACK: GET /rpc with qtcl_getQuantumMetrics
             if not snap:
@@ -5299,120 +5338,82 @@ class LiveRPCOracleSnapshot:
     def _rpc(
         self, method: str, params: list = None, timeout: int = 5, retries: int = 2
     ):
-        """Generic JSON-RPC 2.0 call to server /rpc endpoint.
+        """Generic JSON-RPC 2.0 call to server /rpc endpoint via requests.Session.
 
-        Thread-based hard timeout — CANNOT hang (thread.join() always returns).
-        Used for health checks and metrics during bootstrap.
+        requests handles SSL timeouts correctly on Python 3.12 — urllib can hang
+        indefinitely in ssl.read() behind Koyeb's load balancer.
         Returns result dict or None on failure.
         """
         import urllib.parse as _up
-        import urllib.request as _ur
-        import socket as _sock
-        import threading as _thr
-
-        params_json = json.dumps(params or [])
-        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-        full_url = f"{self.ORACLE_URL}/rpc?{query}"
         t = timeout or 5
+        params_json = json.dumps(params or [])
 
-        def _req_worker(
-            url: str, data: bytes, tout: float, result_container: list, error_container: list
-        ) -> None:
-            """Run HTTP request in daemon thread."""
-            try:
-                _sock.setdefaulttimeout(tout)
-                req = _ur.Request(url, headers={"Accept": "application/json"})
-                if data:
-                    req.data = data
-                    req.add_header("Content-Type", "application/json")
-                with _ur.urlopen(req, timeout=tout) as resp:
-                    result_container.append(json.loads(resp.read().decode("utf-8")))
-            except _ur.HTTPError as _he:
-                try:
-                    result_container.append(json.loads(_he.read().decode("utf-8")))
-                except:
-                    error_container.append(f"HTTP {_he.code}")
-            except Exception as _e:
-                error_container.append(str(_e))
-            finally:
-                try:
-                    _sock.setdefaulttimeout(None)
-                except Exception:
-                    pass
+        _session = self._get_session()  # reuse persistent Session (keep-alive)
 
-        # Build POST body for submitBlock, None for GET
+        # POST for submitBlock, GET for everything else
         post_data = None
-        req_url = full_url
-        if method == "qtcl_submitBlock":
-            payload = {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params or [],
-                "id": 1,
-            }
-            post_data = json.dumps(payload).encode("utf-8")
-            req_url = f"{self.ORACLE_URL}/rpc"
+        req_url = f"{self.ORACLE_URL}/rpc"
+        use_post = method == "qtcl_submitBlock"
+        if use_post:
+            post_data = json.dumps({
+                "jsonrpc": "2.0", "method": method,
+                "params": params or [], "id": 1,
+            }).encode("utf-8")
+        else:
+            query = _up.urlencode({"method": method, "params": params_json, "id": 1})
+            req_url = f"{self.ORACLE_URL}/rpc?{query}"
 
         for attempt in range(retries):
-            _result_box: list = []
-            _error_box: list = []
+            try:
+                if _session:
+                    if use_post:
+                        resp = _session.post(
+                            req_url,
+                            data=post_data,
+                            timeout=(min(t, 10), t),
+                            headers={"Content-Type": "application/json",
+                                     "Accept": "application/json"},
+                        )
+                    else:
+                        resp = _session.get(
+                            req_url,
+                            timeout=(min(t, 10), t),
+                            headers={"Accept": "application/json"},
+                        )
+                    resp.raise_for_status()
+                    result = resp.json()
+                else:
+                    # urllib fallback
+                    import urllib.request as _ur
+                    req = _ur.Request(req_url, headers={"Accept": "application/json"})
+                    if use_post:
+                        req.data = post_data
+                        req.add_header("Content-Type", "application/json")
+                    with _ur.urlopen(req, timeout=t) as r:
+                        result = json.loads(r.read().decode("utf-8"))
 
-            _worker = _thr.Thread(
-                target=_req_worker,
-                args=(req_url, post_data, t, _result_box, _error_box),
-                daemon=True,
-                name=f"RPC-O-{method[:12]}",
-            )
-            _worker.start()
-            _worker.join(timeout=t + 2)
-
-            if _result_box:
-                result = _result_box[0]
                 if isinstance(result, dict):
                     if "result" in result:
                         return result.get("result")
                     elif "error" in result:
                         return result
                 return result
-            elif _error_box:
+
+            except Exception as _e:
                 logger.debug(
-                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries}: {_error_box[0]}"
+                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries}: {_e}"
                 )
-            else:
-                logger.debug(
-                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries}: timeout ({t}s)"
-                )
-
-            if attempt < retries - 1:
-                time.sleep(min(2**attempt, 5))
-
-        return None
-
-        # Use GET for other methods
-        params_json = json.dumps(params or [])
-        query = _up.urlencode({"method": method, "params": params_json, "id": 1})
-        full_url = f"{self.ORACLE_URL}/rpc?{query}"
-
-        for attempt in range(retries):
-            try:
-                # Use urllib with explicit socket timeout (more reliable than requests)
-                req = _ur.Request(full_url, headers={"Accept": "application/json"})
-                # Set socket timeout before urlopen
-                socket.setdefaulttimeout(timeout)
-                with _ur.urlopen(req, timeout=timeout) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                    if "result" in result:
-                        return result.get("result")
-                    elif "error" in result:
-                        return result
-            except Exception as e:
-                logger.debug(
-                    f"[RPC-ORACLE] {method} attempt {attempt + 1}/{retries} failed: {e}"
-                )
+                # Discard stale session on SSL/connection errors
+                if _session and any(k in str(_e) for k in ("SSL", "Connection", "timeout")):
+                    try:
+                        _session.close()
+                    except Exception:
+                        pass
+                    self._session = None
+                    _session = self._get_session()
                 if attempt < retries - 1:
-                    time.sleep(min(2**attempt, 5))  # Cap backoff at 5s
-            finally:
-                socket.setdefaulttimeout(None)  # Reset to default
+                    time.sleep(min(2 ** attempt, 5))
+
         return None
 
     def get_oracle_dm(self) -> tuple:
@@ -11859,84 +11860,62 @@ class KoyebRPCNodule:
     def _rpc(
         self, method: str, params: list = None, timeout: int = None, retries: int = 2
     ) -> Optional[dict]:
-        """Make JSON-RPC 2.0 call to /rpc endpoint.
+        """Make JSON-RPC 2.0 call to /rpc endpoint via requests.Session.
 
-        Uses a thread-based hard timeout (CANNOT hang — thread.join() always returns).
-        urllib's timeout parameter and socket.setdefaulttimeout are unreliable over SSL
-        in Python 3.12 — they can block forever in ssl.read() behind slow load balancers.
+        requests handles SSL timeouts correctly on Python 3.12 — urllib can hang
+        indefinitely in ssl.read() behind Koyeb's load balancer even with timeouts set.
+        Session is reused across calls for connection pooling (keep-alive).
         """
-        import urllib.parse as _up
-        import threading as _thr
-        import urllib.request as _ur
-        import socket as _sock
-
         t = timeout or self.timeout
         last_error = None
 
+        import urllib.parse as _up
         params_json = _json.dumps(params or [])
         query = _up.urlencode({"method": method, "params": params_json, "id": 1})
         full_url = f"{self.base_url}/rpc?{query}"
 
-        def _req_worker(
-            url: str, tout: float, result_container: list, error_container: list
-        ) -> None:
-            """Run the HTTP request in a daemon thread.
-
-            socket.setdefaulttimeout is called INSIDE the thread before urlopen,
-            so it's safe — only affects this thread's socket operations.
-            """
-            try:
-                _sock.setdefaulttimeout(tout)
-                req = _ur.Request(url, headers={"Accept": "application/json"})
-                with _ur.urlopen(req, timeout=tout) as resp:
-                    data = _json.loads(resp.read().decode("utf-8"))
-                    result_container.append(data)
-            except _ur.HTTPError as _he:
-                try:
-                    data = _json.loads(_he.read().decode("utf-8"))
-                    result_container.append(data)
-                except:
-                    error_container.append(f"HTTP {_he.code}")
-            except Exception as _e:
-                error_container.append(str(_e))
-            finally:
-                try:
-                    _sock.setdefaulttimeout(None)
-                except Exception:
-                    pass
+        session = self._get_session()
 
         for attempt in range(retries):
-            _result_box: list = []
-            _error_box: list = []
+            try:
+                if session:
+                    # requests path — reliable SSL timeout on Python 3.12
+                    resp = session.get(
+                        full_url,
+                        timeout=(min(t, 10), t),   # (connect_timeout, read_timeout)
+                        headers={"Accept": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                else:
+                    # urllib fallback (requests not installed)
+                    import urllib.request as _ur
+                    req = _ur.Request(full_url, headers={"Accept": "application/json"})
+                    with _ur.urlopen(req, timeout=t) as r:
+                        data = _json.loads(r.read().decode("utf-8"))
 
-            _worker = _thr.Thread(
-                target=_req_worker,
-                args=(full_url, t, _result_box, _error_box),
-                daemon=True,
-                name=f"RPC-{method[:16]}",
-            )
-            _worker.start()
-            _worker.join(timeout=t + 2)  # Hard timeout — ALWAYS returns
+                if isinstance(data, dict):
+                    if "result" in data:
+                        return data.get("result")
+                    elif "error" in data:
+                        return data
+                return data
 
-            if _result_box:
-                result = _result_box[0]
-                if isinstance(result, dict):
-                    if "result" in result:
-                        return result.get("result")
-                    elif "error" in result:
-                        return result
-                # dict-like but no rpc fields — return raw
-                return result
-            elif _error_box:
-                last_error = _error_box[0]
+            except Exception as _e:
+                last_error = str(_e)
                 _EXP_LOG.debug(f"[RPC] {method} attempt {attempt + 1}: {last_error}")
-            else:
-                # Thread did not complete within timeout
-                last_error = f"timeout ({t}s)"
-                _EXP_LOG.debug(f"[RPC] {method} attempt {attempt + 1}: timed out after {t}s")
-
-            if attempt < retries - 1:
-                time.sleep(2**attempt)
+                # Force new session on connection errors so stale SSL state is cleared
+                if session and ("SSL" in last_error or "Connection" in last_error
+                                or "timeout" in last_error.lower()):
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    self._session = None
+                    session = self._get_session()
+                if attempt < retries - 1:
+                    import time as _t2
+                    _t2.sleep(2 ** attempt)
 
         self._last_error = last_error
         return None
@@ -13527,20 +13506,57 @@ class ClientOracleMesh:
             )
             if dm_hex:
                 try:
+                    import struct as _struct_dm
                     dm_bytes = bytes.fromhex(dm_hex)
-                    # Handle both 16³ (4096 bytes) and 8³ (1024 bytes) formats
-                    if len(dm_bytes) == 4096:
-                        # 16³ format - use first 8×8
-                        dm = _np.frombuffer(
-                            dm_bytes[:1024], dtype=_np.complex128
-                        ).reshape((8, 8))
+                    _EXP_LOG.debug(
+                        f"[ClientOracleMesh] Koyeb snap dm_bytes={len(dm_bytes)} "
+                        f"fid={koyeb_snap.get('w_state_fidelity', 0):.4f}"
+                    )
+                    if len(dm_bytes) == 1024:
+                        # 8x8 complex128 packed by oracle as big-endian >dd pairs
+                        dm_flat = [
+                            complex(_struct_dm.unpack_from(">dd", dm_bytes, i * 16)[0],
+                                    _struct_dm.unpack_from(">dd", dm_bytes, i * 16)[1])
+                            for i in range(64)
+                        ]
+                        dm = _np.array(dm_flat, dtype=_np.complex128).reshape((8, 8))
+                    elif len(dm_bytes) == 4096:
+                        # 16^3 complex64 packed as >ff -- take first 8x8 block
+                        dm_flat = [
+                            complex(_struct_dm.unpack_from(">ff", dm_bytes, i * 8)[0],
+                                    _struct_dm.unpack_from(">ff", dm_bytes, i * 8)[1])
+                            for i in range(64)
+                        ]
+                        dm = _np.array(dm_flat, dtype=_np.complex128).reshape((8, 8))
                     else:
-                        dm = _np.frombuffer(dm_bytes, dtype=_np.complex128).reshape(
-                            (8, 8)
-                        )
+                        dm = _np.frombuffer(dm_bytes[:1024] if len(dm_bytes) >= 1024
+                                            else dm_bytes,
+                                            dtype=_np.complex128).reshape((8, 8))
 
                     dm = ClientQuantumMetrics.enforce_valid_dm(dm)
                     if self._validate_dm(dm, "Koyeb"):
+                        # Feed snapshot into _LIVE_RPC_ORACLE cache so miners see live data
+                        try:
+                            _flat = dm.flatten()
+                            with _LIVE_RPC_ORACLE._dm_lock:
+                                _LIVE_RPC_ORACLE._dm_re = [float(_np.real(c)) for c in _flat]
+                                _LIVE_RPC_ORACLE._dm_im = [float(_np.imag(c)) for c in _flat]
+                                _LIVE_RPC_ORACLE._last_fetch_ts = time.time()
+                            with _LIVE_RPC_ORACLE._oracle_state_lock:
+                                _LIVE_RPC_ORACLE._oracle_state.update({
+                                    "density_matrix_hex":   dm_hex,
+                                    "w_state_fidelity":     float(koyeb_snap.get("w_state_fidelity", 0)),
+                                    "purity":               float(koyeb_snap.get("purity", 0)),
+                                    "von_neumann_entropy":  float(koyeb_snap.get("von_neumann_entropy", 0)),
+                                    "coherence_l1":         float(koyeb_snap.get("coherence_l1", 0)),
+                                    "mermin_test":          koyeb_snap.get("mermin_test", {}),
+                                    "block_height":         int(koyeb_snap.get("block_height", 0)),
+                                    "cycle":                int(koyeb_snap.get("cycle", 0)),
+                                    "consensus":            True,
+                                    "source":               "sse_koyeb",
+                                })
+                        except Exception as _rlo_e:
+                            _EXP_LOG.debug(f"[ClientOracleMesh] _LIVE_RPC_ORACLE sync: {_rlo_e}")
                         dms.append((dm, 1.0, "Koyeb"))
                 except Exception as e:
                     _EXP_LOG.debug(f"[ClientOracleMesh] Koyeb DM parse error: {e}")
@@ -20855,8 +20871,13 @@ class QtclClientApp:
         try:
             return self.wallet.load(pw)
         except ValueError as e:
-            logger.error(f"[HYP-WALLET] ❌ {e}")
-            print("  ❌ Wrong password", flush=True)
+            msg = str(e)
+            logger.error(f"[HYP-WALLET] ❌ {msg}")
+            if "old SL(2,p)" in msg or "hybrid_v3" in msg or "not a V3" in msg:
+                print(f"  ❌ {msg}", flush=True)
+                print("  ➡  Go to Wallet → Create new wallet to generate a V3 hybrid wallet.", flush=True)
+            else:
+                print("  ❌ Wrong password", flush=True)
             return False
 
     def _verify_password(self, password: str) -> bool:
@@ -23573,196 +23594,115 @@ class QtclClientApp:
             _msg = f"FATAL: DM pool daemon startup failed: {_dme}"
             print(f"  ❌ {_msg}")
             raise RuntimeError(_msg) from _dme
-        # ── Bootstrap RPC snapshot — MUST succeed or FATAL ──────────────────────
-        # NO degraded mode fallback. If RPC is down, mining cannot proceed.
+        # ── Bootstrap via SSE snapshot/latest — no RPC polling, no slot cost ──────────────
+        # /rpc/oracle/snapshot/latest is a one-shot GET that returns the last fanned-out
+        # payload. SSEStreamClient (already running) holds the persistent subscription;
+        # this call only touches the lightweight JSON endpoint once at startup.
         import time as _t
         import requests as _requests
 
         _snap = {}
-        print("  🔗 Fetching oracle snapshot from RPC…", end="", flush=True)
+        _latest_url = f"{self.oracle_url.rstrip('/')}/rpc/oracle/snapshot/latest"
+        print("  🌌 Fetching server state via SSE snapshot…", end="", flush=True)
 
-        # ── PHASE 1: Lightweight RPC reachability (via qtcl_getHealth) ──────────────────────
-        # Use JSON-RPC POST /rpc (not SSE) for reachability check. SSE connections are
-        # expensive on gunicorn. We only hard-fail on ConnectionRefused. Any 5xx from
-        # Koyeb's proxy (HTML 503 during worker saturation) is transient — retry with backoff.
-        print("  🔗 Checking RPC endpoint…", end="", flush=True)
-        _boot_retries = 5
-        _boot_health = None
-        _last_boot_error = None
-
+        _boot_retries = 8
+        _snap_data = {}
         for _retry in range(_boot_retries):
             try:
-                _boot_health = _LIVE_RPC_ORACLE._rpc(
-                    "qtcl_getHealth", [], timeout=3, retries=1
-                )
-                if _boot_health is not None:
+                _r = _requests.get(_latest_url, timeout=(5, 10),
+                                   headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+                if _r.status_code == 200:
+                    _snap_data = _r.json() or {}
+                    if _snap_data.get("status") == "no_snapshot_yet" or not _snap_data:
+                        # Server up but oracle hasn't pushed yet — wait for SSE client
+                        _t.sleep(min(2 ** _retry, 16))
+                        # Try SSE client's in-memory cache
+                        _sse_snap = self._sse_client.get_latest_snapshot() if self._sse_client else None
+                        if _sse_snap:
+                            _snap_data = _sse_snap
+                            print(f" ✅ (SSE cache)", flush=True)
+                            break
+                        print(".", end="", flush=True)
+                        continue
+                    print(" ✅", flush=True)
                     break
-                _last_boot_error = "No response from health check"
-                if _retry < _boot_retries - 1:
+                elif _r.status_code == 204:
+                    # No snapshot yet — wait briefly then try SSE cache
+                    _t.sleep(min(2 ** _retry, 16))
+                    _sse_snap = self._sse_client.get_latest_snapshot() if self._sse_client else None
+                    if _sse_snap:
+                        _snap_data = _sse_snap
+                        print(f" ✅ (SSE cache)", flush=True)
+                        break
+                    print(".", end="", flush=True)
+                    continue
+                else:
                     print(f".", end="", flush=True)
-                    _t.sleep(2 ** min(_retry, 4))  # 1, 2, 4, 8, 16s, cap at 16s
+                    _t.sleep(min(2 ** _retry, 16))
                     continue
             except _requests.exceptions.ConnectionError as _ce:
-                _last_boot_error = f"connection refused"
                 if _retry == _boot_retries - 1:
-                    print("\n  ❌ FATAL: Cannot connect to RPC endpoint", flush=True)
-                    print(f"  Check: Is server running at {self.oracle_url}?")
-                    raise RuntimeError(
-                        "RPC bootstrap failed: server unreachable (ConnectionRefused)"
-                    )
-                if _retry < _boot_retries - 1:
-                    print(f".", end="", flush=True)
-                    _t.sleep(2 ** min(_retry, 4))
-                    continue
-            except Exception as _boot_err:
-                # Could be timeout, 503, or other transient error
-                _last_boot_error = str(_boot_err)
-                if _retry < _boot_retries - 1:
-                    print(f".", end="", flush=True)
-                    _t.sleep(2 ** min(_retry, 4))
-                    continue
+                    print("\n  ❌ FATAL: Cannot reach server", flush=True)
+                    raise RuntimeError(f"SSE bootstrap failed: {_ce}") from _ce
+                print(".", end="", flush=True)
+                _t.sleep(min(2 ** _retry, 16))
+            except Exception as _e:
+                _EXP_LOG.debug(f"[BOOTSTRAP] snapshot/latest attempt {_retry+1}: {_e}")
+                print(".", end="", flush=True)
+                _t.sleep(min(2 ** _retry, 16))
 
-        if _boot_health is None:
-            # Server is either down or saturated. Log warning and degrade.
-            print(
-                f"\n  ⚠️  RPC endpoint slow/unavailable: {_last_boot_error}", flush=True
-            )
-            print("  Mining in degraded mode (local entropy fallback)", flush=True)
-            _metrics = {}
-        else:
-            print(" ✓", flush=True)
-
-        # ── PHASE 2: Oracle metrics fetch (optional, non-blocking) ────────────────────────
-        # Attempt to get quantum metrics via RPC. If unavailable, mining continues anyway.
-        # The oracle snapshot is nice-to-have for entropy, not required.
-        _metrics = {}
-        print("  🌌 Checking quantum oracle…", end="", flush=True)
-        try:
-            _m = _LIVE_RPC_ORACLE._rpc(
-                "qtcl_getQuantumMetrics", [], timeout=10, retries=2
-            )
-            if isinstance(_m, dict) and _m.get("oracle_available"):
-                _metrics = _m
-                print(" ✅", flush=True)
-            else:
-                print(" ⚠️", flush=True)
-                print(
-                    "     Oracle initializing, will use local entropy fallback",
-                    flush=True,
-                )
-        except Exception as _oracle_err:
-            print(" ⚠️", flush=True)
-            print(
-                f"     Oracle unavailable ({_oracle_err}), will use local entropy fallback",
-                flush=True,
-            )
-
-        # ── Start quantum oracle mesh if SSE available (background snapshot polling) ────
-        # If bootstrap didn't establish SSE due to server saturation, mining still proceeds
-        # in degraded mode. The oracle mesh can attempt SSE in the background.
+        # Start oracle mesh backed by already-running SSE client
         if self._sse_client:
             try:
                 self._oracle_mesh = ClientOracleMesh(self._sse_client, self)
                 self._oracle_mesh.start()
-                _EXP_LOG.info("[App] Quantum oracle mesh started")
-                print(
-                    f"  ✅ Background oracle mesh polling {self.oracle_url}/rpc/oracle/snapshot",
-                    flush=True,
-                )
-            except Exception as e:
-                _EXP_LOG.warning(f"[App] Failed to start oracle mesh: {e}")
+                _EXP_LOG.info("[BOOTSTRAP] ✅ Oracle mesh started")
+                print(f"  ✅ Oracle mesh live → {self.oracle_url}/rpc/oracle/snapshot", flush=True)
+            except Exception as _me:
+                _EXP_LOG.warning(f"[BOOTSTRAP] Oracle mesh failed to start: {_me}")
                 self._oracle_mesh = None
 
+        # Merge snap_data into _metrics-compatible dict for height resolution
+        _metrics = _snap_data
         snap = _metrics
 
-        # ── Sync koyeb_state with bootstrap snapshot ──────────────────────────
+        # Sync koyeb_state if snap has useful data
         if snap:
             try:
                 self.koyeb_state.sync(self.client_field, timeout=5)
             except Exception as _sync_e:
-                _EXP_LOG.debug(f"[BOOTSTRAP] koyeb_state sync failed: {_sync_e}")
+                _EXP_LOG.debug(f"[BOOTSTRAP] koyeb_state sync: {_sync_e}")
 
-        # ── Resolve block height from live RPC snap (needed by _run_bootstrap) ──
-        # Priority: 1) snap block_height, 2) koyeb_state.block_height, 3) fetch from server
+        # ── Resolve block height from SSE snapshot ──────────────────────────────
+        # snapshot/latest carries block_height (from oracle push) or height field
         bh = int(snap.get("block_height") or snap.get("height") or 0)
         if bh == 0:
             bh = int(self.koyeb_state.block_height or 0)
         if bh == 0:
-            # Final fallback: directly query server for current height (with retry)
-            for _retry in range(3):
-                try:
-                    _height_rpc = self.api._rpc(
-                        "qtcl_getBlockHeight", [], timeout=10, retries=2
-                    )
-                    if (
-                        _height_rpc
-                        and isinstance(_height_rpc, dict)
-                        and not _height_rpc.get("error")
-                    ):
-                        bh = int(_height_rpc.get("height", 0) or 0)
-                        _srv_pqc = _height_rpc.get("pq_curr")
-                        _srv_pql = _height_rpc.get("pq_last")
-                        _EXP_LOG.info(
-                            f"[BOOTSTRAP] Fetched height from server: {bh} pq_curr={_srv_pqc} pq_last={_srv_pql}"
-                        )
-                        if bh > 0:
-                            break
-                    time.sleep(1)
-                except Exception as _e:
-                    _EXP_LOG.debug(
-                        f"[BOOTSTRAP] Could not fetch height from server (attempt {_retry + 1}): {_e}"
-                    )
-                    time.sleep(1)
-
-        # If still at 0, try one more time with envelope method to see raw response
+            # Final fallback: poll SSE client until it receives first snapshot (max 30s)
+            _wait_start = _t.time()
+            while _t.time() - _wait_start < 30:
+                _live = self._sse_client.get_latest_snapshot() if self._sse_client else None
+                if _live:
+                    bh = int(_live.get("block_height") or _live.get("height") or 0)
+                    if bh > 0:
+                        _EXP_LOG.info(f"[BOOTSTRAP] Got height={bh} from SSE stream")
+                        break
+                _t.sleep(1)
         if bh == 0:
-            _EXP_LOG.warning("[BOOTSTRAP] Retrying with envelope to diagnose...")
-            try:
-                _env_resp = self.api._rpc_envelope(
-                    "qtcl_getBlockHeight", [], timeout=15, retries=1
-                )
-                _EXP_LOG.info(f"[BOOTSTRAP] Raw envelope response: {_env_resp}")
-                if _env_resp and isinstance(_env_resp, dict):
-                    if "result" in _env_resp:
-                        _res = _env_resp["result"]
-                        if isinstance(_res, dict):
-                            bh = int(_res.get("height", 0) or 0)
-                            _EXP_LOG.info(
-                                f"[BOOTSTRAP] Extracted height from envelope: {bh}"
-                            )
-                    elif "error" in _env_resp:
-                        _EXP_LOG.error(
-                            f"[BOOTSTRAP] Server returned error: {_env_resp['error']}"
-                        )
-            except Exception as _env_err:
-                _EXP_LOG.error(f"[BOOTSTRAP] Envelope call also failed: {_env_err}")
+            _EXP_LOG.warning("[BOOTSTRAP] Could not determine server height — starting at genesis")
+            print("  ⚠️  Server height unknown — mining at genesis until SSE syncs", flush=True)
 
-        # If STILL at 0, that's a real problem
-        if bh == 0:
-            _EXP_LOG.error(
-                "[BOOTSTRAP] CRITICAL: Could not fetch server height after all attempts."
-            )
-            print(
-                "  ⚠️  WARNING: Server connection failed. Starting at genesis (h=0) - may not sync properly."
-            )
-            print("  ⛏️  Mining at genesis until server connection restored.")
-            # Don't return - let it try mining at genesis
-
-        # pq_curr = target height (block we're mining) = current + 1
-        # pq_last = parent height (current chain tip)
         pq_curr_id = str(bh + 1) if bh >= 0 else "1"
         pq_last_id = str(bh) if bh >= 0 else "0"
-        # Fetch actual pq_curr/pq_last from server block record — they are sealed
-        # by the block sealer and may differ from a local modulo estimate.
+        # Refine pq_curr/pq_last from SSE snapshot fields if present
         try:
-            _blk_rec = self.api._rpc("qtcl_getBlock", [bh], timeout=5, retries=1)
-            if isinstance(_blk_rec, dict) and "error" not in _blk_rec:
-                _srv_pqc = _blk_rec.get("pq_curr") or _blk_rec.get("pq_curr_id")
-                _srv_pql = _blk_rec.get("pq_last") or _blk_rec.get("pq_last_id")
-                if _srv_pqc is not None:
-                    pq_curr_id = str(_srv_pqc)
-                if _srv_pql is not None:
-                    pq_last_id = str(_srv_pql)
+            _srv_pqc = snap.get("pq_curr")
+            _srv_pql = snap.get("pq_last")
+            if _srv_pqc is not None:
+                pq_curr_id = str(_srv_pqc)
+            if _srv_pql is not None:
+                pq_last_id = str(_srv_pql)
         except Exception:
             pass  # keep local modulo fallback
         bath = None
@@ -28935,9 +28875,15 @@ class QtclClientApp:
                     print("  ❌ Password required")
                     continue
                 try:
+                    import shutil as _shutil
+                    _wf = HypGammaWallet().wallet_file
+                    if _wf.exists():
+                        _bak = _wf.with_suffix(".json.v2bak")
+                        _shutil.copy2(str(_wf), str(_bak))
+                        print(f"  📦 Old wallet backed up → {_bak.name}")
                     addr = HypGammaWallet().create(pw)
-                    print(f"  ✅ Created V3 hybrid wallet: {addr}")
-                    print(f"  🛡 Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
+                    print(f"  ✅ V3 hybrid wallet created: {addr}")
+                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
                 except Exception as e:
                     print(f"  ❌ {e}")
             elif ch == "3":
@@ -31740,19 +31686,49 @@ def main() -> None:  # noqa: F811
         init_p2p_bootstrap()
 
         url = args.oracle_url or ENTROPY_SERVER_URL
-        # ── Wallet existence check (skip for oracle-audit mode) ───────────────
+        # ── Wallet existence and format check (skip for oracle-audit mode) ────
         from pathlib import Path as _PathLib
+        import json as _wj
 
         _wallet_file = _PathLib.home() / "qtcl-miner" / "data" / "wallet.json"
         _is_oracle_audit = getattr(args, "oracle_audit", False)
-        if not _wallet_file.exists() and not _is_oracle_audit:
+
+        # Detect old non-hybrid wallet on disk
+        _wallet_is_old_format = False
+        if _wallet_file.exists() and not _is_oracle_audit:
+            try:
+                _wraw = _wj.loads(_wallet_file.read_text())
+                if _wraw.get("wallet_type", "") not in ("hybrid_v3", ""):
+                    _wallet_is_old_format = True
+                elif "wallet_type" not in _wraw:
+                    # No wallet_type stamp = pre-V3 file, check public_key length
+                    # Old SL(2,p)-only wallets stored a single hex string, not a hybrid dict
+                    _pub = _wraw.get("public_key", "")
+                    # Hybrid wallets store SL(2,p) pub only; old ones also did, but lack wallet_type
+                    # Safest signal: if encrypted private_key decrypts to a plain hex string
+                    # we can't know without decrypting, so flag as potentially old
+                    _wallet_is_old_format = True
+            except Exception:
+                pass
+
+        if (not _wallet_file.exists() or _wallet_is_old_format) and not _is_oracle_audit:
             print()
-            print("  ┌──────────────────────────────────────────────────────────┐")
-            print("  │  🔑  Wallet Setup                                        │")
-            print("  │                                                          │")
-            print("  │  No wallet file found.                                   │")
-            print("  │  Create a new QTCL wallet? (Required for all modes)      │")
-            print("  └──────────────────────────────────────────────────────────┘")
+            if _wallet_is_old_format:
+                print("  ┌──────────────────────────────────────────────────────────┐")
+                print("  │  ⚠️   Old Wallet Detected                                 │")
+                print("  │                                                          │")
+                print("  │  Your wallet.json is SL(2,p)-only (pre-V3 format).       │")
+                print("  │  V3 hybrid wallets require Falcon-512 + SL(2,p).         │")
+                print("  │  Create a new V3 wallet? (old file will be backed up)    │")
+                print("  └──────────────────────────────────────────────────────────┘")
+            else:
+                print("  ┌──────────────────────────────────────────────────────────┐")
+                print("  │  🔑  Wallet Setup                                        │")
+                print("  │                                                          │")
+                print("  │  No wallet file found.                                   │")
+                print("  │  Create a new QTCL V3 hybrid wallet?                     │")
+                print("  │  (Falcon-512 NIST FIPS 206 + SL(2,p) scalar Schnorr)    │")
+                print("  └──────────────────────────────────────────────────────────┘")
             # Suppress logging during input to prevent prompt injection
             import contextlib
 
@@ -31777,9 +31753,17 @@ def main() -> None:  # noqa: F811
                         print("  ⚠  Empty password — using defaults")
                         _new_pw = "default_qtcl_password"
 
+                    # Back up old wallet if it exists
+                    if _wallet_is_old_format and _wallet_file.exists():
+                        import shutil as _shutil
+                        _bak = _wallet_file.with_suffix(".json.v2bak")
+                        _shutil.copy2(str(_wallet_file), str(_bak))
+                        print(f"  📦 Old wallet backed up → {_bak.name}")
+
                     _tmp_create_wallet = HypGammaWallet()
                     _new_addr = _tmp_create_wallet.create(_new_pw)
-                    print(f"  ✅ Wallet created: {_new_addr}")
+                    print(f"  ✅ V3 hybrid wallet created: {_new_addr}")
+                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
                     _new_pw = "0" * len(_new_pw)
                 except (EOFError, KeyboardInterrupt):
                     print("  ⚠  Wallet creation skipped — continuing as guest")
