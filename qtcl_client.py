@@ -5151,6 +5151,7 @@ class LiveRPCOracleSnapshot:
                 try:
                     import urllib.parse as _up
 
+                    _payload = {"method": "qtcl_getQuantumMetrics", "params": []}
                     params_json = json.dumps(_payload.get("params", []))
                     query = _up.urlencode(
                         {
@@ -24645,7 +24646,7 @@ class QtclClientApp:
 
                     _miner_reward = 7.2
                     _treasury_reward = 0.8
-                    _treasury_addr = self.koyeb_state.treasury_address or "qtcl1f5080131c276070d09bd2cd8c4bea99d046663b1"
+                    _treasury_addr = self.koyeb_state.treasury_address or "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
                     _miner_cb_id = f"cb_miner_{target_height}_{miner_addr[:16]}"
                     _prior_pending_treasury = []
 
@@ -26525,7 +26526,7 @@ class QtclClientApp:
 
     def _send_tx_wizard(self) -> None:
         try:
-            to_addr = input("  To address (qtcl1…): ").strip()
+            to_addr = input("  To address (64-char hex): ").strip()
             amount = float(input("  Amount (QTCL): ").strip())
 
             donate = input("  Donate to the network? [y/N]: ").strip().lower()
@@ -26536,8 +26537,8 @@ class QtclClientApp:
         except (ValueError, EOFError, KeyboardInterrupt):
             print("  ❌ Cancelled")
             return
-        if not to_addr.startswith("qtcl1"):
-            print("  ❌ Invalid QTCL address")
+        if len(to_addr) != 64 or not all(c in "0123456789abcdefABCDEF" for c in to_addr):
+            print("  ❌ Invalid QTCL address (expected 64-char hex)")
             return
 
         # V3 HYBRID: build tx with hybrid public key dict
@@ -30946,7 +30947,7 @@ class NodeRPCMeshServer:
                     ")"
                 )
                 treasury_address = (
-                    "qtcl1treasury0reward0dist0address00000000000000000000001"
+                    "e8ffb27915ac244e8257de8b7f96ad387d1e9d93c634d849a6ad2dae0da6750b"
                 )
                 treasury_reward_base = 80
                 try:
