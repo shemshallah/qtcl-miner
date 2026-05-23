@@ -786,6 +786,7 @@ class HypGammaEngine:
             timestamp = datetime.now(timezone.utc).isoformat()
             # sig is now a dict directly from SchnorrGamma.sign_hash (not _SigResult)
             result = {
+                'version': sig.get('version', 'schnorr_gamma_gf_v4'),
                 'signature': sig.get('signature', ''),
                 'challenge': sig.get('challenge', ''),
                 'auth_tag': sig.get('auth_tag', sig.get('challenge', '')),
