@@ -8,6 +8,10 @@
 ║                                                                                              ║
 ║   "The geometry does not decorate the cryptography. The cryptography IS the geometry."      ║
 ║                                                                                              ║
+║   HypΓ v4: SL(3,p) upgrade — 3×3 matrices over GF(p), p = 2^255−31.                      ║
+║   Classical DLP security: ~189 bits (Q₃₇₉ factor of p²+p+1 in |SL(3,p)|).               ║
+║   Hybrid wire: "hybrid_sl3p_falcon_v2". Backward compat: v1 (SL(2,p)) verified.           ║
+║                                                                                              ║
 ║   This is NOT a facade. This IS the system. Every piece wired cold: tessellation            ║
 ║   lazy-loading, LDPC error sampling in encrypt/decrypt, eigendecomposition power ops        ║
 ║   with precision escalation (150→210 dps), Fiat-Shamir binding, address derivation,        ║
@@ -334,6 +338,7 @@ try:
         generate_hybrid_keypair as _pqc_generate_keypair,
         hybrid_sign as _pqc_hybrid_sign,
         hybrid_verify as _pqc_hybrid_verify,
+        hybrid_verify_any as _pqc_hybrid_verify_any,
         hybrid_keypair_to_dict,
         hybrid_public_key_to_dict,
         hybrid_keypair_from_dict,
@@ -343,6 +348,7 @@ try:
         HybridSignature,
         pqc_status,
         WIRE_VERSION as PQC_WIRE_VERSION,
+        LEGACY_WIRE_VERSION as PQC_LEGACY_WIRE_VERSION,
     )
     _MODULES_AVAILABLE['hyp_pqc'] = True
 except ImportError:
@@ -722,17 +728,17 @@ class HypGammaEngine:
 
     def sign_hash(self, message_hash: bytes, private_key: str) -> Dict[str, str]:
         """
-        Sign a message hash using Schnorr-Γ over SL(2,p) (v3 scalar construction).
+        Sign a message hash using Schnorr-Γ over SL(3,p) (v4 scalar construction).
 
-        The signature is computed as follows:
-          1. Derive scalar private key x = SHA3-256(walk || "SIGN")
-          2. Sample nonce r ← [0, 2^256)
-          3. Compute commitment R = g^r
-          4. Challenge c = SHA3-256(serialize(R) ‖ serialize(y) ‖ message_hash) mod 2^256
-          5. Response s = r + c·x mod p
-          6. Return (R, Z=g^s, c, s) as the signature
+        Protocol (SL(3,p)):
+          1. Derive scalar private key x = walk_to_private_scalar(walk)
+          2. Commitment R = g₀^r, g₀ = fixed Schnorr generator ∈ SL(3,p)
+          3. Challenge c = SHA3-256(DOMAIN ‖ R ‖ y ‖ message_hash) mod 2^256
+          4. Response s = r + c·x mod SL3_ORDER
+          5. Return (R, Z=g₀^s, c, s)
 
-        Verification: g^s == R @ y^c  (matrix equality in SL(2,p))
+        Verification: g₀^s == R @ y^c  (3×3 matrix equality in SL(3,p))
+        Classical security: ~189 bits (Q₃₇₉ factor of p²+p+1).
 
         Parameters:
             message_hash (bytes): SHA3-256 hash of the message (32 bytes).
@@ -740,10 +746,11 @@ class HypGammaEngine:
 
         Returns:
             dict with keys:
-              'signature': hex(R‖Z) — commitment + response (≈4000 bits)
+              'signature': hex(R‖Z) — commitment + response (≈1152 bytes = 576+576)
               'challenge': hex(c) — 256-bit Fiat-Shamir challenge
               'auth_tag': hex(c) — alias of challenge
               'timestamp': ISO 8601 creation time
+              'R', 'Z', 'c_full', 's_scalar', 'R_canonical_hex': canonical fields
 
         Raises:
             HypEngineError: If signing fails or private key is invalid.
@@ -809,9 +816,14 @@ class HypGammaEngine:
     def verify_signature(self, message_hash: bytes, sig: Dict[str, str],
                          public_key: str) -> bool:
         """
-        Verify a Schnorr-Γ signature (v3 scalar construction).
+        Verify a Schnorr-Γ signature (v4 SL(3,p) scalar construction).
 
-        Verification checks: g^s == R @ y^c  (matrix equality in SL(2,p)).
+        Verification checks: g₀^s == R @ y^c  (3×3 matrix equality in SL(3,p)).
+
+        Version routing:
+          - v4 wire ("schnorr_gamma_gf_v4"): native SL(3,p) verifier
+          - v3 wire ("schnorr_gamma_gf_v3"): legacy SL(2,p) verifier (chain history)
+          - missing version: rejected (M-5 FIX)
 
         Parameters:
             message_hash (bytes): SHA3-256 hash of the message (32 bytes).
@@ -1036,12 +1048,18 @@ class HypGammaEngine:
 
     def generate_hybrid_keypair(self) -> Dict[str, Any]:
         """
-        Generate a hybrid keypair: SL(2,p) scalar Schnorr + Falcon-512.
+        Generate a hybrid keypair: SL(3,p) scalar Schnorr-Γ + Falcon-512.
+
+        SL(3,p) upgrade (HypΓ v4):
+          - 3×3 matrices over GF(p), p = 2^255−31
+          - Walk: 768 steps over 6 generators (3 base + 3 inverse)
+          - Classical DLP: ~189 bits (Q₃₇₉ factor of p²+p+1)
+          - Wire version: "hybrid_sl3p_falcon_v2"
 
         Returns dict with:
-          'sl2p': {private_key, public_key, address}
+          'sl3p': {private_walk_hex, public_hex (576 hex chars), address}
           'falcon': {public_key_b64, secret_key_b64}
-          'version': 'hybrid_sl2p_falcon_v1'
+          'version': 'hybrid_sl3p_falcon_v2'
         """
         if not _MODULES_AVAILABLE.get('hyp_pqc'):
             raise HypEngineError(
@@ -1059,14 +1077,15 @@ class HypGammaEngine:
 
     def hybrid_sign(self, message_hash: bytes, private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Sign with hybrid scheme: BOTH SL(2,p) and Falcon-512 must verify.
+        Sign with hybrid scheme: BOTH SL(3,p) and Falcon-512 must verify.
 
         Parameters:
             message_hash: 32-byte SHA3-256 hash
             private_key_dict: dict from generate_hybrid_keypair() (includes secret keys)
+                              Accepts both v2 (sl3p) and v1 (sl2p) wallet shapes.
 
         Returns:
-            dict with hybrid signature (JSON-compatible)
+            dict with hybrid signature (JSON-compatible, wire version v2)
         """
         if not _MODULES_AVAILABLE.get('hyp_pqc'):
             raise HypEngineError("Hybrid PQC not available")
@@ -1077,8 +1096,8 @@ class HypGammaEngine:
             kp = hybrid_keypair_from_dict(private_key_dict)
             sig = _pqc_hybrid_sign(
                 message_hash,
-                kp.sl2p_private_hex,
-                kp.sl2p_public_hex,
+                kp.sl3p_private_hex,
+                kp.sl3p_public_hex,
                 kp.falcon_secret_key,
             )
             return hybrid_signature_to_dict(sig)
@@ -1097,12 +1116,16 @@ class HypGammaEngine:
         public_key_dict: Dict[str, Any],
     ) -> Tuple[bool, str]:
         """
-        Verify hybrid signature: BOTH SL(2,p) and Falcon-512 must be valid.
+        Verify hybrid signature: BOTH SL(3,p) and Falcon-512 must be valid.
+
+        Version-routing: accepts both v2 (sl3p) and v1 (sl2p) wire formats.
+        Routes v1 signatures to the legacy SL(2,p) verifier automatically,
+        ensuring chain history remains fully verifiable after the upgrade.
 
         Parameters:
             message_hash: 32-byte SHA3-256 hash
             sig_dict: hybrid signature dict from hybrid_sign()
-            public_key_dict: public key dict (no secrets)
+            public_key_dict: public key dict (no secrets); supports sl3p and sl2p
 
         Returns:
             (valid, reason) — valid=True only if BOTH signatures pass
@@ -1113,13 +1136,18 @@ class HypGammaEngine:
             if not isinstance(message_hash, bytes) or len(message_hash) != 32:
                 return False, "invalid_message_hash"
 
-            sig = hybrid_signature_from_dict(sig_dict)
-            sl2p_pub_hex = public_key_dict["sl2p"]["public_hex"]
+            # Support both v2 (sl3p) and v1 (sl2p) public key dict shapes
+            crypto_pub = public_key_dict.get("sl3p") or public_key_dict.get("sl2p")
+            if crypto_pub is None:
+                return False, "public_key_dict_missing_sl3p_block"
+
+            pub_hex = crypto_pub["public_hex"]
             falcon_pk_b64 = public_key_dict["falcon"]["public_key"]
             import base64
             falcon_pk = base64.b64decode(falcon_pk_b64)
 
-            return _pqc_hybrid_verify(message_hash, sig, sl2p_pub_hex, falcon_pk)
+            # Version-routing verifier — handles v1 and v2 automatically
+            return _pqc_hybrid_verify_any(message_hash, sig_dict, pub_hex, falcon_pk)
         except Exception as e:
             return False, f"hybrid_verify_error:{type(e).__name__}"
 
@@ -1138,8 +1166,11 @@ class HypGammaEngine:
         block_hash = hashlib.sha3_256(canonical_json.encode()).digest()
         sig_dict = self.hybrid_sign(block_hash, private_key_dict)
         try:
-            sl2p_pub = private_key_dict["sl2p"]["public_hex"]
-            sig_dict['signer_address'] = self._derive_address_from_public_key(sl2p_pub)
+            # Support both v2 (sl3p) and v1 (sl2p) key dict shapes
+            crypto_pub = private_key_dict.get("sl3p") or private_key_dict.get("sl2p")
+            if crypto_pub:
+                sl3p_pub = crypto_pub["public_hex"]
+                sig_dict['signer_address'] = self._derive_address_from_public_key(sl3p_pub)
         except Exception:
             pass
         return sig_dict
@@ -1156,7 +1187,7 @@ class HypGammaEngine:
         return self.hybrid_verify(block_hash, sig_dict, public_key_dict)
 
     def pqc_status(self) -> Dict[str, Any]:
-        """Return PQC module status."""
+        """Return PQC module status including SL(3,p) security parameters."""
         return pqc_status()
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -1234,8 +1265,10 @@ class HypGammaEngine:
 
             # Deserialize walk indices → raw bytes
             walk_indices = self._deserialize_walk_indices(signing_private_key)
-            # Pack walk as bytes: each index is 2 bits; 512 indices → 128 bytes
-            walk_bytes = bytes(walk_indices)   # uint8 array, values 0-3, 512 bytes
+            # H-1 FIX: use walk_to_bytes() (2-bits/index, 128 bytes) — same encoding
+            # as walk_to_private_scalar, avoiding the 512-byte uint8 inconsistency
+            from hyp_finite_field import walk_to_bytes as _walk_to_bytes
+            walk_bytes = _walk_to_bytes(walk_indices)  # H-1 FIX: compact 128-byte form
 
             # Two-round KDF: compress then domain-separate
             compressed = hashlib.sha3_256(walk_bytes).digest()                        # 32 bytes
@@ -1414,7 +1447,7 @@ class HypGammaEngine:
             with self._lock:
                 if self._lwe is None:
                     raise RuntimeError("GeodesicLWE not initialized after _ensure")
-                result = self._lwe.encrypt(message, public_key)
+                result = self._lwe.encrypt(message, public_key, error_weight=error_weight)  # C-2 FIX: pass error_weight
                 result['error_weight'] = error_weight
                 result['ldpc_coupled'] = True
                 
@@ -1640,24 +1673,31 @@ class HypGammaEngine:
         """
         Deserialize private key string back to walk indices.
 
-        MED-5 FIX (RED TEAM): Prefix detection — "GF1:" prefix identifies
-        binary-packed format, unambiguous and forward-compatible.
-        
-        Fallback heuristic: if all chars are in '0123' and length matches,
-        it's the old decimal encoding. Otherwise treat as hex.
+        Format detection (v4-first):
+          "GF3:" prefix → v4 SL(3,p) walk (6-generator, nibble-packed, indices 0..5)
+          "GF1:" prefix → v3 SL(2,p) walk (4-generator, 2-bit packed, indices 0..3)
+          All-decimal chars of exact walk length → legacy decimal encoding (v2)
+          Otherwise → hex_to_walk() auto-detect
+
+        The hex_to_walk() function in hyp_finite_field.py handles both GF3: and GF1:
+        prefixes natively; this method ensures the full hex_str (including prefix) is
+        passed through unchanged so hex_to_walk can dispatch correctly.
         """
-        # Explicit format prefix (MED-5 FIX)
+        # v4: GF3: prefix — SL(3,p) 6-generator walk
+        if hex_str.startswith("GF3:"):
+            return hex_to_walk(hex_str, length=WALK_LENGTH)
+
+        # v3 legacy: GF1: prefix — SL(2,p) 4-generator walk
         if hex_str.startswith("GF1:"):
             return hex_to_walk(hex_str[4:], length=WALK_LENGTH)
-        
-        # Heuristic: if all chars are in '0123' and length matches walk length,
-        # it's the old decimal encoding.
-        is_decimal = len(hex_str) == WALK_LENGTH and all(c in '0123' for c in hex_str)
 
+        # Legacy decimal encoding (early wallets before GF3:/GF1: prefixes)
+        is_decimal = len(hex_str) == WALK_LENGTH and all(c in '0123' for c in hex_str)
         if is_decimal:
             return [int(c) for c in hex_str]
-        else:
-            return hex_to_walk(hex_str, length=WALK_LENGTH)
+
+        # Default: pass through to hex_to_walk which handles both formats
+        return hex_to_walk(hex_str, length=WALK_LENGTH)
 
     @staticmethod
     def _derive_address_from_public_key(public_key_hex: str) -> str:
@@ -1717,7 +1757,9 @@ def run_tests():
     """
 
     print("\n" + "="*80)
-    print("HYP_ENGINE ENTERPRISE TEST SUITE")
+    print("HYP_ENGINE ENTERPRISE TEST SUITE — HypΓ v4: SL(3,p)")
+    print(f"  Classical security: ~189 bits (Q₃₇₉ factor of p²+p+1)")
+    print(f"  Hybrid wire: hybrid_sl3p_falcon_v2 | Schnorr wire: schnorr_gamma_gf_v4")
     print("="*80)
 
     passed = 0
@@ -1765,9 +1807,12 @@ def run_tests():
         kp = engine.generate_keypair()
         assert isinstance(kp, HypKeyPair), "Not a HypKeyPair"
         assert len(kp.private_key) > 0, "Empty private key"
-        assert len(kp.public_key) >= 256, f"Public key too short: {len(kp.public_key)}"
+        # SL(3,p) public key is 288 bytes = 576 hex chars
+        assert len(kp.public_key) >= 512, f"Public key too short: {len(kp.public_key)}"
         assert len(kp.address) == 64, f"Address wrong length: {len(kp.address)}"
-        print(f"  ✓ PASS: Keypair generated")
+        # v4: private key must have GF3: prefix
+        assert kp.private_key.startswith("GF3:"), f"v4 private key must start with GF3: prefix"
+        print(f"  ✓ PASS: Keypair generated (SL(3,p) — 576-char public key)")
         print(f"    Private key: {kp.private_key[:32]}... ({len(kp.private_key)} chars)")
         print(f"    Public key: {kp.public_key[:32]}... ({len(kp.public_key)} chars)")
         print(f"    Address: {kp.address}")
@@ -1898,23 +1943,27 @@ def run_tests():
     # ─────────────────────────────────────────────────────────────────────────────
 
     try:
-        print("\n[TEST 8] V3 canonical signature dict keys")
+        print("\n[TEST 8] V4 canonical signature dict keys (SL(3,p))")
         engine = HypGammaEngine()
         kp = engine.generate_keypair()
 
-        msg_hash = engine.hash_message(b"V3 canonical test")
+        msg_hash = engine.hash_message(b"V4 canonical test SL3p")
         sig = engine.sign_hash(msg_hash, kp.private_key)
 
-        # Check all required v3 canonical keys
+        # Check all required v4 canonical keys
         required_keys = ['signature', 'challenge', 'auth_tag', 'timestamp',
                          'R', 'Z', 'c_full', 's_scalar', 'R_canonical_hex']
         for key in required_keys:
             assert key in sig, f"Missing key: {key}"
 
+        # R and Z must be 576 chars (288 bytes × 2) for SL(3,p)
+        assert len(sig['R']) == 576, f"R must be 576 hex chars (3×3), got {len(sig['R'])}"
+        assert len(sig['Z']) == 576, f"Z must be 576 hex chars (3×3), got {len(sig['Z'])}"
+
         # Check auth_tag == challenge
         assert sig['auth_tag'] == sig['challenge'], "auth_tag != challenge"
 
-        print(f"  ✓ PASS: V3 canonical keys present")
+        print(f"  ✓ PASS: V4 canonical keys present (R/Z are 576 hex chars = 288 bytes each)")
         print(f"    Keys: {', '.join(sig.keys())}")
         passed += 1
     except Exception as e:
@@ -1995,6 +2044,36 @@ def run_tests():
             failed += 1
         except HypEngineError:
             print(f"  ✓ PASS: Error handling works correctly")
+            passed += 1
+    except Exception as e:
+        print(f"  ✗ FAIL: {e}")
+        failed += 1
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # TEST 12: Hybrid keypair wire format (SL(3,p) v2)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    try:
+        print("\n[TEST 12] Hybrid keypair wire format (SL(3,p) v2)")
+        engine = HypGammaEngine()
+
+        if not _MODULES_AVAILABLE.get('hyp_pqc'):
+            print("  ⚠ SKIP: hyp_pqc not available")
+        else:
+            kp_dict = engine.generate_hybrid_keypair()
+            version = kp_dict.get("version", "")
+            assert version == PQC_WIRE_VERSION, \
+                f"version mismatch: {version!r} != {PQC_WIRE_VERSION!r}"
+            assert "sl3p" in kp_dict, \
+                "v2 hybrid keypair must use 'sl3p' key (not 'sl2p')"
+            assert "falcon" in kp_dict
+            sl3p = kp_dict["sl3p"]
+            assert sl3p["private_walk_hex"].startswith("GF3:"), \
+                "v4 walk must have GF3: prefix"
+            assert len(sl3p["public_hex"]) == 576, \
+                f"SL(3,p) public key must be 576 hex chars, got {len(sl3p['public_hex'])}"
+            print(f"  ✓ PASS: Hybrid keypair uses SL(3,p) wire format v2")
+            print(f"    version={version!r}  public_hex_len={len(sl3p['public_hex'])}")
             passed += 1
     except Exception as e:
         print(f"  ✗ FAIL: {e}")
