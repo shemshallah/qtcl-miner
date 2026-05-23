@@ -48,10 +48,9 @@
 ║     Old wallets (GF1: private keys, 256-hex public keys) remain signable/verifiable.       ║
 ║     New wallets use GF3: private keys, 576-hex public keys (3×3 matrix, 288 bytes).       ║
 ║                                                                                              ║
-║   Falcon library: pqcrypto.sign.falcon_512                                                  ║
-║     Fallback: if pqcrypto unavailable, generates deterministic mock Falcon                 ║
-║     signatures (HMAC-SHA3-512) — insecure, flag via pqc_status()['falcon_real'] = False.  ║
-║     DO NOT deploy with mock Falcon in production.                                           ║
+║   Falcon library: pqcrypto.sign.falcon_512 (REQUIRED — no mock, no fallback)    ║
+║     If pqcrypto is not installed, hyp_pqc.py raises ImportError at load time.  ║
+║     Install: pip install pqcrypto                                               ║
 ║                                                                                              ║
 ║   I love you.                                                                               ║
 ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
@@ -108,122 +107,46 @@ _WALK_PREFIX_V4       = "GF3:" # SL(3,p) v4 nibble-packed
 _WALK_PREFIX_V3       = "GF1:" # SL(2,p) v3 2-bit packed (legacy)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FALCON-512 LAYER — real pqcrypto or mock fallback
+# FALCON-512 LAYER — REQUIRED (no mock, no fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-_FALCON_REAL = False
-_FALCON_SIGN_FN  = None
-_FALCON_VERIFY_FN = None
-_FALCON_KEYGEN_FN = None
 
 try:
     from pqcrypto.sign.falcon_512 import (
-        generate_keypair as _falcon_keygen,
-        sign          as _falcon_sign_raw,   # sign(secret_key, message) → signature
-        verify        as _falcon_verify_raw, # verify(public_key, message, signature) raises on fail
+        generate_keypair as _falcon_keygen_raw,
+        sign             as _falcon_sign_raw,
+        verify           as _falcon_verify_raw,
     )
-    _FALCON_REAL = True
-    _FALCON_KEYGEN_FN  = _falcon_keygen
-    # Normalize to (message, sk) → bytes
-    _FALCON_SIGN_FN    = lambda message, sk: _falcon_sign_raw(sk, message)
-    # Normalize to (message, signature, pk) raises ValueError on fail
-    _FALCON_VERIFY_FN  = lambda message, signature, pk: _falcon_verify_raw(pk, message, signature)
-    logger.info("[hyp_pqc] Falcon-512: pqcrypto loaded (real NIST PQC signatures)")
 except ImportError:
-    logger.warning(
-        "[hyp_pqc] pqcrypto not found — using HMAC-SHA3-512 mock Falcon. "
-        "DO NOT USE IN PRODUCTION. Install: pip install pqcrypto"
+    raise ImportError(
+        "\n"
+        "╔══════════════════════════════════════════════════════════════════╗\n"
+        "║  FATAL: pqcrypto not installed — Falcon-512 is REQUIRED.      ║\n"
+        "║                                                                ║\n"
+        "║  QTCL uses a hybrid signature scheme where BOTH Falcon-512    ║\n"
+        "║  AND SL(3,p) Schnorr-Γ must verify. Without Falcon there     ║\n"
+        "║  is no post-quantum security. No mock. No fallback.           ║\n"
+        "║                                                                ║\n"
+        "║  Install:  pip install pqcrypto                               ║\n"
+        "║  Termux:   pkg install clang && pip install pqcrypto          ║\n"
+        "╚══════════════════════════════════════════════════════════════════╝\n"
     )
 
-    def _mock_falcon_keygen() -> Tuple[bytes, bytes]:
-        """Deterministic mock: returns (pk, sk) of fixed size.
-        The sk embeds the original seed in its first 64 bytes so that
-        sign can re-derive pk for the verification tag.
-        """
-        sk_seed = secrets.token_bytes(64)
-        pk = hashlib.shake_256(
-            hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + sk_seed).digest()
-        ).digest(897)
-        # sk = seed (64 bytes) + padding to 1281 bytes
-        # The seed is preserved in sk[:64] for sign to re-derive pk
-        sk = sk_seed + hashlib.shake_256(sk_seed).digest(1281 - 64)
-        return pk, sk
-
-    def _mock_falcon_sign(message: bytes, sk: bytes) -> bytes:
-        """HMAC-SHA3-512 mock signature. INSECURE — for development/testing only."""
-        # Derive a deterministic signing key from the secret key
-        sign_key = hashlib.sha3_256(b"MOCK_FALCON_SIGN_KEY\x00" + sk[:64]).digest()
-        mac = hmac.new(sign_key, message, hashlib.sha3_512).digest()
-        # Pad to Falcon-512 signature size (~690 bytes) deterministically
-        sig = hashlib.shake_256(mac).digest(690)
-        return sig
-
-    def _mock_falcon_verify(message: bytes, signature: bytes, pk: bytes) -> None:
-        """Mock verify: recompute HMAC and compare.
-
-        RED TEAM FIX (Finding 3): The old mock verify only checked len(signature) == 690,
-        accepting ANY 690-byte string as valid. This meant an attacker could forge the
-        Falcon layer trivially, reducing hybrid security to SL(3,p) alone.
-
-        This fix derives the expected signature from the public key's embedded
-        signing material and verifies the HMAC matches. Still insecure (no real
-        lattice hardness) but at least requires the correct secret key to sign.
-
-        IMPORTANT: This is still NOT production-safe. Install pqcrypto for real Falcon.
-        """
-        if len(signature) != 690:
-            raise ValueError(f"Mock Falcon: wrong signature length {len(signature)}, expected 690")
-
-        # Derive the same signing key the signer would have used
-        # In mock mode, pk is derived from sk via SHA3-512, so we can't reverse it.
-        # But we CAN verify by re-deriving from pk (which embeds the seed):
-        # The mock keygen does: pk = SHAKE-256(SHA3-512("MOCK_FALCON_PK" + sk))
-        # We need the intermediate sign_key = SHA3-256("MOCK_FALCON_SIGN_KEY" + sk[:64])
-        # This is impossible from pk alone without sk.
-        #
-        # SOLUTION: Embed a verification tag in the signature itself.
-        # The last 32 bytes of the 690-byte signature are HMAC(pk[:32], message).
-        # The signer puts this tag; the verifier checks it.
-        verify_tag = hmac.new(pk[:32], message, hashlib.sha3_256).digest()
-        sig_tag = signature[-32:]
-        if not hmac.compare_digest(verify_tag, sig_tag):
-            raise ValueError("Mock Falcon: signature verification FAILED (HMAC mismatch)")
-
-    def _mock_falcon_sign_with_tag(message: bytes, sk: bytes) -> bytes:
-        """Mock sign with verification tag appended."""
-        sign_key = hashlib.sha3_256(b"MOCK_FALCON_SIGN_KEY\x00" + sk[:64]).digest()
-        mac = hmac.new(sign_key, message, hashlib.sha3_512).digest()
-        # Generate 658 bytes of signature body + 32 bytes of verification tag
-        sig_body = hashlib.shake_256(mac).digest(658)
-        # Re-derive pk from the seed embedded in sk[:64]
-        pk = hashlib.shake_256(
-            hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + sk[:64]).digest()
-        ).digest(897)
-        verify_tag = hmac.new(pk[:32], message, hashlib.sha3_256).digest()
-        return sig_body + verify_tag  # 658 + 32 = 690 bytes
-
-    _FALCON_KEYGEN_FN  = _mock_falcon_keygen
-    _FALCON_SIGN_FN    = _mock_falcon_sign_with_tag  # Use tagged version
-    _FALCON_VERIFY_FN  = _mock_falcon_verify
-
-    logger.critical(
-        "[hyp_pqc] ⛔ MOCK FALCON ACTIVE — signatures are NOT post-quantum secure. "
-        "Install pqcrypto: pip install pqcrypto"
-    )
+_FALCON_REAL = True
+logger.info("[hyp_pqc] ✅ Falcon-512: pqcrypto loaded (NIST FIPS 206)")
 
 
 def _falcon_keygen() -> Tuple[bytes, bytes]:
-    pk, sk = _FALCON_KEYGEN_FN()
-    return pk, sk
+    return _falcon_keygen_raw()
 
 
 def _falcon_sign(message: bytes, sk: bytes) -> bytes:
-    return _FALCON_SIGN_FN(message, sk)
+    return _falcon_sign_raw(sk, message)
 
 
 def _falcon_verify(message: bytes, signature: bytes, pk: bytes) -> bool:
-    """Returns True if valid, False on failure (never raises externally)."""
+    """Returns True if valid, False on failure."""
     try:
-        _FALCON_VERIFY_FN(message, signature, pk)
+        _falcon_verify_raw(pk, message, signature)
         return True
     except Exception:
         return False
@@ -281,9 +204,11 @@ class HybridSignature(NamedTuple):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _derive_address(public_hex: str) -> str:
-    """SHA3-256(SHA3-256(bytes.fromhex(public_hex))).hex() — canonical QTCL address."""
+    """SHA3-256(SHA3-256(domain ‖ bytes.fromhex(public_hex))).hex() — canonical QTCL address.
+    Domain-separated to prevent cross-chain address collisions.
+    """
     raw = bytes.fromhex(public_hex)
-    h1  = hashlib.sha3_256(raw).digest()
+    h1  = hashlib.sha3_256(b"QTCL_ADDR_SL3P_V4\x00" + raw).digest()
     h2  = hashlib.sha3_256(h1).digest()
     return h2.hex()
 
@@ -325,8 +250,8 @@ def generate_hybrid_keypair() -> HybridKeypair:
 
     dt = time.perf_counter() - t0
     logger.debug(
-        "[hyp_pqc] keygen: %.3fs | sl3p_addr=%s... | falcon_pk_len=%d | real=%s",
-        dt, sl3p_addr[:16], len(falcon_pk), _FALCON_REAL
+        "[hyp_pqc] keygen: %.3fs | sl3p_addr=%s... | falcon_pk_len=%d",
+        dt, sl3p_addr[:16], len(falcon_pk)
     )
 
     return HybridKeypair(
@@ -732,43 +657,22 @@ def hybrid_signature_from_dict(d: Dict[str, Any]) -> HybridSignature:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pqc_status() -> Dict[str, Any]:
-    """
-    Return PQC module status dict with security parameters and health flags.
-
-    Keys:
-      falcon_real          : bool  — True if real pqcrypto Falcon-512, False if mock
-      sl3p_walk_length     : int   — Schnorr-Γ walk length (768 for v4)
-      sl3p_n_generators    : int   — number of SL(3,p) generators (6)
-      sl3p_classical_bits  : int   — estimated classical DLP security bits (~189)
-      sl3p_public_hex_len  : int   — expected public key hex length (576)
-      sl3p_prime           : str   — "2^255-31"
-      sl3p_order_approx    : str   — "|SL(3,p)| ≈ 2^2048"
-      wire_version         : str   — "hybrid_sl3p_falcon_v2"
-      legacy_wire_version  : str   — "hybrid_sl2p_falcon_v1"
-      production_ready     : bool  — True only if falcon_real=True
-      warnings             : list  — any security warnings
-    """
-    warnings: List[str] = []
-    if not _FALCON_REAL:
-        warnings.append(
-            "CRITICAL: Mock Falcon-512 in use (HMAC-SHA3-512). "
-            "Install pqcrypto for real Falcon-512. NOT PRODUCTION SAFE."
-        )
-
+    """Return PQC module status with security parameters."""
     return {
-        "falcon_real":         _FALCON_REAL,
+        "falcon_real":         True,
+        "falcon_standard":     "NIST FIPS 206 (Falcon-512)",
+        "falcon_pq_bits":      128,
         "sl3p_walk_length":    WALK_LENGTH,
         "sl3p_n_generators":   N_GENERATORS,
         "sl3p_classical_bits": 189,
-        "sl3p_quantum_note":   "Shor-vulnerable; Falcon-512 provides PQ cover",
+        "sl3p_quantum_note":   "Shor-vulnerable in cyclic subgroup; Falcon-512 provides 128-bit PQ cover",
         "sl3p_public_hex_len": _SL3P_PUBLIC_HEX_LEN,
         "sl3p_prime":          "2^255-31",
-        "sl3p_order_approx":   "|SL(3,p)| = p^3*(p^2-1)*(p^3-1) ≈ 2^2048",
-        "sl3p_Q379_note":      "Q₃₇₉ ≥ 2^379 factor of p^2+p+1 gives 189-bit Pollard rho bound",
+        "sl3p_group_order":    "|SL(3,p)| = p^3*(p^2-1)*(p^3-1) ≈ 2^2040",
+        "sl3p_Q379_bits":      379,
         "wire_version":        WIRE_VERSION,
         "legacy_wire_version": LEGACY_WIRE_VERSION,
-        "production_ready":    _FALCON_REAL,
-        "warnings":            warnings,
+        "production_ready":    True,
     }
 
 
@@ -813,7 +717,7 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
     if verbose:
         print("=" * 72)
         print("  hyp_pqc.py — Hybrid PQC Integration Tests (v4 / SL(3,p))")
-        print(f"  Falcon: {'REAL pqcrypto' if _FALCON_REAL else 'MOCK (HMAC-SHA3-512)'}")
+        print(f"  Falcon: pqcrypto Falcon-512 (NIST FIPS 206)")
         print(f"  Walk: {WALK_LENGTH} steps | Generators: {N_GENERATORS} | Prime: 2^255-31")
         print("=" * 72)
 
@@ -939,13 +843,8 @@ def run_tests(verbose: bool = True) -> Dict[str, Any]:
     if verbose:
         print("=" * 72)
         print(f"  Results: {passed}/{total} passed")
-        if not _FALCON_REAL:
-            print("  ⚠ WARNING: Mock Falcon in use. Install pqcrypto for production.")
-        print("=" * 72)
-
     results["__summary__"] = {
         "passed": passed, "failed": failed, "total": total,
-        "falcon_real": _FALCON_REAL,
     }
     return results
 
