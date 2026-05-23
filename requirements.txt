@@ -50,3 +50,10 @@ pydantic>=2.0.0
 #   • Pyth Hermes API:     urllib.request (stdlib) — zero external deps
 #   • Byzantine filter:    statistics (stdlib)
 # All integrations are self-contained within oracle.py + server.py.
+
+#==============================================================
+# CRYPTO
+#==============================================================
+libsodium>=2.7.4
+pynacl>=1.6.2
+pqcrypto>=0.4.0
