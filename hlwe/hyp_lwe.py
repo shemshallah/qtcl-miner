@@ -374,8 +374,9 @@ try:
                            N_GENERATORS, DET_TOLERANCE, ENTRY_OVERFLOW_BOUND,
                            SERIAL_ENTRY_LEN, hyp_metric, sample_disk_point)
     _HYP_GROUP_AVAILABLE = True
-except ImportError as e:
-    logger.error(f"hyp_group.py unavailable: {e}")
+except ImportError:
+    # hyp_group.py is ONLY needed for GeodesicLWE encryption (optional).
+    # Wallet vault encryption, password hashing, Shamir sharing all work without it.
     _HYP_GROUP_AVAILABLE = False
 
 try:

@@ -55,13 +55,25 @@ from pathlib import Path
 try:
     import mpmath
     from mpmath import mp, mpf, mpc, fabs, acos, nstr, almosteq, inf, pi
+    from mpmath import atanh as _atanh
 except ImportError:
     raise ImportError("mpmath required")
 
-try:
-    from hyp_group import hyp_metric
-except ImportError:
-    raise ImportError("hyp_group.py must be in PYTHONPATH")
+# ── Inlined from hyp_group.py (sole dependency) ──────────────────────────
+# hyp_group.py is no longer required. This is the only function we used.
+
+def hyp_metric(z, w):
+    """Hyperbolic distance in the Poincaré disk: dₕ(z,w) = 2·arctanh(|z-w|/|1-z̄w|)."""
+    z, w = mpc(z), mpc(w)
+    abs_z, abs_w = mpmath.fabs(z), mpmath.fabs(w)
+    if abs_z >= 1 or abs_w >= 1:
+        raise ValueError(f"Point outside Poincaré disk: |z|={abs_z}, |w|={abs_w}")
+    abs_diff = mpmath.fabs(z - w)
+    abs_denom = mpmath.fabs(1 - z.conjugate() * w)
+    if abs_denom < mpf("1e-140"):
+        raise ValueError("Hyperbolic metric denominator ~0")
+    ratio = min(abs_diff / abs_denom, mpf("1") - mpf("1e-140"))
+    return 2 * _atanh(ratio)
 
 mp.dps = 150
 logger = logging.getLogger(__name__)

@@ -848,6 +848,148 @@ def gf_generate_keypair() -> GFKeyPair:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# WIRE FORMAT — SIGNATURE DICT SERIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Merged from hyp_schnorr_gf.py — eliminates one file from the system.
+
+WIRE_VERSION: str = "schnorr_gamma_gf_v4"
+LEGACY_WIRE_VERSION: str = "schnorr_gamma_gf_v3"
+
+
+class SchnorrError(Exception):
+    pass
+
+
+class HypSignature(NamedTuple):
+    """Backward-compatible signature type for block integration."""
+    signature: str
+    challenge: str
+    auth_tag: str
+    timestamp: str
+
+    def to_dict(self):
+        return {"signature": self.signature, "challenge": self.challenge,
+                "auth_tag": self.auth_tag, "timestamp": self.timestamp}
+
+
+def signature_to_dict(sig: GFSchnorrSignature) -> dict:
+    """Serialize GFSchnorrSignature to JSON-compatible dict (v4 wire format)."""
+    return {
+        "version": WIRE_VERSION,
+        "R": sig.R.hex(),
+        "Z": sig.Z.hex(),
+        "c_full": format(sig.c_full, "064x"),
+        "s_scalar": format(sig.s_scalar, "064x") if sig.s_scalar else "0",
+        "R_canonical_hex": sig.R_hex or sig.R.hex(),
+    }
+
+
+def signature_from_dict(d: dict) -> GFSchnorrSignature:
+    """Deserialize GFSchnorrSignature from dict. Strict version gating."""
+    version = d.get("version")
+    if version is None:
+        raise ValueError("Signature missing 'version' field — legacy format rejected.")
+    if version == LEGACY_WIRE_VERSION:
+        raise ValueError(
+            f"Legacy SL(2,p) wire format {LEGACY_WIRE_VERSION!r} detected. "
+            "Route to legacy verifier or migrate wallet to SL(3,p)."
+        )
+    if version != WIRE_VERSION:
+        raise ValueError(f"version mismatch: {version!r} != {WIRE_VERSION!r}")
+    if "R" in d and "Z" in d and "c_full" in d:
+        return GFSchnorrSignature(
+            R=GFMatrix.from_hex(d["R"]),
+            Z=GFMatrix.from_hex(d["Z"]),
+            c_full=int(d["c_full"], 16),
+            s_scalar=int(d.get("s_scalar", "0"), 16),
+            R_hex=d.get("R_canonical_hex", d["R"]),
+        )
+    raise ValueError("signature dict missing required fields: need (R, Z, c_full)")
+
+
+def sign_hash(message_hash: bytes, private_walk: list, public_key: GFMatrix) -> dict:
+    """Sign a pre-hashed message. Returns dict for block/tx integration."""
+    from datetime import datetime, timezone
+    sig = gf_sign_full(message_hash, private_walk, public_key)
+    sig_dict = signature_to_dict(sig)
+    challenge_hex = format(sig.c_full, "064x")
+    return {
+        "signature": sig_dict["R"] + sig_dict["Z"],
+        "challenge": challenge_hex,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "auth_tag": challenge_hex,
+        "R": sig_dict["R"], "Z": sig_dict["Z"],
+        "R_canonical_hex": sig.R_hex,
+        "c_full": challenge_hex, "c_exp": 0,
+        "s_scalar": format(sig.s_scalar, "064x") if sig.s_scalar else "0",
+        "version": WIRE_VERSION,
+    }
+
+
+class SchnorrGamma:
+    """Schnorr-Γ over SL(3,p) — Unified API facade for hyp_engine integration.
+
+    Merged from hyp_schnorr_gf.py. All methods route to the SL(3,p) gf_* functions.
+    """
+
+    def keygen(self):
+        kp = gf_generate_keypair()
+        private_walk = hex_to_walk(kp.private_key_hex)
+        pub = GFMatrix.from_hex(kp.public_key_hex)
+        return (private_walk, pub, kp.address)
+
+    def keygen_from_walk(self, private_walk):
+        g = get_schnorr_generator()
+        x = walk_to_private_scalar(private_walk)
+        pub = g ** x
+        addr = hashlib.sha3_256(hashlib.sha3_256(pub.serialize()).digest()).hexdigest()
+        return (private_walk, pub, addr)
+
+    def sign(self, message, private_walk, public_key):
+        return gf_sign_full(message, private_walk, public_key)
+
+    def sign_hash(self, message_hash, private_walk, public_key):
+        if isinstance(public_key, str):
+            public_key = GFMatrix.from_hex(public_key)
+        result = sign_hash(message_hash, private_walk, public_key)
+        result["public_key_hex"] = public_key.hex()
+        return result
+
+    def verify(self, sig, message, public_key):
+        if isinstance(sig, GFSchnorrSignature):
+            return gf_verify_full(sig, message, public_key)
+        return False
+
+    def verify_signature(self, message_hash, sig_dict, public_key):
+        try:
+            version = sig_dict.get("version", "")
+            if version == LEGACY_WIRE_VERSION:
+                return self._verify_legacy(message_hash, sig_dict, public_key)
+            d = {k: v for k, v in sig_dict.items() if k != "signature"}
+            sig = signature_from_dict(d)
+            gf_sig = GFSchnorrSignature(R=sig.R, Z=sig.Z, c_full=sig.c_full,
+                                         s_scalar=sig.s_scalar, R_hex=sig.R_hex)
+            return gf_verify_full(gf_sig, message_hash, public_key)
+        except Exception:
+            return False
+
+    def _verify_legacy(self, message_hash, sig_dict, public_key):
+        try:
+            R = GFMatrix.from_hex(sig_dict.get("R", ""))
+            Z = GFMatrix.from_hex(sig_dict.get("Z", ""))
+            c_full = int(sig_dict.get("c_full", "0"), 16)
+            s_scalar = int(sig_dict.get("s_scalar", "0"), 16)
+            sig = GFSchnorrSignature(R=R, Z=Z, c_full=c_full, s_scalar=s_scalar,
+                                      R_hex=sig_dict.get("R_canonical_hex", R.hex()))
+            return gf_verify_full(sig, message_hash, public_key)
+        except Exception:
+            return False
+
+    def signature_to_dict(self, sig):
+        return signature_to_dict(sig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TESTS
 # ═══════════════════════════════════════════════════════════════════════════
 
