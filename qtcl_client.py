@@ -3933,14 +3933,14 @@ class HypGammaWallet:
         self._init_engine()
         hk = self.engine.generate_hybrid_keypair()
         # Validate structure before touching disk
-        if not isinstance(hk, dict) or 'sl2p' not in hk or 'falcon' not in hk:
+        if not isinstance(hk, dict) or 'sl3p' not in hk or 'falcon' not in hk:
             raise RuntimeError(f"[HYP-WALLET] generate_hybrid_keypair returned unexpected type: {type(hk)}")
-        if 'address' not in hk['sl2p'] or 'public_hex' not in hk['sl2p'] or 'private_walk_hex' not in hk['sl2p']:
-            raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required sl2p fields: {list(hk['sl2p'].keys())}")
+        if 'address' not in hk['sl3p'] or 'public_hex' not in hk['sl3p'] or 'private_walk_hex' not in hk['sl3p']:
+            raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required sl3p fields: {list(hk['sl3p'].keys())}")
         if 'public_key' not in hk['falcon'] or 'secret_key' not in hk['falcon']:
             raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required falcon fields: {list(hk['falcon'].keys())}")
         self.keypair = hk
-        logger.info(f"[HYP-WALLET] ✅ V3 hybrid keypair generated — address: {hk['sl2p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V3 hybrid keypair generated — address: {hk['sl3p']['address'][:16]}...")
         data_dir = Path("data"); data_dir.mkdir(exist_ok=True)
         wallet_path = data_dir / "wallet.json"
         from hyp_lwe import create_wallet_file
@@ -3948,14 +3948,14 @@ class HypGammaWallet:
         # Encrypt the ENTIRE hybrid keypair dict as the vault private_key payload
         full_private_json = _j.dumps(hk)
         wallet_dict, _ = create_wallet_file(
-            hk['sl2p']['address'], hk['sl2p']['public_hex'], full_private_json,
+            hk['sl3p']['address'], hk['sl3p']['public_hex'], full_private_json,
             password, 0, 0)
         # Stamp wallet_type so load() can detect v3 hybrid format
         wallet_dict["wallet_type"] = "hybrid_v3"
         wallet_path.write_text(_j.dumps(wallet_dict, indent=2))
         logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet saved → {wallet_path}")
         self._loaded = True; self._password_verified = True
-        return hk['sl2p']['address']
+        return hk['sl3p']['address']
 
     def load(self, password: str) -> bool:
         """Load V3 hybrid wallet from encrypted file. Raises ValueError on wrong password or old format."""
@@ -3987,14 +3987,14 @@ class HypGammaWallet:
                 "[HYP-WALLET] Wallet contains old SL(2,p)-only private key (plain hex). "
                 "Create a new V3 hybrid wallet — Wallet → Create new wallet."
             )
-        if not isinstance(keypair, dict) or 'sl2p' not in keypair or 'falcon' not in keypair:
+        if not isinstance(keypair, dict) or 'sl3p' not in keypair or 'falcon' not in keypair:
             raise ValueError(
                 "[HYP-WALLET] Wallet private key is not a V3 hybrid keypair dict. "
                 "Create a new wallet."
             )
         self.keypair = keypair
         self._loaded = True; self._password_verified = True
-        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet unlocked — address: {self.keypair['sl2p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet unlocked — address: {self.keypair['sl3p']['address'][:16]}...")
         return True
 
     def verify_password(self, password: str) -> bool:
@@ -4028,7 +4028,7 @@ class HypGammaWallet:
         tx_json = json.dumps(tx_dict, sort_keys=True, separators=(",", ":"))
         tx_hash = hashlib.sha3_256(tx_json.encode()).digest()
         sig = self.engine.hybrid_sign(tx_hash, self.keypair)
-        sig["signer_address"] = self.keypair['sl2p']['address']
+        sig["signer_address"] = self.keypair['sl3p']['address']
         return sig
 
     def verify_signature(self, message_hash: bytes, signature: Dict[str, Any], public_key_dict: Dict[str, Any]) -> bool:
@@ -4043,7 +4043,7 @@ class HypGammaWallet:
             return False
 
     def get_address(self) -> str:
-        return self.keypair['sl2p']['address'] if self.keypair else ""
+        return self.keypair['sl3p']['address'] if self.keypair else ""
 
     def export_keypair(self) -> Dict[str, Any]:
         if not self._password_verified: raise RuntimeError("Must unlock first")
@@ -4051,27 +4051,28 @@ class HypGammaWallet:
 
     @property
     def address(self) -> Optional[str]:
-        return self.keypair['sl2p']['address'] if self.keypair else None
+        return self.keypair['sl3p']['address'] if self.keypair else None
 
     @property
     def public_key(self) -> Optional[str]:
-        """Return SL(2,p) public key hex (for backward compat)."""
-        return self.keypair['sl2p']['public_hex'] if self.keypair else None
+        """Return SL(3,p) public key hex (576-char, 3x3 GFMatrix)."""
+        return self.keypair['sl3p']['public_hex'] if self.keypair else None
 
     @property
     def public_key_dict(self) -> Optional[Dict[str, Any]]:
         """Return full hybrid public key dict (for hybrid verification)."""
         if not self.keypair: return None
         return {
-            'sl2p': {'public_hex': self.keypair['sl2p']['public_hex'], 'address': self.keypair['sl2p']['address']},
+            'sl3p': {'public_hex': self.keypair['sl3p']['public_hex'], 'address': self.keypair['sl3p']['address']},
             'falcon': {'public_key': self.keypair['falcon']['public_key']},
+            'version': self.keypair.get('version', 'hybrid_sl3p_falcon_v2'),
         }
 
     @property
     def private_key(self) -> Optional[str]:
-        """Return SL(2,p) private walk hex."""
+        """Return SL(3,p) private walk hex (GF3:-prefixed)."""
         if not self._password_verified: return None
-        return self.keypair['sl2p']['private_walk_hex'] if self.keypair else None
+        return self.keypair['sl3p']['private_walk_hex'] if self.keypair else None
 
     @property
     def falcon_public_key(self) -> Optional[str]:
@@ -4401,7 +4402,7 @@ def hyp_create_wallet(
             "address": addr,
             "public_key": wallet.public_key,
             "public_key_dict": wallet.public_key_dict,
-            "version": "hybrid_sl2p_falcon_v1",
+            "version": "hybrid_sl3p_falcon_v2",
         }
     except Exception as e:
         logger.error(f"[HypΓ-API] Wallet creation failed: {e}")
@@ -19410,9 +19411,9 @@ class QtclClientApp:
         if not _want_wallet:
             # Anonymous oracle: generate fresh hybrid keypair for attestations
             engine = HypGammaEngine()
-            keypair_dict = engine.generate_keypair()  # returns hybrid dict
-            address = keypair_dict["sl2p"]["address"]
-            public_key = keypair_dict["sl2p"]["public_hex"]
+            keypair_dict = engine.generate_hybrid_keypair()  # returns sl3p hybrid dict
+            address = keypair_dict["sl3p"]["address"]
+            public_key = keypair_dict["sl3p"]["public_hex"]
             falcon_pub = keypair_dict["falcon"]["public_key"]
             identity = {
                 "address": address,
@@ -25444,13 +25445,13 @@ class QtclClientApp:
                                     )
                                     # v3 hybrid PQC: include full public key dict + flag
                                     # so server can verify both Falcon-512 and SL(2,p)
-                                    if _sig.get("version") == "hybrid_sl2p_falcon_v1":
+                                    if _sig.get("version") == "hybrid_sl3p_falcon_v2":
                                         submit_payload["hybrid_pqc"] = True
                                         _pub_dict = self.wallet.public_key_dict
                                         if _pub_dict:
                                             submit_payload["miner_public_key_dict"] = _pub_dict
                                     _EXP_LOG.info(
-                                        f"[MINER] ✅ {'Hybrid PQC' if _sig.get('version') == 'hybrid_sl2p_falcon_v1' else 'HypΓ'}-signed "
+                                        f"[MINER] ✅ {'Hybrid PQC' if _sig.get('version') == 'hybrid_sl3p_falcon_v2' else 'HypΓ'}-signed "
                                         f"block h={target_height} miner={miner_addr[:16]}…"
                                     )
                                     break
@@ -25527,13 +25528,13 @@ class QtclClientApp:
                     )
 
                     # ❤️  I love you — record solve NOW so display shows SOLVED immediately
-                    # Extract sig summary for display — hybrid sigs have 'version' + 'sl2p' + 'falcon',
+                    # Extract sig summary for display — hybrid sigs have 'version' + 'sl3p_R_hex' + 'falcon',
                     # NOT a top-level 'signature' string. Detect both formats.
                     if _sig:
-                        if _sig.get("version") == "hybrid_sl2p_falcon_v1":
-                            # Hybrid PQC sig — show version tag + SL(2,p) R-hex prefix
-                            _sl2p_r = _sig.get("sl2p", {}).get("R", "")
-                            _sig_full = f"hybrid_v1:{str(_sl2p_r)[:40]}" if _sl2p_r else "hybrid_v1:signed"
+                        if _sig.get("version") == "hybrid_sl3p_falcon_v2":
+                            # Hybrid PQC sig — show version tag + SL(3,p) R-hex prefix
+                            _sl3p_r = _sig.get("sl3p_R_hex", "") or _sig.get("sl3p_R_canonical", "")
+                            _sig_full = f"hybrid_v2:{str(_sl3p_r)[:40]}" if _sl3p_r else "hybrid_v2:signed"
                         elif _sig.get("signature"):
                             _sig_full = str(_sig["signature"])
                         elif _sig.get("R") or _sig.get("R_canonical_hex"):
@@ -28943,21 +28944,21 @@ class QtclClientApp:
                 except (EOFError, KeyboardInterrupt):
                     continue
                 if self._verify_password(pw):
-                    sl2p_priv = self.wallet.private_key
+                    sl3p_priv = self.wallet.private_key
                     falcon_priv = self.wallet.falcon_private_key
                     falcon_pub = self.wallet.falcon_public_key
-                    sl2p_pub = self.wallet.public_key
+                    sl3p_pub = self.wallet.public_key
                     addr = self.wallet.address
                     print("\n" + "═" * 72)
                     print("  ⚠️   HYBRID PRIVATE KEY MATERIAL — NEVER SHARE")
                     print("═" * 72)
                     print(f"  Address         : {addr}")
                     print()
-                    print(f"  SL(2,p) private walk hex:")
-                    print(f"  {sl2p_priv}")
+                    print(f"  SL(3,p) private walk hex:")
+                    print(f"  {sl3p_priv}")
                     print()
-                    print(f"  SL(2,p) public hex:")
-                    print(f"  {sl2p_pub}")
+                    print(f"  SL(3,p) public hex:")
+                    print(f"  {sl3p_pub}")
                     print()
                     print(f"  Falcon-512 public key (base64):")
                     print(f"  {falcon_pub}")
