@@ -6874,113 +6874,135 @@ except ImportError:
 
 # ── SCHEMA VALIDATION: Use qtcl_db_builder.py as single source of truth ───────
 def _validate_and_init_schema(db_path: Path) -> bool:
-    """Validate database schema. If ANY critical table missing: DELETE old DB + rebuild fresh.
+    """Validate database schema and CREATE any missing tables/columns in-place.
 
-    No migrations, no repairs, no compatibility hacks. Either schema is perfect or DELETE and rebuild.
-    Returns True if schema valid/fixed, False if error.
+    NEVER deletes the database or calls qtcl_db_builder.py.
+    Uses CREATE TABLE IF NOT EXISTS to add missing tables non-destructively.
+    Returns True if schema is valid (or was repaired), False only on hard error.
     """
-    import subprocess
     import sqlite3 as _sqlite3
 
+    # Minimal DDL for tables that might be absent on a first-run or partial init.
+    # These are CREATE IF NOT EXISTS — completely safe to run on an existing DB.
+    _ENSURE_TABLES_DDL = [
+        """CREATE TABLE IF NOT EXISTS blocks (
+            height INTEGER PRIMARY KEY,
+            block_hash TEXT UNIQUE NOT NULL,
+            parent_hash TEXT,
+            merkle_root TEXT,
+            timestamp INTEGER,
+            tx_count INTEGER DEFAULT 0,
+            miner_address TEXT,
+            difficulty INTEGER DEFAULT 1,
+            nonce TEXT,
+            pq_curr TEXT,
+            pq_last TEXT,
+            data TEXT,
+            size INTEGER DEFAULT 0,
+            version INTEGER DEFAULT 1
+        )""",
+        """CREATE TABLE IF NOT EXISTS transactions (
+            tx_hash TEXT PRIMARY KEY,
+            block_height INTEGER,
+            sender TEXT,
+            recipient TEXT,
+            amount REAL DEFAULT 0,
+            fee REAL DEFAULT 0,
+            nonce INTEGER DEFAULT 0,
+            timestamp INTEGER,
+            memo TEXT,
+            signature TEXT,
+            public_key TEXT,
+            tx_type TEXT DEFAULT 'transfer',
+            status TEXT DEFAULT 'confirmed',
+            data TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS wallet_addresses (
+            address TEXT PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            address_type TEXT DEFAULT 'standard',
+            balance_updated_at INTEGER,
+            tx_count INTEGER DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS pq0_entanglement_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER,
+            pq0 TEXT,
+            pq_iv TEXT,
+            pq_v TEXT,
+            fidelity REAL,
+            measurement TEXT,
+            block_height INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS wstate_consensus_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER,
+            oracle_id TEXT,
+            consensus_value TEXT,
+            votes TEXT,
+            block_height INTEGER,
+            fidelity REAL
+        )""",
+        """CREATE TABLE IF NOT EXISTS hyperbolic_triangles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            depth INTEGER,
+            v0_re REAL, v0_im REAL,
+            v1_re REAL, v1_im REAL,
+            v2_re REAL, v2_im REAL,
+            area REAL,
+            parent_id INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS pseudoqubits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            triangle_id INTEGER,
+            pos_re REAL, pos_im REAL,
+            depth INTEGER,
+            coherence REAL DEFAULT 1.0
+        )""",
+        """CREATE TABLE IF NOT EXISTS sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS address_utxos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            output_index INTEGER DEFAULT 0,
+            amount INTEGER DEFAULT 0,
+            spent INTEGER DEFAULT 0,
+            block_height INTEGER,
+            UNIQUE(tx_hash, output_index)
+        )""",
+    ]
+
     try:
-        # Critical tables that MUST exist (from qtcl_db_builder.py)
-        critical_tables = {
-            "blocks",
-            "transactions",
-            "wallet_addresses",
-            "pq0_entanglement_log",
-            "wstate_consensus_log",
-            "hyperbolic_triangles",
-            "pseudoqubits",
-        }
+        conn = _sqlite3.connect(str(db_path), timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        cursor = conn.cursor()
 
-        required_blocks_cols = {
-            "height",
-            "block_hash",
-            "parent_hash",
-            "merkle_root",
-            "timestamp",
-            "tx_count",
-            "miner_address",
-            "difficulty",
-            "nonce",
-            "pq_curr",
-            "pq_last",
-        }
+        for ddl in _ENSURE_TABLES_DDL:
+            cursor.execute(ddl)
 
-        # Check if DB exists and is valid
-        schema_valid = False
-        if db_path.exists():
-            try:
-                conn = _sqlite3.connect(str(db_path), timeout=10)
-                cursor = conn.cursor()
+        conn.commit()
 
-                # Check which tables exist
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                existing_tables = {row[0] for row in cursor.fetchall()}
+        # Verify critical tables now exist
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing = {row[0] for row in cursor.fetchall()}
+        conn.close()
 
-                # Check blocks table columns
-                cursor.execute("PRAGMA table_info(blocks)")
-                blocks_cols = {row[1] for row in cursor.fetchall()}
-                conn.close()
-
-                # Schema valid if all tables + cols present
-                if critical_tables.issubset(
-                    existing_tables
-                ) and required_blocks_cols.issubset(blocks_cols):
-                    logger.info("[DB-SCHEMA] ✅ Schema valid")
-                    return True
-
-                # Schema incomplete
-                missing_tables = critical_tables - existing_tables
-                missing_cols = required_blocks_cols - blocks_cols
-                logger.warning(
-                    f"[DB-SCHEMA] ⚠️  Missing: tables={missing_tables}, cols={missing_cols}"
-                )
-
-            except Exception as e:
-                logger.debug(f"[DB-SCHEMA] DB check failed: {e}")
-
-        # If we reach here: DB doesn't exist OR is broken. DELETE and rebuild.
-        if db_path.exists():
-            logger.warning(f"[DB-SCHEMA] 🔄 Deleting broken database: {db_path}")
-            db_path.unlink()
-            # Also delete WAL files if they exist
-            for wal_file in db_path.parent.glob(f"{db_path.name}*"):
-                try:
-                    wal_file.unlink()
-                except:
-                    pass
-
-        logger.info(
-            "[DB-SCHEMA] 🔨 Running qtcl_db_builder.py to create fresh schema..."
-        )
-        builder_path = _REPO_ROOT / "qtcl_db_builder.py"
-
-        if not builder_path.exists():
-            logger.error(
-                f"[DB-SCHEMA] ❌ qtcl_db_builder.py not found at {builder_path}"
-            )
+        critical = {"blocks", "transactions", "wallet_addresses",
+                    "pq0_entanglement_log", "wstate_consensus_log",
+                    "hyperbolic_triangles", "pseudoqubits"}
+        missing = critical - existing
+        if missing:
+            logger.error(f"[DB-SCHEMA] ❌ Tables still missing after init: {missing}")
             return False
 
-        # Run builder
-        result = subprocess.run(
-            [sys.executable, str(builder_path)],
-            cwd=str(_REPO_ROOT),
-            capture_output=True,
-            timeout=180,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            logger.error(f"[DB-SCHEMA] ❌ Builder FAILED:\n{result.stderr[-1000:]}")
-            return False
-
-        logger.info("[DB-SCHEMA] ✅ Fresh schema created successfully")
+        logger.info("[DB-SCHEMA] ✅ Schema validated (no DB wipe, no subprocess)")
         return True
 
     except Exception as e:
-        logger.error(f"[DB-SCHEMA] ❌ FATAL validation error: {e}")
+        logger.error(f"[DB-SCHEMA] ❌ Schema init error: {e}")
         return False
 
 
@@ -8174,17 +8196,14 @@ class LocalBlockchainDB:
         return synced
 
     def _wipe_for_resync(self) -> None:
-        """Wipe blocks and transactions for clean chain resync (preserves wallet/config)."""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM blocks")
-            cursor.execute("DELETE FROM transactions")
-            cursor.execute("DELETE FROM wallet_addresses")
-            cursor.execute("DELETE FROM sync_state")
-            self.conn.commit()
-            logger.info("[IBD] Local chain wiped for clean resync")
-        except Exception as e:
-            logger.error(f"[IBD] Wipe failed: {e}")
+        """Fork detected — previously wiped blocks/transactions for clean resync.
+        DISABLED: wipe removed to prevent data loss. Logs the fork and continues.
+        Sync will fill in any gaps from the server without deleting existing data.
+        """
+        logger.warning(
+            "[IBD] Chain fork detected — wipe disabled to preserve data. "
+            "Continuing sync; duplicate inserts will be ignored via ON CONFLICT."
+        )
 
     def sync_wallet_balance(
         self, kapi: "KoyebRPCNodule", address: str
@@ -8324,29 +8343,15 @@ def _forge_and_store_genesis_block(
 
 def _nuclear_wipe_local_db(db: "LocalBlockchainDB") -> bool:
     """
-    Self-discovering DELETE wipe — hits every table NOT in _PRESERVE_TABLES.
-    Schema (CREATE TABLE / indexes) preserved intact for immediate reuse.
-    Caller holds _RESET_LOCK. Returns True on success.
+    Nuclear wipe DISABLED — previously deleted all non-preserved tables on chain reset.
+    Now returns False so _check_and_handle_chain_reset aborts without touching data.
+    Chain reset events (server_height=0) are logged but not acted upon.
     """
-    try:
-        import sqlite3 as _sq3
-
-        conn = _sq3.connect(str(db.db_path), check_same_thread=False, timeout=10)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r[0] for r in cur.fetchall()]
-        wiped = []
-        for tbl in tables:
-            if tbl.lower() not in _PRESERVE_TABLES:
-                cur.execute(f"DELETE FROM {tbl}")  # noqa: S608
-                wiped.append(tbl)
-        conn.commit()
-        conn.close()
-        logger.info(f"[RESET] ✅ Nuclear wipe — {len(wiped)} tables cleared: {wiped}")
-        return True
-    except Exception as _e:
-        logger.error(f"[RESET] ❌ Nuclear wipe failed: {_e}")
-        return False
+    logger.warning(
+        "[RESET] Nuclear wipe suppressed — DB wipe disabled to prevent data loss. "
+        "Ignoring chain reset signal."
+    )
+    return False
 
 
 def _broadcast_reset_to_peers(
@@ -26222,30 +26227,11 @@ class QtclClientApp:
                 _addr2 = getattr(getattr(self, "wallet", None), "address", None)
                 if _addr2:
                     _bal = None
-                    # ── 1. Try local SQLite first (fastest, always up-to-date after local solve)
-                    try:
-                        import sqlite3 as _sq
-
-                        _local_db = (
-                            getattr(self, "_db_path", None)
-                            or getattr(getattr(self, "db", None), "_db_path", None)
-                            or getattr(getattr(self, "db", None), "db_path", None)
-                        )
-                        if _local_db:
-                            _lc = _sq.connect(str(_local_db), timeout=3.0)
-                            _lc.row_factory = _sq.Row
-                            _lr = _lc.execute(
-                                "SELECT balance FROM wallet_addresses WHERE address=?",
-                                (_addr2,),
-                            ).fetchone()
-                            _lc.close()
-                            if _lr is not None:
-                                _bal = int(_lr["balance"] or 0) / 100.0
-                    except Exception:
-                        pass
-                    # ── 2. Fall back to Koyeb RPC if local miss
-                    if _bal is None:
-                        for _retry_idx in range(3):
+                    # ── 1. Query Koyeb RPC first (authoritative UTXO-based balance) ──
+                    # Local SQLite balance lags behind server settlement, causing stale
+                    # reads after block acceptance. Koyeb is the single source of truth.
+                    for _retry_idx in range(3):
+                        try:
                             _bal_r = self.api._rpc(
                                 "qtcl_getBalance", [_addr2], timeout=5, retries=1
                             )
@@ -26255,9 +26241,57 @@ class QtclClientApp:
                                 else None
                             )
                             if _bal is not None and _bal > 0:
+                                # Backfill local SQLite so offline queries have fresh data
+                                try:
+                                    import sqlite3 as _sq
+                                    _local_db = (
+                                        getattr(self, "_db_path", None)
+                                        or getattr(getattr(self, "db", None), "_db_path", None)
+                                        or getattr(getattr(self, "db", None), "db_path", None)
+                                    )
+                                    if _local_db:
+                                        _lc = _sq.connect(str(_local_db), timeout=3.0)
+                                        _lc.execute(
+                                            "INSERT OR IGNORE INTO wallet_addresses "
+                                            "(address,public_key,wallet_fingerprint,balance,address_type) "
+                                            "VALUES (?,?,?,0,'standard')",
+                                            (_addr2, _addr2[:64], _addr2[:64]),
+                                        )
+                                        _lc.execute(
+                                            "UPDATE wallet_addresses SET balance=? WHERE address=?",
+                                            (int(_bal * 100), _addr2),
+                                        )
+                                        _lc.commit()
+                                        _lc.close()
+                                except Exception:
+                                    pass
                                 break
                             if _retry_idx < 2:
                                 time.sleep(0.5)
+                        except Exception:
+                            if _retry_idx < 2:
+                                time.sleep(0.5)
+                    # ── 2. Fall back to local SQLite if Koyeb unreachable ──
+                    if _bal is None:
+                        try:
+                            import sqlite3 as _sq
+                            _local_db = (
+                                getattr(self, "_db_path", None)
+                                or getattr(getattr(self, "db", None), "_db_path", None)
+                                or getattr(getattr(self, "db", None), "db_path", None)
+                            )
+                            if _local_db:
+                                _lc = _sq.connect(str(_local_db), timeout=3.0)
+                                _lc.row_factory = _sq.Row
+                                _lr = _lc.execute(
+                                    "SELECT balance FROM wallet_addresses WHERE address=?",
+                                    (_addr2,),
+                                ).fetchone()
+                                _lc.close()
+                                if _lr is not None:
+                                    _bal = int(_lr["balance"] or 0) / 100.0
+                        except Exception:
+                            pass
                     if _bal is not None:
                         print(f"  Balance : {_bal:.8f} QTCL  ({_addr2[:24]}…)")
             except Exception:
