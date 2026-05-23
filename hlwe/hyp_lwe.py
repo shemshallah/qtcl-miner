@@ -461,10 +461,19 @@ AES_KEY_BYTES: int = 32   # 256-bit key
 AES_NONCE_BYTES: int = 24 # 192-bit nonce (SHAKE-256-CTR)
 AES_TAG_BYTES: int = 32   # 256-bit MAC tag (SHA3-256)
 
-# PBKDF2 key derivation (OWASP 2023)
-PBKDF2_ITERATIONS: int = 600_000  # ~1-2s on mobile, ~0.3s on server
-PBKDF2_SALT_BYTES: int = 32       # 256-bit random salt
-PBKDF2_KEY_LEN: int = 64          # 32 enc + 32 verifier
+# PBKDF2 key derivation
+# RED TEAM FIX (Finding 4): Increased from 600K to 1,000,000 iterations for 2026 GPU
+# threat model. OWASP 2023 recommended 600K; by 2026 GPU cracking has advanced ~4x.
+# 1M iterations ≈ 2-3s on mobile (Galaxy A32), ~0.5s on server.
+#
+# NOTE: Argon2id would be preferable (memory-hard, NIST standard) but requires
+# argon2-cffi which fails to build on Termux/Android (no C compiler for the binding).
+# PBKDF2-HMAC-SHA256 is the best stdlib-only option. The 1M iteration count adds
+# ~20 bits of work factor to a 78-bit password (12 random chars), totaling ~98 bits
+# against GPU-class attackers.
+PBKDF2_ITERATIONS: int = 1_000_000  # ~2-3s on mobile, ~0.5s on server
+PBKDF2_SALT_BYTES: int = 32         # 256-bit random salt
+PBKDF2_KEY_LEN: int = 64            # 32 enc + 32 verifier
 
 # Vault format
 VAULT_VERSION: int = 2

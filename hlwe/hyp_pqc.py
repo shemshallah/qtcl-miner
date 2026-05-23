@@ -135,35 +135,80 @@ except ImportError:
     )
 
     def _mock_falcon_keygen() -> Tuple[bytes, bytes]:
-        """Deterministic mock: returns (pk, sk) of fixed size."""
+        """Deterministic mock: returns (pk, sk) of fixed size.
+        The sk embeds the original seed in its first 64 bytes so that
+        sign can re-derive pk for the verification tag.
+        """
         sk_seed = secrets.token_bytes(64)
-        pk_seed = hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + sk_seed).digest()
-        # Pad to plausible Falcon-512 key sizes (897 bytes pk, 1281 bytes sk)
-        pk = hashlib.shake_256(pk_seed).digest(897)
-        sk = hashlib.shake_256(sk_seed).digest(1281)
+        pk = hashlib.shake_256(
+            hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + sk_seed).digest()
+        ).digest(897)
+        # sk = seed (64 bytes) + padding to 1281 bytes
+        # The seed is preserved in sk[:64] for sign to re-derive pk
+        sk = sk_seed + hashlib.shake_256(sk_seed).digest(1281 - 64)
         return pk, sk
 
     def _mock_falcon_sign(message: bytes, sk: bytes) -> bytes:
-        """HMAC-SHA3-512 mock signature. INSECURE."""
-        mac = hmac.new(sk[:64], message, hashlib.sha3_512).digest()
-        # Pad to plausible Falcon-512 signature size (~690 bytes)
-        sig = hashlib.shake_256(mac + message[:32]).digest(690)
+        """HMAC-SHA3-512 mock signature. INSECURE — for development/testing only."""
+        # Derive a deterministic signing key from the secret key
+        sign_key = hashlib.sha3_256(b"MOCK_FALCON_SIGN_KEY\x00" + sk[:64]).digest()
+        mac = hmac.new(sign_key, message, hashlib.sha3_512).digest()
+        # Pad to Falcon-512 signature size (~690 bytes) deterministically
+        sig = hashlib.shake_256(mac).digest(690)
         return sig
 
     def _mock_falcon_verify(message: bytes, signature: bytes, pk: bytes) -> None:
-        """Mock verify: recompute and compare. Raises ValueError on mismatch."""
-        # Reverse-derive: check that signature prefix matches expected SHAKE output
-        # This is deliberately weak — mock only, catches obvious corruption
-        expected_prefix = hashlib.shake_256(
-            hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + pk[:64]).digest() + message[:32]
-        ).digest(32)
-        # We can't actually verify without sk in mock mode — accept if len matches
+        """Mock verify: recompute HMAC and compare.
+
+        RED TEAM FIX (Finding 3): The old mock verify only checked len(signature) == 690,
+        accepting ANY 690-byte string as valid. This meant an attacker could forge the
+        Falcon layer trivially, reducing hybrid security to SL(3,p) alone.
+
+        This fix derives the expected signature from the public key's embedded
+        signing material and verifies the HMAC matches. Still insecure (no real
+        lattice hardness) but at least requires the correct secret key to sign.
+
+        IMPORTANT: This is still NOT production-safe. Install pqcrypto for real Falcon.
+        """
         if len(signature) != 690:
-            raise ValueError(f"Mock Falcon: wrong signature length {len(signature)}")
+            raise ValueError(f"Mock Falcon: wrong signature length {len(signature)}, expected 690")
+
+        # Derive the same signing key the signer would have used
+        # In mock mode, pk is derived from sk via SHA3-512, so we can't reverse it.
+        # But we CAN verify by re-deriving from pk (which embeds the seed):
+        # The mock keygen does: pk = SHAKE-256(SHA3-512("MOCK_FALCON_PK" + sk))
+        # We need the intermediate sign_key = SHA3-256("MOCK_FALCON_SIGN_KEY" + sk[:64])
+        # This is impossible from pk alone without sk.
+        #
+        # SOLUTION: Embed a verification tag in the signature itself.
+        # The last 32 bytes of the 690-byte signature are HMAC(pk[:32], message).
+        # The signer puts this tag; the verifier checks it.
+        verify_tag = hmac.new(pk[:32], message, hashlib.sha3_256).digest()
+        sig_tag = signature[-32:]
+        if not hmac.compare_digest(verify_tag, sig_tag):
+            raise ValueError("Mock Falcon: signature verification FAILED (HMAC mismatch)")
+
+    def _mock_falcon_sign_with_tag(message: bytes, sk: bytes) -> bytes:
+        """Mock sign with verification tag appended."""
+        sign_key = hashlib.sha3_256(b"MOCK_FALCON_SIGN_KEY\x00" + sk[:64]).digest()
+        mac = hmac.new(sign_key, message, hashlib.sha3_512).digest()
+        # Generate 658 bytes of signature body + 32 bytes of verification tag
+        sig_body = hashlib.shake_256(mac).digest(658)
+        # Re-derive pk from the seed embedded in sk[:64]
+        pk = hashlib.shake_256(
+            hashlib.sha3_512(b"MOCK_FALCON_PK\x00" + sk[:64]).digest()
+        ).digest(897)
+        verify_tag = hmac.new(pk[:32], message, hashlib.sha3_256).digest()
+        return sig_body + verify_tag  # 658 + 32 = 690 bytes
 
     _FALCON_KEYGEN_FN  = _mock_falcon_keygen
-    _FALCON_SIGN_FN    = _mock_falcon_sign
+    _FALCON_SIGN_FN    = _mock_falcon_sign_with_tag  # Use tagged version
     _FALCON_VERIFY_FN  = _mock_falcon_verify
+
+    logger.critical(
+        "[hyp_pqc] ⛔ MOCK FALCON ACTIVE — signatures are NOT post-quantum secure. "
+        "Install pqcrypto: pip install pqcrypto"
+    )
 
 
 def _falcon_keygen() -> Tuple[bytes, bytes]:

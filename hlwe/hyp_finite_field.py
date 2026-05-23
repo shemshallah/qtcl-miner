@@ -708,18 +708,64 @@ def gf_verify(sig: GFSchnorrSignature, message: bytes,
 # SIGN / VERIFY — Scalar Schnorr-Γ over SL(3,p)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _rfc6979_nonce(x: int, message: bytes, extra_entropy: bytes = b"") -> int:
+    """RFC 6979-style deterministic nonce with hedging.
+
+    Derives nonce as HMAC-DRBG(private_key ‖ message ‖ random_padding).
+    The random_padding (32 bytes from os.urandom) provides hedging:
+    even if the HMAC-DRBG is somehow predictable, the randomness prevents
+    nonce reuse. Conversely, even if os.urandom fails (returns constant),
+    the deterministic component prevents nonce reuse across different messages.
+
+    RED TEAM FIX (Finding 2): Pure secrets.randbits(256) is vulnerable to
+    nonce reuse if entropy source fails on headless/container/IoT. Two signatures
+    with the same r on different messages → complete private key recovery via
+    x = (s1 - s2) / (c1 - c2) mod q.
+    """
+    # Encode private key as 32 bytes
+    x_bytes = x.to_bytes(32, 'big')
+
+    # Hedging: mix in 32 bytes of OS randomness as a safety net
+    try:
+        random_pad = secrets.token_bytes(32)
+    except Exception:
+        random_pad = b"\x00" * 32  # degenerate fallback — still safe due to deterministic component
+
+    # HMAC-DRBG seeding: K = HMAC(x ‖ H(m) ‖ random_pad ‖ extra_entropy)
+    h_m = hashlib.sha3_256(message).digest()
+    seed = hashlib.sha3_256(
+        b"QTCL_RFC6979_SL3P_V4\x00" + x_bytes + h_m + random_pad + extra_entropy
+    ).digest()
+
+    # Generate 256-bit nonce via HMAC-DRBG-like extraction
+    k = b"\x00" * 32
+    v = b"\x01" * 32
+    k = hmac.new(k, v + b"\x00" + seed, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    k = hmac.new(k, v + b"\x01" + seed, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+
+    r = int.from_bytes(v, 'big')
+    # Ensure r is in valid range (non-zero, < SL3_ORDER)
+    if r == 0:
+        r = 1
+    return r % SL3_ORDER
+
+
 def gf_sign_full(message: bytes, private_walk: list,
                  public_key: GFMatrix) -> GFSchnorrSignature:
     """Scalar Schnorr-Γ over SL(3,p) — 189-bit classical DLP security.
 
-    Same protocol as v3 but in the larger group. The response s = (r + c·x) mod |SL(3,p)|.
+    Uses RFC 6979-style hedged deterministic nonce to prevent catastrophic
+    nonce reuse. The response s = (r + c·x) mod |SL(3,p)|.
     For PQ resistance, wrap with Falcon-512 hybrid layer.
     """
     g = get_schnorr_generator()
     x = walk_to_private_scalar(private_walk)
 
-    # Nonce: 256-bit random scalar
-    r = secrets.randbits(256)
+    # Hedged deterministic nonce (RFC 6979 + randomness)
+    r = _rfc6979_nonce(x, message)
     R = g ** r
 
     # Challenge: binds R, public key, and message
