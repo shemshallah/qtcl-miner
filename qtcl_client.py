@@ -3784,7 +3784,7 @@ def _mobius_transport(z: complex, t: float) -> complex:
 
 
 class KeyDerivationParams:
-    """V3 key derivation parameters — PBKDF2-HMAC-SHA256 (600K) + SHAKE-256-CTR + SHA3-256 MAC."""
+    """V4 key derivation parameters — PBKDF2-HMAC-SHA256 (600K) + SHAKE-256-CTR + SHA3-256 MAC."""
 
     # KDF parameters (must match hyp_lwe.py PBKDF2_ITERATIONS)
     PBKDF2_ITERATIONS = 600_000   # OWASP 2023 minimum for SHA-256 KDF
@@ -3861,7 +3861,7 @@ class HypKeyPair:
 
 class HypGammaWallet:
     """
-    V3 Hybrid PQC wallet — Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr.
+    V4 Hybrid PQC wallet — Falcon-512 (NIST FIPS 206) + SL(3,p) scalar Schnorr-Γ.
     Singleton. ALL operations use hybrid signatures — no legacy paths.
 
     SECURITY INVARIANTS:
@@ -3870,7 +3870,7 @@ class HypGammaWallet:
       3. Wallet file requires vault_version — invalid files rejected
       4. Password verified via HMAC-SHA3 tag BEFORE attempting decryption
       5. No silent key generation on ANY error path
-      6. Hybrid signatures: BOTH SL(2,p) and Falcon-512 must verify
+      6. Hybrid signatures: BOTH SL(3,p) and Falcon-512 must verify
     """
 
     _instance: Optional["HypGammaWallet"] = None
@@ -3919,7 +3919,7 @@ class HypGammaWallet:
                 raise RuntimeError(f"HypΓ engine init failed: {e}") from e
 
     def create(self, password: str) -> str:
-        """Create new V3 hybrid wallet — Falcon-512 + SL(2,p). Private keys ENCRYPTED from birth.
+        """Create new V4 hybrid wallet — Falcon-512 + SL(3,p). Private keys ENCRYPTED from birth.
 
         Always generates a fresh keypair regardless of singleton state.
         Overwrites any existing wallet.json.
@@ -3940,7 +3940,7 @@ class HypGammaWallet:
         if 'public_key' not in hk['falcon'] or 'secret_key' not in hk['falcon']:
             raise RuntimeError(f"[HYP-WALLET] Hybrid keypair missing required falcon fields: {list(hk['falcon'].keys())}")
         self.keypair = hk
-        logger.info(f"[HYP-WALLET] ✅ V3 hybrid keypair generated — address: {hk['sl3p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V4 hybrid keypair generated — address: {hk['sl3p']['address'][:16]}...")
         data_dir = Path("data"); data_dir.mkdir(exist_ok=True)
         wallet_path = data_dir / "wallet.json"
         from hyp_lwe import create_wallet_file
@@ -3951,14 +3951,14 @@ class HypGammaWallet:
             hk['sl3p']['address'], hk['sl3p']['public_hex'], full_private_json,
             password, 0, 0)
         # Stamp wallet_type so load() can detect v3 hybrid format
-        wallet_dict["wallet_type"] = "hybrid_v3"
+        wallet_dict["wallet_type"] = "hybrid_v4"
         wallet_path.write_text(_j.dumps(wallet_dict, indent=2))
-        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet saved → {wallet_path}")
+        logger.info(f"[HYP-WALLET] ✅ V4 hybrid wallet saved → {wallet_path}")
         self._loaded = True; self._password_verified = True
         return hk['sl3p']['address']
 
     def load(self, password: str) -> bool:
-        """Load V3 hybrid wallet from encrypted file. Raises ValueError on wrong password or old format."""
+        """Load V4 hybrid wallet from encrypted file. Raises ValueError on wrong password or old format."""
         if self.is_loaded(): return True
         wallet_path = self.wallet_file
         if not wallet_path.exists():
@@ -3968,12 +3968,12 @@ class HypGammaWallet:
         raw = _j.loads(wallet_path.read_text())
         if "vault_version" not in raw:
             raise ValueError("[HYP-WALLET] Invalid wallet file — missing vault_version. Create a new wallet.")
-        # Detect old v2 SL(2,p)-only wallets before decrypting
+        # Detect old v2/v3 SL(2,p)-only wallets before decrypting
         wallet_type = raw.get("wallet_type", "")
-        if wallet_type and wallet_type != "hybrid_v3":
+        if wallet_type and wallet_type not in ("hybrid_v3", "hybrid_v4"):
             raise ValueError(
-                f"[HYP-WALLET] Wallet format '{wallet_type}' is not V3 hybrid. "
-                "Run Wallet → Create new wallet to generate a V3 hybrid (Falcon-512 + SL(2,p)) wallet."
+                f"[HYP-WALLET] Wallet format '{wallet_type}' is not V4 hybrid. "
+                "Run Wallet → Create new wallet to generate a V4 hybrid (Falcon-512 + SL(3,p)) wallet."
             )
         self._init_engine()
         from hyp_lwe import load_wallet_file
@@ -3985,16 +3985,16 @@ class HypGammaWallet:
         except (_j.JSONDecodeError, TypeError):
             raise ValueError(
                 "[HYP-WALLET] Wallet contains old SL(2,p)-only private key (plain hex). "
-                "Create a new V3 hybrid wallet — Wallet → Create new wallet."
+                "Create a new V4 hybrid wallet — Wallet → Create new wallet."
             )
         if not isinstance(keypair, dict) or 'sl3p' not in keypair or 'falcon' not in keypair:
             raise ValueError(
-                "[HYP-WALLET] Wallet private key is not a V3 hybrid keypair dict. "
+                "[HYP-WALLET] Wallet private key is not a V4 hybrid keypair dict. "
                 "Create a new wallet."
             )
         self.keypair = keypair
         self._loaded = True; self._password_verified = True
-        logger.info(f"[HYP-WALLET] ✅ V3 hybrid wallet unlocked — address: {self.keypair['sl3p']['address'][:16]}...")
+        logger.info(f"[HYP-WALLET] ✅ V4 hybrid wallet unlocked — address: {self.keypair['sl3p']['address'][:16]}...")
         return True
 
     def verify_password(self, password: str) -> bool:
@@ -4017,7 +4017,7 @@ class HypGammaWallet:
         return change_wallet_password(self.wallet_file, old_password, new_password)
 
     def sign_message(self, message_hash: bytes) -> Dict[str, Any]:
-        """Sign with hybrid PQC — BOTH SL(2,p) and Falcon-512."""
+        """Sign with hybrid PQC — BOTH SL(3,p) and Falcon-512."""
         if not self.keypair: raise RuntimeError("No keypair loaded")
         self._init_engine()
         return self.engine.hybrid_sign(message_hash, self.keypair)
@@ -4055,7 +4055,7 @@ class HypGammaWallet:
 
     @property
     def public_key(self) -> Optional[str]:
-        """Return SL(3,p) public key hex (576-char, 3x3 GFMatrix)."""
+        """Return SL(3,p) public key hex (576-char, 3×3 GFMatrix)."""
         return self.keypair['sl3p']['public_hex'] if self.keypair else None
 
     @property
@@ -4095,7 +4095,7 @@ class HypGammaWallet:
     def is_loaded(self) -> bool: return bool(self.keypair) and self._password_verified
 
 class HypGammaEngine:
-    """V3 Hybrid PQC engine — Falcon-512 + SL(2,p). Singleton."""
+    """V4 Hybrid PQC engine — Falcon-512 + SL(3,p). Singleton."""
 
     _instance: Optional["HypGammaEngine"] = None
     _lock = threading.Lock()
@@ -4112,13 +4112,13 @@ class HypGammaEngine:
         try:
             from hyp_engine import HypGammaEngine as HypEngine
             self._hyp_engine = HypEngine()
-            logger.info("[HYP-ENGINE] ✅ V3 Hybrid PQC engine initialized — Falcon-512 + SL(2,p)")
+            logger.info("[HYP-ENGINE] ✅ V4 Hybrid PQC engine initialized — Falcon-512 + SL(3,p)")
         except ImportError as e:
             logger.critical(f"[HYP-ENGINE] FATAL: hyp_engine module not available: {e}")
             raise RuntimeError(f"HypΓ engine initialization failed: {e}") from e
 
     def generate_keypair(self) -> Dict[str, Any]:
-        """Generate V3 hybrid keypair (Falcon-512 + SL(2,p))."""
+        """Generate V4 hybrid keypair (Falcon-512 + SL(3,p))."""
         return self._hyp_engine.generate_hybrid_keypair()
 
     def sign_hash(self, message_hash: bytes, private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -4139,11 +4139,11 @@ class HypGammaEngine:
         return self._hyp_engine.verify_block_hybrid(block_dict, signature, public_key_dict)
 
     def derive_address(self, public_key_hex: str) -> str:
-        """Derive address from SL(2,p) public key hex."""
+        """Derive address from SL(3,p) public key hex."""
         return self._hyp_engine.derive_address(public_key_hex)
 
     def derive_public_key(self, private_key_hex: str) -> str:
-        """Derive SL(2,p) public key from private walk hex."""
+        """Derive SL(3,p) public key from private walk hex."""
         return self._hyp_engine.derive_public_key(private_key_hex)
 
 
@@ -4268,7 +4268,7 @@ class CompactBlockSerializer:
 def hyp_handshake_challenge(identity: "P2PIdentity", engine=None) -> dict:
     """Create a challenge that proves we control the P2P identity's wallet key.
 
-    Uses the loaded wallet's hybrid keypair (Falcon-512 + SL(2,p)) for signing.
+    Uses the loaded wallet's hybrid keypair (Falcon-512 + SL(3,p)) for signing.
     Falls back to unsigned challenge if wallet is not loaded.
     """
     engine = engine or HypGammaEngine()
@@ -4331,9 +4331,9 @@ def get_hyp_adapter() -> HypGammaWallet:
     return _HYP_ADAPTER
 
 
-# TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (V3 Hybrid PQC)
+# TOP-LEVEL BACKWARD-COMPATIBLE API FUNCTIONS (V4 Hybrid PQC)
 def hyp_sign_block(block_dict: Dict[str, Any], private_key_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Sign block with V3 hybrid PQC (Falcon-512 + SL(2,p))."""
+    """Sign block with V4 hybrid PQC (Falcon-512 + SL(3,p))."""
     try:
         engine = HypGammaEngine()
         return engine.sign_block(block_dict, private_key_dict)
@@ -4357,7 +4357,7 @@ def hyp_verify_block(
 def hyp_sign_transaction(
     tx_data: Dict[str, Any], private_key_dict: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Sign transaction with V3 hybrid PQC (Falcon-512 + SL(2,p))."""
+    """Sign transaction with V4 hybrid PQC (Falcon-512 + SL(3,p))."""
     try:
         wallet = get_wallet_manager()
         return wallet.sign_transaction(tx_data)
@@ -4382,7 +4382,7 @@ def hyp_verify_transaction(
 
 
 def hyp_derive_address(public_key_hex: str) -> str:
-    """Derive address from SL(2,p) public key hex."""
+    """Derive address from SL(3,p) public key hex."""
     try:
         engine = HypGammaEngine()
         return engine.derive_address(public_key_hex)
@@ -4394,7 +4394,7 @@ def hyp_derive_address(public_key_hex: str) -> str:
 def hyp_create_wallet(
     label: Optional[str] = None, passphrase: str = ""
 ) -> Dict[str, Any]:
-    """Create new V3 hybrid wallet (Falcon-512 + SL(2,p))."""
+    """Create new V4 hybrid wallet (Falcon-512 + SL(3,p))."""
     try:
         wallet = get_wallet_manager()
         addr = wallet.create(passphrase)
@@ -4445,7 +4445,7 @@ def hyp_system_info() -> Dict[str, Any]:
         return {"error": str(e), "status": "unavailable"}
 
 
-# PUBLIC API — V3 Hybrid PQC ONLY
+# PUBLIC API — V4 Hybrid PQC ONLY
 __all__ = [
     "HypGammaEngine",
     "HypGammaWallet",
@@ -19361,26 +19361,26 @@ class QtclClientApp:
                 # v3: uses "keypair" dict; v2: used "private_key" str
                 _has_keys = ("address" in raw and "public_key" in raw and
                              ("keypair" in raw or "private_key" in raw))
-                _is_v3 = raw.get("version", 2) >= 3 and "keypair" in raw
-                if _has_keys and _is_v3:
+                _is_v4_compat = raw.get("version", 2) >= 3 and "keypair" in raw
+                if _has_keys and _is_v4_compat:
                     if _want_wallet:
                         if (
                             raw.get("mode") == "wallet_bound"
                             and raw.get("wallet_addr") == oracle_context["wallet_addr"]
                         ):
                             _EXP_LOG.info(
-                                f"[ORACLE-ID] wallet-bound V3 loaded  {raw['address']}"
+                                f"[ORACLE-ID] wallet-bound V4 loaded  {raw['address']}"
                             )
                             return raw
                     else:
                         if raw.get("mode", "anonymous") == "anonymous":
                             _EXP_LOG.info(
-                                f"[ORACLE-ID] anonymous V3 loaded  {raw['address']}"
+                                f"[ORACLE-ID] anonymous V4 loaded  {raw['address']}"
                             )
                             return raw
                 elif _has_keys:
                     # v2 identity on disk — reject, will regenerate as v3
-                    _EXP_LOG.info("[ORACLE-ID] v2 identity on disk — regenerating as v3 hybrid")
+                    _EXP_LOG.info("[ORACLE-ID] v2/v3 identity on disk — regenerating as v4 hybrid")
         except Exception as _e:
             _EXP_LOG.warning(f"[ORACLE-ID] load failed ({_e}), regenerating")
         # ── Generate new identity ─────────────────────────────────────────────
@@ -19402,9 +19402,9 @@ class QtclClientApp:
                     "cert": cert,
                     "mode": "wallet_bound",
                     "created_ns": time.time_ns(),
-                    "version": 3,
+                    "version": 4,
                 }
-                _EXP_LOG.info(f"[ORACLE-ID] wallet-bound V3 hybrid  {address}  ← {_waddr}")
+                _EXP_LOG.info(f"[ORACLE-ID] wallet-bound V4 hybrid  {address}  ← {_waddr}")
             else:
                 _EXP_LOG.warning("[ORACLE-ID] wallet-bound requested but wallet not loaded — falling back to anonymous")
                 _want_wallet = False
@@ -19424,9 +19424,9 @@ class QtclClientApp:
                 "cert": None,
                 "mode": "anonymous",
                 "created_ns": time.time_ns(),
-                "version": 3,
+                "version": 4,
             }
-            _EXP_LOG.info(f"[ORACLE-ID] anonymous V3 hybrid created  {address}")
+            _EXP_LOG.info(f"[ORACLE-ID] anonymous V4 hybrid created  {address}")
         try:
             _id_path.write_text(_json.dumps(identity, indent=2))
         except Exception as _e:
@@ -19438,8 +19438,8 @@ class QtclClientApp:
         self, oracle_pub: str, wallet_addr: str, wallet_priv: str
     ) -> dict:
         """
-        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr) using V3 hybrid PQC.
-        wallet_priv is the SL(2,p) private walk hex (legacy compat param — wallet keypair
+        Delegation certificate: wallet signs (oracle_pub ‖ wallet_addr) using V4 hybrid PQC.
+        wallet_priv is the SL(3,p) private walk hex (legacy compat param — wallet keypair
         dict is loaded from the singleton HypGammaWallet for hybrid signing).
         """
         try:
@@ -19450,7 +19450,7 @@ class QtclClientApp:
             _payload = (oracle_pub + "|" + wallet_addr).encode()
             _hash = _hashlib.sha3_256(_payload).digest()
 
-            # Sign using V3 hybrid (requires loaded wallet keypair dict)
+            # Sign using V4 hybrid (requires loaded wallet keypair dict)
             if wallet.is_loaded() and wallet.keypair:
                 sig_dict = engine.sign_hash(_hash, wallet.keypair)
                 wallet_pub = wallet.public_key or ""
@@ -19465,7 +19465,7 @@ class QtclClientApp:
                     "wallet_pub": wallet_pub,
                     "falcon_pub": wallet.falcon_public_key or "",
                     "oracle_pub": oracle_pub,
-                    "version": "hybrid_v3",
+                    "version": "hybrid_v4",
                 }
             else:
                 _EXP_LOG.warning("[ORACLE-CERT] Wallet not loaded — cannot issue hybrid cert")
@@ -20381,7 +20381,7 @@ class QtclClientApp:
     def _integrate_wallet_send(
         self, to_address: str, amount: int, private_key_dict: Dict[str, Any] = None
     ) -> str:
-        """Send transaction and log wallet operation with V3 Hybrid PQC."""
+        """Send transaction and log wallet operation with V4 Hybrid PQC."""
         tx_data = {
             "sender": self.wallet.address,
             "recipient": to_address,
@@ -20880,9 +20880,9 @@ class QtclClientApp:
         except ValueError as e:
             msg = str(e)
             logger.error(f"[HYP-WALLET] ❌ {msg}")
-            if "old SL(2,p)" in msg or "hybrid_v3" in msg or "not a V3" in msg:
+            if "old SL(2,p)" in msg or "hybrid_v3" in msg or "hybrid_v4" in msg or "not a V4" in msg:
                 print(f"  ❌ {msg}", flush=True)
-                print("  ➡  Go to Wallet → Create new wallet to generate a V3 hybrid wallet.", flush=True)
+                print("  ➡  Go to Wallet → Create new wallet to generate a V4 hybrid wallet.", flush=True)
             else:
                 print("  ❌ Wrong password", flush=True)
             return False
@@ -25443,8 +25443,8 @@ class QtclClientApp:
                                     submit_payload["miner_public_key_hex"] = (
                                         self.wallet.public_key or ""
                                     )
-                                    # v3 hybrid PQC: include full public key dict + flag
-                                    # so server can verify both Falcon-512 and SL(2,p)
+                                    # v4 hybrid PQC: include full public key dict + flag
+                                    # so server can verify both Falcon-512 and SL(3,p)
                                     if _sig.get("version") == "hybrid_sl3p_falcon_v2":
                                         submit_payload["hybrid_pqc"] = True
                                         _pub_dict = self.wallet.public_key_dict
@@ -26576,7 +26576,7 @@ class QtclClientApp:
             print("  ❌ Invalid QTCL address (expected 64-char hex)")
             return
 
-        # V3 HYBRID: build tx with hybrid public key dict
+        # V4 HYBRID: build tx with hybrid public key dict
         tx = {
             "from_address": self.wallet.address,
             "to_address": to_addr,
@@ -26590,7 +26590,7 @@ class QtclClientApp:
             "block_height": self.koyeb_state.block_height,
             "w_state_fidelity": self.koyeb_state.w_state_fidelity,
         }
-        # ── HYBRID SIGNATURE GENERATION (V3 Falcon-512 + SL(2,p)) ──
+        # ── HYBRID SIGNATURE GENERATION (V4 Falcon-512 + SL(3,p)) ──
         if self.wallet.private_key:
             tx_to_sign = {
                 "sender": self.wallet.address,
@@ -28918,16 +28918,16 @@ class QtclClientApp:
                         _shutil.copy2(str(_wf), str(_bak))
                         print(f"  📦 Old wallet backed up → {_bak.name}")
                     addr = HypGammaWallet().create(pw)
-                    print(f"  ✅ V3 hybrid wallet created: {addr}")
-                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
+                    print(f"  ✅ V4 hybrid wallet created: {addr}")
+                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(3,p) scalar Schnorr-Γ")
                 except Exception as e:
                     print(f"  ❌ {e}")
             elif ch == "3":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
-                print(f"\n  ── V3 Hybrid PQC Wallet ────────────────────────────────────")
+                print(f"\n  ── V4 Hybrid PQC Wallet ────────────────────────────────────")
                 print(f"  Address      : {self.wallet.address}")
-                print(f"  SL(2,p) pub  : {self.wallet.public_key}")
+                print(f"  SL(3,p) pub  : {self.wallet.public_key}")
                 print(f"  Falcon-512   : {self.wallet.falcon_public_key}")
                 print(f"  Version      : {self.wallet.wallet_version}")
                 print()
@@ -28935,7 +28935,7 @@ class QtclClientApp:
                 print(f"  wallet.json       : {self.wallet.wallet_file}")
                 print(f"  KDF               : PBKDF2-HMAC-SHA256 (600K iter, 256-bit salt)")
                 print(f"  Cipher            : SHAKE-256-CTR + SHA3-256 Encrypt-then-MAC")
-                print(f"  Signatures        : V3 Hybrid (Falcon-512 NIST FIPS 206 + SL(2,p))")
+                print(f"  Signatures        : V4 Hybrid (Falcon-512 NIST FIPS 206 + SL(3,p))")
             elif ch == "4":
                 if not self.wallet.is_loaded() and not self._load_wallet():
                     continue
@@ -28972,8 +28972,8 @@ class QtclClientApp:
             elif ch == "5":
                 break
             elif ch == "6":
-                print("\n  🔐 V3 Hybrid PQC Wallet")
-                print("  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
+                print("\n  🔐 V4 Hybrid PQC Wallet")
+                print("  Falcon-512 (NIST FIPS 206) + SL(3,p) scalar Schnorr-Γ")
                 print("  Shamir recovery removed — backup your wallet.json file securely.")
             elif ch == "0":
                 try:
@@ -31734,13 +31734,13 @@ def main() -> None:  # noqa: F811
         if _wallet_file.exists() and not _is_oracle_audit:
             try:
                 _wraw = _wj.loads(_wallet_file.read_text())
-                if _wraw.get("wallet_type", "") not in ("hybrid_v3", ""):
+                if _wraw.get("wallet_type", "") not in ("hybrid_v3", "hybrid_v4", ""):
                     _wallet_is_old_format = True
                 elif "wallet_type" not in _wraw:
-                    # No wallet_type stamp = pre-V3 file, check public_key length
-                    # Old SL(2,p)-only wallets stored a single hex string, not a hybrid dict
+                    # No wallet_type stamp = pre-V3/V4 file, check public_key length
+                    # Old SL(2,p)-only wallets stored a single hex string, not a v4 hybrid dict
                     _pub = _wraw.get("public_key", "")
-                    # Hybrid wallets store SL(2,p) pub only; old ones also did, but lack wallet_type
+                    # Hybrid v4 wallets store SL(3,p) pub; old v3 stored SL(2,p) pub
                     # Safest signal: if encrypted private_key decrypts to a plain hex string
                     # we can't know without decrypting, so flag as potentially old
                     _wallet_is_old_format = True
@@ -31753,17 +31753,17 @@ def main() -> None:  # noqa: F811
                 print("  ┌──────────────────────────────────────────────────────────┐")
                 print("  │  ⚠️   Old Wallet Detected                                 │")
                 print("  │                                                          │")
-                print("  │  Your wallet.json is SL(2,p)-only (pre-V3 format).       │")
-                print("  │  V3 hybrid wallets require Falcon-512 + SL(2,p).         │")
-                print("  │  Create a new V3 wallet? (old file will be backed up)    │")
+                print("  │  Your wallet.json is pre-V4 format (SL(2,p)-only).       │")
+                print("  │  V4 hybrid wallets require Falcon-512 + SL(3,p).         │")
+                print("  │  Create a new V4 wallet? (old file will be backed up)    │")
                 print("  └──────────────────────────────────────────────────────────┘")
             else:
                 print("  ┌──────────────────────────────────────────────────────────┐")
                 print("  │  🔑  Wallet Setup                                        │")
                 print("  │                                                          │")
                 print("  │  No wallet file found.                                   │")
-                print("  │  Create a new QTCL V3 hybrid wallet?                     │")
-                print("  │  (Falcon-512 NIST FIPS 206 + SL(2,p) scalar Schnorr)    │")
+                print("  │  Create a new QTCL V4 hybrid wallet?                     │")
+                print("  │  (Falcon-512 NIST FIPS 206 + SL(3,p) scalar Schnorr-Γ)  │")
                 print("  └──────────────────────────────────────────────────────────┘")
             # Suppress logging during input to prevent prompt injection
             import contextlib
@@ -31798,8 +31798,8 @@ def main() -> None:  # noqa: F811
 
                     _tmp_create_wallet = HypGammaWallet()
                     _new_addr = _tmp_create_wallet.create(_new_pw)
-                    print(f"  ✅ V3 hybrid wallet created: {_new_addr}")
-                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(2,p) scalar Schnorr")
+                    print(f"  ✅ V4 hybrid wallet created: {_new_addr}")
+                    print(f"  🛡  Falcon-512 (NIST FIPS 206) + SL(3,p) scalar Schnorr-Γ")
                     _new_pw = "0" * len(_new_pw)
                 except (EOFError, KeyboardInterrupt):
                     print("  ⚠  Wallet creation skipped — continuing as guest")
