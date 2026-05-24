@@ -29695,10 +29695,18 @@ class QtclClientApp:
         print("  │  6.) ⚛️   Node           (quantum mesh relay mode)        │")
         print("  └──────────────────────────────────────────────────────────┘")
         print()
+        _menu_root = _logging.getLogger()
+        _menu_old_level = _menu_root.level
+        _menu_old_handlers = _menu_root.handlers[:]
+        _menu_root.handlers = [_logging.NullHandler()]
+        _menu_root.setLevel(_logging.CRITICAL)
         try:
             choice = input("  Enter choice [1/2/3/4/5/6]: ").strip()
         except (EOFError, KeyboardInterrupt):
             choice = "1"
+        finally:
+            _menu_root.handlers = _menu_old_handlers
+            _menu_root.setLevel(_menu_old_level)
         if choice == "2":
             self.run_transact_mode()
         elif choice == "3":
