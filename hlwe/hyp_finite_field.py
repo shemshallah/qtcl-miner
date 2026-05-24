@@ -809,7 +809,7 @@ class GFSchnorrSignature(NamedTuple):
     R: GFMatrix
     Z: GFMatrix
     c_full: int        # 256-bit Fiat-Shamir challenge
-    s_scalar: int      # scalar response s = (r + c·x) mod SL3_ORDER
+    s_scalar: int      # scalar response s = (r + c·x) mod Q_379
     R_hex: str         # canonical hex of R for exact binding
 
 
@@ -948,12 +948,12 @@ def gf_sign_full(message: bytes, private_walk: list,
         ).digest()
         c_full = int.from_bytes(c_bytes, 'big')
 
-        # Response: s = (r + c·x) mod SL3_ORDER
-        s_scalar = (r + c_full * x) % SL3_ORDER
+        # Response: s = (r + c·x) mod Q_379 (prime subgroup — r,x ∈ [1,Q_379))
+        s_scalar = (r + c_full * x) % Q_379
 
-        # Response matrix: Z = g^s (blinded)
-        Z = _blinded_pow(g, s_scalar, SL3_ORDER)
-        Z2 = _blinded_pow(g, s_scalar, SL3_ORDER)
+        # Response matrix: Z = g^s (blinded) — exponent in Q_379 subgroup
+        Z = _blinded_pow(g, s_scalar, Q_379)
+        Z2 = _blinded_pow(g, s_scalar, Q_379)
         if Z != Z2:
             continue
 
@@ -1012,7 +1012,7 @@ def gf_verify_full(sig: GFSchnorrSignature, message: bytes,
     # Check 2: g^s == R @ y^c  (reduce c mod SL3_ORDER for exponentiation)
     # Use blinded exponentiation for power analysis resistance (finding 12)
     y_c = _blinded_pow(public_key, c_full % SL3_ORDER, SL3_ORDER)
-    g_s = _blinded_pow(g, s_scalar, SL3_ORDER)
+    g_s = _blinded_pow(g, s_scalar, Q_379)
     expected = R @ y_c
     # Use __eq__ (constant-time) for matrix comparison
     if g_s == expected:
