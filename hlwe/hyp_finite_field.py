@@ -935,25 +935,38 @@ def gf_sign_full(message: bytes, private_walk: list,
 
     # DFI: retry loop catches transient faults in exponentiation
     for _fault_retry in range(3):
+        # R = g^r. r ∈ [1, Q_379) so r < SL3_ORDER — no reduction needed.
+        # Blind with SL3_ORDER (= ord(g) divides SL3_ORDER, g^SL3=I).
         R = _blinded_pow(g, r, SL3_ORDER)
         R2 = _blinded_pow(g, r, SL3_ORDER)
-        # Fault check: two independent blinded exps must agree on R
+        # Fault check: normalize PSL representatives before comparing.
+        # Two independent blinded exps may land on M vs -M (projective
+        # equivalents in PSL(3,p)) due to different random blinds.
+        R = R.normalize_psl()
+        R2 = R2.normalize_psl()
         if R != R2:
-            # transient fault — retry with fresh blinded exponent
             continue
 
         # Challenge: domain-separated, binds R + public key + message
+        # R is normalize_psl() — serialize() is deterministic
         c_bytes = hashlib.sha3_256(
             DOMAIN_TAG + R.serialize() + public_key.serialize() + message
         ).digest()
         c_full = int.from_bytes(c_bytes, 'big')
 
-        # Response: s = (r + c·x) mod Q_379 (prime subgroup — r,x ∈ [1,Q_379))
-        s_scalar = (r + c_full * x) % Q_379
+        # Response: s = (r + c·x) mod SL3_ORDER
+        # CRITICAL: must reduce mod SL3_ORDER (the group order), NOT Q_379.
+        # Q_379 is a prime factor of ord(g), not ord(g) itself.
+        # Schnorr: g^s = R @ y^c requires s ≡ r + c·x (mod ord(g)).
+        # x and r are in [1, Q_379) — their DLP hardness is ~189 bits —
+        # but the verification equation operates in the full group.
+        s_scalar = (r + c_full * x) % SL3_ORDER
 
-        # Response matrix: Z = g^s (blinded) — exponent in Q_379 subgroup
-        Z = _blinded_pow(g, s_scalar, Q_379)
-        Z2 = _blinded_pow(g, s_scalar, Q_379)
+        # Response matrix: Z = g^s — exponent mod SL3_ORDER
+        Z = _blinded_pow(g, s_scalar, SL3_ORDER)
+        Z2 = _blinded_pow(g, s_scalar, SL3_ORDER)
+        Z = Z.normalize_psl()
+        Z2 = Z2.normalize_psl()
         if Z != Z2:
             continue
 
@@ -997,7 +1010,10 @@ def gf_verify_full(sig: GFSchnorrSignature, message: bytes,
       2. g^s == R @ y^c                              (scalar response in Q_379)
     """
     g = get_schnorr_generator()
-    R = sig.R
+    # Normalize R to canonical PSL representative — gf_sign_full stores
+    # normalize_psl(R) in the sig and serializes it into the challenge hash.
+    # Without normalization here, the challenge recomputation diverges.
+    R = sig.R.normalize_psl()
     c_full = sig.c_full
     s_scalar = sig.s_scalar
 
@@ -1009,11 +1025,11 @@ def gf_verify_full(sig: GFSchnorrSignature, message: bytes,
     if not _ct_bytes_eq(actual_c_bytes, expected_c_bytes):
         return False
 
-    # Check 2: g^s == R @ y^c  (reduce c mod SL3_ORDER for exponentiation)
-    # Use blinded exponentiation for power analysis resistance (finding 12)
+    # Check 2: g^s == R @ y^c  (c mod SL3_ORDER — the group order)
+    # Must use SL3_ORDER not Q_379: y = g^x is in SL(3,p), ord(y) | SL3_ORDER.
     y_c = _blinded_pow(public_key, c_full % SL3_ORDER, SL3_ORDER)
-    g_s = _blinded_pow(g, s_scalar, Q_379)
-    expected = R @ y_c
+    g_s = _blinded_pow(g, s_scalar, SL3_ORDER).normalize_psl()
+    expected = (R @ y_c).normalize_psl()
     # Use __eq__ (constant-time) for matrix comparison
     if g_s == expected:
         return True
