@@ -116,23 +116,33 @@ try:
         sign             as _falcon_sign_raw,
         verify           as _falcon_verify_raw,
     )
-except ImportError:
-    raise ImportError(
-        "\n"
-        "╔══════════════════════════════════════════════════════════════════╗\n"
-        "║  FATAL: pqcrypto not installed — Falcon-512 is REQUIRED.      ║\n"
-        "║                                                                ║\n"
-        "║  QTCL uses a hybrid signature scheme where BOTH Falcon-512    ║\n"
-        "║  AND SL(3,p) Schnorr-Γ must verify. Without Falcon there     ║\n"
-        "║  is no post-quantum security. No mock. No fallback.           ║\n"
-        "║                                                                ║\n"
-        "║  Install:  pip install pqcrypto                               ║\n"
-        "║  Termux:   pkg install clang && pip install pqcrypto          ║\n"
-        "╚══════════════════════════════════════════════════════════════════╝\n"
+    _FALCON_REAL = True
+    logger.info("[hyp_pqc] ✅ Falcon-512: pqcrypto loaded (NIST FIPS 206)")
+except ImportError as _falcon_import_err:
+    # Module still loads — HypGammaEngine becomes importable.
+    # Hybrid ops raise RuntimeError if actually called without pqcrypto.
+    _FALCON_REAL = False
+    _falcon_import_err_msg = str(_falcon_import_err)
+    logger.warning(
+        "[hyp_pqc] ⚠️  Falcon-512 unavailable (%s). "
+        "Module loaded; hybrid ops raise until pqcrypto installed.",
+        _falcon_import_err_msg,
     )
-
-_FALCON_REAL = True
-logger.info("[hyp_pqc] ✅ Falcon-512: pqcrypto loaded (NIST FIPS 206)")
+    def _falcon_keygen_raw():
+        raise RuntimeError(
+            f"Falcon-512 unavailable (pqcrypto not installed). "
+            "Run: pip install pqcrypto"
+        )
+    def _falcon_sign_raw(sk, message):
+        raise RuntimeError(
+            f"Falcon-512 unavailable (pqcrypto not installed). "
+            "Run: pip install pqcrypto"
+        )
+    def _falcon_verify_raw(pk, message, sig):
+        raise RuntimeError(
+            f"Falcon-512 unavailable (pqcrypto not installed). "
+            "Run: pip install pqcrypto"
+        )
 
 
 def _falcon_keygen() -> Tuple[bytes, bytes]:
